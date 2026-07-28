@@ -48,6 +48,7 @@ fn strict_documents_resolve_compile_bind_and_render() {
             timeline,
             tracks: &tracks,
             clips: &clips,
+            scenes: &[],
             arrangement: Some(arrangement),
         },
         LoaderLimits::VERSION_1,

@@ -48,6 +48,7 @@ pub fn one_clip_schedule() -> OwnedCompiledSchedule {
             timeline,
             tracks: &tracks,
             clips: &clips,
+            scenes: &[],
             arrangement: Some(arrangement),
         },
         LoaderLimits::VERSION_1,

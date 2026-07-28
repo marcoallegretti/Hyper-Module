@@ -93,6 +93,7 @@ pub fn fixture() -> Fixture {
             timeline,
             tracks: &tracks,
             clips: &clips,
+            scenes: &[],
             arrangement: Some(arrangement),
         },
         LoaderLimits::VERSION_1,

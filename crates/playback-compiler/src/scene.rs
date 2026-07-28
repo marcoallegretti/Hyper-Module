@@ -30,12 +30,12 @@ pub struct SceneSlotResource<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct SceneResource<'a> {
-    pub id: &'a str,
+pub struct SceneResource<'input, 'resource> {
+    pub id: &'resource str,
     pub enabled: bool,
     pub order: u8,
     pub launch_quantization: LaunchQuantization,
-    pub slots: &'a [SceneSlotResource<'a>],
+    pub slots: &'input [SceneSlotResource<'resource>],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,12 +61,12 @@ pub struct SceneClipResource<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct ScenePerformanceInput<'a> {
+pub struct ScenePerformanceInput<'input, 'resource> {
     pub enabled: bool,
-    pub tracks: &'a [SceneTrackResource<'a>],
-    pub clips: &'a [SceneClipResource<'a>],
-    pub scenes: &'a [SceneResource<'a>],
-    pub launches: &'a [SceneLaunchResource<'a>],
+    pub tracks: &'input [SceneTrackResource<'resource>],
+    pub clips: &'input [SceneClipResource<'resource>],
+    pub scenes: &'input [SceneResource<'input, 'resource>],
+    pub launches: &'input [SceneLaunchResource<'resource>],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -348,7 +348,9 @@ impl<'resource> CompiledScenePerformance<'resource> {
         self.tracks.get(index).map(|track| track.id)
     }
 
-    pub fn playing_clips(&self) -> impl Iterator<Item = (&str, PlayingSceneClip<'_>)> + '_ {
+    pub fn playing_clips(
+        &self,
+    ) -> impl Iterator<Item = (&'resource str, PlayingSceneClip<'resource>)> + '_ {
         self.tracks.iter().flat_map(|track| {
             track.actions.iter().filter_map(move |action| {
                 if let CompiledAction::Play(playing) = action.action {
@@ -383,11 +385,11 @@ impl<'resource> CompiledScenePerformance<'resource> {
 ///
 /// Returns [`SceneCompileError`] for bounds, identity, order, reference,
 /// quantization, duration, arithmetic, or timeline failures.
-pub fn compile_scene_performance<'a>(
+pub fn compile_scene_performance<'resource>(
     timeline: Timeline<'_>,
-    input: ScenePerformanceInput<'a>,
+    input: ScenePerformanceInput<'_, 'resource>,
     limits: SceneLimits,
-) -> Result<CompiledScenePerformance<'a>, SceneCompileError> {
+) -> Result<CompiledScenePerformance<'resource>, SceneCompileError> {
     enforce_limit(
         SceneCollection::Track,
         input.tracks.len(),
@@ -422,10 +424,10 @@ pub fn compile_scene_performance<'a>(
     Ok(CompiledScenePerformance { tracks })
 }
 
-fn compile_launches<'a>(
+fn compile_launches<'resource>(
     timeline: Timeline<'_>,
-    input: ScenePerformanceInput<'a>,
-    tracks: &mut [CompiledSceneTrack<'a>],
+    input: ScenePerformanceInput<'_, 'resource>,
+    tracks: &mut [CompiledSceneTrack<'resource>],
 ) -> Result<(), SceneCompileError> {
     let mut previous_tick = None;
     for (launch_index, launch) in input.launches.iter().enumerate() {
@@ -519,7 +521,7 @@ fn enforce_limit(
     Ok(())
 }
 
-fn validate_identities(input: ScenePerformanceInput<'_>) -> Result<(), SceneCompileError> {
+fn validate_identities(input: ScenePerformanceInput<'_, '_>) -> Result<(), SceneCompileError> {
     validate_ids(
         SceneCollection::Track,
         input.tracks.iter().map(|resource| resource.id),
@@ -558,7 +560,7 @@ fn validate_ids<'a>(
 }
 
 fn validate_resources(
-    input: ScenePerformanceInput<'_>,
+    input: ScenePerformanceInput<'_, '_>,
     limits: SceneLimits,
 ) -> Result<(), SceneCompileError> {
     for (clip_index, clip) in input.clips.iter().enumerate() {
@@ -632,7 +634,7 @@ fn find_clip(clips: &[SceneClipResource<'_>], id: &str) -> Option<usize> {
     clips.iter().position(|clip| clip.id == id)
 }
 
-fn find_scene(scenes: &[SceneResource<'_>], id: &str) -> Option<usize> {
+fn find_scene(scenes: &[SceneResource<'_, '_>], id: &str) -> Option<usize> {
     scenes.iter().position(|scene| scene.id == id)
 }
 

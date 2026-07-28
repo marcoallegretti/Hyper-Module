@@ -20,8 +20,14 @@ use hyper_playback_compiler::graph::{
     ArrangementResource, AssetResource, ClipResource, CompiledSchedule, GraphError, GraphInput,
     GraphLimits, PlacementResource, TrackKind, TrackResource, compile_arrangement,
 };
+use hyper_playback_compiler::scene::{
+    CompiledScenePerformance, LaunchQuantization, SceneClipResource, SceneCompileError,
+    SceneLaunchResource, SceneLimits, ScenePerformanceInput, SceneResource, SceneSlotAction,
+    SceneSlotResource, SceneTrackResource, compile_scene_performance,
+};
 use hyper_playback_compiler::{
-    CompiledPlacement, TempoEvent, TickRange, Timeline, TimelineError, WarpMarker,
+    ClipCompileSpec, CompileError, CompiledPlacement, CompiledSceneAudioClip, TempoEvent,
+    TickRange, Timeline, TimelineError, WarpMarker, compile_scene_audio_clip,
 };
 use serde::Deserialize;
 use serde::de::IgnoredAny;
@@ -37,6 +43,7 @@ pub enum DocumentKind {
     Timeline,
     Track,
     Clip,
+    Scene,
     Arrangement,
     Mixer,
     AutomationTake,
@@ -79,8 +86,10 @@ impl From<StrictJsonErrorKind> for JsonRejection {
 pub enum CollectionLimit {
     TrackDocuments,
     ClipDocuments,
+    SceneDocuments,
     TrackClipReferences,
     WarpMarkers,
+    SceneSlots,
     Placements,
     SceneLaunches,
     MixerChannels,
@@ -140,8 +149,10 @@ pub struct LoaderLimits {
     pub max_document_bytes: usize,
     pub max_track_documents: usize,
     pub max_clip_documents: usize,
+    pub max_scene_documents: usize,
     pub max_track_clip_references: usize,
     pub max_warp_markers: usize,
+    pub max_scene_slots: usize,
     pub max_placements: usize,
     pub max_scene_launches: usize,
     pub max_mixer_channels: usize,
@@ -157,8 +168,10 @@ impl LoaderLimits {
         max_document_bytes: 1_048_576,
         max_track_documents: 8,
         max_clip_documents: 4_096,
+        max_scene_documents: 8,
         max_track_clip_references: 4_096,
         max_warp_markers: 65_536,
+        max_scene_slots: 8,
         max_placements: 65_536,
         max_scene_launches: 65_536,
         max_mixer_channels: 8,
@@ -177,6 +190,7 @@ pub struct PlaybackJsonInput<'a> {
     pub timeline: &'a [u8],
     pub tracks: &'a [&'a [u8]],
     pub clips: &'a [&'a [u8]],
+    pub scenes: &'a [&'a [u8]],
     pub arrangement: Option<&'a [u8]>,
 }
 
@@ -228,11 +242,39 @@ struct LoadedPlacement {
 }
 
 #[derive(Clone, Debug)]
+enum LoadedSceneSlotAction {
+    Play { clip_id: String },
+    Stop,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedSceneSlot {
+    track_id: String,
+    action: LoadedSceneSlotAction,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedScene {
+    id: String,
+    enabled: bool,
+    order: u8,
+    launch_quantization: LaunchQuantization,
+    slots: Vec<LoadedSceneSlot>,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedSceneLaunch {
+    id: String,
+    tick: u64,
+    scene_id: String,
+}
+
+#[derive(Clone, Debug)]
 struct LoadedArrangement {
     id: String,
     enabled: bool,
     placements: Vec<LoadedPlacement>,
-    scene_launch_ids: Vec<String>,
+    scene_launches: Vec<LoadedSceneLaunch>,
 }
 
 #[derive(Clone, Debug)]
@@ -243,6 +285,7 @@ pub struct LoadedPlaybackProject {
     tempo_events: Vec<TempoEvent>,
     tracks: Vec<LoadedTrack>,
     clips: Vec<LoadedClip>,
+    scenes: Vec<LoadedScene>,
     arrangement: Option<LoadedArrangement>,
 }
 
@@ -823,6 +866,11 @@ impl LoadedPlaybackProject {
     }
 
     #[must_use]
+    pub fn scene_count(&self) -> usize {
+        self.scenes.len()
+    }
+
+    #[must_use]
     pub fn placement_count(&self) -> usize {
         self.arrangement
             .as_ref()
@@ -853,38 +901,55 @@ impl LoadedPlaybackProject {
         assets: &[MediaAssetFact<'_>],
         limits: GraphLimits,
     ) -> Result<OwnedCompiledSchedule, AdapterCompileError> {
-        validate_asset_identities(self, assets)?;
         let timeline = Timeline::try_new(self.sample_rate_hz, &self.tempo_events)
             .map_err(AdapterCompileError::Timeline)?;
+        compile_loaded_arrangement(self, assets, limits, true, timeline)
+    }
 
-        let clip_id_views = build_clip_id_views(&self.tracks)?;
-        let track_resources = build_track_resources(&self.tracks, &clip_id_views)?;
-        let clip_resources = build_clip_resources(&self.clips)?;
-        let asset_resources = build_asset_resources(assets)?;
-        let placement_resources = build_placement_resources(self.arrangement.as_ref())?;
-        let arrangement = ArrangementResource {
-            enabled: self
-                .arrangement
-                .as_ref()
-                .is_none_or(|arrangement| arrangement.enabled),
-            placements: &placement_resources,
-            scene_launch_count: self
-                .arrangement
-                .as_ref()
-                .map_or(0, |arrangement| arrangement.scene_launch_ids.len()),
-        };
-        let compiled = compile_arrangement(
+    /// Atomically compiles explicit placements, recorded scene authority, and
+    /// every scene-play media binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterCompileError`] without publishing a partial graph when
+    /// any timeline, identity, ownership, authority, scene, or native-audio
+    /// requirement fails.
+    pub fn compile_playback<'project>(
+        &'project self,
+        assets: &[MediaAssetFact<'_>],
+        graph_limits: GraphLimits,
+        scene_limits: SceneLimits,
+    ) -> Result<CompiledPlaybackGraph<'project>, AdapterCompileError> {
+        let timeline = Timeline::try_new(self.sample_rate_hz, &self.tempo_events)
+            .map_err(AdapterCompileError::Timeline)?;
+        let arrangement = compile_loaded_arrangement(self, assets, graph_limits, false, timeline)?;
+        validate_single_track_authority(self)?;
+        let scene_tracks = build_scene_track_resources(&self.tracks)?;
+        let scene_clips = build_scene_clip_resources(&self.clips)?;
+        let scene_slots = build_scene_slot_resources(&self.scenes)?;
+        let scenes = build_scene_resources(&self.scenes, &scene_slots)?;
+        let launches = build_scene_launch_resources(self.arrangement.as_ref())?;
+        let scene_authority = compile_scene_performance(
             timeline,
-            GraphInput {
-                tracks: &track_resources,
-                clips: &clip_resources,
-                assets: &asset_resources,
-                arrangement,
+            ScenePerformanceInput {
+                enabled: self
+                    .arrangement
+                    .as_ref()
+                    .is_none_or(|arrangement| arrangement.enabled),
+                tracks: &scene_tracks,
+                clips: &scene_clips,
+                scenes: &scenes,
+                launches: &launches,
             },
-            limits,
+            scene_limits,
         )
-        .map_err(AdapterCompileError::Graph)?;
-        own_schedule(&compiled)
+        .map_err(AdapterCompileError::Scene)?;
+        let scene_audio = compile_scene_audio_bindings(self, assets, timeline, &scene_authority)?;
+        Ok(CompiledPlaybackGraph {
+            arrangement,
+            scene_authority,
+            scene_audio,
+        })
     }
 }
 
@@ -910,11 +975,56 @@ impl OwnedCompiledSchedule {
 }
 
 #[derive(Debug)]
+pub struct CompiledPlaybackGraph<'project> {
+    arrangement: OwnedCompiledSchedule,
+    scene_authority: CompiledScenePerformance<'project>,
+    scene_audio: Vec<CompiledSceneAudioBinding<'project>>,
+}
+
+impl<'project> CompiledPlaybackGraph<'project> {
+    #[must_use]
+    pub const fn arrangement(&self) -> &OwnedCompiledSchedule {
+        &self.arrangement
+    }
+
+    #[must_use]
+    pub const fn scene_authority(&self) -> &CompiledScenePerformance<'project> {
+        &self.scene_authority
+    }
+
+    #[must_use]
+    pub fn scene_audio(&self) -> &[CompiledSceneAudioBinding<'project>] {
+        &self.scene_audio
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompiledSceneAudioBinding<'project> {
+    pub track_id: &'project str,
+    pub launch_id: &'project str,
+    pub scene_id: &'project str,
+    pub clip_id: &'project str,
+    pub asset_id: &'project str,
+    pub compiled: CompiledSceneAudioClip,
+}
+
+#[derive(Debug)]
 pub enum AdapterCompileError {
     Timeline(TimelineError),
-    AssetIdentityCollision { asset_index: usize },
+    AssetIdentityCollision {
+        asset_index: usize,
+    },
     CapacityUnavailable,
+    MixedTrackAuthority {
+        placement_index: usize,
+    },
+    InconsistentCompiledGraph,
     Graph(GraphError),
+    Scene(SceneCompileError),
+    SceneAudio {
+        binding_index: usize,
+        error: CompileError,
+    },
 }
 
 impl fmt::Display for AdapterCompileError {
@@ -930,7 +1040,24 @@ impl fmt::Display for AdapterCompileError {
             Self::CapacityUnavailable => {
                 formatter.write_str("playback adapter capacity is unavailable")
             }
+            Self::MixedTrackAuthority { placement_index } => write!(
+                formatter,
+                "placement {placement_index} targets a scene-controlled track"
+            ),
+            Self::InconsistentCompiledGraph => {
+                formatter.write_str("compiled playback graph is internally inconsistent")
+            }
             Self::Graph(error) => write!(formatter, "playback graph compilation failed: {error}"),
+            Self::Scene(error) => write!(formatter, "scene authority compilation failed: {error}"),
+            Self::SceneAudio {
+                binding_index,
+                error,
+            } => {
+                write!(
+                    formatter,
+                    "scene audio binding {binding_index} compilation failed: {error}"
+                )
+            }
         }
     }
 }
@@ -940,7 +1067,12 @@ impl Error for AdapterCompileError {
         match self {
             Self::Timeline(error) => Some(error),
             Self::Graph(error) => Some(error),
-            Self::AssetIdentityCollision { .. } | Self::CapacityUnavailable => None,
+            Self::Scene(error) => Some(error),
+            Self::SceneAudio { error, .. } => Some(error),
+            Self::AssetIdentityCollision { .. }
+            | Self::CapacityUnavailable
+            | Self::MixedTrackAuthority { .. }
+            | Self::InconsistentCompiledGraph => None,
         }
     }
 }
@@ -1018,6 +1150,8 @@ pub fn load(
         )?);
     }
 
+    let scenes = load_scenes(input.scenes, input.project_id, limits)?;
+
     let arrangement = input
         .arrangement
         .map(|bytes| {
@@ -1046,6 +1180,7 @@ pub fn load(
             .collect(),
         tracks,
         clips,
+        scenes,
         arrangement,
     };
     validate_loaded_identities(&loaded)?;
@@ -1082,6 +1217,12 @@ fn validate_loader_inputs(
         CollectionLimit::ClipDocuments,
         input.clips.len(),
         limits.max_clip_documents,
+        None,
+    )?;
+    enforce_loader_limit(
+        CollectionLimit::SceneDocuments,
+        input.scenes.len(),
+        limits.max_scene_documents,
         None,
     )
 }
@@ -1205,6 +1346,93 @@ fn load_clip(
     })
 }
 
+fn load_scene(
+    bytes: &[u8],
+    index: usize,
+    project_id: &str,
+    maximum_bytes: usize,
+    maximum_slots: usize,
+) -> Result<LoadedScene, LoadError> {
+    let location = DocumentLocation {
+        kind: DocumentKind::Scene,
+        index,
+    };
+    let document: SceneDocument = parse_document(bytes, location, maximum_bytes)?;
+    validate_header(
+        &document.format,
+        document.format_version,
+        "hyper-scene",
+        &document.project_id,
+        project_id,
+        location,
+    )?;
+    enforce_loader_limit(
+        CollectionLimit::SceneSlots,
+        document.slots.len(),
+        maximum_slots,
+        Some(location),
+    )?;
+    if document.order > 7 {
+        return domain_error(location, "scene order must be from zero through seven");
+    }
+    let launch_quantization = match document.launch_quantization {
+        SceneQuantizationDocument::Immediate => LaunchQuantization::Immediate,
+        SceneQuantizationDocument::Grid { quantum_ticks } => {
+            if quantum_ticks == 0 {
+                return domain_error(location, "scene launch quantum must be positive");
+            }
+            LaunchQuantization::Grid { quantum_ticks }
+        }
+    };
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(document.slots.len())
+        .map_err(|_| capacity_error())?;
+    for slot in document.slots {
+        let (track_id, action) = match slot {
+            SceneSlotDocument::Play { track_id, clip_id } => {
+                (track_id, LoadedSceneSlotAction::Play { clip_id })
+            }
+            SceneSlotDocument::Stop { track_id } => (track_id, LoadedSceneSlotAction::Stop),
+        };
+        if slots
+            .iter()
+            .any(|previous: &LoadedSceneSlot| previous.track_id == track_id)
+        {
+            return domain_error(location, "scene slots must target distinct tracks");
+        }
+        slots.push(LoadedSceneSlot { track_id, action });
+    }
+    Ok(LoadedScene {
+        id: document.id,
+        enabled: document.enabled,
+        order: document.order,
+        launch_quantization,
+        slots,
+    })
+}
+
+fn load_scenes(
+    documents: &[&[u8]],
+    project_id: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<LoadedScene>, LoadError> {
+    let mut scenes = Vec::new();
+    scenes
+        .try_reserve_exact(documents.len())
+        .map_err(|_| capacity_error())?;
+    for (index, bytes) in documents.iter().enumerate() {
+        scenes.push(load_scene(
+            bytes,
+            index,
+            project_id,
+            limits.max_document_bytes,
+            limits.max_scene_slots,
+        )?);
+    }
+    Ok(scenes)
+}
+
 fn load_arrangement(
     bytes: &[u8],
     project_id: &str,
@@ -1251,16 +1479,20 @@ fn load_arrangement(
             enabled: placement.enabled,
         })
         .collect();
-    let scene_launch_ids = document
+    let scene_launches = document
         .scene_launches
         .into_iter()
-        .map(|launch| launch.id)
+        .map(|launch| LoadedSceneLaunch {
+            id: launch.id,
+            tick: launch.tick,
+            scene_id: launch.scene_id,
+        })
         .collect();
     Ok(LoadedArrangement {
         id: document.id,
         enabled: document.enabled,
         placements,
-        scene_launch_ids,
+        scene_launches,
     })
 }
 
@@ -1585,6 +1817,7 @@ fn project_contains_identity(project: &LoadedPlaybackProject, id: &str) -> bool 
     project.timeline_id == id
         || project.tracks.iter().any(|track| track.id == id)
         || project.clips.iter().any(|clip| clip.id == id)
+        || project.scenes.iter().any(|scene| scene.id == id)
         || project.arrangement.as_ref().is_some_and(|arrangement| {
             arrangement.id == id
                 || arrangement
@@ -1592,9 +1825,9 @@ fn project_contains_identity(project: &LoadedPlaybackProject, id: &str) -> bool 
                     .iter()
                     .any(|placement| placement.id == id)
                 || arrangement
-                    .scene_launch_ids
+                    .scene_launches
                     .iter()
-                    .any(|scene_id| scene_id == id)
+                    .any(|launch| launch.id == id)
         })
 }
 
@@ -1843,13 +2076,16 @@ fn validate_loaded_identities(project: &LoadedPlaybackProject) -> Result<(), Loa
     for clip in &project.clips {
         insert_identity(&mut identities, &clip.id)?;
     }
+    for scene in &project.scenes {
+        insert_identity(&mut identities, &scene.id)?;
+    }
     if let Some(arrangement) = &project.arrangement {
         insert_identity(&mut identities, &arrangement.id)?;
         for placement in &arrangement.placements {
             insert_identity(&mut identities, &placement.id)?;
         }
-        for scene_id in &arrangement.scene_launch_ids {
-            insert_identity(&mut identities, scene_id)?;
+        for launch in &arrangement.scene_launches {
+            insert_identity(&mut identities, &launch.id)?;
         }
     }
     Ok(())
@@ -1881,6 +2117,7 @@ fn validate_asset_identities(
     identities.insert(project.timeline_id.as_str());
     identities.extend(project.tracks.iter().map(|track| track.id.as_str()));
     identities.extend(project.clips.iter().map(|clip| clip.id.as_str()));
+    identities.extend(project.scenes.iter().map(|scene| scene.id.as_str()));
     if let Some(arrangement) = &project.arrangement {
         identities.insert(arrangement.id.as_str());
         identities.extend(
@@ -1889,7 +2126,12 @@ fn validate_asset_identities(
                 .iter()
                 .map(|placement| placement.id.as_str()),
         );
-        identities.extend(arrangement.scene_launch_ids.iter().map(String::as_str));
+        identities.extend(
+            arrangement
+                .scene_launches
+                .iter()
+                .map(|launch| launch.id.as_str()),
+        );
     }
     for (asset_index, asset) in assets.iter().enumerate() {
         if !identities.insert(asset.id) {
@@ -1994,6 +2236,220 @@ fn build_placement_resources(
         duration_ticks: placement.duration_ticks,
         enabled: placement.enabled,
     }));
+    Ok(output)
+}
+
+fn compile_loaded_arrangement(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    limits: GraphLimits,
+    reject_scene_launches: bool,
+    timeline: Timeline<'_>,
+) -> Result<OwnedCompiledSchedule, AdapterCompileError> {
+    validate_asset_identities(project, assets)?;
+    let clip_id_views = build_clip_id_views(&project.tracks)?;
+    let track_resources = build_track_resources(&project.tracks, &clip_id_views)?;
+    let clip_resources = build_clip_resources(&project.clips)?;
+    let asset_resources = build_asset_resources(assets)?;
+    let placement_resources = build_placement_resources(project.arrangement.as_ref())?;
+    let scene_launch_count = if reject_scene_launches {
+        project
+            .arrangement
+            .as_ref()
+            .map_or(0, |arrangement| arrangement.scene_launches.len())
+    } else {
+        0
+    };
+    let compiled = compile_arrangement(
+        timeline,
+        GraphInput {
+            tracks: &track_resources,
+            clips: &clip_resources,
+            assets: &asset_resources,
+            arrangement: ArrangementResource {
+                enabled: project
+                    .arrangement
+                    .as_ref()
+                    .is_none_or(|arrangement| arrangement.enabled),
+                placements: &placement_resources,
+                scene_launch_count,
+            },
+        },
+        limits,
+    )
+    .map_err(AdapterCompileError::Graph)?;
+    own_schedule(&compiled)
+}
+
+fn validate_single_track_authority(
+    project: &LoadedPlaybackProject,
+) -> Result<(), AdapterCompileError> {
+    let Some(arrangement) = &project.arrangement else {
+        return Ok(());
+    };
+    let mut scene_tracks = BTreeSet::new();
+    for launch in &arrangement.scene_launches {
+        if let Some(scene) = project
+            .scenes
+            .iter()
+            .find(|scene| scene.id == launch.scene_id)
+        {
+            scene_tracks.extend(scene.slots.iter().map(|slot| slot.track_id.as_str()));
+        }
+    }
+    for (placement_index, placement) in arrangement.placements.iter().enumerate() {
+        if scene_tracks.contains(placement.track_id.as_str()) {
+            return Err(AdapterCompileError::MixedTrackAuthority { placement_index });
+        }
+    }
+    Ok(())
+}
+
+fn build_scene_track_resources(
+    tracks: &[LoadedTrack],
+) -> Result<Vec<SceneTrackResource<'_>>, AdapterCompileError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(tracks.len())
+        .map_err(|_| AdapterCompileError::CapacityUnavailable)?;
+    output.extend(tracks.iter().map(|track| SceneTrackResource {
+        id: &track.id,
+        active: track.active,
+    }));
+    Ok(output)
+}
+
+fn build_scene_clip_resources(
+    clips: &[LoadedClip],
+) -> Result<Vec<SceneClipResource<'_>>, AdapterCompileError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(clips.len())
+        .map_err(|_| AdapterCompileError::CapacityUnavailable)?;
+    output.extend(clips.iter().map(|clip| SceneClipResource {
+        id: &clip.id,
+        track_id: &clip.track_id,
+        enabled: clip.enabled,
+        duration_ticks: clip.duration_ticks,
+        loop_enabled: clip.loop_enabled,
+    }));
+    Ok(output)
+}
+
+fn build_scene_slot_resources(
+    scenes: &[LoadedScene],
+) -> Result<Vec<Vec<SceneSlotResource<'_>>>, AdapterCompileError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(scenes.len())
+        .map_err(|_| AdapterCompileError::CapacityUnavailable)?;
+    for scene in scenes {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(scene.slots.len())
+            .map_err(|_| AdapterCompileError::CapacityUnavailable)?;
+        slots.extend(scene.slots.iter().map(|slot| SceneSlotResource {
+            track_id: &slot.track_id,
+            action: match &slot.action {
+                LoadedSceneSlotAction::Play { clip_id } => SceneSlotAction::Play { clip_id },
+                LoadedSceneSlotAction::Stop => SceneSlotAction::Stop,
+            },
+        }));
+        output.push(slots);
+    }
+    Ok(output)
+}
+
+fn build_scene_resources<'input, 'project>(
+    scenes: &'project [LoadedScene],
+    slots: &'input [Vec<SceneSlotResource<'project>>],
+) -> Result<Vec<SceneResource<'input, 'project>>, AdapterCompileError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(scenes.len())
+        .map_err(|_| AdapterCompileError::CapacityUnavailable)?;
+    for (index, scene) in scenes.iter().enumerate() {
+        output.push(SceneResource {
+            id: &scene.id,
+            enabled: scene.enabled,
+            order: scene.order,
+            launch_quantization: scene.launch_quantization,
+            slots: &slots[index],
+        });
+    }
+    Ok(output)
+}
+
+fn build_scene_launch_resources(
+    arrangement: Option<&LoadedArrangement>,
+) -> Result<Vec<SceneLaunchResource<'_>>, AdapterCompileError> {
+    let launches = arrangement.map_or(&[][..], |value| value.scene_launches.as_slice());
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(launches.len())
+        .map_err(|_| AdapterCompileError::CapacityUnavailable)?;
+    output.extend(launches.iter().map(|launch| SceneLaunchResource {
+        id: &launch.id,
+        tick: launch.tick,
+        scene_id: &launch.scene_id,
+    }));
+    Ok(output)
+}
+
+fn compile_scene_audio_bindings<'project>(
+    project: &'project LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    timeline: Timeline<'_>,
+    authority: &CompiledScenePerformance<'project>,
+) -> Result<Vec<CompiledSceneAudioBinding<'project>>, AdapterCompileError> {
+    let binding_count = authority.playing_clips().count();
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(binding_count)
+        .map_err(|_| AdapterCompileError::CapacityUnavailable)?;
+    for (binding_index, (track_id, playing)) in authority.playing_clips().enumerate() {
+        let clip = project
+            .clips
+            .iter()
+            .find(|clip| clip.id == playing.clip_id())
+            .ok_or(AdapterCompileError::InconsistentCompiledGraph)?;
+        let asset = assets
+            .iter()
+            .find(|asset| asset.id == clip.asset_id)
+            .ok_or(AdapterCompileError::InconsistentCompiledGraph)?;
+        let compiled = compile_scene_audio_clip(
+            timeline,
+            ClipCompileSpec {
+                enabled: playing.enabled(),
+                duration_ticks: clip.duration_ticks,
+                source_start_frame: clip.source_start_frame,
+                source_frame_count: clip.source_frame_count,
+                asset_frame_count: asset.frame_count,
+                source_sample_rate_hz: asset.sample_rate_hz,
+                loop_enabled: clip.loop_enabled,
+                loop_range: clip.loop_range,
+                reverse: clip.reverse,
+                gain_decibels: clip.gain_decibels,
+                transpose_cents: clip.transpose_cents,
+                fade_in_ticks: clip.fade_in_ticks,
+                fade_out_ticks: clip.fade_out_ticks,
+                warp_markers: &clip.warp_markers,
+            },
+            playing.started_at_tick(),
+        )
+        .map_err(|error| AdapterCompileError::SceneAudio {
+            binding_index,
+            error,
+        })?;
+        output.push(CompiledSceneAudioBinding {
+            track_id,
+            launch_id: playing.launch_id(),
+            scene_id: playing.scene_id(),
+            clip_id: playing.clip_id(),
+            asset_id: &clip.asset_id,
+            compiled,
+        });
+    }
     Ok(output)
 }
 
@@ -2206,6 +2662,37 @@ struct WarpMarkerDocument {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SceneDocument {
+    format: String,
+    format_version: u32,
+    id: String,
+    project_id: String,
+    #[serde(rename = "name")]
+    _name: String,
+    order: u8,
+    enabled: bool,
+    launch_quantization: SceneQuantizationDocument,
+    slots: Vec<SceneSlotDocument>,
+    #[serde(rename = "extensions")]
+    _extensions: IgnoredAny,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
+enum SceneQuantizationDocument {
+    Immediate,
+    Grid { quantum_ticks: u64 },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
+enum SceneSlotDocument {
+    Play { track_id: String, clip_id: String },
+    Stop { track_id: String },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ArrangementDocument {
     format: String,
     format_version: u32,
@@ -2237,8 +2724,7 @@ struct PlacementDocument {
 struct SceneLaunchDocument {
     id: String,
     tick: u64,
-    #[serde(rename = "scene_id")]
-    _scene_id: String,
+    scene_id: String,
 }
 
 #[derive(Deserialize)]
@@ -2399,6 +2885,13 @@ mod tests {
         }],
         "scene_launches":[],"extensions":{}
     }"#;
+    const SCENE: &[u8] = br#"{
+        "format":"hyper-scene","format_version":1,"id":"scene",
+        "project_id":"project","name":"Verse","order":0,"enabled":true,
+        "launch_quantization":{"mode":"immediate"},
+        "slots":[{"track_id":"track","action":"play","clip_id":"clip"}],
+        "extensions":{}
+    }"#;
     const MIXER: &[u8] = br#"{
         "format":"hyper-mixer","format_version":1,"id":"mixer",
         "project_id":"project",
@@ -2425,6 +2918,25 @@ mod tests {
             timeline,
             tracks,
             clips,
+            scenes: &[],
+            arrangement,
+        }
+    }
+
+    fn input_with_scenes<'a>(
+        timeline: &'a [u8],
+        tracks: &'a [&'a [u8]],
+        clips: &'a [&'a [u8]],
+        scenes: &'a [&'a [u8]],
+        arrangement: Option<&'a [u8]>,
+    ) -> PlaybackJsonInput<'a> {
+        PlaybackJsonInput {
+            project_id: PROJECT_ID,
+            sample_rate_hz: 48_000,
+            timeline,
+            tracks,
+            clips,
+            scenes,
             arrangement,
         }
     }
@@ -2996,7 +3508,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_limits_hierarchy_and_scene_authority() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction covers legacy rejection, atomic publication, strict parsing, and authority conflicts"
+    )]
+    fn enforces_limits_hierarchy_and_publishes_scene_authority_atomically() {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];
         let mut limits = LoaderLimits::VERSION_1;
@@ -3034,11 +3550,13 @@ mod tests {
             "scene_launches":[{"id":"launch","tick":0,"scene_id":"scene"}],
             "extensions":{}
         }"#;
+        let scenes: [&[u8]; 1] = [SCENE];
         let loaded = load(
-            input(TIMELINE, &tracks, &clips, Some(scene_arrangement)),
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(scene_arrangement)),
             LoaderLimits::VERSION_1,
         )
         .unwrap();
+        assert_eq!(loaded.scene_count(), 1);
         assert!(matches!(
             loaded.compile(
                 &[MediaAssetFact {
@@ -3051,6 +3569,131 @@ mod tests {
             Err(AdapterCompileError::Graph(
                 GraphError::UnsupportedSceneLaunches
             ))
+        ));
+        let graph = loaded
+            .compile_playback(
+                &[MediaAssetFact {
+                    id: "asset",
+                    sample_rate_hz: 48_000,
+                    frame_count: 100,
+                }],
+                GraphLimits::VERSION_1,
+                SceneLimits::VERSION_1,
+            )
+            .unwrap();
+        assert!(graph.arrangement().entries().is_empty());
+        assert_eq!(graph.scene_authority().track_count(), 1);
+        assert_eq!(graph.scene_audio().len(), 1);
+        assert_eq!(graph.scene_audio()[0].launch_id, "launch");
+        assert_eq!(graph.scene_audio()[0].compiled.launch_frame(), 0);
+
+        let malformed_scene = String::from_utf8(SCENE.to_vec()).unwrap().replace(
+            "\"action\":\"play\",\"clip_id\":\"clip\"",
+            "\"action\":\"stop\",\"clip_id\":\"clip\"",
+        );
+        let malformed_scenes: [&[u8]; 1] = [malformed_scene.as_bytes()];
+        assert!(matches!(
+            load(
+                input_with_scenes(
+                    TIMELINE,
+                    &tracks,
+                    &clips,
+                    &malformed_scenes,
+                    Some(scene_arrangement),
+                ),
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap_err()
+            .kind,
+            LoadErrorKind::Json {
+                rejection: JsonRejection::TypedDocumentMismatch,
+                ..
+            }
+        ));
+
+        let mixed_arrangement = br#"{
+            "format":"hyper-arrangement","format_version":1,"id":"arrangement",
+            "project_id":"project","name":"Main","enabled":true,
+            "placements":[{
+                "id":"placement","track_id":"track","clip_id":"clip",
+                "start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true
+            }],
+            "scene_launches":[{"id":"launch","tick":4,"scene_id":"scene"}],
+            "extensions":{}
+        }"#;
+        let mixed = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(mixed_arrangement)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            mixed.compile_playback(
+                &[MediaAssetFact {
+                    id: "asset",
+                    sample_rate_hz: 48_000,
+                    frame_count: 100,
+                }],
+                GraphLimits::VERSION_1,
+                SceneLimits::VERSION_1,
+            ),
+            Err(AdapterCompileError::MixedTrackAuthority { placement_index: 0 })
+        ));
+    }
+
+    #[test]
+    fn combined_scene_graph_rejects_quantization_and_audio_consolidation_atomically() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let off_grid_scene = String::from_utf8(SCENE.to_vec()).unwrap().replace(
+            "\"launch_quantization\":{\"mode\":\"immediate\"}",
+            "\"launch_quantization\":{\"mode\":\"grid\",\"quantum_ticks\":2}",
+        );
+        let scenes: [&[u8]; 1] = [off_grid_scene.as_bytes()];
+        let arrangement = br#"{
+            "format":"hyper-arrangement","format_version":1,"id":"arrangement",
+            "project_id":"project","name":"Main","enabled":true,"placements":[],
+            "scene_launches":[{"id":"launch","tick":1,"scene_id":"scene"}],
+            "extensions":{}
+        }"#;
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(arrangement)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let facts = [MediaAssetFact {
+            id: "asset",
+            sample_rate_hz: 48_000,
+            frame_count: 100,
+        }];
+        assert!(matches!(
+            loaded.compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1,),
+            Err(AdapterCompileError::Scene(
+                SceneCompileError::LaunchOffGrid { launch_index: 0 }
+            ))
+        ));
+
+        let transposed_clip = String::from_utf8(CLIP.to_vec())
+            .unwrap()
+            .replace("\"transpose_cents\":0", "\"transpose_cents\":100");
+        let transposed_clips: [&[u8]; 1] = [transposed_clip.as_bytes()];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let loaded = load(
+            input_with_scenes(
+                TIMELINE,
+                &tracks,
+                &transposed_clips,
+                &scenes,
+                Some(arrangement),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            loaded.compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1,),
+            Err(AdapterCompileError::SceneAudio {
+                binding_index: 0,
+                error: CompileError::ConsolidationRequired(_),
+            })
         ));
     }
 

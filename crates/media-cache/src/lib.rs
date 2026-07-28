@@ -9,7 +9,7 @@ use hyper_audio_source::DecodedAudio;
 use hyper_clip_engine::{ClipOutput, ClipPlacement, ClipPlanError, ClipRenderPlan};
 use hyper_playback_compiler::scene::{CompiledScenePerformance, PlayingSceneClip};
 use hyper_playback_compiler::{CompiledSceneAudioClip, PrepareError};
-use hyper_playback_json::{OwnedCompiledSchedule, OwnedScheduleEntry};
+use hyper_playback_json::{CompiledPlaybackGraph, OwnedCompiledSchedule, OwnedScheduleEntry};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheLimits {
@@ -297,11 +297,11 @@ impl DecodedMediaCache {
     ///
     /// Returns [`PrepareSceneAudioError`] for mismatched authority, duplicate
     /// bindings, missing media, or invalid compiled clip data.
-    pub fn prepare_scene_audio<'cache, 'binding>(
+    pub fn prepare_scene_audio<'cache, 'resource>(
         &'cache self,
         authority: &CompiledScenePerformance<'_>,
-        bindings: &'binding [SceneAudioBinding<'binding>],
-    ) -> Result<PreparedSceneAudio<'cache, 'binding>, PrepareSceneAudioError> {
+        bindings: &[SceneAudioBinding<'resource>],
+    ) -> Result<PreparedSceneAudio<'cache, 'resource>, PrepareSceneAudioError> {
         let play_count = authority.playing_clips().count();
         if bindings.len() != play_count {
             return Err(PrepareSceneAudioError::BindingCountMismatch {
@@ -338,12 +338,37 @@ impl DecodedMediaCache {
                 }
             })?;
             entries.push(PreparedSceneAudioEntry {
-                binding,
+                binding: *binding,
                 plan,
                 placement,
             });
         }
         Ok(PreparedSceneAudio { entries })
+    }
+
+    /// Atomically binds every scene play action in a compiled playback graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrepareSceneAudioError`] for capacity, authority, media, or
+    /// decoded-source mismatches.
+    pub fn prepare_playback_scenes<'cache, 'project>(
+        &'cache self,
+        graph: &CompiledPlaybackGraph<'project>,
+    ) -> Result<PreparedSceneAudio<'cache, 'project>, PrepareSceneAudioError> {
+        let mut bindings = Vec::new();
+        bindings
+            .try_reserve_exact(graph.scene_audio().len())
+            .map_err(|_| PrepareSceneAudioError::CapacityUnavailable)?;
+        bindings.extend(graph.scene_audio().iter().map(|entry| SceneAudioBinding {
+            track_id: entry.track_id,
+            launch_id: entry.launch_id,
+            scene_id: entry.scene_id,
+            clip_id: entry.clip_id,
+            asset_id: entry.asset_id,
+            compiled: entry.compiled,
+        }));
+        self.prepare_scene_audio(graph.scene_authority(), &bindings)
     }
 }
 
@@ -478,7 +503,7 @@ impl<'cache, 'binding> PreparedSceneAudio<'cache, 'binding> {
 
 #[derive(Debug)]
 pub struct PreparedSceneAudioEntry<'cache, 'binding> {
-    binding: &'binding SceneAudioBinding<'binding>,
+    binding: SceneAudioBinding<'binding>,
     plan: ClipRenderPlan<'cache>,
     placement: ClipPlacement,
 }
@@ -486,7 +511,7 @@ pub struct PreparedSceneAudioEntry<'cache, 'binding> {
 impl PreparedSceneAudioEntry<'_, '_> {
     #[must_use]
     pub const fn binding(&self) -> &SceneAudioBinding<'_> {
-        self.binding
+        &self.binding
     }
 
     #[must_use]
