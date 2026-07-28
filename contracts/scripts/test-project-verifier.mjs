@@ -5,6 +5,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   symlink,
   unlink,
@@ -15,6 +16,7 @@ import { tmpdir } from "node:os";
 
 import canonicalize from "canonicalize";
 
+import { verifyDescribedFile } from "./verify-bundle.mjs";
 import { verifyProject } from "./verify-project.mjs";
 
 // MIT-licensed reference fixture from music-metadata 11.14.0:
@@ -788,6 +790,25 @@ try {
   const sample = await readFile(samplePath);
   await writeFile(samplePath, Buffer.alloc(sample.length, 0x78));
   await assert.rejects(verifyProject(modified), /SHA-256 mismatch/);
+
+  const capturedBytesRoot = join(temporaryRoot, "captured-resource-bytes");
+  await mkdir(capturedBytesRoot);
+  const originalBytes = Buffer.from('{"value":"original"}');
+  const replacementBytes = Buffer.from('{"value":"replaced"}');
+  const capturedPath = join(capturedBytesRoot, "resource.json");
+  await writeFile(capturedPath, originalBytes);
+  const captured = await verifyDescribedFile(
+    capturedBytesRoot,
+    await realpath(capturedBytesRoot),
+    {
+      path: "resource.json",
+      byte_length: originalBytes.length,
+      sha256: createHash("sha256").update(originalBytes).digest("hex"),
+    },
+    { captureBytes: true },
+  );
+  await writeFile(capturedPath, replacementBytes);
+  assert.deepEqual(captured, originalBytes);
 
   const undeclared = join(temporaryRoot, "undeclared");
   await cp(valid, undeclared, { recursive: true });

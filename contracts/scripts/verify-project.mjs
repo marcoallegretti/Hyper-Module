@@ -242,10 +242,6 @@ export async function verifyProject(
     "managed project files do not exactly match project.json",
   );
 
-  for (const record of records) {
-    await verifyDescribedFile(rootPath, rootRealPath, record);
-  }
-
   const resources = new Map();
   for (const record of project.resources) {
     const validator = validators[record.role];
@@ -253,7 +249,10 @@ export async function verifyProject(
       validator,
       `${record.path}: resource role ${record.role} has no published payload schema`,
     );
-    const bytes = await readFile(resolve(rootPath, ...record.path.split("/")));
+    const bytes = await verifyDescribedFile(rootPath, rootRealPath, record, {
+      captureBytes: true,
+    });
+    assert(bytes, `${record.path}: verified resource bytes are unavailable`);
     assert(
       bytes.length <= manifestLimitBytes,
       `${record.path}: resource exceeds ${manifestLimitBytes} bytes`,
@@ -309,6 +308,10 @@ export async function verifyProject(
       assertAutomationTakeInvariants(resource);
     }
     resources.set(resource.id, resource);
+  }
+
+  for (const record of project.assets) {
+    await verifyDescribedFile(rootPath, rootRealPath, record);
   }
 
   const tracks = project.resources

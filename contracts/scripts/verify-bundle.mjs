@@ -92,7 +92,12 @@ export async function collectRegularFiles(rootPath) {
   return files;
 }
 
-export async function verifyDescribedFile(rootPath, rootRealPath, descriptor) {
+export async function verifyDescribedFile(
+  rootPath,
+  rootRealPath,
+  descriptor,
+  { captureBytes = false } = {},
+) {
   const absolutePath = resolve(rootPath, ...descriptor.path.split("/"));
   const relativePath = relative(rootPath, absolutePath);
   assert(
@@ -132,10 +137,12 @@ export async function verifyDescribedFile(rootPath, rootRealPath, descriptor) {
   let before;
   let after;
   const digest = createHash("sha256");
+  const chunks = captureBytes ? [] : null;
   try {
     before = await handle.stat();
     for await (const chunk of handle.createReadStream({ autoClose: false })) {
       digest.update(chunk);
+      chunks?.push(chunk);
     }
     after = await handle.stat();
   } finally {
@@ -191,6 +198,8 @@ export async function verifyDescribedFile(rootPath, rootRealPath, descriptor) {
     after.mtimeMs,
     `${descriptor.path}: payload path changed during verification`,
   );
+
+  return captureBytes ? Buffer.concat(chunks, after.size) : null;
 }
 
 export async function verifyBundle(bundlePath) {
