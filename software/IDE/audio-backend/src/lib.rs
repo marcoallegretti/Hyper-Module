@@ -354,6 +354,18 @@ pub use pipewire_output::{
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
+mod playback_checkpoint;
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+pub use playback_checkpoint::{
+    PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot, PlaybackRecoveryTransportState,
+};
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
 mod playback_session;
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),

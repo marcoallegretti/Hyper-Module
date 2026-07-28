@@ -1,6 +1,6 @@
 use super::{
     InterleavedStereoProcessor, OutputCallback, OutputStreamCounters, OutputStreamState,
-    OutputStreamStatus, STEREO_CHANNELS,
+    OutputStreamStatus, PlaybackRecoveryCheckpoint, STEREO_CHANNELS,
 };
 use core::error::Error;
 use core::fmt;
@@ -293,6 +293,25 @@ impl WasapiThreadRunner {
             processor.maximum_block_frames(),
         )?;
         self.run(move |output: &mut [f32]| processor.process(output).map(|_| ()))
+    }
+
+    pub(crate) fn run_transport_output_with_checkpoint<R>(
+        self,
+        mut processor: TransportOutputProcessor<'_, '_, R>,
+        checkpoint: PlaybackRecoveryCheckpoint,
+    ) -> Result<(), WasapiStartError>
+    where
+        R: TrackWindowRenderer,
+    {
+        validate_transport_capacity(
+            self.config.maximum_block_frames,
+            processor.maximum_block_frames(),
+        )?;
+        self.run(move |output: &mut [f32]| {
+            processor.process(output).map(|rendered| {
+                checkpoint.publish_cycle(rendered.snapshot().cycle());
+            })
+        })
     }
 
     #[must_use]

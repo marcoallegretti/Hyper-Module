@@ -1,4 +1,4 @@
-use super::{OutputStreamCounters, OutputStreamStatus};
+use super::{OutputStreamCounters, OutputStreamStatus, PlaybackRecoveryCheckpoint};
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::{
     PipeWireOutputConfig, PipeWireOutputStream, PipeWireStartError, PipeWireStartupStage,
@@ -132,6 +132,7 @@ impl Error for DesktopPlaybackSessionStartError {
 struct SessionHandles {
     commands: TransportCommandSender,
     meters: OutputMeterReceiver,
+    recovery: PlaybackRecoveryCheckpoint,
 }
 
 #[derive(Debug)]
@@ -146,6 +147,7 @@ pub struct DesktopPlaybackSession {
     output: DesktopOutputStream,
     commands: TransportCommandSender,
     meters: OutputMeterReceiver,
+    recovery: PlaybackRecoveryCheckpoint,
 }
 
 impl DesktopPlaybackSession {
@@ -181,6 +183,7 @@ impl DesktopPlaybackSession {
                     output,
                     commands: handles.commands,
                     meters: handles.meters,
+                    recovery: handles.recovery,
                 }),
                 Ok(SessionPublication::Failed(source)) => {
                     Err(DesktopPlaybackSessionStartError::Build(source))
@@ -214,6 +217,12 @@ impl DesktopPlaybackSession {
         self.output.status()
     }
 
+    /// Returns an observer for the last successfully committed transport cycle.
+    #[must_use]
+    pub fn recovery_checkpoint(&self) -> PlaybackRecoveryCheckpoint {
+        self.recovery.clone()
+    }
+
     #[cfg(target_os = "windows")]
     /// Returns the asynchronous Windows session-disconnect reason, if
     /// available. Generic runtime failures have no disconnect reason.
@@ -232,6 +241,7 @@ impl DesktopPlaybackSession {
             output,
             commands: _,
             meters: _,
+            recovery: _,
         } = self;
         output.stop()
     }
@@ -316,13 +326,15 @@ fn initialize_session(
         TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender)
             .map_err(DesktopPlaybackSessionBuildError::Output)
             .or_else(|source| fail_build(publication, source))?;
+    let recovery = PlaybackRecoveryCheckpoint::default();
     publication
         .try_send(SessionPublication::Prepared(SessionHandles {
             commands,
             meters,
+            recovery: recovery.clone(),
         }))
         .map_err(|_| callback_error("playback control publication failed".to_owned()))?;
-    runner.run_transport_output(processor)
+    runner.run_transport_output_with_checkpoint(processor, recovery)
 }
 
 fn allocate_scratch_planes(

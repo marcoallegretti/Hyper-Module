@@ -256,6 +256,18 @@ impl TransportCycle {
         self.start_frame
     }
 
+    /// Returns the committed transport position after this successful cycle.
+    #[must_use]
+    pub const fn position_frame(self) -> usize {
+        match self.state {
+            TransportState::Stopped => self.start_frame,
+            TransportState::Rolling => match self.start_frame.checked_add(self.frame_count) {
+                Some(position_frame) => position_frame,
+                None => unreachable!(),
+            },
+        }
+    }
+
     #[must_use]
     pub const fn frame_count(self) -> usize {
         self.frame_count

@@ -614,6 +614,7 @@ fn transport_owns_stopped_rolling_and_located_callback_windows() {
     let stopped = process_transport(&mut transport, &mut left, &mut right).unwrap();
     assert_eq!(stopped.state(), TransportState::Stopped);
     assert_eq!(stopped.start_frame(), 0);
+    assert_eq!(stopped.position_frame(), 0);
     assert_eq!(stopped.frame_count(), 8);
     assert_eq!(stopped.active_slot_count(), 0);
     assert_eq!(transport.position_frame(), 0);
@@ -631,17 +632,20 @@ fn transport_owns_stopped_rolling_and_located_callback_windows() {
     let empty_rolling =
         process_transport(&mut transport, &mut empty_left, &mut empty_right).unwrap();
     assert_eq!(empty_rolling.state(), TransportState::Rolling);
+    assert_eq!(empty_rolling.position_frame(), 0);
     assert_eq!(transport.position_frame(), 0);
 
     let rolling = process_transport(&mut transport, &mut left, &mut right).unwrap();
     assert_eq!(rolling.state(), TransportState::Rolling);
     assert_eq!(rolling.start_frame(), 0);
+    assert_eq!(rolling.position_frame(), 8);
     assert_eq!(rolling.active_slot_count(), 2);
     assert_eq!(transport.position_frame(), 8);
     assert!(left[7] > 0.0);
 
     let consecutive = process_transport(&mut transport, &mut left, &mut right).unwrap();
     assert_eq!(consecutive.start_frame(), 8);
+    assert_eq!(consecutive.position_frame(), 16);
     assert_eq!(transport.position_frame(), 16);
 
     transport.apply_command(TransportCommand::Stop);
@@ -668,6 +672,7 @@ fn transport_owns_stopped_rolling_and_located_callback_windows() {
     let mut seek_right = [9.0_f32; 1];
     let sought = process_transport(&mut transport, &mut seek_left, &mut seek_right).unwrap();
     assert_eq!(sought.start_frame(), 25);
+    assert_eq!(sought.position_frame(), 26);
     assert_eq!(transport.position_frame(), 26);
     assert!((seek_left[0] - 0.223_861_44).abs() <= f32::EPSILON);
     assert!((seek_right[0] - 0.176_986_44).abs() <= f32::EPSILON);
