@@ -102,6 +102,23 @@ impl PreparedPlaybackSession {
     }
 
     #[must_use]
+    pub fn parts(
+        &self,
+    ) -> (
+        &LoadedPlaybackProject,
+        &CompiledMixerGraph,
+        Option<&CompiledAutomation>,
+        &DecodedMediaCache,
+    ) {
+        (
+            &self.project,
+            &self.mixer,
+            self.automation.as_ref(),
+            &self.media,
+        )
+    }
+
+    #[must_use]
     pub fn into_parts(
         self,
     ) -> (
@@ -441,6 +458,13 @@ mod tests {
         assert_eq!(session.sample_rate_hz(), 48_000);
         assert_eq!(session.media_asset_count(), 1);
         assert!(session.has_automation());
+        let (project, mixer, automation, media) = session.parts();
+        assert_eq!(project.project_id(), mixer.project_id());
+        assert_eq!(
+            automation.map(CompiledAutomation::project_id),
+            Some(project.project_id())
+        );
+        assert!(media.contains("asset"));
         let (project, mixer, automation, media) = session.into_parts();
         assert_eq!(project.project_id(), mixer.project_id());
         assert_eq!(

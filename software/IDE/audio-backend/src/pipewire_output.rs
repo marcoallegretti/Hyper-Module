@@ -467,8 +467,12 @@ fn run_pipewire_inner(
         *pw::keys::NODE_LATENCY => latency,
         *pw::keys::AUDIO_CHANNELS => "2",
     };
+    let target_is_pinned = config.target.is_some();
     if let Some(target) = config.target {
         stream_properties.insert("target.object", target);
+        stream_properties.insert("node.dont-fallback", "true");
+        stream_properties.insert("node.dont-move", "true");
+        stream_properties.insert("node.dont-reconnect", "true");
     }
     let stream = pw::stream::StreamBox::new(&core, "hyper-module-output", stream_properties)
         .map_err(|source| backend_error(PipeWireStartupStage::Stream, source))?;
@@ -525,13 +529,17 @@ fn run_pipewire_inner(
         stage: PipeWireStartupStage::Format,
         detail: "serialized format is not a valid SPA pod".to_owned(),
     })?;
+    let mut stream_flags = pw::stream::StreamFlags::AUTOCONNECT
+        | pw::stream::StreamFlags::MAP_BUFFERS
+        | pw::stream::StreamFlags::RT_PROCESS;
+    if target_is_pinned {
+        stream_flags |= pw::stream::StreamFlags::DONT_RECONNECT;
+    }
     stream
         .connect(
             spa::utils::Direction::Output,
             None,
-            pw::stream::StreamFlags::AUTOCONNECT
-                | pw::stream::StreamFlags::MAP_BUFFERS
-                | pw::stream::StreamFlags::RT_PROCESS,
+            stream_flags,
             &mut [pod],
         )
         .map_err(|source| backend_error(PipeWireStartupStage::Connect, source))?;

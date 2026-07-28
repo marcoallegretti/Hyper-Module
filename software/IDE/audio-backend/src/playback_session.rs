@@ -1,4 +1,6 @@
-use super::{OutputStreamCounters, OutputStreamStatus, PlaybackRecoveryCheckpoint};
+use super::{
+    OutputStreamCounters, OutputStreamStatus, PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
+};
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::{
     PipeWireOutputConfig, PipeWireOutputStream, PipeWireStartError, PipeWireStartupStage,
@@ -22,6 +24,7 @@ use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
 use hyper_playback_json::{AdapterCompileError, MediaAssetFact};
 use hyper_playback_session::PreparedPlaybackSession;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 
 pub type DesktopPlaybackSessionInput = PreparedPlaybackSession;
@@ -148,6 +151,128 @@ pub struct DesktopPlaybackSession {
     commands: TransportCommandSender,
     meters: OutputMeterReceiver,
     recovery: PlaybackRecoveryCheckpoint,
+    config: DesktopOutputConfig,
+    source: Arc<DesktopPlaybackSessionInput>,
+}
+
+/// Restart authority retained after a desktop output has been fully torn down.
+///
+/// Decoded media remains shared and immutable. Each restart rebuilds only the
+/// compiled callback/runtime state and restores the final committed checkpoint
+/// before the replacement stream is published.
+#[derive(Debug)]
+pub struct DesktopPlaybackRecovery {
+    config: DesktopOutputConfig,
+    source: Option<Arc<DesktopPlaybackSessionInput>>,
+    checkpoint: PlaybackRecoverySnapshot,
+}
+
+#[derive(Debug)]
+pub struct DesktopPlaybackRecoveryStopError {
+    source: DesktopOutputStopError,
+    recovery: DesktopPlaybackRecovery,
+}
+
+impl DesktopPlaybackRecoveryStopError {
+    #[must_use]
+    pub const fn recovery(&self) -> &DesktopPlaybackRecovery {
+        &self.recovery
+    }
+
+    #[must_use]
+    pub fn into_recovery(self) -> DesktopPlaybackRecovery {
+        self.recovery
+    }
+}
+
+impl fmt::Display for DesktopPlaybackRecoveryStopError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl Error for DesktopPlaybackRecoveryStopError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[derive(Debug)]
+pub enum DesktopPlaybackRecoveryStartError {
+    OutputNotPinned,
+    AlreadyRestarted,
+    Start(DesktopPlaybackSessionStartError),
+}
+
+impl fmt::Display for DesktopPlaybackRecoveryStartError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutputNotPinned => {
+                formatter.write_str("desktop output recovery requires an explicitly pinned target")
+            }
+            Self::AlreadyRestarted => {
+                formatter.write_str("desktop playback recovery was already restarted")
+            }
+            Self::Start(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for DesktopPlaybackRecoveryStartError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::OutputNotPinned | Self::AlreadyRestarted => None,
+            Self::Start(source) => Some(source),
+        }
+    }
+}
+
+impl DesktopPlaybackRecovery {
+    #[must_use]
+    pub const fn checkpoint(&self) -> PlaybackRecoverySnapshot {
+        self.checkpoint
+    }
+
+    /// Rebuilds playback against the same explicitly selected output.
+    ///
+    /// A failed attempt retains restart authority for another try. A successful
+    /// attempt consumes it so the same recovery cannot create parallel outputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DesktopPlaybackRecoveryStartError::OutputNotPinned`] when the
+    /// original stream used the system policy default,
+    /// [`DesktopPlaybackRecoveryStartError::AlreadyRestarted`] after a prior
+    /// success, or wraps any replacement session startup failure.
+    pub fn restart(&mut self) -> Result<DesktopPlaybackSession, DesktopPlaybackRecoveryStartError> {
+        self.restart_with_output(self.config.clone())
+    }
+
+    /// Rebuilds playback against an explicitly selected replacement output.
+    ///
+    /// This is the only recovery path for a session originally opened against
+    /// the system policy default.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::restart`].
+    pub fn restart_with_output(
+        &mut self,
+        config: DesktopOutputConfig,
+    ) -> Result<DesktopPlaybackSession, DesktopPlaybackRecoveryStartError> {
+        if !output_is_pinned(&config) {
+            return Err(DesktopPlaybackRecoveryStartError::OutputNotPinned);
+        }
+        let source = self
+            .source
+            .as_ref()
+            .ok_or(DesktopPlaybackRecoveryStartError::AlreadyRestarted)?;
+        let session =
+            DesktopPlaybackSession::start_retained(config, source.clone(), Some(self.checkpoint))
+                .map_err(DesktopPlaybackRecoveryStartError::Start)?;
+        self.source = None;
+        Ok(session)
+    }
 }
 
 impl DesktopPlaybackSession {
@@ -164,18 +289,29 @@ impl DesktopPlaybackSession {
         config: DesktopOutputConfig,
         input: DesktopPlaybackSessionInput,
     ) -> Result<Self, DesktopPlaybackSessionStartError> {
+        Self::start_retained(config, Arc::new(input), None)
+    }
+
+    fn start_retained(
+        config: DesktopOutputConfig,
+        source: Arc<DesktopPlaybackSessionInput>,
+        initial_checkpoint: Option<PlaybackRecoverySnapshot>,
+    ) -> Result<Self, DesktopPlaybackSessionStartError> {
         let sample_rate_hz = config.sample_rate_hz();
         let maximum_block_frames = config.maximum_block_frames();
         let (publication_sender, publication_receiver) = sync_channel(1);
-        let output = DesktopOutputStream::start_with_thread_initializer(config, move |runner| {
-            initialize_session(
-                runner,
-                input,
-                sample_rate_hz,
-                maximum_block_frames,
-                &publication_sender,
-            )
-        });
+        let thread_source = source.clone();
+        let output =
+            DesktopOutputStream::start_with_thread_initializer(config.clone(), move |runner| {
+                initialize_session(
+                    runner,
+                    &thread_source,
+                    sample_rate_hz,
+                    maximum_block_frames,
+                    initial_checkpoint,
+                    &publication_sender,
+                )
+            });
 
         match output {
             Ok(output) => match publication_receiver.recv() {
@@ -184,6 +320,8 @@ impl DesktopPlaybackSession {
                     commands: handles.commands,
                     meters: handles.meters,
                     recovery: handles.recovery,
+                    config,
+                    source,
                 }),
                 Ok(SessionPublication::Failed(source)) => {
                     Err(DesktopPlaybackSessionStartError::Build(source))
@@ -223,6 +361,36 @@ impl DesktopPlaybackSession {
         self.recovery.clone()
     }
 
+    /// Stops the current backend and captures its final committed transport
+    /// state together with the immutable source required for a restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns a shutdown error that still owns the recovery authority if the
+    /// backend thread panicked.
+    pub fn into_recovery(
+        self,
+    ) -> Result<DesktopPlaybackRecovery, DesktopPlaybackRecoveryStopError> {
+        let Self {
+            output,
+            commands: _,
+            meters: _,
+            recovery,
+            config,
+            source,
+        } = self;
+        let stop_result = output.stop();
+        let recovery = DesktopPlaybackRecovery {
+            config,
+            source: Some(source),
+            checkpoint: recovery.snapshot(),
+        };
+        match stop_result {
+            Ok(()) => Ok(recovery),
+            Err(source) => Err(DesktopPlaybackRecoveryStopError { source, recovery }),
+        }
+    }
+
     #[cfg(target_os = "windows")]
     /// Returns the asynchronous Windows session-disconnect reason, if
     /// available. Generic runtime failures have no disconnect reason.
@@ -242,6 +410,8 @@ impl DesktopPlaybackSession {
             commands: _,
             meters: _,
             recovery: _,
+            config: _,
+            source: _,
         } = self;
         output.stop()
     }
@@ -259,12 +429,13 @@ fn failed_build(
 
 fn initialize_session(
     runner: DesktopThreadRunner,
-    input: DesktopPlaybackSessionInput,
+    input: &DesktopPlaybackSessionInput,
     sample_rate_hz: u32,
     maximum_block_frames: usize,
+    initial_checkpoint: Option<PlaybackRecoverySnapshot>,
     publication: &SyncSender<SessionPublication>,
 ) -> Result<(), DesktopOutputStartError> {
-    let (project, mixer, automation, media) = input.into_parts();
+    let (project, mixer, automation, media) = input.parts();
     if project.sample_rate_hz() != sample_rate_hz {
         return fail_build(
             publication,
@@ -293,12 +464,12 @@ fn initialize_session(
     let runtime = match automation {
         Some(automation) => RoutedMainRuntime::try_new_prepared_playback_automated(
             &prepared,
-            &mixer,
-            automation,
+            mixer,
+            automation.clone(),
             maximum_block_frames,
         ),
         None => {
-            RoutedMainRuntime::try_new_prepared_playback(&prepared, &mixer, maximum_block_frames)
+            RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, maximum_block_frames)
         }
     }
     .map_err(DesktopPlaybackSessionBuildError::Runtime)
@@ -321,12 +492,17 @@ fn initialize_session(
     );
 
     let (commands, mut transport) = RoutedTransportRuntime::with_command_queue(runtime);
+    if let Some(checkpoint) = initial_checkpoint {
+        transport.apply_command(checkpoint.restore_command());
+    }
     let (mut meter_sender, meters) = output_meter_channel();
     let processor =
         TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender)
             .map_err(DesktopPlaybackSessionBuildError::Output)
             .or_else(|source| fail_build(publication, source))?;
-    let recovery = PlaybackRecoveryCheckpoint::default();
+    let recovery = initial_checkpoint
+        .map(PlaybackRecoveryCheckpoint::from_snapshot)
+        .unwrap_or_default();
     publication
         .try_send(SessionPublication::Prepared(SessionHandles {
             commands,
@@ -335,6 +511,16 @@ fn initialize_session(
         }))
         .map_err(|_| callback_error("playback control publication failed".to_owned()))?;
     runner.run_transport_output_with_checkpoint(processor, recovery)
+}
+
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+fn output_is_pinned(config: &DesktopOutputConfig) -> bool {
+    config.target().is_some()
+}
+
+#[cfg(target_os = "windows")]
+fn output_is_pinned(config: &DesktopOutputConfig) -> bool {
+    config.device_id().is_some()
 }
 
 fn allocate_scratch_planes(
@@ -415,6 +601,28 @@ mod tests {
                 project: 44_100,
                 output: 48_000,
             })
+        ));
+    }
+
+    #[test]
+    fn recovery_rejects_policy_defaults_and_accepts_explicit_outputs() {
+        let policy_default = DesktopOutputConfig::try_new(48_000, 256).unwrap();
+        assert!(!output_is_pinned(&policy_default));
+
+        #[cfg(target_os = "windows")]
+        let pinned = policy_default.with_device_id("endpoint-id").unwrap();
+        #[cfg(all(target_os = "linux", target_endian = "little"))]
+        let pinned = policy_default.with_target("sink-name").unwrap();
+        assert!(output_is_pinned(&pinned));
+
+        let mut spent = DesktopPlaybackRecovery {
+            config: pinned,
+            source: None,
+            checkpoint: PlaybackRecoveryCheckpoint::default().snapshot(),
+        };
+        assert!(matches!(
+            spent.restart(),
+            Err(DesktopPlaybackRecoveryStartError::AlreadyRestarted)
         ));
     }
 }

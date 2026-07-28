@@ -1,6 +1,6 @@
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
-use hyper_mixer_runtime::{TransportCycle, TransportState};
+use hyper_mixer_runtime::{LocateState, TransportCommand, TransportCycle, TransportState};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +32,16 @@ impl PlaybackRecoverySnapshot {
     pub const fn committed_cycle_count(self) -> u64 {
         self.committed_cycle_count
     }
+
+    pub(crate) const fn restore_command(self) -> TransportCommand {
+        TransportCommand::Locate {
+            frame: self.position_frame,
+            state: match self.state {
+                PlaybackRecoveryTransportState::Stopped => LocateState::Stopped,
+                PlaybackRecoveryTransportState::Rolling => LocateState::Rolling,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -52,6 +62,16 @@ pub struct PlaybackRecoveryCheckpoint {
 }
 
 impl PlaybackRecoveryCheckpoint {
+    pub(crate) fn from_snapshot(snapshot: PlaybackRecoverySnapshot) -> Self {
+        Self {
+            inner: Arc::new(PlaybackRecoveryState {
+                sequence: AtomicU64::new(snapshot.committed_cycle_count * 2),
+                position_frame: AtomicUsize::new(snapshot.position_frame),
+                transport_state: AtomicU8::new(snapshot.state as u8),
+            }),
+        }
+    }
+
     /// Returns one coherent recovery snapshot.
     #[must_use]
     pub fn snapshot(&self) -> PlaybackRecoverySnapshot {
@@ -139,6 +159,13 @@ mod tests {
                 committed_cycle_count: 1,
             }
         );
+        assert_eq!(
+            checkpoint.snapshot().restore_command(),
+            TransportCommand::Locate {
+                frame: 256,
+                state: LocateState::Rolling,
+            }
+        );
         checkpoint.publish(PlaybackRecoveryTransportState::Stopped, 256);
         assert_eq!(
             checkpoint.snapshot(),
@@ -146,6 +173,13 @@ mod tests {
                 state: PlaybackRecoveryTransportState::Stopped,
                 position_frame: 256,
                 committed_cycle_count: 2,
+            }
+        );
+        assert_eq!(
+            checkpoint.snapshot().restore_command(),
+            TransportCommand::Locate {
+                frame: 256,
+                state: LocateState::Stopped,
             }
         );
     }
@@ -180,5 +214,25 @@ mod tests {
             assert_eq!(snapshot.state(), expected);
         }
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn checkpoint_can_resume_an_existing_publication_sequence() {
+        let checkpoint = PlaybackRecoveryCheckpoint::from_snapshot(PlaybackRecoverySnapshot {
+            state: PlaybackRecoveryTransportState::Rolling,
+            position_frame: 512,
+            committed_cycle_count: 7,
+        });
+
+        assert_eq!(
+            checkpoint.snapshot(),
+            PlaybackRecoverySnapshot {
+                state: PlaybackRecoveryTransportState::Rolling,
+                position_frame: 512,
+                committed_cycle_count: 7,
+            }
+        );
+        checkpoint.publish(PlaybackRecoveryTransportState::Rolling, 640);
+        assert_eq!(checkpoint.snapshot().committed_cycle_count(), 8);
     }
 }

@@ -372,7 +372,8 @@ mod playback_session;
     target_os = "windows"
 ))]
 pub use playback_session::{
-    DesktopOutputConfig, DesktopOutputStartError, DesktopOutputStopError, DesktopPlaybackSession,
+    DesktopOutputConfig, DesktopOutputStartError, DesktopOutputStopError, DesktopPlaybackRecovery,
+    DesktopPlaybackRecoveryStartError, DesktopPlaybackRecoveryStopError, DesktopPlaybackSession,
     DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
     DesktopPlaybackSessionStartError,
 };
