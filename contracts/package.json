@@ -5,7 +5,7 @@
   "description": "Conformance tests for Hyper Module data contracts",
   "type": "module",
   "scripts": {
-    "test": "node scripts/verify-contracts.mjs && node scripts/test-timeline.mjs && node scripts/test-audio-clip.mjs && node scripts/test-scene.mjs && node scripts/test-arrangement.mjs && node scripts/test-mixer.mjs && node scripts/test-control-mappings.mjs && node scripts/test-timing-simulator.mjs && node scripts/test-recording-metadata.mjs && node scripts/test-automation-take.mjs && node scripts/test-bundle-verifier.mjs && node scripts/test-bundle-builder.mjs && node scripts/test-project-bundle-builder.mjs && node scripts/test-project-roundtrip.mjs && node scripts/test-deployment-target.mjs && node scripts/test-deployment-authorization.mjs && node scripts/test-project-verifier.mjs",
+    "test": "node scripts/test-public-boundary.mjs && node scripts/verify-contracts.mjs && node scripts/test-timeline.mjs && node scripts/test-audio-clip.mjs && node scripts/test-scene.mjs && node scripts/test-arrangement.mjs && node scripts/test-mixer.mjs && node scripts/test-control-mappings.mjs && node scripts/test-timing-simulator.mjs && node scripts/test-recording-metadata.mjs && node scripts/test-automation-take.mjs && node scripts/test-bundle-verifier.mjs && node scripts/test-bundle-builder.mjs && node scripts/test-project-bundle-builder.mjs && node scripts/test-project-roundtrip.mjs && node scripts/test-deployment-target.mjs && node scripts/test-deployment-authorization.mjs && node scripts/test-project-verifier.mjs",
     "build:bundle": "node scripts/build-bundle.mjs",
     "build:project-bundle": "node scripts/build-project-bundle.mjs",
     "restore:project": "node scripts/restore-project.mjs",

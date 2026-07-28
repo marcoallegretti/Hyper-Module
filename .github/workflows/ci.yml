@@ -22,15 +22,10 @@ jobs:
           persist-credentials: false
 
       - name: Reject private paths
-        shell: bash
-        run: |
-          set -euo pipefail
-          pattern='(^|/)(int_docs|\.agents|\.codex|\.claude|\.cursor|\.gemini|\.mcp|\.ocr|llm|ai_workspace)(/|$)|(^|/)AGENTS\.md$|(^|/)(CLAUDE|CODEX|GEMINI)\.md$|^\.github/(commands/|copilot-instructions\.md$|instructions/|prompts/)'
-          tracked="$(git ls-files | grep -E "$pattern" || true)"
-          if [[ -n "$tracked" ]]; then
-            printf '%s\n' "private paths are tracked:" "$tracked" >&2
-            exit 1
-          fi
+        run: node contracts/scripts/check-public-boundary.mjs
+
+      - name: Test private-path policy
+        run: node contracts/scripts/test-public-boundary.mjs
 
   rust:
     name: Rust (${{ matrix.os }})
