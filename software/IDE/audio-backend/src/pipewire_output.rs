@@ -2,6 +2,7 @@ use super::{InterleavedStereoProcessor, OutputCallback, OutputStreamCounters, ST
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
+use hyper_mixer_runtime::{TrackWindowRenderer, TransportOutputProcessor};
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
@@ -243,6 +244,27 @@ impl PipeWireThreadRunner {
             detail: source.to_string(),
         })?;
         run_pipewire_inner(self.config, callback, self.stop_requested, &self.startup)
+    }
+
+    /// Runs one prepared transport output processor on this `PipeWire` thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipeWireStartError`] when the transport and stream callback
+    /// capacities differ or when backend startup or lifecycle fails. Transport
+    /// processing failures follow the stream's fail-silent counter policy.
+    pub fn run_transport_output<R>(
+        self,
+        mut processor: TransportOutputProcessor<'_, '_, R>,
+    ) -> Result<(), PipeWireStartError>
+    where
+        R: TrackWindowRenderer,
+    {
+        validate_transport_capacity(
+            self.config.maximum_block_frames,
+            processor.maximum_block_frames(),
+        )?;
+        self.run(move |output: &mut [f32]| processor.process(output).map(|_| ()))
     }
 
     /// Returns whether stream startup or shutdown cancellation was requested.
@@ -542,6 +564,21 @@ fn backend_error(stage: PipeWireStartupStage, source: impl fmt::Display) -> Pipe
     }
 }
 
+fn validate_transport_capacity(
+    pipewire_frames: usize,
+    transport_frames: usize,
+) -> Result<(), PipeWireStartError> {
+    if pipewire_frames != transport_frames {
+        return Err(PipeWireStartError::Backend {
+            stage: PipeWireStartupStage::Callback,
+            detail: format!(
+                "PipeWire capacity is {pipewire_frames} frames; transport capacity is {transport_frames}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,5 +648,18 @@ mod tests {
         });
 
         assert!(matches!(result, Err(PipeWireStartError::ThreadPanicked)));
+    }
+
+    #[test]
+    fn transport_and_pipewire_capacities_must_match() {
+        assert!(validate_transport_capacity(64, 64).is_ok());
+        assert!(matches!(
+            validate_transport_capacity(64, 128),
+            Err(PipeWireStartError::Backend {
+                stage: PipeWireStartupStage::Callback,
+                detail
+            }) if detail
+                == "PipeWire capacity is 64 frames; transport capacity is 128"
+        ));
     }
 }

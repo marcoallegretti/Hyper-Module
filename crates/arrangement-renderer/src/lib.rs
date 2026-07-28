@@ -309,6 +309,7 @@ impl<'prepared, 'cache, 'schedule> ArrangementRenderer<'prepared, 'cache, 'sched
 pub struct RenderScratchSlot<'a> {
     left: &'a mut [f32],
     right: &'a mut [f32],
+    active_frames: usize,
     entry_index: Option<usize>,
     channels: usize,
 }
@@ -316,9 +317,15 @@ pub struct RenderScratchSlot<'a> {
 impl<'a> RenderScratchSlot<'a> {
     #[must_use]
     pub const fn new(left: &'a mut [f32], right: &'a mut [f32]) -> Self {
+        let active_frames = if left.len() < right.len() {
+            left.len()
+        } else {
+            right.len()
+        };
         Self {
             left,
             right,
+            active_frames,
             entry_index: None,
             channels: 0,
         }
@@ -336,24 +343,38 @@ impl<'a> RenderScratchSlot<'a> {
 
     #[must_use]
     pub fn left(&self) -> &[f32] {
-        self.left
+        &self.left[..self.active_frames]
     }
 
     #[must_use]
     pub fn right(&self) -> &[f32] {
-        self.right
+        &self.right[..self.active_frames]
+    }
+
+    #[must_use]
+    pub const fn left_capacity_frames(&self) -> usize {
+        self.left.len()
+    }
+
+    #[must_use]
+    pub const fn right_capacity_frames(&self) -> usize {
+        self.right.len()
     }
 
     #[must_use]
     pub fn input_block(&self) -> InputBlock<'_> {
         if self.channels == 2 {
             InputBlock::Stereo {
-                left: &*self.left,
-                right: &*self.right,
+                left: &self.left[..self.active_frames],
+                right: &self.right[..self.active_frames],
             }
         } else {
-            InputBlock::Mono(&*self.left)
+            InputBlock::Mono(&self.left[..self.active_frames])
         }
+    }
+
+    fn activate(&mut self, frame_count: usize) {
+        self.active_frames = frame_count;
     }
 }
 
@@ -483,7 +504,7 @@ fn render_window(
         });
     }
     for (slot_index, slot) in scratch.iter().take(required).enumerate() {
-        if slot.left.len() != frame_count || slot.right.len() != frame_count {
+        if slot.left.len() < frame_count || slot.right.len() < frame_count {
             return Err(RenderWindowError::ScratchLengthMismatch {
                 slot: slot_index,
                 expected: frame_count,
@@ -491,6 +512,9 @@ fn render_window(
                 right: slot.right.len(),
             });
         }
+    }
+    for slot in scratch.iter_mut().take(required) {
+        slot.activate(frame_count);
     }
 
     for slot in scratch.iter_mut().take(required) {
@@ -580,7 +604,7 @@ fn render_track_window(
         });
     }
     for (slot_index, slot) in scratch.iter().enumerate() {
-        if slot.left.len() != frame_count || slot.right.len() != frame_count {
+        if slot.left.len() < frame_count || slot.right.len() < frame_count {
             return Err(RenderWindowError::ScratchLengthMismatch {
                 slot: slot_index,
                 expected: frame_count,
@@ -588,6 +612,9 @@ fn render_track_window(
                 right: slot.right.len(),
             });
         }
+    }
+    for slot in scratch.iter_mut() {
+        slot.activate(frame_count);
     }
 
     for (lane, slot) in renderer.lanes.iter().zip(scratch.iter_mut()) {
@@ -716,8 +743,8 @@ fn intersection(
 }
 
 fn clear_slot(slot: &mut RenderScratchSlot<'_>) {
-    slot.left.fill(0.0);
-    slot.right.fill(0.0);
+    slot.left[..slot.active_frames].fill(0.0);
+    slot.right[..slot.active_frames].fill(0.0);
     slot.entry_index = None;
     slot.channels = 0;
 }
@@ -1076,7 +1103,7 @@ impl Error for SceneRenderError {
 fn validate_scene_scratch(
     track_channels: &[usize],
     frame_count: usize,
-    scratch: &[RenderScratchSlot<'_>],
+    scratch: &mut [RenderScratchSlot<'_>],
 ) -> Result<(), SceneRenderError> {
     if frame_count > MAX_PROCESS_FRAMES {
         return Err(SceneRenderError::BlockTooLarge {
@@ -1091,7 +1118,7 @@ fn validate_scene_scratch(
         });
     }
     for (slot_index, slot) in scratch.iter().enumerate() {
-        if slot.left.len() != frame_count || slot.right.len() != frame_count {
+        if slot.left.len() < frame_count || slot.right.len() < frame_count {
             return Err(SceneRenderError::ScratchLengthMismatch {
                 slot: slot_index,
                 expected: frame_count,
@@ -1099,6 +1126,9 @@ fn validate_scene_scratch(
                 right: slot.right.len(),
             });
         }
+    }
+    for slot in scratch.iter_mut() {
+        slot.activate(frame_count);
     }
     Ok(())
 }

@@ -11,7 +11,8 @@ use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{InterleavedStereoCallback, StereoOutput};
 use hyper_mixer_runtime::{
     FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, PreparedPlaybackMainRuntime,
-    PreparedPlaybackTransportRuntime, TransportCommand, output_meter_channel,
+    PreparedPlaybackTransportRuntime, TransportCommand, TransportOutputProcessor,
+    output_meter_channel,
 };
 
 use common::{fixture, graph_fixture, playback_fixture};
@@ -205,4 +206,42 @@ fn prepared_combined_playback_performs_zero_heap_allocations() {
     for (actual, source) in output_right[25..].iter().zip(&fixture.scene_samples[..39]) {
         assert!((*actual - *source).abs() <= f32::EPSILON);
     }
+}
+
+#[test]
+fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 64)
+            .unwrap();
+    let (mut command_sender, mut transport) =
+        PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+    let mut arrangement_left = [0.0_f32; 64];
+    let mut arrangement_right = [0.0_f32; 64];
+    let mut scene_left = [0.0_f32; 64];
+    let mut scene_right = [0.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let (mut meter_sender, _meter_receiver) = output_meter_channel();
+    let mut processor =
+        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender).unwrap();
+    let mut first = [0.0_f32; 100];
+    let mut second = [0.0_f32; 50];
+
+    ALLOCATIONS.store(0, Ordering::SeqCst);
+    COUNTING.store(true, Ordering::SeqCst);
+    let start_result = command_sender.try_send(TransportCommand::Start);
+    let first_result = processor.process(&mut first);
+    let second_result = processor.process(&mut second);
+    COUNTING.store(false, Ordering::SeqCst);
+
+    assert!(start_result.is_ok());
+    assert!(first_result.is_ok());
+    assert!(second_result.is_ok());
+    assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
 }

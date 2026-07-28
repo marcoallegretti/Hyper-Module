@@ -10,7 +10,7 @@ use hyper_mixer_runtime::{
     OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot, PreparedPlaybackMainRuntime,
     PreparedPlaybackTransportRuntime, RuntimeCreationError, RuntimeProcessError,
     RuntimeProjectComponent, TransportCommand, TransportCommandSendError, TransportCycle,
-    TransportState, output_meter_channel,
+    TransportOutputCreationError, TransportOutputProcessor, TransportState, output_meter_channel,
 };
 
 use common::{fixture, graph_fixture, playback_fixture};
@@ -258,6 +258,186 @@ fn combined_transport_renders_each_track_authority_and_reconstructs_scene_state_
     assert_eq!(transport.position_frame(), 75);
     assert_samples(&output_left, &fixture.arrangement_samples[25..75]);
     assert_samples(&output_right, &fixture.scene_samples[..50]);
+}
+
+#[test]
+fn transport_output_processor_reuses_maximum_scratch_for_variable_quanta() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 64)
+            .unwrap();
+    let (mut command_sender, mut transport) =
+        PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+    let mut arrangement_left = [9.0_f32; 64];
+    let mut arrangement_right = [9.0_f32; 64];
+    let mut scene_left = [9.0_f32; 64];
+    let mut scene_right = [9.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let (mut meter_sender, mut meter_receiver) = output_meter_channel();
+    let mut processor =
+        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender).unwrap();
+
+    command_sender.try_send(TransportCommand::Start).unwrap();
+    let mut first = [9.0_f32; 100];
+    let first_cycle = processor.process(&mut first).unwrap();
+    assert_eq!(first_cycle.snapshot().cycle().start_frame(), 0);
+    assert_eq!(first_cycle.snapshot().cycle().frame_count(), 50);
+    assert_eq!(first_cycle.snapshot().cycle().active_slot_count(), 2);
+    for (actual, expected) in first
+        .chunks_exact(2)
+        .map(|frame| frame[0])
+        .zip(&fixture.arrangement_samples[..50])
+    {
+        assert!((actual - *expected).abs() <= f32::EPSILON);
+    }
+    assert!(
+        first
+            .chunks_exact(2)
+            .take(25)
+            .all(|frame| frame[1].abs() <= f32::EPSILON)
+    );
+    for (actual, expected) in first
+        .chunks_exact(2)
+        .skip(25)
+        .map(|frame| frame[1])
+        .zip(&fixture.scene_samples[..25])
+    {
+        assert!((actual - *expected).abs() <= f32::EPSILON);
+    }
+    assert_eq!(
+        meter_receiver.read_latest().snapshot(),
+        Some(first_cycle.snapshot())
+    );
+
+    let mut second = [9.0_f32; 50];
+    let second_cycle = processor.process(&mut second).unwrap();
+    assert_eq!(second_cycle.snapshot().cycle().start_frame(), 50);
+    assert_eq!(second_cycle.snapshot().cycle().frame_count(), 25);
+    for (actual, expected) in second
+        .chunks_exact(2)
+        .map(|frame| frame[0])
+        .zip(&fixture.arrangement_samples[50..75])
+    {
+        assert!((actual - *expected).abs() <= f32::EPSILON);
+    }
+    for (actual, expected) in second
+        .chunks_exact(2)
+        .map(|frame| frame[1])
+        .zip(&fixture.scene_samples[25..50])
+    {
+        assert!((actual - *expected).abs() <= f32::EPSILON);
+    }
+
+    command_sender.try_send(TransportCommand::Stop).unwrap();
+    let mut stopped = [9.0_f32; 32];
+    let stopped_cycle = processor.process(&mut stopped).unwrap();
+    assert_eq!(stopped_cycle.snapshot().cycle().start_frame(), 75);
+    assert_eq!(
+        stopped_cycle.snapshot().cycle().state(),
+        TransportState::Stopped
+    );
+    assert!(stopped.iter().all(|sample| sample.abs() <= f32::EPSILON));
+    drop(processor);
+    assert_eq!(scratch[0].left().len(), 25);
+    assert_eq!(scratch[0].right().len(), 25);
+    assert_eq!(scratch[0].left_capacity_frames(), 64);
+    assert_eq!(scratch[0].right_capacity_frames(), 64);
+}
+
+#[test]
+fn transport_output_processor_rejects_incomplete_scratch_before_processing() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 64)
+            .unwrap();
+    let mut transport = PreparedPlaybackTransportRuntime::new(runtime);
+    let (mut meter_sender, _meter_receiver) = output_meter_channel();
+    let mut no_scratch = [];
+
+    assert_eq!(
+        TransportOutputProcessor::try_new(&mut transport, &mut no_scratch, &mut meter_sender)
+            .unwrap_err(),
+        TransportOutputCreationError::ScratchSlotCountMismatch {
+            expected: 2,
+            actual: 0
+        }
+    );
+
+    let mut left_short = [0.0_f32; 63];
+    let mut right_full = [0.0_f32; 64];
+    let mut left_full = [0.0_f32; 64];
+    let mut right_full_2 = [0.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut left_short, &mut right_full),
+        RenderScratchSlot::new(&mut left_full, &mut right_full_2),
+    ];
+    assert_eq!(
+        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender)
+            .unwrap_err(),
+        TransportOutputCreationError::ScratchCapacity {
+            slot: 0,
+            required: 64,
+            left: 63,
+            right: 64
+        }
+    );
+}
+
+#[test]
+fn transport_output_processor_is_fail_silent_before_transport_mutation() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 64)
+            .unwrap();
+    let (mut command_sender, mut transport) =
+        PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+    let mut arrangement_left = [9.0_f32; 64];
+    let mut arrangement_right = [9.0_f32; 64];
+    let mut scene_left = [9.0_f32; 64];
+    let mut scene_right = [9.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let (mut meter_sender, _meter_receiver) = output_meter_channel();
+    let mut processor =
+        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender).unwrap();
+    command_sender.try_send(TransportCommand::Start).unwrap();
+
+    let mut malformed = [9.0_f32; 3];
+    assert_eq!(
+        processor.process(&mut malformed),
+        Err(StereoCallbackError::SampleCountNotStereoAligned { samples: 3 })
+    );
+    assert!(malformed.iter().all(|sample| sample.abs() <= f32::EPSILON));
+
+    let mut first_valid = [0.0_f32; 16];
+    let first_cycle = processor.process(&mut first_valid).unwrap();
+    assert_eq!(first_cycle.snapshot().cycle().start_frame(), 0);
+    assert_eq!(first_cycle.snapshot().cycle().applied_command_count(), 1);
+
+    let mut oversized = [9.0_f32; 130];
+    assert_eq!(
+        processor.process(&mut oversized),
+        Err(StereoCallbackError::BlockTooLarge {
+            actual: 65,
+            maximum: 64
+        })
+    );
+    assert!(oversized.iter().all(|sample| sample.abs() <= f32::EPSILON));
+
+    let mut after_rejection = [0.0_f32; 16];
+    let next_cycle = processor.process(&mut after_rejection).unwrap();
+    assert_eq!(next_cycle.snapshot().cycle().start_frame(), 8);
 }
 
 #[test]

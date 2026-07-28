@@ -10,9 +10,9 @@ use hyper_arrangement_renderer::{
     RenderScratchSlot, RenderWindowError, RenderedWindow, RendererCreationError,
 };
 use hyper_audio_engine::{
-    ChannelParameters, ControlledInputBlock, InputBlock, InterleavedStereoCallback, LinearGain,
-    MAX_PROCESS_FRAMES, MixerCreationError, Pan, ParameterError, ProcessError, StereoBlockMeter,
-    StereoCallbackError, StereoMixer, StereoOutput,
+    CallbackAdapterCreationError, ChannelParameters, ControlledInputBlock, InputBlock,
+    InterleavedStereoCallback, LinearGain, MAX_PROCESS_FRAMES, MixerCreationError, Pan,
+    ParameterError, ProcessError, StereoBlockMeter, StereoCallbackError, StereoMixer, StereoOutput,
 };
 use hyper_media_cache::{PreparedPlayback, PreparedSchedule};
 use hyper_playback_compiler::FrameTimelineError;
@@ -1505,6 +1505,11 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         self.runtime.max_block_frames()
     }
 
+    #[must_use]
+    pub fn slot_count(&self) -> usize {
+        self.runtime.slot_count()
+    }
+
     /// Applies one transport command for the next process cycle.
     pub fn apply_command(&mut self, command: TransportCommand) {
         match command {
@@ -1653,6 +1658,132 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             fence(Ordering::Acquire);
         }
         disconnected
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportOutputCreationError {
+    Callback(CallbackAdapterCreationError),
+    ScratchSlotCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    ScratchCapacity {
+        slot: usize,
+        required: usize,
+        left: usize,
+        right: usize,
+    },
+}
+
+impl fmt::Display for TransportOutputCreationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Callback(source) => write!(formatter, "callback construction failed: {source}"),
+            Self::ScratchSlotCountMismatch { expected, actual } => write!(
+                formatter,
+                "transport output requires {expected} scratch slots; {actual} were provided"
+            ),
+            Self::ScratchCapacity {
+                slot,
+                required,
+                left,
+                right,
+            } => write!(
+                formatter,
+                "transport output scratch slot {slot} requires {required} frames; left={left}, right={right}"
+            ),
+        }
+    }
+}
+
+impl Error for TransportOutputCreationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Callback(source) => Some(source),
+            Self::ScratchSlotCountMismatch { .. } | Self::ScratchCapacity { .. } => None,
+        }
+    }
+}
+
+/// Device-independent owner of one transport's interleaved output path.
+///
+/// Construction preallocates planar callback storage and verifies that every
+/// render scratch slot can serve the transport's maximum block. Processing
+/// reuses those capacities for variable callback quanta and publishes meters
+/// through the existing bounded channel.
+#[derive(Debug)]
+pub struct TransportOutputProcessor<'state, 'buffers, R> {
+    transport: &'state mut RoutedTransportRuntime<R>,
+    callback: InterleavedStereoCallback,
+    scratch: &'state mut [RenderScratchSlot<'buffers>],
+    meter_sender: &'state mut OutputMeterSender,
+}
+
+impl<'state, 'buffers, R: TrackWindowRenderer> TransportOutputProcessor<'state, 'buffers, R> {
+    /// Binds transport, scratch, interleaving, and meter publication once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportOutputCreationError`] when callback storage cannot be
+    /// allocated or scratch slot count/capacity cannot serve every callback.
+    pub fn try_new(
+        transport: &'state mut RoutedTransportRuntime<R>,
+        scratch: &'state mut [RenderScratchSlot<'buffers>],
+        meter_sender: &'state mut OutputMeterSender,
+    ) -> Result<Self, TransportOutputCreationError> {
+        let expected_slots = transport.slot_count();
+        if scratch.len() != expected_slots {
+            return Err(TransportOutputCreationError::ScratchSlotCountMismatch {
+                expected: expected_slots,
+                actual: scratch.len(),
+            });
+        }
+        let required = transport.max_block_frames();
+        for (slot, scratch_slot) in scratch.iter().enumerate() {
+            let left = scratch_slot.left_capacity_frames();
+            let right = scratch_slot.right_capacity_frames();
+            if left < required || right < required {
+                return Err(TransportOutputCreationError::ScratchCapacity {
+                    slot,
+                    required,
+                    left,
+                    right,
+                });
+            }
+        }
+        let callback = InterleavedStereoCallback::try_new(required)
+            .map_err(TransportOutputCreationError::Callback)?;
+        Ok(Self {
+            transport,
+            callback,
+            scratch,
+            meter_sender,
+        })
+    }
+
+    #[must_use]
+    pub fn maximum_block_frames(&self) -> usize {
+        self.callback.maximum_frames()
+    }
+
+    /// Processes one variable-size interleaved stereo callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StereoCallbackError`] for invalid device-buffer shape,
+    /// excessive quantum, or an underlying transport failure. Every failure
+    /// replaces the full device buffer with silence.
+    pub fn process(
+        &mut self,
+        interleaved_output: &mut [f32],
+    ) -> Result<InterleavedTransportCycle, StereoCallbackError<RuntimeProcessError>> {
+        self.transport.process_interleaved_cycle(
+            &mut self.callback,
+            self.scratch,
+            interleaved_output,
+            self.meter_sender,
+        )
     }
 }
 

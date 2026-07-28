@@ -10,5 +10,6 @@ workspace = true
 
 [target.'cfg(all(target_os = "linux", target_endian = "little"))'.dependencies]
 bytemuck = "=1.24.0"
+hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
 pipewire = "=0.10.0"
 spa-sys = { package = "libspa-sys", version = "=0.10.0" }
