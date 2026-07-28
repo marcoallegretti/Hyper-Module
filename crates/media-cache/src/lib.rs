@@ -9,7 +9,9 @@ use hyper_audio_source::DecodedAudio;
 use hyper_clip_engine::{ClipOutput, ClipPlacement, ClipPlanError, ClipRenderPlan};
 use hyper_playback_compiler::scene::{CompiledScenePerformance, PlayingSceneClip};
 use hyper_playback_compiler::{CompiledSceneAudioClip, PrepareError};
-use hyper_playback_json::{CompiledPlaybackGraph, OwnedCompiledSchedule, OwnedScheduleEntry};
+use hyper_playback_json::{
+    CompiledPlaybackGraph, MediaAssetFact, OwnedCompiledSchedule, OwnedScheduleEntry,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheLimits {
@@ -245,6 +247,16 @@ impl DecodedMediaCache {
     #[must_use]
     pub fn contains(&self, asset_id: &str) -> bool {
         self.find(asset_id).is_some()
+    }
+
+    /// Returns facts derived from the exact decoded assets in this cache.
+    #[must_use]
+    pub fn media_asset_facts(&self) -> impl ExactSizeIterator<Item = MediaAssetFact<'_>> + '_ {
+        self.entries.iter().map(|entry| MediaAssetFact {
+            id: &entry.asset_id,
+            sample_rate_hz: entry.audio.sample_rate_hz(),
+            frame_count: entry.audio.frame_count(),
+        })
     }
 
     fn find(&self, asset_id: &str) -> Option<&CacheEntry> {
@@ -746,6 +758,38 @@ mod tests {
         assert_eq!(cache.decoded_sample_bytes(), 24);
         assert!(cache.contains("a"));
         assert!(cache.contains("z"));
+    }
+
+    #[test]
+    fn playback_facts_come_from_sorted_decoded_assets() {
+        let mut builder = DecodedMediaCacheBuilder::try_new(CacheLimits {
+            max_assets: 2,
+            max_frames_per_asset: 4,
+            max_decoded_sample_bytes: 32,
+        })
+        .unwrap();
+        builder.try_insert("z", mono(2)).unwrap();
+        let stereo = DecodedAudio::from_stereo(48_000, vec![0.0; 3], vec![0.0; 3]).unwrap();
+        builder.try_insert("a", stereo).unwrap();
+
+        let cache = builder.seal();
+        let facts: Vec<_> = cache.media_asset_facts().collect();
+
+        assert_eq!(
+            facts,
+            [
+                MediaAssetFact {
+                    id: "a",
+                    sample_rate_hz: 48_000,
+                    frame_count: 3,
+                },
+                MediaAssetFact {
+                    id: "z",
+                    sample_rate_hz: 48_000,
+                    frame_count: 2,
+                },
+            ]
+        );
     }
 
     #[test]

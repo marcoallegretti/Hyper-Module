@@ -10,6 +10,10 @@ workspace = true
 
 [target.'cfg(all(target_os = "linux", target_endian = "little"))'.dependencies]
 bytemuck = "=1.24.0"
+hyper-arrangement-renderer = { path = "../../../crates/arrangement-renderer" }
+hyper-media-cache = { path = "../../../crates/media-cache" }
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
+hyper-playback-compiler = { path = "../../../crates/playback-compiler" }
+hyper-playback-json = { path = "../../../crates/playback-json" }
 pipewire = "=0.10.0"
 spa-sys = { package = "libspa-sys", version = "=0.10.0" }

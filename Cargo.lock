@@ -220,7 +220,11 @@ name = "hyper-desktop-audio"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "hyper-arrangement-renderer",
+ "hyper-media-cache",
  "hyper-mixer-runtime",
+ "hyper-playback-compiler",
+ "hyper-playback-json",
  "libspa-sys",
  "pipewire",
 ]

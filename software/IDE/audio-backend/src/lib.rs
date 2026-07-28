@@ -247,6 +247,13 @@ pub use pipewire_output::{
     PipeWireOutputConfig, PipeWireOutputConfigError, PipeWireOutputStream, PipeWireStartError,
     PipeWireStartupStage, PipeWireStopError, PipeWireThreadRunner,
 };
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+mod playback_session;
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+pub use playback_session::{
+    DesktopPlaybackSession, DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
+    DesktopPlaybackSessionStartError,
+};
 
 #[cfg(test)]
 mod tests {

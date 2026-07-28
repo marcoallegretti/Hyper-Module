@@ -1,0 +1,383 @@
+use super::{
+    OutputStreamCounters, PipeWireOutputConfig, PipeWireOutputStream, PipeWireStartError,
+    PipeWireStartupStage, PipeWireStopError, PipeWireThreadRunner,
+};
+use core::error::Error;
+use core::fmt;
+use hyper_arrangement_renderer::RenderScratchSlot;
+use hyper_media_cache::{DecodedMediaCache, PreparePlaybackError};
+use hyper_mixer_runtime::{
+    OutputMeterReceiver, RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError,
+    TransportCommandSender, TransportOutputCreationError, TransportOutputProcessor,
+    output_meter_channel,
+};
+use hyper_playback_compiler::graph::GraphLimits;
+use hyper_playback_compiler::scene::SceneLimits;
+use hyper_playback_json::{
+    AdapterCompileError, CompiledAutomation, CompiledMixerGraph, LoadedPlaybackProject,
+    MediaAssetFact,
+};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+
+/// Fully owned, post-verification inputs for one desktop playback session.
+#[derive(Debug)]
+pub struct DesktopPlaybackSessionInput {
+    project: LoadedPlaybackProject,
+    mixer: CompiledMixerGraph,
+    automation: Option<CompiledAutomation>,
+    media: DecodedMediaCache,
+}
+
+impl DesktopPlaybackSessionInput {
+    #[must_use]
+    pub const fn new(
+        project: LoadedPlaybackProject,
+        mixer: CompiledMixerGraph,
+        automation: Option<CompiledAutomation>,
+        media: DecodedMediaCache,
+    ) -> Self {
+        Self {
+            project,
+            mixer,
+            automation,
+            media,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum DesktopPlaybackSessionBuildError {
+    SampleRateMismatch { project: u32, output: u32 },
+    AssetFactCapacityUnavailable,
+    Playback(AdapterCompileError),
+    Media(PreparePlaybackError),
+    Runtime(RuntimeCreationError),
+    ScratchCapacityUnavailable,
+    Output(TransportOutputCreationError),
+}
+
+impl fmt::Display for DesktopPlaybackSessionBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SampleRateMismatch { project, output } => write!(
+                formatter,
+                "project sample rate is {project} Hz; output is configured for {output} Hz"
+            ),
+            Self::AssetFactCapacityUnavailable => {
+                formatter.write_str("media fact capacity is unavailable")
+            }
+            Self::Playback(source) => write!(formatter, "playback compilation failed: {source}"),
+            Self::Media(source) => write!(formatter, "media preparation failed: {source}"),
+            Self::Runtime(source) => write!(formatter, "runtime construction failed: {source}"),
+            Self::ScratchCapacityUnavailable => {
+                formatter.write_str("render scratch capacity is unavailable")
+            }
+            Self::Output(source) => {
+                write!(formatter, "transport output construction failed: {source}")
+            }
+        }
+    }
+}
+
+impl Error for DesktopPlaybackSessionBuildError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Playback(source) => Some(source),
+            Self::Media(source) => Some(source),
+            Self::Runtime(source) => Some(source),
+            Self::Output(source) => Some(source),
+            Self::SampleRateMismatch { .. }
+            | Self::AssetFactCapacityUnavailable
+            | Self::ScratchCapacityUnavailable => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum DesktopPlaybackSessionStartError {
+    Build(DesktopPlaybackSessionBuildError),
+    Output(PipeWireStartError),
+    PublicationUnavailable,
+}
+
+impl fmt::Display for DesktopPlaybackSessionStartError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Build(source) => source.fmt(formatter),
+            Self::Output(source) => source.fmt(formatter),
+            Self::PublicationUnavailable => {
+                formatter.write_str("playback controls were unavailable after output startup")
+            }
+        }
+    }
+}
+
+impl Error for DesktopPlaybackSessionStartError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Build(source) => Some(source),
+            Self::Output(source) => Some(source),
+            Self::PublicationUnavailable => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SessionHandles {
+    commands: TransportCommandSender,
+    meters: OutputMeterReceiver,
+}
+
+#[derive(Debug)]
+enum SessionPublication {
+    Prepared(SessionHandles),
+    Failed(DesktopPlaybackSessionBuildError),
+}
+
+/// One live `PipeWire` output with its bounded application-thread controls.
+#[derive(Debug)]
+pub struct DesktopPlaybackSession {
+    output: PipeWireOutputStream,
+    commands: TransportCommandSender,
+    meters: OutputMeterReceiver,
+}
+
+impl DesktopPlaybackSession {
+    /// Compiles and binds one verified session entirely on the output thread.
+    ///
+    /// Controls are returned only after `PipeWire` reports a usable stream state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DesktopPlaybackSessionStartError`] if session construction or
+    /// output startup fails. No partial session is published.
+    pub fn start(
+        config: PipeWireOutputConfig,
+        input: DesktopPlaybackSessionInput,
+    ) -> Result<Self, DesktopPlaybackSessionStartError> {
+        let sample_rate_hz = config.sample_rate_hz();
+        let maximum_block_frames = config.maximum_block_frames();
+        let (publication_sender, publication_receiver) = sync_channel(1);
+        let output = PipeWireOutputStream::start_with_thread_initializer(config, move |runner| {
+            initialize_session(
+                runner,
+                input,
+                sample_rate_hz,
+                maximum_block_frames,
+                &publication_sender,
+            )
+        });
+
+        match output {
+            Ok(output) => match publication_receiver.recv() {
+                Ok(SessionPublication::Prepared(handles)) => Ok(Self {
+                    output,
+                    commands: handles.commands,
+                    meters: handles.meters,
+                }),
+                Ok(SessionPublication::Failed(source)) => {
+                    Err(DesktopPlaybackSessionStartError::Build(source))
+                }
+                Err(_) => Err(DesktopPlaybackSessionStartError::PublicationUnavailable),
+            },
+            Err(source) => match failed_build(&publication_receiver) {
+                Some(build) => Err(DesktopPlaybackSessionStartError::Build(build)),
+                None => Err(DesktopPlaybackSessionStartError::Output(source)),
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn command_sender(&mut self) -> &mut TransportCommandSender {
+        &mut self.commands
+    }
+
+    #[must_use]
+    pub fn meter_receiver(&mut self) -> &mut OutputMeterReceiver {
+        &mut self.meters
+    }
+
+    #[must_use]
+    pub fn counters(&self) -> OutputStreamCounters {
+        self.output.counters()
+    }
+
+    /// Stops the output thread and waits for its complete teardown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipeWireStopError`] if the output thread panicked.
+    pub fn stop(self) -> Result<(), PipeWireStopError> {
+        let Self {
+            output,
+            commands: _,
+            meters: _,
+        } = self;
+        output.stop()
+    }
+}
+
+fn failed_build(
+    receiver: &Receiver<SessionPublication>,
+) -> Option<DesktopPlaybackSessionBuildError> {
+    match receiver.try_recv() {
+        Ok(SessionPublication::Failed(source)) => Some(source),
+        Ok(SessionPublication::Prepared(_))
+        | Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+    }
+}
+
+fn initialize_session(
+    runner: PipeWireThreadRunner,
+    input: DesktopPlaybackSessionInput,
+    sample_rate_hz: u32,
+    maximum_block_frames: usize,
+    publication: &SyncSender<SessionPublication>,
+) -> Result<(), PipeWireStartError> {
+    if input.project.sample_rate_hz() != sample_rate_hz {
+        return fail_build(
+            publication,
+            DesktopPlaybackSessionBuildError::SampleRateMismatch {
+                project: input.project.sample_rate_hz(),
+                output: sample_rate_hz,
+            },
+        );
+    }
+
+    let mut facts: Vec<MediaAssetFact<'_>> = Vec::new();
+    facts
+        .try_reserve_exact(input.media.asset_count())
+        .map_err(|_| DesktopPlaybackSessionBuildError::AssetFactCapacityUnavailable)
+        .or_else(|source| fail_build(publication, source))?;
+    facts.extend(input.media.media_asset_facts());
+
+    let graph = input
+        .project
+        .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(DesktopPlaybackSessionBuildError::Playback)
+        .or_else(|source| fail_build(publication, source))?;
+    let prepared = input
+        .media
+        .prepare_playback(&graph)
+        .map_err(DesktopPlaybackSessionBuildError::Media)
+        .or_else(|source| fail_build(publication, source))?;
+    let runtime = match input.automation {
+        Some(automation) => RoutedMainRuntime::try_new_prepared_playback_automated(
+            &prepared,
+            &input.mixer,
+            automation,
+            maximum_block_frames,
+        ),
+        None => RoutedMainRuntime::try_new_prepared_playback(
+            &prepared,
+            &input.mixer,
+            maximum_block_frames,
+        ),
+    }
+    .map_err(DesktopPlaybackSessionBuildError::Runtime)
+    .or_else(|source| fail_build(publication, source))?;
+
+    let slot_count = input.mixer.slots().len();
+    let mut left = allocate_scratch_planes(slot_count, maximum_block_frames)
+        .or_else(|source| fail_build(publication, source))?;
+    let mut right = allocate_scratch_planes(slot_count, maximum_block_frames)
+        .or_else(|source| fail_build(publication, source))?;
+    let mut scratch: Vec<RenderScratchSlot<'_>> = Vec::new();
+    scratch
+        .try_reserve_exact(slot_count)
+        .map_err(|_| DesktopPlaybackSessionBuildError::ScratchCapacityUnavailable)
+        .or_else(|source| fail_build(publication, source))?;
+    scratch.extend(
+        left.iter_mut()
+            .zip(&mut right)
+            .map(|(left, right)| RenderScratchSlot::new(left, right)),
+    );
+
+    let (commands, mut transport) = RoutedTransportRuntime::with_command_queue(runtime);
+    let (mut meter_sender, meters) = output_meter_channel();
+    let processor =
+        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender)
+            .map_err(DesktopPlaybackSessionBuildError::Output)
+            .or_else(|source| fail_build(publication, source))?;
+    publication
+        .try_send(SessionPublication::Prepared(SessionHandles {
+            commands,
+            meters,
+        }))
+        .map_err(|_| PipeWireStartError::Backend {
+            stage: PipeWireStartupStage::Callback,
+            detail: "playback control publication failed".to_owned(),
+        })?;
+    runner.run_transport_output(processor)
+}
+
+fn allocate_scratch_planes(
+    slot_count: usize,
+    maximum_block_frames: usize,
+) -> Result<Vec<Vec<f32>>, DesktopPlaybackSessionBuildError> {
+    let mut planes = Vec::new();
+    planes
+        .try_reserve_exact(slot_count)
+        .map_err(|_| DesktopPlaybackSessionBuildError::ScratchCapacityUnavailable)?;
+    for _ in 0..slot_count {
+        let mut plane = Vec::new();
+        plane
+            .try_reserve_exact(maximum_block_frames)
+            .map_err(|_| DesktopPlaybackSessionBuildError::ScratchCapacityUnavailable)?;
+        plane.resize(maximum_block_frames, 0.0);
+        planes.push(plane);
+    }
+    Ok(planes)
+}
+
+fn fail_build<T>(
+    publication: &SyncSender<SessionPublication>,
+    source: DesktopPlaybackSessionBuildError,
+) -> Result<T, PipeWireStartError> {
+    let detail = source.to_string();
+    let _ = publication.try_send(SessionPublication::Failed(source));
+    Err(PipeWireStartError::Backend {
+        stage: PipeWireStartupStage::Callback,
+        detail,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scratch_planes_have_the_exact_session_shape() {
+        let planes = allocate_scratch_planes(3, 128).unwrap();
+
+        assert_eq!(planes.len(), 3);
+        assert!(planes.iter().all(|plane| plane == &[0.0; 128]));
+    }
+
+    #[test]
+    fn build_failure_is_published_before_backend_failure() {
+        let (sender, receiver) = sync_channel(1);
+        let result = fail_build::<()>(
+            &sender,
+            DesktopPlaybackSessionBuildError::SampleRateMismatch {
+                project: 44_100,
+                output: 48_000,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(PipeWireStartError::Backend {
+                stage: PipeWireStartupStage::Callback,
+                ..
+            })
+        ));
+        assert!(matches!(
+            failed_build(&receiver),
+            Some(DesktopPlaybackSessionBuildError::SampleRateMismatch {
+                project: 44_100,
+                output: 48_000,
+            })
+        ));
+    }
+}
