@@ -3,6 +3,7 @@
 
 use core::error::Error;
 use core::fmt;
+use core::sync::atomic::{Ordering, fence};
 
 use hyper_arrangement_renderer::{
     ArrangementRenderer, RenderScratchSlot, RenderWindowError, RenderedWindow,
@@ -19,8 +20,10 @@ use hyper_playback_json::{
     AutomationValue, CompiledAutomation, CompiledMainMixer, CompiledMixerDestination,
     CompiledMixerGraph, CompiledMixerTap, CompiledMixerTrackKind,
 };
+use rtrb::{Consumer, Producer, PushError, RingBuffer};
 
 pub const MAX_MAIN_MIXER_SLOTS: usize = 8;
+pub const MAX_QUEUED_TRANSPORT_COMMANDS: usize = 64;
 const MAX_SENDS_PER_SLOT: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,13 +139,82 @@ pub enum TransportCommand {
     Locate { frame: usize, state: LocateState },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportCommandSendError {
+    Full(TransportCommand),
+    Disconnected(TransportCommand),
+}
+
+impl TransportCommandSendError {
+    #[must_use]
+    pub const fn command(self) -> TransportCommand {
+        match self {
+            Self::Full(command) | Self::Disconnected(command) => command,
+        }
+    }
+}
+
+impl fmt::Display for TransportCommandSendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full(_) => formatter.write_str("transport command queue is full"),
+            Self::Disconnected(_) => {
+                formatter.write_str("transport command receiver is disconnected")
+            }
+        }
+    }
+}
+
+impl Error for TransportCommandSendError {}
+
+/// Application-thread half of the bounded transport command queue.
+#[derive(Debug)]
+pub struct TransportCommandSender {
+    producer: Producer<TransportCommand>,
+}
+
+impl TransportCommandSender {
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        MAX_QUEUED_TRANSPORT_COMMANDS
+    }
+
+    #[must_use]
+    pub fn is_disconnected(&self) -> bool {
+        let disconnected = self.producer.is_abandoned();
+        if disconnected {
+            fence(Ordering::Acquire);
+        }
+        disconnected
+    }
+
+    /// Attempts to enqueue one command without waiting or allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original command when the fixed queue is full or when the
+    /// receiving transport has already been destroyed.
+    pub fn try_send(&mut self, command: TransportCommand) -> Result<(), TransportCommandSendError> {
+        if self.is_disconnected() {
+            return Err(TransportCommandSendError::Disconnected(command));
+        }
+        self.producer.push(command).map_err(|error| match error {
+            PushError::Full(command) => TransportCommandSendError::Full(command),
+        })
+    }
+}
+
 /// Result of one device-independent transport processing cycle.
+///
+/// Queue diagnostics describe commands applied at the beginning of this cycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransportCycle {
     state: TransportState,
     start_frame: usize,
     frame_count: usize,
     active_slot_count: usize,
+    applied_command_count: usize,
+    command_sender_disconnected: bool,
 }
 
 impl TransportCycle {
@@ -164,6 +236,16 @@ impl TransportCycle {
     #[must_use]
     pub const fn active_slot_count(self) -> usize {
         self.active_slot_count
+    }
+
+    #[must_use]
+    pub const fn applied_command_count(self) -> usize {
+        self.applied_command_count
+    }
+
+    #[must_use]
+    pub const fn command_sender_disconnected(self) -> bool {
+        self.command_sender_disconnected
     }
 }
 
@@ -954,6 +1036,7 @@ pub struct GraphTransportRuntime<'prepared, 'cache, 'schedule> {
     runtime: GraphMainRuntime<'prepared, 'cache, 'schedule>,
     state: TransportState,
     position_frame: usize,
+    command_consumer: Option<Consumer<TransportCommand>>,
 }
 
 impl<'prepared, 'cache, 'schedule> GraphTransportRuntime<'prepared, 'cache, 'schedule> {
@@ -963,7 +1046,28 @@ impl<'prepared, 'cache, 'schedule> GraphTransportRuntime<'prepared, 'cache, 'sch
             runtime,
             state: TransportState::Stopped,
             position_frame: 0,
+            command_consumer: None,
         }
+    }
+
+    /// Creates a transport and its application-thread command sender.
+    ///
+    /// Queue storage is allocated once during construction. The sender and
+    /// process-cycle receiver are wait-free after construction.
+    #[must_use]
+    pub fn with_command_queue(
+        runtime: GraphMainRuntime<'prepared, 'cache, 'schedule>,
+    ) -> (TransportCommandSender, Self) {
+        let (producer, consumer) = RingBuffer::new(MAX_QUEUED_TRANSPORT_COMMANDS);
+        (
+            TransportCommandSender { producer },
+            Self {
+                runtime,
+                state: TransportState::Stopped,
+                position_frame: 0,
+                command_consumer: Some(consumer),
+            },
+        )
     }
 
     #[must_use]
@@ -999,6 +1103,10 @@ impl<'prepared, 'cache, 'schedule> GraphTransportRuntime<'prepared, 'cache, 'sch
 
     /// Processes the next transport-owned callback window.
     ///
+    /// Output shape and block capacity are validated before queued commands are
+    /// consumed. A valid cycle applies a bounded FIFO batch before it captures
+    /// the cycle's state and start frame.
+    ///
     /// Stopped cycles clear the output without reading arrangement scratch or
     /// advancing the position. Rolling cycles render from the current absolute
     /// frame and publish the next position only after successful processing.
@@ -1026,6 +1134,8 @@ impl<'prepared, 'cache, 'schedule> GraphTransportRuntime<'prepared, 'cache, 'sch
                 maximum: self.runtime.max_block_frames(),
             });
         }
+        let applied_command_count = self.drain_commands();
+        let command_sender_disconnected = self.command_sender_disconnected();
         let start_frame = self.position_frame;
         if self.state == TransportState::Stopped {
             output.left.fill(0.0);
@@ -1035,6 +1145,8 @@ impl<'prepared, 'cache, 'schedule> GraphTransportRuntime<'prepared, 'cache, 'sch
                 start_frame,
                 frame_count,
                 active_slot_count: 0,
+                applied_command_count,
+                command_sender_disconnected,
             });
         }
         let next_frame = start_frame
@@ -1047,7 +1159,36 @@ impl<'prepared, 'cache, 'schedule> GraphTransportRuntime<'prepared, 'cache, 'sch
             start_frame,
             frame_count,
             active_slot_count: rendered.active_slot_count,
+            applied_command_count,
+            command_sender_disconnected,
         })
+    }
+
+    fn drain_commands(&mut self) -> usize {
+        let mut applied = 0;
+        for _ in 0..MAX_QUEUED_TRANSPORT_COMMANDS {
+            let command = self
+                .command_consumer
+                .as_mut()
+                .and_then(|consumer| consumer.pop().ok());
+            let Some(command) = command else {
+                break;
+            };
+            self.apply_command(command);
+            applied += 1;
+        }
+        applied
+    }
+
+    fn command_sender_disconnected(&self) -> bool {
+        let disconnected = self
+            .command_consumer
+            .as_ref()
+            .is_some_and(Consumer::is_abandoned);
+        if disconnected {
+            fence(Ordering::Acquire);
+        }
+        disconnected
     }
 }
 

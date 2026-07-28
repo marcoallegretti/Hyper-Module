@@ -3,8 +3,9 @@ mod common;
 use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{MAX_PROCESS_FRAMES, StereoOutput};
 use hyper_mixer_runtime::{
-    FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, LocateState, RuntimeCreationError,
-    RuntimeProcessError, TransportCommand, TransportCycle, TransportState,
+    FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, LocateState,
+    MAX_QUEUED_TRANSPORT_COMMANDS, RuntimeCreationError, RuntimeProcessError, TransportCommand,
+    TransportCommandSendError, TransportCycle, TransportState,
 };
 
 use common::{fixture, graph_fixture};
@@ -372,6 +373,191 @@ fn failed_transport_cycle_preserves_position_and_output() {
     assert_eq!(transport.position_frame(), 12);
     assert_constant(&output_left, 8.0);
     assert_constant(&output_right, 8.0);
+}
+
+#[test]
+fn queued_transport_commands_preserve_fifo_order_across_threads() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime =
+        GraphMainRuntime::try_new_automated(&prepared, &fixture.mixer, fixture.automation, 8)
+            .unwrap();
+    let (sender, mut transport) = GraphTransportRuntime::with_command_queue(runtime);
+    let mut sender = std::thread::spawn(move || {
+        let mut sender = sender;
+        assert_eq!(sender.capacity(), MAX_QUEUED_TRANSPORT_COMMANDS);
+        sender
+            .try_send(TransportCommand::Locate {
+                frame: 25,
+                state: LocateState::Rolling,
+            })
+            .unwrap();
+        sender.try_send(TransportCommand::Stop).unwrap();
+        sender
+            .try_send(TransportCommand::Locate {
+                frame: 40,
+                state: LocateState::Preserve,
+            })
+            .unwrap();
+        sender.try_send(TransportCommand::Start).unwrap();
+        sender
+    })
+    .join()
+    .unwrap();
+    let mut left = [9.0_f32; 1];
+    let mut right = [9.0_f32; 1];
+
+    let cycle = process_transport(&mut transport, &mut left, &mut right).unwrap();
+
+    assert_eq!(cycle.applied_command_count(), 4);
+    assert!(!cycle.command_sender_disconnected());
+    assert_eq!(cycle.state(), TransportState::Rolling);
+    assert_eq!(cycle.start_frame(), 40);
+    assert_eq!(transport.position_frame(), 41);
+    assert!(left[0] > 0.0);
+    assert!(right[0] > 0.0);
+    sender.try_send(TransportCommand::Stop).unwrap();
+}
+
+#[test]
+fn transport_command_queue_reports_saturation_and_disconnection() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(runtime);
+    for _ in 0..MAX_QUEUED_TRANSPORT_COMMANDS {
+        sender.try_send(TransportCommand::Stop).unwrap();
+    }
+    let full = sender.try_send(TransportCommand::Start).unwrap_err();
+    assert_eq!(
+        full,
+        TransportCommandSendError::Full(TransportCommand::Start)
+    );
+    assert_eq!(full.command(), TransportCommand::Start);
+    let mut left = [9.0_f32; 1];
+    let mut right = [9.0_f32; 1];
+
+    let drained = process_transport(&mut transport, &mut left, &mut right).unwrap();
+
+    assert_eq!(
+        drained.applied_command_count(),
+        MAX_QUEUED_TRANSPORT_COMMANDS
+    );
+    assert_eq!(drained.state(), TransportState::Stopped);
+    assert_constant(&left, 0.0);
+    assert_constant(&right, 0.0);
+    sender.try_send(TransportCommand::Start).unwrap();
+    let started = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(started.applied_command_count(), 1);
+    assert_eq!(started.state(), TransportState::Rolling);
+
+    drop(transport);
+    assert!(sender.is_disconnected());
+    assert_eq!(
+        sender.try_send(TransportCommand::Stop),
+        Err(TransportCommandSendError::Disconnected(
+            TransportCommand::Stop
+        ))
+    );
+}
+
+#[test]
+fn transport_reports_abandoned_sender_after_applying_pending_commands() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(runtime);
+    sender.try_send(TransportCommand::Start).unwrap();
+    drop(sender);
+    let mut left = [9.0_f32; 1];
+    let mut right = [9.0_f32; 1];
+
+    let cycle = process_transport(&mut transport, &mut left, &mut right).unwrap();
+
+    assert_eq!(cycle.applied_command_count(), 1);
+    assert!(cycle.command_sender_disconnected());
+    assert_eq!(cycle.state(), TransportState::Rolling);
+}
+
+#[test]
+fn invalid_cycle_does_not_consume_queued_commands() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(runtime);
+    sender.try_send(TransportCommand::Start).unwrap();
+    let mut scratch = [];
+    let mut invalid_left = [8.0_f32; 2];
+    let mut invalid_right = [8.0_f32; 1];
+
+    assert_eq!(
+        transport.process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut invalid_left,
+                right: &mut invalid_right,
+            },
+        ),
+        Err(RuntimeProcessError::OutputLengthMismatch { left: 2, right: 1 })
+    );
+    assert_eq!(transport.state(), TransportState::Stopped);
+    let mut oversized_left = [8.0_f32; 9];
+    let mut oversized_right = [8.0_f32; 9];
+    assert_eq!(
+        transport.process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut oversized_left,
+                right: &mut oversized_right,
+            },
+        ),
+        Err(RuntimeProcessError::BlockLimit {
+            actual: 9,
+            maximum: 8,
+        })
+    );
+    assert_eq!(transport.state(), TransportState::Stopped);
+    let mut left = [9.0_f32; 1];
+    let mut right = [9.0_f32; 1];
+    let cycle = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(cycle.applied_command_count(), 1);
+    assert_eq!(cycle.state(), TransportState::Rolling);
+}
+
+#[test]
+fn queued_command_remains_applied_when_later_cycle_work_fails() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(runtime);
+    sender
+        .try_send(TransportCommand::Locate {
+            frame: usize::MAX - 1,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    let mut scratch = [];
+    let mut left = [9.0_f32; 2];
+    let mut right = [9.0_f32; 2];
+
+    assert_eq!(
+        transport.process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        ),
+        Err(RuntimeProcessError::FrameRangeOverflow)
+    );
+    assert_eq!(transport.state(), TransportState::Rolling);
+    assert_eq!(transport.position_frame(), usize::MAX - 1);
+    assert_constant(&left, 9.0);
+    assert_constant(&right, 9.0);
+    sender.try_send(TransportCommand::Stop).unwrap();
+    let stopped = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(stopped.applied_command_count(), 1);
+    assert_eq!(stopped.state(), TransportState::Stopped);
 }
 
 #[test]

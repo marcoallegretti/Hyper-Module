@@ -99,8 +99,7 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
     let automated =
         GraphMainRuntime::try_new_automated(&prepared, &fixture.mixer, fixture.automation, 64)
             .unwrap();
-    let mut transport = GraphTransportRuntime::new(automated);
-    transport.apply_command(TransportCommand::Start);
+    let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(automated);
     let mut left_0 = [0.0_f32; 64];
     let mut right_0 = [0.0_f32; 64];
     let mut left_1 = [0.0_f32; 64];
@@ -131,6 +130,7 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
             right: &mut output_right,
         },
     );
+    let start_result = sender.try_send(TransportCommand::Start);
     let automated_result = transport.process_cycle(
         &mut scratch,
         StereoOutput {
@@ -138,7 +138,7 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
             right: &mut output_right,
         },
     );
-    transport.apply_command(TransportCommand::Stop);
+    let stop_result = sender.try_send(TransportCommand::Stop);
     let stopped_result = transport.process_cycle(
         &mut scratch,
         StereoOutput {
@@ -149,7 +149,9 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
     COUNTING.store(false, Ordering::SeqCst);
 
     assert!(result.is_ok());
+    assert!(start_result.is_ok());
     assert!(automated_result.is_ok());
+    assert!(stop_result.is_ok());
     assert!(stopped_result.is_ok());
     assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
 }

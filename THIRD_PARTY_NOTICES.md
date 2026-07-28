@@ -58,3 +58,19 @@ Sources:
 - <https://github.com/dtolnay/syn>
 - <https://github.com/dtolnay/unicode-ident>
 - <https://github.com/dtolnay/zmij>
+
+## rtrb 0.3.4
+
+The `hyper-mixer-runtime` crate uses `rtrb` 0.3.4 for bounded
+single-producer/single-consumer transport command delivery.
+
+The crate metadata lists Stjepan Glavina and Matthias Geier as authors.
+
+Licensed under either the MIT License or Apache License 2.0.
+
+Source: <https://github.com/mgeier/rtrb/tree/0.3.4>
+
+Licenses:
+
+- <https://github.com/mgeier/rtrb/blob/0.3.4/LICENSE-MIT>
+- <https://github.com/mgeier/rtrb/blob/0.3.4/LICENSE-APACHE>
