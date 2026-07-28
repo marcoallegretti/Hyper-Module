@@ -1,19 +1,11 @@
 use hyper_audio_source::DecodedAudio;
-use hyper_media_cache::{
-    CacheLimits, DecodedMediaCache, DecodedMediaCacheBuilder, SceneAudioBinding,
-};
+use hyper_media_cache::{CacheLimits, DecodedMediaCache, DecodedMediaCacheBuilder};
 use hyper_playback_compiler::graph::GraphLimits;
-use hyper_playback_compiler::scene::{
-    CompiledScenePerformance, LaunchQuantization, SceneClipResource, SceneLimits,
-    ScenePerformanceInput, SceneResource, SceneSlotAction, SceneSlotResource, SceneTrackResource,
-    compile_scene_performance,
-};
-use hyper_playback_compiler::{
-    ClipCompileSpec, TempoEvent, TickRange, Timeline, WarpMarker, compile_scene_audio_clip,
-};
+use hyper_playback_compiler::scene::SceneLimits;
 use hyper_playback_json::{
-    CompiledAutomation, CompiledMainMixer, CompiledMixerGraph, LoaderLimits, MediaAssetFact,
-    OwnedCompiledSchedule, PlaybackJsonInput, load,
+    CompiledAutomation, CompiledMainMixer, CompiledMixerGraph, CompiledPlaybackGraph,
+    LoadedPlaybackProject, LoaderLimits, MediaAssetFact, OwnedCompiledSchedule, PlaybackJsonInput,
+    load,
 };
 
 pub struct Fixture {
@@ -41,69 +33,36 @@ pub struct GraphFixture {
 
 pub struct PlaybackFixture {
     pub cache: DecodedMediaCache,
-    pub schedule: OwnedCompiledSchedule,
+    pub project: LoadedPlaybackProject,
     pub mixer: CompiledMixerGraph,
-    pub authority: CompiledScenePerformance<'static>,
-    pub scene_bindings: Vec<SceneAudioBinding<'static>>,
+    #[allow(
+        dead_code,
+        reason = "compiled automation is consumed by the allocation test binary"
+    )]
+    pub automation: CompiledAutomation,
     pub arrangement_samples: Vec<f32>,
     pub scene_samples: Vec<f32>,
 }
 
-static PLAYBACK_SCENE_TRACKS: [SceneTrackResource<'static>; 2] = [
-    SceneTrackResource {
-        id: "scene-track",
-        active: true,
-    },
-    SceneTrackResource {
-        id: "arrangement-track",
-        active: true,
-    },
-];
-static PLAYBACK_SCENE_CLIPS: [SceneClipResource<'static>; 1] = [SceneClipResource {
-    id: "scene-clip",
-    track_id: "scene-track",
-    enabled: true,
-    duration_ticks: 4,
-    loop_enabled: false,
-}];
-static PLAYBACK_PLAY_SLOTS: [SceneSlotResource<'static>; 1] = [SceneSlotResource {
-    track_id: "scene-track",
-    action: SceneSlotAction::Play {
-        clip_id: "scene-clip",
-    },
-}];
-static PLAYBACK_STOP_SLOTS: [SceneSlotResource<'static>; 1] = [SceneSlotResource {
-    track_id: "scene-track",
-    action: SceneSlotAction::Stop,
-}];
-static PLAYBACK_SCENES: [SceneResource<'static, 'static>; 2] = [
-    SceneResource {
-        id: "play",
-        enabled: true,
-        order: 0,
-        launch_quantization: LaunchQuantization::Immediate,
-        slots: &PLAYBACK_PLAY_SLOTS,
-    },
-    SceneResource {
-        id: "stop",
-        enabled: true,
-        order: 1,
-        launch_quantization: LaunchQuantization::Immediate,
-        slots: &PLAYBACK_STOP_SLOTS,
-    },
-];
-static PLAYBACK_LAUNCHES: [hyper_playback_compiler::scene::SceneLaunchResource<'static>; 2] = [
-    hyper_playback_compiler::scene::SceneLaunchResource {
-        id: "play-launch",
-        tick: 1,
-        scene_id: "play",
-    },
-    hyper_playback_compiler::scene::SceneLaunchResource {
-        id: "stop-launch",
-        tick: 3,
-        scene_id: "stop",
-    },
-];
+impl PlaybackFixture {
+    pub fn compile_playback(&self) -> CompiledPlaybackGraph<'_> {
+        let asset_facts = [
+            MediaAssetFact {
+                id: "arrangement-asset",
+                sample_rate_hz: 48_000,
+                frame_count: 100,
+            },
+            MediaAssetFact {
+                id: "scene-asset",
+                sample_rate_hz: 48_000,
+                frame_count: 100,
+            },
+        ];
+        self.project
+            .compile_playback(&asset_facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+            .unwrap()
+    }
+}
 
 pub fn fixture() -> Fixture {
     let timeline = br#"{
@@ -257,6 +216,20 @@ pub fn playback_fixture() -> PlaybackFixture {
         ],
         "extensions":{}
     }"#;
+    let play_scene = br#"{
+        "format":"hyper-scene","format_version":1,"id":"play",
+        "project_id":"project","name":"Play","order":0,"enabled":true,
+        "launch_quantization":{"mode":"immediate"},
+        "slots":[{"track_id":"scene-track","action":"play","clip_id":"scene-clip"}],
+        "extensions":{}
+    }"#;
+    let stop_scene = br#"{
+        "format":"hyper-scene","format_version":1,"id":"stop",
+        "project_id":"project","name":"Stop","order":1,"enabled":true,
+        "launch_quantization":{"mode":"immediate"},
+        "slots":[{"track_id":"scene-track","action":"stop"}],
+        "extensions":{}
+    }"#;
     let arrangement = br#"{
         "format":"hyper-arrangement","format_version":1,"id":"arrangement",
         "project_id":"project","name":"Main","enabled":true,
@@ -265,7 +238,11 @@ pub fn playback_fixture() -> PlaybackFixture {
             "clip_id":"arrangement-clip","start_tick":0,"clip_start_tick":0,
             "duration_ticks":4,"enabled":true
         }],
-        "scene_launches":[],"extensions":{}
+        "scene_launches":[
+            {"id":"play-launch","tick":1,"scene_id":"play"},
+            {"id":"stop-launch","tick":3,"scene_id":"stop"}
+        ],
+        "extensions":{}
     }"#;
     let mixer_json = br#"{
         "format":"hyper-mixer","format_version":1,"id":"mixer",
@@ -287,8 +264,25 @@ pub fn playback_fixture() -> PlaybackFixture {
         "cue":{"source":"main","gain_millionths":1000000,"mute":false},
         "extensions":{}
     }"#;
+    let automation_json = br#"{
+        "format":"hyper-automation-take","format_version":1,
+        "id":"automation","project_id":"project","name":"Unity","enabled":true,
+        "captured_at_utc":"2026-07-28T14:00:00.000Z",
+        "start_tick":0,"end_tick":5,
+        "lanes":[{
+            "id":"main-gain",
+            "target":{"kind":"mixer-main","parameter":"gain"},
+            "interpolation":"linear",
+            "points":[
+                {"tick":0,"value":1000000},
+                {"tick":4,"value":1000000}
+            ]
+        }],
+        "extensions":{}
+    }"#;
     let tracks: [&[u8]; 2] = [arrangement_track, scene_track];
     let clips: [&[u8]; 2] = [arrangement_clip, scene_clip];
+    let scenes: [&[u8]; 2] = [play_scene, stop_scene];
     let loaded = load(
         PlaybackJsonInput {
             project_id: "project",
@@ -296,89 +290,22 @@ pub fn playback_fixture() -> PlaybackFixture {
             timeline: timeline_json,
             tracks: &tracks,
             clips: &clips,
-            scenes: &[],
+            scenes: &scenes,
             arrangement: Some(arrangement),
         },
         LoaderLimits::VERSION_1,
     )
     .unwrap();
-    let asset_facts = [
-        MediaAssetFact {
-            id: "arrangement-asset",
-            sample_rate_hz: 48_000,
-            frame_count: 100,
-        },
-        MediaAssetFact {
-            id: "scene-asset",
-            sample_rate_hz: 48_000,
-            frame_count: 100,
-        },
-    ];
-    let schedule = loaded
-        .compile(&asset_facts, GraphLimits::VERSION_1)
-        .unwrap();
-    let mixer = loaded
+    let loaded_mixer = loaded
         .load_mixer(mixer_json, LoaderLimits::VERSION_1)
-        .unwrap()
-        .compile_main_graph()
         .unwrap();
-
-    let tempos = [TempoEvent {
-        tick: 0,
-        microseconds_per_quarter: 1_000_000,
-    }];
-    let timeline = Timeline::try_new(48_000, &tempos).unwrap();
-    let authority = compile_scene_performance(
-        timeline,
-        ScenePerformanceInput {
-            enabled: true,
-            tracks: &PLAYBACK_SCENE_TRACKS,
-            clips: &PLAYBACK_SCENE_CLIPS,
-            scenes: &PLAYBACK_SCENES,
-            launches: &PLAYBACK_LAUNCHES,
-        },
-        SceneLimits::VERSION_1,
-    )
-    .unwrap();
-    let markers = [
-        WarpMarker {
-            tick: 0,
-            source_frame_offset: 0,
-        },
-        WarpMarker {
-            tick: 4,
-            source_frame_offset: 100,
-        },
-    ];
-    let compiled_scene_audio = compile_scene_audio_clip(
-        timeline,
-        ClipCompileSpec {
-            enabled: true,
-            duration_ticks: 4,
-            source_start_frame: 0,
-            source_frame_count: 100,
-            asset_frame_count: 100,
-            source_sample_rate_hz: 48_000,
-            loop_enabled: false,
-            loop_range: TickRange { start: 0, end: 4 },
-            reverse: false,
-            gain_decibels: 0.0,
-            transpose_cents: 0,
-            fade_in_ticks: 0,
-            fade_out_ticks: 0,
-            warp_markers: &markers,
-        },
-        1,
-    )
-    .unwrap();
-    let scene_bindings = vec![SceneAudioBinding {
-        track_id: "scene-track",
-        launch_id: "play-launch",
-        scene_id: "play",
-        clip_id: "scene-clip",
-        asset_id: "scene-asset",
-        compiled: compiled_scene_audio,
-    }];
+    let loaded_automation = loaded
+        .load_automation_takes(&loaded_mixer, &[automation_json], LoaderLimits::VERSION_1)
+        .unwrap();
+    let mixer = loaded_mixer.compile_main_graph().unwrap();
+    let automation = loaded
+        .compile_main_automation(&mixer, &loaded_automation)
+        .unwrap();
 
     let arrangement_samples: Vec<f32> =
         (0_u16..100).map(|frame| f32::from(frame) / 100.0).collect();
@@ -406,10 +333,9 @@ pub fn playback_fixture() -> PlaybackFixture {
 
     PlaybackFixture {
         cache: builder.seal(),
-        schedule,
+        project: loaded,
         mixer,
-        authority,
-        scene_bindings,
+        automation,
         arrangement_samples,
         scene_samples,
     }

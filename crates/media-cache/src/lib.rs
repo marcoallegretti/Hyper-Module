@@ -370,6 +370,30 @@ impl DecodedMediaCache {
         }));
         self.prepare_scene_audio(graph.scene_authority(), &bindings)
     }
+
+    /// Atomically binds every arrangement placement and scene play action in a
+    /// compiled playback graph to this immutable cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreparePlaybackError`] without publishing partial prepared
+    /// state when either arrangement or scene media cannot be bound.
+    pub fn prepare_playback<'cache, 'graph, 'project>(
+        &'cache self,
+        graph: &'graph CompiledPlaybackGraph<'project>,
+    ) -> Result<PreparedPlayback<'cache, 'graph, 'project>, PreparePlaybackError> {
+        let schedule = self
+            .prepare_schedule(graph.arrangement())
+            .map_err(PreparePlaybackError::Schedule)?;
+        let scene_audio = self
+            .prepare_playback_scenes(graph)
+            .map_err(PreparePlaybackError::SceneAudio)?;
+        Ok(PreparedPlayback {
+            authority: graph.scene_authority(),
+            schedule,
+            scene_audio,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -465,6 +489,55 @@ impl Error for PrepareSceneAudioError {
             Self::InvalidAsset { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreparePlaybackError {
+    Schedule(PrepareScheduleError),
+    SceneAudio(PrepareSceneAudioError),
+}
+
+impl fmt::Display for PreparePlaybackError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Schedule(source) => write!(formatter, "arrangement preparation failed: {source}"),
+            Self::SceneAudio(source) => write!(formatter, "scene preparation failed: {source}"),
+        }
+    }
+}
+
+impl Error for PreparePlaybackError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Schedule(source) => Some(source),
+            Self::SceneAudio(source) => Some(source),
+        }
+    }
+}
+
+/// Immutable cache bindings for one exact compiled playback graph.
+#[derive(Debug)]
+pub struct PreparedPlayback<'cache, 'graph, 'project> {
+    authority: &'graph CompiledScenePerformance<'project>,
+    schedule: PreparedSchedule<'cache, 'graph>,
+    scene_audio: PreparedSceneAudio<'cache, 'project>,
+}
+
+impl<'cache, 'graph, 'project> PreparedPlayback<'cache, 'graph, 'project> {
+    #[must_use]
+    pub const fn authority(&self) -> &'graph CompiledScenePerformance<'project> {
+        self.authority
+    }
+
+    #[must_use]
+    pub const fn schedule(&self) -> &PreparedSchedule<'cache, 'graph> {
+        &self.schedule
+    }
+
+    #[must_use]
+    pub const fn scene_audio(&self) -> &PreparedSceneAudio<'cache, 'project> {
+        &self.scene_audio
     }
 }
 

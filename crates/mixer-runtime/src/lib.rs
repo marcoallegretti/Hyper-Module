@@ -14,9 +14,8 @@ use hyper_audio_engine::{
     MAX_PROCESS_FRAMES, MixerCreationError, Pan, ParameterError, ProcessError, StereoBlockMeter,
     StereoCallbackError, StereoMixer, StereoOutput,
 };
-use hyper_media_cache::{PreparedSceneAudio, PreparedSchedule};
+use hyper_media_cache::{PreparedPlayback, PreparedSchedule};
 use hyper_playback_compiler::FrameTimelineError;
-use hyper_playback_compiler::scene::CompiledScenePerformance;
 use hyper_playback_json::{
     AutomationChannelParameter, AutomationMainParameter, AutomationSendParameter, AutomationTarget,
     AutomationValue, CompiledAutomation, CompiledMainMixer, CompiledMixerDestination,
@@ -819,8 +818,8 @@ pub struct RoutedMainRuntime<R> {
 pub type GraphMainRuntime<'prepared, 'cache, 'schedule> =
     RoutedMainRuntime<ArrangementRenderer<'prepared, 'cache, 'schedule>>;
 
-pub type PlaybackGraphMainRuntime<'prepared, 'authority, 'cache, 'schedule, 'resource> =
-    RoutedMainRuntime<PlaybackRenderer<'prepared, 'authority, 'cache, 'schedule, 'resource>>;
+pub type PreparedPlaybackMainRuntime<'prepared, 'cache, 'graph, 'project> =
+    RoutedMainRuntime<PlaybackRenderer<'prepared, 'graph, 'cache, 'graph, 'project>>;
 
 mod sealed {
     pub trait TrackWindowRenderer {}
@@ -923,60 +922,45 @@ impl<'prepared, 'cache, 'schedule>
     }
 }
 
-impl<'prepared, 'authority, 'cache, 'schedule, 'resource>
-    RoutedMainRuntime<PlaybackRenderer<'prepared, 'authority, 'cache, 'schedule, 'resource>>
+impl<'prepared, 'cache, 'graph, 'project>
+    RoutedMainRuntime<PlaybackRenderer<'prepared, 'graph, 'cache, 'graph, 'project>>
 {
-    /// Binds prepared arrangement and scene audio to one routed mixer graph.
+    /// Binds one atomically prepared playback graph to a routed mixer.
     ///
     /// # Errors
     ///
     /// Returns [`RuntimeCreationError`] for bounds, capacity, renderer, or
     /// mixer construction failures.
-    pub fn try_new_playback(
-        schedule: &'prepared PreparedSchedule<'cache, 'schedule>,
-        authority: &'authority CompiledScenePerformance<'resource>,
-        scene_audio: &'prepared PreparedSceneAudio<'cache, 'resource>,
+    pub fn try_new_prepared_playback(
+        prepared: &'prepared PreparedPlayback<'cache, 'graph, 'project>,
         compiled: &CompiledMixerGraph,
         max_block_frames: usize,
     ) -> Result<Self, RuntimeCreationError> {
-        Self::try_new_playback_inner(
-            schedule,
-            authority,
-            scene_audio,
-            compiled,
-            None,
-            max_block_frames,
-        )
+        Self::try_new_prepared_playback_inner(prepared, compiled, None, max_block_frames)
     }
 
-    /// Binds combined playback and compiled sample automation to one graph.
+    /// Binds prepared playback and compiled sample automation to one graph.
     ///
     /// # Errors
     ///
     /// Returns [`RuntimeCreationError`] under the same conditions as
-    /// [`Self::try_new_playback`].
-    pub fn try_new_playback_automated(
-        schedule: &'prepared PreparedSchedule<'cache, 'schedule>,
-        authority: &'authority CompiledScenePerformance<'resource>,
-        scene_audio: &'prepared PreparedSceneAudio<'cache, 'resource>,
+    /// [`Self::try_new_prepared_playback`].
+    pub fn try_new_prepared_playback_automated(
+        prepared: &'prepared PreparedPlayback<'cache, 'graph, 'project>,
         compiled: &CompiledMixerGraph,
         automation: CompiledAutomation,
         max_block_frames: usize,
     ) -> Result<Self, RuntimeCreationError> {
-        Self::try_new_playback_inner(
-            schedule,
-            authority,
-            scene_audio,
+        Self::try_new_prepared_playback_inner(
+            prepared,
             compiled,
             Some(automation),
             max_block_frames,
         )
     }
 
-    fn try_new_playback_inner(
-        schedule: &'prepared PreparedSchedule<'cache, 'schedule>,
-        authority: &'authority CompiledScenePerformance<'resource>,
-        scene_audio: &'prepared PreparedSceneAudio<'cache, 'resource>,
+    fn try_new_prepared_playback_inner(
+        prepared: &'prepared PreparedPlayback<'cache, 'graph, 'project>,
         compiled: &CompiledMixerGraph,
         automation: Option<CompiledAutomation>,
         max_block_frames: usize,
@@ -988,9 +972,9 @@ impl<'prepared, 'authority, 'cache, 'schedule, 'resource>
             track_ids[index] = slot.track_id();
         }
         let renderer = PlaybackRenderer::try_new_for_tracks(
-            schedule,
-            authority,
-            scene_audio,
+            prepared.schedule(),
+            prepared.authority(),
+            prepared.scene_audio(),
             0,
             &track_ids[..slot_count],
         )
@@ -1433,8 +1417,8 @@ pub struct RoutedTransportRuntime<R> {
 pub type GraphTransportRuntime<'prepared, 'cache, 'schedule> =
     RoutedTransportRuntime<ArrangementRenderer<'prepared, 'cache, 'schedule>>;
 
-pub type PlaybackGraphTransportRuntime<'prepared, 'authority, 'cache, 'schedule, 'resource> =
-    RoutedTransportRuntime<PlaybackRenderer<'prepared, 'authority, 'cache, 'schedule, 'resource>>;
+pub type PreparedPlaybackTransportRuntime<'prepared, 'cache, 'graph, 'project> =
+    RoutedTransportRuntime<PlaybackRenderer<'prepared, 'graph, 'cache, 'graph, 'project>>;
 
 impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     #[must_use]

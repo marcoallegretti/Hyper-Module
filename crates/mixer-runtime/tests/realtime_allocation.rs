@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{InterleavedStereoCallback, StereoOutput};
 use hyper_mixer_runtime::{
-    FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, PlaybackGraphMainRuntime,
-    PlaybackGraphTransportRuntime, TransportCommand, output_meter_channel,
+    FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, PreparedPlaybackMainRuntime,
+    PreparedPlaybackTransportRuntime, TransportCommand, output_meter_channel,
 };
 
 use common::{fixture, graph_fixture, playback_fixture};
@@ -162,20 +162,17 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
 fn prepared_combined_playback_performs_zero_heap_allocations() {
     let _guard = TEST_LOCK.lock().unwrap();
     let fixture = playback_fixture();
-    let prepared_schedule = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
-    let prepared_scene = fixture
-        .cache
-        .prepare_scene_audio(&fixture.authority, &fixture.scene_bindings)
-        .unwrap();
-    let runtime = PlaybackGraphMainRuntime::try_new_playback(
-        &prepared_schedule,
-        &fixture.authority,
-        &prepared_scene,
+    let automation = fixture.automation.clone();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_automated(
+        &prepared,
         &fixture.mixer,
+        automation,
         64,
     )
     .unwrap();
-    let mut transport = PlaybackGraphTransportRuntime::new(runtime);
+    let mut transport = PreparedPlaybackTransportRuntime::new(runtime);
     transport.apply_command(TransportCommand::Start);
     let mut arrangement_left = [0.0_f32; 64];
     let mut arrangement_right = [0.0_f32; 64];

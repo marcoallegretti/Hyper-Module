@@ -1,14 +1,16 @@
 mod common;
 
-use hyper_arrangement_renderer::RenderScratchSlot;
+use hyper_arrangement_renderer::{
+    PlaybackRendererCreationError, RenderScratchSlot, RendererCreationError,
+};
 use hyper_audio_engine::{
     InterleavedStereoCallback, MAX_PROCESS_FRAMES, StereoCallbackError, StereoOutput,
 };
 use hyper_mixer_runtime::{
     FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, LocateState,
     MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, OutputMeterPublication,
-    OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot, PlaybackGraphMainRuntime,
-    PlaybackGraphTransportRuntime, RuntimeCreationError, RuntimeProcessError, TransportCommand,
+    OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot, PreparedPlaybackMainRuntime,
+    PreparedPlaybackTransportRuntime, RuntimeCreationError, RuntimeProcessError, TransportCommand,
     TransportCommandSendError, TransportCycle, TransportState, output_meter_channel,
 };
 
@@ -186,20 +188,12 @@ fn verified_documents_render_through_fixed_main_mixer_slots() {
 #[test]
 fn combined_transport_renders_each_track_authority_and_reconstructs_scene_state_on_locate() {
     let fixture = playback_fixture();
-    let prepared_schedule = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
-    let prepared_scene = fixture
-        .cache
-        .prepare_scene_audio(&fixture.authority, &fixture.scene_bindings)
-        .unwrap();
-    let runtime = PlaybackGraphMainRuntime::try_new_playback(
-        &prepared_schedule,
-        &fixture.authority,
-        &prepared_scene,
-        &fixture.mixer,
-        100,
-    )
-    .unwrap();
-    let mut transport = PlaybackGraphTransportRuntime::new(runtime);
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 100)
+            .unwrap();
+    let mut transport = PreparedPlaybackTransportRuntime::new(runtime);
     transport.apply_command(TransportCommand::Start);
 
     let mut arrangement_left = [9.0_f32; 100];
@@ -265,6 +259,22 @@ fn combined_transport_renders_each_track_authority_and_reconstructs_scene_state_
     assert_eq!(transport.position_frame(), 75);
     assert_samples(&output_left, &fixture.arrangement_samples[25..75]);
     assert_samples(&output_right, &fixture.scene_samples[..50]);
+}
+
+#[test]
+fn prepared_playback_rejects_a_mixer_from_another_track_graph() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let unrelated = graph_fixture();
+
+    assert_eq!(
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &unrelated.mixer, 64)
+            .unwrap_err(),
+        RuntimeCreationError::PlaybackRenderer(PlaybackRendererCreationError::Arrangement(
+            RendererCreationError::MissingScheduleTrack { entry_index: 0 }
+        ))
+    );
 }
 
 #[test]
