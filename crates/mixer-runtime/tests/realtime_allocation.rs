@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::StereoOutput;
-use hyper_mixer_runtime::{FlatMainRuntime, GraphMainRuntime};
+use hyper_mixer_runtime::{
+    FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, TransportCommand,
+};
 
 use common::{fixture, graph_fixture};
 
@@ -94,9 +96,11 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
     let fixture = graph_fixture();
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
     let mut runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 64).unwrap();
-    let mut automated =
+    let automated =
         GraphMainRuntime::try_new_automated(&prepared, &fixture.mixer, fixture.automation, 64)
             .unwrap();
+    let mut transport = GraphTransportRuntime::new(automated);
+    transport.apply_command(TransportCommand::Start);
     let mut left_0 = [0.0_f32; 64];
     let mut right_0 = [0.0_f32; 64];
     let mut left_1 = [0.0_f32; 64];
@@ -127,8 +131,15 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
             right: &mut output_right,
         },
     );
-    let automated_result = automated.process_window(
-        0,
+    let automated_result = transport.process_cycle(
+        &mut scratch,
+        StereoOutput {
+            left: &mut output_left,
+            right: &mut output_right,
+        },
+    );
+    transport.apply_command(TransportCommand::Stop);
+    let stopped_result = transport.process_cycle(
         &mut scratch,
         StereoOutput {
             left: &mut output_left,
@@ -139,5 +150,6 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
 
     assert!(result.is_ok());
     assert!(automated_result.is_ok());
+    assert!(stopped_result.is_ok());
     assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
 }

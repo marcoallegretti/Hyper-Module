@@ -3,10 +3,19 @@ mod common;
 use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{MAX_PROCESS_FRAMES, StereoOutput};
 use hyper_mixer_runtime::{
-    FlatMainRuntime, GraphMainRuntime, RuntimeCreationError, RuntimeProcessError,
+    FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, LocateState, RuntimeCreationError,
+    RuntimeProcessError, TransportCommand, TransportCycle, TransportState,
 };
 
 use common::{fixture, graph_fixture};
+
+fn assert_constant(samples: &[f32], expected: f32) {
+    assert!(
+        samples
+            .iter()
+            .all(|sample| (*sample - expected).abs() <= f32::EPSILON)
+    );
+}
 
 fn render_automated_graph(
     runtime: &mut GraphMainRuntime<'_, '_, '_>,
@@ -42,6 +51,31 @@ fn render_automated_graph(
         start = end;
     }
     (output_left, output_right)
+}
+
+fn process_transport<const FRAMES: usize>(
+    transport: &mut GraphTransportRuntime<'_, '_, '_>,
+    output_left: &mut [f32; FRAMES],
+    output_right: &mut [f32; FRAMES],
+) -> Result<TransportCycle, RuntimeProcessError> {
+    let mut scratch_left = [[9.0_f32; FRAMES]; 5];
+    let mut scratch_right = [[9.0_f32; FRAMES]; 5];
+    let [left_0, left_1, left_2, left_3, left_4] = &mut scratch_left;
+    let [right_0, right_1, right_2, right_3, right_4] = &mut scratch_right;
+    let mut scratch = [
+        RenderScratchSlot::new(left_0, right_0),
+        RenderScratchSlot::new(left_1, right_1),
+        RenderScratchSlot::new(left_2, right_2),
+        RenderScratchSlot::new(left_3, right_3),
+        RenderScratchSlot::new(left_4, right_4),
+    ];
+    transport.process_cycle(
+        &mut scratch,
+        StereoOutput {
+            left: output_left,
+            right: output_right,
+        },
+    )
 }
 
 #[test]
@@ -202,6 +236,142 @@ fn automated_graph_is_sample_exact_and_block_size_independent() {
     assert!(whole_right[50].abs() <= f32::EPSILON);
     assert!((whole_left[75] - 0.421_875).abs() <= f32::EPSILON);
     assert!((whole_right[75] - 0.187_5).abs() <= f32::EPSILON);
+}
+
+#[test]
+fn transport_owns_stopped_rolling_and_located_callback_windows() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime =
+        GraphMainRuntime::try_new_automated(&prepared, &fixture.mixer, fixture.automation, 8)
+            .unwrap();
+    let mut transport = GraphTransportRuntime::new(runtime);
+    let mut left = [9.0_f32; 8];
+    let mut right = [9.0_f32; 8];
+
+    let stopped = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(stopped.state(), TransportState::Stopped);
+    assert_eq!(stopped.start_frame(), 0);
+    assert_eq!(stopped.frame_count(), 8);
+    assert_eq!(stopped.active_slot_count(), 0);
+    assert_eq!(transport.position_frame(), 0);
+    assert_constant(&left, 0.0);
+    assert_constant(&right, 0.0);
+
+    let mut empty_left = [];
+    let mut empty_right = [];
+    let empty_stopped =
+        process_transport(&mut transport, &mut empty_left, &mut empty_right).unwrap();
+    assert_eq!(empty_stopped.frame_count(), 0);
+    assert_eq!(transport.position_frame(), 0);
+
+    transport.apply_command(TransportCommand::Start);
+    let empty_rolling =
+        process_transport(&mut transport, &mut empty_left, &mut empty_right).unwrap();
+    assert_eq!(empty_rolling.state(), TransportState::Rolling);
+    assert_eq!(transport.position_frame(), 0);
+
+    let rolling = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(rolling.state(), TransportState::Rolling);
+    assert_eq!(rolling.start_frame(), 0);
+    assert_eq!(rolling.active_slot_count(), 2);
+    assert_eq!(transport.position_frame(), 8);
+    assert!(left[7] > 0.0);
+
+    let consecutive = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(consecutive.start_frame(), 8);
+    assert_eq!(transport.position_frame(), 16);
+
+    transport.apply_command(TransportCommand::Stop);
+    left.fill(9.0);
+    right.fill(9.0);
+    process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(transport.position_frame(), 16);
+    assert_constant(&left, 0.0);
+    assert_constant(&right, 0.0);
+
+    transport.apply_command(TransportCommand::Locate {
+        frame: 25,
+        state: LocateState::Preserve,
+    });
+    assert_eq!(transport.state(), TransportState::Stopped);
+    process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(transport.position_frame(), 25);
+
+    transport.apply_command(TransportCommand::Locate {
+        frame: 25,
+        state: LocateState::Rolling,
+    });
+    let mut seek_left = [9.0_f32; 1];
+    let mut seek_right = [9.0_f32; 1];
+    let sought = process_transport(&mut transport, &mut seek_left, &mut seek_right).unwrap();
+    assert_eq!(sought.start_frame(), 25);
+    assert_eq!(transport.position_frame(), 26);
+    assert!((seek_left[0] - 0.223_861_44).abs() <= f32::EPSILON);
+    assert!((seek_right[0] - 0.176_986_44).abs() <= f32::EPSILON);
+
+    transport.apply_command(TransportCommand::Locate {
+        frame: 40,
+        state: LocateState::Stopped,
+    });
+    process_transport(&mut transport, &mut seek_left, &mut seek_right).unwrap();
+    assert_eq!(transport.state(), TransportState::Stopped);
+    assert_eq!(transport.position_frame(), 40);
+    assert_constant(&seek_left, 0.0);
+    assert_constant(&seek_right, 0.0);
+
+    transport.apply_command(TransportCommand::Locate {
+        frame: usize::MAX - 1,
+        state: LocateState::Rolling,
+    });
+    let mut overflow_left = [9.0_f32; 2];
+    let mut overflow_right = [9.0_f32; 2];
+    assert_eq!(
+        process_transport(&mut transport, &mut overflow_left, &mut overflow_right),
+        Err(RuntimeProcessError::FrameRangeOverflow)
+    );
+    assert_eq!(transport.position_frame(), usize::MAX - 1);
+    assert_constant(&overflow_left, 9.0);
+    assert_constant(&overflow_right, 9.0);
+}
+
+#[test]
+fn failed_transport_cycle_preserves_position_and_output() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let mut transport = GraphTransportRuntime::new(runtime);
+    transport.apply_command(TransportCommand::Locate {
+        frame: 12,
+        state: LocateState::Rolling,
+    });
+    let mut scratch_left = [[7.0_f32; 2]; 5];
+    let mut scratch_right = [[7.0_f32; 2]; 5];
+    let [left_0, left_1, left_2, left_3, left_4] = &mut scratch_left;
+    let [right_0, right_1, right_2, right_3, right_4] = &mut scratch_right;
+    let mut scratch = [
+        RenderScratchSlot::new(left_0, right_0),
+        RenderScratchSlot::new(left_1, right_1),
+        RenderScratchSlot::new(left_2, right_2),
+        RenderScratchSlot::new(left_3, right_3),
+        RenderScratchSlot::new(left_4, right_4),
+    ];
+    let mut output_left = [8.0_f32; 2];
+    let mut output_right = [8.0_f32; 1];
+
+    assert_eq!(
+        transport.process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut output_left,
+                right: &mut output_right,
+            },
+        ),
+        Err(RuntimeProcessError::OutputLengthMismatch { left: 2, right: 1 })
+    );
+    assert_eq!(transport.position_frame(), 12);
+    assert_constant(&output_left, 8.0);
+    assert_constant(&output_right, 8.0);
 }
 
 #[test]

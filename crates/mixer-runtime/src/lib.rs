@@ -116,6 +116,57 @@ impl Error for RuntimeProcessError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportState {
+    Stopped,
+    Rolling,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocateState {
+    Preserve,
+    Stopped,
+    Rolling,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportCommand {
+    Start,
+    Stop,
+    Locate { frame: usize, state: LocateState },
+}
+
+/// Result of one device-independent transport processing cycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransportCycle {
+    state: TransportState,
+    start_frame: usize,
+    frame_count: usize,
+    active_slot_count: usize,
+}
+
+impl TransportCycle {
+    #[must_use]
+    pub const fn state(self) -> TransportState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn start_frame(self) -> usize {
+        self.start_frame
+    }
+
+    #[must_use]
+    pub const fn frame_count(self) -> usize {
+        self.frame_count
+    }
+
+    #[must_use]
+    pub const fn active_slot_count(self) -> usize {
+        self.active_slot_count
+    }
+}
+
 /// A prepared arrangement renderer and mixer whose slot identities cannot
 /// diverge after construction.
 ///
@@ -889,6 +940,114 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
                 );
             }
         }
+    }
+}
+
+/// Single-owner transport state for the routed main-output engine.
+///
+/// Commands are applied synchronously between process cycles. This type does
+/// not provide cross-thread command delivery or device I/O. Stopped cycles
+/// produce silence and retain the current frame; rolling cycles advance only
+/// after the complete routed window succeeds.
+#[derive(Debug)]
+pub struct GraphTransportRuntime<'prepared, 'cache, 'schedule> {
+    runtime: GraphMainRuntime<'prepared, 'cache, 'schedule>,
+    state: TransportState,
+    position_frame: usize,
+}
+
+impl<'prepared, 'cache, 'schedule> GraphTransportRuntime<'prepared, 'cache, 'schedule> {
+    #[must_use]
+    pub const fn new(runtime: GraphMainRuntime<'prepared, 'cache, 'schedule>) -> Self {
+        Self {
+            runtime,
+            state: TransportState::Stopped,
+            position_frame: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> TransportState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn position_frame(&self) -> usize {
+        self.position_frame
+    }
+
+    #[must_use]
+    pub const fn max_block_frames(&self) -> usize {
+        self.runtime.max_block_frames()
+    }
+
+    /// Applies one transport command for the next process cycle.
+    pub const fn apply_command(&mut self, command: TransportCommand) {
+        match command {
+            TransportCommand::Start => self.state = TransportState::Rolling,
+            TransportCommand::Stop => self.state = TransportState::Stopped,
+            TransportCommand::Locate { frame, state } => {
+                self.position_frame = frame;
+                match state {
+                    LocateState::Preserve => {}
+                    LocateState::Stopped => self.state = TransportState::Stopped,
+                    LocateState::Rolling => self.state = TransportState::Rolling,
+                }
+            }
+        }
+    }
+
+    /// Processes the next transport-owned callback window.
+    ///
+    /// Stopped cycles clear the output without reading arrangement scratch or
+    /// advancing the position. Rolling cycles render from the current absolute
+    /// frame and publish the next position only after successful processing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeProcessError`] for output shape, block capacity, frame
+    /// range, rendering, automation, or mixer failures. A failed cycle never
+    /// advances the transport position.
+    pub fn process_cycle(
+        &mut self,
+        scratch: &mut [RenderScratchSlot<'_>],
+        output: StereoOutput<'_>,
+    ) -> Result<TransportCycle, RuntimeProcessError> {
+        let frame_count = output.left.len();
+        if frame_count != output.right.len() {
+            return Err(RuntimeProcessError::OutputLengthMismatch {
+                left: frame_count,
+                right: output.right.len(),
+            });
+        }
+        if frame_count > self.runtime.max_block_frames() {
+            return Err(RuntimeProcessError::BlockLimit {
+                actual: frame_count,
+                maximum: self.runtime.max_block_frames(),
+            });
+        }
+        let start_frame = self.position_frame;
+        if self.state == TransportState::Stopped {
+            output.left.fill(0.0);
+            output.right.fill(0.0);
+            return Ok(TransportCycle {
+                state: self.state,
+                start_frame,
+                frame_count,
+                active_slot_count: 0,
+            });
+        }
+        let next_frame = start_frame
+            .checked_add(frame_count)
+            .ok_or(RuntimeProcessError::FrameRangeOverflow)?;
+        let rendered = self.runtime.process_window(start_frame, scratch, output)?;
+        self.position_frame = next_frame;
+        Ok(TransportCycle {
+            state: self.state,
+            start_frame,
+            frame_count,
+            active_slot_count: rendered.active_slot_count,
+        })
     }
 }
 
