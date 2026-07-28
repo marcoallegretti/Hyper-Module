@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/control-mappings.schema.json",
+  "title": "Hyper Module control mappings version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "id",
+    "project_id",
+    "bindings",
+    "extensions"
+  ],
+  "properties": {
+    "format": { "const": "hyper-control-mappings" },
+    "format_version": { "const": 1 },
+    "id": { "$ref": "common.schema.json#/$defs/entity_id" },
+    "project_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+    "bindings": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/binding" }
+    },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+  },
+  "$defs": {
+    "normalized_signed": {
+      "type": "integer",
+      "minimum": -1000000,
+      "maximum": 1000000
+    },
+    "normalized_unsigned": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000000
+    },
+    "binding": {
+      "type": "object",
+      "required": ["id", "enabled", "source", "scope", "transform", "target"],
+      "properties": {
+        "id": { "$ref": "common.schema.json#/$defs/entity_id" },
+        "enabled": { "type": "boolean" },
+        "source": {
+          "oneOf": [
+            { "$ref": "#/$defs/cv_source" },
+            { "$ref": "#/$defs/clock_source" },
+            { "$ref": "#/$defs/reset_source" }
+          ]
+        },
+        "scope": {
+          "oneOf": [
+            { "$ref": "#/$defs/global_scope" },
+            { "$ref": "#/$defs/mixer_scope" },
+            { "$ref": "#/$defs/track_scope" },
+            { "$ref": "#/$defs/scene_scope" }
+          ]
+        },
+        "transform": {
+          "oneOf": [
+            { "$ref": "#/$defs/linear_transform" },
+            { "$ref": "#/$defs/trigger_transform" }
+          ]
+        },
+        "target": {
+          "oneOf": [
+            { "$ref": "#/$defs/channel_target" },
+            { "$ref": "#/$defs/send_target" },
+            { "$ref": "#/$defs/main_target" },
+            { "$ref": "#/$defs/cue_target" },
+            { "$ref": "#/$defs/scene_target" },
+            { "$ref": "#/$defs/transport_target" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "cv_source": {
+      "type": "object",
+      "required": ["kind", "input_index"],
+      "properties": {
+        "kind": { "const": "cv-input" },
+        "input_index": { "type": "integer", "minimum": 0, "maximum": 3 }
+      },
+      "additionalProperties": false
+    },
+    "clock_source": {
+      "type": "object",
+      "required": ["kind", "edge"],
+      "properties": {
+        "kind": { "const": "clock-input" },
+        "edge": { "enum": ["rising", "falling"] }
+      },
+      "additionalProperties": false
+    },
+    "reset_source": {
+      "type": "object",
+      "required": ["kind", "edge"],
+      "properties": {
+        "kind": { "const": "reset-input" },
+        "edge": { "enum": ["rising", "falling"] }
+      },
+      "additionalProperties": false
+    },
+    "global_scope": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": { "kind": { "const": "global" } },
+      "additionalProperties": false
+    },
+    "mixer_scope": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": { "kind": { "const": "mixer-page" } },
+      "additionalProperties": false
+    },
+    "track_scope": {
+      "type": "object",
+      "required": ["kind", "track_id"],
+      "properties": {
+        "kind": { "const": "track" },
+        "track_id": { "$ref": "common.schema.json#/$defs/entity_id" }
+      },
+      "additionalProperties": false
+    },
+    "scene_scope": {
+      "type": "object",
+      "required": ["kind", "scene_id"],
+      "properties": {
+        "kind": { "const": "scene" },
+        "scene_id": { "$ref": "common.schema.json#/$defs/entity_id" }
+      },
+      "additionalProperties": false
+    },
+    "linear_transform": {
+      "type": "object",
+      "required": [
+        "kind",
+        "input_min",
+        "input_max",
+        "output_min",
+        "output_max"
+      ],
+      "properties": {
+        "kind": { "const": "linear" },
+        "input_min": { "$ref": "#/$defs/normalized_signed" },
+        "input_max": { "$ref": "#/$defs/normalized_signed" },
+        "output_min": { "$ref": "#/$defs/normalized_unsigned" },
+        "output_max": { "$ref": "#/$defs/normalized_unsigned" }
+      },
+      "additionalProperties": false
+    },
+    "trigger_transform": {
+      "type": "object",
+      "required": ["kind", "behavior"],
+      "properties": {
+        "kind": { "const": "trigger" },
+        "behavior": { "enum": ["invoke", "toggle", "momentary"] }
+      },
+      "additionalProperties": false
+    },
+    "channel_target": {
+      "type": "object",
+      "required": ["kind", "track_id", "parameter"],
+      "properties": {
+        "kind": { "const": "mixer-channel" },
+        "track_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+        "parameter": { "enum": ["gain", "pan", "mute", "solo"] }
+      },
+      "additionalProperties": false
+    },
+    "send_target": {
+      "type": "object",
+      "required": ["kind", "send_id", "parameter"],
+      "properties": {
+        "kind": { "const": "mixer-send" },
+        "send_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+        "parameter": { "enum": ["gain", "pan", "enabled"] }
+      },
+      "additionalProperties": false
+    },
+    "main_target": {
+      "type": "object",
+      "required": ["kind", "parameter"],
+      "properties": {
+        "kind": { "const": "mixer-main" },
+        "parameter": { "enum": ["gain", "mute"] }
+      },
+      "additionalProperties": false
+    },
+    "cue_target": {
+      "type": "object",
+      "required": ["kind", "parameter"],
+      "properties": {
+        "kind": { "const": "mixer-cue" },
+        "parameter": { "enum": ["gain", "mute"] }
+      },
+      "additionalProperties": false
+    },
+    "scene_target": {
+      "type": "object",
+      "required": ["kind", "scene_id", "action"],
+      "properties": {
+        "kind": { "const": "scene" },
+        "scene_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+        "action": { "const": "launch" }
+      },
+      "additionalProperties": false
+    },
+    "transport_target": {
+      "type": "object",
+      "required": ["kind", "action"],
+      "properties": {
+        "kind": { "const": "transport" },
+        "action": { "enum": ["play", "stop", "toggle", "reset"] }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/timeline.schema.json",
+  "title": "Hyper Module timeline version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "id",
+    "project_id",
+    "ticks_per_quarter",
+    "tempo_events",
+    "meter_events",
+    "extensions"
+  ],
+  "properties": {
+    "format": {
+      "const": "hyper-timeline"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "project_id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "ticks_per_quarter": {
+      "const": 1920
+    },
+    "tempo_events": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 65536,
+      "items": {
+        "$ref": "#/$defs/tempo_event"
+      }
+    },
+    "meter_events": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 65536,
+      "items": {
+        "$ref": "#/$defs/meter_event"
+      }
+    },
+    "extensions": {
+      "$ref": "common.schema.json#/$defs/extensions"
+    }
+  },
+  "$defs": {
+    "tempo_event": {
+      "type": "object",
+      "required": ["tick", "microseconds_per_quarter"],
+      "properties": {
+        "tick": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "microseconds_per_quarter": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16777215
+        }
+      },
+      "additionalProperties": false
+    },
+    "meter_event": {
+      "type": "object",
+      "required": ["tick", "numerator", "denominator"],
+      "properties": {
+        "tick": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "numerator": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 255
+        },
+        "denominator": {
+          "enum": [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

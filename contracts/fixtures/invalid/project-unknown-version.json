@@ -1,0 +1,26 @@
+{
+  "format": "hyper-project",
+  "format_version": 2,
+  "project_id": "018f47a2-6b2d-7c11-8a44-001122334455",
+  "revision": 0,
+  "name": "Unsupported Version",
+  "sample_rate_hz": 48000,
+  "required_capabilities": {
+    "format": "hyper-hardware-capabilities",
+    "format_version": 1,
+    "audio_inputs": 0,
+    "audio_outputs": 2,
+    "cv_inputs": 0,
+    "cv_outputs": 0,
+    "gate_outputs": 0,
+    "has_clock_input": false,
+    "has_reset_input": false,
+    "has_clock_output": false,
+    "usb_mode": "none",
+    "has_ethernet": false,
+    "extensions": {}
+  },
+  "resources": [],
+  "assets": [],
+  "extensions": {}
+}

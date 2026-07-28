@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/deployment-request.schema.json",
+  "title": "Hyper Module signed deployment request version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "device_id",
+    "client_id",
+    "request_id",
+    "sequence",
+    "operation",
+    "bundle_sha256",
+    "bundle_byte_length",
+    "runtime_version",
+    "issued_at_epoch_ms",
+    "expires_at_epoch_ms",
+    "signature",
+    "extensions"
+  ],
+  "properties": {
+    "format": { "const": "hyper-deployment-request" },
+    "format_version": { "const": 1 },
+    "device_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+    "client_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+    "request_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+    "sequence": {
+      "$ref": "common.schema.json#/$defs/safe_positive_integer"
+    },
+    "operation": { "const": "deploy" },
+    "bundle_sha256": { "$ref": "common.schema.json#/$defs/sha256" },
+    "bundle_byte_length": {
+      "$ref": "common.schema.json#/$defs/safe_positive_integer"
+    },
+    "runtime_version": {
+      "$ref": "common.schema.json#/$defs/semantic_version"
+    },
+    "issued_at_epoch_ms": {
+      "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+    },
+    "expires_at_epoch_ms": {
+      "$ref": "common.schema.json#/$defs/safe_positive_integer"
+    },
+    "signature": {
+      "$ref": "common.schema.json#/$defs/ed25519_signature"
+    },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+  },
+  "additionalProperties": false
+}

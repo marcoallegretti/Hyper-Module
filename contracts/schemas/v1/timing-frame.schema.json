@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/timing-frame.schema.json",
+  "title": "Hyper Module timing protocol frame version 1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/session_open"
+    },
+    {
+      "$ref": "#/$defs/heartbeat"
+    },
+    {
+      "$ref": "#/$defs/schedule"
+    }
+  ],
+  "$defs": {
+    "session_open": {
+      "type": "object",
+      "required": [
+        "format",
+        "format_version",
+        "protocol_version",
+        "kind",
+        "session_id",
+        "session_epoch",
+        "sequence"
+      ],
+      "properties": {
+        "format": {
+          "const": "hyper-timing-frame"
+        },
+        "format_version": {
+          "const": 1
+        },
+        "protocol_version": {
+          "const": 1
+        },
+        "kind": {
+          "const": "session-open"
+        },
+        "session_id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "session_epoch": {
+          "$ref": "common.schema.json#/$defs/safe_positive_integer"
+        },
+        "sequence": {
+          "const": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "heartbeat": {
+      "type": "object",
+      "required": [
+        "format",
+        "format_version",
+        "protocol_version",
+        "kind",
+        "session_id",
+        "session_epoch",
+        "sequence"
+      ],
+      "properties": {
+        "format": {
+          "const": "hyper-timing-frame"
+        },
+        "format_version": {
+          "const": 1
+        },
+        "protocol_version": {
+          "const": 1
+        },
+        "kind": {
+          "const": "heartbeat"
+        },
+        "session_id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "session_epoch": {
+          "$ref": "common.schema.json#/$defs/safe_positive_integer"
+        },
+        "sequence": {
+          "$ref": "common.schema.json#/$defs/safe_positive_integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "schedule": {
+      "type": "object",
+      "required": [
+        "format",
+        "format_version",
+        "protocol_version",
+        "kind",
+        "session_id",
+        "session_epoch",
+        "sequence",
+        "coverage_until_us",
+        "events"
+      ],
+      "properties": {
+        "format": {
+          "const": "hyper-timing-frame"
+        },
+        "format_version": {
+          "const": 1
+        },
+        "protocol_version": {
+          "const": 1
+        },
+        "kind": {
+          "const": "schedule"
+        },
+        "session_id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "session_epoch": {
+          "$ref": "common.schema.json#/$defs/safe_positive_integer"
+        },
+        "sequence": {
+          "$ref": "common.schema.json#/$defs/safe_positive_integer"
+        },
+        "coverage_until_us": {
+          "$ref": "common.schema.json#/$defs/safe_positive_integer"
+        },
+        "events": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/cv_output"
+              },
+              {
+                "$ref": "#/$defs/gate_output"
+              },
+              {
+                "$ref": "#/$defs/clock_output"
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "cv_output": {
+      "type": "object",
+      "required": ["kind", "output_index", "value", "timestamp_us"],
+      "properties": {
+        "kind": {
+          "const": "cv-output"
+        },
+        "output_index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "value": {
+          "type": "integer",
+          "minimum": -1000000,
+          "maximum": 1000000
+        },
+        "timestamp_us": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "gate_output": {
+      "type": "object",
+      "required": ["kind", "output_index", "level", "timestamp_us"],
+      "properties": {
+        "kind": {
+          "const": "gate-output"
+        },
+        "output_index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "level": {
+          "type": "boolean"
+        },
+        "timestamp_us": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "clock_output": {
+      "type": "object",
+      "required": ["kind", "level", "timestamp_us"],
+      "properties": {
+        "kind": {
+          "const": "clock-output"
+        },
+        "level": {
+          "type": "boolean"
+        },
+        "timestamp_us": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "format": "hyper-timing-frame",
+  "format_version": 1,
+  "protocol_version": 2,
+  "kind": "session-open",
+  "session_id": "018f47a2-6b2d-7c11-8a44-001122334490",
+  "session_epoch": 7,
+  "sequence": 1
+}

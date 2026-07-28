@@ -1,0 +1,258 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/deployment-authorization-state.schema.json",
+  "title": "Hyper Module deployment authorization state version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "generation",
+    "device_id",
+    "device_public_key",
+    "policy",
+    "pending_pairing_challenge",
+    "clients",
+    "recent_requests",
+    "audit_sequence",
+    "audit_events",
+    "extensions"
+  ],
+  "properties": {
+    "format": { "const": "hyper-deployment-authorization-state" },
+    "format_version": { "const": 1 },
+    "generation": {
+      "$ref": "common.schema.json#/$defs/safe_positive_integer"
+    },
+    "device_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+    "device_public_key": {
+      "$ref": "common.schema.json#/$defs/ed25519_public_jwk"
+    },
+    "policy": { "$ref": "#/$defs/policy" },
+    "pending_pairing_challenge": {
+      "oneOf": [
+        { "$ref": "#/$defs/pairing_challenge" },
+        { "type": "null" }
+      ]
+    },
+    "clients": {
+      "type": "array",
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/client" }
+    },
+    "recent_requests": {
+      "type": "array",
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/recent_request" }
+    },
+    "audit_sequence": {
+      "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+    },
+    "audit_events": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": { "$ref": "#/$defs/audit_event" }
+    },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+  },
+  "$defs": {
+    "policy": {
+      "type": "object",
+      "required": [
+        "max_paired_clients",
+        "max_recent_requests",
+        "max_audit_events",
+        "max_request_lifetime_ms",
+        "max_clock_skew_ms",
+        "max_bundle_bytes"
+      ],
+      "properties": {
+        "max_paired_clients": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "max_recent_requests": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "max_audit_events": {
+          "type": "integer",
+          "minimum": 16,
+          "maximum": 1024
+        },
+        "max_request_lifetime_ms": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 900000
+        },
+        "max_clock_skew_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 300000
+        },
+        "max_bundle_bytes": {
+          "$ref": "common.schema.json#/$defs/safe_positive_integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "pairing_challenge": {
+      "type": "object",
+      "required": ["challenge_id", "expires_at_epoch_ms"],
+      "properties": {
+        "challenge_id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "expires_at_epoch_ms": {
+          "$ref": "common.schema.json#/$defs/safe_positive_integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "client": {
+      "type": "object",
+      "required": [
+        "client_id",
+        "client_name",
+        "public_key",
+        "key_thumbprint",
+        "paired_at_epoch_ms",
+        "last_request_sequence"
+      ],
+      "properties": {
+        "client_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+        "client_name": { "$ref": "common.schema.json#/$defs/display_name" },
+        "public_key": {
+          "$ref": "common.schema.json#/$defs/ed25519_public_jwk"
+        },
+        "key_thumbprint": {
+          "$ref": "common.schema.json#/$defs/sha256_base64url"
+        },
+        "paired_at_epoch_ms": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "last_request_sequence": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "recent_request": {
+      "type": "object",
+      "required": [
+        "request_id",
+        "client_id",
+        "sequence",
+        "envelope_sha256",
+        "bundle_sha256",
+        "status",
+        "deployment_generation",
+        "failure_code"
+      ],
+      "properties": {
+        "request_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+        "client_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+        "sequence": {
+          "$ref": "common.schema.json#/$defs/safe_positive_integer"
+        },
+        "envelope_sha256": {
+          "$ref": "common.schema.json#/$defs/sha256"
+        },
+        "bundle_sha256": {
+          "$ref": "common.schema.json#/$defs/sha256"
+        },
+        "status": {
+          "enum": ["authorized", "succeeded", "failed"]
+        },
+        "deployment_generation": {
+          "oneOf": [
+            {
+              "$ref": "common.schema.json#/$defs/safe_positive_integer"
+            },
+            { "type": "null" }
+          ]
+        },
+        "failure_code": {
+          "oneOf": [
+            { "const": "deployment-failed" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "audit_event": {
+      "type": "object",
+      "required": [
+        "sequence",
+        "event_id",
+        "event_type",
+        "client_id",
+        "request_id",
+        "result",
+        "reason",
+        "occurred_at_epoch_ms"
+      ],
+      "properties": {
+        "sequence": {
+          "$ref": "common.schema.json#/$defs/safe_positive_integer"
+        },
+        "event_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+        "event_type": {
+          "enum": [
+            "pairing",
+            "client-revocation",
+            "deployment-authorization",
+            "deployment-result"
+          ]
+        },
+        "client_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/entity_id" },
+            { "type": "null" }
+          ]
+        },
+        "request_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/entity_id" },
+            { "type": "null" }
+          ]
+        },
+        "result": {
+          "enum": ["accepted", "rejected", "succeeded", "failed"]
+        },
+        "reason": {
+          "enum": [
+            "paired",
+            "already-paired",
+            "revoked",
+            "authorized",
+            "deployment-succeeded",
+            "deployment-failed",
+            "unknown-client",
+            "invalid-signature",
+            "wrong-device",
+            "expired",
+            "not-yet-valid",
+            "invalid-lifetime",
+            "replay",
+            "request-id-collision",
+            "request-in-progress",
+            "bundle-too-large",
+            "physical-authorization-required",
+            "invalid-pairing-challenge",
+            "client-limit",
+            "client-id-collision",
+            "key-already-paired"
+          ]
+        },
+        "occurred_at_epoch_ms": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

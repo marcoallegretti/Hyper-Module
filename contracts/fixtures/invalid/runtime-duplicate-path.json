@@ -1,0 +1,45 @@
+{
+  "format": "hyper-runtime-bundle",
+  "format_version": 1,
+  "project_id": "018f47a2-6b2d-7c11-8a44-001122334455",
+  "project_revision": 0,
+  "source_project_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "minimum_runtime_version": "1.0.0",
+  "builder": {
+    "id": "hyper-bundle-builder",
+    "version": "1.0.0"
+  },
+  "entrypoint": "project.runtime.json",
+  "required_capabilities": {
+    "format": "hyper-hardware-capabilities",
+    "format_version": 1,
+    "audio_inputs": 0,
+    "audio_outputs": 2,
+    "cv_inputs": 0,
+    "cv_outputs": 0,
+    "gate_outputs": 0,
+    "has_clock_input": false,
+    "has_reset_input": false,
+    "has_clock_output": false,
+    "usb_mode": "none",
+    "has_ethernet": false,
+    "extensions": {}
+  },
+  "files": [
+    {
+      "path": "project.runtime.json",
+      "role": "runtime-project",
+      "media_type": "application/json",
+      "byte_length": 1,
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    {
+      "path": "project.runtime.json",
+      "role": "audio",
+      "media_type": "audio/wav",
+      "byte_length": 1,
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  ],
+  "extensions": {}
+}

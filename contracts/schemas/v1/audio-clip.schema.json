@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/audio-clip.schema.json",
+  "title": "Hyper Module audio clip version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "id",
+    "project_id",
+    "track_id",
+    "name",
+    "enabled",
+    "duration_ticks",
+    "source",
+    "loop",
+    "playback",
+    "fades",
+    "warp_markers",
+    "extensions"
+  ],
+  "properties": {
+    "format": {
+      "const": "hyper-audio-clip"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "project_id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "track_id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "duration_ticks": {
+      "$ref": "common.schema.json#/$defs/safe_positive_integer"
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
+    "loop": {
+      "$ref": "#/$defs/loop"
+    },
+    "playback": {
+      "$ref": "#/$defs/playback"
+    },
+    "fades": {
+      "$ref": "#/$defs/fades"
+    },
+    "warp_markers": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 65536,
+      "items": {
+        "$ref": "#/$defs/warp_marker"
+      }
+    },
+    "extensions": {
+      "$ref": "common.schema.json#/$defs/extensions"
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "required": ["asset_id", "start_frame", "frame_count"],
+      "properties": {
+        "asset_id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "start_frame": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "frame_count": {
+          "$ref": "common.schema.json#/$defs/safe_positive_integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "loop": {
+      "type": "object",
+      "required": ["enabled", "start_tick", "end_tick"],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "start_tick": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "end_tick": {
+          "$ref": "common.schema.json#/$defs/safe_positive_integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "playback": {
+      "type": "object",
+      "required": ["gain_decibels", "reverse", "transpose_cents"],
+      "properties": {
+        "gain_decibels": {
+          "type": "number"
+        },
+        "reverse": {
+          "type": "boolean"
+        },
+        "transpose_cents": {
+          "$ref": "common.schema.json#/$defs/safe_integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "fades": {
+      "type": "object",
+      "required": ["curve", "in_ticks", "out_ticks"],
+      "properties": {
+        "curve": {
+          "const": "linear-amplitude"
+        },
+        "in_ticks": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "out_ticks": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "warp_marker": {
+      "type": "object",
+      "required": ["tick", "source_frame_offset"],
+      "properties": {
+        "tick": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "source_frame_offset": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,24 @@
+{
+  "format": "hyper-scene",
+  "format_version": 1,
+  "id": "018f47a2-6b2d-7c11-8a44-001122334461",
+  "project_id": "018f47a2-6b2d-7c11-8a44-001122334455",
+  "name": "Duplicate Track",
+  "order": 0,
+  "enabled": true,
+  "launch_quantization": {
+    "mode": "immediate"
+  },
+  "slots": [
+    {
+      "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
+      "action": "play",
+      "clip_id": "018f47a2-6b2d-7c11-8a44-001122334460"
+    },
+    {
+      "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
+      "action": "stop"
+    }
+  ],
+  "extensions": {}
+}

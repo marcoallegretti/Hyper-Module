@@ -1,0 +1,12 @@
+{
+  "format": "hyper-track",
+  "format_version": 1,
+  "id": "018f47a2-6b2d-7c11-8a44-001122334456",
+  "project_id": "018f47a2-6b2d-7c11-8a44-001122334455",
+  "name": "Audio 1",
+  "kind": "audio",
+  "order": 0,
+  "active": true,
+  "clip_ids": [],
+  "extensions": {}
+}

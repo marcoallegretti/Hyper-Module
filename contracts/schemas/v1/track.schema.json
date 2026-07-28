@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/track.schema.json",
+  "title": "Hyper Module structural track version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "id",
+    "project_id",
+    "name",
+    "kind",
+    "order",
+    "active",
+    "clip_ids",
+    "extensions"
+  ],
+  "properties": {
+    "format": {
+      "const": "hyper-track"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "project_id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "kind": {
+      "enum": ["audio", "midi", "cv-gate", "external-input", "group", "return"]
+    },
+    "order": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 7
+    },
+    "active": {
+      "type": "boolean"
+    },
+    "parent_track_id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "clip_ids": {
+      "type": "array",
+      "maxItems": 4096,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "common.schema.json#/$defs/entity_id"
+      }
+    },
+    "extensions": {
+      "$ref": "common.schema.json#/$defs/extensions"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "enum": ["group", "return", "external-input"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "clip_ids": {
+            "type": "array",
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

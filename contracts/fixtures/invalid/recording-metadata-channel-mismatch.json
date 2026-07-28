@@ -1,0 +1,16 @@
+{
+  "format": "hyper-recording-metadata",
+  "format_version": 1,
+  "id": "018f47a2-6b2d-7c11-8a44-001122334477",
+  "project_id": "018f47a2-6b2d-7c11-8a44-001122334455",
+  "asset_id": "018f47a2-6b2d-7c11-8a44-001122334478",
+  "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
+  "capture_kind": "new",
+  "captured_at_utc": "2026-07-27T12:00:00.000Z",
+  "timeline_start_tick": 0,
+  "source_input_indices": [0],
+  "sample_rate_hz": 48000,
+  "channels": 2,
+  "frame_count": 96000,
+  "extensions": {}
+}

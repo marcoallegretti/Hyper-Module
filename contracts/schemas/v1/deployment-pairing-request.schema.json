@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/deployment-pairing-request.schema.json",
+  "title": "Hyper Module deployment pairing request version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "device_id",
+    "client_id",
+    "client_name",
+    "client_public_key",
+    "challenge_id",
+    "issued_at_epoch_ms",
+    "expires_at_epoch_ms",
+    "signature",
+    "extensions"
+  ],
+  "properties": {
+    "format": { "const": "hyper-deployment-pairing-request" },
+    "format_version": { "const": 1 },
+    "device_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+    "client_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+    "client_name": { "$ref": "common.schema.json#/$defs/display_name" },
+    "client_public_key": {
+      "$ref": "common.schema.json#/$defs/ed25519_public_jwk"
+    },
+    "challenge_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+    "issued_at_epoch_ms": {
+      "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+    },
+    "expires_at_epoch_ms": {
+      "$ref": "common.schema.json#/$defs/safe_positive_integer"
+    },
+    "signature": {
+      "$ref": "common.schema.json#/$defs/ed25519_signature"
+    },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+  },
+  "additionalProperties": false
+}

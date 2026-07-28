@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/mixer.schema.json",
+  "title": "Hyper Module mixer state version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "id",
+    "project_id",
+    "channels",
+    "return_buses",
+    "main",
+    "cue",
+    "extensions"
+  ],
+  "properties": {
+    "format": {
+      "const": "hyper-mixer"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "project_id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "channels": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/channel"
+      }
+    },
+    "return_buses": {
+      "type": "array",
+      "maxItems": 2,
+      "items": {
+        "$ref": "#/$defs/return_bus"
+      }
+    },
+    "main": {
+      "$ref": "#/$defs/output_state"
+    },
+    "cue": {
+      "$ref": "#/$defs/cue_state"
+    },
+    "extensions": {
+      "$ref": "common.schema.json#/$defs/extensions"
+    }
+  },
+  "$defs": {
+    "gain": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2000000
+    },
+    "pan": {
+      "type": "integer",
+      "minimum": -1000000,
+      "maximum": 1000000
+    },
+    "destination": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {
+            "kind": {
+              "const": "main"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "track_id"],
+          "properties": {
+            "kind": {
+              "const": "track"
+            },
+            "track_id": {
+              "$ref": "common.schema.json#/$defs/entity_id"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "send": {
+      "type": "object",
+      "required": [
+        "id",
+        "bus",
+        "tap",
+        "gain_millionths",
+        "pan_millionths",
+        "enabled"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "bus": {
+          "enum": ["a", "b"]
+        },
+        "tap": {
+          "enum": ["pre-fader", "post-fader"]
+        },
+        "gain_millionths": {
+          "$ref": "#/$defs/gain"
+        },
+        "pan_millionths": {
+          "$ref": "#/$defs/pan"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "channel": {
+      "type": "object",
+      "required": [
+        "track_id",
+        "gain_millionths",
+        "pan_millionths",
+        "mute",
+        "solo",
+        "destination",
+        "sends"
+      ],
+      "properties": {
+        "track_id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "gain_millionths": {
+          "$ref": "#/$defs/gain"
+        },
+        "pan_millionths": {
+          "$ref": "#/$defs/pan"
+        },
+        "mute": {
+          "type": "boolean"
+        },
+        "solo": {
+          "type": "boolean"
+        },
+        "destination": {
+          "$ref": "#/$defs/destination"
+        },
+        "sends": {
+          "type": "array",
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/send"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "return_bus": {
+      "type": "object",
+      "required": ["bus", "track_id"],
+      "properties": {
+        "bus": {
+          "enum": ["a", "b"]
+        },
+        "track_id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        }
+      },
+      "additionalProperties": false
+    },
+    "output_state": {
+      "type": "object",
+      "required": ["gain_millionths", "mute"],
+      "properties": {
+        "gain_millionths": {
+          "$ref": "#/$defs/gain"
+        },
+        "mute": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "cue_state": {
+      "type": "object",
+      "required": ["source", "gain_millionths", "mute"],
+      "properties": {
+        "source": {
+          "enum": ["main", "solo"]
+        },
+        "gain_millionths": {
+          "$ref": "#/$defs/gain"
+        },
+        "mute": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/project.schema.json",
+  "title": "Hyper Module editable project package version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "project_id",
+    "revision",
+    "name",
+    "sample_rate_hz",
+    "required_capabilities",
+    "resources",
+    "assets",
+    "extensions"
+  ],
+  "properties": {
+    "format": {
+      "const": "hyper-project"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "project_id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "revision": {
+      "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "sample_rate_hz": {
+      "const": 48000
+    },
+    "required_capabilities": {
+      "$ref": "hardware-capabilities.schema.json"
+    },
+    "resources": {
+      "type": "array",
+      "maxItems": 4096,
+      "contains": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "const": "timeline"
+          }
+        },
+        "required": ["role"]
+      },
+      "minContains": 1,
+      "maxContains": 1,
+      "items": {
+        "$ref": "#/$defs/resource"
+      }
+    },
+    "assets": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": {
+        "$ref": "#/$defs/asset"
+      }
+    },
+    "extensions": {
+      "$ref": "common.schema.json#/$defs/extensions"
+    }
+  },
+  "$defs": {
+    "resource": {
+      "type": "object",
+      "required": [
+        "id",
+        "role",
+        "path",
+        "media_type",
+        "byte_length",
+        "sha256",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "role": {
+          "enum": [
+            "timeline",
+            "track",
+            "clip",
+            "scene",
+            "arrangement",
+            "mixer",
+            "mapping",
+            "automation-take",
+            "recording-metadata"
+          ]
+        },
+        "path": {
+          "$ref": "common.schema.json#/$defs/relative_path"
+        },
+        "media_type": {
+          "const": "application/json"
+        },
+        "byte_length": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "sha256": {
+          "$ref": "common.schema.json#/$defs/sha256"
+        },
+        "extensions": {
+          "$ref": "common.schema.json#/$defs/extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "asset": {
+      "type": "object",
+      "required": [
+        "id",
+        "role",
+        "path",
+        "media_type",
+        "byte_length",
+        "sha256",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "role": {
+          "enum": ["sample", "recording"]
+        },
+        "path": {
+          "$ref": "common.schema.json#/$defs/relative_path"
+        },
+        "media_type": {
+          "enum": ["audio/flac", "audio/wav"]
+        },
+        "byte_length": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "sha256": {
+          "$ref": "common.schema.json#/$defs/sha256"
+        },
+        "extensions": {
+          "$ref": "common.schema.json#/$defs/extensions"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

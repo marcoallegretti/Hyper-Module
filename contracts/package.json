@@ -1,0 +1,26 @@
+{
+  "name": "hyper-module-contracts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Conformance tests for Hyper Module data contracts",
+  "type": "module",
+  "scripts": {
+    "test": "node scripts/verify-contracts.mjs && node scripts/test-timeline.mjs && node scripts/test-audio-clip.mjs && node scripts/test-scene.mjs && node scripts/test-arrangement.mjs && node scripts/test-mixer.mjs && node scripts/test-control-mappings.mjs && node scripts/test-timing-simulator.mjs && node scripts/test-recording-metadata.mjs && node scripts/test-automation-take.mjs && node scripts/test-bundle-verifier.mjs && node scripts/test-bundle-builder.mjs && node scripts/test-project-bundle-builder.mjs && node scripts/test-project-roundtrip.mjs && node scripts/test-deployment-target.mjs && node scripts/test-deployment-authorization.mjs && node scripts/test-project-verifier.mjs",
+    "build:bundle": "node scripts/build-bundle.mjs",
+    "build:project-bundle": "node scripts/build-project-bundle.mjs",
+    "restore:project": "node scripts/restore-project.mjs",
+    "deploy:local": "node scripts/deployment-target.mjs",
+    "verify:project": "node scripts/verify-project.mjs",
+    "verify:bundle": "node scripts/verify-bundle.mjs"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0",
+    "canonicalize": "3.0.0",
+    "jsonc-parser": "3.3.1",
+    "music-metadata": "11.14.0",
+    "semver": "7.7.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

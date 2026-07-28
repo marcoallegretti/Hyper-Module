@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/deployment-storage-policy.schema.json",
+  "title": "Hyper Module deployment storage policy version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "max_installed_bundles",
+    "max_installed_bytes",
+    "minimum_free_bytes",
+    "extensions"
+  ],
+  "properties": {
+    "format": { "const": "hyper-deployment-storage-policy" },
+    "format_version": { "const": 1 },
+    "max_installed_bundles": {
+      "type": "integer",
+      "minimum": 3,
+      "maximum": 4096
+    },
+    "max_installed_bytes": {
+      "$ref": "common.schema.json#/$defs/safe_positive_integer"
+    },
+    "minimum_free_bytes": {
+      "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+    },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+  },
+  "additionalProperties": false
+}

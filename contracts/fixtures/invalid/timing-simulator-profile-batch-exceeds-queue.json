@@ -1,0 +1,26 @@
+{
+  "format": "hyper-timing-simulator-profile",
+  "format_version": 1,
+  "protocol_version": 1,
+  "capabilities": {
+    "format": "hyper-hardware-capabilities",
+    "format_version": 1,
+    "audio_inputs": 2,
+    "audio_outputs": 2,
+    "cv_inputs": 2,
+    "cv_outputs": 2,
+    "gate_outputs": 2,
+    "has_clock_input": true,
+    "has_reset_input": true,
+    "has_clock_output": true,
+    "usb_mode": "none",
+    "has_ethernet": true,
+    "extensions": {}
+  },
+  "max_batch_events": 9,
+  "output_queue_capacity": 8,
+  "input_queue_capacity": 4,
+  "max_schedule_horizon_us": 1000000,
+  "heartbeat_timeout_us": 250000,
+  "extensions": {}
+}

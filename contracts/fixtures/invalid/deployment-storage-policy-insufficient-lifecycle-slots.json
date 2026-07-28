@@ -1,0 +1,8 @@
+{
+  "format": "hyper-deployment-storage-policy",
+  "format_version": 1,
+  "max_installed_bundles": 2,
+  "max_installed_bytes": 1073741824,
+  "minimum_free_bytes": 536870912,
+  "extensions": {}
+}

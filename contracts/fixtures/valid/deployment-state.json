@@ -1,0 +1,14 @@
+{
+  "format": "hyper-deployment-state",
+  "format_version": 1,
+  "generation": 2,
+  "active": {
+    "bundle_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "project_id": "018f47a2-6b2d-7c11-8a44-001122334455",
+    "project_revision": 8,
+    "minimum_runtime_version": "1.0.0",
+    "status": "healthy"
+  },
+  "previous_bundle_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "extensions": {}
+}

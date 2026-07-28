@@ -1,0 +1,42 @@
+# Private design, agent, and model-assistance material
+/int_docs/
+**/int_docs/
+/.agents/
+**/.agents/
+/.codex/
+**/.codex/
+/.claude/
+**/.claude/
+/.cursor/
+**/.cursor/
+/.gemini/
+**/.gemini/
+/.mcp/
+**/.mcp/
+/.ocr/
+**/.ocr/
+/llm/
+**/llm/
+/ai_workspace/
+**/ai_workspace/
+/.github/commands/
+/.github/copilot-instructions.md
+/.github/instructions/
+/.github/prompts/
+AGENTS.md
+**/AGENTS.md
+CLAUDE.md
+**/CLAUDE.md
+CODEX.md
+**/CODEX.md
+GEMINI.md
+**/GEMINI.md
+
+# Private project documentation
+/docs/architecture/
+/contracts/README.md
+
+# Generated dependency and test output
+/contracts/node_modules/
+/contracts/coverage/
+/target/

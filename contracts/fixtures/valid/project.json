@@ -1,0 +1,62 @@
+{
+  "format": "hyper-project",
+  "format_version": 1,
+  "project_id": "018f47a2-6b2d-7c11-8a44-001122334455",
+  "revision": 7,
+  "name": "Contract Fixture",
+  "sample_rate_hz": 48000,
+  "required_capabilities": {
+    "format": "hyper-hardware-capabilities",
+    "format_version": 1,
+    "audio_inputs": 2,
+    "audio_outputs": 2,
+    "cv_inputs": 0,
+    "cv_outputs": 0,
+    "gate_outputs": 0,
+    "has_clock_input": false,
+    "has_reset_input": false,
+    "has_clock_output": false,
+    "usb_mode": "none",
+    "has_ethernet": true,
+    "extensions": {}
+  },
+  "resources": [
+    {
+      "id": "018f47a2-6b2d-7c11-8a44-001122334458",
+      "role": "timeline",
+      "path": "timeline/timeline.json",
+      "media_type": "application/json",
+      "byte_length": 513,
+      "sha256": "123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",
+      "extensions": {}
+    },
+    {
+      "id": "018f47a2-6b2d-7c11-8a44-001122334456",
+      "role": "track",
+      "path": "tracks/018f47a2-6b2d-7c11-8a44-001122334456.json",
+      "media_type": "application/json",
+      "byte_length": 312,
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "extensions": {}
+    }
+  ],
+  "assets": [
+    {
+      "id": "018f47a2-6b2d-7c11-8a44-001122334457",
+      "role": "sample",
+      "path": "assets/samples/kick.flac",
+      "media_type": "audio/flac",
+      "byte_length": 58214,
+      "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+      "extensions": {}
+    }
+  ],
+  "extensions": {
+    "org.example.fixture": {
+      "preserve_me": true,
+      "nested": {
+        "value": 9
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "format": "hyper-deployment-pairing-request",
+  "format_version": 1,
+  "device_id": "10000000-0000-4000-8000-000000000001",
+  "client_id": "20000000-0000-4000-8000-000000000001",
+  "client_name": "Studio Desktop",
+  "client_public_key": {
+    "kty": "OKP",
+    "crv": "Ed25519",
+    "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  "challenge_id": "30000000-0000-4000-8000-000000000001",
+  "issued_at_epoch_ms": 1785153600000,
+  "expires_at_epoch_ms": 1785153660000,
+  "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+  "extensions": {}
+}

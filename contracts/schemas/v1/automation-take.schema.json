@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/automation-take.schema.json",
+  "title": "Hyper Module automation take version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "id",
+    "project_id",
+    "name",
+    "enabled",
+    "captured_at_utc",
+    "start_tick",
+    "end_tick",
+    "lanes",
+    "extensions"
+  ],
+  "properties": {
+    "format": { "const": "hyper-automation-take" },
+    "format_version": { "const": 1 },
+    "id": { "$ref": "common.schema.json#/$defs/entity_id" },
+    "project_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "enabled": { "type": "boolean" },
+    "captured_at_utc": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$"
+    },
+    "start_tick": {
+      "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+    },
+    "end_tick": {
+      "$ref": "common.schema.json#/$defs/safe_positive_integer"
+    },
+    "lanes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/lane" }
+    },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+  },
+  "$defs": {
+    "lane": {
+      "type": "object",
+      "required": ["id", "target", "interpolation", "points"],
+      "properties": {
+        "id": { "$ref": "common.schema.json#/$defs/entity_id" },
+        "target": {
+          "oneOf": [
+            { "$ref": "#/$defs/channel_target" },
+            { "$ref": "#/$defs/send_target" },
+            { "$ref": "#/$defs/main_target" },
+            { "$ref": "#/$defs/cue_target" }
+          ]
+        },
+        "interpolation": { "enum": ["hold", "linear"] },
+        "points": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 65536,
+          "items": {
+            "oneOf": [
+              { "$ref": "#/$defs/integer_point" },
+              { "$ref": "#/$defs/boolean_point" }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "integer_point": {
+      "type": "object",
+      "required": ["tick", "value"],
+      "properties": {
+        "tick": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "value": {
+          "type": "integer",
+          "minimum": -1000000,
+          "maximum": 2000000
+        }
+      },
+      "additionalProperties": false
+    },
+    "boolean_point": {
+      "type": "object",
+      "required": ["tick", "value"],
+      "properties": {
+        "tick": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "value": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "channel_target": {
+      "type": "object",
+      "required": ["kind", "track_id", "parameter"],
+      "properties": {
+        "kind": { "const": "mixer-channel" },
+        "track_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+        "parameter": { "enum": ["gain", "pan", "mute", "solo"] }
+      },
+      "additionalProperties": false
+    },
+    "send_target": {
+      "type": "object",
+      "required": ["kind", "send_id", "parameter"],
+      "properties": {
+        "kind": { "const": "mixer-send" },
+        "send_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+        "parameter": { "enum": ["gain", "pan", "enabled"] }
+      },
+      "additionalProperties": false
+    },
+    "main_target": {
+      "type": "object",
+      "required": ["kind", "parameter"],
+      "properties": {
+        "kind": { "const": "mixer-main" },
+        "parameter": { "enum": ["gain", "mute"] }
+      },
+      "additionalProperties": false
+    },
+    "cue_target": {
+      "type": "object",
+      "required": ["kind", "parameter"],
+      "properties": {
+        "kind": { "const": "mixer-cue" },
+        "parameter": { "enum": ["gain", "mute"] }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/timing-simulator-profile.schema.json",
+  "title": "Hyper Module deterministic timing simulator profile version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "protocol_version",
+    "capabilities",
+    "max_batch_events",
+    "output_queue_capacity",
+    "input_queue_capacity",
+    "max_schedule_horizon_us",
+    "heartbeat_timeout_us",
+    "extensions"
+  ],
+  "properties": {
+    "format": {
+      "const": "hyper-timing-simulator-profile"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "protocol_version": {
+      "const": 1
+    },
+    "capabilities": {
+      "$ref": "hardware-capabilities.schema.json"
+    },
+    "max_batch_events": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 256
+    },
+    "output_queue_capacity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096
+    },
+    "input_queue_capacity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096
+    },
+    "max_schedule_horizon_us": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 60000000
+    },
+    "heartbeat_timeout_us": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10000000
+    },
+    "extensions": {
+      "$ref": "common.schema.json#/$defs/extensions"
+    }
+  },
+  "additionalProperties": false
+}

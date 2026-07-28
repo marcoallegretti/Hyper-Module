@@ -1,0 +1,33 @@
+{
+  "format": "hyper-runtime-build-plan",
+  "format_version": 1,
+  "project_id": "018f47a2-6b2d-7c11-8a44-001122334455",
+  "project_revision": 7,
+  "source_project_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "minimum_runtime_version": "1.0.0",
+  "entrypoint": "project.runtime.json",
+  "required_capabilities": {
+    "format": "hyper-hardware-capabilities",
+    "format_version": 1,
+    "audio_inputs": 2,
+    "audio_outputs": 2,
+    "cv_inputs": 0,
+    "cv_outputs": 0,
+    "gate_outputs": 0,
+    "has_clock_input": false,
+    "has_reset_input": false,
+    "has_clock_output": false,
+    "usb_mode": "none",
+    "has_ethernet": true,
+    "extensions": {}
+  },
+  "payloads": [
+    {
+      "source_path": "compiled/project.runtime.json",
+      "path": "project.runtime.json",
+      "role": "runtime-project",
+      "media_type": "application/octet-stream"
+    }
+  ],
+  "extensions": {}
+}

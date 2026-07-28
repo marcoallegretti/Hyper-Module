@@ -1,0 +1,22 @@
+{
+  "format": "hyper-timeline",
+  "format_version": 1,
+  "id": "018f47a2-6b2d-7c11-8a44-001122334458",
+  "project_id": "018f47a2-6b2d-7c11-8a44-001122334455",
+  "ticks_per_quarter": 1920,
+  "tempo_events": [
+    {
+      "tick": 0,
+      "microseconds_per_quarter": 500000,
+      "ramp_to_next": true
+    }
+  ],
+  "meter_events": [
+    {
+      "tick": 0,
+      "numerator": 4,
+      "denominator": 4
+    }
+  ],
+  "extensions": {}
+}

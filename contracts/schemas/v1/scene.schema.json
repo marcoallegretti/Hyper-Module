@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/scene.schema.json",
+  "title": "Hyper Module clip-launcher scene version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "id",
+    "project_id",
+    "name",
+    "order",
+    "enabled",
+    "launch_quantization",
+    "slots",
+    "extensions"
+  ],
+  "properties": {
+    "format": {
+      "const": "hyper-scene"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "project_id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "order": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 7
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "launch_quantization": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/immediate_quantization"
+        },
+        {
+          "$ref": "#/$defs/grid_quantization"
+        }
+      ]
+    },
+    "slots": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/play_slot"
+          },
+          {
+            "$ref": "#/$defs/stop_slot"
+          }
+        ]
+      }
+    },
+    "extensions": {
+      "$ref": "common.schema.json#/$defs/extensions"
+    }
+  },
+  "$defs": {
+    "immediate_quantization": {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "const": "immediate"
+        }
+      },
+      "additionalProperties": false
+    },
+    "grid_quantization": {
+      "type": "object",
+      "required": ["mode", "quantum_ticks"],
+      "properties": {
+        "mode": {
+          "const": "grid"
+        },
+        "quantum_ticks": {
+          "$ref": "common.schema.json#/$defs/safe_positive_integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "play_slot": {
+      "type": "object",
+      "required": ["track_id", "action", "clip_id"],
+      "properties": {
+        "track_id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "action": {
+          "const": "play"
+        },
+        "clip_id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        }
+      },
+      "additionalProperties": false
+    },
+    "stop_slot": {
+      "type": "object",
+      "required": ["track_id", "action"],
+      "properties": {
+        "track_id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "action": {
+          "const": "stop"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

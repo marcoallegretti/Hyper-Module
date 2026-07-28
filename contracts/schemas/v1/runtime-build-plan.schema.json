@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/runtime-build-plan.schema.json",
+  "title": "Hyper Module runtime bundle build plan version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "project_id",
+    "project_revision",
+    "source_project_sha256",
+    "minimum_runtime_version",
+    "entrypoint",
+    "required_capabilities",
+    "payloads",
+    "extensions"
+  ],
+  "properties": {
+    "format": {
+      "const": "hyper-runtime-build-plan"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "project_id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "project_revision": {
+      "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+    },
+    "source_project_sha256": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "minimum_runtime_version": {
+      "$ref": "common.schema.json#/$defs/semantic_version"
+    },
+    "entrypoint": {
+      "$ref": "common.schema.json#/$defs/relative_path"
+    },
+    "required_capabilities": {
+      "$ref": "hardware-capabilities.schema.json"
+    },
+    "payloads": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "items": {
+        "$ref": "#/$defs/payload"
+      }
+    },
+    "extensions": {
+      "$ref": "common.schema.json#/$defs/extensions"
+    }
+  },
+  "$defs": {
+    "payload": {
+      "type": "object",
+      "required": ["source_path", "path", "role", "media_type"],
+      "properties": {
+        "source_path": {
+          "$ref": "common.schema.json#/$defs/relative_path"
+        },
+        "path": {
+          "$ref": "common.schema.json#/$defs/relative_path"
+        },
+        "role": {
+          "enum": ["runtime-project", "runtime-data", "audio"]
+        },
+        "media_type": {
+          "enum": [
+            "application/json",
+            "application/octet-stream",
+            "audio/flac",
+            "audio/wav"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "role": {
+                "const": "runtime-data"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "media_type": {
+                "const": "application/json"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "role": {
+                "const": "runtime-project"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "media_type": {
+                "const": "application/json"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "role": {
+                "const": "audio"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "media_type": {
+                "enum": ["audio/flac", "audio/wav"]
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

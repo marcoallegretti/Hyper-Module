@@ -1,0 +1,18 @@
+[package]
+name = "hyper-playback-json"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+hyper-audio-engine = { path = "../audio-engine" }
+hyper-playback-compiler = { path = "../playback-compiler" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+
+[dev-dependencies]
+hyper-audio-source = { path = "../audio-source" }
+
+[lints]
+workspace = true

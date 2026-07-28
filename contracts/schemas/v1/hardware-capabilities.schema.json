@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/hardware-capabilities.schema.json",
+  "title": "Hyper Module hardware capabilities version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "audio_inputs",
+    "audio_outputs",
+    "cv_inputs",
+    "cv_outputs",
+    "gate_outputs",
+    "has_clock_input",
+    "has_reset_input",
+    "has_clock_output",
+    "usb_mode",
+    "has_ethernet",
+    "extensions"
+  ],
+  "properties": {
+    "format": {
+      "const": "hyper-hardware-capabilities"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "audio_inputs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2
+    },
+    "audio_outputs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2
+    },
+    "cv_inputs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4
+    },
+    "cv_outputs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4
+    },
+    "gate_outputs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4
+    },
+    "has_clock_input": {
+      "type": "boolean"
+    },
+    "has_reset_input": {
+      "type": "boolean"
+    },
+    "has_clock_output": {
+      "type": "boolean"
+    },
+    "usb_mode": {
+      "enum": ["none", "host", "service", "host-and-service"]
+    },
+    "has_ethernet": {
+      "type": "boolean"
+    },
+    "extensions": {
+      "$ref": "common.schema.json#/$defs/extensions"
+    }
+  },
+  "additionalProperties": false
+}

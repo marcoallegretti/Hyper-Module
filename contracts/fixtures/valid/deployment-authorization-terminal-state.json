@@ -1,0 +1,80 @@
+{
+  "format": "hyper-deployment-authorization-state",
+  "format_version": 1,
+  "generation": 5,
+  "device_id": "10000000-0000-4000-8000-000000000001",
+  "device_public_key": {
+    "kty": "OKP",
+    "crv": "Ed25519",
+    "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  "policy": {
+    "max_paired_clients": 4,
+    "max_recent_requests": 64,
+    "max_audit_events": 256,
+    "max_request_lifetime_ms": 300000,
+    "max_clock_skew_ms": 30000,
+    "max_bundle_bytes": 1073741824
+  },
+  "pending_pairing_challenge": null,
+  "clients": [
+    {
+      "client_id": "20000000-0000-4000-8000-000000000001",
+      "client_name": "Studio Desktop",
+      "public_key": {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      },
+      "key_thumbprint": "ogRZbCR5KTrPFCAfuYmCMwj0w7Yuk3Lr6YWQWfpkbf0",
+      "paired_at_epoch_ms": 1785153600000,
+      "last_request_sequence": 1
+    }
+  ],
+  "recent_requests": [
+    {
+      "request_id": "30000000-0000-4000-8000-000000000001",
+      "client_id": "20000000-0000-4000-8000-000000000001",
+      "sequence": 1,
+      "envelope_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "bundle_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "status": "succeeded",
+      "deployment_generation": 1,
+      "failure_code": null
+    }
+  ],
+  "audit_sequence": 3,
+  "audit_events": [
+    {
+      "sequence": 1,
+      "event_id": "40000000-0000-4000-8000-000000000001",
+      "event_type": "pairing",
+      "client_id": "20000000-0000-4000-8000-000000000001",
+      "request_id": null,
+      "result": "accepted",
+      "reason": "paired",
+      "occurred_at_epoch_ms": 1785153600000
+    },
+    {
+      "sequence": 2,
+      "event_id": "40000000-0000-4000-8000-000000000002",
+      "event_type": "deployment-authorization",
+      "client_id": "20000000-0000-4000-8000-000000000001",
+      "request_id": "30000000-0000-4000-8000-000000000001",
+      "result": "accepted",
+      "reason": "authorized",
+      "occurred_at_epoch_ms": 1785153601000
+    },
+    {
+      "sequence": 3,
+      "event_id": "40000000-0000-4000-8000-000000000003",
+      "event_type": "deployment-result",
+      "client_id": "20000000-0000-4000-8000-000000000001",
+      "request_id": "30000000-0000-4000-8000-000000000001",
+      "result": "succeeded",
+      "reason": "deployment-succeeded",
+      "occurred_at_epoch_ms": 1785153602000
+    }
+  ],
+  "extensions": {}
+}

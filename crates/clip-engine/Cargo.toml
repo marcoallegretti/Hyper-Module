@@ -1,0 +1,16 @@
+[package]
+name = "hyper-clip-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+hyper-audio-source = { path = "../audio-source" }
+
+[dev-dependencies]
+hyper-audio-engine = { path = "../audio-engine" }
+hyper-offline-renderer = { path = "../offline-renderer" }
+
+[lints]
+workspace = true

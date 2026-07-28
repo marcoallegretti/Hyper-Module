@@ -1,0 +1,5 @@
+* text=auto eol=lf
+
+*.flac binary
+*.pdf binary
+*.wav binary

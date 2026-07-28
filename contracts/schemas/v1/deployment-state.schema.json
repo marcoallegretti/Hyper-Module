@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/deployment-state.schema.json",
+  "title": "Hyper Module local deployment state version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "generation",
+    "active",
+    "previous_bundle_sha256",
+    "extensions"
+  ],
+  "properties": {
+    "format": { "const": "hyper-deployment-state" },
+    "format_version": { "const": 1 },
+    "generation": {
+      "$ref": "common.schema.json#/$defs/safe_positive_integer"
+    },
+    "active": { "$ref": "#/$defs/activation" },
+    "previous_bundle_sha256": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/sha256" },
+        { "type": "null" }
+      ]
+    },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+  },
+  "$defs": {
+    "activation": {
+      "type": "object",
+      "required": [
+        "bundle_sha256",
+        "project_id",
+        "project_revision",
+        "minimum_runtime_version",
+        "status"
+      ],
+      "properties": {
+        "bundle_sha256": {
+          "$ref": "common.schema.json#/$defs/sha256"
+        },
+        "project_id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "project_revision": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "minimum_runtime_version": {
+          "$ref": "common.schema.json#/$defs/semantic_version"
+        },
+        "status": {
+          "enum": ["pending", "healthy"]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

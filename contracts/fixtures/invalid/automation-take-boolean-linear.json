@@ -1,0 +1,26 @@
+{
+  "format": "hyper-automation-take",
+  "format_version": 1,
+  "id": "018f47a2-6b2d-7c11-8a44-001122334479",
+  "project_id": "018f47a2-6b2d-7c11-8a44-001122334455",
+  "name": "Invalid Boolean interpolation",
+  "enabled": true,
+  "captured_at_utc": "2026-07-27T12:05:00.000Z",
+  "start_tick": 0,
+  "end_tick": 7680,
+  "lanes": [
+    {
+      "id": "018f47a2-6b2d-7c11-8a44-001122334480",
+      "target": {
+        "kind": "mixer-main",
+        "parameter": "mute"
+      },
+      "interpolation": "linear",
+      "points": [
+        { "tick": 0, "value": false },
+        { "tick": 3840, "value": true }
+      ]
+    }
+  ],
+  "extensions": {}
+}

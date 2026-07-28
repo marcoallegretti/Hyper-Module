@@ -1,0 +1,15 @@
+{
+  "format": "hyper-hardware-capabilities",
+  "format_version": 1,
+  "audio_inputs": 2,
+  "audio_outputs": 2,
+  "cv_inputs": 4,
+  "cv_outputs": 4,
+  "gate_outputs": 4,
+  "has_clock_input": true,
+  "has_reset_input": true,
+  "has_clock_output": true,
+  "usb_mode": "host-and-service",
+  "has_ethernet": true,
+  "extensions": {}
+}

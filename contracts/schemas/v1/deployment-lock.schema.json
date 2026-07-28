@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/deployment-lock.schema.json",
+  "title": "Hyper Module deployment lock owner version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "owner_pid",
+    "owner_token",
+    "extensions"
+  ],
+  "properties": {
+    "format": { "const": "hyper-deployment-lock" },
+    "format_version": { "const": 1 },
+    "owner_pid": {
+      "$ref": "common.schema.json#/$defs/safe_positive_integer"
+    },
+    "owner_token": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+  },
+  "additionalProperties": false
+}

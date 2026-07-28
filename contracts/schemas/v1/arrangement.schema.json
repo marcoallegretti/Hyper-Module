@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/arrangement.schema.json",
+  "title": "Hyper Module linear arrangement version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "id",
+    "project_id",
+    "name",
+    "enabled",
+    "placements",
+    "scene_launches",
+    "extensions"
+  ],
+  "properties": {
+    "format": {
+      "const": "hyper-arrangement"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "project_id": {
+      "$ref": "common.schema.json#/$defs/entity_id"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "placements": {
+      "type": "array",
+      "maxItems": 65536,
+      "items": {
+        "$ref": "#/$defs/placement"
+      }
+    },
+    "scene_launches": {
+      "type": "array",
+      "maxItems": 65536,
+      "items": {
+        "$ref": "#/$defs/scene_launch"
+      }
+    },
+    "extensions": {
+      "$ref": "common.schema.json#/$defs/extensions"
+    }
+  },
+  "$defs": {
+    "placement": {
+      "type": "object",
+      "required": [
+        "id",
+        "track_id",
+        "clip_id",
+        "start_tick",
+        "clip_start_tick",
+        "duration_ticks",
+        "enabled"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "track_id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "clip_id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "start_tick": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "clip_start_tick": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "duration_ticks": {
+          "$ref": "common.schema.json#/$defs/safe_positive_integer"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "scene_launch": {
+      "type": "object",
+      "required": ["id", "tick", "scene_id"],
+      "properties": {
+        "id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        },
+        "tick": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "scene_id": {
+          "$ref": "common.schema.json#/$defs/entity_id"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
