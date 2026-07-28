@@ -1,15 +1,19 @@
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+use super::pipewire_output::PipeWireThreadRunner;
+#[cfg(target_os = "windows")]
+use super::wasapi_output::WasapiThreadRunner;
 use super::{
     OutputStreamCounters, OutputStreamStatus, PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
 };
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::{
     PipeWireOutputConfig, PipeWireOutputConfigError, PipeWireOutputStream, PipeWireStartError,
-    PipeWireStartupStage, PipeWireStopError, PipeWireThreadRunner,
+    PipeWireStartupStage, PipeWireStopError,
 };
 #[cfg(target_os = "windows")]
 use super::{
     WasapiDisconnectReason, WasapiOutputConfig, WasapiOutputConfigError, WasapiOutputStream,
-    WasapiStartError, WasapiStartupStage, WasapiStopError, WasapiThreadRunner,
+    WasapiStartError, WasapiStartupStage, WasapiStopError,
 };
 use core::error::Error;
 use core::fmt;

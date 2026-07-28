@@ -1,7 +1,7 @@
 use super::{
-    InterleavedStereoProcessor, OutputCallback, OutputCallbackStatus, OutputStreamCounters,
-    OutputStreamState, OutputStreamStatus, PlaybackRecoveryCheckpoint, STEREO_CHANNELS,
-    WasapiOutputEndpoint,
+    BackendThreadCompletion, BackendThreadJoin, BoundedBackendThread, InterleavedStereoProcessor,
+    OutputCallback, OutputCallbackStatus, OutputStreamCounters, OutputStreamState,
+    OutputStreamStatus, PlaybackRecoveryCheckpoint, STEREO_CHANNELS, WasapiOutputEndpoint,
 };
 use core::cell::Cell;
 use core::error::Error;
@@ -10,13 +10,14 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use hyper_mixer_runtime::{TrackWindowRenderer, TransportOutputProcessor};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
 use wasapi::{
     Direction, DisconnectReason, EventCallbacks, SampleType, ShareMode, StreamMode, WaveFormat,
 };
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const EVENT_WAIT_MILLISECONDS: u32 = 100;
 const MAX_CONSECUTIVE_EVENT_TIMEOUTS: u8 = 10;
 
@@ -209,11 +210,15 @@ impl Error for WasapiStartError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WasapiStopError {
     ThreadPanicked,
+    ShutdownTimeout,
 }
 
 impl fmt::Display for WasapiStopError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("WASAPI thread panicked during shutdown")
+        formatter.write_str(match self {
+            Self::ThreadPanicked => "WASAPI thread panicked during shutdown",
+            Self::ShutdownTimeout => "WASAPI shutdown timed out",
+        })
     }
 }
 
@@ -241,14 +246,15 @@ pub enum WasapiDisconnectReason {
 #[derive(Debug)]
 pub struct WasapiOutputStream {
     stop_requested: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    thread: BoundedBackendThread,
     counters: OutputStreamCounters,
     status: OutputStreamStatus,
     disconnect_reason: Arc<AtomicU8>,
+    shutdown_timeout: Duration,
 }
 
 #[derive(Debug)]
-pub struct WasapiThreadRunner {
+pub(crate) struct WasapiThreadRunner {
     config: WasapiOutputConfig,
     stop_requested: Arc<AtomicBool>,
     startup: SyncSender<Result<(), WasapiStartError>>,
@@ -264,7 +270,7 @@ impl WasapiThreadRunner {
     ///
     /// Returns [`WasapiStartError`] for callback, COM, endpoint, format,
     /// stream, or buffer initialization failure.
-    pub fn run<P>(self, processor: P) -> Result<(), WasapiStartError>
+    pub(crate) fn run<P>(self, processor: P) -> Result<(), WasapiStartError>
     where
         P: InterleavedStereoProcessor,
     {
@@ -299,27 +305,6 @@ impl WasapiThreadRunner {
         )
     }
 
-    /// Runs one prepared transport output processor on this WASAPI thread.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WasapiStartError`] when the transport and stream callback
-    /// capacities differ or when backend startup or lifecycle fails. Transport
-    /// processing failures follow the stream's fail-silent counter policy.
-    pub fn run_transport_output<R>(
-        self,
-        mut processor: TransportOutputProcessor<'_, '_, R>,
-    ) -> Result<(), WasapiStartError>
-    where
-        R: TrackWindowRenderer,
-    {
-        validate_transport_capacity(
-            self.config.maximum_block_frames,
-            processor.maximum_block_frames(),
-        )?;
-        self.run(move |output: &mut [f32]| processor.process(output).map(|_| ()))
-    }
-
     pub(crate) fn run_transport_output_with_checkpoint<R>(
         self,
         mut processor: TransportOutputProcessor<'_, '_, R>,
@@ -350,7 +335,8 @@ impl WasapiThreadRunner {
     }
 
     #[must_use]
-    pub fn stop_requested(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn stop_requested(&self) -> bool {
         self.stop_requested.load(Ordering::Acquire)
     }
 }
@@ -375,9 +361,26 @@ impl WasapiOutputStream {
     ///
     /// Returns [`WasapiStartError`] when initialization panics, terminates,
     /// times out, or reports a backend failure.
-    pub fn start_with_thread_initializer<F>(
+    pub(crate) fn start_with_thread_initializer<F>(
         config: WasapiOutputConfig,
         initialize: F,
+    ) -> Result<Self, WasapiStartError>
+    where
+        F: FnOnce(WasapiThreadRunner) -> Result<(), WasapiStartError> + Send + 'static,
+    {
+        Self::start_with_thread_initializer_timeouts(
+            config,
+            initialize,
+            STARTUP_TIMEOUT,
+            SHUTDOWN_TIMEOUT,
+        )
+    }
+
+    fn start_with_thread_initializer_timeouts<F>(
+        config: WasapiOutputConfig,
+        initialize: F,
+        startup_timeout: Duration,
+        shutdown_timeout: Duration,
     ) -> Result<Self, WasapiStartError>
     where
         F: FnOnce(WasapiThreadRunner) -> Result<(), WasapiStartError> + Send + 'static,
@@ -393,9 +396,15 @@ impl WasapiOutputStream {
         let thread_disconnect_reason = Arc::clone(&disconnect_reason);
         let (startup_sender, startup_receiver) = sync_channel(1);
         let failure_sender = startup_sender.clone();
-        let thread = thread::Builder::new()
+        let (completion_sender, completion_receiver) = sync_channel(1);
+        let completion_thread_status = status.clone();
+        let handle = thread::Builder::new()
             .name("hyper-wasapi-output".to_owned())
             .spawn(move || {
+                let _completion = BackendThreadCompletion {
+                    sender: completion_sender,
+                    status: completion_thread_status,
+                };
                 let thread = WasapiThreadRunner {
                     config,
                     stop_requested: thread_stop,
@@ -412,20 +421,22 @@ impl WasapiOutputStream {
                 }
             })
             .map_err(WasapiStartError::ThreadSpawn)?;
+        let mut thread = BoundedBackendThread::new(handle, completion_receiver);
 
-        match wait_for_startup(&startup_receiver) {
+        match wait_for_startup(&startup_receiver, startup_timeout) {
             Ok(()) => Ok(Self {
                 stop_requested,
-                thread: Some(thread),
+                thread,
                 counters,
                 status,
                 disconnect_reason,
+                shutdown_timeout,
             }),
             Err(error) => {
                 stop_requested.store(true, Ordering::Release);
-                match thread.join() {
-                    Ok(()) => Err(error),
-                    Err(_) => Err(WasapiStartError::ThreadPanicked),
+                match thread.wait(shutdown_timeout) {
+                    BackendThreadJoin::Panicked => Err(WasapiStartError::ThreadPanicked),
+                    BackendThreadJoin::Completed | BackendThreadJoin::TimedOut => Err(error),
                 }
             }
         }
@@ -460,10 +471,11 @@ impl WasapiOutputStream {
     }
 
     fn join(&mut self) -> Result<(), WasapiStopError> {
-        if let Some(thread) = self.thread.take() {
-            thread.join().map_err(|_| WasapiStopError::ThreadPanicked)?;
+        match self.thread.wait(self.shutdown_timeout) {
+            BackendThreadJoin::Completed => Ok(()),
+            BackendThreadJoin::Panicked => Err(WasapiStopError::ThreadPanicked),
+            BackendThreadJoin::TimedOut => Err(WasapiStopError::ShutdownTimeout),
         }
-        Ok(())
     }
 }
 
@@ -471,14 +483,15 @@ impl Drop for WasapiOutputStream {
     fn drop(&mut self) {
         self.status.request_stop();
         self.stop_requested.store(true, Ordering::Release);
-        let _ = self.join();
+        self.thread.detach();
     }
 }
 
 fn wait_for_startup(
     receiver: &Receiver<Result<(), WasapiStartError>>,
+    timeout: Duration,
 ) -> Result<(), WasapiStartError> {
-    match receiver.recv_timeout(STARTUP_TIMEOUT) {
+    match receiver.recv_timeout(timeout) {
         Ok(result) => result,
         Err(RecvTimeoutError::Timeout) => Err(WasapiStartError::StartupTimeout),
         Err(RecvTimeoutError::Disconnected) => Err(WasapiStartError::ThreadTerminated),
@@ -854,6 +867,8 @@ impl Drop for StartedStream<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
 
     #[test]
     fn config_rejects_invalid_domains() {
@@ -908,6 +923,114 @@ mod tests {
         });
 
         assert!(matches!(result, Err(WasapiStartError::ThreadPanicked)));
+    }
+
+    #[test]
+    fn uncooperative_initializer_cannot_extend_startup_deadline() {
+        let config = WasapiOutputConfig::try_new(48_000, 64).unwrap();
+        let (release_sender, release_receiver) = sync_channel(1);
+        let started = Instant::now();
+
+        let result = WasapiOutputStream::start_with_thread_initializer_timeouts(
+            config,
+            move |_| {
+                release_receiver.recv().unwrap();
+                Ok(())
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        );
+
+        assert!(matches!(result, Err(WasapiStartError::StartupTimeout)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_sender.send(()).unwrap();
+    }
+
+    #[test]
+    fn uncooperative_shutdown_returns_a_timeout() {
+        let config = WasapiOutputConfig::try_new(48_000, 64).unwrap();
+        let (release_sender, release_receiver) = sync_channel(1);
+        let stream = WasapiOutputStream::start_with_thread_initializer_timeouts(
+            config,
+            move |runner| {
+                runner.status.mark_running();
+                let _ = runner.startup.try_send(Ok(()));
+                release_receiver.recv().unwrap();
+                Ok(())
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let started = Instant::now();
+
+        let result = stream.stop();
+
+        assert_eq!(result, Err(WasapiStopError::ShutdownTimeout));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_sender.send(()).unwrap();
+    }
+
+    #[test]
+    fn uncooperative_lifecycle_is_bounded_in_a_subprocess() {
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .args([
+                "--ignored",
+                "--exact",
+                "wasapi_output::tests::uncooperative_lifecycle_subprocess_fixture",
+            ])
+            .env("HYPER_UNCOOPERATIVE_LIFECYCLE_FIXTURE", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("uncooperative lifecycle subprocess exceeded its deadline");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn uncooperative_lifecycle_subprocess_fixture() {
+        if std::env::var_os("HYPER_UNCOOPERATIVE_LIFECYCLE_FIXTURE").is_none() {
+            return;
+        }
+        let config = WasapiOutputConfig::try_new(48_000, 64).unwrap();
+        let startup = WasapiOutputStream::start_with_thread_initializer_timeouts(
+            config.clone(),
+            |_| loop {
+                thread::park();
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        );
+        assert!(matches!(startup, Err(WasapiStartError::StartupTimeout)));
+
+        let stream = WasapiOutputStream::start_with_thread_initializer_timeouts(
+            config,
+            |runner| {
+                runner.status.mark_running();
+                let _ = runner.startup.try_send(Ok(()));
+                loop {
+                    thread::park();
+                }
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        assert_eq!(stream.stop(), Err(WasapiStopError::ShutdownTimeout));
     }
 
     #[test]

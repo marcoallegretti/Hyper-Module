@@ -2,6 +2,21 @@ use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+use std::thread::JoinHandle;
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+use std::time::Duration;
 
 pub const STEREO_CHANNELS: usize = 2;
 pub const MAXIMUM_BLOCK_FRAMES: usize = 4_096;
@@ -103,6 +118,87 @@ impl OutputStreamStatus {
                     _ => None,
                 },
             );
+    }
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackendThreadJoin {
+    Completed,
+    Panicked,
+    TimedOut,
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+#[derive(Debug)]
+struct BoundedBackendThread {
+    handle: Option<JoinHandle<()>>,
+    completed: Receiver<()>,
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+impl BoundedBackendThread {
+    fn new(handle: JoinHandle<()>, completed: Receiver<()>) -> Self {
+        Self {
+            handle: Some(handle),
+            completed,
+        }
+    }
+
+    fn wait(&mut self, timeout: Duration) -> BackendThreadJoin {
+        let completion = self.completed.recv_timeout(timeout);
+        let Some(handle) = self.handle.take() else {
+            return BackendThreadJoin::Completed;
+        };
+        match completion {
+            Ok(()) => match handle.join() {
+                Ok(()) => BackendThreadJoin::Completed,
+                Err(_) => BackendThreadJoin::Panicked,
+            },
+            Err(RecvTimeoutError::Disconnected) => {
+                if handle.join().is_ok() {
+                    BackendThreadJoin::Completed
+                } else {
+                    BackendThreadJoin::Panicked
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => BackendThreadJoin::TimedOut,
+        }
+    }
+
+    fn detach(&mut self) {
+        let _ = self.handle.take();
+    }
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+struct BackendThreadCompletion {
+    sender: SyncSender<()>,
+    status: OutputStreamStatus,
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+impl Drop for BackendThreadCompletion {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.status.mark_failed();
+        }
+        let _ = self.sender.try_send(());
     }
 }
 
@@ -339,7 +435,7 @@ mod pipewire_output;
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 pub use pipewire_output::{
     PipeWireOutputConfig, PipeWireOutputConfigError, PipeWireOutputStream, PipeWireStartError,
-    PipeWireStartupStage, PipeWireStopError, PipeWireThreadRunner,
+    PipeWireStartupStage, PipeWireStopError,
 };
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
@@ -380,7 +476,7 @@ mod wasapi_output;
 #[cfg(target_os = "windows")]
 pub use wasapi_output::{
     WasapiDisconnectReason, WasapiOutputConfig, WasapiOutputConfigError, WasapiOutputStream,
-    WasapiStartError, WasapiStartupStage, WasapiStopError, WasapiThreadRunner,
+    WasapiStartError, WasapiStartupStage, WasapiStopError,
 };
 
 #[cfg(all(target_os = "linux", target_endian = "little"))]
