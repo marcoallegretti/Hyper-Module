@@ -1542,8 +1542,10 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     /// Processes the next transport-owned callback window.
     ///
     /// Output shape and block capacity are validated before queued commands are
-    /// consumed. A valid cycle applies a bounded FIFO batch before it captures
-    /// the cycle's state and start frame.
+    /// consumed. A valid cycle applies a bounded FIFO batch provisionally
+    /// before it captures the cycle's state and start frame. If later work
+    /// fails, the transport and renderer return to the preceding committed
+    /// state; consumed commands are not replayed.
     ///
     /// Stopped cycles clear the output without reading arrangement scratch or
     /// advancing the position. Rolling cycles render from the current absolute
@@ -1553,7 +1555,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     ///
     /// Returns [`RuntimeProcessError`] for output shape, block capacity, frame
     /// range, rendering, automation, or mixer failures. A failed cycle never
-    /// advances the transport position.
+    /// commits queued command state or advances the transport position.
     pub fn process_cycle(
         &mut self,
         scratch: &mut [RenderScratchSlot<'_>],
@@ -1572,6 +1574,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 maximum: self.runtime.max_block_frames(),
             });
         }
+        let committed_state = self.state;
+        let committed_position = self.position_frame;
         let applied_command_count = self.drain_commands();
         let command_sender_disconnected = self.command_sender_disconnected();
         let start_frame = self.position_frame;
@@ -1587,10 +1591,22 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 command_sender_disconnected,
             });
         }
-        let next_frame = start_frame
-            .checked_add(frame_count)
-            .ok_or(RuntimeProcessError::FrameRangeOverflow)?;
-        let rendered = self.runtime.process_window(start_frame, scratch, output)?;
+        let rendered = (|| {
+            let next_frame = start_frame
+                .checked_add(frame_count)
+                .ok_or(RuntimeProcessError::FrameRangeOverflow)?;
+            let rendered = self.runtime.process_window(start_frame, scratch, output)?;
+            Ok((next_frame, rendered))
+        })();
+        let (next_frame, rendered) = match rendered {
+            Ok(rendered) => rendered,
+            Err(source) => {
+                self.state = committed_state;
+                self.position_frame = committed_position;
+                self.runtime.seek(committed_position);
+                return Err(source);
+            }
+        };
         self.position_frame = next_frame;
         Ok(TransportCycle {
             state: self.state,

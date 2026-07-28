@@ -993,7 +993,7 @@ fn invalid_cycle_does_not_consume_queued_commands() {
 }
 
 #[test]
-fn queued_command_remains_applied_when_later_cycle_work_fails() {
+fn queued_command_is_rolled_back_when_later_cycle_work_fails() {
     let fixture = graph_fixture();
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
     let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
@@ -1018,14 +1018,41 @@ fn queued_command_remains_applied_when_later_cycle_work_fails() {
         ),
         Err(RuntimeProcessError::FrameRangeOverflow)
     );
-    assert_eq!(transport.state(), TransportState::Rolling);
-    assert_eq!(transport.position_frame(), usize::MAX - 1);
+    assert_eq!(transport.state(), TransportState::Stopped);
+    assert_eq!(transport.position_frame(), 0);
     assert_constant(&left, 9.0);
     assert_constant(&right, 9.0);
-    sender.try_send(TransportCommand::Stop).unwrap();
-    let stopped = process_transport(&mut transport, &mut left, &mut right).unwrap();
-    assert_eq!(stopped.applied_command_count(), 1);
-    assert_eq!(stopped.state(), TransportState::Stopped);
+    sender.try_send(TransportCommand::Start).unwrap();
+    let restarted = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(restarted.applied_command_count(), 1);
+    assert_eq!(restarted.state(), TransportState::Rolling);
+    assert_eq!(restarted.start_frame(), 0);
+}
+
+#[test]
+fn queued_start_is_rolled_back_when_track_rendering_fails() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(runtime);
+    sender.try_send(TransportCommand::Start).unwrap();
+    let mut scratch = [];
+    let mut left = [9.0_f32; 1];
+    let mut right = [9.0_f32; 1];
+
+    let result = transport.process_cycle(
+        &mut scratch,
+        StereoOutput {
+            left: &mut left,
+            right: &mut right,
+        },
+    );
+
+    assert!(matches!(result, Err(RuntimeProcessError::Render(_))));
+    assert_eq!(transport.state(), TransportState::Stopped);
+    assert_eq!(transport.position_frame(), 0);
+    assert_constant(&left, 9.0);
+    assert_constant(&right, 9.0);
 }
 
 #[test]
