@@ -16,12 +16,13 @@ use hyper_playback_json::{
     load,
 };
 
-/// Canonical resource bytes returned by the package-verification boundary.
+/// Canonical resource bytes supplied to playback-session assembly.
 ///
-/// This type performs no filesystem access and does not replace package
+/// This carrier performs no filesystem access and encodes no package
+/// provenance. Callers must not treat construction as evidence of
 /// canonicalization, digest, manifest, or media verification.
 #[derive(Debug)]
-pub struct VerifiedPlaybackDocuments {
+pub struct PlaybackDocumentBytes {
     pub project_id: String,
     pub sample_rate_hz: u32,
     pub timeline: Vec<u8>,
@@ -33,14 +34,16 @@ pub struct VerifiedPlaybackDocuments {
     pub automation_takes: Vec<Vec<u8>>,
 }
 
-/// One package-verified asset decoded outside the real-time path.
+/// One decoded asset supplied outside the real-time path.
+///
+/// This carrier encodes no package or digest provenance.
 #[derive(Debug)]
-pub struct VerifiedDecodedAsset {
+pub struct DecodedPlaybackAsset {
     asset_id: String,
     audio: DecodedAudio,
 }
 
-impl VerifiedDecodedAsset {
+impl DecodedPlaybackAsset {
     #[must_use]
     pub const fn new(asset_id: String, audio: DecodedAudio) -> Self {
         Self { asset_id, audio }
@@ -65,9 +68,9 @@ pub struct PlaybackSessionAssemblyLimits {
 }
 
 #[derive(Debug)]
-pub struct VerifiedPlaybackSessionInput {
-    pub documents: VerifiedPlaybackDocuments,
-    pub decoded_assets: Vec<VerifiedDecodedAsset>,
+pub struct PlaybackSessionAssemblyInput {
+    pub documents: PlaybackDocumentBytes,
+    pub decoded_assets: Vec<DecodedPlaybackAsset>,
     pub limits: PlaybackSessionAssemblyLimits,
 }
 
@@ -229,19 +232,21 @@ impl Error for PlaybackSessionAssemblyError {
     }
 }
 
-/// Converts one already package-verified snapshot into owned playback state.
+/// Converts caller-supplied canonical documents and decoded media into owned
+/// playback state.
 ///
 /// All resource references, mixer routing, automation targets, decoded-media
 /// limits, and project identities are checked before any session is returned.
+/// Package provenance and digests must be established by a separate boundary.
 ///
 /// # Errors
 ///
 /// Returns [`PlaybackSessionAssemblyError`] without publishing partial state
 /// when any bounded loading, compilation, or cache step fails.
-pub fn assemble_verified_playback_session(
-    input: VerifiedPlaybackSessionInput,
+pub fn assemble_playback_session(
+    input: PlaybackSessionAssemblyInput,
 ) -> Result<PreparedPlaybackSession, PlaybackSessionAssemblyError> {
-    let VerifiedPlaybackSessionInput {
+    let PlaybackSessionAssemblyInput {
         documents,
         decoded_assets,
         limits,
@@ -418,9 +423,9 @@ mod tests {
         "extensions":{}
     }"#;
 
-    fn input(assets: Vec<VerifiedDecodedAsset>) -> VerifiedPlaybackSessionInput {
-        VerifiedPlaybackSessionInput {
-            documents: VerifiedPlaybackDocuments {
+    fn input(assets: Vec<DecodedPlaybackAsset>) -> PlaybackSessionAssemblyInput {
+        PlaybackSessionAssemblyInput {
+            documents: PlaybackDocumentBytes {
                 project_id: "project".to_owned(),
                 sample_rate_hz: 48_000,
                 timeline: TIMELINE.to_vec(),
@@ -443,16 +448,16 @@ mod tests {
         }
     }
 
-    fn asset(id: &str) -> VerifiedDecodedAsset {
-        VerifiedDecodedAsset::new(
+    fn asset(id: &str) -> DecodedPlaybackAsset {
+        DecodedPlaybackAsset::new(
             id.to_owned(),
             DecodedAudio::from_mono(48_000, vec![0.25; 100]).unwrap(),
         )
     }
 
     #[test]
-    fn verified_documents_and_media_assemble_as_one_owned_session() {
-        let session = assemble_verified_playback_session(input(vec![asset("asset")])).unwrap();
+    fn canonical_documents_and_media_assemble_as_one_owned_session() {
+        let session = assemble_playback_session(input(vec![asset("asset")])).unwrap();
 
         assert_eq!(session.project_id(), "project");
         assert_eq!(session.sample_rate_hz(), 48_000);
@@ -476,8 +481,7 @@ mod tests {
 
     #[test]
     fn duplicate_decoded_identity_rejects_the_entire_session() {
-        let result =
-            assemble_verified_playback_session(input(vec![asset("asset"), asset("asset")]));
+        let result = assemble_playback_session(input(vec![asset("asset"), asset("asset")]));
 
         assert!(matches!(
             result,
@@ -497,7 +501,7 @@ mod tests {
             .into_bytes();
 
         assert!(matches!(
-            assemble_verified_playback_session(input),
+            assemble_playback_session(input),
             Err(PlaybackSessionAssemblyError::Mixer(_))
         ));
     }
@@ -508,7 +512,7 @@ mod tests {
         input.limits.documents.max_track_documents = 0;
 
         assert!(matches!(
-            assemble_verified_playback_session(input),
+            assemble_playback_session(input),
             Err(PlaybackSessionAssemblyError::DocumentCountLimit {
                 kind: PlaybackDocumentKind::Track,
                 actual: 1,
@@ -520,17 +524,17 @@ mod tests {
     #[test]
     fn missing_decoded_binding_rejects_the_entire_session() {
         assert!(matches!(
-            assemble_verified_playback_session(input(vec![asset("foreign")])),
+            assemble_playback_session(input(vec![asset("foreign")])),
             Err(PlaybackSessionAssemblyError::Playback(_))
         ));
     }
 
     #[test]
-    fn automation_is_absent_only_when_no_take_was_verified() {
+    fn automation_is_absent_only_when_no_take_was_supplied() {
         let mut input = input(vec![asset("asset")]);
         input.documents.automation_takes.clear();
 
-        let session = assemble_verified_playback_session(input).unwrap();
+        let session = assemble_playback_session(input).unwrap();
 
         assert!(!session.has_automation());
     }

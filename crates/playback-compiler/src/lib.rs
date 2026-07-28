@@ -642,7 +642,8 @@ impl Error for PrepareError {
 
 /// Compiles one verified clip placement into the native frame-domain engine.
 ///
-/// This compiler intentionally accepts typed, already package-verified data.
+/// This compiler intentionally accepts typed data and does not assert package
+/// provenance.
 /// It does not parse JSON or resolve project identifiers and assets.
 ///
 /// # Errors

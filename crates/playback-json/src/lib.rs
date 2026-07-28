@@ -1105,7 +1105,8 @@ impl Error for AdapterCompileError {
     }
 }
 
-/// Strictly loads already package-verified playback resource documents.
+/// Strictly loads caller-supplied playback resource documents without
+/// asserting package provenance.
 ///
 /// This does not replace schema, canonical-byte, digest, manifest, or media
 /// verification. It is the bounded execution adapter after those gates.
