@@ -88,9 +88,9 @@ License: <https://gitlab.freedesktop.org/pipewire/pipewire-rs/-/blob/v0.10.0/LIC
 
 ## bytemuck 1.24.0
 
-The Linux PipeWire callback uses `bytemuck` 1.24.0 for checked conversion of
-mapped byte buffers to native `f32` samples without unsafe code in this
-repository.
+The Linux PipeWire and Windows WASAPI callbacks use `bytemuck` 1.24.0 for
+checked conversion between byte buffers and native `f32` samples without
+unsafe code in this repository.
 
 Copyright the bytemuck contributors. Licensed under the zlib License,
 Apache License 2.0, or MIT License.
@@ -102,3 +102,25 @@ Licenses:
 - <https://github.com/Lokathor/bytemuck/blob/da748163ea203f80098b6bdc754c54ebc535364c/LICENSE-ZLIB>
 - <https://github.com/Lokathor/bytemuck/blob/da748163ea203f80098b6bdc754c54ebc535364c/LICENSE-APACHE>
 - <https://github.com/Lokathor/bytemuck/blob/da748163ea203f80098b6bdc754c54ebc535364c/LICENSE-MIT>
+
+## wasapi 0.22.0
+
+The Windows portion of `hyper-desktop-audio` uses the `wasapi` 0.22.0 crate
+and its Microsoft `windows-rs` dependencies for event-driven shared-mode
+audio rendering.
+
+Copyright the wasapi-rs contributors. Licensed under the MIT License.
+
+Source: <https://github.com/HEnquist/wasapi-rs/tree/v0.22.0>
+
+License: <https://github.com/HEnquist/wasapi-rs/blob/v0.22.0/LICENSE.txt>
+
+The `windows-rs` dependencies are Copyright Microsoft Corporation and
+licensed under the MIT License or Apache License 2.0.
+
+Source: <https://github.com/microsoft/windows-rs>
+
+Licenses:
+
+- <https://github.com/microsoft/windows-rs/blob/master/license-mit>
+- <https://github.com/microsoft/windows-rs/blob/master/license-apache>

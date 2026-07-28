@@ -111,7 +111,10 @@ impl OutputStreamCounters {
         Self::add(&self.state.silent_frames, frames);
     }
 
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[cfg(any(
+        all(target_os = "linux", target_endian = "little"),
+        target_os = "windows"
+    ))]
     fn record_stream_error(&self) {
         Self::add(&self.state.stream_errors, 1);
     }
@@ -253,6 +256,13 @@ mod playback_session;
 pub use playback_session::{
     DesktopPlaybackSession, DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
     DesktopPlaybackSessionStartError,
+};
+#[cfg(target_os = "windows")]
+mod wasapi_output;
+#[cfg(target_os = "windows")]
+pub use wasapi_output::{
+    WasapiOutputConfig, WasapiOutputConfigError, WasapiOutputStream, WasapiStartError,
+    WasapiStartupStage, WasapiStopError, WasapiThreadRunner,
 };
 
 #[cfg(test)]

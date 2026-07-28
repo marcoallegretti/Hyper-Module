@@ -18,3 +18,7 @@ hyper-playback-json = { path = "../../../crates/playback-json" }
 hyper-playback-session = { path = "../../../crates/playback-session" }
 pipewire = "=0.10.0"
 spa-sys = { package = "libspa-sys", version = "=0.10.0" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+bytemuck = "=1.24.0"
+wasapi = "=0.22.0"
