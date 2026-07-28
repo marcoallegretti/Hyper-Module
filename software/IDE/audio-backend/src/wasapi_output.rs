@@ -1,7 +1,9 @@
 use super::{
-    InterleavedStereoProcessor, OutputCallback, OutputStreamCounters, OutputStreamState,
-    OutputStreamStatus, PlaybackRecoveryCheckpoint, STEREO_CHANNELS, WasapiOutputEndpoint,
+    InterleavedStereoProcessor, OutputCallback, OutputCallbackStatus, OutputStreamCounters,
+    OutputStreamState, OutputStreamStatus, PlaybackRecoveryCheckpoint, STEREO_CHANNELS,
+    WasapiOutputEndpoint,
 };
+use core::cell::Cell;
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -266,6 +268,14 @@ impl WasapiThreadRunner {
     where
         P: InterleavedStereoProcessor,
     {
+        self.run_with_commit(processor, || {})
+    }
+
+    fn run_with_commit<P, C>(self, processor: P, commit: C) -> Result<(), WasapiStartError>
+    where
+        P: InterleavedStereoProcessor,
+        C: FnMut(),
+    {
         let callback = OutputCallback::try_new_with_counters(
             processor,
             self.config.maximum_block_frames,
@@ -278,11 +288,14 @@ impl WasapiThreadRunner {
         run_wasapi_inner(
             &self.config,
             callback,
-            &self.stop_requested,
-            &self.startup,
-            &self.counters,
-            &self.status,
-            &self.disconnect_reason,
+            WasapiRuntimeSignals {
+                stop_requested: &self.stop_requested,
+                startup: &self.startup,
+                counters: &self.counters,
+                status: &self.status,
+                disconnect_reason: &self.disconnect_reason,
+            },
+            commit,
         )
     }
 
@@ -310,7 +323,7 @@ impl WasapiThreadRunner {
     pub(crate) fn run_transport_output_with_checkpoint<R>(
         self,
         mut processor: TransportOutputProcessor<'_, '_, R>,
-        checkpoint: PlaybackRecoveryCheckpoint,
+        checkpoint: &PlaybackRecoveryCheckpoint,
     ) -> Result<(), WasapiStartError>
     where
         R: TrackWindowRenderer,
@@ -319,11 +332,21 @@ impl WasapiThreadRunner {
             self.config.maximum_block_frames,
             processor.maximum_block_frames(),
         )?;
-        self.run(move |output: &mut [f32]| {
-            processor.process(output).map(|rendered| {
-                checkpoint.publish_cycle(rendered.snapshot().cycle());
-            })
-        })
+        let pending_cycle = Cell::new(None);
+        self.run_with_commit(
+            |output: &mut [f32]| {
+                pending_cycle.set(None);
+                processor.process(output).map(|rendered| {
+                    pending_cycle.set(Some(rendered.snapshot().cycle()));
+                })
+            },
+            || {
+                let cycle = pending_cycle
+                    .take()
+                    .expect("a rendered WASAPI block has a pending recovery cycle");
+                checkpoint.publish_cycle(cycle);
+            },
+        )
     }
 
     #[must_use]
@@ -462,17 +485,27 @@ fn wait_for_startup(
     }
 }
 
-fn run_wasapi_inner<P: InterleavedStereoProcessor>(
+#[derive(Clone, Copy)]
+struct WasapiRuntimeSignals<'state> {
+    stop_requested: &'state AtomicBool,
+    startup: &'state SyncSender<Result<(), WasapiStartError>>,
+    counters: &'state OutputStreamCounters,
+    status: &'state OutputStreamStatus,
+    disconnect_reason: &'state Arc<AtomicU8>,
+}
+
+fn run_wasapi_inner<P, C>(
     config: &WasapiOutputConfig,
     mut callback: OutputCallback<P>,
-    stop_requested: &AtomicBool,
-    startup: &SyncSender<Result<(), WasapiStartError>>,
-    counters: &OutputStreamCounters,
-    status: &OutputStreamStatus,
-    disconnect_reason: &Arc<AtomicU8>,
-) -> Result<(), WasapiStartError> {
+    signals: WasapiRuntimeSignals<'_>,
+    mut commit: C,
+) -> Result<(), WasapiStartError>
+where
+    P: InterleavedStereoProcessor,
+    C: FnMut(),
+{
     let _com = initialize_com()?;
-    let mut output = open_render_output(config, status, disconnect_reason)?;
+    let mut output = open_render_output(config, signals.status, signals.disconnect_reason)?;
     let initial_frames = usize::try_from(
         output
             .client
@@ -489,6 +522,7 @@ fn run_wasapi_inner<P: InterleavedStereoProcessor>(
         &mut output.samples,
         &mut callback,
         &output.render,
+        &mut commit,
     )
     .map_err(|source| backend_error(WasapiStartupStage::Buffer, source))?;
     output
@@ -496,20 +530,24 @@ fn run_wasapi_inner<P: InterleavedStereoProcessor>(
         .start_stream()
         .map_err(|source| backend_error(WasapiStartupStage::Start, source))?;
     let _started = StartedStream(&output.client);
-    status.mark_running();
-    if status.state() != OutputStreamState::Running {
+    signals.status.mark_running();
+    if signals.status.state() != OutputStreamState::Running {
         return Err(WasapiStartError::Backend {
             stage: WasapiStartupStage::State,
-            detail: match decode_disconnect_reason(disconnect_reason.load(Ordering::Acquire)) {
+            detail: match decode_disconnect_reason(
+                signals.disconnect_reason.load(Ordering::Acquire),
+            ) {
                 Some(reason) => format!("audio session disconnected during startup: {reason:?}"),
                 None => "audio session failed during startup".to_owned(),
             },
         });
     }
-    let _ = startup.try_send(Ok(()));
+    let _ = signals.startup.try_send(Ok(()));
 
     let mut consecutive_event_timeouts = 0_u8;
-    while !stop_requested.load(Ordering::Acquire) && status.state() != OutputStreamState::Failed {
+    while !signals.stop_requested.load(Ordering::Acquire)
+        && signals.status.state() != OutputStreamState::Failed
+    {
         if output
             .event
             .wait_for_event(EVENT_WAIT_MILLISECONDS)
@@ -517,16 +555,16 @@ fn run_wasapi_inner<P: InterleavedStereoProcessor>(
         {
             consecutive_event_timeouts = consecutive_event_timeouts.saturating_add(1);
             if consecutive_event_timeouts >= MAX_CONSECUTIVE_EVENT_TIMEOUTS {
-                status.mark_failed();
-                counters.record_stream_error();
+                signals.status.mark_failed();
+                signals.counters.record_stream_error();
                 break;
             }
             continue;
         }
         consecutive_event_timeouts = 0;
         let Ok(available) = output.client.get_available_space_in_frames() else {
-            status.mark_failed();
-            counters.record_stream_error();
+            signals.status.mark_failed();
+            signals.counters.record_stream_error();
             break;
         };
         if write_frames(
@@ -535,11 +573,12 @@ fn run_wasapi_inner<P: InterleavedStereoProcessor>(
             &mut output.samples,
             &mut callback,
             &output.render,
+            &mut commit,
         )
         .is_err()
         {
-            status.mark_failed();
-            counters.record_stream_error();
+            signals.status.mark_failed();
+            signals.counters.record_stream_error();
             break;
         }
     }
@@ -661,19 +700,66 @@ fn open_render_output(
     })
 }
 
-fn write_frames<P: InterleavedStereoProcessor>(
-    mut remaining_frames: usize,
+#[derive(Debug)]
+enum WriteFramesError<E> {
+    Callback(OutputCallbackStatus),
+    Submission(E),
+}
+
+impl<E: fmt::Display> fmt::Display for WriteFramesError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Callback(status) => write!(formatter, "audio callback failed: {status:?}"),
+            Self::Submission(source) => write!(formatter, "device submission failed: {source}"),
+        }
+    }
+}
+
+fn write_frames<P, C>(
+    remaining_frames: usize,
     maximum_block_frames: usize,
     samples: &mut [f32],
     callback: &mut OutputCallback<P>,
     render: &wasapi::AudioRenderClient,
-) -> Result<(), wasapi::WasapiError> {
+    commit: &mut C,
+) -> Result<(), WriteFramesError<wasapi::WasapiError>>
+where
+    P: InterleavedStereoProcessor,
+    C: FnMut(),
+{
+    render_frames(
+        remaining_frames,
+        maximum_block_frames,
+        samples,
+        callback,
+        |frames, bytes| render.write_to_device(frames, bytes, None),
+        commit,
+    )
+}
+
+fn render_frames<P, C, S, E>(
+    mut remaining_frames: usize,
+    maximum_block_frames: usize,
+    samples: &mut [f32],
+    callback: &mut OutputCallback<P>,
+    mut submit: S,
+    commit: &mut C,
+) -> Result<(), WriteFramesError<E>>
+where
+    P: InterleavedStereoProcessor,
+    C: FnMut(),
+    S: FnMut(usize, &[u8]) -> Result<(), E>,
+{
     while remaining_frames > 0 {
         let frames = remaining_frames.min(maximum_block_frames);
         let sample_count = frames * STEREO_CHANNELS;
         let block = &mut samples[..sample_count];
-        let _ = callback.process(block);
-        render.write_to_device(frames, bytemuck::cast_slice(block), None)?;
+        let status = callback.process(block);
+        if status != OutputCallbackStatus::Rendered {
+            return Err(WriteFramesError::Callback(status));
+        }
+        submit(frames, bytemuck::cast_slice(block)).map_err(WriteFramesError::Submission)?;
+        commit();
         remaining_frames -= frames;
     }
     Ok(())
@@ -833,6 +919,74 @@ mod tests {
                 detail,
             }) if detail == "WASAPI capacity is 64 frames; transport capacity is 128"
         ));
+    }
+
+    #[test]
+    fn recovery_commit_follows_successful_device_submission() {
+        let mut callback = OutputCallback::try_new(
+            |output: &mut [f32]| {
+                output.fill(0.25);
+                Ok::<_, ()>(())
+            },
+            2,
+        )
+        .unwrap();
+        let mut samples = [0.0_f32; 4];
+        let mut submissions = 0;
+        let mut commits = 0;
+
+        let result = render_frames(
+            2,
+            1,
+            &mut samples,
+            &mut callback,
+            |_, _| {
+                submissions += 1;
+                if submissions == 2 {
+                    Err("submission rejected")
+                } else {
+                    Ok(())
+                }
+            },
+            &mut || commits += 1,
+        );
+
+        assert!(matches!(
+            result,
+            Err(WriteFramesError::Submission("submission rejected"))
+        ));
+        assert_eq!(submissions, 2);
+        assert_eq!(commits, 1);
+    }
+
+    #[test]
+    fn failed_callback_is_not_submitted_or_committed() {
+        let mut callback =
+            OutputCallback::try_new(|_: &mut [f32]| Err::<(), _>("render failed"), 1).unwrap();
+        let mut samples = [1.0_f32; 2];
+        let mut submissions = 0;
+        let mut commits = 0;
+
+        let result = render_frames(
+            1,
+            1,
+            &mut samples,
+            &mut callback,
+            |_, _| {
+                submissions += 1;
+                Ok::<_, ()>(())
+            },
+            &mut || commits += 1,
+        );
+
+        assert!(matches!(
+            result,
+            Err(WriteFramesError::Callback(
+                OutputCallbackStatus::ProcessorFailed
+            ))
+        ));
+        assert_eq!(submissions, 0);
+        assert_eq!(commits, 0);
     }
 
     #[test]

@@ -515,7 +515,7 @@ fn initialize_session(
             recovery: recovery.clone(),
         }))
         .map_err(|_| callback_error("playback control publication failed".to_owned()))?;
-    runner.run_transport_output_with_checkpoint(processor, recovery)
+    runner.run_transport_output_with_checkpoint(processor, &recovery)
 }
 
 #[cfg(all(target_os = "linux", target_endian = "little"))]

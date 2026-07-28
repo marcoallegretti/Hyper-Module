@@ -1,7 +1,6 @@
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 pub const STEREO_CHANNELS: usize = 2;
@@ -116,6 +115,12 @@ pub trait InterleavedStereoProcessor {
     ///
     /// Returns an implementation-defined error when the block cannot be
     /// rendered. The output owner replaces the block with silence.
+    ///
+    /// # Panics
+    ///
+    /// Implementations must not panic. Native backends can invoke this method
+    /// from a real-time callback, where panic hooks and unwinding are not
+    /// bounded operations.
     fn process(&mut self, output: &mut [f32]) -> Result<(), Self::Error>;
 }
 
@@ -134,7 +139,6 @@ where
 pub enum OutputCallbackStatus {
     Rendered,
     ProcessorFailed,
-    ProcessorPanicked,
     SampleCountNotStereoAligned { samples: usize },
     BlockTooLarge { frames: usize, maximum: usize },
 }
@@ -146,7 +150,6 @@ pub struct OutputStreamSnapshot {
     pub rendered_frame_count: u64,
     pub silent_frame_count: u64,
     pub processor_failure_count: u64,
-    pub processor_panic_count: u64,
     pub invalid_shape_count: u64,
     pub oversized_block_count: u64,
     pub unavailable_buffer_count: u64,
@@ -161,7 +164,6 @@ struct OutputStreamCounterState {
     rendered_frames: AtomicU64,
     silent_frames: AtomicU64,
     processor_failures: AtomicU64,
-    processor_panics: AtomicU64,
     invalid_shapes: AtomicU64,
     oversized_blocks: AtomicU64,
     unavailable_buffers: AtomicU64,
@@ -183,7 +185,6 @@ impl OutputStreamCounters {
             rendered_frame_count: self.state.rendered_frames.load(Ordering::Relaxed),
             silent_frame_count: self.state.silent_frames.load(Ordering::Relaxed),
             processor_failure_count: self.state.processor_failures.load(Ordering::Relaxed),
-            processor_panic_count: self.state.processor_panics.load(Ordering::Relaxed),
             invalid_shape_count: self.state.invalid_shapes.load(Ordering::Relaxed),
             oversized_block_count: self.state.oversized_blocks.load(Ordering::Relaxed),
             unavailable_buffer_count: self.state.unavailable_buffers.load(Ordering::Relaxed),
@@ -243,7 +244,6 @@ pub struct OutputCallback<P> {
     processor: P,
     maximum_block_frames: usize,
     counters: OutputStreamCounters,
-    processor_panicked: bool,
 }
 
 impl<P: InterleavedStereoProcessor> OutputCallback<P> {
@@ -279,7 +279,6 @@ impl<P: InterleavedStereoProcessor> OutputCallback<P> {
             processor,
             maximum_block_frames,
             counters,
-            processor_panicked: false,
         })
     }
 
@@ -315,30 +314,15 @@ impl<P: InterleavedStereoProcessor> OutputCallback<P> {
 
         output.fill(0.0);
         OutputStreamCounters::add(&self.counters.state.callbacks, 1);
-        if self.processor_panicked {
+        if self.processor.process(output).is_ok() {
+            OutputStreamCounters::add(&self.counters.state.rendered_callbacks, 1);
+            OutputStreamCounters::add(&self.counters.state.rendered_frames, frames);
+            OutputCallbackStatus::Rendered
+        } else {
+            output.fill(0.0);
+            OutputStreamCounters::add(&self.counters.state.processor_failures, 1);
             OutputStreamCounters::add(&self.counters.state.silent_frames, frames);
-            return OutputCallbackStatus::ProcessorPanicked;
-        }
-        let result = catch_unwind(AssertUnwindSafe(|| self.processor.process(output)));
-        match result {
-            Ok(Ok(())) => {
-                OutputStreamCounters::add(&self.counters.state.rendered_callbacks, 1);
-                OutputStreamCounters::add(&self.counters.state.rendered_frames, frames);
-                OutputCallbackStatus::Rendered
-            }
-            Ok(Err(_)) => {
-                output.fill(0.0);
-                OutputStreamCounters::add(&self.counters.state.processor_failures, 1);
-                OutputStreamCounters::add(&self.counters.state.silent_frames, frames);
-                OutputCallbackStatus::ProcessorFailed
-            }
-            Err(_) => {
-                self.processor_panicked = true;
-                output.fill(0.0);
-                OutputStreamCounters::add(&self.counters.state.processor_panics, 1);
-                OutputStreamCounters::add(&self.counters.state.silent_frames, frames);
-                OutputCallbackStatus::ProcessorPanicked
-            }
+            OutputCallbackStatus::ProcessorFailed
         }
     }
 }
@@ -440,11 +424,7 @@ mod tests {
                 move |output: &mut [f32]| -> Result<(), &'static str> {
                     call += 1;
                     output.fill(f32::from(call));
-                    match call {
-                        1 => Ok(()),
-                        2 => Err("failure"),
-                        _ => panic!("panic"),
-                    }
+                    if call == 1 { Ok(()) } else { Err("failure") }
                 }
             },
             2,
@@ -466,20 +446,6 @@ mod tests {
         );
         assert_samples(&failed, 0.0);
 
-        let mut panicked = [9.0_f32; 4];
-        assert_eq!(
-            callback.process(&mut panicked),
-            OutputCallbackStatus::ProcessorPanicked
-        );
-        assert_samples(&panicked, 0.0);
-
-        let mut after_panic = [9.0_f32; 4];
-        assert_eq!(
-            callback.process(&mut after_panic),
-            OutputCallbackStatus::ProcessorPanicked
-        );
-        assert_samples(&after_panic, 0.0);
-
         let mut malformed = [9.0_f32; 3];
         assert_eq!(
             callback.process(&mut malformed),
@@ -500,12 +466,11 @@ mod tests {
         assert_eq!(
             counters.snapshot(),
             OutputStreamSnapshot {
-                callback_count: 6,
+                callback_count: 4,
                 rendered_callback_count: 1,
                 rendered_frame_count: 2,
-                silent_frame_count: 9,
+                silent_frame_count: 5,
                 processor_failure_count: 1,
-                processor_panic_count: 1,
                 invalid_shape_count: 1,
                 oversized_block_count: 1,
                 ..OutputStreamSnapshot::default()

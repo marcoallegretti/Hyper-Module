@@ -1,7 +1,9 @@
 use super::{
-    InterleavedStereoProcessor, OutputCallback, OutputStreamCounters, OutputStreamState,
-    OutputStreamStatus, PipeWireOutputTarget, PlaybackRecoveryCheckpoint, STEREO_CHANNELS,
+    InterleavedStereoProcessor, OutputCallback, OutputCallbackStatus, OutputStreamCounters,
+    OutputStreamState, OutputStreamStatus, PipeWireOutputTarget, PlaybackRecoveryCheckpoint,
+    STEREO_CHANNELS,
 };
+use core::cell::Cell;
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +23,7 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const BYTES_PER_SAMPLE: usize = size_of::<f32>();
 const FRAME_STRIDE: usize = STEREO_CHANNELS * BYTES_PER_SAMPLE;
 type PipeWireProcessor<'processor> = Box<dyn FnMut(&mut [f32]) -> Result<(), ()> + 'processor>;
+type PipeWireCommit<'processor> = Box<dyn FnMut() + 'processor>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PipeWireOutputConfig {
@@ -248,9 +251,18 @@ impl PipeWireThreadRunner {
     where
         P: InterleavedStereoProcessor,
     {
+        self.run_with_commit(processor, || {})
+    }
+
+    fn run_with_commit<P, C>(self, processor: P, commit: C) -> Result<(), PipeWireStartError>
+    where
+        P: InterleavedStereoProcessor,
+        C: FnMut(),
+    {
         let mut processor = processor;
         let processor: PipeWireProcessor<'_> =
             Box::new(move |output| processor.process(output).map_err(|_| ()));
+        let commit: PipeWireCommit<'_> = Box::new(commit);
         let callback = OutputCallback::try_new_with_counters(
             processor,
             self.config.maximum_block_frames,
@@ -263,6 +275,7 @@ impl PipeWireThreadRunner {
         run_pipewire_inner(
             self.config,
             callback,
+            commit,
             self.stop_requested,
             &self.startup,
             &self.status,
@@ -293,7 +306,7 @@ impl PipeWireThreadRunner {
     pub(crate) fn run_transport_output_with_checkpoint<R>(
         self,
         mut processor: TransportOutputProcessor<'_, '_, R>,
-        checkpoint: PlaybackRecoveryCheckpoint,
+        checkpoint: &PlaybackRecoveryCheckpoint,
     ) -> Result<(), PipeWireStartError>
     where
         R: TrackWindowRenderer,
@@ -302,11 +315,21 @@ impl PipeWireThreadRunner {
             self.config.maximum_block_frames,
             processor.maximum_block_frames(),
         )?;
-        self.run(move |output: &mut [f32]| {
-            processor.process(output).map(|rendered| {
-                checkpoint.publish_cycle(rendered.snapshot().cycle());
-            })
-        })
+        let pending_cycle = Cell::new(None);
+        self.run_with_commit(
+            |output: &mut [f32]| {
+                pending_cycle.set(None);
+                processor.process(output).map(|rendered| {
+                    pending_cycle.set(Some(rendered.snapshot().cycle()));
+                })
+            },
+            || {
+                let cycle = pending_cycle
+                    .take()
+                    .expect("a rendered PipeWire block has a pending recovery cycle");
+                checkpoint.publish_cycle(cycle);
+            },
+        )
     }
 
     /// Returns whether stream startup or shutdown cancellation was requested.
@@ -449,12 +472,16 @@ fn wait_for_startup(
 
 struct PipeWireCallback<'processor> {
     output: OutputCallback<PipeWireProcessor<'processor>>,
+    commit: PipeWireCommit<'processor>,
     startup: Option<SyncSender<Result<(), PipeWireStartError>>>,
+    main_loop: pw::main_loop::MainLoopRc,
+    status: OutputStreamStatus,
 }
 
 fn run_pipewire_inner(
     config: PipeWireOutputConfig,
     callback: OutputCallback<PipeWireProcessor<'_>>,
+    commit: PipeWireCommit<'_>,
     stop_requested: Arc<AtomicBool>,
     startup: &SyncSender<Result<(), PipeWireStartError>>,
     status: &OutputStreamStatus,
@@ -495,7 +522,10 @@ fn run_pipewire_inner(
     let listener = stream
         .add_local_listener_with_user_data(PipeWireCallback {
             output: callback,
+            commit,
             startup: Some(startup.clone()),
+            main_loop: main_loop.clone(),
+            status: status.clone(),
         })
         .state_changed(move |_, state, _, new| match new {
             pw::stream::StreamState::Paused | pw::stream::StreamState::Streaming => {
@@ -534,7 +564,7 @@ fn run_pipewire_inner(
             loop_for_stop.quit();
         }
     });
-    stop_timer.update_timer(Some(STOP_POLL_INTERVAL), Some(STOP_POLL_INTERVAL));
+    arm_stop_timer(&stop_timer)?;
 
     let format = build_format(config.sample_rate_hz)?;
     let pod = Pod::from_bytes(&format).ok_or_else(|| PipeWireStartError::Backend {
@@ -560,6 +590,14 @@ fn run_pipewire_inner(
     drop(stop_timer);
     drop(listener);
     Ok(())
+}
+
+fn arm_stop_timer(timer: &pw::loop_::TimerSource<'_>) -> Result<(), PipeWireStartError> {
+    timer
+        .update_timer(Some(STOP_POLL_INTERVAL), Some(STOP_POLL_INTERVAL))
+        .into_result()
+        .map(|_| ())
+        .map_err(|source| backend_error(PipeWireStartupStage::MainLoop, source))
 }
 
 fn process_pipewire_buffer(stream: &pw::stream::Stream, state: &mut PipeWireCallback<'_>) {
@@ -594,7 +632,13 @@ fn process_pipewire_buffer(stream: &pw::stream::Stream, state: &mut PipeWireCall
             .record_malformed_buffer(aligned_bytes / FRAME_STRIDE);
     } else if let Ok(samples) = bytemuck::try_cast_slice_mut::<u8, f32>(&mut bytes[..aligned_bytes])
     {
-        let _ = state.output.process(samples);
+        let callback_status = state.output.process(samples);
+        if callback_status == OutputCallbackStatus::Rendered {
+            (state.commit)();
+        } else {
+            state.status.mark_failed();
+            state.main_loop.quit();
+        }
     } else {
         bytes[..aligned_bytes].fill(0);
         state
