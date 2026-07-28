@@ -1,6 +1,13 @@
+use super::OutputStreamCounters;
+#[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::{
-    OutputStreamCounters, PipeWireOutputConfig, PipeWireOutputStream, PipeWireStartError,
-    PipeWireStartupStage, PipeWireStopError, PipeWireThreadRunner,
+    PipeWireOutputConfig, PipeWireOutputStream, PipeWireStartError, PipeWireStartupStage,
+    PipeWireStopError, PipeWireThreadRunner,
+};
+#[cfg(target_os = "windows")]
+use super::{
+    WasapiOutputConfig, WasapiOutputStream, WasapiStartError, WasapiStartupStage, WasapiStopError,
+    WasapiThreadRunner,
 };
 use core::error::Error;
 use core::fmt;
@@ -18,6 +25,31 @@ use hyper_playback_session::PreparedPlaybackSession;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 
 pub type DesktopPlaybackSessionInput = PreparedPlaybackSession;
+
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+pub type DesktopOutputConfig = PipeWireOutputConfig;
+#[cfg(target_os = "windows")]
+pub type DesktopOutputConfig = WasapiOutputConfig;
+
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+pub type DesktopOutputStartError = PipeWireStartError;
+#[cfg(target_os = "windows")]
+pub type DesktopOutputStartError = WasapiStartError;
+
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+pub type DesktopOutputStopError = PipeWireStopError;
+#[cfg(target_os = "windows")]
+pub type DesktopOutputStopError = WasapiStopError;
+
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+type DesktopOutputStream = PipeWireOutputStream;
+#[cfg(target_os = "windows")]
+type DesktopOutputStream = WasapiOutputStream;
+
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+type DesktopThreadRunner = PipeWireThreadRunner;
+#[cfg(target_os = "windows")]
+type DesktopThreadRunner = WasapiThreadRunner;
 
 #[derive(Debug)]
 pub enum DesktopPlaybackSessionBuildError {
@@ -70,7 +102,7 @@ impl Error for DesktopPlaybackSessionBuildError {
 #[derive(Debug)]
 pub enum DesktopPlaybackSessionStartError {
     Build(DesktopPlaybackSessionBuildError),
-    Output(PipeWireStartError),
+    Output(DesktopOutputStartError),
     PublicationUnavailable,
 }
 
@@ -108,10 +140,10 @@ enum SessionPublication {
     Failed(DesktopPlaybackSessionBuildError),
 }
 
-/// One live `PipeWire` output with its bounded application-thread controls.
+/// One live native desktop output with its bounded application-thread controls.
 #[derive(Debug)]
 pub struct DesktopPlaybackSession {
-    output: PipeWireOutputStream,
+    output: DesktopOutputStream,
     commands: TransportCommandSender,
     meters: OutputMeterReceiver,
 }
@@ -119,20 +151,21 @@ pub struct DesktopPlaybackSession {
 impl DesktopPlaybackSession {
     /// Compiles and binds one verified session entirely on the output thread.
     ///
-    /// Controls are returned only after `PipeWire` reports a usable stream state.
+    /// Controls are returned only after the native backend reports a usable
+    /// stream state.
     ///
     /// # Errors
     ///
     /// Returns [`DesktopPlaybackSessionStartError`] if session construction or
     /// output startup fails. No partial session is published.
     pub fn start(
-        config: PipeWireOutputConfig,
+        config: DesktopOutputConfig,
         input: DesktopPlaybackSessionInput,
     ) -> Result<Self, DesktopPlaybackSessionStartError> {
         let sample_rate_hz = config.sample_rate_hz();
         let maximum_block_frames = config.maximum_block_frames();
         let (publication_sender, publication_receiver) = sync_channel(1);
-        let output = PipeWireOutputStream::start_with_thread_initializer(config, move |runner| {
+        let output = DesktopOutputStream::start_with_thread_initializer(config, move |runner| {
             initialize_session(
                 runner,
                 input,
@@ -180,8 +213,8 @@ impl DesktopPlaybackSession {
     ///
     /// # Errors
     ///
-    /// Returns [`PipeWireStopError`] if the output thread panicked.
-    pub fn stop(self) -> Result<(), PipeWireStopError> {
+    /// Returns [`DesktopOutputStopError`] if the output thread panicked.
+    pub fn stop(self) -> Result<(), DesktopOutputStopError> {
         let Self {
             output,
             commands: _,
@@ -202,12 +235,12 @@ fn failed_build(
 }
 
 fn initialize_session(
-    runner: PipeWireThreadRunner,
+    runner: DesktopThreadRunner,
     input: DesktopPlaybackSessionInput,
     sample_rate_hz: u32,
     maximum_block_frames: usize,
     publication: &SyncSender<SessionPublication>,
-) -> Result<(), PipeWireStartError> {
+) -> Result<(), DesktopOutputStartError> {
     let (project, mixer, automation, media) = input.into_parts();
     if project.sample_rate_hz() != sample_rate_hz {
         return fail_build(
@@ -275,10 +308,7 @@ fn initialize_session(
             commands,
             meters,
         }))
-        .map_err(|_| PipeWireStartError::Backend {
-            stage: PipeWireStartupStage::Callback,
-            detail: "playback control publication failed".to_owned(),
-        })?;
+        .map_err(|_| callback_error("playback control publication failed".to_owned()))?;
     runner.run_transport_output(processor)
 }
 
@@ -304,13 +334,26 @@ fn allocate_scratch_planes(
 fn fail_build<T>(
     publication: &SyncSender<SessionPublication>,
     source: DesktopPlaybackSessionBuildError,
-) -> Result<T, PipeWireStartError> {
+) -> Result<T, DesktopOutputStartError> {
     let detail = source.to_string();
     let _ = publication.try_send(SessionPublication::Failed(source));
-    Err(PipeWireStartError::Backend {
+    Err(callback_error(detail))
+}
+
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+fn callback_error(detail: String) -> DesktopOutputStartError {
+    PipeWireStartError::Backend {
         stage: PipeWireStartupStage::Callback,
         detail,
-    })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn callback_error(detail: String) -> DesktopOutputStartError {
+    WasapiStartError::Backend {
+        stage: WasapiStartupStage::Callback,
+        detail,
+    }
 }
 
 #[cfg(test)]
@@ -338,10 +381,8 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(PipeWireStartError::Backend {
-                stage: PipeWireStartupStage::Callback,
-                ..
-            })
+            Err(DesktopOutputStartError::Backend { detail, .. })
+                if detail == "project sample rate is 44100 Hz; output is configured for 48000 Hz"
         ));
         assert!(matches!(
             failed_build(&receiver),

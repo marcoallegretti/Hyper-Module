@@ -250,11 +250,18 @@ pub use pipewire_output::{
     PipeWireOutputConfig, PipeWireOutputConfigError, PipeWireOutputStream, PipeWireStartError,
     PipeWireStartupStage, PipeWireStopError, PipeWireThreadRunner,
 };
-#[cfg(all(target_os = "linux", target_endian = "little"))]
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
 mod playback_session;
-#[cfg(all(target_os = "linux", target_endian = "little"))]
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
 pub use playback_session::{
-    DesktopPlaybackSession, DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
+    DesktopOutputConfig, DesktopOutputStartError, DesktopOutputStopError, DesktopPlaybackSession,
+    DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
     DesktopPlaybackSessionStartError,
 };
 #[cfg(target_os = "windows")]

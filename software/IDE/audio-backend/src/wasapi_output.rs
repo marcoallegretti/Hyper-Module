@@ -2,6 +2,7 @@ use super::{InterleavedStereoProcessor, OutputCallback, OutputStreamCounters, ST
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
+use hyper_mixer_runtime::{TrackWindowRenderer, TransportOutputProcessor};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
@@ -235,6 +236,27 @@ impl WasapiThreadRunner {
             &self.startup,
             &self.counters,
         )
+    }
+
+    /// Runs one prepared transport output processor on this WASAPI thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasapiStartError`] when the transport and stream callback
+    /// capacities differ or when backend startup or lifecycle fails. Transport
+    /// processing failures follow the stream's fail-silent counter policy.
+    pub fn run_transport_output<R>(
+        self,
+        mut processor: TransportOutputProcessor<'_, '_, R>,
+    ) -> Result<(), WasapiStartError>
+    where
+        R: TrackWindowRenderer,
+    {
+        validate_transport_capacity(
+            self.config.maximum_block_frames,
+            processor.maximum_block_frames(),
+        )?;
+        self.run(move |output: &mut [f32]| processor.process(output).map(|_| ()))
     }
 
     #[must_use]
@@ -538,6 +560,21 @@ fn backend_error(stage: WasapiStartupStage, source: impl fmt::Display) -> Wasapi
     }
 }
 
+fn validate_transport_capacity(
+    wasapi_frames: usize,
+    transport_frames: usize,
+) -> Result<(), WasapiStartError> {
+    if wasapi_frames != transport_frames {
+        return Err(WasapiStartError::Backend {
+            stage: WasapiStartupStage::Callback,
+            detail: format!(
+                "WASAPI capacity is {wasapi_frames} frames; transport capacity is {transport_frames}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 struct ComGuard;
 
 impl Drop for ComGuard {
@@ -611,5 +648,16 @@ mod tests {
         });
 
         assert!(matches!(result, Err(WasapiStartError::ThreadPanicked)));
+    }
+
+    #[test]
+    fn transport_and_wasapi_capacities_must_match() {
+        assert!(matches!(
+            validate_transport_capacity(64, 128),
+            Err(WasapiStartError::Backend {
+                stage: WasapiStartupStage::Callback,
+                detail,
+            }) if detail == "WASAPI capacity is 64 frames; transport capacity is 128"
+        ));
     }
 }
