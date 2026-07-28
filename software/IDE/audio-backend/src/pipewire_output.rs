@@ -730,6 +730,7 @@ fn validate_transport_capacity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::AtomicUsize;
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
@@ -768,6 +769,37 @@ mod tests {
             error.source().map(ToString::to_string),
             Some("fixture rejected".to_owned())
         );
+    }
+
+    #[test]
+    #[ignore = "requires a live PipeWire daemon with the hyper-ci-sink null sink"]
+    fn live_pipewire_null_sink_processes_audio() {
+        let targets = super::super::discover_pipewire_output_targets().unwrap();
+        let target = targets
+            .targets()
+            .iter()
+            .find(|target| target.display_name() == "Hyper CI Sink")
+            .expect("CI null sink was not discovered");
+        let config = PipeWireOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_output_target(target)
+            .unwrap();
+        let processed = Arc::new(AtomicUsize::new(0));
+        let callback_processed = Arc::clone(&processed);
+        let stream = PipeWireOutputStream::start(config, move |output: &mut [f32]| {
+            output.fill(0.25);
+            callback_processed.fetch_add(output.len(), Ordering::Relaxed);
+            Ok::<_, u8>(())
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while processed.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        stream.stop().unwrap();
+
+        assert!(processed.load(Ordering::Relaxed) > 0);
     }
 
     #[test]

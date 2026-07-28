@@ -49,7 +49,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends libpipewire-0.3-dev
+          sudo apt-get install --no-install-recommends libpipewire-0.3-dev pipewire pipewire-bin wireplumber
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -59,6 +59,10 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --all-targets --locked
+
+      - name: Test live PipeWire output
+        if: runner.os == 'Linux'
+        run: bash software/IDE/audio-backend/scripts/test-pipewire-live.sh
 
       - name: Check documentation
         env:
