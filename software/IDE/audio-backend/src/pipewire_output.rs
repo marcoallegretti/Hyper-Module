@@ -1,6 +1,6 @@
 use super::{
     InterleavedStereoProcessor, OutputCallback, OutputStreamCounters, OutputStreamState,
-    OutputStreamStatus, PlaybackRecoveryCheckpoint, STEREO_CHANNELS,
+    OutputStreamStatus, PipeWireOutputTarget, PlaybackRecoveryCheckpoint, STEREO_CHANNELS,
 };
 use core::error::Error;
 use core::fmt;
@@ -71,6 +71,18 @@ impl PipeWireOutputConfig {
         }
         self.target = Some(target.to_owned());
         Ok(self)
+    }
+
+    /// Selects one target returned by desktop output discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipeWireOutputConfigError`] if its routing identity is invalid.
+    pub fn with_output_target(
+        self,
+        target: &PipeWireOutputTarget,
+    ) -> Result<Self, PipeWireOutputConfigError> {
+        self.with_target(target.routing_id())
     }
 
     #[must_use]

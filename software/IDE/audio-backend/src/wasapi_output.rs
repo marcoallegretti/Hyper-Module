@@ -1,6 +1,6 @@
 use super::{
     InterleavedStereoProcessor, OutputCallback, OutputStreamCounters, OutputStreamState,
-    OutputStreamStatus, PlaybackRecoveryCheckpoint, STEREO_CHANNELS,
+    OutputStreamStatus, PlaybackRecoveryCheckpoint, STEREO_CHANNELS, WasapiOutputEndpoint,
 };
 use core::error::Error;
 use core::fmt;
@@ -67,6 +67,18 @@ impl WasapiOutputConfig {
         }
         self.device_id = Some(device_id.to_owned());
         Ok(self)
+    }
+
+    /// Selects one endpoint returned by desktop output discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasapiOutputConfigError`] if its routing identity is invalid.
+    pub fn with_output_target(
+        self,
+        target: &WasapiOutputEndpoint,
+    ) -> Result<Self, WasapiOutputConfigError> {
+        self.with_device_id(target.routing_id())
     }
 
     #[must_use]

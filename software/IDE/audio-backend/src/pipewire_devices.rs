@@ -24,6 +24,11 @@ impl PipeWireOutputTarget {
     }
 
     #[must_use]
+    pub fn routing_id(&self) -> &str {
+        self.target()
+    }
+
+    #[must_use]
     pub fn display_name(&self) -> &str {
         &self.display_name
     }
@@ -46,6 +51,11 @@ impl PipeWireOutputTargets {
         self.targets
             .iter()
             .find(|candidate| candidate.target == target)
+    }
+
+    #[must_use]
+    pub fn target_by_routing_id(&self, routing_id: &str) -> Option<&PipeWireOutputTarget> {
+        self.target_by_name(routing_id)
     }
 }
 
@@ -414,6 +424,13 @@ mod tests {
                 .map(PipeWireOutputTarget::display_name),
             Some("USB Audio")
         );
+        let selected = snapshot.target_by_routing_id("alsa_output.usb-b").unwrap();
+        assert_eq!(selected.routing_id(), "alsa_output.usb-b");
+        let config = crate::DesktopOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_output_target(selected)
+            .unwrap();
+        assert_eq!(config.target(), Some("alsa_output.usb-b"));
     }
 
     #[test]

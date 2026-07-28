@@ -19,6 +19,11 @@ impl WasapiOutputEndpoint {
     }
 
     #[must_use]
+    pub fn routing_id(&self) -> &str {
+        self.device_id()
+    }
+
+    #[must_use]
     pub fn display_name(&self) -> &str {
         &self.display_name
     }
@@ -42,6 +47,11 @@ impl WasapiOutputEndpoints {
     }
 
     #[must_use]
+    pub fn targets(&self) -> &[WasapiOutputEndpoint] {
+        self.endpoints()
+    }
+
+    #[must_use]
     pub fn default_endpoint(&self) -> Option<&WasapiOutputEndpoint> {
         self.endpoints.iter().find(|endpoint| endpoint.default)
     }
@@ -51,6 +61,11 @@ impl WasapiOutputEndpoints {
         self.endpoints
             .iter()
             .find(|endpoint| endpoint.device_id == device_id)
+    }
+
+    #[must_use]
+    pub fn target_by_routing_id(&self, routing_id: &str) -> Option<&WasapiOutputEndpoint> {
+        self.endpoint_by_id(routing_id)
     }
 }
 
@@ -371,6 +386,13 @@ mod tests {
                 .map(WasapiOutputEndpoint::display_name),
             Some("Speakers")
         );
+        let selected = snapshot.target_by_routing_id("endpoint-a").unwrap();
+        assert_eq!(selected.routing_id(), "endpoint-a");
+        let config = crate::DesktopOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_output_target(selected)
+            .unwrap();
+        assert_eq!(config.device_id(), Some("endpoint-a"));
     }
 
     #[test]

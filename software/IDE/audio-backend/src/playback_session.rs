@@ -3,13 +3,13 @@ use super::{
 };
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::{
-    PipeWireOutputConfig, PipeWireOutputStream, PipeWireStartError, PipeWireStartupStage,
-    PipeWireStopError, PipeWireThreadRunner,
+    PipeWireOutputConfig, PipeWireOutputConfigError, PipeWireOutputStream, PipeWireStartError,
+    PipeWireStartupStage, PipeWireStopError, PipeWireThreadRunner,
 };
 #[cfg(target_os = "windows")]
 use super::{
-    WasapiDisconnectReason, WasapiOutputConfig, WasapiOutputStream, WasapiStartError,
-    WasapiStartupStage, WasapiStopError, WasapiThreadRunner,
+    WasapiDisconnectReason, WasapiOutputConfig, WasapiOutputConfigError, WasapiOutputStream,
+    WasapiStartError, WasapiStartupStage, WasapiStopError, WasapiThreadRunner,
 };
 use core::error::Error;
 use core::fmt;
@@ -33,6 +33,11 @@ pub type DesktopPlaybackSessionInput = PreparedPlaybackSession;
 pub type DesktopOutputConfig = PipeWireOutputConfig;
 #[cfg(target_os = "windows")]
 pub type DesktopOutputConfig = WasapiOutputConfig;
+
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+pub type DesktopOutputConfigError = PipeWireOutputConfigError;
+#[cfg(target_os = "windows")]
+pub type DesktopOutputConfigError = WasapiOutputConfigError;
 
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 pub type DesktopOutputStartError = PipeWireStartError;
