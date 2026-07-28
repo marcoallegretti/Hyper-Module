@@ -165,32 +165,65 @@ pub struct DesktopPlaybackRecovery {
 }
 
 #[derive(Debug)]
-pub struct DesktopPlaybackRecoveryStopError {
-    source: DesktopOutputStopError,
-    recovery: DesktopPlaybackRecovery,
+pub enum DesktopPlaybackRecoveryStopError {
+    ThreadPanicked {
+        source: DesktopOutputStopError,
+        recovery: DesktopPlaybackRecovery,
+    },
+    ShutdownTimedOut {
+        source: DesktopOutputStopError,
+    },
 }
 
 impl DesktopPlaybackRecoveryStopError {
+    fn from_stop(source: DesktopOutputStopError, recovery: DesktopPlaybackRecovery) -> Self {
+        match source {
+            DesktopOutputStopError::ThreadPanicked => Self::ThreadPanicked { source, recovery },
+            DesktopOutputStopError::ShutdownTimeout => Self::ShutdownTimedOut { source },
+        }
+    }
+
+    /// Returns restart authority only when the backend thread is known to have
+    /// terminated.
     #[must_use]
-    pub const fn recovery(&self) -> &DesktopPlaybackRecovery {
-        &self.recovery
+    pub const fn recovery(&self) -> Option<&DesktopPlaybackRecovery> {
+        match self {
+            Self::ThreadPanicked { recovery, .. } => Some(recovery),
+            Self::ShutdownTimedOut { .. } => None,
+        }
+    }
+
+    /// Returns restart authority only when the backend thread is known to have
+    /// terminated.
+    #[must_use]
+    pub fn into_recovery(self) -> Option<DesktopPlaybackRecovery> {
+        match self {
+            Self::ThreadPanicked { recovery, .. } => Some(recovery),
+            Self::ShutdownTimedOut { .. } => None,
+        }
     }
 
     #[must_use]
-    pub fn into_recovery(self) -> DesktopPlaybackRecovery {
-        self.recovery
+    pub const fn is_shutdown_timeout(&self) -> bool {
+        matches!(self, Self::ShutdownTimedOut { .. })
+    }
+
+    fn source_error(&self) -> &DesktopOutputStopError {
+        match self {
+            Self::ThreadPanicked { source, .. } | Self::ShutdownTimedOut { source } => source,
+        }
     }
 }
 
 impl fmt::Display for DesktopPlaybackRecoveryStopError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.source.fmt(formatter)
+        self.source_error().fmt(formatter)
     }
 }
 
 impl Error for DesktopPlaybackRecoveryStopError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.source)
+        Some(self.source_error())
     }
 }
 
@@ -363,8 +396,10 @@ impl DesktopPlaybackSession {
     ///
     /// # Errors
     ///
-    /// Returns a shutdown error that still owns the recovery authority if the
-    /// backend thread panicked.
+    /// A joined backend panic returns an error that retains recovery authority.
+    /// A shutdown timeout does not: the detached backend thread may still own
+    /// the native output, so starting a replacement would violate single-owner
+    /// playback.
     pub fn into_recovery(
         self,
     ) -> Result<DesktopPlaybackRecovery, DesktopPlaybackRecoveryStopError> {
@@ -384,7 +419,9 @@ impl DesktopPlaybackSession {
         };
         match stop_result {
             Ok(()) => Ok(recovery),
-            Err(source) => Err(DesktopPlaybackRecoveryStopError { source, recovery }),
+            Err(source) => Err(DesktopPlaybackRecoveryStopError::from_stop(
+                source, recovery,
+            )),
         }
     }
 
@@ -400,7 +437,8 @@ impl DesktopPlaybackSession {
     ///
     /// # Errors
     ///
-    /// Returns [`DesktopOutputStopError`] if the output thread panicked.
+    /// Returns [`DesktopOutputStopError`] if the output thread panicked or did
+    /// not terminate before the bounded shutdown deadline.
     pub fn stop(self) -> Result<(), DesktopOutputStopError> {
         let Self {
             output,
@@ -612,5 +650,39 @@ mod tests {
             spent.restart(),
             Err(DesktopPlaybackRecoveryStartError::AlreadyRestarted)
         ));
+    }
+
+    #[test]
+    fn shutdown_timeout_never_releases_restart_authority() {
+        let recovery = DesktopPlaybackRecovery {
+            config: DesktopOutputConfig::try_new(48_000, 256).unwrap(),
+            source: None,
+            checkpoint: PlaybackRecoveryCheckpoint::default().snapshot(),
+        };
+        let error = DesktopPlaybackRecoveryStopError::from_stop(
+            DesktopOutputStopError::ShutdownTimeout,
+            recovery,
+        );
+
+        assert!(error.is_shutdown_timeout());
+        assert!(error.recovery().is_none());
+        assert!(error.into_recovery().is_none());
+    }
+
+    #[test]
+    fn joined_panic_retains_restart_authority() {
+        let recovery = DesktopPlaybackRecovery {
+            config: DesktopOutputConfig::try_new(48_000, 256).unwrap(),
+            source: None,
+            checkpoint: PlaybackRecoveryCheckpoint::default().snapshot(),
+        };
+        let error = DesktopPlaybackRecoveryStopError::from_stop(
+            DesktopOutputStopError::ThreadPanicked,
+            recovery,
+        );
+
+        assert!(!error.is_shutdown_timeout());
+        assert!(error.recovery().is_some());
+        assert!(error.into_recovery().is_some());
     }
 }

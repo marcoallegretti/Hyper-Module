@@ -475,7 +475,8 @@ impl WasapiOutputStream {
     ///
     /// # Errors
     ///
-    /// Returns [`WasapiStopError`] if the render thread panicked.
+    /// Returns [`WasapiStopError`] if the render thread panicked or did not
+    /// terminate before the bounded shutdown deadline.
     pub fn stop(mut self) -> Result<(), WasapiStopError> {
         self.status.request_stop();
         self.stop_requested.store(true, Ordering::Release);

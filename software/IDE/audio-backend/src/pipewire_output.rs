@@ -451,7 +451,8 @@ impl PipeWireOutputStream {
     ///
     /// # Errors
     ///
-    /// Returns [`PipeWireStopError`] if the backend thread panicked.
+    /// Returns [`PipeWireStopError`] if the backend thread panicked or did not
+    /// terminate before the bounded shutdown deadline.
     pub fn stop(mut self) -> Result<(), PipeWireStopError> {
         self.status.request_stop();
         self.stop_requested.store(true, Ordering::Release);
