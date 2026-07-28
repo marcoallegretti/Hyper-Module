@@ -225,6 +225,7 @@ dependencies = [
  "hyper-mixer-runtime",
  "hyper-playback-compiler",
  "hyper-playback-json",
+ "hyper-playback-session",
  "libspa-sys",
  "pipewire",
 ]
@@ -277,6 +278,16 @@ dependencies = [
  "hyper-playback-compiler",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "hyper-playback-session"
+version = "0.1.0"
+dependencies = [
+ "hyper-audio-source",
+ "hyper-media-cache",
+ "hyper-playback-compiler",
+ "hyper-playback-json",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ use super::{
 use core::error::Error;
 use core::fmt;
 use hyper_arrangement_renderer::RenderScratchSlot;
-use hyper_media_cache::{DecodedMediaCache, PreparePlaybackError};
+use hyper_media_cache::PreparePlaybackError;
 use hyper_mixer_runtime::{
     OutputMeterReceiver, RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError,
     TransportCommandSender, TransportOutputCreationError, TransportOutputProcessor,
@@ -13,37 +13,11 @@ use hyper_mixer_runtime::{
 };
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
-use hyper_playback_json::{
-    AdapterCompileError, CompiledAutomation, CompiledMixerGraph, LoadedPlaybackProject,
-    MediaAssetFact,
-};
+use hyper_playback_json::{AdapterCompileError, MediaAssetFact};
+use hyper_playback_session::PreparedPlaybackSession;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 
-/// Fully owned, post-verification inputs for one desktop playback session.
-#[derive(Debug)]
-pub struct DesktopPlaybackSessionInput {
-    project: LoadedPlaybackProject,
-    mixer: CompiledMixerGraph,
-    automation: Option<CompiledAutomation>,
-    media: DecodedMediaCache,
-}
-
-impl DesktopPlaybackSessionInput {
-    #[must_use]
-    pub const fn new(
-        project: LoadedPlaybackProject,
-        mixer: CompiledMixerGraph,
-        automation: Option<CompiledAutomation>,
-        media: DecodedMediaCache,
-    ) -> Self {
-        Self {
-            project,
-            mixer,
-            automation,
-            media,
-        }
-    }
-}
+pub type DesktopPlaybackSessionInput = PreparedPlaybackSession;
 
 #[derive(Debug)]
 pub enum DesktopPlaybackSessionBuildError {
@@ -234,11 +208,12 @@ fn initialize_session(
     maximum_block_frames: usize,
     publication: &SyncSender<SessionPublication>,
 ) -> Result<(), PipeWireStartError> {
-    if input.project.sample_rate_hz() != sample_rate_hz {
+    let (project, mixer, automation, media) = input.into_parts();
+    if project.sample_rate_hz() != sample_rate_hz {
         return fail_build(
             publication,
             DesktopPlaybackSessionBuildError::SampleRateMismatch {
-                project: input.project.sample_rate_hz(),
+                project: project.sample_rate_hz(),
                 output: sample_rate_hz,
             },
         );
@@ -246,38 +221,34 @@ fn initialize_session(
 
     let mut facts: Vec<MediaAssetFact<'_>> = Vec::new();
     facts
-        .try_reserve_exact(input.media.asset_count())
+        .try_reserve_exact(media.asset_count())
         .map_err(|_| DesktopPlaybackSessionBuildError::AssetFactCapacityUnavailable)
         .or_else(|source| fail_build(publication, source))?;
-    facts.extend(input.media.media_asset_facts());
+    facts.extend(media.media_asset_facts());
 
-    let graph = input
-        .project
+    let graph = project
         .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
         .map_err(DesktopPlaybackSessionBuildError::Playback)
         .or_else(|source| fail_build(publication, source))?;
-    let prepared = input
-        .media
+    let prepared = media
         .prepare_playback(&graph)
         .map_err(DesktopPlaybackSessionBuildError::Media)
         .or_else(|source| fail_build(publication, source))?;
-    let runtime = match input.automation {
+    let runtime = match automation {
         Some(automation) => RoutedMainRuntime::try_new_prepared_playback_automated(
             &prepared,
-            &input.mixer,
+            &mixer,
             automation,
             maximum_block_frames,
         ),
-        None => RoutedMainRuntime::try_new_prepared_playback(
-            &prepared,
-            &input.mixer,
-            maximum_block_frames,
-        ),
+        None => {
+            RoutedMainRuntime::try_new_prepared_playback(&prepared, &mixer, maximum_block_frames)
+        }
     }
     .map_err(DesktopPlaybackSessionBuildError::Runtime)
     .or_else(|source| fail_build(publication, source))?;
 
-    let slot_count = input.mixer.slots().len();
+    let slot_count = mixer.slots().len();
     let mut left = allocate_scratch_planes(slot_count, maximum_block_frames)
         .or_else(|source| fail_build(publication, source))?;
     let mut right = allocate_scratch_planes(slot_count, maximum_block_frames)
