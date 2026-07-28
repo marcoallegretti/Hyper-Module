@@ -10,8 +10,9 @@ use hyper_arrangement_renderer::{
     RendererCreationError,
 };
 use hyper_audio_engine::{
-    ChannelParameters, ControlledInputBlock, InputBlock, LinearGain, MAX_PROCESS_FRAMES,
-    MixerCreationError, Pan, ParameterError, ProcessError, StereoMixer, StereoOutput,
+    ChannelParameters, ControlledInputBlock, InputBlock, InterleavedStereoCallback, LinearGain,
+    MAX_PROCESS_FRAMES, MixerCreationError, Pan, ParameterError, ProcessError, StereoBlockMeter,
+    StereoCallbackError, StereoMixer, StereoOutput,
 };
 use hyper_media_cache::PreparedSchedule;
 use hyper_playback_compiler::FrameTimelineError;
@@ -24,6 +25,7 @@ use rtrb::{Consumer, Producer, PushError, RingBuffer};
 
 pub const MAX_MAIN_MIXER_SLOTS: usize = 8;
 pub const MAX_QUEUED_TRANSPORT_COMMANDS: usize = 64;
+pub const MAX_QUEUED_OUTPUT_METER_SNAPSHOTS: usize = 64;
 const MAX_SENDS_PER_SLOT: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -246,6 +248,225 @@ impl TransportCycle {
     #[must_use]
     pub const fn command_sender_disconnected(self) -> bool {
         self.command_sender_disconnected
+    }
+}
+
+/// Final output meter data associated with one successful transport cycle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OutputMeterSnapshot {
+    cycle: TransportCycle,
+    meter: StereoBlockMeter,
+    dropped_before: usize,
+}
+
+impl OutputMeterSnapshot {
+    #[must_use]
+    pub const fn cycle(self) -> TransportCycle {
+        self.cycle
+    }
+
+    #[must_use]
+    pub const fn meter(self) -> StereoBlockMeter {
+        self.meter
+    }
+
+    /// Snapshots rejected by a full queue since the preceding successful
+    /// publication.
+    #[must_use]
+    pub const fn dropped_before(self) -> usize {
+        self.dropped_before
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OutputMeterPublishError {
+    Full(OutputMeterSnapshot),
+    Disconnected(OutputMeterSnapshot),
+}
+
+impl OutputMeterPublishError {
+    #[must_use]
+    pub const fn snapshot(self) -> OutputMeterSnapshot {
+        match self {
+            Self::Full(snapshot) | Self::Disconnected(snapshot) => snapshot,
+        }
+    }
+}
+
+impl fmt::Display for OutputMeterPublishError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full(_) => formatter.write_str("output meter snapshot queue is full"),
+            Self::Disconnected(_) => {
+                formatter.write_str("output meter snapshot receiver is disconnected")
+            }
+        }
+    }
+}
+
+impl Error for OutputMeterPublishError {}
+
+/// Audio-thread half of the bounded output meter snapshot channel.
+#[derive(Debug)]
+pub struct OutputMeterSender {
+    producer: Producer<OutputMeterSnapshot>,
+    dropped_snapshot_count: usize,
+}
+
+impl OutputMeterSender {
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        MAX_QUEUED_OUTPUT_METER_SNAPSHOTS
+    }
+
+    #[must_use]
+    pub fn is_disconnected(&self) -> bool {
+        let disconnected = self.producer.is_abandoned();
+        if disconnected {
+            fence(Ordering::Acquire);
+        }
+        disconnected
+    }
+
+    /// Attempts to publish one callback snapshot without waiting or allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns the published snapshot on success, including drop telemetry.
+    /// Returns the snapshot if the queue is full or its receiver has been
+    /// destroyed. A full queue increments a local saturating counter that is
+    /// attached to the next successfully published snapshot.
+    pub fn try_publish(
+        &mut self,
+        mut snapshot: OutputMeterSnapshot,
+    ) -> Result<OutputMeterSnapshot, OutputMeterPublishError> {
+        if self.is_disconnected() {
+            return Err(OutputMeterPublishError::Disconnected(snapshot));
+        }
+        snapshot.dropped_before = self.dropped_snapshot_count;
+        match self.producer.push(snapshot) {
+            Ok(()) => {
+                self.dropped_snapshot_count = 0;
+                Ok(snapshot)
+            }
+            Err(PushError::Full(snapshot)) => {
+                self.dropped_snapshot_count = self.dropped_snapshot_count.saturating_add(1);
+                Err(OutputMeterPublishError::Full(snapshot))
+            }
+        }
+    }
+}
+
+/// Result of draining the bounded output meter channel to its newest snapshot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LatestOutputMeterSnapshot {
+    snapshot: Option<OutputMeterSnapshot>,
+    coalesced_snapshot_count: usize,
+    dropped_snapshot_count: usize,
+    sender_disconnected: bool,
+}
+
+impl LatestOutputMeterSnapshot {
+    #[must_use]
+    pub const fn snapshot(self) -> Option<OutputMeterSnapshot> {
+        self.snapshot
+    }
+
+    #[must_use]
+    pub const fn coalesced_snapshot_count(self) -> usize {
+        self.coalesced_snapshot_count
+    }
+
+    #[must_use]
+    pub const fn dropped_snapshot_count(self) -> usize {
+        self.dropped_snapshot_count
+    }
+
+    #[must_use]
+    pub const fn sender_disconnected(self) -> bool {
+        self.sender_disconnected
+    }
+}
+
+/// Control-thread half of the bounded output meter snapshot channel.
+#[derive(Debug)]
+pub struct OutputMeterReceiver {
+    consumer: Consumer<OutputMeterSnapshot>,
+}
+
+impl OutputMeterReceiver {
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        MAX_QUEUED_OUTPUT_METER_SNAPSHOTS
+    }
+
+    /// Drains available snapshots and returns only the newest one.
+    ///
+    /// Coalesced snapshots were successfully delivered but superseded during
+    /// this read. Dropped snapshots were rejected earlier because the queue
+    /// was full. Both counts are explicit and independent.
+    #[must_use]
+    pub fn read_latest(&mut self) -> LatestOutputMeterSnapshot {
+        let mut snapshot = None;
+        let mut delivered_snapshot_count = 0_usize;
+        let mut dropped_snapshot_count = 0_usize;
+        for _ in 0..MAX_QUEUED_OUTPUT_METER_SNAPSHOTS {
+            let Ok(next) = self.consumer.pop() else {
+                break;
+            };
+            dropped_snapshot_count = dropped_snapshot_count.saturating_add(next.dropped_before());
+            snapshot = Some(next);
+            delivered_snapshot_count += 1;
+        }
+        let sender_disconnected = self.consumer.is_abandoned();
+        if sender_disconnected {
+            fence(Ordering::Acquire);
+        }
+        LatestOutputMeterSnapshot {
+            snapshot,
+            coalesced_snapshot_count: delivered_snapshot_count.saturating_sub(1),
+            dropped_snapshot_count,
+            sender_disconnected,
+        }
+    }
+}
+
+/// Allocates the fixed output meter queue before callback processing starts.
+#[must_use]
+pub fn output_meter_channel() -> (OutputMeterSender, OutputMeterReceiver) {
+    let (producer, consumer) = RingBuffer::new(MAX_QUEUED_OUTPUT_METER_SNAPSHOTS);
+    (
+        OutputMeterSender {
+            producer,
+            dropped_snapshot_count: 0,
+        },
+        OutputMeterReceiver { consumer },
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputMeterPublication {
+    Published,
+    QueueFull,
+    ReceiverDisconnected,
+}
+
+/// Result and publication status of one interleaved transport callback.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InterleavedTransportCycle {
+    snapshot: OutputMeterSnapshot,
+    publication: OutputMeterPublication,
+}
+
+impl InterleavedTransportCycle {
+    #[must_use]
+    pub const fn snapshot(self) -> OutputMeterSnapshot {
+        self.snapshot
+    }
+
+    #[must_use]
+    pub const fn publication(self) -> OutputMeterPublication {
+        self.publication
     }
 }
 
@@ -1161,6 +1382,49 @@ impl<'prepared, 'cache, 'schedule> GraphTransportRuntime<'prepared, 'cache, 'sch
             active_slot_count: rendered.active_slot_count,
             applied_command_count,
             command_sender_disconnected,
+        })
+    }
+
+    /// Processes, interleaves, meters, and publishes one transport callback.
+    ///
+    /// Audio success is independent from meter-channel availability. Queue
+    /// saturation or receiver disconnection is returned as publication status
+    /// while the successfully processed audio and snapshot remain available.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StereoCallbackError`] for invalid interleaved output shape,
+    /// callback capacity, or an underlying transport processing failure. Every
+    /// such failure follows the callback adapter's fail-silent policy and
+    /// publishes no meter snapshot.
+    pub fn process_interleaved_cycle(
+        &mut self,
+        callback: &mut InterleavedStereoCallback,
+        scratch: &mut [RenderScratchSlot<'_>],
+        interleaved_output: &mut [f32],
+        meter_sender: &mut OutputMeterSender,
+    ) -> Result<InterleavedTransportCycle, StereoCallbackError<RuntimeProcessError>> {
+        let processed = callback.process(interleaved_output, |output| {
+            self.process_cycle(scratch, output)
+        })?;
+        let (cycle, meter) = processed.into_parts();
+        let snapshot = OutputMeterSnapshot {
+            cycle,
+            meter,
+            dropped_before: 0,
+        };
+        let (snapshot, publication) = match meter_sender.try_publish(snapshot) {
+            Ok(snapshot) => (snapshot, OutputMeterPublication::Published),
+            Err(OutputMeterPublishError::Full(snapshot)) => {
+                (snapshot, OutputMeterPublication::QueueFull)
+            }
+            Err(OutputMeterPublishError::Disconnected(_)) => {
+                (snapshot, OutputMeterPublication::ReceiverDisconnected)
+            }
+        };
+        Ok(InterleavedTransportCycle {
+            snapshot,
+            publication,
         })
     }
 

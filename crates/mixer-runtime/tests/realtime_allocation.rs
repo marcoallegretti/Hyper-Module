@@ -11,6 +11,7 @@ use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{InterleavedStereoCallback, StereoOutput};
 use hyper_mixer_runtime::{
     FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, TransportCommand,
+    output_meter_channel,
 };
 
 use common::{fixture, graph_fixture};
@@ -120,6 +121,7 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
     let mut output_left = [0.0_f32; 64];
     let mut output_right = [0.0_f32; 64];
     let mut callback = InterleavedStereoCallback::try_new(64).unwrap();
+    let (mut meter_sender, _meter_receiver) = output_meter_channel();
     let mut interleaved = [0.0_f32; 128];
 
     ALLOCATIONS.store(0, Ordering::SeqCst);
@@ -133,13 +135,19 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
         },
     );
     let start_result = sender.try_send(TransportCommand::Start);
-    let automated_result = callback.process(&mut interleaved, |output| {
-        transport.process_cycle(&mut scratch, output)
-    });
+    let automated_result = transport.process_interleaved_cycle(
+        &mut callback,
+        &mut scratch,
+        &mut interleaved,
+        &mut meter_sender,
+    );
     let stop_result = sender.try_send(TransportCommand::Stop);
-    let stopped_result = callback.process(&mut interleaved, |output| {
-        transport.process_cycle(&mut scratch, output)
-    });
+    let stopped_result = transport.process_interleaved_cycle(
+        &mut callback,
+        &mut scratch,
+        &mut interleaved,
+        &mut meter_sender,
+    );
     COUNTING.store(false, Ordering::SeqCst);
 
     assert!(result.is_ok());

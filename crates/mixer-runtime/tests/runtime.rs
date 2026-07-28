@@ -1,11 +1,15 @@
 mod common;
 
 use hyper_arrangement_renderer::RenderScratchSlot;
-use hyper_audio_engine::{InterleavedStereoCallback, MAX_PROCESS_FRAMES, StereoOutput};
+use hyper_audio_engine::{
+    InterleavedStereoCallback, MAX_PROCESS_FRAMES, StereoCallbackError, StereoOutput,
+};
 use hyper_mixer_runtime::{
     FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, LocateState,
-    MAX_QUEUED_TRANSPORT_COMMANDS, RuntimeCreationError, RuntimeProcessError, TransportCommand,
-    TransportCommandSendError, TransportCycle, TransportState,
+    MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, OutputMeterPublication,
+    OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot, RuntimeCreationError,
+    RuntimeProcessError, TransportCommand, TransportCommandSendError, TransportCycle,
+    TransportState, output_meter_channel,
 };
 
 use common::{fixture, graph_fixture};
@@ -15,6 +19,59 @@ fn assert_constant(samples: &[f32], expected: f32) {
         samples
             .iter()
             .all(|sample| (*sample - expected).abs() <= f32::EPSILON)
+    );
+}
+
+fn assert_meter_delivery_and_backpressure(
+    transport: &mut GraphTransportRuntime<'_, '_, '_>,
+    callback: &mut InterleavedStereoCallback,
+    scratch: &mut [RenderScratchSlot<'_>],
+    interleaved: &mut [f32],
+    meter_sender: &mut OutputMeterSender,
+    mut meter_receiver: OutputMeterReceiver,
+    first_snapshot: OutputMeterSnapshot,
+) {
+    let first_read = meter_receiver.read_latest();
+    assert_eq!(first_read.snapshot(), Some(first_snapshot));
+    assert_eq!(first_read.coalesced_snapshot_count(), 0);
+    assert_eq!(first_read.dropped_snapshot_count(), 0);
+    assert!(!first_read.sender_disconnected());
+
+    for _ in 0..MAX_QUEUED_OUTPUT_METER_SNAPSHOTS {
+        let report = transport
+            .process_interleaved_cycle(callback, scratch, interleaved, meter_sender)
+            .unwrap();
+        assert_eq!(report.publication(), OutputMeterPublication::Published);
+    }
+    let full = transport
+        .process_interleaved_cycle(callback, scratch, interleaved, meter_sender)
+        .unwrap();
+    assert_eq!(full.publication(), OutputMeterPublication::QueueFull);
+    let latest = meter_receiver.read_latest();
+    assert!(latest.snapshot().is_some());
+    assert_eq!(
+        latest.coalesced_snapshot_count(),
+        MAX_QUEUED_OUTPUT_METER_SNAPSHOTS - 1
+    );
+    assert_eq!(latest.dropped_snapshot_count(), 0);
+    assert!(!latest.sender_disconnected());
+
+    let recovered = transport
+        .process_interleaved_cycle(callback, scratch, interleaved, meter_sender)
+        .unwrap();
+    assert_eq!(recovered.publication(), OutputMeterPublication::Published);
+    assert_eq!(recovered.snapshot().dropped_before(), 1);
+    let recovery_read = meter_receiver.read_latest();
+    assert_eq!(recovery_read.snapshot(), Some(recovered.snapshot()));
+    assert_eq!(recovery_read.dropped_snapshot_count(), 1);
+
+    drop(meter_receiver);
+    let disconnected = transport
+        .process_interleaved_cycle(callback, scratch, interleaved, meter_sender)
+        .unwrap();
+    assert_eq!(
+        disconnected.publication(),
+        OutputMeterPublication::ReceiverDisconnected
     );
 }
 
@@ -428,6 +485,7 @@ fn interleaved_callback_executes_the_transport_runtime() {
             .unwrap();
     let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(runtime);
     let mut callback = InterleavedStereoCallback::try_new(8).unwrap();
+    let (mut meter_sender, mut meter_receiver) = output_meter_channel();
     sender.try_send(TransportCommand::Start).unwrap();
     let mut scratch_left = [[9.0_f32; 2]; 5];
     let mut scratch_right = [[9.0_f32; 2]; 5];
@@ -441,14 +499,33 @@ fn interleaved_callback_executes_the_transport_runtime() {
         RenderScratchSlot::new(left_4, right_4),
     ];
     let mut interleaved = [9.0_f32; 4];
+    let mut invalid_interleaved = [9.0_f32; 3];
 
-    let processed = callback
-        .process(&mut interleaved, |output| {
-            transport.process_cycle(&mut scratch, output)
-        })
+    assert!(matches!(
+        transport.process_interleaved_cycle(
+            &mut callback,
+            &mut scratch,
+            &mut invalid_interleaved,
+            &mut meter_sender,
+        ),
+        Err(StereoCallbackError::SampleCountNotStereoAligned { samples: 3 })
+    ));
+    assert_constant(&invalid_interleaved, 0.0);
+    assert_eq!(meter_receiver.read_latest().snapshot(), None);
+
+    let reported = transport
+        .process_interleaved_cycle(
+            &mut callback,
+            &mut scratch,
+            &mut interleaved,
+            &mut meter_sender,
+        )
         .unwrap();
-    let (cycle, meter) = processed.into_parts();
+    let snapshot = reported.snapshot();
+    let cycle = snapshot.cycle();
+    let meter = snapshot.meter();
 
+    assert_eq!(reported.publication(), OutputMeterPublication::Published);
     assert_eq!(cycle.applied_command_count(), 1);
     assert_eq!(cycle.state(), TransportState::Rolling);
     assert_eq!(cycle.start_frame(), 0);
@@ -474,6 +551,16 @@ fn interleaved_callback_executes_the_transport_runtime() {
     assert_eq!(meter.right().sample_peak(), Some(expected_right_peak));
     assert_eq!(meter.left().non_finite_sample_count(), 0);
     assert_eq!(meter.right().non_finite_sample_count(), 0);
+
+    assert_meter_delivery_and_backpressure(
+        &mut transport,
+        &mut callback,
+        &mut scratch,
+        &mut interleaved,
+        &mut meter_sender,
+        meter_receiver,
+        snapshot,
+    );
 }
 
 #[test]
@@ -534,6 +621,21 @@ fn transport_reports_abandoned_sender_after_applying_pending_commands() {
     assert_eq!(cycle.applied_command_count(), 1);
     assert!(cycle.command_sender_disconnected());
     assert_eq!(cycle.state(), TransportState::Rolling);
+}
+
+#[test]
+fn meter_receiver_reports_an_abandoned_sender_without_a_snapshot() {
+    let (meter_sender, mut meter_receiver) = output_meter_channel();
+    assert_eq!(meter_sender.capacity(), MAX_QUEUED_OUTPUT_METER_SNAPSHOTS);
+    assert_eq!(meter_receiver.capacity(), MAX_QUEUED_OUTPUT_METER_SNAPSHOTS);
+    drop(meter_sender);
+
+    let latest = meter_receiver.read_latest();
+
+    assert_eq!(latest.snapshot(), None);
+    assert_eq!(latest.coalesced_snapshot_count(), 0);
+    assert_eq!(latest.dropped_snapshot_count(), 0);
+    assert!(latest.sender_disconnected());
 }
 
 #[test]
