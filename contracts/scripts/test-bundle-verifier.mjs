@@ -17,7 +17,7 @@ import canonicalize from "canonicalize";
 
 import { buildProjectBundle } from "./build-project-bundle.mjs";
 import { createMinimalProject } from "./test-project-fixture.mjs";
-import { verifyBundle } from "./verify-bundle.mjs";
+import { collectRegularFiles, verifyBundle } from "./verify-bundle.mjs";
 
 async function createValidBundle(parent, name) {
   const fixture = await createMinimalProject(parent, `${name}-source`);
@@ -90,7 +90,24 @@ try {
   const extra = join(temporaryRoot, "extra");
   await cp(valid, extra, { recursive: true });
   await writeFile(join(extra, "undeclared.bin"), "undeclared");
-  await assert.rejects(verifyBundle(extra), /do not exactly match manifest/);
+  await assert.rejects(verifyBundle(extra), /undeclared file is forbidden/);
+
+  const boundedTree = join(temporaryRoot, "bounded-tree");
+  await mkdir(join(boundedTree, "a", "b", "c"), { recursive: true });
+  await writeFile(join(boundedTree, "one.bin"), "one");
+  await writeFile(join(boundedTree, "two.bin"), "two");
+  await assert.rejects(
+    collectRegularFiles(boundedTree, { maximumDepth: 2 }),
+    /filesystem tree exceeds depth 2/,
+  );
+  await assert.rejects(
+    collectRegularFiles(boundedTree, { maximumEntries: 2 }),
+    /filesystem tree exceeds 2 entries/,
+  );
+  await assert.rejects(
+    collectRegularFiles(boundedTree, { maximumPathBytes: 4 }),
+    /filesystem tree paths exceed 4 bytes/,
+  );
 
   const missing = join(temporaryRoot, "missing");
   await cp(valid, missing, { recursive: true });

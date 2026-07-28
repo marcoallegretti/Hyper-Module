@@ -116,6 +116,17 @@ function isLocalOnlyPath(path) {
   return path.startsWith("cache/") || path.startsWith("backups/");
 }
 
+function directoryPrefixes(paths) {
+  const directories = new Set();
+  for (const path of paths) {
+    const segments = path.split("/");
+    for (let length = 1; length < segments.length; length += 1) {
+      directories.add(segments.slice(0, length).join("/"));
+    }
+  }
+  return directories;
+}
+
 async function readAudioAssetFormat(rootPath, asset) {
   const assetPath = resolve(rootPath, ...asset.path.split("/"));
   let metadata;
@@ -227,7 +238,19 @@ export async function verifyProject(
 
   const records = [...project.resources, ...project.assets];
   const declaredPaths = records.map((record) => record.path).sort();
-  const allFiles = await collectRegularFiles(rootPath);
+  const acceptedManagedPaths = new Set([
+    "project.json",
+    ...declaredPaths,
+    ...ignoredManagedPathSet,
+  ]);
+  const acceptedManagedDirectories = directoryPrefixes(acceptedManagedPaths);
+  const projectTreeOptions = {
+    allowDirectory: (path) =>
+      acceptedManagedDirectories.has(path) || isLocalOnlyPath(`${path}/`),
+    allowFile: (path) =>
+      acceptedManagedPaths.has(path) || isLocalOnlyPath(path),
+  };
+  const allFiles = await collectRegularFiles(rootPath, projectTreeOptions);
   const managedFiles = allFiles
     .filter(
       (path) =>
@@ -807,7 +830,7 @@ export async function verifyProject(
     }
   }
 
-  const finalManagedFiles = (await collectRegularFiles(rootPath))
+  const finalManagedFiles = (await collectRegularFiles(rootPath, projectTreeOptions))
     .filter(
       (path) =>
         path !== "project.json" &&

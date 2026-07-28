@@ -815,7 +815,7 @@ try {
   await writeFile(join(undeclared, "tracks", "undeclared.json"), "{}");
   await assert.rejects(
     verifyProject(undeclared),
-    /do not exactly match project.json/,
+    /undeclared file is forbidden/,
   );
 
   const missing = join(temporaryRoot, "missing");
