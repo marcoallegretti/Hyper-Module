@@ -24,7 +24,10 @@ import { assertRecordingMetadataInvariants } from "../lib/recording-metadata.mjs
 import { assertSceneInvariants } from "../lib/scene.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
 import { assertTimelineInvariants } from "../lib/timeline.mjs";
-import { verifyDescribedFile } from "./verify-bundle.mjs";
+import {
+  readStableRegularFile,
+  verifyDescribedFile,
+} from "./verify-bundle.mjs";
 
 const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const manifestLimitBytes = 1024 * 1024;
@@ -190,17 +193,11 @@ export async function verifyProject(
   const rootRealPath = await realpath(rootPath);
 
   const manifestPath = join(rootPath, "project.json");
-  const manifestStatus = await lstat(manifestPath);
-  assert(
-    manifestStatus.isFile() && !manifestStatus.isSymbolicLink(),
-    "project.json must be a regular file",
+  const manifestBytes = await readStableRegularFile(
+    manifestPath,
+    "project.json",
+    manifestLimitBytes,
   );
-  assert(
-    manifestStatus.size <= manifestLimitBytes,
-    `project.json exceeds ${manifestLimitBytes} bytes`,
-  );
-
-  const manifestBytes = await readFile(manifestPath);
   assert(
     !manifestBytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])),
     "project.json must not contain a byte-order mark",
