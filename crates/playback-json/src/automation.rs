@@ -225,6 +225,7 @@ impl LoadedAutomationSet {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AutomationCompileError {
     CapacityUnavailable,
+    ProjectMismatch,
     UnsupportedCueTarget,
     TargetMismatch,
     Timeline(FrameTimelineError),
@@ -235,6 +236,9 @@ impl fmt::Display for AutomationCompileError {
         match self {
             Self::CapacityUnavailable => {
                 formatter.write_str("compiled automation capacity is unavailable")
+            }
+            Self::ProjectMismatch => {
+                formatter.write_str("automation and mixer belong to different projects")
             }
             Self::UnsupportedCueTarget => {
                 formatter.write_str("cue automation is unavailable in the main-output runtime")
@@ -251,7 +255,10 @@ impl Error for AutomationCompileError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Timeline(source) => Some(source),
-            Self::CapacityUnavailable | Self::UnsupportedCueTarget | Self::TargetMismatch => None,
+            Self::CapacityUnavailable
+            | Self::ProjectMismatch
+            | Self::UnsupportedCueTarget
+            | Self::TargetMismatch => None,
         }
     }
 }
@@ -320,11 +327,17 @@ impl CompiledAutomationTarget {
 /// Precompiled enabled automation indexed by resolved mixer target.
 #[derive(Clone, Debug)]
 pub struct CompiledAutomation {
+    project_id: String,
     timeline: FrameTimeline,
     targets: Vec<CompiledAutomationTarget>,
 }
 
 impl CompiledAutomation {
+    #[must_use]
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
     #[must_use]
     pub fn target_count(&self) -> usize {
         self.targets.len()
@@ -429,6 +442,14 @@ impl LoadedPlaybackProject {
         mixer: &CompiledMixerGraph,
         automation: &LoadedAutomationSet,
     ) -> Result<CompiledAutomation, AutomationCompileError> {
+        if self.project_id != mixer.project_id() {
+            return Err(AutomationCompileError::ProjectMismatch);
+        }
+        let mut project_id = String::new();
+        project_id
+            .try_reserve_exact(self.project_id.len())
+            .map_err(|_| AutomationCompileError::CapacityUnavailable)?;
+        project_id.push_str(&self.project_id);
         let timeline = FrameTimeline::try_new(self.sample_rate_hz, &self.tempo_events)
             .map_err(AutomationCompileError::Timeline)?;
         let enabled_lane_count = automation
@@ -487,7 +508,11 @@ impl LoadedPlaybackProject {
                 points,
             });
         }
-        Ok(CompiledAutomation { timeline, targets })
+        Ok(CompiledAutomation {
+            project_id,
+            timeline,
+            targets,
+        })
     }
 }
 

@@ -29,7 +29,14 @@ pub const MAX_QUEUED_OUTPUT_METER_SNAPSHOTS: usize = 64;
 const MAX_SENDS_PER_SLOT: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeProjectComponent {
+    Mixer,
+    Automation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeCreationError {
+    ProjectMismatch { component: RuntimeProjectComponent },
     SlotLimit { actual: usize, maximum: usize },
     InvalidMaximumBlockFrames { actual: usize, maximum: usize },
     CapacityUnavailable,
@@ -41,6 +48,14 @@ pub enum RuntimeCreationError {
 impl fmt::Display for RuntimeCreationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ProjectMismatch { component } => write!(
+                formatter,
+                "compiled {} belongs to a different project",
+                match component {
+                    RuntimeProjectComponent::Mixer => "mixer",
+                    RuntimeProjectComponent::Automation => "automation",
+                }
+            ),
             Self::SlotLimit { actual, maximum } => write!(
                 formatter,
                 "compiled main mixer has {actual} slots; maximum is {maximum}"
@@ -67,7 +82,8 @@ impl Error for RuntimeCreationError {
             Self::Renderer(source) => Some(source),
             Self::PlaybackRenderer(source) => Some(source),
             Self::Mixer(source) => Some(source),
-            Self::SlotLimit { .. }
+            Self::ProjectMismatch { .. }
+            | Self::SlotLimit { .. }
             | Self::InvalidMaximumBlockFrames { .. }
             | Self::CapacityUnavailable => None,
         }
@@ -507,6 +523,11 @@ impl<'prepared, 'cache, 'schedule> FlatMainRuntime<'prepared, 'cache, 'schedule>
         schedule: &'prepared PreparedSchedule<'cache, 'schedule>,
         compiled: &CompiledMainMixer,
     ) -> Result<Self, RuntimeCreationError> {
+        if schedule.project_id() != compiled.project_id() {
+            return Err(RuntimeCreationError::ProjectMismatch {
+                component: RuntimeProjectComponent::Mixer,
+            });
+        }
         let slot_count = compiled.slots().len();
         if slot_count > MAX_MAIN_MIXER_SLOTS {
             return Err(RuntimeCreationError::SlotLimit {
@@ -910,6 +931,7 @@ impl<'prepared, 'cache, 'schedule>
         automation: Option<CompiledAutomation>,
         max_block_frames: usize,
     ) -> Result<Self, RuntimeCreationError> {
+        validate_project_identity(schedule.project_id(), compiled, automation.as_ref())?;
         validate_routed_runtime_bounds(compiled, max_block_frames)?;
         let slot_count = compiled.slots().len();
         let mut track_ids = [""; MAX_MAIN_MIXER_SLOTS];
@@ -965,6 +987,7 @@ impl<'prepared, 'cache, 'graph, 'project>
         automation: Option<CompiledAutomation>,
         max_block_frames: usize,
     ) -> Result<Self, RuntimeCreationError> {
+        validate_project_identity(prepared.project_id(), compiled, automation.as_ref())?;
         validate_routed_runtime_bounds(compiled, max_block_frames)?;
         let slot_count = compiled.slots().len();
         let mut track_ids = [""; MAX_MAIN_MIXER_SLOTS];
@@ -981,6 +1004,24 @@ impl<'prepared, 'cache, 'graph, 'project>
         .map_err(RuntimeCreationError::PlaybackRenderer)?;
         build_routed_main_runtime(renderer, compiled, automation, max_block_frames)
     }
+}
+
+fn validate_project_identity(
+    project_id: &str,
+    compiled: &CompiledMixerGraph,
+    automation: Option<&CompiledAutomation>,
+) -> Result<(), RuntimeCreationError> {
+    if project_id != compiled.project_id() {
+        return Err(RuntimeCreationError::ProjectMismatch {
+            component: RuntimeProjectComponent::Mixer,
+        });
+    }
+    if automation.is_some_and(|automation| automation.project_id() != project_id) {
+        return Err(RuntimeCreationError::ProjectMismatch {
+            component: RuntimeProjectComponent::Automation,
+        });
+    }
+    Ok(())
 }
 
 fn validate_routed_runtime_bounds(

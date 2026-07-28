@@ -288,7 +288,10 @@ impl DecodedMediaCache {
                 placement,
             });
         }
-        Ok(PreparedSchedule { entries })
+        Ok(PreparedSchedule {
+            project_id: schedule.project_id(),
+            entries,
+        })
     }
 
     /// Atomically binds every compiled scene play action to immutable media.
@@ -389,6 +392,7 @@ impl DecodedMediaCache {
             .prepare_playback_scenes(graph)
             .map_err(PreparePlaybackError::SceneAudio)?;
         Ok(PreparedPlayback {
+            project_id: graph.project_id(),
             authority: graph.scene_authority(),
             schedule,
             scene_audio,
@@ -519,12 +523,18 @@ impl Error for PreparePlaybackError {
 /// Immutable cache bindings for one exact compiled playback graph.
 #[derive(Debug)]
 pub struct PreparedPlayback<'cache, 'graph, 'project> {
+    project_id: &'project str,
     authority: &'graph CompiledScenePerformance<'project>,
     schedule: PreparedSchedule<'cache, 'graph>,
     scene_audio: PreparedSceneAudio<'cache, 'project>,
 }
 
 impl<'cache, 'graph, 'project> PreparedPlayback<'cache, 'graph, 'project> {
+    #[must_use]
+    pub const fn project_id(&self) -> &'project str {
+        self.project_id
+    }
+
     #[must_use]
     pub const fn authority(&self) -> &'graph CompiledScenePerformance<'project> {
         self.authority
@@ -651,10 +661,16 @@ impl Error for PrepareScheduleError {
 
 #[derive(Debug)]
 pub struct PreparedSchedule<'cache, 'schedule> {
+    project_id: &'schedule str,
     entries: Vec<PreparedScheduleEntry<'cache, 'schedule>>,
 }
 
 impl<'cache, 'schedule> PreparedSchedule<'cache, 'schedule> {
+    #[must_use]
+    pub const fn project_id(&self) -> &'schedule str {
+        self.project_id
+    }
+
     #[must_use]
     pub fn entries(&self) -> &[PreparedScheduleEntry<'cache, 'schedule>] {
         &self.entries

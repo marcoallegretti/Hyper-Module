@@ -121,6 +121,7 @@ fn cache_binds_compiled_identity_and_renders_prepared_audio() {
     let cache = builder.seal();
 
     let prepared = cache.prepare_schedule(&schedule).unwrap();
+    assert_eq!(prepared.project_id(), "project");
     let entry = &prepared.entries()[0];
     let mut output = [0.0_f32; 100];
     entry
@@ -247,6 +248,7 @@ fn complete_playback_preparation_rejects_each_missing_authority_atomically() {
         .unwrap();
     let complete = complete.seal();
     let prepared = complete.prepare_playback(&graph).unwrap();
+    assert_eq!(prepared.project_id(), "project");
     assert_eq!(prepared.schedule().entries().len(), 1);
     assert_eq!(prepared.scene_audio().entries().len(), 1);
     assert_eq!(prepared.authority().track_count(), 2);

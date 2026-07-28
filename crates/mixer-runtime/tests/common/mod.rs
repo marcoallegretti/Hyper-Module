@@ -348,39 +348,39 @@ pub fn playback_fixture() -> PlaybackFixture {
 pub fn graph_fixture() -> GraphFixture {
     let timeline = br#"{
         "format":"hyper-timeline","format_version":1,"id":"timeline",
-        "project_id":"project","ticks_per_quarter":1920,
+        "project_id":"graph-project","ticks_per_quarter":1920,
         "tempo_events":[{"tick":0,"microseconds_per_quarter":1000000}],
         "meter_events":[{"tick":0,"numerator":4,"denominator":4}],
         "extensions":{}
     }"#;
     let source = br#"{
         "format":"hyper-track","format_version":1,"id":"source",
-        "project_id":"project","name":"Source","kind":"audio","order":0,
+        "project_id":"graph-project","name":"Source","kind":"audio","order":0,
         "active":true,"clip_ids":["clip"],"extensions":{}
     }"#;
     let silent = br#"{
         "format":"hyper-track","format_version":1,"id":"silent",
-        "project_id":"project","name":"Silent","kind":"audio","order":1,
+        "project_id":"graph-project","name":"Silent","kind":"audio","order":1,
         "active":true,"clip_ids":["clip-silent"],"extensions":{}
     }"#;
     let group = br#"{
         "format":"hyper-track","format_version":1,"id":"group",
-        "project_id":"project","name":"Group","kind":"group","order":2,
+        "project_id":"graph-project","name":"Group","kind":"group","order":2,
         "active":true,"clip_ids":[],"extensions":{}
     }"#;
     let return_a = br#"{
         "format":"hyper-track","format_version":1,"id":"return-a",
-        "project_id":"project","name":"Return A","kind":"return","order":3,
+        "project_id":"graph-project","name":"Return A","kind":"return","order":3,
         "active":true,"clip_ids":[],"extensions":{}
     }"#;
     let return_b = br#"{
         "format":"hyper-track","format_version":1,"id":"return-b",
-        "project_id":"project","name":"Return B","kind":"return","order":4,
+        "project_id":"graph-project","name":"Return B","kind":"return","order":4,
         "active":true,"clip_ids":[],"extensions":{}
     }"#;
     let clip = br#"{
         "format":"hyper-audio-clip","format_version":1,"id":"clip",
-        "project_id":"project","track_id":"source","name":"Clip","enabled":true,
+        "project_id":"graph-project","track_id":"source","name":"Clip","enabled":true,
         "duration_ticks":4,
         "source":{"asset_id":"asset","start_frame":0,"frame_count":100},
         "loop":{"enabled":false,"start_tick":0,"end_tick":4},
@@ -394,7 +394,7 @@ pub fn graph_fixture() -> GraphFixture {
     }"#;
     let silent_clip = br#"{
         "format":"hyper-audio-clip","format_version":1,"id":"clip-silent",
-        "project_id":"project","track_id":"silent","name":"Silent Clip","enabled":true,
+        "project_id":"graph-project","track_id":"silent","name":"Silent Clip","enabled":true,
         "duration_ticks":4,
         "source":{"asset_id":"asset","start_frame":0,"frame_count":100},
         "loop":{"enabled":false,"start_tick":0,"end_tick":4},
@@ -408,7 +408,7 @@ pub fn graph_fixture() -> GraphFixture {
     }"#;
     let arrangement = br#"{
         "format":"hyper-arrangement","format_version":1,"id":"arrangement",
-        "project_id":"project","name":"Main","enabled":true,
+        "project_id":"graph-project","name":"Main","enabled":true,
         "placements":[
             {
                 "id":"placement-silent","track_id":"silent","clip_id":"clip-silent",
@@ -423,7 +423,7 @@ pub fn graph_fixture() -> GraphFixture {
     }"#;
     let mixer = br#"{
         "format":"hyper-mixer","format_version":1,"id":"mixer",
-        "project_id":"project",
+        "project_id":"graph-project",
         "channels":[
             {
                 "track_id":"source","gain_millionths":500000,
@@ -473,7 +473,7 @@ pub fn graph_fixture() -> GraphFixture {
     }"#;
     let automation = br#"{
         "format":"hyper-automation-take","format_version":1,
-        "id":"automation","project_id":"project","name":"Main pass","enabled":true,
+        "id":"automation","project_id":"graph-project","name":"Main pass","enabled":true,
         "captured_at_utc":"2026-07-28T14:00:00.000Z",
         "start_tick":0,"end_tick":5,
         "lanes":[
@@ -520,7 +520,7 @@ pub fn graph_fixture() -> GraphFixture {
     let clips: [&[u8]; 2] = [clip, silent_clip];
     let loaded = load(
         PlaybackJsonInput {
-            project_id: "project",
+            project_id: "graph-project",
             sample_rate_hz: 48_000,
             timeline,
             tracks: &tracks,

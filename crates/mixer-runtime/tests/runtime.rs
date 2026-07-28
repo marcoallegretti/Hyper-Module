@@ -1,8 +1,6 @@
 mod common;
 
-use hyper_arrangement_renderer::{
-    PlaybackRendererCreationError, RenderScratchSlot, RendererCreationError,
-};
+use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{
     InterleavedStereoCallback, MAX_PROCESS_FRAMES, StereoCallbackError, StereoOutput,
 };
@@ -10,8 +8,9 @@ use hyper_mixer_runtime::{
     FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, LocateState,
     MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, OutputMeterPublication,
     OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot, PreparedPlaybackMainRuntime,
-    PreparedPlaybackTransportRuntime, RuntimeCreationError, RuntimeProcessError, TransportCommand,
-    TransportCommandSendError, TransportCycle, TransportState, output_meter_channel,
+    PreparedPlaybackTransportRuntime, RuntimeCreationError, RuntimeProcessError,
+    RuntimeProjectComponent, TransportCommand, TransportCommandSendError, TransportCycle,
+    TransportState, output_meter_channel,
 };
 
 use common::{fixture, graph_fixture, playback_fixture};
@@ -262,7 +261,7 @@ fn combined_transport_renders_each_track_authority_and_reconstructs_scene_state_
 }
 
 #[test]
-fn prepared_playback_rejects_a_mixer_from_another_track_graph() {
+fn prepared_playback_rejects_a_mixer_from_another_project_before_track_mapping() {
     let fixture = playback_fixture();
     let graph = fixture.compile_playback();
     let prepared = fixture.cache.prepare_playback(&graph).unwrap();
@@ -271,9 +270,30 @@ fn prepared_playback_rejects_a_mixer_from_another_track_graph() {
     assert_eq!(
         PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &unrelated.mixer, 64)
             .unwrap_err(),
-        RuntimeCreationError::PlaybackRenderer(PlaybackRendererCreationError::Arrangement(
-            RendererCreationError::MissingScheduleTrack { entry_index: 0 }
-        ))
+        RuntimeCreationError::ProjectMismatch {
+            component: RuntimeProjectComponent::Mixer
+        }
+    );
+}
+
+#[test]
+fn prepared_playback_rejects_automation_from_another_project() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let unrelated = graph_fixture();
+
+    assert_eq!(
+        PreparedPlaybackMainRuntime::try_new_prepared_playback_automated(
+            &prepared,
+            &fixture.mixer,
+            unrelated.automation,
+            64,
+        )
+        .unwrap_err(),
+        RuntimeCreationError::ProjectMismatch {
+            component: RuntimeProjectComponent::Automation
+        }
     );
 }
 

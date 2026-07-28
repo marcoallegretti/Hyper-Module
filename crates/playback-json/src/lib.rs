@@ -327,6 +327,7 @@ enum MixerTap {
 
 #[derive(Clone, Debug)]
 pub struct LoadedMixer {
+    project_id: String,
     id: String,
     channels: Vec<LoadedMixerChannel>,
     return_buses: Vec<(MixerBus, String)>,
@@ -345,11 +346,17 @@ pub enum CueSource {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompiledMainMixer {
+    project_id: String,
     slots: Vec<CompiledMixerSlot>,
     master_gain: LinearGain,
 }
 
 impl CompiledMainMixer {
+    #[must_use]
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
     #[must_use]
     pub fn slots(&self) -> &[CompiledMixerSlot] {
         &self.slots
@@ -381,6 +388,7 @@ impl CompiledMixerSlot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompiledMixerGraph {
+    project_id: String,
     slots: Vec<CompiledGraphSlot>,
     processing_order: Vec<usize>,
     master_gain: LinearGain,
@@ -389,6 +397,11 @@ pub struct CompiledMixerGraph {
 }
 
 impl CompiledMixerGraph {
+    #[must_use]
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
     #[must_use]
     pub fn slots(&self) -> &[CompiledGraphSlot] {
         &self.slots
@@ -623,6 +636,7 @@ impl LoadedMixer {
             });
         }
         Ok(CompiledMainMixer {
+            project_id: try_owned_compile(&self.project_id)?,
             slots,
             master_gain: if self.main_muted {
                 LinearGain::SILENCE
@@ -714,6 +728,7 @@ impl LoadedMixer {
         }
         let processing_order = compile_processing_order(&slots)?;
         Ok(CompiledMixerGraph {
+            project_id: try_owned_compile(&self.project_id)?,
             slots,
             processing_order,
             master_gain: if self.main_muted {
@@ -946,6 +961,7 @@ impl LoadedPlaybackProject {
         .map_err(AdapterCompileError::Scene)?;
         let scene_audio = compile_scene_audio_bindings(self, assets, timeline, &scene_authority)?;
         Ok(CompiledPlaybackGraph {
+            project_id: &self.project_id,
             arrangement,
             scene_authority,
             scene_audio,
@@ -964,10 +980,16 @@ pub struct OwnedScheduleEntry {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OwnedCompiledSchedule {
+    project_id: String,
     entries: Vec<OwnedScheduleEntry>,
 }
 
 impl OwnedCompiledSchedule {
+    #[must_use]
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
     #[must_use]
     pub fn entries(&self) -> &[OwnedScheduleEntry] {
         &self.entries
@@ -976,12 +998,18 @@ impl OwnedCompiledSchedule {
 
 #[derive(Debug)]
 pub struct CompiledPlaybackGraph<'project> {
+    project_id: &'project str,
     arrangement: OwnedCompiledSchedule,
     scene_authority: CompiledScenePerformance<'project>,
     scene_audio: Vec<CompiledSceneAudioBinding<'project>>,
 }
 
 impl<'project> CompiledPlaybackGraph<'project> {
+    #[must_use]
+    pub const fn project_id(&self) -> &'project str {
+        self.project_id
+    }
+
     #[must_use]
     pub const fn arrangement(&self) -> &OwnedCompiledSchedule {
         &self.arrangement
@@ -1614,6 +1642,7 @@ fn load_mixer_document(
         CueSourceDocument::Solo => CueSource::Solo,
     };
     Ok(LoadedMixer {
+        project_id: document.project_id,
         id: document.id,
         channels,
         return_buses,
@@ -2278,7 +2307,7 @@ fn compile_loaded_arrangement(
         limits,
     )
     .map_err(AdapterCompileError::Graph)?;
-    own_schedule(&compiled)
+    own_schedule(&project.project_id, &compiled)
 }
 
 fn validate_single_track_authority(
@@ -2454,6 +2483,7 @@ fn compile_scene_audio_bindings<'project>(
 }
 
 fn own_schedule(
+    project_id: &str,
     compiled: &CompiledSchedule<'_>,
 ) -> Result<OwnedCompiledSchedule, AdapterCompileError> {
     let mut entries = Vec::new();
@@ -2469,7 +2499,10 @@ fn own_schedule(
             compiled: entry.compiled,
         });
     }
-    Ok(OwnedCompiledSchedule { entries })
+    Ok(OwnedCompiledSchedule {
+        project_id: try_owned(project_id)?,
+        entries,
+    })
 }
 
 fn try_owned(value: &str) -> Result<String, AdapterCompileError> {
@@ -2964,6 +2997,7 @@ mod tests {
                 GraphLimits::VERSION_1,
             )
             .unwrap();
+        assert_eq!(schedule.project_id(), PROJECT_ID);
         assert_eq!(schedule.entries().len(), 1);
         assert_eq!(schedule.entries()[0].asset_id, "asset");
     }
@@ -2988,6 +3022,7 @@ mod tests {
         assert!(!mixer.cue_muted());
 
         let compiled = mixer.compile_flat_main().unwrap();
+        assert_eq!(compiled.project_id(), PROJECT_ID);
         assert_eq!(compiled.master_gain(), LinearGain::SILENCE);
         assert_eq!(compiled.slots()[0].track_id(), "track");
         assert_eq!(
@@ -3048,6 +3083,7 @@ mod tests {
             sends: Vec::new(),
         };
         let mixer = LoadedMixer {
+            project_id: "project".to_owned(),
             id: "mixer".to_owned(),
             channels: vec![channel.clone()],
             return_buses: Vec::new(),
@@ -3147,6 +3183,7 @@ mod tests {
             Err(MixerCompileError::UnsupportedPrimaryRouting)
         );
         let graph = mixer.compile_main_graph().unwrap();
+        assert_eq!(graph.project_id(), PROJECT_ID);
         assert_eq!(graph.processing_order(), &[0, 1, 2]);
         assert_eq!(
             graph.slots()[0].destination(),
@@ -3311,7 +3348,14 @@ mod tests {
             .unwrap();
         let graph = mixer.compile_main_graph().unwrap();
         let compiled = loaded.compile_main_automation(&graph, &automation).unwrap();
+        assert_eq!(compiled.project_id(), PROJECT_ID);
         assert_eq!(compiled.target_count(), 1);
+        let mut foreign_graph = graph.clone();
+        foreign_graph.project_id = "foreign-project".to_owned();
+        assert!(matches!(
+            loaded.compile_main_automation(&foreign_graph, &automation),
+            Err(AutomationCompileError::ProjectMismatch)
+        ));
         let mut frame_values = Vec::new();
         compiled
             .visit_frame_values(25, |target, value| {
@@ -3581,6 +3625,7 @@ mod tests {
                 SceneLimits::VERSION_1,
             )
             .unwrap();
+        assert_eq!(graph.project_id(), PROJECT_ID);
         assert!(graph.arrangement().entries().is_empty());
         assert_eq!(graph.scene_authority().track_count(), 1);
         assert_eq!(graph.scene_audio().len(), 1);
