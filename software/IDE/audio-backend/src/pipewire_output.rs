@@ -16,6 +16,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const BYTES_PER_SAMPLE: usize = size_of::<f32>();
 const FRAME_STRIDE: usize = STEREO_CHANNELS * BYTES_PER_SAMPLE;
+type PipeWireProcessor<'processor> = Box<dyn FnMut(&mut [f32]) -> Result<(), ()> + 'processor>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PipeWireOutputConfig {
@@ -142,6 +143,7 @@ impl fmt::Display for PipeWireStartupStage {
 #[derive(Debug)]
 pub enum PipeWireStartError {
     ThreadSpawn(std::io::Error),
+    ThreadPanicked,
     StartupTimeout,
     ThreadTerminated,
     Backend {
@@ -156,6 +158,7 @@ impl fmt::Display for PipeWireStartError {
             Self::ThreadSpawn(source) => {
                 write!(formatter, "cannot start PipeWire thread: {source}")
             }
+            Self::ThreadPanicked => formatter.write_str("PipeWire thread panicked during startup"),
             Self::StartupTimeout => formatter.write_str("PipeWire startup timed out"),
             Self::ThreadTerminated => {
                 formatter.write_str("PipeWire thread terminated during startup")
@@ -171,7 +174,10 @@ impl Error for PipeWireStartError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ThreadSpawn(source) => Some(source),
-            Self::StartupTimeout | Self::ThreadTerminated | Self::Backend { .. } => None,
+            Self::ThreadPanicked
+            | Self::StartupTimeout
+            | Self::ThreadTerminated
+            | Self::Backend { .. } => None,
         }
     }
 }
@@ -196,6 +202,56 @@ pub struct PipeWireOutputStream {
     counters: OutputStreamCounters,
 }
 
+/// Backend-thread context for constructing callback state from owned inputs.
+///
+/// The initializer passed to [`PipeWireOutputStream::start_with_thread_initializer`] owns
+/// project inputs moved to the backend thread. It can borrow those local inputs
+/// while constructing a processor, then pass that processor to [`Self::run`].
+/// This avoids requiring self-referential or leaked prepared playback state.
+#[derive(Debug)]
+pub struct PipeWireThreadRunner {
+    config: PipeWireOutputConfig,
+    stop_requested: Arc<AtomicBool>,
+    startup: SyncSender<Result<(), PipeWireStartError>>,
+    counters: OutputStreamCounters,
+}
+
+impl PipeWireThreadRunner {
+    /// Runs the `PipeWire` loop with processor state constructed on this thread.
+    ///
+    /// The processor may borrow values owned by the thread initializer. It is
+    /// dropped before the initializer returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipeWireStartError`] for callback construction, backend
+    /// construction, format, connection, or stream-state failure.
+    pub fn run<P>(self, processor: P) -> Result<(), PipeWireStartError>
+    where
+        P: InterleavedStereoProcessor,
+    {
+        let mut processor = processor;
+        let processor: PipeWireProcessor<'_> =
+            Box::new(move |output| processor.process(output).map_err(|_| ()));
+        let callback = OutputCallback::try_new_with_counters(
+            processor,
+            self.config.maximum_block_frames,
+            self.counters,
+        )
+        .map_err(|source| PipeWireStartError::Backend {
+            stage: PipeWireStartupStage::Callback,
+            detail: source.to_string(),
+        })?;
+        run_pipewire_inner(self.config, callback, self.stop_requested, &self.startup)
+    }
+
+    /// Returns whether stream startup or shutdown cancellation was requested.
+    #[must_use]
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Acquire)
+    }
+}
+
 impl PipeWireOutputStream {
     /// Connects a stereo `f32` output node and owns its `PipeWire` loop thread.
     ///
@@ -205,22 +261,53 @@ impl PipeWireOutputStream {
     /// format, connection, or initial stream state cannot be established.
     pub fn start<P>(config: PipeWireOutputConfig, processor: P) -> Result<Self, PipeWireStartError>
     where
-        P: InterleavedStereoProcessor,
+        P: InterleavedStereoProcessor + Send + 'static,
     {
-        let callback =
-            OutputCallback::try_new(processor, config.maximum_block_frames).map_err(|source| {
-                PipeWireStartError::Backend {
-                    stage: PipeWireStartupStage::Callback,
-                    detail: source.to_string(),
-                }
-            })?;
-        let counters = callback.counters();
+        Self::start_with_thread_initializer(config, move |thread| thread.run(processor))
+    }
+
+    /// Starts a backend thread that constructs and runs its processor locally.
+    ///
+    /// The initializer is moved to the backend thread. It may own project
+    /// documents, compiled graphs, decoded media, and other session inputs;
+    /// borrowed prepared state can then remain valid for the complete
+    /// [`PipeWireThreadRunner::run`] call.
+    ///
+    /// The initializer must either call [`PipeWireThreadRunner::run`] or return an
+    /// error. Returning success without running the context is reported as
+    /// [`PipeWireStartError::ThreadTerminated`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipeWireStartError`] when the thread cannot be created, the
+    /// initializer or backend fails, startup times out, or the thread
+    /// terminates before reaching a usable stream state.
+    pub fn start_with_thread_initializer<F>(
+        config: PipeWireOutputConfig,
+        initialize: F,
+    ) -> Result<Self, PipeWireStartError>
+    where
+        F: FnOnce(PipeWireThreadRunner) -> Result<(), PipeWireStartError> + Send + 'static,
+    {
         let stop_requested = Arc::new(AtomicBool::new(false));
+        let counters = OutputStreamCounters::default();
         let thread_stop = Arc::clone(&stop_requested);
+        let thread_counters = counters.clone();
         let (startup_sender, startup_receiver) = sync_channel(1);
+        let failure_sender = startup_sender.clone();
         let thread = thread::Builder::new()
             .name("hyper-pipewire-output".to_owned())
-            .spawn(move || run_pipewire(config, callback, thread_stop, &startup_sender))
+            .spawn(move || {
+                let thread = PipeWireThreadRunner {
+                    config,
+                    stop_requested: thread_stop,
+                    startup: startup_sender,
+                    counters: thread_counters,
+                };
+                if let Err(error) = initialize(thread) {
+                    let _ = failure_sender.try_send(Err(error));
+                }
+            })
             .map_err(PipeWireStartError::ThreadSpawn)?;
 
         match wait_for_startup(&startup_receiver) {
@@ -231,8 +318,10 @@ impl PipeWireOutputStream {
             }),
             Err(error) => {
                 stop_requested.store(true, Ordering::Release);
-                let _ = thread.join();
-                Err(error)
+                match thread.join() {
+                    Ok(()) => Err(error),
+                    Err(_) => Err(PipeWireStartError::ThreadPanicked),
+                }
             }
         }
     }
@@ -279,33 +368,17 @@ fn wait_for_startup(
     }
 }
 
-struct PipeWireCallback<P> {
-    output: OutputCallback<P>,
+struct PipeWireCallback<'processor> {
+    output: OutputCallback<PipeWireProcessor<'processor>>,
     startup: Option<SyncSender<Result<(), PipeWireStartError>>>,
 }
 
-fn run_pipewire<P>(
+fn run_pipewire_inner(
     config: PipeWireOutputConfig,
-    callback: OutputCallback<P>,
+    callback: OutputCallback<PipeWireProcessor<'_>>,
     stop_requested: Arc<AtomicBool>,
     startup: &SyncSender<Result<(), PipeWireStartError>>,
-) where
-    P: InterleavedStereoProcessor,
-{
-    if let Err(error) = run_pipewire_inner(config, callback, stop_requested, startup) {
-        let _ = startup.try_send(Err(error));
-    }
-}
-
-fn run_pipewire_inner<P>(
-    config: PipeWireOutputConfig,
-    callback: OutputCallback<P>,
-    stop_requested: Arc<AtomicBool>,
-    startup: &SyncSender<Result<(), PipeWireStartError>>,
-) -> Result<(), PipeWireStartError>
-where
-    P: InterleavedStereoProcessor,
-{
+) -> Result<(), PipeWireStartError> {
     pw::init();
     let main_loop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|source| backend_error(PipeWireStartupStage::MainLoop, source))?;
@@ -357,7 +430,7 @@ where
             }
             pw::stream::StreamState::Unconnected | pw::stream::StreamState::Connecting => {}
         })
-        .process(process_pipewire_buffer::<P>)
+        .process(process_pipewire_buffer)
         .register()
         .map_err(|source| backend_error(PipeWireStartupStage::Listener, source))?;
 
@@ -391,10 +464,7 @@ where
     Ok(())
 }
 
-fn process_pipewire_buffer<P>(stream: &pw::stream::Stream, state: &mut PipeWireCallback<P>)
-where
-    P: InterleavedStereoProcessor,
-{
+fn process_pipewire_buffer(stream: &pw::stream::Stream, state: &mut PipeWireCallback<'_>) {
     let Some(mut buffer) = stream.dequeue_buffer() else {
         state.output.counters().record_unavailable_buffer();
         return;
@@ -504,5 +574,42 @@ mod tests {
     fn stereo_format_is_a_valid_spa_pod() {
         let format = build_format(48_000).unwrap();
         assert!(Pod::from_bytes(&format).is_some());
+    }
+
+    #[test]
+    fn thread_local_initializer_failure_is_reported_before_backend_start() {
+        let config = PipeWireOutputConfig::try_new(48_000, 64).unwrap();
+        let result = PipeWireOutputStream::start_with_thread_initializer(config, |_| {
+            Err(PipeWireStartError::Backend {
+                stage: PipeWireStartupStage::Callback,
+                detail: "fixture rejected".to_owned(),
+            })
+        });
+
+        assert!(matches!(
+            result,
+            Err(PipeWireStartError::Backend {
+                stage: PipeWireStartupStage::Callback,
+                detail
+            }) if detail == "fixture rejected"
+        ));
+    }
+
+    #[test]
+    fn thread_local_initializer_must_run_its_context() {
+        let config = PipeWireOutputConfig::try_new(48_000, 64).unwrap();
+        let result = PipeWireOutputStream::start_with_thread_initializer(config, |_| Ok(()));
+
+        assert!(matches!(result, Err(PipeWireStartError::ThreadTerminated)));
+    }
+
+    #[test]
+    fn thread_local_initializer_panic_is_distinct() {
+        let config = PipeWireOutputConfig::try_new(48_000, 64).unwrap();
+        let result = PipeWireOutputStream::start_with_thread_initializer(config, |_| {
+            panic!("initializer panic");
+        });
+
+        assert!(matches!(result, Err(PipeWireStartError::ThreadPanicked)));
     }
 }

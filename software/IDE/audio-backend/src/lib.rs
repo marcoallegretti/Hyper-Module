@@ -7,7 +7,7 @@ use std::sync::Arc;
 pub const STEREO_CHANNELS: usize = 2;
 pub const MAXIMUM_BLOCK_FRAMES: usize = 4_096;
 
-pub trait InterleavedStereoProcessor: Send + 'static {
+pub trait InterleavedStereoProcessor {
     type Error;
 
     /// Renders one interleaved stereo block in place.
@@ -21,7 +21,7 @@ pub trait InterleavedStereoProcessor: Send + 'static {
 
 impl<F, E> InterleavedStereoProcessor for F
 where
-    F: FnMut(&mut [f32]) -> Result<(), E> + Send + 'static,
+    F: FnMut(&mut [f32]) -> Result<(), E>,
 {
     type Error = E;
 
@@ -154,6 +154,18 @@ impl<P: InterleavedStereoProcessor> OutputCallback<P> {
         processor: P,
         maximum_block_frames: usize,
     ) -> Result<Self, OutputCallbackConfigError> {
+        Self::try_new_with_counters(
+            processor,
+            maximum_block_frames,
+            OutputStreamCounters::default(),
+        )
+    }
+
+    fn try_new_with_counters(
+        processor: P,
+        maximum_block_frames: usize,
+        counters: OutputStreamCounters,
+    ) -> Result<Self, OutputCallbackConfigError> {
         if !(1..=MAXIMUM_BLOCK_FRAMES).contains(&maximum_block_frames) {
             return Err(OutputCallbackConfigError::InvalidMaximumBlockFrames {
                 actual: maximum_block_frames,
@@ -163,7 +175,7 @@ impl<P: InterleavedStereoProcessor> OutputCallback<P> {
         Ok(Self {
             processor,
             maximum_block_frames,
-            counters: OutputStreamCounters::default(),
+            counters,
             processor_panicked: false,
         })
     }
@@ -233,7 +245,7 @@ mod pipewire_output;
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 pub use pipewire_output::{
     PipeWireOutputConfig, PipeWireOutputConfigError, PipeWireOutputStream, PipeWireStartError,
-    PipeWireStartupStage, PipeWireStopError,
+    PipeWireStartupStage, PipeWireStopError, PipeWireThreadRunner,
 };
 
 #[cfg(test)]
@@ -348,5 +360,29 @@ mod tests {
                 maximum: MAXIMUM_BLOCK_FRAMES
             }) if actual == MAXIMUM_BLOCK_FRAMES + 1
         ));
+    }
+
+    #[test]
+    fn callback_can_borrow_thread_local_processor_state() {
+        let mut invocation_count = 0_u8;
+        {
+            let mut callback = OutputCallback::try_new(
+                |output: &mut [f32]| -> Result<(), ()> {
+                    invocation_count = invocation_count.saturating_add(1);
+                    output.fill(f32::from(invocation_count));
+                    Ok(())
+                },
+                2,
+            )
+            .unwrap();
+            let mut output = [0.0_f32; 4];
+
+            assert_eq!(
+                callback.process(&mut output),
+                OutputCallbackStatus::Rendered
+            );
+            assert_samples(&output, 1.0);
+        }
+        assert_eq!(invocation_count, 1);
     }
 }
