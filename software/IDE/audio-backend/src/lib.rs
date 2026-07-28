@@ -344,6 +344,13 @@ impl<P: InterleavedStereoProcessor> OutputCallback<P> {
 }
 
 #[cfg(all(target_os = "linux", target_endian = "little"))]
+mod pipewire_devices;
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+pub use pipewire_devices::{
+    PipeWireOutputTarget, PipeWireOutputTargets, PipeWireTargetDiscoveryError,
+    PipeWireTargetDiscoveryStage, discover_pipewire_output_targets,
+};
+#[cfg(all(target_os = "linux", target_endian = "little"))]
 mod pipewire_output;
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 pub use pipewire_output::{
