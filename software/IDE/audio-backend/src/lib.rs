@@ -265,6 +265,13 @@ pub use playback_session::{
     DesktopPlaybackSessionStartError,
 };
 #[cfg(target_os = "windows")]
+mod wasapi_devices;
+#[cfg(target_os = "windows")]
+pub use wasapi_devices::{
+    WasapiEndpointDiscoveryError, WasapiEndpointDiscoveryStage, WasapiOutputEndpoint,
+    WasapiOutputEndpoints, discover_wasapi_output_endpoints,
+};
+#[cfg(target_os = "windows")]
 mod wasapi_output;
 #[cfg(target_os = "windows")]
 pub use wasapi_output::{
