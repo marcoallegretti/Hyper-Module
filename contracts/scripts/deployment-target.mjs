@@ -7,12 +7,13 @@ import {
   open,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   statfs,
   unlink,
 } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import Ajv2020 from "ajv/dist/2020.js";
@@ -43,7 +44,6 @@ const DEPLOYMENT_FAULT_BOUNDARIES = new Set([
   "after-authorization-sync",
   "after-authorization-state-publication",
   "after-deployment-publication-before-result",
-  "after-garbage-collection",
   "after-staging-copy",
   "after-staging-verification",
   "after-bundle-publication",
@@ -319,7 +319,35 @@ async function requireTarget(targetPath) {
     "deployment target must be a real directory",
   );
   await mkdir(join(targetRoot, "bundles"), { recursive: true });
+  await requireBundlesRoot(targetRoot);
   return targetRoot;
+}
+
+async function requireBundlesRoot(targetRoot) {
+  const targetStatus = await lstat(targetRoot);
+  assert(
+    targetStatus.isDirectory() && !targetStatus.isSymbolicLink(),
+    "deployment target must remain a real directory",
+  );
+  const bundlesRoot = join(targetRoot, "bundles");
+  const bundlesStatus = await lstat(bundlesRoot);
+  assert(
+    bundlesStatus.isDirectory() && !bundlesStatus.isSymbolicLink(),
+    "deployment bundles directory must be a real directory",
+  );
+  const [targetRealPath, bundlesRealPath] = await Promise.all([
+    realpath(targetRoot),
+    realpath(bundlesRoot),
+  ]);
+  const relativePath = relative(targetRealPath, bundlesRealPath);
+  assert(
+    relativePath &&
+      relativePath !== ".." &&
+      !relativePath.startsWith(`..${sep}`) &&
+      !isAbsolute(relativePath),
+    "deployment bundles directory escapes the target",
+  );
+  return bundlesRoot;
 }
 
 function protectedBundleIdentities(state) {
@@ -336,7 +364,7 @@ function protectedBundleIdentities(state) {
 }
 
 async function inspectInstalledBundles(targetRoot) {
-  const bundlesRoot = join(targetRoot, "bundles");
+  const bundlesRoot = await requireBundlesRoot(targetRoot);
   const entries = await readdir(bundlesRoot, { withFileTypes: true });
   const bundles = [];
   for (const entry of entries.sort((left, right) =>
@@ -426,7 +454,14 @@ async function collectUnprotectedBundles(targetRoot) {
       retained.push(bundle);
       continue;
     }
-    await rm(join(targetRoot, "bundles", bundle.sha256), {
+    const bundlesRoot = await requireBundlesRoot(targetRoot);
+    const bundlePath = join(bundlesRoot, bundle.sha256);
+    const bundleStatus = await lstat(bundlePath);
+    assert(
+      bundleStatus.isDirectory() && !bundleStatus.isSymbolicLink(),
+      `installed bundle entry is not a real directory: ${bundle.sha256}`,
+    );
+    await rm(bundlePath, {
       recursive: true,
       force: false,
     });
@@ -671,21 +706,22 @@ export async function recoverDeploymentTarget(
   return withDeploymentLock(targetRoot, async () => {
     const removedTemporaryPaths = await removeTransactionResidue(targetRoot);
     const policy = await readStoragePolicy(targetRoot);
-    let garbage = null;
+    let storage = null;
     if (policy) {
-      const collected = await collectUnprotectedBundles(targetRoot);
+      const state = await readState(targetRoot);
+      const bundles = await inspectInstalledBundles(targetRoot);
       const usage = summarizeStorage(
-        collected.bundles,
-        collected.protectedIdentities,
+        bundles,
+        protectedBundleIdentities(state),
       );
       assertPolicyCapacity(policy, usage, await availableBytes(targetRoot));
-      garbage = { removed: collected.removed, ...usage };
+      storage = usage;
     }
     return {
       recovered_lock_owner: owner,
       forced,
       removed_temporary_paths: removedTemporaryPaths,
-      garbage,
+      storage,
     };
   });
 }
@@ -694,7 +730,8 @@ async function installIdentity(sourceRoot, targetRoot, faultAt = undefined) {
   const source = await inspectBundle(sourceRoot);
   const policy = await readStoragePolicy(targetRoot);
   assert(policy, "deployment storage policy is not configured");
-  const installedPath = join(targetRoot, "bundles", source.sha256);
+  const bundlesRoot = await requireBundlesRoot(targetRoot);
+  const installedPath = join(bundlesRoot, source.sha256);
   try {
     const status = await lstat(installedPath);
     assert(status.isDirectory(), "installed bundle path is not a directory");
@@ -705,12 +742,9 @@ async function installIdentity(sourceRoot, targetRoot, faultAt = undefined) {
     if (error.code !== "ENOENT") throw error;
   }
 
-  const collected = await collectUnprotectedBundles(targetRoot);
-  injectFault(faultAt, "after-garbage-collection");
-  const usage = summarizeStorage(
-    collected.bundles,
-    collected.protectedIdentities,
-  );
+  const state = await readState(targetRoot);
+  const bundles = await inspectInstalledBundles(targetRoot);
+  const usage = summarizeStorage(bundles, protectedBundleIdentities(state));
   assertPolicyCapacity(
     policy,
     usage,
@@ -735,6 +769,11 @@ async function installIdentity(sourceRoot, targetRoot, faultAt = undefined) {
       "staged bundle identity changed during transfer",
     );
     injectFault(faultAt, "after-staging-verification");
+    assert.equal(
+      await requireBundlesRoot(targetRoot),
+      bundlesRoot,
+      "deployment bundles directory changed during installation",
+    );
     await rename(stagingPath, installedPath);
     installed = true;
     injectFault(faultAt, "after-bundle-publication");

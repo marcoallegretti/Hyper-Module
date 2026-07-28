@@ -8,6 +8,7 @@ import {
   readFile,
   readdir,
   rm,
+  symlink,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -256,6 +257,45 @@ try {
     /deployment storage policy exceeds 65536 bytes/,
   );
 
+  const redirectedTarget = join(temporaryRoot, "redirected-target");
+  const redirectedOutside = join(temporaryRoot, "redirected-outside");
+  await mkdir(redirectedTarget);
+  await mkdir(redirectedOutside);
+  await symlink(
+    redirectedOutside,
+    join(redirectedTarget, "bundles"),
+    "junction",
+  );
+  await assert.rejects(
+    configureDeploymentStorage(redirectedTarget, storagePolicy()),
+    /bundles directory must be a real directory|bundles directory escapes/,
+  );
+
+  const replacedBundlesTarget = await createTarget(
+    temporaryRoot,
+    "replaced-bundles-target",
+  );
+  const replacedBundlesOutside = join(
+    temporaryRoot,
+    "replaced-bundles-outside",
+  );
+  await mkdir(replacedBundlesOutside);
+  await writeFile(join(replacedBundlesOutside, "sentinel"), "preserve");
+  await rm(join(replacedBundlesTarget, "bundles"), { recursive: true });
+  await symlink(
+    replacedBundlesOutside,
+    join(replacedBundlesTarget, "bundles"),
+    "junction",
+  );
+  await assert.rejects(
+    readDeploymentStorage(replacedBundlesTarget),
+    /bundles directory must be a real directory|bundles directory escapes/,
+  );
+  assert.equal(
+    await readFile(join(replacedBundlesOutside, "sentinel"), "utf8"),
+    "preserve",
+  );
+
   const garbageTarget = await createTarget(temporaryRoot, "garbage-target");
   const garbageIdentity = await installBundle(bundle7, garbageTarget);
   assert.equal((await readDeploymentStorage(garbageTarget)).installed_bundle_count, 1);
@@ -287,6 +327,19 @@ try {
   });
   const bundle10 = join(temporaryRoot, "revision-10.runtime");
   await buildProjectBundle(source10.root, bundle10, "1.0.0");
+  await assert.rejects(
+    installBundle(bundle10, quotaTarget),
+    /bundle-count quota exceeded/,
+  );
+  assert(
+    (await readdir(join(quotaTarget, "bundles"))).includes(identity9),
+    "failed installation removed an installed candidate",
+  );
+  const quotaGarbage = await collectDeploymentGarbage(quotaTarget);
+  assert.deepEqual(
+    quotaGarbage.removed.map(({ bundle_sha256 }) => bundle_sha256),
+    [identity9],
+  );
   const identity10 = await installBundle(bundle10, quotaTarget);
   const quotaStorage = await readDeploymentStorage(quotaTarget);
   assert.equal(quotaStorage.installed_bundle_count, 3);
@@ -386,7 +439,13 @@ try {
     policyResidue,
     stateResidue,
   ].sort());
-  assert.equal(recoveredTarget.garbage.removed[0].bundle_sha256, recoveryCandidate);
+  assert.equal(recoveredTarget.storage.installed_bundle_count, 1);
+  assert(
+    (await readdir(join(recoveryTarget, "bundles"))).includes(
+      recoveryCandidate,
+    ),
+    "recovery removed a retained candidate",
+  );
   assert.equal(await readDeploymentLock(recoveryTarget), null);
   assert(
     (await readdir(recoveryTarget)).includes(".install-not-a-transaction"),
@@ -427,7 +486,6 @@ try {
   assert.equal(await readDeploymentLock(malformedLockTarget), null);
 
   const faultBoundaries = [
-    "after-garbage-collection",
     "after-staging-copy",
     "after-staging-verification",
     "after-bundle-publication",
@@ -466,10 +524,18 @@ try {
     const installedAfterRecovery = await readdir(
       join(faultTarget, "bundles"),
     );
-    assert.equal(installedAfterRecovery.length, publishedState ? 1 : 0);
+    const retainedInstallation = [
+      "after-bundle-installation",
+      "after-state-sync",
+      "after-state-publication",
+    ].includes(boundary);
+    assert.equal(installedAfterRecovery.length, retainedInstallation ? 1 : 0);
     if (publishedState) {
       const retry = await deployBundle(bundle7, faultTarget, "1.0.0");
       assert.deepEqual(retry, stateAfterFault);
+    } else if (retainedInstallation) {
+      const retry = await deployBundle(bundle7, faultTarget, "1.0.0");
+      assert.equal(retry.active.bundle_sha256, installedAfterRecovery[0]);
     }
   }
   await assert.rejects(
