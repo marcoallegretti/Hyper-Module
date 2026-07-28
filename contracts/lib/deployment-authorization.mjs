@@ -179,7 +179,6 @@ export async function validateDeploymentAuthorizationState(state) {
     validate(state),
     `deployment authorization state schema validation failed: ${JSON.stringify(validate.errors)}`,
   );
-  assertPublicKey(state.device_public_key);
   assert(
     state.clients.length <= state.policy.max_paired_clients,
     "paired client policy limit exceeded",
@@ -398,7 +397,6 @@ function temporalRejection(state, request, now) {
 
 export async function createDeploymentAuthorizationState({
   deviceId,
-  devicePublicKey,
   policy,
 }) {
   const state = {
@@ -406,7 +404,6 @@ export async function createDeploymentAuthorizationState({
     format_version: 1,
     generation: 1,
     device_id: deviceId,
-    device_public_key: devicePublicKey,
     policy,
     pending_pairing_challenge: null,
     clients: [],
@@ -455,7 +452,6 @@ export async function issuePairingChallenge(
     state: nextState,
     challenge: {
       device_id: state.device_id,
-      device_public_key: state.device_public_key,
       challenge_id: challengeId,
       expires_at_epoch_ms: expiresAt,
     },

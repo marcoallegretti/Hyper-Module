@@ -3,11 +3,6 @@
   "format_version": 1,
   "generation": 5,
   "device_id": "10000000-0000-4000-8000-000000000001",
-  "device_public_key": {
-    "kty": "OKP",
-    "crv": "Ed25519",
-    "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-  },
   "policy": {
     "max_paired_clients": 4,
     "max_recent_requests": 64,

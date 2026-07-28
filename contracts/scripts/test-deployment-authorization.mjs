@@ -27,10 +27,8 @@ import { createMinimalProject } from "./test-project-fixture.mjs";
 const now = 1785153600000;
 const deviceId = "10000000-0000-4000-8000-000000000001";
 const clientId = "20000000-0000-4000-8000-000000000001";
-const deviceKeys = generateKeyPairSync("ed25519");
 const clientKeys = generateKeyPairSync("ed25519");
 const secondClientKeys = generateKeyPairSync("ed25519");
-const devicePublicKey = ed25519PublicJwk(deviceKeys.publicKey);
 const clientPublicKey = ed25519PublicJwk(clientKeys.publicKey);
 const secondClientPublicKey = ed25519PublicJwk(secondClientKeys.publicKey);
 
@@ -58,7 +56,6 @@ assert.equal(
 
 let state = await createDeploymentAuthorizationState({
   deviceId,
-  devicePublicKey,
   policy,
 });
 assert.equal(

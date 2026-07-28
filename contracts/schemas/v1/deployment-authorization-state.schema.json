@@ -8,7 +8,6 @@
     "format_version",
     "generation",
     "device_id",
-    "device_public_key",
     "policy",
     "pending_pairing_challenge",
     "clients",
@@ -24,9 +23,6 @@
       "$ref": "common.schema.json#/$defs/safe_positive_integer"
     },
     "device_id": { "$ref": "common.schema.json#/$defs/entity_id" },
-    "device_public_key": {
-      "$ref": "common.schema.json#/$defs/ed25519_public_jwk"
-    },
     "policy": { "$ref": "#/$defs/policy" },
     "pending_pairing_challenge": {
       "oneOf": [

@@ -549,7 +549,6 @@ try {
     temporaryRoot,
     "authorization-target",
   );
-  const deviceKeys = generateKeyPairSync("ed25519");
   const clientKeys = generateKeyPairSync("ed25519");
   const deviceId = "10000000-0000-4000-8000-000000000001";
   const clientId = "20000000-0000-4000-8000-000000000001";
@@ -565,7 +564,6 @@ try {
   };
   const initialAuthorization = await createDeploymentAuthorizationState({
     deviceId,
-    devicePublicKey: ed25519PublicJwk(deviceKeys.publicKey),
     policy: authorizationPolicy,
   });
   const cliAuthorizationTarget = await createTarget(
