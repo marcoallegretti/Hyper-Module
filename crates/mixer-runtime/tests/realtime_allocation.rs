@@ -20,31 +20,34 @@ use common::{fixture, graph_fixture, playback_fixture};
 struct CountingAllocator;
 
 static COUNTING: AtomicBool = AtomicBool::new(false);
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static HEAP_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            HEAP_OPERATIONS.fetch_add(1, Ordering::Relaxed);
         }
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            HEAP_OPERATIONS.fetch_add(1, Ordering::Relaxed);
         }
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        if COUNTING.load(Ordering::Relaxed) {
+            HEAP_OPERATIONS.fetch_add(1, Ordering::Relaxed);
+        }
         unsafe { System.dealloc(pointer, layout) }
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            HEAP_OPERATIONS.fetch_add(1, Ordering::Relaxed);
         }
         unsafe { System.realloc(pointer, layout, size) }
     }
@@ -52,6 +55,40 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+struct HeapMeasurement {
+    active: bool,
+}
+
+impl HeapMeasurement {
+    fn start() -> Self {
+        HEAP_OPERATIONS.store(0, Ordering::SeqCst);
+        COUNTING.store(true, Ordering::SeqCst);
+        Self { active: true }
+    }
+
+    fn finish(mut self) -> usize {
+        COUNTING.store(false, Ordering::SeqCst);
+        self.active = false;
+        HEAP_OPERATIONS.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for HeapMeasurement {
+    fn drop(&mut self) {
+        if self.active {
+            COUNTING.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+fn assert_allocator_positive_control() {
+    let measurement = HeapMeasurement::start();
+    let value = Box::new(7_u8);
+    std::hint::black_box(&value);
+    drop(value);
+    assert!(measurement.finish() >= 2);
+}
 
 #[test]
 fn prepared_arrangement_to_main_mix_performs_zero_heap_allocations() {
@@ -68,8 +105,8 @@ fn prepared_arrangement_to_main_mix_performs_zero_heap_allocations() {
     let mut output_left = [0.0_f32; 64];
     let mut output_right = [0.0_f32; 64];
 
-    ALLOCATIONS.store(0, Ordering::SeqCst);
-    COUNTING.store(true, Ordering::SeqCst);
+    assert_allocator_positive_control();
+    let measurement = HeapMeasurement::start();
     let result = runtime.process_window(
         0,
         &mut scratch,
@@ -78,10 +115,10 @@ fn prepared_arrangement_to_main_mix_performs_zero_heap_allocations() {
             right: &mut output_right,
         },
     );
-    COUNTING.store(false, Ordering::SeqCst);
+    let heap_operations = measurement.finish();
 
     assert!(result.is_ok());
-    assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
+    assert_eq!(heap_operations, 0);
     for (actual, source) in output_left.iter().zip(&fixture.samples[..64]) {
         assert!((*actual - *source * 0.25).abs() <= f32::EPSILON);
     }
@@ -125,8 +162,8 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
     let (mut meter_sender, _meter_receiver) = output_meter_channel();
     let mut interleaved = [0.0_f32; 128];
 
-    ALLOCATIONS.store(0, Ordering::SeqCst);
-    COUNTING.store(true, Ordering::SeqCst);
+    assert_allocator_positive_control();
+    let measurement = HeapMeasurement::start();
     let result = runtime.process_window(
         0,
         &mut scratch,
@@ -149,14 +186,14 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
         &mut interleaved,
         &mut meter_sender,
     );
-    COUNTING.store(false, Ordering::SeqCst);
+    let heap_operations = measurement.finish();
 
     assert!(result.is_ok());
     assert!(start_result.is_ok());
     assert!(automated_result.is_ok());
     assert!(stop_result.is_ok());
     assert!(stopped_result.is_ok());
-    assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
+    assert_eq!(heap_operations, 0);
 }
 
 #[test]
@@ -186,8 +223,8 @@ fn prepared_combined_playback_performs_zero_heap_allocations() {
     let mut output_left = [0.0_f32; 64];
     let mut output_right = [0.0_f32; 64];
 
-    ALLOCATIONS.store(0, Ordering::SeqCst);
-    COUNTING.store(true, Ordering::SeqCst);
+    assert_allocator_positive_control();
+    let measurement = HeapMeasurement::start();
     let result = transport.process_cycle(
         &mut scratch,
         StereoOutput {
@@ -195,10 +232,10 @@ fn prepared_combined_playback_performs_zero_heap_allocations() {
             right: &mut output_right,
         },
     );
-    COUNTING.store(false, Ordering::SeqCst);
+    let heap_operations = measurement.finish();
 
     assert!(result.is_ok());
-    assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
+    assert_eq!(heap_operations, 0);
     for (actual, source) in output_left.iter().zip(&fixture.arrangement_samples[..64]) {
         assert!((*actual - *source).abs() <= f32::EPSILON);
     }
@@ -233,15 +270,15 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
     let mut first = [0.0_f32; 100];
     let mut second = [0.0_f32; 50];
 
-    ALLOCATIONS.store(0, Ordering::SeqCst);
-    COUNTING.store(true, Ordering::SeqCst);
+    assert_allocator_positive_control();
+    let measurement = HeapMeasurement::start();
     let start_result = command_sender.try_send(TransportCommand::Start);
     let first_result = processor.process(&mut first);
     let second_result = processor.process(&mut second);
-    COUNTING.store(false, Ordering::SeqCst);
+    let heap_operations = measurement.finish();
 
     assert!(start_result.is_ok());
     assert!(first_result.is_ok());
     assert!(second_result.is_ok());
-    assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
+    assert_eq!(heap_operations, 0);
 }
