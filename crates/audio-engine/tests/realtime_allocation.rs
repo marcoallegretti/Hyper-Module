@@ -5,7 +5,7 @@ use std::alloc::System;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hyper_audio_engine::{
-    ChannelParameters, InputBlock, LinearGain, Pan, StereoMixer, StereoOutput,
+    ChannelParameters, ControlledInputBlock, InputBlock, LinearGain, Pan, StereoMixer, StereoOutput,
 };
 
 struct CountingAllocator;
@@ -60,6 +60,13 @@ fn processing_performs_zero_heap_allocations() {
             right: &stereo_right,
         },
     ];
+    let controlled_parameters = [parameters[0]; 128];
+    let controlled_master = [LinearGain::UNITY; 128];
+    let controlled_inputs = [ControlledInputBlock {
+        input: inputs[0],
+        parameters: &controlled_parameters,
+    }];
+    let mut controlled_mixer = StereoMixer::try_new(&parameters[..1], LinearGain::UNITY).unwrap();
     let mut output_left = [0.0_f32; 128];
     let mut output_right = [0.0_f32; 128];
 
@@ -74,8 +81,17 @@ fn processing_performs_zero_heap_allocations() {
             right: &mut output_right,
         },
     );
+    let controlled_result = controlled_mixer.process_controlled(
+        &controlled_inputs,
+        &controlled_master,
+        StereoOutput {
+            left: &mut output_left,
+            right: &mut output_right,
+        },
+    );
     COUNTING.store(false, Ordering::SeqCst);
 
     assert!(result.is_ok());
+    assert!(controlled_result.is_ok());
     assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
 }

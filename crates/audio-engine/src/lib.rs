@@ -158,6 +158,13 @@ pub enum InputBlock<'a> {
     Stereo { left: &'a [f32], right: &'a [f32] },
 }
 
+/// One input plus exact per-sample mixer controls for a processing block.
+#[derive(Clone, Copy, Debug)]
+pub struct ControlledInputBlock<'a> {
+    pub input: InputBlock<'a>,
+    pub parameters: &'a [ChannelParameters],
+}
+
 impl InputBlock<'_> {
     fn frame_count(self) -> Result<usize, ProcessError> {
         match self {
@@ -198,6 +205,15 @@ pub enum ProcessError {
         expected: usize,
         actual: usize,
     },
+    ControlFrameCountMismatch {
+        input: usize,
+        expected: usize,
+        actual: usize,
+    },
+    MasterControlFrameCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
     BlockTooLarge {
         actual: usize,
         maximum: usize,
@@ -230,6 +246,18 @@ impl fmt::Display for ProcessError {
             } => write!(
                 formatter,
                 "input {input} has {actual} frames; expected {expected}"
+            ),
+            Self::ControlFrameCountMismatch {
+                input,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "input {input} has {actual} control frames; expected {expected}"
+            ),
+            Self::MasterControlFrameCountMismatch { expected, actual } => write!(
+                formatter,
+                "master has {actual} control frames; expected {expected}"
             ),
             Self::BlockTooLarge { actual, maximum } => {
                 write!(formatter, "block has {actual} frames; maximum is {maximum}")
@@ -385,6 +413,97 @@ impl StereoMixer {
         self.master_gain = target_master_gain.value();
         Ok(())
     }
+
+    /// Processes exact per-sample controls without adding a block ramp.
+    ///
+    /// This path is intended for already compiled automation vectors. The
+    /// control value at index `n` applies to sample frame `n`; the last values
+    /// become the scalar-ramp starting state for any later [`Self::process`]
+    /// call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessError`] before touching output or state when channel
+    /// counts, audio frame counts, control frame counts, or output lengths
+    /// disagree, or the block exceeds the supported real-time bound.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn process_controlled(
+        &mut self,
+        inputs: &[ControlledInputBlock<'_>],
+        master_gain: &[LinearGain],
+        output: StereoOutput<'_>,
+    ) -> Result<(), ProcessError> {
+        let frame_count = output.left.len();
+        if frame_count != output.right.len() {
+            return Err(ProcessError::OutputLengthMismatch {
+                left: frame_count,
+                right: output.right.len(),
+            });
+        }
+        if frame_count > MAX_PROCESS_FRAMES {
+            return Err(ProcessError::BlockTooLarge {
+                actual: frame_count,
+                maximum: MAX_PROCESS_FRAMES,
+            });
+        }
+        if inputs.len() != self.channels.len() {
+            return Err(ProcessError::InputCountMismatch {
+                configured: self.channels.len(),
+                inputs: inputs.len(),
+                parameters: inputs.len(),
+            });
+        }
+        if master_gain.len() != frame_count {
+            return Err(ProcessError::MasterControlFrameCountMismatch {
+                expected: frame_count,
+                actual: master_gain.len(),
+            });
+        }
+        for (index, controlled) in inputs.iter().enumerate() {
+            let actual = controlled.input.frame_count()?;
+            if actual != frame_count {
+                return Err(ProcessError::InputFrameCountMismatch {
+                    input: index,
+                    expected: frame_count,
+                    actual,
+                });
+            }
+            if controlled.parameters.len() != frame_count {
+                return Err(ProcessError::ControlFrameCountMismatch {
+                    input: index,
+                    expected: frame_count,
+                    actual: controlled.parameters.len(),
+                });
+            }
+        }
+        if frame_count == 0 {
+            return Ok(());
+        }
+
+        output.left.fill(0.0);
+        output.right.fill(0.0);
+        for (slot, controlled) in inputs.iter().enumerate() {
+            match controlled.input {
+                InputBlock::Mono(samples) => {
+                    mix_mono_controlled(samples, controlled.parameters, output.left, output.right);
+                }
+                InputBlock::Stereo { left, right } => {
+                    mix_stereo_controlled(
+                        left,
+                        right,
+                        controlled.parameters,
+                        output.left,
+                        output.right,
+                    );
+                }
+            }
+            self.channels[slot] =
+                ChannelState::from(controlled.parameters[controlled.parameters.len() - 1]);
+        }
+        apply_controlled_master_gain(output.left, output.right, master_gain);
+        self.master_gain = master_gain[master_gain.len() - 1].value();
+        Ok(())
+    }
 }
 
 fn ramp(start: f32, end: f32, frame: usize, reciprocal_frames: f32) -> f32 {
@@ -450,6 +569,35 @@ fn mix_stereo(
     }
 }
 
+fn mix_mono_controlled(
+    input: &[f32],
+    parameters: &[ChannelParameters],
+    output_left: &mut [f32],
+    output_right: &mut [f32],
+) {
+    for (frame, sample) in input.iter().copied().enumerate() {
+        let state = ChannelState::from(parameters[frame]);
+        let (pan_left, pan_right) = mono_pan_coefficients(state.pan);
+        output_left[frame] += sample * state.gain * pan_left;
+        output_right[frame] += sample * state.gain * pan_right;
+    }
+}
+
+fn mix_stereo_controlled(
+    input_left: &[f32],
+    input_right: &[f32],
+    parameters: &[ChannelParameters],
+    output_left: &mut [f32],
+    output_right: &mut [f32],
+) {
+    for frame in 0..input_left.len() {
+        let state = ChannelState::from(parameters[frame]);
+        let (balance_left, balance_right) = stereo_balance_coefficients(state.pan);
+        output_left[frame] += input_left[frame] * state.gain * balance_left;
+        output_right[frame] += input_right[frame] * state.gain * balance_right;
+    }
+}
+
 fn apply_master_gain(
     output_left: &mut [f32],
     output_right: &mut [f32],
@@ -461,6 +609,17 @@ fn apply_master_gain(
         let gain = ramp(start, target, frame, reciprocal_frames);
         output_left[frame] *= gain;
         output_right[frame] *= gain;
+    }
+}
+
+fn apply_controlled_master_gain(
+    output_left: &mut [f32],
+    output_right: &mut [f32],
+    master_gain: &[LinearGain],
+) {
+    for frame in 0..output_left.len() {
+        output_left[frame] *= master_gain[frame].value();
+        output_right[frame] *= master_gain[frame].value();
     }
 }
 
@@ -822,6 +981,103 @@ mod tests {
         assert!(left[0] > 0.0);
         assert!(left[1].abs() <= EPSILON);
         assert_samples(&left, &right);
+    }
+
+    #[test]
+    fn controlled_processing_is_sample_exact_and_block_size_independent() {
+        let initial = [parameters(LinearGain::UNITY, Pan::CENTER, true)];
+        let controls = [
+            parameters(LinearGain::SILENCE, Pan::CENTER, true),
+            parameters(LinearGain::new(0.25).unwrap(), Pan::CENTER, true),
+            parameters(LinearGain::new(0.5).unwrap(), Pan::CENTER, true),
+            parameters(LinearGain::new(0.75).unwrap(), Pan::CENTER, true),
+            parameters(LinearGain::UNITY, Pan::CENTER, false),
+            parameters(LinearGain::new(1.25).unwrap(), Pan::CENTER, true),
+            parameters(LinearGain::new(1.5).unwrap(), Pan::CENTER, true),
+            parameters(LinearGain::new(1.75).unwrap(), Pan::CENTER, true),
+        ];
+        let master = [LinearGain::UNITY; 8];
+        let source_left = [1.0; 8];
+        let source_right = [1.0; 8];
+        let input = InputBlock::Stereo {
+            left: &source_left,
+            right: &source_right,
+        };
+        let mut whole = StereoMixer::try_new(&initial, LinearGain::UNITY).unwrap();
+        let mut whole_left = [9.0; 8];
+        let mut whole_right = [9.0; 8];
+        whole
+            .process_controlled(
+                &[ControlledInputBlock {
+                    input,
+                    parameters: &controls,
+                }],
+                &master,
+                StereoOutput {
+                    left: &mut whole_left,
+                    right: &mut whole_right,
+                },
+            )
+            .unwrap();
+
+        let mut split = StereoMixer::try_new(&initial, LinearGain::UNITY).unwrap();
+        let mut split_left = [9.0; 8];
+        let mut split_right = [9.0; 8];
+        for range in [0..3, 3..8] {
+            split
+                .process_controlled(
+                    &[ControlledInputBlock {
+                        input: InputBlock::Stereo {
+                            left: &source_left[range.clone()],
+                            right: &source_right[range.clone()],
+                        },
+                        parameters: &controls[range.clone()],
+                    }],
+                    &master[range.clone()],
+                    StereoOutput {
+                        left: &mut split_left[range.clone()],
+                        right: &mut split_right[range],
+                    },
+                )
+                .unwrap();
+        }
+        let expected = [0.0, 0.25, 0.5, 0.75, 0.0, 1.25, 1.5, 1.75];
+        assert_samples(&whole_left, &expected);
+        assert_samples(&whole_right, &expected);
+        assert_samples(&split_left, &expected);
+        assert_samples(&split_right, &expected);
+    }
+
+    #[test]
+    fn controlled_processing_applies_pan_at_each_sample() {
+        let initial = [parameters(LinearGain::UNITY, Pan::CENTER, true)];
+        let controls = [
+            parameters(LinearGain::UNITY, Pan::HARD_LEFT, true),
+            parameters(LinearGain::UNITY, Pan::CENTER, true),
+            parameters(LinearGain::UNITY, Pan::HARD_RIGHT, true),
+        ];
+        let source = [1.0; 3];
+        let mut left = [9.0; 3];
+        let mut right = [9.0; 3];
+        let mut mixer = StereoMixer::try_new(&initial, LinearGain::UNITY).unwrap();
+
+        mixer
+            .process_controlled(
+                &[ControlledInputBlock {
+                    input: InputBlock::Mono(&source),
+                    parameters: &controls,
+                }],
+                &[LinearGain::UNITY; 3],
+                StereoOutput {
+                    left: &mut left,
+                    right: &mut right,
+                },
+            )
+            .unwrap();
+
+        let (center_left, center_right) = mono_pan_coefficients(Pan::CENTER.value());
+        assert_samples(&left, &[1.0, center_left, 0.0]);
+        assert_samples(&right, &[0.0, center_right, 1.0]);
     }
 
     #[test]
