@@ -29,7 +29,7 @@ import canonicalize from "canonicalize";
 
 import {
   syncDirectoryTree,
-  syncPublishedEntry,
+  syncPublishedDirectory,
 } from "../lib/durable-files.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
 import { verifyBundle } from "./verify-bundle.mjs";
@@ -302,10 +302,15 @@ export async function buildBundle(planPath, sourcePath, outputPath) {
     await chmod(join(stageRoot, "manifest.json"), 0o644);
 
     await verifyBundle(stageRoot);
-    await syncDirectoryTree(stageRoot);
+    const declaredFiles = [
+      "manifest.json",
+      ...manifest.files.map((file) => file.path),
+    ];
+    await syncDirectoryTree(stageRoot, declaredFiles);
+    await verifyBundle(stageRoot);
     await assertPathAbsent(outputRoot);
     await rename(stageRoot, outputRoot);
-    await syncPublishedEntry(outputRoot);
+    await syncPublishedDirectory(outputRoot);
     published = true;
     return {
       output_path: outputRoot,

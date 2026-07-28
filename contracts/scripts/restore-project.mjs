@@ -24,7 +24,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   syncDirectoryTree,
-  syncPublishedEntry,
+  syncPublishedDirectory,
 } from "../lib/durable-files.mjs";
 import { verifyBundle } from "./verify-bundle.mjs";
 import { verifyProject } from "./verify-project.mjs";
@@ -242,9 +242,18 @@ export async function restoreProject(bundlePath, outputPath, { faultAt } = {}) {
 
     await assertPathAbsent(outputRoot);
     injectFault(faultAt, "before-publication");
-    await syncDirectoryTree(stageRoot);
+    await syncDirectoryTree(
+      stageRoot,
+      payloads.map((descriptor) => descriptor.path),
+    );
+    const finalRestored = await verifyProject(stageRoot);
+    assert.equal(
+      finalRestored.identity,
+      restored.identity,
+      "restored project identity changed before publication",
+    );
     await rename(stageRoot, outputRoot);
-    await syncPublishedEntry(outputRoot);
+    await syncPublishedDirectory(outputRoot);
     published = true;
 
     return {

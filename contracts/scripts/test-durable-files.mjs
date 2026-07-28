@@ -13,6 +13,7 @@ import { join } from "node:path";
 
 import {
   syncDirectoryTree,
+  syncPublishedDirectory,
   syncPublishedEntry,
   syncRemovedEntry,
 } from "../lib/durable-files.mjs";
@@ -30,14 +31,22 @@ try {
   const tree = join(root, "tree");
   await mkdir(join(tree, "nested"), { recursive: true });
   await writeFile(join(tree, "nested", "payload"), "payload");
-  await syncDirectoryTree(tree);
+  await syncDirectoryTree(tree, ["nested/payload"]);
+  await syncPublishedDirectory(tree);
+
+  await writeFile(join(tree, "undeclared"), "undeclared");
+  await assert.rejects(
+    syncDirectoryTree(tree, ["nested/payload"]),
+    /filesystem tree exceeds 2 entries|undeclared file is forbidden/,
+  );
+  await rm(join(tree, "undeclared"));
 
   const outside = join(root, "outside");
   await mkdir(outside);
   await symlink(outside, join(tree, "link"), "junction");
   await assert.rejects(
-    syncDirectoryTree(tree),
-    /durable tree contains a symbolic link/,
+    syncDirectoryTree(tree, ["nested/payload"]),
+    /filesystem tree exceeds 2 entries|symbolic links and junctions are forbidden/,
   );
   await rm(join(tree, "link"));
 
@@ -48,4 +57,3 @@ try {
 }
 
 console.log("Durable filesystem primitives passed");
-

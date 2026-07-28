@@ -33,6 +33,7 @@ import {
 } from "../lib/deployment-authorization.mjs";
 import {
   syncDirectoryTree,
+  syncPublishedDirectory,
   syncPublishedEntry,
   syncRemovedEntry,
 } from "../lib/durable-files.mjs";
@@ -777,7 +778,16 @@ async function installIdentity(sourceRoot, targetRoot, faultAt = undefined) {
       "staged bundle identity changed during transfer",
     );
     injectFault(faultAt, "after-staging-verification");
-    await syncDirectoryTree(stagingPath);
+    await syncDirectoryTree(stagingPath, [
+      "manifest.json",
+      ...staged.manifest.files.map((file) => file.path),
+    ]);
+    const durable = await inspectBundle(stagingPath);
+    assert.equal(
+      durable.sha256,
+      source.sha256,
+      "staged bundle identity changed before publication",
+    );
     assert.equal(
       await requireBundlesRoot(targetRoot),
       bundlesRoot,
@@ -785,7 +795,7 @@ async function installIdentity(sourceRoot, targetRoot, faultAt = undefined) {
     );
     await rename(stagingPath, installedPath);
     installed = true;
-    await syncPublishedEntry(installedPath);
+    await syncPublishedDirectory(installedPath);
     injectFault(faultAt, "after-bundle-publication");
     assertPolicyCapacity(
       policy,
