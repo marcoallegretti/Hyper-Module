@@ -348,6 +348,13 @@ impl<'resource> CompiledScenePerformance<'resource> {
         self.tracks.get(index).map(|track| track.id)
     }
 
+    #[must_use]
+    pub fn track_has_actions(&self, index: usize) -> Option<bool> {
+        self.tracks
+            .get(index)
+            .map(|track| !track.actions.is_empty())
+    }
+
     pub fn playing_clips(
         &self,
     ) -> impl Iterator<Item = (&'resource str, PlayingSceneClip<'resource>)> + '_ {

@@ -10,11 +10,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{InterleavedStereoCallback, StereoOutput};
 use hyper_mixer_runtime::{
-    FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, TransportCommand,
-    output_meter_channel,
+    FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, PlaybackGraphMainRuntime,
+    PlaybackGraphTransportRuntime, TransportCommand, output_meter_channel,
 };
 
-use common::{fixture, graph_fixture};
+use common::{fixture, graph_fixture, playback_fixture};
 
 struct CountingAllocator;
 
@@ -156,4 +156,56 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
     assert!(stop_result.is_ok());
     assert!(stopped_result.is_ok());
     assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn prepared_combined_playback_performs_zero_heap_allocations() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let fixture = playback_fixture();
+    let prepared_schedule = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let prepared_scene = fixture
+        .cache
+        .prepare_scene_audio(&fixture.authority, &fixture.scene_bindings)
+        .unwrap();
+    let runtime = PlaybackGraphMainRuntime::try_new_playback(
+        &prepared_schedule,
+        &fixture.authority,
+        &prepared_scene,
+        &fixture.mixer,
+        64,
+    )
+    .unwrap();
+    let mut transport = PlaybackGraphTransportRuntime::new(runtime);
+    transport.apply_command(TransportCommand::Start);
+    let mut arrangement_left = [0.0_f32; 64];
+    let mut arrangement_right = [0.0_f32; 64];
+    let mut scene_left = [0.0_f32; 64];
+    let mut scene_right = [0.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut output_left = [0.0_f32; 64];
+    let mut output_right = [0.0_f32; 64];
+
+    ALLOCATIONS.store(0, Ordering::SeqCst);
+    COUNTING.store(true, Ordering::SeqCst);
+    let result = transport.process_cycle(
+        &mut scratch,
+        StereoOutput {
+            left: &mut output_left,
+            right: &mut output_right,
+        },
+    );
+    COUNTING.store(false, Ordering::SeqCst);
+
+    assert!(result.is_ok());
+    assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
+    for (actual, source) in output_left.iter().zip(&fixture.arrangement_samples[..64]) {
+        assert!((*actual - *source).abs() <= f32::EPSILON);
+    }
+    assert!(output_right[..25].iter().all(|sample| *sample == 0.0));
+    for (actual, source) in output_right[25..].iter().zip(&fixture.scene_samples[..39]) {
+        assert!((*actual - *source).abs() <= f32::EPSILON);
+    }
 }

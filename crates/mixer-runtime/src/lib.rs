@@ -6,16 +6,17 @@ use core::fmt;
 use core::sync::atomic::{Ordering, fence};
 
 use hyper_arrangement_renderer::{
-    ArrangementRenderer, RenderScratchSlot, RenderWindowError, RenderedWindow,
-    RendererCreationError,
+    ArrangementRenderer, PlaybackRenderError, PlaybackRenderer, PlaybackRendererCreationError,
+    RenderScratchSlot, RenderWindowError, RenderedWindow, RendererCreationError,
 };
 use hyper_audio_engine::{
     ChannelParameters, ControlledInputBlock, InputBlock, InterleavedStereoCallback, LinearGain,
     MAX_PROCESS_FRAMES, MixerCreationError, Pan, ParameterError, ProcessError, StereoBlockMeter,
     StereoCallbackError, StereoMixer, StereoOutput,
 };
-use hyper_media_cache::PreparedSchedule;
+use hyper_media_cache::{PreparedSceneAudio, PreparedSchedule};
 use hyper_playback_compiler::FrameTimelineError;
+use hyper_playback_compiler::scene::CompiledScenePerformance;
 use hyper_playback_json::{
     AutomationChannelParameter, AutomationMainParameter, AutomationSendParameter, AutomationTarget,
     AutomationValue, CompiledAutomation, CompiledMainMixer, CompiledMixerDestination,
@@ -34,6 +35,7 @@ pub enum RuntimeCreationError {
     InvalidMaximumBlockFrames { actual: usize, maximum: usize },
     CapacityUnavailable,
     Renderer(RendererCreationError),
+    PlaybackRenderer(PlaybackRendererCreationError),
     Mixer(MixerCreationError),
 }
 
@@ -52,6 +54,9 @@ impl fmt::Display for RuntimeCreationError {
                 formatter.write_str("mixer runtime buffer capacity is unavailable")
             }
             Self::Renderer(source) => write!(formatter, "mixer track indexing failed: {source}"),
+            Self::PlaybackRenderer(source) => {
+                write!(formatter, "playback track indexing failed: {source}")
+            }
             Self::Mixer(source) => write!(formatter, "mixer construction failed: {source}"),
         }
     }
@@ -61,6 +66,7 @@ impl Error for RuntimeCreationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Renderer(source) => Some(source),
+            Self::PlaybackRenderer(source) => Some(source),
             Self::Mixer(source) => Some(source),
             Self::SlotLimit { .. }
             | Self::InvalidMaximumBlockFrames { .. }
@@ -78,6 +84,7 @@ pub enum RuntimeProcessError {
     AutomationValueMismatch,
     Parameter(ParameterError),
     Render(RenderWindowError),
+    PlaybackRender(PlaybackRenderError),
     Mixer(ProcessError),
 }
 
@@ -101,6 +108,9 @@ impl fmt::Display for RuntimeProcessError {
             }
             Self::Parameter(source) => write!(formatter, "automation parameter failed: {source}"),
             Self::Render(source) => write!(formatter, "track rendering failed: {source}"),
+            Self::PlaybackRender(source) => {
+                write!(formatter, "combined track rendering failed: {source}")
+            }
             Self::Mixer(source) => write!(formatter, "main mixing failed: {source}"),
         }
     }
@@ -110,6 +120,7 @@ impl Error for RuntimeProcessError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Render(source) => Some(source),
+            Self::PlaybackRender(source) => Some(source),
             Self::Mixer(source) => Some(source),
             Self::Automation(source) => Some(source),
             Self::Parameter(source) => Some(source),
@@ -785,8 +796,8 @@ impl FrameOverrides {
 /// A bounded primary/send/return graph whose route order and buffers are
 /// completely compiled before callback execution.
 #[derive(Debug)]
-pub struct GraphMainRuntime<'prepared, 'cache, 'schedule> {
-    renderer: ArrangementRenderer<'prepared, 'cache, 'schedule>,
+pub struct RoutedMainRuntime<R> {
+    renderer: R,
     slots: Vec<GraphSlotRuntime>,
     processing_order: Vec<usize>,
     route_buffers: Vec<StereoBuffer>,
@@ -805,7 +816,65 @@ pub struct GraphMainRuntime<'prepared, 'cache, 'schedule> {
     max_block_frames: usize,
 }
 
-impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule> {
+pub type GraphMainRuntime<'prepared, 'cache, 'schedule> =
+    RoutedMainRuntime<ArrangementRenderer<'prepared, 'cache, 'schedule>>;
+
+pub type PlaybackGraphMainRuntime<'prepared, 'authority, 'cache, 'schedule, 'resource> =
+    RoutedMainRuntime<PlaybackRenderer<'prepared, 'authority, 'cache, 'schedule, 'resource>>;
+
+mod sealed {
+    pub trait TrackWindowRenderer {}
+}
+
+#[doc(hidden)]
+pub trait TrackWindowRenderer: sealed::TrackWindowRenderer {
+    fn render_track_window(
+        &mut self,
+        start_frame: usize,
+        frame_count: usize,
+        scratch: &mut [RenderScratchSlot<'_>],
+    ) -> Result<RenderedWindow, RuntimeProcessError>;
+
+    fn seek(&mut self, frame: usize);
+}
+
+impl sealed::TrackWindowRenderer for ArrangementRenderer<'_, '_, '_> {}
+
+impl TrackWindowRenderer for ArrangementRenderer<'_, '_, '_> {
+    fn render_track_window(
+        &mut self,
+        start_frame: usize,
+        frame_count: usize,
+        scratch: &mut [RenderScratchSlot<'_>],
+    ) -> Result<RenderedWindow, RuntimeProcessError> {
+        ArrangementRenderer::render_track_window(self, start_frame, frame_count, scratch)
+            .map_err(RuntimeProcessError::Render)
+    }
+
+    fn seek(&mut self, _frame: usize) {}
+}
+
+impl sealed::TrackWindowRenderer for PlaybackRenderer<'_, '_, '_, '_, '_> {}
+
+impl TrackWindowRenderer for PlaybackRenderer<'_, '_, '_, '_, '_> {
+    fn render_track_window(
+        &mut self,
+        start_frame: usize,
+        frame_count: usize,
+        scratch: &mut [RenderScratchSlot<'_>],
+    ) -> Result<RenderedWindow, RuntimeProcessError> {
+        PlaybackRenderer::render_track_window(self, start_frame, frame_count, scratch)
+            .map_err(RuntimeProcessError::PlaybackRender)
+    }
+
+    fn seek(&mut self, frame: usize) {
+        PlaybackRenderer::seek(self, frame);
+    }
+}
+
+impl<'prepared, 'cache, 'schedule>
+    RoutedMainRuntime<ArrangementRenderer<'prepared, 'cache, 'schedule>>
+{
     /// Binds a prepared schedule to a fully resolved mixer graph.
     ///
     /// # Errors
@@ -842,106 +911,198 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
         automation: Option<CompiledAutomation>,
         max_block_frames: usize,
     ) -> Result<Self, RuntimeCreationError> {
+        validate_routed_runtime_bounds(compiled, max_block_frames)?;
         let slot_count = compiled.slots().len();
-        if slot_count > MAX_MAIN_MIXER_SLOTS {
-            return Err(RuntimeCreationError::SlotLimit {
-                actual: slot_count,
-                maximum: MAX_MAIN_MIXER_SLOTS,
-            });
-        }
-        if max_block_frames == 0 || max_block_frames > MAX_PROCESS_FRAMES {
-            return Err(RuntimeCreationError::InvalidMaximumBlockFrames {
-                actual: max_block_frames,
-                maximum: MAX_PROCESS_FRAMES,
-            });
-        }
-
         let mut track_ids = [""; MAX_MAIN_MIXER_SLOTS];
         for (index, slot) in compiled.slots().iter().enumerate() {
             track_ids[index] = slot.track_id();
         }
         let renderer = ArrangementRenderer::try_new_for_tracks(schedule, &track_ids[..slot_count])
             .map_err(RuntimeCreationError::Renderer)?;
-        let control_frame_count = if automation.is_some() {
-            max_block_frames
-        } else {
-            0
-        };
+        build_routed_main_runtime(renderer, compiled, automation, max_block_frames)
+    }
+}
 
-        let mut slots = Vec::new();
-        slots
-            .try_reserve_exact(slot_count)
-            .map_err(|_| RuntimeCreationError::CapacityUnavailable)?;
-        for compiled_slot in compiled.slots() {
-            let parameters = compiled_slot.parameters();
-            let processor = StereoMixer::try_new(&[parameters], LinearGain::UNITY)
-                .map_err(RuntimeCreationError::Mixer)?;
-            let mut sends = Vec::new();
-            sends
-                .try_reserve_exact(compiled_slot.sends().len())
-                .map_err(|_| RuntimeCreationError::CapacityUnavailable)?;
-            for compiled_send in compiled_slot.sends() {
-                let parameters = compiled_send.parameters();
-                sends.push(GraphSendRuntime {
-                    target_slot: compiled_send.target_slot(),
-                    tap: compiled_send.tap(),
-                    parameters,
-                    enabled: compiled_send.enabled(),
-                    controls: try_filled(control_frame_count, parameters)?,
-                    processor: StereoMixer::try_new(&[parameters], LinearGain::UNITY)
-                        .map_err(RuntimeCreationError::Mixer)?,
-                });
-            }
-            slots.push(GraphSlotRuntime {
-                kind: compiled_slot.kind(),
-                destination: compiled_slot.destination(),
-                parameters,
-                muted: compiled_slot.muted(),
-                solo: compiled_slot.solo(),
-                controls: try_filled(control_frame_count, parameters)?,
-                processor,
-                sends,
-            });
-        }
-
-        let mut processing_order = Vec::new();
-        processing_order
-            .try_reserve_exact(compiled.processing_order().len())
-            .map_err(|_| RuntimeCreationError::CapacityUnavailable)?;
-        processing_order.extend_from_slice(compiled.processing_order());
-
-        let mut route_buffers = Vec::new();
-        route_buffers
-            .try_reserve_exact(slot_count)
-            .map_err(|_| RuntimeCreationError::CapacityUnavailable)?;
-        for _ in 0..slot_count {
-            route_buffers.push(StereoBuffer::try_new(max_block_frames)?);
-        }
-        let main_parameters = [ChannelParameters::new(LinearGain::UNITY, Pan::CENTER, true)];
-        let main_processor = StereoMixer::try_new(&main_parameters, compiled.master_gain())
-            .map_err(RuntimeCreationError::Mixer)?;
-
-        Ok(Self {
-            renderer,
-            slots,
-            processing_order,
-            route_buffers,
-            channel_output: StereoBuffer::try_new(max_block_frames)?,
-            send_output: StereoBuffer::try_new(max_block_frames)?,
-            main_input: StereoBuffer::try_new(max_block_frames)?,
-            main_processor,
-            main_parameters,
-            master_gain: compiled.master_gain(),
-            main_gain: compiled.main_gain(),
-            main_muted: compiled.main_muted(),
-            main_input_controls: try_filled(control_frame_count, main_parameters[0])?,
-            unity_master_controls: try_filled(control_frame_count, LinearGain::UNITY)?,
-            master_controls: try_filled(control_frame_count, compiled.master_gain())?,
-            automation,
+impl<'prepared, 'authority, 'cache, 'schedule, 'resource>
+    RoutedMainRuntime<PlaybackRenderer<'prepared, 'authority, 'cache, 'schedule, 'resource>>
+{
+    /// Binds prepared arrangement and scene audio to one routed mixer graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeCreationError`] for bounds, capacity, renderer, or
+    /// mixer construction failures.
+    pub fn try_new_playback(
+        schedule: &'prepared PreparedSchedule<'cache, 'schedule>,
+        authority: &'authority CompiledScenePerformance<'resource>,
+        scene_audio: &'prepared PreparedSceneAudio<'cache, 'resource>,
+        compiled: &CompiledMixerGraph,
+        max_block_frames: usize,
+    ) -> Result<Self, RuntimeCreationError> {
+        Self::try_new_playback_inner(
+            schedule,
+            authority,
+            scene_audio,
+            compiled,
+            None,
             max_block_frames,
-        })
+        )
     }
 
+    /// Binds combined playback and compiled sample automation to one graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeCreationError`] under the same conditions as
+    /// [`Self::try_new_playback`].
+    pub fn try_new_playback_automated(
+        schedule: &'prepared PreparedSchedule<'cache, 'schedule>,
+        authority: &'authority CompiledScenePerformance<'resource>,
+        scene_audio: &'prepared PreparedSceneAudio<'cache, 'resource>,
+        compiled: &CompiledMixerGraph,
+        automation: CompiledAutomation,
+        max_block_frames: usize,
+    ) -> Result<Self, RuntimeCreationError> {
+        Self::try_new_playback_inner(
+            schedule,
+            authority,
+            scene_audio,
+            compiled,
+            Some(automation),
+            max_block_frames,
+        )
+    }
+
+    fn try_new_playback_inner(
+        schedule: &'prepared PreparedSchedule<'cache, 'schedule>,
+        authority: &'authority CompiledScenePerformance<'resource>,
+        scene_audio: &'prepared PreparedSceneAudio<'cache, 'resource>,
+        compiled: &CompiledMixerGraph,
+        automation: Option<CompiledAutomation>,
+        max_block_frames: usize,
+    ) -> Result<Self, RuntimeCreationError> {
+        validate_routed_runtime_bounds(compiled, max_block_frames)?;
+        let slot_count = compiled.slots().len();
+        let mut track_ids = [""; MAX_MAIN_MIXER_SLOTS];
+        for (index, slot) in compiled.slots().iter().enumerate() {
+            track_ids[index] = slot.track_id();
+        }
+        let renderer = PlaybackRenderer::try_new_for_tracks(
+            schedule,
+            authority,
+            scene_audio,
+            0,
+            &track_ids[..slot_count],
+        )
+        .map_err(RuntimeCreationError::PlaybackRenderer)?;
+        build_routed_main_runtime(renderer, compiled, automation, max_block_frames)
+    }
+}
+
+fn validate_routed_runtime_bounds(
+    compiled: &CompiledMixerGraph,
+    max_block_frames: usize,
+) -> Result<(), RuntimeCreationError> {
+    let slot_count = compiled.slots().len();
+    if slot_count > MAX_MAIN_MIXER_SLOTS {
+        return Err(RuntimeCreationError::SlotLimit {
+            actual: slot_count,
+            maximum: MAX_MAIN_MIXER_SLOTS,
+        });
+    }
+    if max_block_frames == 0 || max_block_frames > MAX_PROCESS_FRAMES {
+        return Err(RuntimeCreationError::InvalidMaximumBlockFrames {
+            actual: max_block_frames,
+            maximum: MAX_PROCESS_FRAMES,
+        });
+    }
+    Ok(())
+}
+
+fn build_routed_main_runtime<R>(
+    renderer: R,
+    compiled: &CompiledMixerGraph,
+    automation: Option<CompiledAutomation>,
+    max_block_frames: usize,
+) -> Result<RoutedMainRuntime<R>, RuntimeCreationError> {
+    let slot_count = compiled.slots().len();
+    let control_frame_count = if automation.is_some() {
+        max_block_frames
+    } else {
+        0
+    };
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(slot_count)
+        .map_err(|_| RuntimeCreationError::CapacityUnavailable)?;
+    for compiled_slot in compiled.slots() {
+        let parameters = compiled_slot.parameters();
+        let processor = StereoMixer::try_new(&[parameters], LinearGain::UNITY)
+            .map_err(RuntimeCreationError::Mixer)?;
+        let mut sends = Vec::new();
+        sends
+            .try_reserve_exact(compiled_slot.sends().len())
+            .map_err(|_| RuntimeCreationError::CapacityUnavailable)?;
+        for compiled_send in compiled_slot.sends() {
+            let parameters = compiled_send.parameters();
+            sends.push(GraphSendRuntime {
+                target_slot: compiled_send.target_slot(),
+                tap: compiled_send.tap(),
+                parameters,
+                enabled: compiled_send.enabled(),
+                controls: try_filled(control_frame_count, parameters)?,
+                processor: StereoMixer::try_new(&[parameters], LinearGain::UNITY)
+                    .map_err(RuntimeCreationError::Mixer)?,
+            });
+        }
+        slots.push(GraphSlotRuntime {
+            kind: compiled_slot.kind(),
+            destination: compiled_slot.destination(),
+            parameters,
+            muted: compiled_slot.muted(),
+            solo: compiled_slot.solo(),
+            controls: try_filled(control_frame_count, parameters)?,
+            processor,
+            sends,
+        });
+    }
+    let mut processing_order = Vec::new();
+    processing_order
+        .try_reserve_exact(compiled.processing_order().len())
+        .map_err(|_| RuntimeCreationError::CapacityUnavailable)?;
+    processing_order.extend_from_slice(compiled.processing_order());
+    let mut route_buffers = Vec::new();
+    route_buffers
+        .try_reserve_exact(slot_count)
+        .map_err(|_| RuntimeCreationError::CapacityUnavailable)?;
+    for _ in 0..slot_count {
+        route_buffers.push(StereoBuffer::try_new(max_block_frames)?);
+    }
+    let main_parameters = [ChannelParameters::new(LinearGain::UNITY, Pan::CENTER, true)];
+    let main_processor = StereoMixer::try_new(&main_parameters, compiled.master_gain())
+        .map_err(RuntimeCreationError::Mixer)?;
+    Ok(RoutedMainRuntime {
+        renderer,
+        slots,
+        processing_order,
+        route_buffers,
+        channel_output: StereoBuffer::try_new(max_block_frames)?,
+        send_output: StereoBuffer::try_new(max_block_frames)?,
+        main_input: StereoBuffer::try_new(max_block_frames)?,
+        main_processor,
+        main_parameters,
+        master_gain: compiled.master_gain(),
+        main_gain: compiled.main_gain(),
+        main_muted: compiled.main_muted(),
+        main_input_controls: try_filled(control_frame_count, main_parameters[0])?,
+        unity_master_controls: try_filled(control_frame_count, LinearGain::UNITY)?,
+        master_controls: try_filled(control_frame_count, compiled.master_gain())?,
+        automation,
+        max_block_frames,
+    })
+}
+
+impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
     #[must_use]
     pub fn slot_count(&self) -> usize {
         self.slots.len()
@@ -950,6 +1111,10 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
     #[must_use]
     pub const fn max_block_frames(&self) -> usize {
         self.max_block_frames
+    }
+
+    pub fn seek(&mut self, frame: usize) {
+        self.renderer.seek(frame);
     }
 
     /// Renders and executes one bounded graph window into the main output.
@@ -982,53 +1147,58 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
                 maximum: self.max_block_frames,
             });
         }
-        let rendered = self
-            .renderer
-            .render_track_window(arrangement_start_frame, frame_count, scratch)
-            .map_err(RuntimeProcessError::Render)?;
+        let rendered =
+            self.renderer
+                .render_track_window(arrangement_start_frame, frame_count, scratch)?;
         if frame_count == 0 {
             return Ok(rendered);
         }
-        if self.automation.is_some() {
-            self.prepare_automation_controls(arrangement_start_frame, frame_count)?;
-        }
+        let result = (|| {
+            if self.automation.is_some() {
+                self.prepare_automation_controls(arrangement_start_frame, frame_count)?;
+            }
 
-        for buffer in &mut self.route_buffers {
-            buffer.clear_prefix(frame_count);
-        }
-        self.main_input.clear_prefix(frame_count);
+            for buffer in &mut self.route_buffers {
+                buffer.clear_prefix(frame_count);
+            }
+            self.main_input.clear_prefix(frame_count);
 
-        for order_index in 0..self.processing_order.len() {
-            let slot_index = self.processing_order[order_index];
-            self.process_sends(slot_index, CompiledMixerTap::PreFader, frame_count, scratch)?;
-            self.process_channel(slot_index, frame_count, scratch)?;
-            self.route_channel_output(slot_index, frame_count);
-            self.process_sends(
-                slot_index,
-                CompiledMixerTap::PostFader,
-                frame_count,
-                scratch,
-            )?;
-        }
+            for order_index in 0..self.processing_order.len() {
+                let slot_index = self.processing_order[order_index];
+                self.process_sends(slot_index, CompiledMixerTap::PreFader, frame_count, scratch)?;
+                self.process_channel(slot_index, frame_count, scratch)?;
+                self.route_channel_output(slot_index, frame_count);
+                self.process_sends(
+                    slot_index,
+                    CompiledMixerTap::PostFader,
+                    frame_count,
+                    scratch,
+                )?;
+            }
 
-        let main_input = [InputBlock::Stereo {
-            left: &self.main_input.left[..frame_count],
-            right: &self.main_input.right[..frame_count],
-        }];
-        if self.automation.is_some() {
-            let controlled = [ControlledInputBlock {
-                input: main_input[0],
-                parameters: &self.main_input_controls[..frame_count],
+            let main_input = [InputBlock::Stereo {
+                left: &self.main_input.left[..frame_count],
+                right: &self.main_input.right[..frame_count],
             }];
-            self.main_processor
-                .process_controlled(&controlled, &self.master_controls[..frame_count], output)
-                .map_err(RuntimeProcessError::Mixer)?;
-        } else {
-            self.main_processor
-                .process(&main_input, &self.main_parameters, self.master_gain, output)
-                .map_err(RuntimeProcessError::Mixer)?;
+            if self.automation.is_some() {
+                let controlled = [ControlledInputBlock {
+                    input: main_input[0],
+                    parameters: &self.main_input_controls[..frame_count],
+                }];
+                self.main_processor
+                    .process_controlled(&controlled, &self.master_controls[..frame_count], output)
+                    .map_err(RuntimeProcessError::Mixer)?;
+            } else {
+                self.main_processor
+                    .process(&main_input, &self.main_parameters, self.master_gain, output)
+                    .map_err(RuntimeProcessError::Mixer)?;
+            }
+            Ok(rendered)
+        })();
+        if result.is_err() {
+            self.renderer.seek(arrangement_start_frame);
         }
-        Ok(rendered)
+        result
     }
 
     fn prepare_automation_controls(
@@ -1253,16 +1423,22 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
 /// produce silence and retain the current frame; rolling cycles advance only
 /// after the complete routed window succeeds.
 #[derive(Debug)]
-pub struct GraphTransportRuntime<'prepared, 'cache, 'schedule> {
-    runtime: GraphMainRuntime<'prepared, 'cache, 'schedule>,
+pub struct RoutedTransportRuntime<R> {
+    runtime: RoutedMainRuntime<R>,
     state: TransportState,
     position_frame: usize,
     command_consumer: Option<Consumer<TransportCommand>>,
 }
 
-impl<'prepared, 'cache, 'schedule> GraphTransportRuntime<'prepared, 'cache, 'schedule> {
+pub type GraphTransportRuntime<'prepared, 'cache, 'schedule> =
+    RoutedTransportRuntime<ArrangementRenderer<'prepared, 'cache, 'schedule>>;
+
+pub type PlaybackGraphTransportRuntime<'prepared, 'authority, 'cache, 'schedule, 'resource> =
+    RoutedTransportRuntime<PlaybackRenderer<'prepared, 'authority, 'cache, 'schedule, 'resource>>;
+
+impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     #[must_use]
-    pub const fn new(runtime: GraphMainRuntime<'prepared, 'cache, 'schedule>) -> Self {
+    pub const fn new(runtime: RoutedMainRuntime<R>) -> Self {
         Self {
             runtime,
             state: TransportState::Stopped,
@@ -1276,9 +1452,7 @@ impl<'prepared, 'cache, 'schedule> GraphTransportRuntime<'prepared, 'cache, 'sch
     /// Queue storage is allocated once during construction. The sender and
     /// process-cycle receiver are wait-free after construction.
     #[must_use]
-    pub fn with_command_queue(
-        runtime: GraphMainRuntime<'prepared, 'cache, 'schedule>,
-    ) -> (TransportCommandSender, Self) {
+    pub fn with_command_queue(runtime: RoutedMainRuntime<R>) -> (TransportCommandSender, Self) {
         let (producer, consumer) = RingBuffer::new(MAX_QUEUED_TRANSPORT_COMMANDS);
         (
             TransportCommandSender { producer },
@@ -1307,12 +1481,13 @@ impl<'prepared, 'cache, 'schedule> GraphTransportRuntime<'prepared, 'cache, 'sch
     }
 
     /// Applies one transport command for the next process cycle.
-    pub const fn apply_command(&mut self, command: TransportCommand) {
+    pub fn apply_command(&mut self, command: TransportCommand) {
         match command {
             TransportCommand::Start => self.state = TransportState::Rolling,
             TransportCommand::Stop => self.state = TransportState::Stopped,
             TransportCommand::Locate { frame, state } => {
                 self.position_frame = frame;
+                self.runtime.seek(frame);
                 match state {
                     LocateState::Preserve => {}
                     LocateState::Stopped => self.state = TransportState::Stopped,

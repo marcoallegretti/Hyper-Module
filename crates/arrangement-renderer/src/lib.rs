@@ -722,10 +722,13 @@ fn clear_slot(slot: &mut RenderScratchSlot<'_>) {
     slot.channels = 0;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SceneRendererCreationError {
     CapacityUnavailable,
     Runtime(SceneRuntimeError),
+    EmptyTrackId { track_index: usize },
+    DuplicateTrackId { track_index: usize },
+    MissingAuthorityTrack { track_index: usize },
     UnknownBindingTrack { binding_index: usize },
     InconsistentTrackChannels { binding_index: usize },
 }
@@ -737,6 +740,19 @@ impl fmt::Display for SceneRendererCreationError {
                 formatter.write_str("scene renderer capacity is unavailable")
             }
             Self::Runtime(source) => write!(formatter, "scene runtime creation failed: {source}"),
+            Self::EmptyTrackId { track_index } => {
+                write!(formatter, "scene renderer track {track_index} is empty")
+            }
+            Self::DuplicateTrackId { track_index } => {
+                write!(
+                    formatter,
+                    "scene renderer track {track_index} is duplicated"
+                )
+            }
+            Self::MissingAuthorityTrack { track_index } => write!(
+                formatter,
+                "scene renderer track {track_index} is absent from scene authority"
+            ),
             Self::UnknownBindingTrack { binding_index } => write!(
                 formatter,
                 "scene audio binding {binding_index} references an unknown track"
@@ -763,7 +779,9 @@ pub struct SceneRenderer<'authority, 'resource, 'prepared, 'cache, 'binding> {
     runtime: SceneRuntime<'authority, 'resource>,
     audio: &'prepared PreparedSceneAudio<'cache, 'binding>,
     track_ids: Vec<&'resource str>,
+    authority_indices: Vec<usize>,
     track_channels: Vec<usize>,
+    controlled_tracks: Vec<bool>,
 }
 
 impl<'authority, 'resource, 'prepared, 'cache, 'binding>
@@ -780,9 +798,6 @@ impl<'authority, 'resource, 'prepared, 'cache, 'binding>
         audio: &'prepared PreparedSceneAudio<'cache, 'binding>,
         start_frame: usize,
     ) -> Result<Self, SceneRendererCreationError> {
-        let runtime = authority
-            .runtime_at(start_frame)
-            .map_err(SceneRendererCreationError::Runtime)?;
         let mut track_ids = Vec::new();
         track_ids
             .try_reserve_exact(authority.track_count())
@@ -794,14 +809,69 @@ impl<'authority, 'resource, 'prepared, 'cache, 'binding>
                     .ok_or(SceneRendererCreationError::CapacityUnavailable)?,
             );
         }
+        Self::try_new_for_tracks(authority, audio, start_frame, &track_ids)
+    }
+
+    /// Creates a scene renderer in caller-provided mixer-track order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneRendererCreationError`] for invalid or unknown tracks,
+    /// runtime allocation, missing binding tracks, or channel-layout changes.
+    pub fn try_new_for_tracks(
+        authority: &'authority CompiledScenePerformance<'resource>,
+        audio: &'prepared PreparedSceneAudio<'cache, 'binding>,
+        start_frame: usize,
+        output_track_ids: &[&str],
+    ) -> Result<Self, SceneRendererCreationError> {
+        for (track_index, track_id) in output_track_ids.iter().enumerate() {
+            if track_id.is_empty() {
+                return Err(SceneRendererCreationError::EmptyTrackId { track_index });
+            }
+            if output_track_ids[..track_index].contains(track_id) {
+                return Err(SceneRendererCreationError::DuplicateTrackId { track_index });
+            }
+        }
+        let runtime = authority
+            .runtime_at(start_frame)
+            .map_err(SceneRendererCreationError::Runtime)?;
+        let mut track_ids = Vec::new();
+        track_ids
+            .try_reserve_exact(output_track_ids.len())
+            .map_err(|_| SceneRendererCreationError::CapacityUnavailable)?;
+        let mut authority_indices = Vec::new();
+        authority_indices
+            .try_reserve_exact(output_track_ids.len())
+            .map_err(|_| SceneRendererCreationError::CapacityUnavailable)?;
+        let mut controlled_tracks = Vec::new();
+        controlled_tracks
+            .try_reserve_exact(output_track_ids.len())
+            .map_err(|_| SceneRendererCreationError::CapacityUnavailable)?;
+        for (track_index, track_id) in output_track_ids.iter().enumerate() {
+            let authority_index = (0..authority.track_count())
+                .find(|index| authority.track_id(*index) == Some(*track_id))
+                .ok_or(SceneRendererCreationError::MissingAuthorityTrack { track_index })?;
+            track_ids.push(
+                authority
+                    .track_id(authority_index)
+                    .ok_or(SceneRendererCreationError::CapacityUnavailable)?,
+            );
+            authority_indices.push(authority_index);
+            controlled_tracks.push(
+                authority
+                    .track_has_actions(authority_index)
+                    .ok_or(SceneRendererCreationError::CapacityUnavailable)?,
+            );
+        }
         let mut track_channels = Vec::new();
         track_channels
-            .try_reserve_exact(authority.track_count())
+            .try_reserve_exact(output_track_ids.len())
             .map_err(|_| SceneRendererCreationError::CapacityUnavailable)?;
-        track_channels.resize(authority.track_count(), 0);
+        track_channels.resize(output_track_ids.len(), 0);
         for (binding_index, entry) in audio.entries().iter().enumerate() {
-            let track_index = (0..authority.track_count())
-                .find(|index| authority.track_id(*index) == Some(entry.binding().track_id))
+            let track_index = track_ids
+                .iter()
+                .position(|track_id| *track_id == entry.binding().track_id)
                 .ok_or(SceneRendererCreationError::UnknownBindingTrack { binding_index })?;
             let channels = entry.channels();
             if track_channels[track_index] != 0 && track_channels[track_index] != channels {
@@ -820,7 +890,9 @@ impl<'authority, 'resource, 'prepared, 'cache, 'binding>
             runtime,
             audio,
             track_ids,
+            authority_indices,
             track_channels,
+            controlled_tracks,
         })
     }
 
@@ -847,13 +919,45 @@ impl<'authority, 'resource, 'prepared, 'cache, 'binding>
         frame_count: usize,
         scratch: &mut [RenderScratchSlot<'_>],
     ) -> Result<RenderedWindow, SceneRenderError> {
+        self.render_window_inner(start_frame, frame_count, scratch, false)
+    }
+
+    /// Renders only scene-controlled tracks while preserving other scratch
+    /// lanes already produced for the same callback window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneRenderError`] under the same conditions as
+    /// [`Self::render_window`]. Any failure clears every scratch lane.
+    pub fn render_window_over(
+        &mut self,
+        start_frame: usize,
+        frame_count: usize,
+        scratch: &mut [RenderScratchSlot<'_>],
+    ) -> Result<RenderedWindow, SceneRenderError> {
+        self.render_window_inner(start_frame, frame_count, scratch, true)
+    }
+
+    fn render_window_inner(
+        &mut self,
+        start_frame: usize,
+        frame_count: usize,
+        scratch: &mut [RenderScratchSlot<'_>],
+        preserve_uncontrolled: bool,
+    ) -> Result<RenderedWindow, SceneRenderError> {
         validate_scene_scratch(&self.track_channels, frame_count, scratch)?;
-        for (slot, channels) in scratch.iter_mut().zip(&self.track_channels) {
+        for (track_index, (slot, channels)) in
+            scratch.iter_mut().zip(&self.track_channels).enumerate()
+        {
+            if preserve_uncontrolled && !self.controlled_tracks[track_index] {
+                continue;
+            }
             clear_slot(slot);
             slot.channels = *channels;
         }
         let audio = self.audio;
         let track_ids = &self.track_ids;
+        let authority_indices = &self.authority_indices;
         let track_channels = &self.track_channels;
         let result = self
             .runtime
@@ -861,6 +965,7 @@ impl<'authority, 'resource, 'prepared, 'cache, 'binding>
                 render_scene_segment(
                     audio,
                     track_ids,
+                    authority_indices,
                     track_channels,
                     start_frame,
                     segment,
@@ -886,7 +991,7 @@ impl<'authority, 'resource, 'prepared, 'cache, 'binding>
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SceneRenderError {
     BlockTooLarge {
         actual: usize,
@@ -1001,14 +1106,15 @@ fn validate_scene_scratch(
 fn render_scene_segment(
     audio: &PreparedSceneAudio<'_, '_>,
     track_ids: &[&str],
+    authority_indices: &[usize],
     track_channels: &[usize],
     window_start: usize,
     segment: SceneSegment<'_, '_>,
     scratch: &mut [RenderScratchSlot<'_>],
 ) -> Result<(), SceneRenderError> {
     let segment_end = segment.offset_frames + segment.frame_count;
-    for (track_index, state) in segment.track_states.iter().enumerate() {
-        let Some(playing) = *state else {
+    for (track_index, authority_index) in authority_indices.iter().enumerate() {
+        let Some(playing) = segment.track_states[*authority_index] else {
             continue;
         };
         if !playing.enabled() {
@@ -1072,5 +1178,119 @@ fn clear_scene_scratch(scratch: &mut [RenderScratchSlot<'_>], track_channels: &[
     for (slot, channels) in scratch.iter_mut().zip(track_channels) {
         clear_slot(slot);
         slot.channels = *channels;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackRendererCreationError {
+    Arrangement(RendererCreationError),
+    Scene(SceneRendererCreationError),
+}
+
+impl fmt::Display for PlaybackRendererCreationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Arrangement(source) => {
+                write!(formatter, "arrangement renderer creation failed: {source}")
+            }
+            Self::Scene(source) => write!(formatter, "scene renderer creation failed: {source}"),
+        }
+    }
+}
+
+impl Error for PlaybackRendererCreationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Arrangement(source) => Some(source),
+            Self::Scene(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackRenderError {
+    Arrangement(RenderWindowError),
+    Scene(SceneRenderError),
+}
+
+impl fmt::Display for PlaybackRenderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Arrangement(source) => {
+                write!(formatter, "arrangement rendering failed: {source}")
+            }
+            Self::Scene(source) => write!(formatter, "scene rendering failed: {source}"),
+        }
+    }
+}
+
+impl Error for PlaybackRenderError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Arrangement(source) => Some(source),
+            Self::Scene(source) => Some(source),
+        }
+    }
+}
+
+/// One fixed-track renderer for explicit placements and recorded scene state.
+#[derive(Debug)]
+pub struct PlaybackRenderer<'prepared, 'authority, 'cache, 'schedule, 'resource> {
+    arrangement: ArrangementRenderer<'prepared, 'cache, 'schedule>,
+    scene: SceneRenderer<'authority, 'resource, 'prepared, 'cache, 'resource>,
+}
+
+impl<'prepared, 'authority, 'cache, 'schedule, 'resource>
+    PlaybackRenderer<'prepared, 'authority, 'cache, 'schedule, 'resource>
+{
+    /// Builds both render authorities in caller-provided mixer-track order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlaybackRendererCreationError`] if either immutable renderer
+    /// cannot be constructed completely.
+    pub fn try_new_for_tracks(
+        schedule: &'prepared PreparedSchedule<'cache, 'schedule>,
+        authority: &'authority CompiledScenePerformance<'resource>,
+        scene_audio: &'prepared PreparedSceneAudio<'cache, 'resource>,
+        start_frame: usize,
+        track_ids: &[&str],
+    ) -> Result<Self, PlaybackRendererCreationError> {
+        let arrangement = ArrangementRenderer::try_new_for_tracks(schedule, track_ids)
+            .map_err(PlaybackRendererCreationError::Arrangement)?;
+        let scene =
+            SceneRenderer::try_new_for_tracks(authority, scene_audio, start_frame, track_ids)
+                .map_err(PlaybackRendererCreationError::Scene)?;
+        Ok(Self { arrangement, scene })
+    }
+
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        self.scene.position()
+    }
+
+    pub fn seek(&mut self, frame: usize) {
+        self.scene.seek(frame);
+    }
+
+    /// Renders each track from its single compiled authority into shared
+    /// scratch lanes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlaybackRenderError`] if either authority fails. Scene
+    /// failures restore scene state and clear every scratch lane.
+    pub fn render_track_window(
+        &mut self,
+        start_frame: usize,
+        frame_count: usize,
+        scratch: &mut [RenderScratchSlot<'_>],
+    ) -> Result<RenderedWindow, PlaybackRenderError> {
+        self.arrangement
+            .render_track_window(start_frame, frame_count, scratch)
+            .map_err(PlaybackRenderError::Arrangement)?;
+        self.scene
+            .render_window_over(start_frame, frame_count, scratch)
+            .map_err(PlaybackRenderError::Scene)
     }
 }

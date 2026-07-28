@@ -7,12 +7,12 @@ use hyper_audio_engine::{
 use hyper_mixer_runtime::{
     FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, LocateState,
     MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, OutputMeterPublication,
-    OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot, RuntimeCreationError,
-    RuntimeProcessError, TransportCommand, TransportCommandSendError, TransportCycle,
-    TransportState, output_meter_channel,
+    OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot, PlaybackGraphMainRuntime,
+    PlaybackGraphTransportRuntime, RuntimeCreationError, RuntimeProcessError, TransportCommand,
+    TransportCommandSendError, TransportCycle, TransportState, output_meter_channel,
 };
 
-use common::{fixture, graph_fixture};
+use common::{fixture, graph_fixture, playback_fixture};
 
 fn assert_constant(samples: &[f32], expected: f32) {
     assert!(
@@ -20,6 +20,16 @@ fn assert_constant(samples: &[f32], expected: f32) {
             .iter()
             .all(|sample| (*sample - expected).abs() <= f32::EPSILON)
     );
+}
+
+fn assert_samples(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!(
+            (*actual - *expected).abs() <= 1.0e-6,
+            "expected {expected}, got {actual}"
+        );
+    }
 }
 
 fn assert_meter_delivery_and_backpressure(
@@ -171,6 +181,90 @@ fn verified_documents_render_through_fixed_main_mixer_slots() {
             .iter()
             .all(|sample| sample.abs() <= f32::EPSILON)
     );
+}
+
+#[test]
+fn combined_transport_renders_each_track_authority_and_reconstructs_scene_state_on_locate() {
+    let fixture = playback_fixture();
+    let prepared_schedule = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let prepared_scene = fixture
+        .cache
+        .prepare_scene_audio(&fixture.authority, &fixture.scene_bindings)
+        .unwrap();
+    let runtime = PlaybackGraphMainRuntime::try_new_playback(
+        &prepared_schedule,
+        &fixture.authority,
+        &prepared_scene,
+        &fixture.mixer,
+        100,
+    )
+    .unwrap();
+    let mut transport = PlaybackGraphTransportRuntime::new(runtime);
+    transport.apply_command(TransportCommand::Start);
+
+    let mut arrangement_left = [9.0_f32; 100];
+    let mut arrangement_right = [9.0_f32; 100];
+    let mut scene_left = [9.0_f32; 100];
+    let mut scene_right = [9.0_f32; 100];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut output_left = [9.0_f32; 100];
+    let mut output_right = [9.0_f32; 100];
+    let first = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut output_left,
+                right: &mut output_right,
+            },
+        )
+        .unwrap();
+
+    let expected_scene: Vec<f32> = (0..100)
+        .map(|frame| {
+            if (25..75).contains(&frame) {
+                fixture.scene_samples[frame - 25]
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    assert_eq!(first.active_slot_count(), 2);
+    assert_eq!(transport.position_frame(), 100);
+    assert_samples(&output_left, &fixture.arrangement_samples);
+    assert_samples(&output_right, &expected_scene);
+
+    transport.apply_command(TransportCommand::Locate {
+        frame: 25,
+        state: LocateState::Rolling,
+    });
+    let mut arrangement_left = [9.0_f32; 50];
+    let mut arrangement_right = [9.0_f32; 50];
+    let mut scene_left = [9.0_f32; 50];
+    let mut scene_right = [9.0_f32; 50];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut output_left = [9.0_f32; 50];
+    let mut output_right = [9.0_f32; 50];
+    let located = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut output_left,
+                right: &mut output_right,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(located.start_frame(), 25);
+    assert_eq!(located.active_slot_count(), 2);
+    assert_eq!(transport.position_frame(), 75);
+    assert_samples(&output_left, &fixture.arrangement_samples[25..75]);
+    assert_samples(&output_right, &fixture.scene_samples[..50]);
 }
 
 #[test]
