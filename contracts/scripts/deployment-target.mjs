@@ -31,6 +31,11 @@ import {
   validateInitialDeploymentAuthorizationState,
   verifyDeploymentRequestBundle,
 } from "../lib/deployment-authorization.mjs";
+import {
+  syncDirectoryTree,
+  syncPublishedEntry,
+  syncRemovedEntry,
+} from "../lib/durable-files.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
 import { inspectDeploymentBundle } from "../lib/deployment-bundle.mjs";
 
@@ -232,7 +237,9 @@ async function writeCanonicalFile(
     await handle.close();
   }
   try {
-    await rename(temporaryPath, join(targetRoot, `${name}.json`));
+    const publishedPath = join(targetRoot, `${name}.json`);
+    await rename(temporaryPath, publishedPath);
+    await syncPublishedEntry(publishedPath);
     if (name === "state") injectFault(faultAt, "after-state-publication");
     if (name === "authorization") {
       injectFault(faultAt, "after-authorization-state-publication");
@@ -465,6 +472,7 @@ async function collectUnprotectedBundles(targetRoot) {
       recursive: true,
       force: false,
     });
+    await syncRemovedEntry(bundlesRoot);
     removed.push({
       bundle_sha256: bundle.sha256,
       byte_length: bundle.byte_length,
@@ -769,6 +777,7 @@ async function installIdentity(sourceRoot, targetRoot, faultAt = undefined) {
       "staged bundle identity changed during transfer",
     );
     injectFault(faultAt, "after-staging-verification");
+    await syncDirectoryTree(stagingPath);
     assert.equal(
       await requireBundlesRoot(targetRoot),
       bundlesRoot,
@@ -776,6 +785,7 @@ async function installIdentity(sourceRoot, targetRoot, faultAt = undefined) {
     );
     await rename(stagingPath, installedPath);
     installed = true;
+    await syncPublishedEntry(installedPath);
     injectFault(faultAt, "after-bundle-publication");
     assertPolicyCapacity(
       policy,

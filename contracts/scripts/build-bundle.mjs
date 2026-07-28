@@ -27,6 +27,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import Ajv2020 from "ajv/dist/2020.js";
 import canonicalize from "canonicalize";
 
+import {
+  syncDirectoryTree,
+  syncPublishedEntry,
+} from "../lib/durable-files.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
 import { verifyBundle } from "./verify-bundle.mjs";
 
@@ -298,8 +302,10 @@ export async function buildBundle(planPath, sourcePath, outputPath) {
     await chmod(join(stageRoot, "manifest.json"), 0o644);
 
     await verifyBundle(stageRoot);
+    await syncDirectoryTree(stageRoot);
     await assertPathAbsent(outputRoot);
     await rename(stageRoot, outputRoot);
+    await syncPublishedEntry(outputRoot);
     published = true;
     return {
       output_path: outputRoot,

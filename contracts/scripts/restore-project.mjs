@@ -22,6 +22,10 @@ import {
 } from "node:path";
 import { pathToFileURL } from "node:url";
 
+import {
+  syncDirectoryTree,
+  syncPublishedEntry,
+} from "../lib/durable-files.mjs";
 import { verifyBundle } from "./verify-bundle.mjs";
 import { verifyProject } from "./verify-project.mjs";
 
@@ -238,7 +242,9 @@ export async function restoreProject(bundlePath, outputPath, { faultAt } = {}) {
 
     await assertPathAbsent(outputRoot);
     injectFault(faultAt, "before-publication");
+    await syncDirectoryTree(stageRoot);
     await rename(stageRoot, outputRoot);
+    await syncPublishedEntry(outputRoot);
     published = true;
 
     return {
