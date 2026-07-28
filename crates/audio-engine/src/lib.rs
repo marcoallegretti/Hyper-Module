@@ -294,6 +294,7 @@ impl Error for CallbackAdapterCreationError {}
 pub enum StereoCallbackError<E> {
     SampleCountNotStereoAligned { samples: usize },
     BlockTooLarge { actual: usize, maximum: usize },
+    NonFiniteOutput { samples: usize },
     Processor(E),
 }
 
@@ -308,6 +309,10 @@ impl<E: fmt::Display> fmt::Display for StereoCallbackError<E> {
                 formatter,
                 "callback block has {actual} frames; configured maximum is {maximum}"
             ),
+            Self::NonFiniteOutput { samples } => write!(
+                formatter,
+                "stereo processing produced {samples} non-finite output samples"
+            ),
             Self::Processor(source) => write!(formatter, "stereo processing failed: {source}"),
         }
     }
@@ -317,7 +322,9 @@ impl<E: Error + 'static> Error for StereoCallbackError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Processor(source) => Some(source),
-            Self::SampleCountNotStereoAligned { .. } | Self::BlockTooLarge { .. } => None,
+            Self::SampleCountNotStereoAligned { .. }
+            | Self::BlockTooLarge { .. }
+            | Self::NonFiniteOutput { .. } => None,
         }
     }
 }
@@ -546,6 +553,17 @@ impl InterleavedStereoCallback {
                 return Err(StereoCallbackError::Processor(source));
             }
         };
+        let non_finite_samples = self.left[..frame_count]
+            .iter()
+            .chain(&self.right[..frame_count])
+            .filter(|sample| !sample.is_finite())
+            .count();
+        if non_finite_samples != 0 {
+            interleaved_output.fill(0.0);
+            return Err(StereoCallbackError::NonFiniteOutput {
+                samples: non_finite_samples,
+            });
+        }
         let mut left_meter = ChannelMeterAccumulator::default();
         let mut right_meter = ChannelMeterAccumulator::default();
         for (frame, samples) in interleaved_output.chunks_exact_mut(2).enumerate() {
@@ -1008,29 +1026,40 @@ mod tests {
     }
 
     #[test]
-    fn callback_meter_invalidates_readings_containing_non_finite_samples() {
+    fn callback_rejects_and_silences_non_finite_samples() {
         let mut adapter = InterleavedStereoCallback::try_new(3).unwrap();
         let mut output = [9.0_f32; 6];
 
-        let meter = adapter
-            .process(&mut output, |planar| {
-                planar.left.copy_from_slice(&[0.5, f32::NAN, f32::INFINITY]);
-                planar.right.copy_from_slice(&[0.0, -1.0, 0.5]);
-                Ok::<_, ()>(())
-            })
-            .unwrap()
-            .meter();
+        let result = adapter.process(&mut output, |planar| {
+            planar.left.copy_from_slice(&[0.5, f32::NAN, f32::INFINITY]);
+            planar.right.copy_from_slice(&[0.0, -1.0, 0.5]);
+            Ok::<_, ()>(())
+        });
 
-        assert_eq!(meter.left().sample_peak(), None);
-        assert_eq!(meter.left().block_rms(), None);
-        assert_eq!(meter.left().full_scale_sample_count(), 0);
-        assert_eq!(meter.left().non_finite_sample_count(), 2);
-        assert_eq!(meter.right().sample_peak(), Some(1.0));
-        assert_eq!(meter.right().block_rms(), Some((1.25_f32 / 3.0).sqrt()));
-        assert_eq!(meter.right().full_scale_sample_count(), 1);
-        assert_eq!(meter.right().non_finite_sample_count(), 0);
-        assert!(output[2].is_nan());
-        assert!(output[4].is_infinite());
+        assert_eq!(
+            result,
+            Err(StereoCallbackError::NonFiniteOutput { samples: 2 })
+        );
+        assert_samples(&output, &[0.0; 6]);
+    }
+
+    #[test]
+    fn callback_rejects_overflow_from_finite_samples() {
+        let mut adapter = InterleavedStereoCallback::try_new(1).unwrap();
+        let mut output = [9.0_f32; 2];
+
+        let result = adapter.process(&mut output, |planar| {
+            let finite_sample = f32::MAX;
+            planar.left[0] = finite_sample * 2.0;
+            planar.right[0] = finite_sample;
+            Ok::<_, ()>(())
+        });
+
+        assert_eq!(
+            result,
+            Err(StereoCallbackError::NonFiniteOutput { samples: 1 })
+        );
+        assert_samples(&output, &[0.0; 2]);
     }
 
     #[test]
