@@ -6,7 +6,13 @@ use core::fmt;
 
 use hyper_audio_engine::{InputBlock, MAX_PROCESS_FRAMES};
 use hyper_clip_engine::{ClipOutput, ClipPlanError};
-use hyper_media_cache::{PreparedSchedule, PreparedScheduleEntry};
+use hyper_media_cache::{
+    PreparedSceneAudio, PreparedSceneAudioEntry, PreparedSchedule, PreparedScheduleEntry,
+};
+use hyper_playback_compiler::scene::{
+    CompiledScenePerformance, PlayingSceneClip, SceneProcessError, SceneRuntime, SceneRuntimeError,
+    SceneSegment,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RendererCreationError {
@@ -714,4 +720,357 @@ fn clear_slot(slot: &mut RenderScratchSlot<'_>) {
     slot.right.fill(0.0);
     slot.entry_index = None;
     slot.channels = 0;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SceneRendererCreationError {
+    CapacityUnavailable,
+    Runtime(SceneRuntimeError),
+    UnknownBindingTrack { binding_index: usize },
+    InconsistentTrackChannels { binding_index: usize },
+}
+
+impl fmt::Display for SceneRendererCreationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityUnavailable => {
+                formatter.write_str("scene renderer capacity is unavailable")
+            }
+            Self::Runtime(source) => write!(formatter, "scene runtime creation failed: {source}"),
+            Self::UnknownBindingTrack { binding_index } => write!(
+                formatter,
+                "scene audio binding {binding_index} references an unknown track"
+            ),
+            Self::InconsistentTrackChannels { binding_index } => write!(
+                formatter,
+                "scene audio binding {binding_index} changes its track channel layout"
+            ),
+        }
+    }
+}
+
+impl Error for SceneRendererCreationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Runtime(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SceneRenderer<'authority, 'resource, 'prepared, 'cache, 'binding> {
+    runtime: SceneRuntime<'authority, 'resource>,
+    audio: &'prepared PreparedSceneAudio<'cache, 'binding>,
+    track_ids: Vec<&'resource str>,
+    track_channels: Vec<usize>,
+}
+
+impl<'authority, 'resource, 'prepared, 'cache, 'binding>
+    SceneRenderer<'authority, 'resource, 'prepared, 'cache, 'binding>
+{
+    /// Creates a fixed-track scene renderer outside callback processing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneRendererCreationError`] for runtime allocation, unknown
+    /// binding tracks, or channel-layout changes on one track.
+    pub fn try_new(
+        authority: &'authority CompiledScenePerformance<'resource>,
+        audio: &'prepared PreparedSceneAudio<'cache, 'binding>,
+        start_frame: usize,
+    ) -> Result<Self, SceneRendererCreationError> {
+        let runtime = authority
+            .runtime_at(start_frame)
+            .map_err(SceneRendererCreationError::Runtime)?;
+        let mut track_ids = Vec::new();
+        track_ids
+            .try_reserve_exact(authority.track_count())
+            .map_err(|_| SceneRendererCreationError::CapacityUnavailable)?;
+        for index in 0..authority.track_count() {
+            track_ids.push(
+                authority
+                    .track_id(index)
+                    .ok_or(SceneRendererCreationError::CapacityUnavailable)?,
+            );
+        }
+        let mut track_channels = Vec::new();
+        track_channels
+            .try_reserve_exact(authority.track_count())
+            .map_err(|_| SceneRendererCreationError::CapacityUnavailable)?;
+        track_channels.resize(authority.track_count(), 0);
+        for (binding_index, entry) in audio.entries().iter().enumerate() {
+            let track_index = (0..authority.track_count())
+                .find(|index| authority.track_id(*index) == Some(entry.binding().track_id))
+                .ok_or(SceneRendererCreationError::UnknownBindingTrack { binding_index })?;
+            let channels = entry.channels();
+            if track_channels[track_index] != 0 && track_channels[track_index] != channels {
+                return Err(SceneRendererCreationError::InconsistentTrackChannels {
+                    binding_index,
+                });
+            }
+            track_channels[track_index] = channels;
+        }
+        for channels in &mut track_channels {
+            if *channels == 0 {
+                *channels = 1;
+            }
+        }
+        Ok(Self {
+            runtime,
+            audio,
+            track_ids,
+            track_channels,
+        })
+    }
+
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        self.runtime.position()
+    }
+
+    pub fn seek(&mut self, frame: usize) {
+        self.runtime.seek(frame);
+    }
+
+    /// Renders scene-controlled tracks into one fixed scratch slot per track.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneRenderError`] for invalid windows or scratch, missing
+    /// prepared state, arithmetic failure, or unexpected clip rendering
+    /// failure. Runtime position is restored and all scratch is cleared on
+    /// failure.
+    pub fn render_window(
+        &mut self,
+        start_frame: usize,
+        frame_count: usize,
+        scratch: &mut [RenderScratchSlot<'_>],
+    ) -> Result<RenderedWindow, SceneRenderError> {
+        validate_scene_scratch(&self.track_channels, frame_count, scratch)?;
+        for (slot, channels) in scratch.iter_mut().zip(&self.track_channels) {
+            clear_slot(slot);
+            slot.channels = *channels;
+        }
+        let audio = self.audio;
+        let track_ids = &self.track_ids;
+        let track_channels = &self.track_channels;
+        let result = self
+            .runtime
+            .try_process_window(start_frame, frame_count, |segment| {
+                render_scene_segment(
+                    audio,
+                    track_ids,
+                    track_channels,
+                    start_frame,
+                    segment,
+                    scratch,
+                )
+            });
+        match result {
+            Ok(_) => Ok(RenderedWindow {
+                active_slot_count: scratch
+                    .iter()
+                    .filter(|slot| slot.entry_index.is_some())
+                    .count(),
+            }),
+            Err(SceneProcessError::Runtime(source)) => {
+                clear_scene_scratch(scratch, track_channels);
+                Err(SceneRenderError::Runtime(source))
+            }
+            Err(SceneProcessError::Observer(source)) => {
+                clear_scene_scratch(scratch, track_channels);
+                Err(source)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SceneRenderError {
+    BlockTooLarge {
+        actual: usize,
+        maximum: usize,
+    },
+    ScratchSlotCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    ScratchLengthMismatch {
+        slot: usize,
+        expected: usize,
+        left: usize,
+        right: usize,
+    },
+    Runtime(SceneRuntimeError),
+    MissingPreparedClip {
+        track_index: usize,
+    },
+    FrameArithmetic {
+        track_index: usize,
+    },
+    Clip {
+        track_index: usize,
+        source: ClipPlanError,
+    },
+}
+
+impl fmt::Display for SceneRenderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BlockTooLarge { actual, maximum } => {
+                write!(
+                    formatter,
+                    "scene block has {actual} frames; maximum is {maximum}"
+                )
+            }
+            Self::ScratchSlotCountMismatch { expected, actual } => write!(
+                formatter,
+                "scene rendering requires {expected} scratch slots; {actual} were provided"
+            ),
+            Self::ScratchLengthMismatch {
+                slot,
+                expected,
+                left,
+                right,
+            } => write!(
+                formatter,
+                "scene scratch slot {slot} requires {expected} frames; left={left}, right={right}"
+            ),
+            Self::Runtime(source) => write!(formatter, "scene runtime failed: {source}"),
+            Self::MissingPreparedClip { track_index } => {
+                write!(formatter, "scene track {track_index} has no prepared clip")
+            }
+            Self::FrameArithmetic { track_index } => {
+                write!(
+                    formatter,
+                    "scene track {track_index} frame arithmetic failed"
+                )
+            }
+            Self::Clip {
+                track_index,
+                source,
+            } => write!(
+                formatter,
+                "scene track {track_index} rendering failed: {source}"
+            ),
+        }
+    }
+}
+
+impl Error for SceneRenderError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Runtime(source) => Some(source),
+            Self::Clip { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+fn validate_scene_scratch(
+    track_channels: &[usize],
+    frame_count: usize,
+    scratch: &[RenderScratchSlot<'_>],
+) -> Result<(), SceneRenderError> {
+    if frame_count > MAX_PROCESS_FRAMES {
+        return Err(SceneRenderError::BlockTooLarge {
+            actual: frame_count,
+            maximum: MAX_PROCESS_FRAMES,
+        });
+    }
+    if scratch.len() != track_channels.len() {
+        return Err(SceneRenderError::ScratchSlotCountMismatch {
+            expected: track_channels.len(),
+            actual: scratch.len(),
+        });
+    }
+    for (slot_index, slot) in scratch.iter().enumerate() {
+        if slot.left.len() != frame_count || slot.right.len() != frame_count {
+            return Err(SceneRenderError::ScratchLengthMismatch {
+                slot: slot_index,
+                expected: frame_count,
+                left: slot.left.len(),
+                right: slot.right.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn render_scene_segment(
+    audio: &PreparedSceneAudio<'_, '_>,
+    track_ids: &[&str],
+    track_channels: &[usize],
+    window_start: usize,
+    segment: SceneSegment<'_, '_>,
+    scratch: &mut [RenderScratchSlot<'_>],
+) -> Result<(), SceneRenderError> {
+    let segment_end = segment.offset_frames + segment.frame_count;
+    for (track_index, state) in segment.track_states.iter().enumerate() {
+        let Some(playing) = *state else {
+            continue;
+        };
+        if !playing.enabled() {
+            continue;
+        }
+        let (entry_index, entry) = audio
+            .find_index(track_ids[track_index], playing)
+            .ok_or(SceneRenderError::MissingPreparedClip { track_index })?;
+        render_scene_entry(
+            entry,
+            entry_index,
+            track_index,
+            track_channels[track_index],
+            window_start,
+            segment.offset_frames,
+            segment_end,
+            playing,
+            &mut scratch[track_index],
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_scene_entry(
+    entry: &PreparedSceneAudioEntry<'_, '_>,
+    entry_index: usize,
+    track_index: usize,
+    channels: usize,
+    window_start: usize,
+    segment_offset: usize,
+    segment_end: usize,
+    playing: PlayingSceneClip<'_>,
+    slot: &mut RenderScratchSlot<'_>,
+) -> Result<(), SceneRenderError> {
+    let absolute_start = window_start
+        .checked_add(segment_offset)
+        .ok_or(SceneRenderError::FrameArithmetic { track_index })?;
+    let launch_offset = absolute_start
+        .checked_sub(playing.started_at_frame())
+        .ok_or(SceneRenderError::FrameArithmetic { track_index })?;
+    let output = if channels == 1 {
+        ClipOutput::Mono(&mut slot.left[segment_offset..segment_end])
+    } else {
+        ClipOutput::Stereo {
+            left: &mut slot.left[segment_offset..segment_end],
+            right: &mut slot.right[segment_offset..segment_end],
+        }
+    };
+    entry
+        .render_block(launch_offset, output)
+        .map_err(|source| SceneRenderError::Clip {
+            track_index,
+            source,
+        })?;
+    slot.entry_index = Some(entry_index);
+    Ok(())
+}
+
+fn clear_scene_scratch(scratch: &mut [RenderScratchSlot<'_>], track_channels: &[usize]) {
+    for (slot, channels) in scratch.iter_mut().zip(track_channels) {
+        clear_slot(slot);
+        slot.channels = *channels;
+    }
 }

@@ -1,5 +1,6 @@
 //! Bounded compilation and sample-exact execution of recorded scene authority.
 
+use core::convert::Infallible;
 use core::error::Error;
 use core::fmt;
 
@@ -270,6 +271,7 @@ pub struct PlayingSceneClip<'a> {
     launch_id: &'a str,
     scene_id: &'a str,
     clip_id: &'a str,
+    started_at_tick: u64,
     started_at_frame: usize,
     natural_end_frame: Option<usize>,
     enabled: bool,
@@ -294,6 +296,11 @@ impl<'a> PlayingSceneClip<'a> {
     #[must_use]
     pub const fn started_at_frame(self) -> usize {
         self.started_at_frame
+    }
+
+    #[must_use]
+    pub const fn started_at_tick(self) -> u64 {
+        self.started_at_tick
     }
 
     #[must_use]
@@ -330,15 +337,27 @@ pub struct CompiledScenePerformance<'a> {
     tracks: Vec<CompiledSceneTrack<'a>>,
 }
 
-impl CompiledScenePerformance<'_> {
+impl<'resource> CompiledScenePerformance<'resource> {
     #[must_use]
     pub fn track_count(&self) -> usize {
         self.tracks.len()
     }
 
     #[must_use]
-    pub fn track_id(&self, index: usize) -> Option<&str> {
+    pub fn track_id(&self, index: usize) -> Option<&'resource str> {
         self.tracks.get(index).map(|track| track.id)
+    }
+
+    pub fn playing_clips(&self) -> impl Iterator<Item = (&str, PlayingSceneClip<'_>)> + '_ {
+        self.tracks.iter().flat_map(|track| {
+            track.actions.iter().filter_map(move |action| {
+                if let CompiledAction::Play(playing) = action.action {
+                    Some((track.id, playing))
+                } else {
+                    None
+                }
+            })
+        })
     }
 
     /// Creates runtime state positioned immediately before rendering `frame`.
@@ -347,7 +366,10 @@ impl CompiledScenePerformance<'_> {
     ///
     /// Returns [`SceneRuntimeError::CapacityUnavailable`] if fixed runtime
     /// state cannot be allocated.
-    pub fn runtime_at(&self, frame: usize) -> Result<SceneRuntime<'_, '_>, SceneRuntimeError> {
+    pub fn runtime_at<'plan>(
+        &'plan self,
+        frame: usize,
+    ) -> Result<SceneRuntime<'plan, 'resource>, SceneRuntimeError> {
         SceneRuntime::try_new(self, frame)
     }
 }
@@ -462,6 +484,7 @@ fn compile_launches<'a>(
                         launch_id: launch.id,
                         scene_id: scene.id,
                         clip_id,
+                        started_at_tick: launch.tick,
                         started_at_frame: start_frame,
                         natural_end_frame,
                         enabled: input.tracks[track_index].active && clip.enabled,
@@ -637,6 +660,12 @@ impl fmt::Display for SceneRuntimeError {
 
 impl Error for SceneRuntimeError {}
 
+#[derive(Debug)]
+pub enum SceneProcessError<E> {
+    Runtime(SceneRuntimeError),
+    Observer(E),
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SceneSegment<'state, 'resource> {
     pub offset_frames: usize,
@@ -724,24 +753,60 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
         frame_count: usize,
         mut observe: impl FnMut(SceneSegment<'_, 'resource>),
     ) -> Result<usize, SceneRuntimeError> {
+        match self.try_process_window(start_frame, frame_count, |segment| {
+            observe(segment);
+            Ok::<(), Infallible>(())
+        }) {
+            Ok(count) => Ok(count),
+            Err(SceneProcessError::Runtime(error)) => Err(error),
+            Err(SceneProcessError::Observer(error)) => match error {},
+        }
+    }
+
+    /// Fallibly visits each segment and restores runtime state if observation
+    /// fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneProcessError::Runtime`] for invalid windows and
+    /// [`SceneProcessError::Observer`] for observer failures.
+    pub fn try_process_window<E>(
+        &mut self,
+        start_frame: usize,
+        frame_count: usize,
+        mut observe: impl FnMut(SceneSegment<'_, 'resource>) -> Result<(), E>,
+    ) -> Result<usize, SceneProcessError<E>> {
         if start_frame != self.position {
-            return Err(SceneRuntimeError::WindowNotContiguous {
-                expected: self.position,
-                actual: start_frame,
-            });
+            return Err(SceneProcessError::Runtime(
+                SceneRuntimeError::WindowNotContiguous {
+                    expected: self.position,
+                    actual: start_frame,
+                },
+            ));
         }
         let end_frame = start_frame
             .checked_add(frame_count)
-            .ok_or(SceneRuntimeError::FrameOverflow)?;
+            .ok_or(SceneProcessError::Runtime(SceneRuntimeError::FrameOverflow))?;
+        let saved_position = self.position;
+        let track_count = self.states.len();
+        let mut saved_states = [None; VERSION_1_MAX_SCENE_TRACKS];
+        saved_states[..track_count].copy_from_slice(&self.states);
+        let mut saved_cursors = [0_usize; VERSION_1_MAX_SCENE_TRACKS];
+        saved_cursors[..track_count].copy_from_slice(&self.cursors);
         let mut segment_count = 0;
         while self.position < end_frame {
             self.apply_boundary();
             let next_boundary = self.next_boundary(end_frame);
-            observe(SceneSegment {
+            if let Err(error) = observe(SceneSegment {
                 offset_frames: self.position - start_frame,
                 frame_count: next_boundary - self.position,
                 track_states: &self.states,
-            });
+            }) {
+                self.position = saved_position;
+                self.states.copy_from_slice(&saved_states[..track_count]);
+                self.cursors.copy_from_slice(&saved_cursors[..track_count]);
+                return Err(SceneProcessError::Observer(error));
+            }
             segment_count += 1;
             self.position = next_boundary;
         }

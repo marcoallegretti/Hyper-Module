@@ -507,6 +507,56 @@ pub struct CompiledPlacement {
     placement_spec: PlacementSpec,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompiledSceneAudioClip {
+    launch_frame: usize,
+    expected_source_sample_rate_hz: u32,
+    expected_source_frame_count: usize,
+    clip_spec: NativeClipSpec,
+    placement_spec: PlacementSpec,
+}
+
+impl CompiledSceneAudioClip {
+    #[must_use]
+    pub const fn launch_frame(self) -> usize {
+        self.launch_frame
+    }
+
+    #[must_use]
+    pub const fn is_looping(self) -> bool {
+        self.clip_spec.loop_range.is_some()
+    }
+
+    /// Binds the compiled launch clip to its verified decoded source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrepareError`] for decoded-media mismatches or an unexpected
+    /// native clip-plan failure.
+    pub fn prepare(
+        self,
+        source: &DecodedAudio,
+    ) -> Result<(ClipRenderPlan<'_>, ClipPlacement), PrepareError> {
+        if source.sample_rate_hz() != self.expected_source_sample_rate_hz {
+            return Err(PrepareError::SourceSampleRateMismatch {
+                expected: self.expected_source_sample_rate_hz,
+                actual: source.sample_rate_hz(),
+            });
+        }
+        if source.frame_count() != self.expected_source_frame_count {
+            return Err(PrepareError::SourceFrameCountMismatch {
+                expected: self.expected_source_frame_count,
+                actual: source.frame_count(),
+            });
+        }
+        let plan = ClipRenderPlan::try_new(source, self.clip_spec).map_err(PrepareError::Clip)?;
+        let placement = plan
+            .place(self.placement_spec)
+            .map_err(PrepareError::Clip)?;
+        Ok((plan, placement))
+    }
+}
+
 impl CompiledPlacement {
     #[must_use]
     pub const fn arrangement_start_frame(self) -> usize {
@@ -688,6 +738,96 @@ pub fn compile_placement(
         placement_spec: PlacementSpec {
             clip_start_frame,
             frame_count,
+        },
+    })
+}
+
+/// Compiles one clip for playback from a recorded scene launch.
+///
+/// Open-ended loops are accepted only when the native clip rate matches every
+/// remaining tempo segment. This prevents a later tempo change from being
+/// silently ignored.
+///
+/// # Errors
+///
+/// Returns [`CompileError`] for invalid clip data, arithmetic failure, or a
+/// native execution requirement that needs consolidation.
+pub fn compile_scene_audio_clip(
+    timeline: Timeline<'_>,
+    clip: ClipCompileSpec<'_>,
+    launch_tick: u64,
+) -> Result<CompiledSceneAudioClip, CompileError> {
+    validate_clip(clip)?;
+    if clip.transpose_cents != 0 {
+        return Err(CompileError::ConsolidationRequired(
+            ConsolidationReason::Transposition,
+        ));
+    }
+    if clip.source_sample_rate_hz != timeline.sample_rate_hz() {
+        return Err(CompileError::ConsolidationRequired(
+            ConsolidationReason::Resampling,
+        ));
+    }
+    if !warp_is_linear(clip)? {
+        return Err(CompileError::ConsolidationRequired(
+            ConsolidationReason::TimeStretch,
+        ));
+    }
+    let end_tick = if clip.loop_enabled {
+        u64::MAX
+    } else {
+        launch_tick
+            .checked_add(clip.duration_ticks)
+            .ok_or(CompileError::ArithmeticOverflow)?
+    };
+    if !timeline.placement_uses_rate(
+        launch_tick,
+        end_tick,
+        clip.duration_ticks,
+        clip.source_frame_count,
+    )? {
+        return Err(CompileError::ConsolidationRequired(
+            ConsolidationReason::TimeStretch,
+        ));
+    }
+    let source_end = clip
+        .source_start_frame
+        .checked_add(clip.source_frame_count)
+        .ok_or(CompileError::ArithmeticOverflow)?;
+    let loop_range = if clip.loop_enabled {
+        Some(FrameRange {
+            start: clip_tick_to_frame(clip, clip.loop_range.start)?,
+            end: clip_tick_to_frame(clip, clip.loop_range.end)?,
+        })
+    } else {
+        None
+    };
+    let placement_frame_count = if clip.loop_enabled {
+        usize::MAX
+    } else {
+        clip.source_frame_count
+    };
+    Ok(CompiledSceneAudioClip {
+        launch_frame: timeline.tick_to_frame_ceil(launch_tick)?,
+        expected_source_sample_rate_hz: clip.source_sample_rate_hz,
+        expected_source_frame_count: clip.asset_frame_count,
+        clip_spec: NativeClipSpec {
+            enabled: clip.enabled,
+            source: FrameRange {
+                start: clip.source_start_frame,
+                end: source_end,
+            },
+            loop_range,
+            reverse: clip.reverse,
+            gain_decibels: clip.gain_decibels,
+            fade_in_frames: clip_tick_span_to_frames(clip, clip.fade_in_ticks)?,
+            fade_out_frames: clip_tick_span_to_frames(clip, clip.fade_out_ticks)?,
+            transpose_cents: 0,
+            time_mapping: TimeMapping::NativeRate,
+        },
+        placement_spec: PlacementSpec {
+            clip_start_frame: 0,
+            frame_count: placement_frame_count,
         },
     })
 }

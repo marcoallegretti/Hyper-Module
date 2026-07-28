@@ -7,7 +7,8 @@ use core::mem::size_of;
 
 use hyper_audio_source::DecodedAudio;
 use hyper_clip_engine::{ClipOutput, ClipPlacement, ClipPlanError, ClipRenderPlan};
-use hyper_playback_compiler::PrepareError;
+use hyper_playback_compiler::scene::{CompiledScenePerformance, PlayingSceneClip};
+use hyper_playback_compiler::{CompiledSceneAudioClip, PrepareError};
 use hyper_playback_json::{OwnedCompiledSchedule, OwnedScheduleEntry};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -288,6 +289,223 @@ impl DecodedMediaCache {
             });
         }
         Ok(PreparedSchedule { entries })
+    }
+
+    /// Atomically binds every compiled scene play action to immutable media.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrepareSceneAudioError`] for mismatched authority, duplicate
+    /// bindings, missing media, or invalid compiled clip data.
+    pub fn prepare_scene_audio<'cache, 'binding>(
+        &'cache self,
+        authority: &CompiledScenePerformance<'_>,
+        bindings: &'binding [SceneAudioBinding<'binding>],
+    ) -> Result<PreparedSceneAudio<'cache, 'binding>, PrepareSceneAudioError> {
+        let play_count = authority.playing_clips().count();
+        if bindings.len() != play_count {
+            return Err(PrepareSceneAudioError::BindingCountMismatch {
+                expected: play_count,
+                actual: bindings.len(),
+            });
+        }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(bindings.len())
+            .map_err(|_| PrepareSceneAudioError::CapacityUnavailable)?;
+        for (binding_index, binding) in bindings.iter().enumerate() {
+            if bindings[..binding_index]
+                .iter()
+                .any(|previous| previous.key() == binding.key())
+            {
+                return Err(PrepareSceneAudioError::DuplicateBinding { binding_index });
+            }
+            let playing = authority
+                .playing_clips()
+                .find(|(track_id, playing)| binding.matches(track_id, *playing))
+                .ok_or(PrepareSceneAudioError::AuthorityMismatch { binding_index })?
+                .1;
+            if binding.compiled.launch_frame() != playing.started_at_frame() {
+                return Err(PrepareSceneAudioError::LaunchFrameMismatch { binding_index });
+            }
+            let cached = self
+                .find(binding.asset_id)
+                .ok_or(PrepareSceneAudioError::MissingAsset { binding_index })?;
+            let (plan, placement) = binding.compiled.prepare(&cached.audio).map_err(|source| {
+                PrepareSceneAudioError::InvalidAsset {
+                    binding_index,
+                    source,
+                }
+            })?;
+            entries.push(PreparedSceneAudioEntry {
+                binding,
+                plan,
+                placement,
+            });
+        }
+        Ok(PreparedSceneAudio { entries })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SceneAudioBinding<'a> {
+    pub track_id: &'a str,
+    pub launch_id: &'a str,
+    pub scene_id: &'a str,
+    pub clip_id: &'a str,
+    pub asset_id: &'a str,
+    pub compiled: CompiledSceneAudioClip,
+}
+
+impl SceneAudioBinding<'_> {
+    fn key(&self) -> (&str, &str, &str) {
+        (self.track_id, self.launch_id, self.clip_id)
+    }
+
+    fn matches(&self, track_id: &str, playing: PlayingSceneClip<'_>) -> bool {
+        self.track_id == track_id
+            && self.launch_id == playing.launch_id()
+            && self.scene_id == playing.scene_id()
+            && self.clip_id == playing.clip_id()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PrepareSceneAudioError {
+    CapacityUnavailable,
+    BindingCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    DuplicateBinding {
+        binding_index: usize,
+    },
+    AuthorityMismatch {
+        binding_index: usize,
+    },
+    LaunchFrameMismatch {
+        binding_index: usize,
+    },
+    MissingAsset {
+        binding_index: usize,
+    },
+    InvalidAsset {
+        binding_index: usize,
+        source: PrepareError,
+    },
+}
+
+impl fmt::Display for PrepareSceneAudioError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityUnavailable => {
+                formatter.write_str("prepared scene-audio capacity is unavailable")
+            }
+            Self::BindingCountMismatch { expected, actual } => write!(
+                formatter,
+                "scene authority requires {expected} audio bindings; {actual} were provided"
+            ),
+            Self::DuplicateBinding { binding_index } => {
+                write!(
+                    formatter,
+                    "scene audio binding {binding_index} is duplicated"
+                )
+            }
+            Self::AuthorityMismatch { binding_index } => write!(
+                formatter,
+                "scene audio binding {binding_index} has no matching play action"
+            ),
+            Self::LaunchFrameMismatch { binding_index } => write!(
+                formatter,
+                "scene audio binding {binding_index} has the wrong launch frame"
+            ),
+            Self::MissingAsset { binding_index } => write!(
+                formatter,
+                "scene audio binding {binding_index} references missing media"
+            ),
+            Self::InvalidAsset {
+                binding_index,
+                source,
+            } => write!(
+                formatter,
+                "scene audio binding {binding_index} cannot bind its media: {source}"
+            ),
+        }
+    }
+}
+
+impl Error for PrepareSceneAudioError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidAsset { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedSceneAudio<'cache, 'binding> {
+    entries: Vec<PreparedSceneAudioEntry<'cache, 'binding>>,
+}
+
+impl<'cache, 'binding> PreparedSceneAudio<'cache, 'binding> {
+    #[must_use]
+    pub fn entries(&self) -> &[PreparedSceneAudioEntry<'cache, 'binding>] {
+        &self.entries
+    }
+
+    #[must_use]
+    pub fn find(
+        &self,
+        track_id: &str,
+        playing: PlayingSceneClip<'_>,
+    ) -> Option<&PreparedSceneAudioEntry<'cache, 'binding>> {
+        self.find_index(track_id, playing).map(|(_, entry)| entry)
+    }
+
+    #[must_use]
+    pub fn find_index(
+        &self,
+        track_id: &str,
+        playing: PlayingSceneClip<'_>,
+    ) -> Option<(usize, &PreparedSceneAudioEntry<'cache, 'binding>)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.binding.matches(track_id, playing))
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedSceneAudioEntry<'cache, 'binding> {
+    binding: &'binding SceneAudioBinding<'binding>,
+    plan: ClipRenderPlan<'cache>,
+    placement: ClipPlacement,
+}
+
+impl PreparedSceneAudioEntry<'_, '_> {
+    #[must_use]
+    pub const fn binding(&self) -> &SceneAudioBinding<'_> {
+        self.binding
+    }
+
+    #[must_use]
+    pub const fn channels(&self) -> usize {
+        self.plan.channels()
+    }
+
+    /// Renders a scene clip block relative to its launch frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClipPlanError`] if the block exceeds the prepared native clip.
+    pub fn render_block(
+        &self,
+        launch_frame_offset: usize,
+        output: ClipOutput<'_>,
+    ) -> Result<(), ClipPlanError> {
+        self.plan
+            .render_block(self.placement, launch_frame_offset, output)
     }
 }
 

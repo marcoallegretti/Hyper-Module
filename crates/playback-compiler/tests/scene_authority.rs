@@ -1,7 +1,7 @@
 use hyper_playback_compiler::scene::{
     LaunchQuantization, PlayingSceneClip, SceneClipResource, SceneCompileError, SceneLimits,
-    ScenePerformanceInput, SceneResource, SceneRuntimeError, SceneSlotAction, SceneSlotResource,
-    SceneTrackResource, compile_scene_performance,
+    ScenePerformanceInput, SceneProcessError, SceneResource, SceneRuntimeError, SceneSlotAction,
+    SceneSlotResource, SceneTrackResource, compile_scene_performance,
 };
 use hyper_playback_compiler::{TempoEvent, Timeline};
 
@@ -181,6 +181,24 @@ fn scene_authority_is_sparse_sample_exact_and_seekable() {
         runtime.process_window(usize::MAX, 1, |_| {}),
         Err(SceneRuntimeError::FrameOverflow)
     );
+
+    runtime.seek(0);
+    let before = runtime.track_states().to_vec();
+    let mut observations = 0;
+    let failed = runtime.try_process_window(0, 120, |_| {
+        observations += 1;
+        if observations == 2 {
+            Err("render failed")
+        } else {
+            Ok(())
+        }
+    });
+    assert!(matches!(
+        failed,
+        Err(SceneProcessError::Observer("render failed"))
+    ));
+    assert_eq!(runtime.position(), 0);
+    assert_eq!(runtime.track_states(), before);
 }
 
 #[test]
