@@ -1544,8 +1544,10 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     /// Output shape and block capacity are validated before queued commands are
     /// consumed. A valid cycle applies a bounded FIFO batch provisionally
     /// before it captures the cycle's state and start frame. If later work
-    /// fails, the transport and renderer return to the preceding committed
-    /// state; consumed commands are not replayed.
+    /// fails, transport state and renderer position return to their preceding
+    /// committed values; consumed commands are not replayed. Arbitrary mixer
+    /// processor state is not transactional, so callers must not continue
+    /// processing after a mixer failure.
     ///
     /// Stopped cycles clear the output without reading arrangement scratch or
     /// advancing the position. Rolling cycles render from the current absolute
