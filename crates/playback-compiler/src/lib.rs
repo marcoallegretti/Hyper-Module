@@ -11,6 +11,7 @@ use hyper_clip_engine::{
 };
 
 pub mod graph;
+pub mod scene;
 
 pub const TICKS_PER_QUARTER: u64 = 1_920;
 const MICROSECONDS_PER_SECOND: u128 = 1_000_000;
@@ -294,6 +295,27 @@ impl<'a> Timeline<'a> {
         let numerator = self.exact_frame_numerator(tick)?;
         let denominator = u128::from(TICKS_PER_QUARTER) * MICROSECONDS_PER_SECOND;
         usize::try_from(numerator / denominator).map_err(|_| TimelineError::FrameOutOfRange)
+    }
+
+    /// Converts an absolute project tick to the first sample frame whose start
+    /// is at or after that tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimelineError`] if checked arithmetic or platform frame
+    /// conversion fails.
+    pub fn tick_to_frame_ceil(self, tick: u64) -> Result<usize, TimelineError> {
+        let numerator = self.exact_frame_numerator(tick)?;
+        let denominator = u128::from(TICKS_PER_QUARTER) * MICROSECONDS_PER_SECOND;
+        let quotient = numerator / denominator;
+        let rounded = if numerator % denominator == 0 {
+            quotient
+        } else {
+            quotient
+                .checked_add(1)
+                .ok_or(TimelineError::ArithmeticOverflow)?
+        };
+        usize::try_from(rounded).map_err(|_| TimelineError::FrameOutOfRange)
     }
 
     fn exact_frame_numerator(self, tick: u64) -> Result<u128, TimelineError> {
