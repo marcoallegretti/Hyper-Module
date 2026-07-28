@@ -32,14 +32,90 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 pub type DesktopPlaybackSessionInput = PreparedPlaybackSession;
 
 #[cfg(all(target_os = "linux", target_endian = "little"))]
-pub type DesktopOutputStartError = PipeWireStartError;
+type NativeDesktopOutputStartError = PipeWireStartError;
 #[cfg(target_os = "windows")]
-pub type DesktopOutputStartError = WasapiStartError;
+type NativeDesktopOutputStartError = WasapiStartError;
 
 #[cfg(all(target_os = "linux", target_endian = "little"))]
-pub type DesktopOutputStopError = PipeWireStopError;
+type NativeDesktopOutputStopError = PipeWireStopError;
 #[cfg(target_os = "windows")]
-pub type DesktopOutputStopError = WasapiStopError;
+type NativeDesktopOutputStopError = WasapiStopError;
+
+#[derive(Debug)]
+pub enum DesktopOutputStartError {
+    ThreadSpawn(std::io::Error),
+    ThreadPanicked,
+    StartupTimeout,
+    ThreadTerminated,
+    Backend {
+        source: Box<dyn Error + Send + Sync>,
+    },
+}
+
+impl fmt::Display for DesktopOutputStartError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ThreadSpawn(_) => formatter.write_str("desktop output thread could not start"),
+            Self::ThreadPanicked => formatter.write_str("desktop output thread panicked"),
+            Self::StartupTimeout => formatter.write_str("desktop output startup timed out"),
+            Self::ThreadTerminated => {
+                formatter.write_str("desktop output thread terminated during startup")
+            }
+            Self::Backend { source } => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for DesktopOutputStartError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ThreadSpawn(source) => Some(source),
+            Self::Backend { source } => Some(source.as_ref()),
+            Self::ThreadPanicked | Self::StartupTimeout | Self::ThreadTerminated => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DesktopOutputStopError {
+    ThreadPanicked,
+    ShutdownTimeout,
+}
+
+impl fmt::Display for DesktopOutputStopError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ThreadPanicked => "desktop output thread panicked during shutdown",
+            Self::ShutdownTimeout => "desktop output shutdown timed out",
+        })
+    }
+}
+
+impl Error for DesktopOutputStopError {}
+
+impl From<NativeDesktopOutputStartError> for DesktopOutputStartError {
+    fn from(source: NativeDesktopOutputStartError) -> Self {
+        match source {
+            NativeDesktopOutputStartError::ThreadSpawn(source) => Self::ThreadSpawn(source),
+            NativeDesktopOutputStartError::ThreadPanicked => Self::ThreadPanicked,
+            NativeDesktopOutputStartError::StartupTimeout => Self::StartupTimeout,
+            NativeDesktopOutputStartError::ThreadTerminated => Self::ThreadTerminated,
+            source @ (NativeDesktopOutputStartError::Backend { .. }
+            | NativeDesktopOutputStartError::BackendSource { .. }) => Self::Backend {
+                source: Box::new(source),
+            },
+        }
+    }
+}
+
+impl From<NativeDesktopOutputStopError> for DesktopOutputStopError {
+    fn from(source: NativeDesktopOutputStopError) -> Self {
+        match source {
+            NativeDesktopOutputStopError::ThreadPanicked => Self::ThreadPanicked,
+            NativeDesktopOutputStopError::ShutdownTimeout => Self::ShutdownTimeout,
+        }
+    }
+}
 
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 type DesktopOutputStream = PipeWireOutputStream;
@@ -360,7 +436,7 @@ impl DesktopPlaybackSession {
             },
             Err(source) => match failed_build(&publication_receiver) {
                 Some(build) => Err(DesktopPlaybackSessionStartError::Build(build)),
-                None => Err(DesktopPlaybackSessionStartError::Output(source)),
+                None => Err(DesktopPlaybackSessionStartError::Output(source.into())),
             },
         }
     }
@@ -411,7 +487,7 @@ impl DesktopPlaybackSession {
             config,
             source,
         } = self;
-        let stop_result = output.stop();
+        let stop_result = output.stop().map_err(DesktopOutputStopError::from);
         let recovery = DesktopPlaybackRecovery {
             config,
             source: Some(source),
@@ -448,7 +524,7 @@ impl DesktopPlaybackSession {
             config: _,
             source: _,
         } = self;
-        output.stop()
+        output.stop().map_err(DesktopOutputStopError::from)
     }
 }
 
@@ -469,7 +545,7 @@ fn initialize_session(
     maximum_block_frames: usize,
     initial_checkpoint: Option<PlaybackRecoverySnapshot>,
     publication: &SyncSender<SessionPublication>,
-) -> Result<(), DesktopOutputStartError> {
+) -> Result<(), NativeDesktopOutputStartError> {
     let (project, mixer, automation, media) = input.parts();
     if project.sample_rate_hz() != sample_rate_hz {
         return fail_build(
@@ -574,14 +650,14 @@ fn allocate_scratch_planes(
 fn fail_build<T>(
     publication: &SyncSender<SessionPublication>,
     source: DesktopPlaybackSessionBuildError,
-) -> Result<T, DesktopOutputStartError> {
+) -> Result<T, NativeDesktopOutputStartError> {
     let detail = source.to_string();
     let _ = publication.try_send(SessionPublication::Failed(source));
     Err(callback_error(detail))
 }
 
 #[cfg(all(target_os = "linux", target_endian = "little"))]
-fn callback_error(detail: String) -> DesktopOutputStartError {
+fn callback_error(detail: String) -> NativeDesktopOutputStartError {
     PipeWireStartError::Backend {
         stage: PipeWireStartupStage::Callback,
         detail,
@@ -589,7 +665,7 @@ fn callback_error(detail: String) -> DesktopOutputStartError {
 }
 
 #[cfg(target_os = "windows")]
-fn callback_error(detail: String) -> DesktopOutputStartError {
+fn callback_error(detail: String) -> NativeDesktopOutputStartError {
     WasapiStartError::Backend {
         stage: WasapiStartupStage::Callback,
         detail,
@@ -621,7 +697,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(DesktopOutputStartError::Backend { detail, .. })
+            Err(NativeDesktopOutputStartError::Backend { detail, .. })
                 if detail == "project sample rate is 44100 Hz; output is configured for 48000 Hz"
         ));
         assert!(matches!(
@@ -631,6 +707,24 @@ mod tests {
                 output: 48_000,
             })
         ));
+    }
+
+    #[test]
+    fn desktop_start_error_preserves_native_backend_source() {
+        let error = DesktopOutputStartError::from(callback_error("fixture rejected".to_owned()));
+
+        assert!(matches!(error, DesktopOutputStartError::Backend { .. }));
+        assert_eq!(
+            error.source().map(ToString::to_string),
+            Some(
+                if cfg!(target_os = "windows") {
+                    "WASAPI callback failed: fixture rejected"
+                } else {
+                    "PipeWire callback failed: fixture rejected"
+                }
+                .to_owned()
+            )
+        );
     }
 
     #[test]

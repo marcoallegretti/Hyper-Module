@@ -189,6 +189,10 @@ pub enum WasapiStartError {
         stage: WasapiStartupStage,
         detail: String,
     },
+    BackendSource {
+        stage: WasapiStartupStage,
+        source: Box<dyn Error + Send + Sync>,
+    },
 }
 
 impl fmt::Display for WasapiStartError {
@@ -203,6 +207,9 @@ impl fmt::Display for WasapiStartError {
             Self::Backend { stage, detail } => {
                 write!(formatter, "WASAPI {stage} failed: {detail}")
             }
+            Self::BackendSource { stage, source } => {
+                write!(formatter, "WASAPI {stage} failed: {source}")
+            }
         }
     }
 }
@@ -215,6 +222,7 @@ impl Error for WasapiStartError {
             | Self::StartupTimeout
             | Self::ThreadTerminated
             | Self::Backend { .. } => None,
+            Self::BackendSource { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -741,6 +749,15 @@ impl<E: fmt::Display> fmt::Display for WriteFramesError<E> {
     }
 }
 
+impl<E: Error + 'static> Error for WriteFramesError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Callback(_) => None,
+            Self::Submission(source) => Some(source),
+        }
+    }
+}
+
 fn write_frames<P, C>(
     remaining_frames: usize,
     maximum_block_frames: usize,
@@ -791,10 +808,13 @@ where
     Ok(())
 }
 
-fn backend_error(stage: WasapiStartupStage, source: impl fmt::Display) -> WasapiStartError {
-    WasapiStartError::Backend {
+fn backend_error(
+    stage: WasapiStartupStage,
+    source: impl Error + Send + Sync + 'static,
+) -> WasapiStartError {
+    WasapiStartError::BackendSource {
         stage,
-        detail: source.to_string(),
+        source: Box::new(source),
     }
 }
 
@@ -898,6 +918,19 @@ mod tests {
                 .unwrap()
                 .with_device_id(""),
             Err(WasapiOutputConfigError::EmptyDeviceId)
+        );
+    }
+
+    #[test]
+    fn backend_error_preserves_its_native_source() {
+        let error = backend_error(
+            WasapiStartupStage::Client,
+            std::io::Error::other("fixture rejected"),
+        );
+
+        assert_eq!(
+            error.source().map(ToString::to_string),
+            Some("fixture rejected".to_owned())
         );
     }
 

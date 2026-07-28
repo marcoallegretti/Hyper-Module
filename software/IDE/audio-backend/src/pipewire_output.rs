@@ -182,6 +182,10 @@ pub enum PipeWireStartError {
         stage: PipeWireStartupStage,
         detail: String,
     },
+    BackendSource {
+        stage: PipeWireStartupStage,
+        source: Box<dyn Error + Send + Sync>,
+    },
 }
 
 impl fmt::Display for PipeWireStartError {
@@ -198,6 +202,9 @@ impl fmt::Display for PipeWireStartError {
             Self::Backend { stage, detail } => {
                 write!(formatter, "PipeWire {stage} failed: {detail}")
             }
+            Self::BackendSource { stage, source } => {
+                write!(formatter, "PipeWire {stage} failed: {source}")
+            }
         }
     }
 }
@@ -210,6 +217,7 @@ impl Error for PipeWireStartError {
             | Self::StartupTimeout
             | Self::ThreadTerminated
             | Self::Backend { .. } => None,
+            Self::BackendSource { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -694,10 +702,13 @@ fn build_format(sample_rate_hz: u32) -> Result<Vec<u8>, PipeWireStartError> {
     })
 }
 
-fn backend_error(stage: PipeWireStartupStage, source: impl fmt::Display) -> PipeWireStartError {
-    PipeWireStartError::Backend {
+fn backend_error(
+    stage: PipeWireStartupStage,
+    source: impl Error + Send + Sync + 'static,
+) -> PipeWireStartError {
+    PipeWireStartError::BackendSource {
         stage,
-        detail: source.to_string(),
+        source: Box::new(source),
     }
 }
 
@@ -743,6 +754,19 @@ mod tests {
                 .unwrap()
                 .with_target("target\0object"),
             Err(PipeWireOutputConfigError::TargetContainsNul)
+        );
+    }
+
+    #[test]
+    fn backend_error_preserves_its_native_source() {
+        let error = backend_error(
+            PipeWireStartupStage::Context,
+            std::io::Error::other("fixture rejected"),
+        );
+
+        assert_eq!(
+            error.source().map(ToString::to_string),
+            Some("fixture rejected".to_owned())
         );
     }
 
