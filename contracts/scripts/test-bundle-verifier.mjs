@@ -15,9 +15,10 @@ import { tmpdir } from "node:os";
 
 import canonicalize from "canonicalize";
 
+import { collectRegularFiles } from "../lib/filesystem-tree.mjs";
 import { buildProjectBundle } from "./build-project-bundle.mjs";
 import { createMinimalProject } from "./test-project-fixture.mjs";
-import { collectRegularFiles, verifyBundle } from "./verify-bundle.mjs";
+import { verifyBundle } from "./verify-bundle.mjs";
 
 async function createValidBundle(parent, name) {
   const fixture = await createMinimalProject(parent, `${name}-source`);

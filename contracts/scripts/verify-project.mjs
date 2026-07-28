@@ -15,12 +15,16 @@ import {
 } from "../lib/automation-take.mjs";
 import { assertAudioClipInvariants } from "../lib/audio-clip.mjs";
 import { assertControlMappingInvariants } from "../lib/control-mappings.mjs";
+import {
+  collectRegularFiles,
+  directoryPrefixes,
+} from "../lib/filesystem-tree.mjs";
 import { assertMixerInvariants } from "../lib/mixer.mjs";
 import { assertRecordingMetadataInvariants } from "../lib/recording-metadata.mjs";
 import { assertSceneInvariants } from "../lib/scene.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
 import { assertTimelineInvariants } from "../lib/timeline.mjs";
-import { collectRegularFiles, verifyDescribedFile } from "./verify-bundle.mjs";
+import { verifyDescribedFile } from "./verify-bundle.mjs";
 
 const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const manifestLimitBytes = 1024 * 1024;
@@ -114,17 +118,6 @@ function assertProjectInvariants(project) {
 
 function isLocalOnlyPath(path) {
   return path.startsWith("cache/") || path.startsWith("backups/");
-}
-
-function directoryPrefixes(paths) {
-  const directories = new Set();
-  for (const path of paths) {
-    const segments = path.split("/");
-    for (let length = 1; length < segments.length; length += 1) {
-      directories.add(segments.slice(0, length).join("/"));
-    }
-  }
-  return directories;
 }
 
 async function readAudioAssetFormat(rootPath, asset) {
