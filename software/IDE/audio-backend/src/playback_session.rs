@@ -1,4 +1,4 @@
-use super::OutputStreamCounters;
+use super::{OutputStreamCounters, OutputStreamStatus};
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::{
     PipeWireOutputConfig, PipeWireOutputStream, PipeWireStartError, PipeWireStartupStage,
@@ -6,8 +6,8 @@ use super::{
 };
 #[cfg(target_os = "windows")]
 use super::{
-    WasapiOutputConfig, WasapiOutputStream, WasapiStartError, WasapiStartupStage, WasapiStopError,
-    WasapiThreadRunner,
+    WasapiDisconnectReason, WasapiOutputConfig, WasapiOutputStream, WasapiStartError,
+    WasapiStartupStage, WasapiStopError, WasapiThreadRunner,
 };
 use core::error::Error;
 use core::fmt;
@@ -207,6 +207,19 @@ impl DesktopPlaybackSession {
     #[must_use]
     pub fn counters(&self) -> OutputStreamCounters {
         self.output.counters()
+    }
+
+    #[must_use]
+    pub fn output_status(&self) -> OutputStreamStatus {
+        self.output.status()
+    }
+
+    #[cfg(target_os = "windows")]
+    /// Returns the asynchronous Windows session-disconnect reason, if
+    /// available. Generic runtime failures have no disconnect reason.
+    #[must_use]
+    pub fn disconnect_reason(&self) -> Option<WasapiDisconnectReason> {
+        self.output.disconnect_reason()
     }
 
     /// Stops the output thread and waits for its complete teardown.

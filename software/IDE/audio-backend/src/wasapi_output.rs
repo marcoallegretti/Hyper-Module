@@ -1,13 +1,18 @@
-use super::{InterleavedStereoProcessor, OutputCallback, OutputStreamCounters, STEREO_CHANNELS};
+use super::{
+    InterleavedStereoProcessor, OutputCallback, OutputStreamCounters, OutputStreamState,
+    OutputStreamStatus, STEREO_CHANNELS,
+};
 use core::error::Error;
 use core::fmt;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use hyper_mixer_runtime::{TrackWindowRenderer, TransportOutputProcessor};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use wasapi::{Direction, SampleType, ShareMode, StreamMode, WaveFormat};
+use wasapi::{
+    Direction, DisconnectReason, EventCallbacks, SampleType, ShareMode, StreamMode, WaveFormat,
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_WAIT_MILLISECONDS: u32 = 100;
@@ -116,6 +121,9 @@ pub enum WasapiStartupStage {
     Client,
     Format,
     Initialize,
+    SessionControl,
+    Notifications,
+    State,
     Event,
     RenderClient,
     Buffer,
@@ -132,6 +140,9 @@ impl fmt::Display for WasapiStartupStage {
             Self::Client => "audio client",
             Self::Format => "audio format",
             Self::Initialize => "stream initialization",
+            Self::SessionControl => "audio session control",
+            Self::Notifications => "audio session notifications",
+            Self::State => "stream state",
             Self::Event => "event handle",
             Self::RenderClient => "render client",
             Self::Buffer => "render buffer",
@@ -194,11 +205,32 @@ impl fmt::Display for WasapiStopError {
 
 impl Error for WasapiStopError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum WasapiDisconnectReason {
+    /// The selected endpoint was removed.
+    DeviceRemoval = 1,
+    /// The Windows audio service stopped.
+    AudioServiceStopped = 2,
+    /// The selected endpoint's shared stream format changed.
+    FormatChanged = 3,
+    /// The owning Windows session logged off.
+    SessionLogoff = 4,
+    /// The owning Windows session disconnected.
+    SessionDisconnected = 5,
+    /// An exclusive-mode client displaced this shared-mode stream.
+    ExclusiveModeOverride = 6,
+    /// Windows supplied a disconnect reason unknown to the binding.
+    Unknown = 7,
+}
+
 #[derive(Debug)]
 pub struct WasapiOutputStream {
     stop_requested: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     counters: OutputStreamCounters,
+    status: OutputStreamStatus,
+    disconnect_reason: Arc<AtomicU8>,
 }
 
 #[derive(Debug)]
@@ -207,6 +239,8 @@ pub struct WasapiThreadRunner {
     stop_requested: Arc<AtomicBool>,
     startup: SyncSender<Result<(), WasapiStartError>>,
     counters: OutputStreamCounters,
+    status: OutputStreamStatus,
+    disconnect_reason: Arc<AtomicU8>,
 }
 
 impl WasapiThreadRunner {
@@ -235,6 +269,8 @@ impl WasapiThreadRunner {
             &self.stop_requested,
             &self.startup,
             &self.counters,
+            &self.status,
+            &self.disconnect_reason,
         )
     }
 
@@ -294,8 +330,13 @@ impl WasapiOutputStream {
     {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let counters = OutputStreamCounters::default();
+        let status = OutputStreamStatus::default();
+        let disconnect_reason = Arc::new(AtomicU8::new(0));
         let thread_stop = Arc::clone(&stop_requested);
         let thread_counters = counters.clone();
+        let thread_status = status.clone();
+        let completion_status = status.clone();
+        let thread_disconnect_reason = Arc::clone(&disconnect_reason);
         let (startup_sender, startup_receiver) = sync_channel(1);
         let failure_sender = startup_sender.clone();
         let thread = thread::Builder::new()
@@ -306,9 +347,14 @@ impl WasapiOutputStream {
                     stop_requested: thread_stop,
                     startup: startup_sender,
                     counters: thread_counters,
+                    status: thread_status,
+                    disconnect_reason: thread_disconnect_reason,
                 };
                 if let Err(error) = initialize(thread) {
+                    completion_status.mark_failed();
                     let _ = failure_sender.try_send(Err(error));
+                } else {
+                    completion_status.mark_stopped();
                 }
             })
             .map_err(WasapiStartError::ThreadSpawn)?;
@@ -318,6 +364,8 @@ impl WasapiOutputStream {
                 stop_requested,
                 thread: Some(thread),
                 counters,
+                status,
+                disconnect_reason,
             }),
             Err(error) => {
                 stop_requested.store(true, Ordering::Release);
@@ -334,12 +382,25 @@ impl WasapiOutputStream {
         self.counters.clone()
     }
 
+    #[must_use]
+    pub fn status(&self) -> OutputStreamStatus {
+        self.status.clone()
+    }
+
+    /// Returns the asynchronous Windows session-disconnect reason, if one was
+    /// published. A generic runtime failure can have no disconnect reason.
+    #[must_use]
+    pub fn disconnect_reason(&self) -> Option<WasapiDisconnectReason> {
+        decode_disconnect_reason(self.disconnect_reason.load(Ordering::Acquire))
+    }
+
     /// Stops and joins the owned render thread.
     ///
     /// # Errors
     ///
     /// Returns [`WasapiStopError`] if the render thread panicked.
     pub fn stop(mut self) -> Result<(), WasapiStopError> {
+        self.status.request_stop();
         self.stop_requested.store(true, Ordering::Release);
         self.join()
     }
@@ -354,6 +415,7 @@ impl WasapiOutputStream {
 
 impl Drop for WasapiOutputStream {
     fn drop(&mut self) {
+        self.status.request_stop();
         self.stop_requested.store(true, Ordering::Release);
         let _ = self.join();
     }
@@ -375,9 +437,11 @@ fn run_wasapi_inner<P: InterleavedStereoProcessor>(
     stop_requested: &AtomicBool,
     startup: &SyncSender<Result<(), WasapiStartError>>,
     counters: &OutputStreamCounters,
+    status: &OutputStreamStatus,
+    disconnect_reason: &Arc<AtomicU8>,
 ) -> Result<(), WasapiStartError> {
     let _com = initialize_com()?;
-    let mut output = open_render_output(config)?;
+    let mut output = open_render_output(config, status, disconnect_reason)?;
     let initial_frames = usize::try_from(
         output
             .client
@@ -401,10 +465,20 @@ fn run_wasapi_inner<P: InterleavedStereoProcessor>(
         .start_stream()
         .map_err(|source| backend_error(WasapiStartupStage::Start, source))?;
     let _started = StartedStream(&output.client);
+    status.mark_running();
+    if status.state() != OutputStreamState::Running {
+        return Err(WasapiStartError::Backend {
+            stage: WasapiStartupStage::State,
+            detail: match decode_disconnect_reason(disconnect_reason.load(Ordering::Acquire)) {
+                Some(reason) => format!("audio session disconnected during startup: {reason:?}"),
+                None => "audio session failed during startup".to_owned(),
+            },
+        });
+    }
     let _ = startup.try_send(Ok(()));
 
     let mut consecutive_event_timeouts = 0_u8;
-    while !stop_requested.load(Ordering::Acquire) {
+    while !stop_requested.load(Ordering::Acquire) && status.state() != OutputStreamState::Failed {
         if output
             .event
             .wait_for_event(EVENT_WAIT_MILLISECONDS)
@@ -412,6 +486,7 @@ fn run_wasapi_inner<P: InterleavedStereoProcessor>(
         {
             consecutive_event_timeouts = consecutive_event_timeouts.saturating_add(1);
             if consecutive_event_timeouts >= MAX_CONSECUTIVE_EVENT_TIMEOUTS {
+                status.mark_failed();
                 counters.record_stream_error();
                 break;
             }
@@ -419,6 +494,7 @@ fn run_wasapi_inner<P: InterleavedStereoProcessor>(
         }
         consecutive_event_timeouts = 0;
         let Ok(available) = output.client.get_available_space_in_frames() else {
+            status.mark_failed();
             counters.record_stream_error();
             break;
         };
@@ -431,6 +507,7 @@ fn run_wasapi_inner<P: InterleavedStereoProcessor>(
         )
         .is_err()
         {
+            status.mark_failed();
             counters.record_stream_error();
             break;
         }
@@ -439,10 +516,11 @@ fn run_wasapi_inner<P: InterleavedStereoProcessor>(
 }
 
 struct WasapiRenderOutput {
-    client: wasapi::AudioClient,
+    _notifications: wasapi::EventRegistration,
     render: wasapi::AudioRenderClient,
     event: wasapi::Handle,
     samples: Vec<f32>,
+    client: wasapi::AudioClient,
 }
 
 fn initialize_com() -> Result<ComGuard, WasapiStartError> {
@@ -456,7 +534,11 @@ fn initialize_com() -> Result<ComGuard, WasapiStartError> {
     Ok(ComGuard)
 }
 
-fn open_render_output(config: &WasapiOutputConfig) -> Result<WasapiRenderOutput, WasapiStartError> {
+fn open_render_output(
+    config: &WasapiOutputConfig,
+    status: &OutputStreamStatus,
+    disconnect_reason: &Arc<AtomicU8>,
+) -> Result<WasapiRenderOutput, WasapiStartError> {
     let enumerator = wasapi::DeviceEnumerator::new()
         .map_err(|source| backend_error(WasapiStartupStage::Enumerator, source))?;
     let device = match &config.device_id {
@@ -506,6 +588,18 @@ fn open_render_output(config: &WasapiOutputConfig) -> Result<WasapiRenderOutput,
             },
         )
         .map_err(|source| backend_error(WasapiStartupStage::Initialize, source))?;
+    let session_control = client
+        .get_audiosessioncontrol()
+        .map_err(|source| backend_error(WasapiStartupStage::SessionControl, source))?;
+    let mut callbacks = EventCallbacks::new();
+    let callback_status = status.clone();
+    let callback_reason = Arc::clone(disconnect_reason);
+    callbacks.set_disconnected_callback(move |reason| {
+        publish_disconnect(&reason, &callback_status, &callback_reason);
+    });
+    let notifications = session_control
+        .register_session_notification(callbacks)
+        .map_err(|source| backend_error(WasapiStartupStage::Notifications, source))?;
     let event = client
         .set_get_eventhandle()
         .map_err(|source| backend_error(WasapiStartupStage::Event, source))?;
@@ -528,10 +622,11 @@ fn open_render_output(config: &WasapiOutputConfig) -> Result<WasapiRenderOutput,
         })?;
     samples.resize(sample_capacity, 0.0_f32);
     Ok(WasapiRenderOutput {
-        client,
+        _notifications: notifications,
         render,
         event,
         samples,
+        client,
     })
 }
 
@@ -558,6 +653,54 @@ fn backend_error(stage: WasapiStartupStage, source: impl fmt::Display) -> Wasapi
         stage,
         detail: source.to_string(),
     }
+}
+
+const fn map_disconnect_reason(reason: &DisconnectReason) -> WasapiDisconnectReason {
+    match reason {
+        DisconnectReason::DeviceRemoval => WasapiDisconnectReason::DeviceRemoval,
+        DisconnectReason::ServerShutdown => WasapiDisconnectReason::AudioServiceStopped,
+        DisconnectReason::FormatChanged => WasapiDisconnectReason::FormatChanged,
+        DisconnectReason::SessionLogoff => WasapiDisconnectReason::SessionLogoff,
+        DisconnectReason::SessionDisconnected => WasapiDisconnectReason::SessionDisconnected,
+        DisconnectReason::ExclusiveModeOverride => WasapiDisconnectReason::ExclusiveModeOverride,
+        DisconnectReason::Unknown => WasapiDisconnectReason::Unknown,
+    }
+}
+
+const fn decode_disconnect_reason(value: u8) -> Option<WasapiDisconnectReason> {
+    match value {
+        value if value == WasapiDisconnectReason::DeviceRemoval as u8 => {
+            Some(WasapiDisconnectReason::DeviceRemoval)
+        }
+        value if value == WasapiDisconnectReason::AudioServiceStopped as u8 => {
+            Some(WasapiDisconnectReason::AudioServiceStopped)
+        }
+        value if value == WasapiDisconnectReason::FormatChanged as u8 => {
+            Some(WasapiDisconnectReason::FormatChanged)
+        }
+        value if value == WasapiDisconnectReason::SessionLogoff as u8 => {
+            Some(WasapiDisconnectReason::SessionLogoff)
+        }
+        value if value == WasapiDisconnectReason::SessionDisconnected as u8 => {
+            Some(WasapiDisconnectReason::SessionDisconnected)
+        }
+        value if value == WasapiDisconnectReason::ExclusiveModeOverride as u8 => {
+            Some(WasapiDisconnectReason::ExclusiveModeOverride)
+        }
+        value if value == WasapiDisconnectReason::Unknown as u8 => {
+            Some(WasapiDisconnectReason::Unknown)
+        }
+        _ => None,
+    }
+}
+
+fn publish_disconnect(
+    reason: &DisconnectReason,
+    status: &OutputStreamStatus,
+    destination: &AtomicU8,
+) {
+    destination.store(map_disconnect_reason(reason) as u8, Ordering::Release);
+    status.mark_failed();
 }
 
 fn validate_transport_capacity(
@@ -659,5 +802,76 @@ mod tests {
                 detail,
             }) if detail == "WASAPI capacity is 64 frames; transport capacity is 128"
         ));
+    }
+
+    #[test]
+    fn every_wasapi_disconnect_reason_has_a_stable_public_mapping() {
+        let mappings = [
+            (
+                DisconnectReason::DeviceRemoval,
+                WasapiDisconnectReason::DeviceRemoval,
+            ),
+            (
+                DisconnectReason::ServerShutdown,
+                WasapiDisconnectReason::AudioServiceStopped,
+            ),
+            (
+                DisconnectReason::FormatChanged,
+                WasapiDisconnectReason::FormatChanged,
+            ),
+            (
+                DisconnectReason::SessionLogoff,
+                WasapiDisconnectReason::SessionLogoff,
+            ),
+            (
+                DisconnectReason::SessionDisconnected,
+                WasapiDisconnectReason::SessionDisconnected,
+            ),
+            (
+                DisconnectReason::ExclusiveModeOverride,
+                WasapiDisconnectReason::ExclusiveModeOverride,
+            ),
+            (DisconnectReason::Unknown, WasapiDisconnectReason::Unknown),
+        ];
+
+        for (source, expected) in mappings {
+            assert_eq!(map_disconnect_reason(&source), expected);
+            assert_eq!(decode_disconnect_reason(expected as u8), Some(expected));
+        }
+        assert_eq!(decode_disconnect_reason(0), None);
+    }
+
+    #[test]
+    fn disconnect_reason_is_published_before_terminal_failure() {
+        let status = OutputStreamStatus::default();
+        let reason = AtomicU8::new(0);
+        status.mark_running();
+
+        publish_disconnect(&DisconnectReason::DeviceRemoval, &status, &reason);
+
+        assert_eq!(status.state(), OutputStreamState::Failed);
+        assert_eq!(
+            decode_disconnect_reason(reason.load(Ordering::Acquire)),
+            Some(WasapiDisconnectReason::DeviceRemoval)
+        );
+    }
+
+    #[test]
+    fn owned_stream_publishes_requested_shutdown_completion() {
+        let config = WasapiOutputConfig::try_new(48_000, 64).unwrap();
+        let stream = WasapiOutputStream::start_with_thread_initializer(config, |runner| {
+            runner.status.mark_running();
+            let _ = runner.startup.try_send(Ok(()));
+            while !runner.stop_requested() {
+                thread::yield_now();
+            }
+            Ok(())
+        })
+        .unwrap();
+        let status = stream.status();
+
+        assert_eq!(status.state(), OutputStreamState::Running);
+        stream.stop().unwrap();
+        assert_eq!(status.state(), OutputStreamState::Stopped);
     }
 }

@@ -1,11 +1,111 @@
 use core::error::Error;
 use core::fmt;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 pub const STEREO_CHANNELS: usize = 2;
 pub const MAXIMUM_BLOCK_FRAMES: usize = 4_096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum OutputStreamState {
+    /// Backend construction has not yet published readiness.
+    Starting,
+    /// The backend published a usable stream and still owns it.
+    Running,
+    /// Application shutdown won the race with any backend failure.
+    StopRequested,
+    /// The backend thread completed after an application shutdown request.
+    Stopped,
+    /// Backend startup or runtime ownership ended unexpectedly.
+    Failed,
+}
+
+/// Cloneable, lock-free observer for one output thread's lifecycle.
+#[derive(Clone, Debug)]
+pub struct OutputStreamStatus {
+    state: Arc<AtomicU8>,
+}
+
+impl Default for OutputStreamStatus {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(OutputStreamState::Starting as u8)),
+        }
+    }
+}
+
+impl OutputStreamStatus {
+    /// Returns the latest lifecycle state.
+    #[must_use]
+    pub fn state(&self) -> OutputStreamState {
+        match self.state.load(Ordering::Acquire) {
+            value if value == OutputStreamState::Starting as u8 => OutputStreamState::Starting,
+            value if value == OutputStreamState::Running as u8 => OutputStreamState::Running,
+            value if value == OutputStreamState::StopRequested as u8 => {
+                OutputStreamState::StopRequested
+            }
+            value if value == OutputStreamState::Stopped as u8 => OutputStreamState::Stopped,
+            _ => OutputStreamState::Failed,
+        }
+    }
+
+    fn mark_running(&self) {
+        let _ = self.state.compare_exchange(
+            OutputStreamState::Starting as u8,
+            OutputStreamState::Running as u8,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn request_stop(&self) {
+        let _ =
+            self.state.fetch_update(
+                Ordering::Release,
+                Ordering::Relaxed,
+                |current| match current {
+                    value
+                        if value == OutputStreamState::Starting as u8
+                            || value == OutputStreamState::Running as u8 =>
+                    {
+                        Some(OutputStreamState::StopRequested as u8)
+                    }
+                    _ => None,
+                },
+            );
+    }
+
+    fn mark_stopped(&self) {
+        let _ =
+            self.state.fetch_update(
+                Ordering::Release,
+                Ordering::Relaxed,
+                |current| match current {
+                    value if value == OutputStreamState::Failed as u8 => None,
+                    _ => Some(OutputStreamState::Stopped as u8),
+                },
+            );
+    }
+
+    fn mark_failed(&self) {
+        let _ =
+            self.state.fetch_update(
+                Ordering::Release,
+                Ordering::Relaxed,
+                |current| match current {
+                    value
+                        if value == OutputStreamState::Starting as u8
+                            || value == OutputStreamState::Running as u8 =>
+                    {
+                        Some(OutputStreamState::Failed as u8)
+                    }
+                    _ => None,
+                },
+            );
+    }
+}
 
 pub trait InterleavedStereoProcessor {
     type Error;
@@ -275,8 +375,8 @@ pub use wasapi_devices::{
 mod wasapi_output;
 #[cfg(target_os = "windows")]
 pub use wasapi_output::{
-    WasapiOutputConfig, WasapiOutputConfigError, WasapiOutputStream, WasapiStartError,
-    WasapiStartupStage, WasapiStopError, WasapiThreadRunner,
+    WasapiDisconnectReason, WasapiOutputConfig, WasapiOutputConfigError, WasapiOutputStream,
+    WasapiStartError, WasapiStartupStage, WasapiStopError, WasapiThreadRunner,
 };
 
 #[cfg(test)]
@@ -371,6 +471,26 @@ mod tests {
                 ..OutputStreamSnapshot::default()
             }
         );
+    }
+
+    #[test]
+    fn stream_status_has_terminal_stop_and_failure_states() {
+        let stopped = OutputStreamStatus::default();
+        assert_eq!(stopped.state(), OutputStreamState::Starting);
+        stopped.mark_running();
+        assert_eq!(stopped.state(), OutputStreamState::Running);
+        stopped.request_stop();
+        assert_eq!(stopped.state(), OutputStreamState::StopRequested);
+        stopped.mark_failed();
+        assert_eq!(stopped.state(), OutputStreamState::StopRequested);
+        stopped.mark_stopped();
+        assert_eq!(stopped.state(), OutputStreamState::Stopped);
+
+        let failed = OutputStreamStatus::default();
+        failed.mark_running();
+        failed.mark_failed();
+        failed.mark_stopped();
+        assert_eq!(failed.state(), OutputStreamState::Failed);
     }
 
     #[test]

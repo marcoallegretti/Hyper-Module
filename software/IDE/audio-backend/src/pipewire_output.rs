@@ -1,4 +1,7 @@
-use super::{InterleavedStereoProcessor, OutputCallback, OutputStreamCounters, STEREO_CHANNELS};
+use super::{
+    InterleavedStereoProcessor, OutputCallback, OutputStreamCounters, OutputStreamState,
+    OutputStreamStatus, STEREO_CHANNELS,
+};
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -201,6 +204,7 @@ pub struct PipeWireOutputStream {
     stop_requested: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     counters: OutputStreamCounters,
+    status: OutputStreamStatus,
 }
 
 /// Backend-thread context for constructing callback state from owned inputs.
@@ -215,6 +219,7 @@ pub struct PipeWireThreadRunner {
     stop_requested: Arc<AtomicBool>,
     startup: SyncSender<Result<(), PipeWireStartError>>,
     counters: OutputStreamCounters,
+    status: OutputStreamStatus,
 }
 
 impl PipeWireThreadRunner {
@@ -243,7 +248,13 @@ impl PipeWireThreadRunner {
             stage: PipeWireStartupStage::Callback,
             detail: source.to_string(),
         })?;
-        run_pipewire_inner(self.config, callback, self.stop_requested, &self.startup)
+        run_pipewire_inner(
+            self.config,
+            callback,
+            self.stop_requested,
+            &self.startup,
+            &self.status,
+        )
     }
 
     /// Runs one prepared transport output processor on this `PipeWire` thread.
@@ -313,8 +324,11 @@ impl PipeWireOutputStream {
     {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let counters = OutputStreamCounters::default();
+        let status = OutputStreamStatus::default();
         let thread_stop = Arc::clone(&stop_requested);
         let thread_counters = counters.clone();
+        let thread_status = status.clone();
+        let completion_status = status.clone();
         let (startup_sender, startup_receiver) = sync_channel(1);
         let failure_sender = startup_sender.clone();
         let thread = thread::Builder::new()
@@ -325,9 +339,13 @@ impl PipeWireOutputStream {
                     stop_requested: thread_stop,
                     startup: startup_sender,
                     counters: thread_counters,
+                    status: thread_status,
                 };
                 if let Err(error) = initialize(thread) {
+                    completion_status.mark_failed();
                     let _ = failure_sender.try_send(Err(error));
+                } else {
+                    completion_status.mark_stopped();
                 }
             })
             .map_err(PipeWireStartError::ThreadSpawn)?;
@@ -337,6 +355,7 @@ impl PipeWireOutputStream {
                 stop_requested,
                 thread: Some(thread),
                 counters,
+                status,
             }),
             Err(error) => {
                 stop_requested.store(true, Ordering::Release);
@@ -353,12 +372,18 @@ impl PipeWireOutputStream {
         self.counters.clone()
     }
 
+    #[must_use]
+    pub fn status(&self) -> OutputStreamStatus {
+        self.status.clone()
+    }
+
     /// Requests loop shutdown and joins the owned backend thread.
     ///
     /// # Errors
     ///
     /// Returns [`PipeWireStopError`] if the backend thread panicked.
     pub fn stop(mut self) -> Result<(), PipeWireStopError> {
+        self.status.request_stop();
         self.stop_requested.store(true, Ordering::Release);
         self.join()
     }
@@ -375,6 +400,7 @@ impl PipeWireOutputStream {
 
 impl Drop for PipeWireOutputStream {
     fn drop(&mut self) {
+        self.status.request_stop();
         self.stop_requested.store(true, Ordering::Release);
         let _ = self.join();
     }
@@ -400,6 +426,7 @@ fn run_pipewire_inner(
     callback: OutputCallback<PipeWireProcessor<'_>>,
     stop_requested: Arc<AtomicBool>,
     startup: &SyncSender<Result<(), PipeWireStartError>>,
+    status: &OutputStreamStatus,
 ) -> Result<(), PipeWireStartError> {
     pw::init();
     let main_loop = pw::main_loop::MainLoopRc::new(None)
@@ -429,6 +456,7 @@ fn run_pipewire_inner(
 
     let loop_for_state = main_loop.clone();
     let counters = callback.counters();
+    let state_status = status.clone();
     let listener = stream
         .add_local_listener_with_user_data(PipeWireCallback {
             output: callback,
@@ -436,11 +464,13 @@ fn run_pipewire_inner(
         })
         .state_changed(move |_, state, _, new| match new {
             pw::stream::StreamState::Paused | pw::stream::StreamState::Streaming => {
+                state_status.mark_running();
                 if let Some(sender) = state.startup.take() {
                     let _ = sender.try_send(Ok(()));
                 }
             }
             pw::stream::StreamState::Error(detail) => {
+                state_status.mark_failed();
                 counters.record_stream_error();
                 if let Some(sender) = state.startup.take() {
                     let _ = sender.try_send(Err(PipeWireStartError::Backend {
@@ -450,7 +480,14 @@ fn run_pipewire_inner(
                 }
                 loop_for_state.quit();
             }
-            pw::stream::StreamState::Unconnected | pw::stream::StreamState::Connecting => {}
+            pw::stream::StreamState::Unconnected => {
+                if state_status.state() == OutputStreamState::Running {
+                    state_status.mark_failed();
+                    counters.record_stream_error();
+                    loop_for_state.quit();
+                }
+            }
+            pw::stream::StreamState::Connecting => {}
         })
         .process(process_pipewire_buffer)
         .register()
