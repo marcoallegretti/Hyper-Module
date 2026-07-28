@@ -1,13 +1,14 @@
 use core::error::Error;
 use core::fmt;
 
+use hyper_playback_compiler::{FrameTickPosition, FrameTimeline, FrameTimelineError};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 
 use super::{
-    CollectionLimit, DocumentKind, DocumentLocation, LoadError, LoadedMixer, LoadedPlaybackProject,
-    LoaderLimits, TrackKind, capacity_error, domain_error, enforce_loader_limit, parse_document,
-    project_contains_identity, validate_header,
+    CollectionLimit, CompiledMixerGraph, DocumentKind, DocumentLocation, LoadError, LoadedMixer,
+    LoadedPlaybackProject, LoaderLimits, TrackKind, capacity_error, domain_error,
+    enforce_loader_limit, parse_document, project_contains_identity, validate_header,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -221,6 +222,135 @@ impl LoadedAutomationSet {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutomationCompileError {
+    CapacityUnavailable,
+    UnsupportedCueTarget,
+    TargetMismatch,
+    Timeline(FrameTimelineError),
+}
+
+impl fmt::Display for AutomationCompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityUnavailable => {
+                formatter.write_str("compiled automation capacity is unavailable")
+            }
+            Self::UnsupportedCueTarget => {
+                formatter.write_str("cue automation is unavailable in the main-output runtime")
+            }
+            Self::TargetMismatch => {
+                formatter.write_str("automation target does not match the compiled mixer graph")
+            }
+            Self::Timeline(source) => write!(formatter, "automation timeline failed: {source}"),
+        }
+    }
+}
+
+impl Error for AutomationCompileError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Timeline(source) => Some(source),
+            Self::CapacityUnavailable | Self::UnsupportedCueTarget | Self::TargetMismatch => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CompiledAutomationInterval {
+    start_tick: u64,
+    end_tick: u64,
+    interpolation: AutomationInterpolation,
+    points: Vec<AutomationPoint>,
+}
+
+impl CompiledAutomationInterval {
+    fn value_at(&self, position: FrameTickPosition) -> Result<AutomationValue, FrameTimelineError> {
+        let first = self.points[0];
+        if position.is_before(first.tick) {
+            return Ok(first.value);
+        }
+        let right_index = self
+            .points
+            .partition_point(|point| position.is_at_or_after(point.tick));
+        if right_index == self.points.len() {
+            return Ok(self.points[self.points.len() - 1].value);
+        }
+        let left = self.points[right_index - 1];
+        let right = self.points[right_index];
+        if self.interpolation == AutomationInterpolation::Hold {
+            return Ok(left.value);
+        }
+        let (AutomationValue::Integer(left_value), AutomationValue::Integer(right_value)) =
+            (left.value, right.value)
+        else {
+            unreachable!("validated linear lanes contain only integer points");
+        };
+        position
+            .interpolate_i32(left.tick, left_value, right.tick, right_value)
+            .map(AutomationValue::Integer)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CompiledAutomationTarget {
+    target: AutomationTarget,
+    intervals: Vec<CompiledAutomationInterval>,
+}
+
+impl CompiledAutomationTarget {
+    fn value_at(
+        &self,
+        position: FrameTickPosition,
+    ) -> Result<Option<AutomationValue>, FrameTimelineError> {
+        let right = self
+            .intervals
+            .partition_point(|interval| position.is_at_or_after(interval.start_tick));
+        let Some(index) = right.checked_sub(1) else {
+            return Ok(None);
+        };
+        let interval = &self.intervals[index];
+        if !position.is_before(interval.end_tick) {
+            return Ok(None);
+        }
+        interval.value_at(position).map(Some)
+    }
+}
+
+/// Precompiled enabled automation indexed by resolved mixer target.
+#[derive(Clone, Debug)]
+pub struct CompiledAutomation {
+    timeline: FrameTimeline,
+    targets: Vec<CompiledAutomationTarget>,
+}
+
+impl CompiledAutomation {
+    #[must_use]
+    pub fn target_count(&self) -> usize {
+        self.targets.len()
+    }
+
+    /// Visits every active target value at the exact start of one sample frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameTimelineError`] for checked timeline or interpolation
+    /// arithmetic failure.
+    pub fn visit_frame_values(
+        &self,
+        frame: usize,
+        mut visitor: impl FnMut(AutomationTarget, AutomationValue),
+    ) -> Result<(), FrameTimelineError> {
+        let position = self.timeline.position_at_frame(frame)?;
+        for target in &self.targets {
+            if let Some(value) = target.value_at(position)? {
+                visitor(target.target, value);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl LoadedPlaybackProject {
     /// Loads, resolves, and cross-validates post-verified automation resources.
     ///
@@ -286,6 +416,108 @@ impl LoadedPlaybackProject {
         }
         validate_enabled_overlaps(&takes)?;
         Ok(LoadedAutomationSet { takes })
+    }
+
+    /// Compiles enabled automation for the resolved main-output mixer graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationCompileError`] for unavailable capacity, cue
+    /// targets, graph mismatch, or timeline compilation failure.
+    pub fn compile_main_automation(
+        &self,
+        mixer: &CompiledMixerGraph,
+        automation: &LoadedAutomationSet,
+    ) -> Result<CompiledAutomation, AutomationCompileError> {
+        let timeline = FrameTimeline::try_new(self.sample_rate_hz, &self.tempo_events)
+            .map_err(AutomationCompileError::Timeline)?;
+        let enabled_lane_count = automation
+            .takes
+            .iter()
+            .filter(|take| take.enabled)
+            .try_fold(0_usize, |count, take| count.checked_add(take.lanes.len()))
+            .ok_or(AutomationCompileError::CapacityUnavailable)?;
+        let mut pending = Vec::new();
+        pending
+            .try_reserve_exact(enabled_lane_count)
+            .map_err(|_| AutomationCompileError::CapacityUnavailable)?;
+        for take in automation.takes.iter().filter(|take| take.enabled) {
+            for lane in &take.lanes {
+                validate_compiled_target(mixer, lane.target)?;
+                pending.push(PendingAutomationLane {
+                    target: lane.target,
+                    start_tick: take.start_tick,
+                    end_tick: take.end_tick,
+                    lane,
+                });
+            }
+        }
+        pending.sort_unstable_by_key(|lane| (lane.target, lane.start_tick));
+
+        let mut targets: Vec<CompiledAutomationTarget> = Vec::new();
+        for lane in pending {
+            if targets
+                .last()
+                .is_none_or(|target| target.target != lane.target)
+            {
+                targets
+                    .try_reserve(1)
+                    .map_err(|_| AutomationCompileError::CapacityUnavailable)?;
+                targets.push(CompiledAutomationTarget {
+                    target: lane.target,
+                    intervals: Vec::new(),
+                });
+            }
+            let intervals = &mut targets
+                .last_mut()
+                .ok_or(AutomationCompileError::CapacityUnavailable)?
+                .intervals;
+            intervals
+                .try_reserve(1)
+                .map_err(|_| AutomationCompileError::CapacityUnavailable)?;
+            let mut points = Vec::new();
+            points
+                .try_reserve_exact(lane.lane.points.len())
+                .map_err(|_| AutomationCompileError::CapacityUnavailable)?;
+            points.extend_from_slice(&lane.lane.points);
+            intervals.push(CompiledAutomationInterval {
+                start_tick: lane.start_tick,
+                end_tick: lane.end_tick,
+                interpolation: lane.lane.interpolation,
+                points,
+            });
+        }
+        Ok(CompiledAutomation { timeline, targets })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingAutomationLane<'a> {
+    target: AutomationTarget,
+    start_tick: u64,
+    end_tick: u64,
+    lane: &'a AutomationLane,
+}
+
+fn validate_compiled_target(
+    mixer: &CompiledMixerGraph,
+    target: AutomationTarget,
+) -> Result<(), AutomationCompileError> {
+    match target {
+        AutomationTarget::Channel { slot, .. } if slot < mixer.slots().len() => Ok(()),
+        AutomationTarget::Send { slot, send, .. }
+            if mixer
+                .slots()
+                .get(slot)
+                .is_some_and(|channel| send < channel.sends().len()) =>
+        {
+            Ok(())
+        }
+        AutomationTarget::Main { .. } => Ok(()),
+        AutomationTarget::Cue { .. } => Err(AutomationCompileError::UnsupportedCueTarget),
+        AutomationTarget::Channel { .. } | AutomationTarget::Send { .. } => {
+            Err(AutomationCompileError::TargetMismatch)
+        }
     }
 }
 

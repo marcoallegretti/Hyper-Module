@@ -9,16 +9,19 @@ use hyper_arrangement_renderer::{
     RendererCreationError,
 };
 use hyper_audio_engine::{
-    ChannelParameters, InputBlock, LinearGain, MAX_PROCESS_FRAMES, MixerCreationError, Pan,
-    ProcessError, StereoMixer, StereoOutput,
+    ChannelParameters, ControlledInputBlock, InputBlock, LinearGain, MAX_PROCESS_FRAMES,
+    MixerCreationError, Pan, ParameterError, ProcessError, StereoMixer, StereoOutput,
 };
 use hyper_media_cache::PreparedSchedule;
+use hyper_playback_compiler::FrameTimelineError;
 use hyper_playback_json::{
-    CompiledMainMixer, CompiledMixerDestination, CompiledMixerGraph, CompiledMixerTap,
-    CompiledMixerTrackKind,
+    AutomationChannelParameter, AutomationMainParameter, AutomationSendParameter, AutomationTarget,
+    AutomationValue, CompiledAutomation, CompiledMainMixer, CompiledMixerDestination,
+    CompiledMixerGraph, CompiledMixerTap, CompiledMixerTrackKind,
 };
 
 pub const MAX_MAIN_MIXER_SLOTS: usize = 8;
+const MAX_SENDS_PER_SLOT: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeCreationError {
@@ -65,6 +68,10 @@ impl Error for RuntimeCreationError {
 pub enum RuntimeProcessError {
     OutputLengthMismatch { left: usize, right: usize },
     BlockLimit { actual: usize, maximum: usize },
+    FrameRangeOverflow,
+    Automation(FrameTimelineError),
+    AutomationValueMismatch,
+    Parameter(ParameterError),
     Render(RenderWindowError),
     Mixer(ProcessError),
 }
@@ -82,6 +89,12 @@ impl fmt::Display for RuntimeProcessError {
                 formatter,
                 "runtime block has {actual} frames; configured maximum is {maximum}"
             ),
+            Self::FrameRangeOverflow => formatter.write_str("runtime frame range overflowed"),
+            Self::Automation(source) => write!(formatter, "automation evaluation failed: {source}"),
+            Self::AutomationValueMismatch => {
+                formatter.write_str("compiled automation value differs from its target domain")
+            }
+            Self::Parameter(source) => write!(formatter, "automation parameter failed: {source}"),
             Self::Render(source) => write!(formatter, "track rendering failed: {source}"),
             Self::Mixer(source) => write!(formatter, "main mixing failed: {source}"),
         }
@@ -93,7 +106,12 @@ impl Error for RuntimeProcessError {
         match self {
             Self::Render(source) => Some(source),
             Self::Mixer(source) => Some(source),
-            Self::OutputLengthMismatch { .. } | Self::BlockLimit { .. } => None,
+            Self::Automation(source) => Some(source),
+            Self::Parameter(source) => Some(source),
+            Self::OutputLengthMismatch { .. }
+            | Self::BlockLimit { .. }
+            | Self::FrameRangeOverflow
+            | Self::AutomationValueMismatch => None,
         }
     }
 }
@@ -230,11 +248,22 @@ impl StereoBuffer {
     }
 }
 
+fn try_filled<T: Copy>(count: usize, value: T) -> Result<Vec<T>, RuntimeCreationError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(count)
+        .map_err(|_| RuntimeCreationError::CapacityUnavailable)?;
+    output.resize(count, value);
+    Ok(output)
+}
+
 #[derive(Debug)]
 struct GraphSendRuntime {
     target_slot: usize,
     tap: CompiledMixerTap,
     parameters: ChannelParameters,
+    enabled: bool,
+    controls: Vec<ChannelParameters>,
     processor: StereoMixer,
 }
 
@@ -243,8 +272,160 @@ struct GraphSlotRuntime {
     kind: CompiledMixerTrackKind,
     destination: CompiledMixerDestination,
     parameters: ChannelParameters,
+    muted: bool,
+    solo: bool,
+    controls: Vec<ChannelParameters>,
     processor: StereoMixer,
     sends: Vec<GraphSendRuntime>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ChannelOverrides {
+    gain: Option<i32>,
+    pan: Option<i32>,
+    mute: Option<bool>,
+    solo: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SendOverrides {
+    gain: Option<i32>,
+    pan: Option<i32>,
+    enabled: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MainOverrides {
+    gain: Option<i32>,
+    mute: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FrameOverrides {
+    channels: [ChannelOverrides; MAX_MAIN_MIXER_SLOTS],
+    sends: [[SendOverrides; MAX_SENDS_PER_SLOT]; MAX_MAIN_MIXER_SLOTS],
+    main: MainOverrides,
+    mismatch: bool,
+}
+
+impl FrameOverrides {
+    fn channel_mut(&mut self, slot: usize) -> Option<&mut ChannelOverrides> {
+        let Some(channel) = self.channels.get_mut(slot) else {
+            self.mismatch = true;
+            return None;
+        };
+        Some(channel)
+    }
+
+    fn send_mut(&mut self, slot: usize, send: usize) -> Option<&mut SendOverrides> {
+        let Some(sends) = self.sends.get_mut(slot) else {
+            self.mismatch = true;
+            return None;
+        };
+        let Some(send) = sends.get_mut(send) else {
+            self.mismatch = true;
+            return None;
+        };
+        Some(send)
+    }
+
+    fn apply(&mut self, target: AutomationTarget, value: AutomationValue) {
+        match (target, value) {
+            (
+                AutomationTarget::Channel {
+                    slot,
+                    parameter: AutomationChannelParameter::Gain,
+                },
+                AutomationValue::Integer(value),
+            ) => {
+                if let Some(channel) = self.channel_mut(slot) {
+                    channel.gain = Some(value);
+                }
+            }
+            (
+                AutomationTarget::Channel {
+                    slot,
+                    parameter: AutomationChannelParameter::Pan,
+                },
+                AutomationValue::Integer(value),
+            ) => {
+                if let Some(channel) = self.channel_mut(slot) {
+                    channel.pan = Some(value);
+                }
+            }
+            (
+                AutomationTarget::Channel {
+                    slot,
+                    parameter: AutomationChannelParameter::Mute,
+                },
+                AutomationValue::Boolean(value),
+            ) => {
+                if let Some(channel) = self.channel_mut(slot) {
+                    channel.mute = Some(value);
+                }
+            }
+            (
+                AutomationTarget::Channel {
+                    slot,
+                    parameter: AutomationChannelParameter::Solo,
+                },
+                AutomationValue::Boolean(value),
+            ) => {
+                if let Some(channel) = self.channel_mut(slot) {
+                    channel.solo = Some(value);
+                }
+            }
+            (
+                AutomationTarget::Send {
+                    slot,
+                    send,
+                    parameter: AutomationSendParameter::Gain,
+                },
+                AutomationValue::Integer(value),
+            ) => {
+                if let Some(send) = self.send_mut(slot, send) {
+                    send.gain = Some(value);
+                }
+            }
+            (
+                AutomationTarget::Send {
+                    slot,
+                    send,
+                    parameter: AutomationSendParameter::Pan,
+                },
+                AutomationValue::Integer(value),
+            ) => {
+                if let Some(send) = self.send_mut(slot, send) {
+                    send.pan = Some(value);
+                }
+            }
+            (
+                AutomationTarget::Send {
+                    slot,
+                    send,
+                    parameter: AutomationSendParameter::Enabled,
+                },
+                AutomationValue::Boolean(value),
+            ) => {
+                if let Some(send) = self.send_mut(slot, send) {
+                    send.enabled = Some(value);
+                }
+            }
+            (
+                AutomationTarget::Main {
+                    parameter: AutomationMainParameter::Gain,
+                },
+                AutomationValue::Integer(value),
+            ) => self.main.gain = Some(value),
+            (
+                AutomationTarget::Main {
+                    parameter: AutomationMainParameter::Mute,
+                },
+                AutomationValue::Boolean(value),
+            ) => self.main.mute = Some(value),
+            _ => self.mismatch = true,
+        }
+    }
 }
 
 /// A bounded primary/send/return graph whose route order and buffers are
@@ -261,6 +442,12 @@ pub struct GraphMainRuntime<'prepared, 'cache, 'schedule> {
     main_processor: StereoMixer,
     main_parameters: [ChannelParameters; 1],
     master_gain: LinearGain,
+    main_gain: LinearGain,
+    main_muted: bool,
+    main_input_controls: Vec<ChannelParameters>,
+    unity_master_controls: Vec<LinearGain>,
+    master_controls: Vec<LinearGain>,
+    automation: Option<CompiledAutomation>,
     max_block_frames: usize,
 }
 
@@ -275,6 +462,30 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
     pub fn try_new(
         schedule: &'prepared PreparedSchedule<'cache, 'schedule>,
         compiled: &CompiledMixerGraph,
+        max_block_frames: usize,
+    ) -> Result<Self, RuntimeCreationError> {
+        Self::try_new_inner(schedule, compiled, None, max_block_frames)
+    }
+
+    /// Binds a prepared schedule, mixer graph, and compiled sample automation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeCreationError`] for the same structural, capacity,
+    /// renderer, or mixer failures as [`Self::try_new`].
+    pub fn try_new_automated(
+        schedule: &'prepared PreparedSchedule<'cache, 'schedule>,
+        compiled: &CompiledMixerGraph,
+        automation: CompiledAutomation,
+        max_block_frames: usize,
+    ) -> Result<Self, RuntimeCreationError> {
+        Self::try_new_inner(schedule, compiled, Some(automation), max_block_frames)
+    }
+
+    fn try_new_inner(
+        schedule: &'prepared PreparedSchedule<'cache, 'schedule>,
+        compiled: &CompiledMixerGraph,
+        automation: Option<CompiledAutomation>,
         max_block_frames: usize,
     ) -> Result<Self, RuntimeCreationError> {
         let slot_count = compiled.slots().len();
@@ -297,6 +508,11 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
         }
         let renderer = ArrangementRenderer::try_new_for_tracks(schedule, &track_ids[..slot_count])
             .map_err(RuntimeCreationError::Renderer)?;
+        let control_frame_count = if automation.is_some() {
+            max_block_frames
+        } else {
+            0
+        };
 
         let mut slots = Vec::new();
         slots
@@ -316,6 +532,8 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
                     target_slot: compiled_send.target_slot(),
                     tap: compiled_send.tap(),
                     parameters,
+                    enabled: compiled_send.enabled(),
+                    controls: try_filled(control_frame_count, parameters)?,
                     processor: StereoMixer::try_new(&[parameters], LinearGain::UNITY)
                         .map_err(RuntimeCreationError::Mixer)?,
                 });
@@ -324,6 +542,9 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
                 kind: compiled_slot.kind(),
                 destination: compiled_slot.destination(),
                 parameters,
+                muted: compiled_slot.muted(),
+                solo: compiled_slot.solo(),
+                controls: try_filled(control_frame_count, parameters)?,
                 processor,
                 sends,
             });
@@ -357,6 +578,12 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
             main_processor,
             main_parameters,
             master_gain: compiled.master_gain(),
+            main_gain: compiled.main_gain(),
+            main_muted: compiled.main_muted(),
+            main_input_controls: try_filled(control_frame_count, main_parameters[0])?,
+            unity_master_controls: try_filled(control_frame_count, LinearGain::UNITY)?,
+            master_controls: try_filled(control_frame_count, compiled.master_gain())?,
+            automation,
             max_block_frames,
         })
     }
@@ -408,6 +635,9 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
         if frame_count == 0 {
             return Ok(rendered);
         }
+        if self.automation.is_some() {
+            self.prepare_automation_controls(arrangement_start_frame, frame_count)?;
+        }
 
         for buffer in &mut self.route_buffers {
             buffer.clear_prefix(frame_count);
@@ -431,10 +661,104 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
             left: &self.main_input.left[..frame_count],
             right: &self.main_input.right[..frame_count],
         }];
-        self.main_processor
-            .process(&main_input, &self.main_parameters, self.master_gain, output)
-            .map_err(RuntimeProcessError::Mixer)?;
+        if self.automation.is_some() {
+            let controlled = [ControlledInputBlock {
+                input: main_input[0],
+                parameters: &self.main_input_controls[..frame_count],
+            }];
+            self.main_processor
+                .process_controlled(&controlled, &self.master_controls[..frame_count], output)
+                .map_err(RuntimeProcessError::Mixer)?;
+        } else {
+            self.main_processor
+                .process(&main_input, &self.main_parameters, self.master_gain, output)
+                .map_err(RuntimeProcessError::Mixer)?;
+        }
         Ok(rendered)
+    }
+
+    fn prepare_automation_controls(
+        &mut self,
+        arrangement_start_frame: usize,
+        frame_count: usize,
+    ) -> Result<(), RuntimeProcessError> {
+        for frame in 0..frame_count {
+            let absolute_frame = arrangement_start_frame
+                .checked_add(frame)
+                .ok_or(RuntimeProcessError::FrameRangeOverflow)?;
+            let mut overrides = FrameOverrides::default();
+            self.automation
+                .as_ref()
+                .ok_or(RuntimeProcessError::AutomationValueMismatch)?
+                .visit_frame_values(absolute_frame, |target, value| {
+                    overrides.apply(target, value);
+                })
+                .map_err(RuntimeProcessError::Automation)?;
+            if overrides.mismatch {
+                return Err(RuntimeProcessError::AutomationValueMismatch);
+            }
+
+            let mut muted = [false; MAX_MAIN_MIXER_SLOTS];
+            let mut solo = [false; MAX_MAIN_MIXER_SLOTS];
+            let mut send_enabled = [[false; MAX_SENDS_PER_SLOT]; MAX_MAIN_MIXER_SLOTS];
+            for (slot_index, slot) in self.slots.iter_mut().enumerate() {
+                let channel = overrides.channels[slot_index];
+                let gain = automated_gain(channel.gain, slot.parameters.gain)?;
+                let pan = automated_pan(channel.pan, slot.parameters.pan)?;
+                muted[slot_index] = channel.mute.unwrap_or(slot.muted);
+                solo[slot_index] = channel.solo.unwrap_or(slot.solo);
+                slot.controls[frame] = ChannelParameters::new(gain, pan, !muted[slot_index]);
+                for (send_index, send) in slot.sends.iter_mut().enumerate() {
+                    let send_override = overrides.sends[slot_index][send_index];
+                    let gain = automated_gain(send_override.gain, send.parameters.gain)?;
+                    let pan = automated_pan(send_override.pan, send.parameters.pan)?;
+                    let enabled = send_override.enabled.unwrap_or(send.enabled);
+                    send_enabled[slot_index][send_index] = enabled;
+                    send.controls[frame] = ChannelParameters::new(gain, pan, enabled);
+                }
+            }
+
+            let any_solo =
+                self.slots.iter().enumerate().any(|(slot, channel)| {
+                    channel.kind == CompiledMixerTrackKind::Audio && solo[slot]
+                });
+            let mut eligible = [!any_solo; MAX_MAIN_MIXER_SLOTS];
+            if any_solo {
+                for (slot, channel) in self.slots.iter().enumerate() {
+                    eligible[slot] = channel.kind == CompiledMixerTrackKind::Audio && solo[slot];
+                }
+                for &slot_index in &self.processing_order {
+                    if !eligible[slot_index] {
+                        continue;
+                    }
+                    if let CompiledMixerDestination::Slot(target) =
+                        self.slots[slot_index].destination
+                    {
+                        eligible[target] = true;
+                    }
+                    for (send_index, send) in self.slots[slot_index].sends.iter().enumerate() {
+                        if send_enabled[slot_index][send_index] {
+                            eligible[send.target_slot] = true;
+                        }
+                    }
+                }
+            }
+            for (slot_index, slot) in self.slots.iter_mut().enumerate() {
+                slot.controls[frame].audible &= eligible[slot_index];
+                for send in &mut slot.sends {
+                    send.controls[frame].audible &= !muted[slot_index] && eligible[slot_index];
+                }
+            }
+
+            let main_gain = automated_gain(overrides.main.gain, self.main_gain)?;
+            let main_muted = overrides.main.mute.unwrap_or(self.main_muted);
+            self.master_controls[frame] = if main_muted {
+                LinearGain::SILENCE
+            } else {
+                main_gain
+            };
+        }
+        Ok(())
     }
 
     fn process_sends(
@@ -463,19 +787,37 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
                 }
             };
             let inputs = [input];
-            let parameters = [self.slots[slot_index].sends[send_index].parameters];
-            self.slots[slot_index].sends[send_index]
-                .processor
-                .process(
-                    &inputs,
-                    &parameters,
-                    LinearGain::UNITY,
-                    StereoOutput {
-                        left: &mut self.send_output.left[..frame_count],
-                        right: &mut self.send_output.right[..frame_count],
-                    },
-                )
-                .map_err(RuntimeProcessError::Mixer)?;
+            if self.automation.is_some() {
+                let send = &mut self.slots[slot_index].sends[send_index];
+                let controlled = [ControlledInputBlock {
+                    input,
+                    parameters: &send.controls[..frame_count],
+                }];
+                send.processor
+                    .process_controlled(
+                        &controlled,
+                        &self.unity_master_controls[..frame_count],
+                        StereoOutput {
+                            left: &mut self.send_output.left[..frame_count],
+                            right: &mut self.send_output.right[..frame_count],
+                        },
+                    )
+                    .map_err(RuntimeProcessError::Mixer)?;
+            } else {
+                let parameters = [self.slots[slot_index].sends[send_index].parameters];
+                self.slots[slot_index].sends[send_index]
+                    .processor
+                    .process(
+                        &inputs,
+                        &parameters,
+                        LinearGain::UNITY,
+                        StereoOutput {
+                            left: &mut self.send_output.left[..frame_count],
+                            right: &mut self.send_output.right[..frame_count],
+                        },
+                    )
+                    .map_err(RuntimeProcessError::Mixer)?;
+            }
             let target = self.slots[slot_index].sends[send_index].target_slot;
             accumulate(
                 &mut self.route_buffers[target],
@@ -501,19 +843,37 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
             }
         };
         let inputs = [input];
-        let parameters = [self.slots[slot_index].parameters];
-        self.slots[slot_index]
-            .processor
-            .process(
-                &inputs,
-                &parameters,
-                LinearGain::UNITY,
-                StereoOutput {
-                    left: &mut self.channel_output.left[..frame_count],
-                    right: &mut self.channel_output.right[..frame_count],
-                },
-            )
-            .map_err(RuntimeProcessError::Mixer)
+        if self.automation.is_some() {
+            let slot = &mut self.slots[slot_index];
+            let controlled = [ControlledInputBlock {
+                input,
+                parameters: &slot.controls[..frame_count],
+            }];
+            slot.processor
+                .process_controlled(
+                    &controlled,
+                    &self.unity_master_controls[..frame_count],
+                    StereoOutput {
+                        left: &mut self.channel_output.left[..frame_count],
+                        right: &mut self.channel_output.right[..frame_count],
+                    },
+                )
+                .map_err(RuntimeProcessError::Mixer)
+        } else {
+            let parameters = [self.slots[slot_index].parameters];
+            self.slots[slot_index]
+                .processor
+                .process(
+                    &inputs,
+                    &parameters,
+                    LinearGain::UNITY,
+                    StereoOutput {
+                        left: &mut self.channel_output.left[..frame_count],
+                        right: &mut self.channel_output.right[..frame_count],
+                    },
+                )
+                .map_err(RuntimeProcessError::Mixer)
+        }
     }
 
     fn route_channel_output(&mut self, slot_index: usize, frame_count: usize) {
@@ -530,6 +890,20 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
             }
         }
     }
+}
+
+fn automated_gain(value: Option<i32>, base: LinearGain) -> Result<LinearGain, RuntimeProcessError> {
+    let Some(value) = value else {
+        return Ok(base);
+    };
+    let value = u32::try_from(value).map_err(|_| RuntimeProcessError::AutomationValueMismatch)?;
+    LinearGain::from_millionths(value).map_err(RuntimeProcessError::Parameter)
+}
+
+fn automated_pan(value: Option<i32>, base: Pan) -> Result<Pan, RuntimeProcessError> {
+    value.map_or(Ok(base), |value| {
+        Pan::from_millionths(value).map_err(RuntimeProcessError::Parameter)
+    })
 }
 
 fn accumulate(destination: &mut StereoBuffer, source: &StereoBuffer, frame_count: usize) {

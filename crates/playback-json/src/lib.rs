@@ -5,9 +5,10 @@ mod automation;
 mod strict;
 
 pub use automation::{
-    AutomationChannelParameter, AutomationEvaluationError, AutomationInterpolation, AutomationLane,
-    AutomationMainParameter, AutomationPoint, AutomationSendParameter, AutomationTake,
-    AutomationTarget, AutomationValue, LoadedAutomationSet,
+    AutomationChannelParameter, AutomationCompileError, AutomationEvaluationError,
+    AutomationInterpolation, AutomationLane, AutomationMainParameter, AutomationPoint,
+    AutomationSendParameter, AutomationTake, AutomationTarget, AutomationValue, CompiledAutomation,
+    LoadedAutomationSet,
 };
 
 use core::error::Error;
@@ -287,6 +288,7 @@ pub struct LoadedMixer {
     channels: Vec<LoadedMixerChannel>,
     return_buses: Vec<(MixerBus, String)>,
     main_gain: LinearGain,
+    main_muted: bool,
     cue_source: CueSource,
     cue_gain: LinearGain,
     cue_muted: bool,
@@ -339,6 +341,8 @@ pub struct CompiledMixerGraph {
     slots: Vec<CompiledGraphSlot>,
     processing_order: Vec<usize>,
     master_gain: LinearGain,
+    main_gain: LinearGain,
+    main_muted: bool,
 }
 
 impl CompiledMixerGraph {
@@ -356,6 +360,16 @@ impl CompiledMixerGraph {
     pub const fn master_gain(&self) -> LinearGain {
         self.master_gain
     }
+
+    #[must_use]
+    pub const fn main_gain(&self) -> LinearGain {
+        self.main_gain
+    }
+
+    #[must_use]
+    pub const fn main_muted(&self) -> bool {
+        self.main_muted
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -363,6 +377,8 @@ pub struct CompiledGraphSlot {
     track_id: String,
     kind: CompiledMixerTrackKind,
     parameters: ChannelParameters,
+    muted: bool,
+    solo: bool,
     destination: CompiledMixerDestination,
     sends: Vec<CompiledMixerSend>,
 }
@@ -381,6 +397,16 @@ impl CompiledGraphSlot {
     #[must_use]
     pub const fn parameters(&self) -> ChannelParameters {
         self.parameters
+    }
+
+    #[must_use]
+    pub const fn muted(&self) -> bool {
+        self.muted
+    }
+
+    #[must_use]
+    pub const fn solo(&self) -> bool {
+        self.solo
     }
 
     #[must_use]
@@ -412,6 +438,7 @@ pub struct CompiledMixerSend {
     target_slot: usize,
     tap: CompiledMixerTap,
     parameters: ChannelParameters,
+    enabled: bool,
 }
 
 impl CompiledMixerSend {
@@ -428,6 +455,11 @@ impl CompiledMixerSend {
     #[must_use]
     pub const fn parameters(self) -> ChannelParameters {
         self.parameters
+    }
+
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        self.enabled
     }
 }
 
@@ -549,7 +581,11 @@ impl LoadedMixer {
         }
         Ok(CompiledMainMixer {
             slots,
-            master_gain: self.main_gain,
+            master_gain: if self.main_muted {
+                LinearGain::SILENCE
+            } else {
+                self.main_gain
+            },
         })
     }
 
@@ -618,6 +654,7 @@ impl LoadedMixer {
                         MixerTap::PostFader => CompiledMixerTap::PostFader,
                     },
                     parameters,
+                    enabled: send.parameters.audible,
                 });
             }
             let mut parameters = channel.parameters;
@@ -626,6 +663,8 @@ impl LoadedMixer {
                 track_id: try_owned_compile(&channel.track_id)?,
                 kind,
                 parameters,
+                muted: !channel.parameters.audible,
+                solo: channel.solo,
                 destination,
                 sends,
             });
@@ -634,7 +673,13 @@ impl LoadedMixer {
         Ok(CompiledMixerGraph {
             slots,
             processing_order,
-            master_gain: self.main_gain,
+            master_gain: if self.main_muted {
+                LinearGain::SILENCE
+            } else {
+                self.main_gain
+            },
+            main_gain: self.main_gain,
+            main_muted: self.main_muted,
         })
     }
 
@@ -1328,12 +1373,8 @@ fn load_mixer_document(
             try_owned_load(&return_bus.track_id)?,
         ));
     }
-    let main_gain = if document.main.mute {
-        LinearGain::SILENCE
-    } else {
-        LinearGain::from_millionths(document.main.gain_millionths)
-            .map_err(|error| domain_error_value(location, &error.to_string()))?
-    };
+    let main_gain = LinearGain::from_millionths(document.main.gain_millionths)
+        .map_err(|error| domain_error_value(location, &error.to_string()))?;
     let cue_gain = LinearGain::from_millionths(document.cue.gain_millionths)
         .map_err(|error| domain_error_value(location, &error.to_string()))?;
     let cue_source = match document.cue.source {
@@ -1345,6 +1386,7 @@ fn load_mixer_document(
         channels,
         return_buses,
         main_gain,
+        main_muted: document.main.mute,
         cue_source,
         cue_gain,
         cue_muted: document.cue.mute,
@@ -2498,6 +2540,7 @@ mod tests {
             channels: vec![channel.clone()],
             return_buses: Vec::new(),
             main_gain: LinearGain::UNITY,
+            main_muted: false,
             cue_source: CueSource::Main,
             cue_gain: LinearGain::UNITY,
             cue_muted: false,
@@ -2726,6 +2769,79 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn automation_compiler_evaluates_exact_sample_starts() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer = loaded.load_mixer(MIXER, LoaderLimits::VERSION_1).unwrap();
+        let take = br#"{
+            "format":"hyper-automation-take","format_version":1,
+            "id":"take","project_id":"project","name":"Pass","enabled":true,
+            "captured_at_utc":"2026-07-28T12:05:00.000Z",
+            "start_tick":0,"end_tick":8,
+            "lanes":[{
+                "id":"lane",
+                "target":{"kind":"mixer-channel","track_id":"track","parameter":"gain"},
+                "interpolation":"linear",
+                "points":[{"tick":0,"value":1000000},{"tick":3,"value":0}]
+            }],
+            "extensions":{}
+        }"#;
+        let automation = loaded
+            .load_automation_takes(&mixer, &[take], LoaderLimits::VERSION_1)
+            .unwrap();
+        let graph = mixer.compile_main_graph().unwrap();
+        let compiled = loaded.compile_main_automation(&graph, &automation).unwrap();
+        assert_eq!(compiled.target_count(), 1);
+        let mut frame_values = Vec::new();
+        compiled
+            .visit_frame_values(25, |target, value| {
+                frame_values.push((target, value));
+            })
+            .unwrap();
+        assert_eq!(
+            frame_values,
+            vec![(
+                AutomationTarget::Channel {
+                    slot: 0,
+                    parameter: AutomationChannelParameter::Gain,
+                },
+                AutomationValue::Integer(666_667),
+            )]
+        );
+        frame_values.clear();
+        compiled
+            .visit_frame_values(200, |target, value| frame_values.push((target, value)))
+            .unwrap();
+        assert!(frame_values.is_empty());
+
+        let cue_take = br#"{
+            "format":"hyper-automation-take","format_version":1,
+            "id":"cue-take","project_id":"project","name":"Cue pass","enabled":true,
+            "captured_at_utc":"2026-07-28T12:06:00.000Z",
+            "start_tick":0,"end_tick":8,
+            "lanes":[{
+                "id":"cue-lane",
+                "target":{"kind":"mixer-cue","parameter":"gain"},
+                "interpolation":"linear",
+                "points":[{"tick":0,"value":1000000},{"tick":3,"value":0}]
+            }],
+            "extensions":{}
+        }"#;
+        let cue_automation = loaded
+            .load_automation_takes(&mixer, &[cue_take], LoaderLimits::VERSION_1)
+            .unwrap();
+        assert!(matches!(
+            loaded.compile_main_automation(&graph, &cue_automation),
+            Err(AutomationCompileError::UnsupportedCueTarget)
+        ));
     }
 
     #[test]

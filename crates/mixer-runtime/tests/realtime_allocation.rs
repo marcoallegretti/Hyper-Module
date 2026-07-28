@@ -94,6 +94,9 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
     let fixture = graph_fixture();
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
     let mut runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 64).unwrap();
+    let mut automated =
+        GraphMainRuntime::try_new_automated(&prepared, &fixture.mixer, fixture.automation, 64)
+            .unwrap();
     let mut left_0 = [0.0_f32; 64];
     let mut right_0 = [0.0_f32; 64];
     let mut left_1 = [0.0_f32; 64];
@@ -124,8 +127,17 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
             right: &mut output_right,
         },
     );
+    let automated_result = automated.process_window(
+        0,
+        &mut scratch,
+        StereoOutput {
+            left: &mut output_left,
+            right: &mut output_right,
+        },
+    );
     COUNTING.store(false, Ordering::SeqCst);
 
     assert!(result.is_ok());
+    assert!(automated_result.is_ok());
     assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
 }

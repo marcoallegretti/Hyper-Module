@@ -2,8 +2,8 @@ use hyper_audio_source::DecodedAudio;
 use hyper_media_cache::{CacheLimits, DecodedMediaCache, DecodedMediaCacheBuilder};
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_json::{
-    CompiledMainMixer, CompiledMixerGraph, LoaderLimits, MediaAssetFact, OwnedCompiledSchedule,
-    PlaybackJsonInput, load,
+    CompiledAutomation, CompiledMainMixer, CompiledMixerGraph, LoaderLimits, MediaAssetFact,
+    OwnedCompiledSchedule, PlaybackJsonInput, load,
 };
 
 pub struct Fixture {
@@ -17,6 +17,11 @@ pub struct GraphFixture {
     pub cache: DecodedMediaCache,
     pub schedule: OwnedCompiledSchedule,
     pub mixer: CompiledMixerGraph,
+    #[allow(
+        dead_code,
+        reason = "compiled automation is consumed by the functional and allocation binaries"
+    )]
+    pub automation: CompiledAutomation,
     #[allow(
         dead_code,
         reason = "sample vector is asserted by the functional test binary"
@@ -145,7 +150,7 @@ pub fn graph_fixture() -> GraphFixture {
     let silent = br#"{
         "format":"hyper-track","format_version":1,"id":"silent",
         "project_id":"project","name":"Silent","kind":"audio","order":1,
-        "active":true,"clip_ids":[],"extensions":{}
+        "active":true,"clip_ids":["clip-silent"],"extensions":{}
     }"#;
     let group = br#"{
         "format":"hyper-track","format_version":1,"id":"group",
@@ -176,13 +181,33 @@ pub fn graph_fixture() -> GraphFixture {
         ],
         "extensions":{}
     }"#;
+    let silent_clip = br#"{
+        "format":"hyper-audio-clip","format_version":1,"id":"clip-silent",
+        "project_id":"project","track_id":"silent","name":"Silent Clip","enabled":true,
+        "duration_ticks":4,
+        "source":{"asset_id":"asset","start_frame":0,"frame_count":100},
+        "loop":{"enabled":false,"start_tick":0,"end_tick":4},
+        "playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},
+        "fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},
+        "warp_markers":[
+            {"tick":0,"source_frame_offset":0},
+            {"tick":4,"source_frame_offset":100}
+        ],
+        "extensions":{}
+    }"#;
     let arrangement = br#"{
         "format":"hyper-arrangement","format_version":1,"id":"arrangement",
         "project_id":"project","name":"Main","enabled":true,
-        "placements":[{
-            "id":"placement","track_id":"source","clip_id":"clip",
-            "start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true
-        }],
+        "placements":[
+            {
+                "id":"placement-silent","track_id":"silent","clip_id":"clip-silent",
+                "start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true
+            },
+            {
+                "id":"placement","track_id":"source","clip_id":"clip",
+                "start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true
+            }
+        ],
         "scene_launches":[],"extensions":{}
     }"#;
     let mixer = br#"{
@@ -235,8 +260,53 @@ pub fn graph_fixture() -> GraphFixture {
         "cue":{"source":"solo","gain_millionths":1000000,"mute":false},
         "extensions":{}
     }"#;
+    let automation = br#"{
+        "format":"hyper-automation-take","format_version":1,
+        "id":"automation","project_id":"project","name":"Main pass","enabled":true,
+        "captured_at_utc":"2026-07-28T14:00:00.000Z",
+        "start_tick":0,"end_tick":5,
+        "lanes":[
+            {
+                "id":"automation-gain",
+                "target":{"kind":"mixer-channel","track_id":"source","parameter":"gain"},
+                "interpolation":"linear",
+                "points":[{"tick":0,"value":0},{"tick":4,"value":1000000}]
+            },
+            {
+                "id":"automation-main-mute",
+                "target":{"kind":"mixer-main","parameter":"mute"},
+                "interpolation":"hold",
+                "points":[
+                    {"tick":0,"value":false},
+                    {"tick":2,"value":true},
+                    {"tick":3,"value":false}
+                ]
+            },
+            {
+                "id":"automation-send",
+                "target":{"kind":"mixer-send","send_id":"send-a","parameter":"enabled"},
+                "interpolation":"hold",
+                "points":[
+                    {"tick":0,"value":true},
+                    {"tick":1,"value":false},
+                    {"tick":2,"value":true}
+                ]
+            },
+            {
+                "id":"automation-solo",
+                "target":{"kind":"mixer-channel","track_id":"source","parameter":"solo"},
+                "interpolation":"hold",
+                "points":[
+                    {"tick":0,"value":true},
+                    {"tick":1,"value":false},
+                    {"tick":3,"value":true}
+                ]
+            }
+        ],
+        "extensions":{}
+    }"#;
     let tracks: [&[u8]; 5] = [source, silent, group, return_a, return_b];
-    let clips: [&[u8]; 1] = [clip];
+    let clips: [&[u8]; 2] = [clip, silent_clip];
     let loaded = load(
         PlaybackJsonInput {
             project_id: "project",
@@ -259,10 +329,13 @@ pub fn graph_fixture() -> GraphFixture {
             GraphLimits::VERSION_1,
         )
         .unwrap();
-    let mixer = loaded
-        .load_mixer(mixer, LoaderLimits::VERSION_1)
-        .unwrap()
-        .compile_main_graph()
+    let loaded_mixer = loaded.load_mixer(mixer, LoaderLimits::VERSION_1).unwrap();
+    let loaded_automation = loaded
+        .load_automation_takes(&loaded_mixer, &[automation], LoaderLimits::VERSION_1)
+        .unwrap();
+    let mixer = loaded_mixer.compile_main_graph().unwrap();
+    let automation = loaded
+        .compile_main_automation(&mixer, &loaded_automation)
         .unwrap();
     let samples: Vec<f32> = (0_u16..100).map(|frame| f32::from(frame) / 100.0).collect();
     let mut builder = DecodedMediaCacheBuilder::try_new(CacheLimits {
@@ -282,6 +355,7 @@ pub fn graph_fixture() -> GraphFixture {
         cache: builder.seal(),
         schedule,
         mixer,
+        automation,
         samples,
     }
 }
