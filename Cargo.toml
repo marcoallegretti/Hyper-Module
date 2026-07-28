@@ -9,6 +9,7 @@ members = [
     "crates/offline-renderer",
     "crates/playback-compiler",
     "crates/playback-json",
+    "software/IDE/audio-backend",
 ]
 resolver = "3"
 

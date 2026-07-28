@@ -1,0 +1,14 @@
+[package]
+name = "hyper-desktop-audio"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[target.'cfg(all(target_os = "linux", target_endian = "little"))'.dependencies]
+bytemuck = "=1.24.0"
+pipewire = "=0.10.0"
+spa-sys = { package = "libspa-sys", version = "=0.10.0" }

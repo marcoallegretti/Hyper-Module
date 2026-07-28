@@ -74,3 +74,31 @@ Licenses:
 
 - <https://github.com/mgeier/rtrb/blob/0.3.4/LICENSE-MIT>
 - <https://github.com/mgeier/rtrb/blob/0.3.4/LICENSE-APACHE>
+
+## PipeWire Rust bindings 0.10.0
+
+The Linux portion of `hyper-desktop-audio` uses the `pipewire`, `libspa`,
+`pipewire-sys`, and `libspa-sys` 0.10.0 crates.
+
+Copyright the pipewire-rs contributors. Licensed under the MIT License.
+
+Source: <https://gitlab.freedesktop.org/pipewire/pipewire-rs/-/tree/v0.10.0>
+
+License: <https://gitlab.freedesktop.org/pipewire/pipewire-rs/-/blob/v0.10.0/LICENSE>
+
+## bytemuck 1.24.0
+
+The Linux PipeWire callback uses `bytemuck` 1.24.0 for checked conversion of
+mapped byte buffers to native `f32` samples without unsafe code in this
+repository.
+
+Copyright the bytemuck contributors. Licensed under the zlib License,
+Apache License 2.0, or MIT License.
+
+Source: <https://github.com/Lokathor/bytemuck/tree/da748163ea203f80098b6bdc754c54ebc535364c>
+
+Licenses:
+
+- <https://github.com/Lokathor/bytemuck/blob/da748163ea203f80098b6bdc754c54ebc535364c/LICENSE-ZLIB>
+- <https://github.com/Lokathor/bytemuck/blob/da748163ea203f80098b6bdc754c54ebc535364c/LICENSE-APACHE>
+- <https://github.com/Lokathor/bytemuck/blob/da748163ea203f80098b6bdc754c54ebc535364c/LICENSE-MIT>

@@ -1,0 +1,352 @@
+use core::error::Error;
+use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
+
+pub const STEREO_CHANNELS: usize = 2;
+pub const MAXIMUM_BLOCK_FRAMES: usize = 4_096;
+
+pub trait InterleavedStereoProcessor: Send + 'static {
+    type Error;
+
+    /// Renders one interleaved stereo block in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-defined error when the block cannot be
+    /// rendered. The output owner replaces the block with silence.
+    fn process(&mut self, output: &mut [f32]) -> Result<(), Self::Error>;
+}
+
+impl<F, E> InterleavedStereoProcessor for F
+where
+    F: FnMut(&mut [f32]) -> Result<(), E> + Send + 'static,
+{
+    type Error = E;
+
+    fn process(&mut self, output: &mut [f32]) -> Result<(), Self::Error> {
+        self(output)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputCallbackStatus {
+    Rendered,
+    ProcessorFailed,
+    ProcessorPanicked,
+    SampleCountNotStereoAligned { samples: usize },
+    BlockTooLarge { frames: usize, maximum: usize },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OutputStreamSnapshot {
+    pub callback_count: u64,
+    pub rendered_callback_count: u64,
+    pub rendered_frame_count: u64,
+    pub silent_frame_count: u64,
+    pub processor_failure_count: u64,
+    pub processor_panic_count: u64,
+    pub invalid_shape_count: u64,
+    pub oversized_block_count: u64,
+    pub unavailable_buffer_count: u64,
+    pub malformed_buffer_count: u64,
+    pub stream_error_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct OutputStreamCounterState {
+    callbacks: AtomicU64,
+    rendered_callbacks: AtomicU64,
+    rendered_frames: AtomicU64,
+    silent_frames: AtomicU64,
+    processor_failures: AtomicU64,
+    processor_panics: AtomicU64,
+    invalid_shapes: AtomicU64,
+    oversized_blocks: AtomicU64,
+    unavailable_buffers: AtomicU64,
+    malformed_buffers: AtomicU64,
+    stream_errors: AtomicU64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OutputStreamCounters {
+    state: Arc<OutputStreamCounterState>,
+}
+
+impl OutputStreamCounters {
+    #[must_use]
+    pub fn snapshot(&self) -> OutputStreamSnapshot {
+        OutputStreamSnapshot {
+            callback_count: self.state.callbacks.load(Ordering::Relaxed),
+            rendered_callback_count: self.state.rendered_callbacks.load(Ordering::Relaxed),
+            rendered_frame_count: self.state.rendered_frames.load(Ordering::Relaxed),
+            silent_frame_count: self.state.silent_frames.load(Ordering::Relaxed),
+            processor_failure_count: self.state.processor_failures.load(Ordering::Relaxed),
+            processor_panic_count: self.state.processor_panics.load(Ordering::Relaxed),
+            invalid_shape_count: self.state.invalid_shapes.load(Ordering::Relaxed),
+            oversized_block_count: self.state.oversized_blocks.load(Ordering::Relaxed),
+            unavailable_buffer_count: self.state.unavailable_buffers.load(Ordering::Relaxed),
+            malformed_buffer_count: self.state.malformed_buffers.load(Ordering::Relaxed),
+            stream_error_count: self.state.stream_errors.load(Ordering::Relaxed),
+        }
+    }
+
+    fn add(counter: &AtomicU64, amount: usize) {
+        let amount = u64::try_from(amount).unwrap_or(u64::MAX);
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(amount))
+        });
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    fn record_unavailable_buffer(&self) {
+        Self::add(&self.state.unavailable_buffers, 1);
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    fn record_malformed_buffer(&self, frames: usize) {
+        Self::add(&self.state.callbacks, 1);
+        Self::add(&self.state.malformed_buffers, 1);
+        Self::add(&self.state.silent_frames, frames);
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    fn record_stream_error(&self) {
+        Self::add(&self.state.stream_errors, 1);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputCallbackConfigError {
+    InvalidMaximumBlockFrames { actual: usize, maximum: usize },
+}
+
+impl fmt::Display for OutputCallbackConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidMaximumBlockFrames { actual, maximum } => write!(
+                formatter,
+                "maximum callback block has {actual} frames; expected 1 through {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for OutputCallbackConfigError {}
+
+#[derive(Debug)]
+pub struct OutputCallback<P> {
+    processor: P,
+    maximum_block_frames: usize,
+    counters: OutputStreamCounters,
+    processor_panicked: bool,
+}
+
+impl<P: InterleavedStereoProcessor> OutputCallback<P> {
+    /// Creates a fail-silent callback owner for interleaved stereo `f32`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutputCallbackConfigError`] when the callback capacity is
+    /// zero or exceeds [`MAXIMUM_BLOCK_FRAMES`].
+    pub fn try_new(
+        processor: P,
+        maximum_block_frames: usize,
+    ) -> Result<Self, OutputCallbackConfigError> {
+        if !(1..=MAXIMUM_BLOCK_FRAMES).contains(&maximum_block_frames) {
+            return Err(OutputCallbackConfigError::InvalidMaximumBlockFrames {
+                actual: maximum_block_frames,
+                maximum: MAXIMUM_BLOCK_FRAMES,
+            });
+        }
+        Ok(Self {
+            processor,
+            maximum_block_frames,
+            counters: OutputStreamCounters::default(),
+            processor_panicked: false,
+        })
+    }
+
+    #[must_use]
+    pub fn counters(&self) -> OutputStreamCounters {
+        self.counters.clone()
+    }
+
+    #[must_use]
+    pub const fn maximum_block_frames(&self) -> usize {
+        self.maximum_block_frames
+    }
+
+    pub fn process(&mut self, output: &mut [f32]) -> OutputCallbackStatus {
+        let samples = output.len();
+        if !samples.is_multiple_of(STEREO_CHANNELS) {
+            output.fill(0.0);
+            OutputStreamCounters::add(&self.counters.state.callbacks, 1);
+            OutputStreamCounters::add(&self.counters.state.invalid_shapes, 1);
+            return OutputCallbackStatus::SampleCountNotStereoAligned { samples };
+        }
+        let frames = samples / STEREO_CHANNELS;
+        if frames > self.maximum_block_frames {
+            output.fill(0.0);
+            OutputStreamCounters::add(&self.counters.state.callbacks, 1);
+            OutputStreamCounters::add(&self.counters.state.oversized_blocks, 1);
+            OutputStreamCounters::add(&self.counters.state.silent_frames, frames);
+            return OutputCallbackStatus::BlockTooLarge {
+                frames,
+                maximum: self.maximum_block_frames,
+            };
+        }
+
+        output.fill(0.0);
+        OutputStreamCounters::add(&self.counters.state.callbacks, 1);
+        if self.processor_panicked {
+            OutputStreamCounters::add(&self.counters.state.silent_frames, frames);
+            return OutputCallbackStatus::ProcessorPanicked;
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| self.processor.process(output)));
+        match result {
+            Ok(Ok(())) => {
+                OutputStreamCounters::add(&self.counters.state.rendered_callbacks, 1);
+                OutputStreamCounters::add(&self.counters.state.rendered_frames, frames);
+                OutputCallbackStatus::Rendered
+            }
+            Ok(Err(_)) => {
+                output.fill(0.0);
+                OutputStreamCounters::add(&self.counters.state.processor_failures, 1);
+                OutputStreamCounters::add(&self.counters.state.silent_frames, frames);
+                OutputCallbackStatus::ProcessorFailed
+            }
+            Err(_) => {
+                self.processor_panicked = true;
+                output.fill(0.0);
+                OutputStreamCounters::add(&self.counters.state.processor_panics, 1);
+                OutputStreamCounters::add(&self.counters.state.silent_frames, frames);
+                OutputCallbackStatus::ProcessorPanicked
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+mod pipewire_output;
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+pub use pipewire_output::{
+    PipeWireOutputConfig, PipeWireOutputConfigError, PipeWireOutputStream, PipeWireStartError,
+    PipeWireStartupStage, PipeWireStopError,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_samples(actual: &[f32], expected: f32) {
+        assert!(
+            actual
+                .iter()
+                .all(|sample| (*sample - expected).abs() <= f32::EPSILON)
+        );
+    }
+
+    #[test]
+    fn callback_is_fail_silent_and_counts_every_outcome() {
+        let call = 0_u8;
+        let mut callback = OutputCallback::try_new(
+            {
+                let mut call = call;
+                move |output: &mut [f32]| -> Result<(), &'static str> {
+                    call += 1;
+                    output.fill(f32::from(call));
+                    match call {
+                        1 => Ok(()),
+                        2 => Err("failure"),
+                        _ => panic!("panic"),
+                    }
+                }
+            },
+            2,
+        )
+        .unwrap();
+        let counters = callback.counters();
+
+        let mut rendered = [9.0_f32; 4];
+        assert_eq!(
+            callback.process(&mut rendered),
+            OutputCallbackStatus::Rendered
+        );
+        assert_samples(&rendered, 1.0);
+
+        let mut failed = [9.0_f32; 4];
+        assert_eq!(
+            callback.process(&mut failed),
+            OutputCallbackStatus::ProcessorFailed
+        );
+        assert_samples(&failed, 0.0);
+
+        let mut panicked = [9.0_f32; 4];
+        assert_eq!(
+            callback.process(&mut panicked),
+            OutputCallbackStatus::ProcessorPanicked
+        );
+        assert_samples(&panicked, 0.0);
+
+        let mut after_panic = [9.0_f32; 4];
+        assert_eq!(
+            callback.process(&mut after_panic),
+            OutputCallbackStatus::ProcessorPanicked
+        );
+        assert_samples(&after_panic, 0.0);
+
+        let mut malformed = [9.0_f32; 3];
+        assert_eq!(
+            callback.process(&mut malformed),
+            OutputCallbackStatus::SampleCountNotStereoAligned { samples: 3 }
+        );
+        assert_samples(&malformed, 0.0);
+
+        let mut oversized = [9.0_f32; 6];
+        assert_eq!(
+            callback.process(&mut oversized),
+            OutputCallbackStatus::BlockTooLarge {
+                frames: 3,
+                maximum: 2
+            }
+        );
+        assert_samples(&oversized, 0.0);
+
+        assert_eq!(
+            counters.snapshot(),
+            OutputStreamSnapshot {
+                callback_count: 6,
+                rendered_callback_count: 1,
+                rendered_frame_count: 2,
+                silent_frame_count: 9,
+                processor_failure_count: 1,
+                processor_panic_count: 1,
+                invalid_shape_count: 1,
+                oversized_block_count: 1,
+                ..OutputStreamSnapshot::default()
+            }
+        );
+    }
+
+    #[test]
+    fn callback_capacity_is_strict() {
+        let processor = |_: &mut [f32]| Ok::<_, ()>(());
+        assert!(matches!(
+            OutputCallback::try_new(processor, 0),
+            Err(OutputCallbackConfigError::InvalidMaximumBlockFrames {
+                actual: 0,
+                maximum: MAXIMUM_BLOCK_FRAMES
+            })
+        ));
+        let processor = |_: &mut [f32]| Ok::<_, ()>(());
+        assert!(matches!(
+            OutputCallback::try_new(processor, MAXIMUM_BLOCK_FRAMES + 1),
+            Err(OutputCallbackConfigError::InvalidMaximumBlockFrames {
+                actual,
+                maximum: MAXIMUM_BLOCK_FRAMES
+            }) if actual == MAXIMUM_BLOCK_FRAMES + 1
+        ));
+    }
+}
