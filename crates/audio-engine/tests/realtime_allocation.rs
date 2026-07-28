@@ -5,7 +5,8 @@ use std::alloc::System;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hyper_audio_engine::{
-    ChannelParameters, ControlledInputBlock, InputBlock, LinearGain, Pan, StereoMixer, StereoOutput,
+    ChannelParameters, ControlledInputBlock, InputBlock, InterleavedStereoCallback, LinearGain,
+    Pan, StereoMixer, StereoOutput,
 };
 
 struct CountingAllocator;
@@ -69,6 +70,10 @@ fn processing_performs_zero_heap_allocations() {
     let mut controlled_mixer = StereoMixer::try_new(&parameters[..1], LinearGain::UNITY).unwrap();
     let mut output_left = [0.0_f32; 128];
     let mut output_right = [0.0_f32; 128];
+    let mut callback = InterleavedStereoCallback::try_new(128).unwrap();
+    let mut interleaved = [0.0_f32; 256];
+    let mut failed_interleaved = [1.0_f32; 256];
+    let mut invalid_interleaved = [1.0_f32; 3];
 
     ALLOCATIONS.store(0, Ordering::SeqCst);
     COUNTING.store(true, Ordering::SeqCst);
@@ -89,9 +94,23 @@ fn processing_performs_zero_heap_allocations() {
             right: &mut output_right,
         },
     );
+    let callback_result = callback.process(&mut interleaved, |output| {
+        output.left.fill(0.25);
+        output.right.fill(-0.25);
+        Ok::<_, u8>(())
+    });
+    let callback_failure = callback.process(&mut failed_interleaved, |output| {
+        output.left.fill(0.5);
+        output.right.fill(-0.5);
+        Err::<(), _>(7_u8)
+    });
+    let callback_validation = callback.process(&mut invalid_interleaved, |_| Ok::<_, u8>(()));
     COUNTING.store(false, Ordering::SeqCst);
 
     assert!(result.is_ok());
     assert!(controlled_result.is_ok());
+    assert!(callback_result.is_ok());
+    assert!(callback_failure.is_err());
+    assert!(callback_validation.is_err());
     assert_eq!(ALLOCATIONS.load(Ordering::SeqCst), 0);
 }

@@ -1,7 +1,7 @@
 mod common;
 
 use hyper_arrangement_renderer::RenderScratchSlot;
-use hyper_audio_engine::{MAX_PROCESS_FRAMES, StereoOutput};
+use hyper_audio_engine::{InterleavedStereoCallback, MAX_PROCESS_FRAMES, StereoOutput};
 use hyper_mixer_runtime::{
     FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, LocateState,
     MAX_QUEUED_TRANSPORT_COMMANDS, RuntimeCreationError, RuntimeProcessError, TransportCommand,
@@ -417,6 +417,49 @@ fn queued_transport_commands_preserve_fifo_order_across_threads() {
     assert!(left[0] > 0.0);
     assert!(right[0] > 0.0);
     sender.try_send(TransportCommand::Stop).unwrap();
+}
+
+#[test]
+fn interleaved_callback_executes_the_transport_runtime() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime =
+        GraphMainRuntime::try_new_automated(&prepared, &fixture.mixer, fixture.automation, 8)
+            .unwrap();
+    let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(runtime);
+    let mut callback = InterleavedStereoCallback::try_new(8).unwrap();
+    sender.try_send(TransportCommand::Start).unwrap();
+    let mut scratch_left = [[9.0_f32; 2]; 5];
+    let mut scratch_right = [[9.0_f32; 2]; 5];
+    let [left_0, left_1, left_2, left_3, left_4] = &mut scratch_left;
+    let [right_0, right_1, right_2, right_3, right_4] = &mut scratch_right;
+    let mut scratch = [
+        RenderScratchSlot::new(left_0, right_0),
+        RenderScratchSlot::new(left_1, right_1),
+        RenderScratchSlot::new(left_2, right_2),
+        RenderScratchSlot::new(left_3, right_3),
+        RenderScratchSlot::new(left_4, right_4),
+    ];
+    let mut interleaved = [9.0_f32; 4];
+
+    let cycle = callback
+        .process(&mut interleaved, |output| {
+            transport.process_cycle(&mut scratch, output)
+        })
+        .unwrap();
+
+    assert_eq!(cycle.applied_command_count(), 1);
+    assert_eq!(cycle.state(), TransportState::Rolling);
+    assert_eq!(cycle.start_frame(), 0);
+    assert_eq!(cycle.frame_count(), 2);
+    assert_eq!(transport.position_frame(), 2);
+    assert!(
+        interleaved
+            .iter()
+            .all(|sample| (*sample - 9.0).abs() > f32::EPSILON)
+    );
+    assert!(interleaved.iter().all(|sample| sample.is_finite()));
+    assert!(interleaved.iter().any(|sample| sample.abs() > f32::EPSILON));
 }
 
 #[test]

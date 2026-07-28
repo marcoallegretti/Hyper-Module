@@ -268,6 +268,156 @@ impl fmt::Display for ProcessError {
 
 impl Error for ProcessError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallbackAdapterCreationError {
+    InvalidMaximumFrames { actual: usize, maximum: usize },
+    CapacityUnavailable,
+}
+
+impl fmt::Display for CallbackAdapterCreationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidMaximumFrames { actual, maximum } => write!(
+                formatter,
+                "callback maximum has {actual} frames; valid range is 1..={maximum}"
+            ),
+            Self::CapacityUnavailable => {
+                formatter.write_str("callback planar buffer capacity is unavailable")
+            }
+        }
+    }
+}
+
+impl Error for CallbackAdapterCreationError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StereoCallbackError<E> {
+    SampleCountNotStereoAligned { samples: usize },
+    BlockTooLarge { actual: usize, maximum: usize },
+    Processor(E),
+}
+
+impl<E: fmt::Display> fmt::Display for StereoCallbackError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SampleCountNotStereoAligned { samples } => write!(
+                formatter,
+                "interleaved callback has {samples} samples; stereo requires an even sample count"
+            ),
+            Self::BlockTooLarge { actual, maximum } => write!(
+                formatter,
+                "callback block has {actual} frames; configured maximum is {maximum}"
+            ),
+            Self::Processor(source) => write!(formatter, "stereo processing failed: {source}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for StereoCallbackError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Processor(source) => Some(source),
+            Self::SampleCountNotStereoAligned { .. } | Self::BlockTooLarge { .. } => None,
+        }
+    }
+}
+
+/// Preallocated adapter from interleaved stereo device buffers to planar DSP.
+///
+/// Device setup owns sample-format and channel negotiation. Callback processing
+/// performs no allocation, waiting, I/O, logging, or dynamic dispatch. Output
+/// is interleaved only after the processor succeeds; every rejected or failed
+/// callback is replaced with silence.
+#[derive(Debug)]
+pub struct InterleavedStereoCallback {
+    left: Vec<f32>,
+    right: Vec<f32>,
+}
+
+impl InterleavedStereoCallback {
+    /// Allocates both planar callback buffers before device processing starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallbackAdapterCreationError`] for a zero or unsupported frame
+    /// bound, or if either planar buffer cannot be reserved.
+    pub fn try_new(maximum_frames: usize) -> Result<Self, CallbackAdapterCreationError> {
+        if maximum_frames == 0 || maximum_frames > MAX_PROCESS_FRAMES {
+            return Err(CallbackAdapterCreationError::InvalidMaximumFrames {
+                actual: maximum_frames,
+                maximum: MAX_PROCESS_FRAMES,
+            });
+        }
+        let mut left = Vec::new();
+        left.try_reserve_exact(maximum_frames)
+            .map_err(|_| CallbackAdapterCreationError::CapacityUnavailable)?;
+        left.resize(maximum_frames, 0.0);
+        let mut right = Vec::new();
+        right
+            .try_reserve_exact(maximum_frames)
+            .map_err(|_| CallbackAdapterCreationError::CapacityUnavailable)?;
+        right.resize(maximum_frames, 0.0);
+        Ok(Self { left, right })
+    }
+
+    #[must_use]
+    pub fn maximum_frames(&self) -> usize {
+        self.left.len()
+    }
+
+    /// Processes one interleaved stereo `f32` device callback.
+    ///
+    /// The supplied processor receives zeroed planar slices of the exact
+    /// callback length. The device buffer is not exposed to partial processor
+    /// writes, and frames left unwritten by a successful processor stay silent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StereoCallbackError`] when the sample count is not stereo
+    /// aligned, the callback exceeds the configured frame bound, or the
+    /// processor fails. Every error clears the complete device buffer.
+    pub fn process<R, E, F>(
+        &mut self,
+        interleaved_output: &mut [f32],
+        processor: F,
+    ) -> Result<R, StereoCallbackError<E>>
+    where
+        F: FnOnce(StereoOutput<'_>) -> Result<R, E>,
+    {
+        if !interleaved_output.len().is_multiple_of(2) {
+            let samples = interleaved_output.len();
+            interleaved_output.fill(0.0);
+            return Err(StereoCallbackError::SampleCountNotStereoAligned { samples });
+        }
+        let frame_count = interleaved_output.len() / 2;
+        if frame_count > self.maximum_frames() {
+            interleaved_output.fill(0.0);
+            return Err(StereoCallbackError::BlockTooLarge {
+                actual: frame_count,
+                maximum: self.maximum_frames(),
+            });
+        }
+        self.left[..frame_count].fill(0.0);
+        self.right[..frame_count].fill(0.0);
+        let result = processor(StereoOutput {
+            left: &mut self.left[..frame_count],
+            right: &mut self.right[..frame_count],
+        });
+        let value = match result {
+            Ok(value) => value,
+            Err(source) => {
+                interleaved_output.fill(0.0);
+                return Err(StereoCallbackError::Processor(source));
+            }
+        };
+        for (frame, samples) in interleaved_output.chunks_exact_mut(2).enumerate() {
+            samples[0] = self.left[frame];
+            samples[1] = self.right[frame];
+        }
+        Ok(value)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ChannelState {
     gain: f32,
@@ -641,6 +791,96 @@ mod tests {
 
     fn parameters(gain: LinearGain, pan: Pan, audible: bool) -> ChannelParameters {
         ChannelParameters::new(gain, pan, audible)
+    }
+
+    #[test]
+    fn callback_adapter_interleaves_exact_variable_sized_blocks() {
+        let mut adapter = InterleavedStereoCallback::try_new(4).unwrap();
+        assert_eq!(adapter.maximum_frames(), 4);
+        let mut output = [9.0_f32; 6];
+
+        let value = adapter
+            .process(&mut output, |planar| {
+                assert_eq!(planar.left.len(), 3);
+                assert_eq!(planar.right.len(), 3);
+                planar.left.copy_from_slice(&[1.0, 2.0, 3.0]);
+                planar.right.copy_from_slice(&[-1.0, -2.0, -3.0]);
+                Ok::<_, ()>(17)
+            })
+            .unwrap();
+
+        assert_eq!(value, 17);
+        assert_samples(&output, &[1.0, -1.0, 2.0, -2.0, 3.0, -3.0]);
+
+        let mut shorter = [9.0_f32; 4];
+        adapter
+            .process(&mut shorter, |planar| {
+                planar.left[0] = 4.0;
+                planar.right[0] = 5.0;
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_samples(&shorter, &[4.0, 5.0, 0.0, 0.0]);
+
+        let mut empty = [];
+        adapter
+            .process(&mut empty, |planar| {
+                assert!(planar.left.is_empty());
+                assert!(planar.right.is_empty());
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn callback_adapter_silences_every_rejected_or_failed_block() {
+        assert_eq!(
+            InterleavedStereoCallback::try_new(0).unwrap_err(),
+            CallbackAdapterCreationError::InvalidMaximumFrames {
+                actual: 0,
+                maximum: MAX_PROCESS_FRAMES,
+            }
+        );
+        assert_eq!(
+            InterleavedStereoCallback::try_new(MAX_PROCESS_FRAMES + 1).unwrap_err(),
+            CallbackAdapterCreationError::InvalidMaximumFrames {
+                actual: MAX_PROCESS_FRAMES + 1,
+                maximum: MAX_PROCESS_FRAMES,
+            }
+        );
+
+        let mut adapter = InterleavedStereoCallback::try_new(4).unwrap();
+        let mut odd = [9.0_f32; 3];
+        assert_eq!(
+            adapter.process(&mut odd, |_| -> Result<(), &'static str> {
+                panic!("processor must not run for an invalid sample count")
+            }),
+            Err(StereoCallbackError::SampleCountNotStereoAligned { samples: 3 })
+        );
+        assert_samples(&odd, &[0.0; 3]);
+
+        let mut oversized = [9.0_f32; 10];
+        assert_eq!(
+            adapter.process(&mut oversized, |_| -> Result<(), &'static str> {
+                panic!("processor must not run for an oversized block")
+            }),
+            Err(StereoCallbackError::BlockTooLarge {
+                actual: 5,
+                maximum: 4,
+            })
+        );
+        assert_samples(&oversized, &[0.0; 10]);
+
+        let mut failed = [9.0_f32; 4];
+        assert_eq!(
+            adapter.process(&mut failed, |planar| {
+                planar.left.fill(1.0);
+                planar.right.fill(2.0);
+                Err::<(), _>("render failure")
+            }),
+            Err(StereoCallbackError::Processor("render failure"))
+        );
+        assert_samples(&failed, &[0.0; 4]);
     }
 
     #[test]

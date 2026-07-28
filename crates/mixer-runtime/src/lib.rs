@@ -1027,8 +1027,8 @@ impl<'prepared, 'cache, 'schedule> GraphMainRuntime<'prepared, 'cache, 'schedule
 
 /// Single-owner transport state for the routed main-output engine.
 ///
-/// Commands are applied synchronously between process cycles. This type does
-/// not provide cross-thread command delivery or device I/O. Stopped cycles
+/// Commands can be applied synchronously or through the optional bounded
+/// cross-thread queue. This type does not provide device I/O. Stopped cycles
 /// produce silence and retain the current frame; rolling cycles advance only
 /// after the complete routed window succeeds.
 #[derive(Debug)]

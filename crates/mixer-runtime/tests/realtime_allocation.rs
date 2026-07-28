@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hyper_arrangement_renderer::RenderScratchSlot;
-use hyper_audio_engine::StereoOutput;
+use hyper_audio_engine::{InterleavedStereoCallback, StereoOutput};
 use hyper_mixer_runtime::{
     FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, TransportCommand,
 };
@@ -119,6 +119,8 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
     ];
     let mut output_left = [0.0_f32; 64];
     let mut output_right = [0.0_f32; 64];
+    let mut callback = InterleavedStereoCallback::try_new(64).unwrap();
+    let mut interleaved = [0.0_f32; 128];
 
     ALLOCATIONS.store(0, Ordering::SeqCst);
     COUNTING.store(true, Ordering::SeqCst);
@@ -131,21 +133,13 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
         },
     );
     let start_result = sender.try_send(TransportCommand::Start);
-    let automated_result = transport.process_cycle(
-        &mut scratch,
-        StereoOutput {
-            left: &mut output_left,
-            right: &mut output_right,
-        },
-    );
+    let automated_result = callback.process(&mut interleaved, |output| {
+        transport.process_cycle(&mut scratch, output)
+    });
     let stop_result = sender.try_send(TransportCommand::Stop);
-    let stopped_result = transport.process_cycle(
-        &mut scratch,
-        StereoOutput {
-            left: &mut output_left,
-            right: &mut output_right,
-        },
-    );
+    let stopped_result = callback.process(&mut interleaved, |output| {
+        transport.process_cycle(&mut scratch, output)
+    });
     COUNTING.store(false, Ordering::SeqCst);
 
     assert!(result.is_ok());
