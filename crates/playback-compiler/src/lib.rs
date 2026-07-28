@@ -51,6 +51,189 @@ impl fmt::Display for TimelineError {
 
 impl Error for TimelineError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameTimelineError {
+    Timeline(TimelineError),
+    CapacityUnavailable,
+    ArithmeticOverflow,
+    TickOutOfRange,
+}
+
+impl fmt::Display for FrameTimelineError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeline(source) => write!(formatter, "timeline is invalid: {source}"),
+            Self::CapacityUnavailable => {
+                formatter.write_str("frame timeline capacity is unavailable")
+            }
+            Self::ArithmeticOverflow => formatter.write_str("frame timeline arithmetic overflowed"),
+            Self::TickOutOfRange => {
+                formatter.write_str("sample frame maps outside the project tick domain")
+            }
+        }
+    }
+}
+
+impl Error for FrameTimelineError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Timeline(source) => Some(source),
+            Self::CapacityUnavailable | Self::ArithmeticOverflow | Self::TickOutOfRange => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrameTempoSegment {
+    start_tick: u64,
+    start_frame_numerator: u128,
+    tick_denominator: u128,
+}
+
+/// Exact musical position at the start of one sample frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameTickPosition {
+    tick: u64,
+    remainder: u128,
+    denominator: u128,
+}
+
+impl FrameTickPosition {
+    #[must_use]
+    pub const fn whole_tick(self) -> u64 {
+        self.tick
+    }
+
+    #[must_use]
+    pub const fn is_at_or_after(self, tick: u64) -> bool {
+        self.tick >= tick
+    }
+
+    #[must_use]
+    pub const fn is_before(self, tick: u64) -> bool {
+        self.tick < tick
+    }
+
+    /// Interpolates an integer value at this exact fractional-tick position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameTimelineError`] unless this position lies in the closed
+    /// interval between two strictly ordered ticks, or if checked arithmetic
+    /// fails.
+    pub fn interpolate_i32(
+        self,
+        left_tick: u64,
+        left_value: i32,
+        right_tick: u64,
+        right_value: i32,
+    ) -> Result<i32, FrameTimelineError> {
+        if left_tick >= right_tick
+            || self.is_before(left_tick)
+            || self.is_at_or_after(right_tick) && self.tick != right_tick
+            || self.tick == right_tick && self.remainder != 0
+        {
+            return Err(FrameTimelineError::TickOutOfRange);
+        }
+        let whole_elapsed = u128::from(self.tick - left_tick)
+            .checked_mul(self.denominator)
+            .ok_or(FrameTimelineError::ArithmeticOverflow)?;
+        let elapsed = whole_elapsed
+            .checked_add(self.remainder)
+            .ok_or(FrameTimelineError::ArithmeticOverflow)?;
+        let duration = u128::from(right_tick - left_tick)
+            .checked_mul(self.denominator)
+            .ok_or(FrameTimelineError::ArithmeticOverflow)?;
+        let elapsed =
+            i128::try_from(elapsed).map_err(|_| FrameTimelineError::ArithmeticOverflow)?;
+        let duration =
+            i128::try_from(duration).map_err(|_| FrameTimelineError::ArithmeticOverflow)?;
+        let delta = i128::from(right_value) - i128::from(left_value);
+        let value = i128::from(left_value)
+            .checked_add(
+                delta
+                    .checked_mul(elapsed)
+                    .ok_or(FrameTimelineError::ArithmeticOverflow)?
+                    / duration,
+            )
+            .ok_or(FrameTimelineError::ArithmeticOverflow)?;
+        i32::try_from(value).map_err(|_| FrameTimelineError::ArithmeticOverflow)
+    }
+}
+
+/// Owned step-tempo index for allocation-free sample-frame to tick conversion.
+#[derive(Clone, Debug)]
+pub struct FrameTimeline {
+    segments: Vec<FrameTempoSegment>,
+}
+
+impl FrameTimeline {
+    /// Builds exact tempo-segment boundaries outside the real-time path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameTimelineError`] for an invalid timeline, unavailable
+    /// capacity, or checked arithmetic failure.
+    pub fn try_new(
+        sample_rate_hz: u32,
+        tempo_events: &[TempoEvent],
+    ) -> Result<Self, FrameTimelineError> {
+        let timeline = Timeline::try_new(sample_rate_hz, tempo_events)
+            .map_err(FrameTimelineError::Timeline)?;
+        let mut segments = Vec::new();
+        segments
+            .try_reserve_exact(tempo_events.len())
+            .map_err(|_| FrameTimelineError::CapacityUnavailable)?;
+        for event in tempo_events {
+            let tick_denominator = u128::from(sample_rate_hz)
+                .checked_mul(u128::from(event.microseconds_per_quarter))
+                .ok_or(FrameTimelineError::ArithmeticOverflow)?;
+            segments.push(FrameTempoSegment {
+                start_tick: event.tick,
+                start_frame_numerator: timeline
+                    .exact_frame_numerator(event.tick)
+                    .map_err(FrameTimelineError::Timeline)?,
+                tick_denominator,
+            });
+        }
+        Ok(Self { segments })
+    }
+
+    /// Returns the exact musical position at the start of `frame`.
+    ///
+    /// A tick boundary inside a sample frame therefore takes effect on the
+    /// first sample whose start is at or after that boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameTimelineError`] for checked arithmetic or if the result
+    /// exceeds the project tick domain.
+    pub fn position_at_frame(&self, frame: usize) -> Result<FrameTickPosition, FrameTimelineError> {
+        let timeline_denominator = u128::from(TICKS_PER_QUARTER) * MICROSECONDS_PER_SECOND;
+        let frame_numerator = u128::try_from(frame)
+            .map_err(|_| FrameTimelineError::ArithmeticOverflow)?
+            .checked_mul(timeline_denominator)
+            .ok_or(FrameTimelineError::ArithmeticOverflow)?;
+        let segment_index = self
+            .segments
+            .partition_point(|segment| segment.start_frame_numerator <= frame_numerator)
+            .saturating_sub(1);
+        let segment = self.segments[segment_index];
+        let elapsed = frame_numerator
+            .checked_sub(segment.start_frame_numerator)
+            .ok_or(FrameTimelineError::ArithmeticOverflow)?;
+        let whole_elapsed = elapsed / segment.tick_denominator;
+        let tick = u128::from(segment.start_tick)
+            .checked_add(whole_elapsed)
+            .ok_or(FrameTimelineError::ArithmeticOverflow)?;
+        Ok(FrameTickPosition {
+            tick: u64::try_from(tick).map_err(|_| FrameTimelineError::TickOutOfRange)?,
+            remainder: elapsed % segment.tick_denominator,
+            denominator: segment.tick_denominator,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Timeline<'a> {
     sample_rate_hz: u32,
@@ -699,6 +882,60 @@ mod tests {
             },
         ];
         assert_eq!(timeline(&boundary).tick_to_frame(2), Ok(25));
+    }
+
+    #[test]
+    fn maps_sample_starts_to_exact_fractional_ticks() {
+        let events = [TempoEvent {
+            tick: 0,
+            microseconds_per_quarter: 500_000,
+        }];
+        let frames = FrameTimeline::try_new(48_000, &events).unwrap();
+        assert_eq!(
+            frames.position_at_frame(0),
+            Ok(FrameTickPosition {
+                tick: 0,
+                remainder: 0,
+                denominator: 24_000_000_000,
+            })
+        );
+        assert_eq!(
+            frames.position_at_frame(12),
+            Ok(FrameTickPosition {
+                tick: 0,
+                remainder: 23_040_000_000,
+                denominator: 24_000_000_000,
+            })
+        );
+        assert_eq!(frames.position_at_frame(13).unwrap().whole_tick(), 1);
+
+        let decreasing = frames
+            .position_at_frame(25)
+            .unwrap()
+            .interpolate_i32(0, 1_000_000, 3, 0)
+            .unwrap();
+        assert_eq!(decreasing, 333_334);
+    }
+
+    #[test]
+    fn selects_tempo_by_the_exact_sample_start_boundary() {
+        let events = [
+            TempoEvent {
+                tick: 0,
+                microseconds_per_quarter: 500_001,
+            },
+            TempoEvent {
+                tick: 1,
+                microseconds_per_quarter: 1_000_000,
+            },
+        ];
+        let frames = FrameTimeline::try_new(48_000, &events).unwrap();
+        let before = frames.position_at_frame(12).unwrap();
+        let after = frames.position_at_frame(13).unwrap();
+        assert_eq!(before.whole_tick(), 0);
+        assert_eq!(after.whole_tick(), 1);
+        assert!(after.remainder > 0);
+        assert_eq!(after.denominator, 48_000_000_000);
     }
 
     #[test]
