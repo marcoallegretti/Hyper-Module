@@ -423,6 +423,20 @@ impl<P: InterleavedStereoProcessor> OutputCallback<P> {
     }
 }
 
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+mod desktop_output;
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+pub use desktop_output::{
+    DesktopOutputConfig, DesktopOutputConfigError, DesktopOutputDiscoveryError,
+    DesktopOutputTarget, DesktopOutputTargets, discover_desktop_output_targets,
+};
+
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 mod pipewire_devices;
 #[cfg(all(target_os = "linux", target_endian = "little"))]
@@ -459,9 +473,9 @@ mod playback_session;
     target_os = "windows"
 ))]
 pub use playback_session::{
-    DesktopOutputConfig, DesktopOutputConfigError, DesktopOutputStartError, DesktopOutputStopError,
-    DesktopPlaybackRecovery, DesktopPlaybackRecoveryStartError, DesktopPlaybackRecoveryStopError,
-    DesktopPlaybackSession, DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
+    DesktopOutputStartError, DesktopOutputStopError, DesktopPlaybackRecovery,
+    DesktopPlaybackRecoveryStartError, DesktopPlaybackRecoveryStopError, DesktopPlaybackSession,
+    DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
     DesktopPlaybackSessionStartError,
 };
 #[cfg(target_os = "windows")]
@@ -478,26 +492,6 @@ pub use wasapi_output::{
     WasapiDisconnectReason, WasapiOutputConfig, WasapiOutputConfigError, WasapiOutputStream,
     WasapiStartError, WasapiStartupStage, WasapiStopError,
 };
-
-#[cfg(all(target_os = "linux", target_endian = "little"))]
-pub type DesktopOutputTarget = PipeWireOutputTarget;
-#[cfg(target_os = "windows")]
-pub type DesktopOutputTarget = WasapiOutputEndpoint;
-
-#[cfg(all(target_os = "linux", target_endian = "little"))]
-pub type DesktopOutputTargets = PipeWireOutputTargets;
-#[cfg(target_os = "windows")]
-pub type DesktopOutputTargets = WasapiOutputEndpoints;
-
-#[cfg(all(target_os = "linux", target_endian = "little"))]
-pub type DesktopOutputDiscoveryError = PipeWireTargetDiscoveryError;
-#[cfg(target_os = "windows")]
-pub type DesktopOutputDiscoveryError = WasapiEndpointDiscoveryError;
-
-#[cfg(all(target_os = "linux", target_endian = "little"))]
-pub use discover_pipewire_output_targets as discover_desktop_output_targets;
-#[cfg(target_os = "windows")]
-pub use discover_wasapi_output_endpoints as discover_desktop_output_targets;
 
 #[cfg(test)]
 mod tests {

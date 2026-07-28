@@ -426,7 +426,7 @@ mod tests {
         );
         let selected = snapshot.target_by_routing_id("alsa_output.usb-b").unwrap();
         assert_eq!(selected.routing_id(), "alsa_output.usb-b");
-        let config = crate::DesktopOutputConfig::try_new(48_000, 256)
+        let config = crate::PipeWireOutputConfig::try_new(48_000, 256)
             .unwrap()
             .with_output_target(selected)
             .unwrap();

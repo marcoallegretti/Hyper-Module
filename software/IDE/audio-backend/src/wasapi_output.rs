@@ -29,6 +29,18 @@ pub struct WasapiOutputConfig {
 }
 
 impl WasapiOutputConfig {
+    pub(crate) const fn from_desktop(
+        sample_rate_hz: u32,
+        maximum_block_frames: usize,
+        device_id: Option<String>,
+    ) -> Self {
+        Self {
+            sample_rate_hz,
+            maximum_block_frames,
+            device_id,
+        }
+    }
+
     /// Creates a strict shared-mode stereo `f32` output configuration.
     ///
     /// # Errors

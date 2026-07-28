@@ -388,7 +388,7 @@ mod tests {
         );
         let selected = snapshot.target_by_routing_id("endpoint-a").unwrap();
         assert_eq!(selected.routing_id(), "endpoint-a");
-        let config = crate::DesktopOutputConfig::try_new(48_000, 256)
+        let config = crate::WasapiOutputConfig::try_new(48_000, 256)
             .unwrap()
             .with_output_target(selected)
             .unwrap();

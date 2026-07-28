@@ -3,17 +3,15 @@ use super::pipewire_output::PipeWireThreadRunner;
 #[cfg(target_os = "windows")]
 use super::wasapi_output::WasapiThreadRunner;
 use super::{
-    OutputStreamCounters, OutputStreamStatus, PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
+    DesktopOutputConfig, OutputStreamCounters, OutputStreamStatus, PlaybackRecoveryCheckpoint,
+    PlaybackRecoverySnapshot,
 };
 #[cfg(all(target_os = "linux", target_endian = "little"))]
-use super::{
-    PipeWireOutputConfig, PipeWireOutputConfigError, PipeWireOutputStream, PipeWireStartError,
-    PipeWireStartupStage, PipeWireStopError,
-};
+use super::{PipeWireOutputStream, PipeWireStartError, PipeWireStartupStage, PipeWireStopError};
 #[cfg(target_os = "windows")]
 use super::{
-    WasapiDisconnectReason, WasapiOutputConfig, WasapiOutputConfigError, WasapiOutputStream,
-    WasapiStartError, WasapiStartupStage, WasapiStopError,
+    WasapiDisconnectReason, WasapiOutputStream, WasapiStartError, WasapiStartupStage,
+    WasapiStopError,
 };
 use core::error::Error;
 use core::fmt;
@@ -32,16 +30,6 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 
 pub type DesktopPlaybackSessionInput = PreparedPlaybackSession;
-
-#[cfg(all(target_os = "linux", target_endian = "little"))]
-pub type DesktopOutputConfig = PipeWireOutputConfig;
-#[cfg(target_os = "windows")]
-pub type DesktopOutputConfig = WasapiOutputConfig;
-
-#[cfg(all(target_os = "linux", target_endian = "little"))]
-pub type DesktopOutputConfigError = PipeWireOutputConfigError;
-#[cfg(target_os = "windows")]
-pub type DesktopOutputConfigError = WasapiOutputConfigError;
 
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 pub type DesktopOutputStartError = PipeWireStartError;
@@ -285,7 +273,7 @@ impl DesktopPlaybackRecovery {
 }
 
 impl DesktopPlaybackSession {
-    /// Compiles and binds one verified session entirely on the output thread.
+    /// Compiles and binds one prepared session entirely on the output thread.
     ///
     /// Controls are returned only after the native backend reports a usable
     /// stream state.
@@ -311,7 +299,7 @@ impl DesktopPlaybackSession {
         let (publication_sender, publication_receiver) = sync_channel(1);
         let thread_source = source.clone();
         let output =
-            DesktopOutputStream::start_with_thread_initializer(config.clone(), move |runner| {
+            DesktopOutputStream::start_with_thread_initializer(config.native(), move |runner| {
                 initialize_session(
                     runner,
                     &thread_source,
@@ -522,14 +510,8 @@ fn initialize_session(
     runner.run_transport_output_with_checkpoint(processor, &recovery)
 }
 
-#[cfg(all(target_os = "linux", target_endian = "little"))]
 fn output_is_pinned(config: &DesktopOutputConfig) -> bool {
-    config.target().is_some()
-}
-
-#[cfg(target_os = "windows")]
-fn output_is_pinned(config: &DesktopOutputConfig) -> bool {
-    config.device_id().is_some()
+    config.routing_id().is_some()
 }
 
 fn allocate_scratch_planes(
@@ -618,10 +600,7 @@ mod tests {
         let policy_default = DesktopOutputConfig::try_new(48_000, 256).unwrap();
         assert!(!output_is_pinned(&policy_default));
 
-        #[cfg(target_os = "windows")]
-        let pinned = policy_default.with_device_id("endpoint-id").unwrap();
-        #[cfg(all(target_os = "linux", target_endian = "little"))]
-        let pinned = policy_default.with_target("sink-name").unwrap();
+        let pinned = policy_default.with_routing_id("opaque-route").unwrap();
         assert!(output_is_pinned(&pinned));
 
         let mut spent = DesktopPlaybackRecovery {
