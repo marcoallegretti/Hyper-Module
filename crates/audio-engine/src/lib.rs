@@ -322,6 +322,142 @@ impl<E: Error + 'static> Error for StereoCallbackError<E> {
     }
 }
 
+/// Per-channel measurements for one successful device callback.
+///
+/// `sample_peak` is the largest absolute sample value; it is not an
+/// oversampled true-peak measurement. `block_rms` covers only this callback
+/// block and has no loudness weighting or meter ballistics. Both readings are
+/// unavailable when the channel contains any non-finite sample.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChannelBlockMeter {
+    sample_peak: Option<f32>,
+    block_rms: Option<f32>,
+    full_scale_sample_count: usize,
+    non_finite_sample_count: usize,
+}
+
+impl ChannelBlockMeter {
+    #[must_use]
+    pub const fn sample_peak(self) -> Option<f32> {
+        self.sample_peak
+    }
+
+    #[must_use]
+    pub const fn block_rms(self) -> Option<f32> {
+        self.block_rms
+    }
+
+    /// Counts finite samples whose absolute value is at least `1.0`.
+    ///
+    /// This reports sample-domain full-scale excursions, not inter-sample
+    /// peaks or proof that a preceding process clipped the signal.
+    #[must_use]
+    pub const fn full_scale_sample_count(self) -> usize {
+        self.full_scale_sample_count
+    }
+
+    #[must_use]
+    pub const fn non_finite_sample_count(self) -> usize {
+        self.non_finite_sample_count
+    }
+}
+
+/// Measurements derived from the final planar stereo output of one callback.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StereoBlockMeter {
+    frame_count: usize,
+    left: ChannelBlockMeter,
+    right: ChannelBlockMeter,
+}
+
+impl StereoBlockMeter {
+    #[must_use]
+    pub const fn frame_count(self) -> usize {
+        self.frame_count
+    }
+
+    #[must_use]
+    pub const fn left(self) -> ChannelBlockMeter {
+        self.left
+    }
+
+    #[must_use]
+    pub const fn right(self) -> ChannelBlockMeter {
+        self.right
+    }
+}
+
+/// Processor result and final-output measurements from one callback.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProcessedStereoCallback<R> {
+    processor_result: R,
+    meter: StereoBlockMeter,
+}
+
+impl<R> ProcessedStereoCallback<R> {
+    #[must_use]
+    pub const fn processor_result(&self) -> &R {
+        &self.processor_result
+    }
+
+    #[must_use]
+    pub const fn meter(&self) -> StereoBlockMeter {
+        self.meter
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (R, StereoBlockMeter) {
+        (self.processor_result, self.meter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ChannelMeterAccumulator {
+    sample_peak: f32,
+    sum_squares: f64,
+    full_scale_sample_count: usize,
+    non_finite_sample_count: usize,
+}
+
+impl ChannelMeterAccumulator {
+    fn observe(&mut self, sample: f32) {
+        if !sample.is_finite() {
+            self.non_finite_sample_count += 1;
+            return;
+        }
+        let absolute = sample.abs();
+        self.sample_peak = self.sample_peak.max(absolute);
+        self.sum_squares += f64::from(sample) * f64::from(sample);
+        if absolute >= 1.0 {
+            self.full_scale_sample_count += 1;
+        }
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "the validated frame count is at most 65,536 and f64 RMS intentionally returns f32"
+    )]
+    fn finish(self, frame_count: usize) -> ChannelBlockMeter {
+        let readings = if self.non_finite_sample_count == 0 {
+            let rms = if frame_count == 0 {
+                0.0
+            } else {
+                (self.sum_squares / frame_count as f64).sqrt() as f32
+            };
+            Some((self.sample_peak, rms))
+        } else {
+            None
+        };
+        ChannelBlockMeter {
+            sample_peak: readings.map(|(peak, _)| peak),
+            block_rms: readings.map(|(_, rms)| rms),
+            full_scale_sample_count: self.full_scale_sample_count,
+            non_finite_sample_count: self.non_finite_sample_count,
+        }
+    }
+}
+
 /// Preallocated adapter from interleaved stereo device buffers to planar DSP.
 ///
 /// Device setup owns sample-format and channel negotiation. Callback processing
@@ -380,7 +516,7 @@ impl InterleavedStereoCallback {
         &mut self,
         interleaved_output: &mut [f32],
         processor: F,
-    ) -> Result<R, StereoCallbackError<E>>
+    ) -> Result<ProcessedStereoCallback<R>, StereoCallbackError<E>>
     where
         F: FnOnce(StereoOutput<'_>) -> Result<R, E>,
     {
@@ -410,11 +546,24 @@ impl InterleavedStereoCallback {
                 return Err(StereoCallbackError::Processor(source));
             }
         };
+        let mut left_meter = ChannelMeterAccumulator::default();
+        let mut right_meter = ChannelMeterAccumulator::default();
         for (frame, samples) in interleaved_output.chunks_exact_mut(2).enumerate() {
-            samples[0] = self.left[frame];
-            samples[1] = self.right[frame];
+            let left = self.left[frame];
+            let right = self.right[frame];
+            left_meter.observe(left);
+            right_meter.observe(right);
+            samples[0] = left;
+            samples[1] = right;
         }
-        Ok(value)
+        Ok(ProcessedStereoCallback {
+            processor_result: value,
+            meter: StereoBlockMeter {
+                frame_count,
+                left: left_meter.finish(frame_count),
+                right: right_meter.finish(frame_count),
+            },
+        })
     }
 }
 
@@ -799,7 +948,7 @@ mod tests {
         assert_eq!(adapter.maximum_frames(), 4);
         let mut output = [9.0_f32; 6];
 
-        let value = adapter
+        let processed = adapter
             .process(&mut output, |planar| {
                 assert_eq!(planar.left.len(), 3);
                 assert_eq!(planar.right.len(), 3);
@@ -809,7 +958,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(value, 17);
+        assert_eq!(*processed.processor_result(), 17);
         assert_samples(&output, &[1.0, -1.0, 2.0, -2.0, 3.0, -3.0]);
 
         let mut shorter = [9.0_f32; 4];
@@ -830,6 +979,75 @@ mod tests {
                 Ok::<_, ()>(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn callback_adapter_measures_final_sample_peak_and_block_rms() {
+        let mut adapter = InterleavedStereoCallback::try_new(4).unwrap();
+        let mut output = [9.0_f32; 8];
+
+        let processed = adapter
+            .process(&mut output, |planar| {
+                planar.left.copy_from_slice(&[0.0, -0.5, 1.0, -1.5]);
+                planar.right.copy_from_slice(&[0.25, -0.25, 0.25, -0.25]);
+                Ok::<_, ()>("rendered")
+            })
+            .unwrap();
+        let (processor_result, meter) = processed.into_parts();
+
+        assert_eq!(processor_result, "rendered");
+        assert_eq!(meter.frame_count(), 4);
+        assert_eq!(meter.left().sample_peak(), Some(1.5));
+        assert_eq!(meter.left().full_scale_sample_count(), 2);
+        assert_eq!(meter.left().non_finite_sample_count(), 0);
+        assert!((meter.left().block_rms().unwrap() - (3.5_f32 / 4.0).sqrt()).abs() <= EPSILON);
+        assert_eq!(meter.right().sample_peak(), Some(0.25));
+        assert_eq!(meter.right().block_rms(), Some(0.25));
+        assert_eq!(meter.right().full_scale_sample_count(), 0);
+        assert_eq!(meter.right().non_finite_sample_count(), 0);
+    }
+
+    #[test]
+    fn callback_meter_invalidates_readings_containing_non_finite_samples() {
+        let mut adapter = InterleavedStereoCallback::try_new(3).unwrap();
+        let mut output = [9.0_f32; 6];
+
+        let meter = adapter
+            .process(&mut output, |planar| {
+                planar.left.copy_from_slice(&[0.5, f32::NAN, f32::INFINITY]);
+                planar.right.copy_from_slice(&[0.0, -1.0, 0.5]);
+                Ok::<_, ()>(())
+            })
+            .unwrap()
+            .meter();
+
+        assert_eq!(meter.left().sample_peak(), None);
+        assert_eq!(meter.left().block_rms(), None);
+        assert_eq!(meter.left().full_scale_sample_count(), 0);
+        assert_eq!(meter.left().non_finite_sample_count(), 2);
+        assert_eq!(meter.right().sample_peak(), Some(1.0));
+        assert_eq!(meter.right().block_rms(), Some((1.25_f32 / 3.0).sqrt()));
+        assert_eq!(meter.right().full_scale_sample_count(), 1);
+        assert_eq!(meter.right().non_finite_sample_count(), 0);
+        assert!(output[2].is_nan());
+        assert!(output[4].is_infinite());
+    }
+
+    #[test]
+    fn callback_meter_reports_zero_for_an_empty_block() {
+        let mut adapter = InterleavedStereoCallback::try_new(1).unwrap();
+        let mut output = [];
+
+        let meter = adapter
+            .process(&mut output, |_| Ok::<_, ()>(()))
+            .unwrap()
+            .meter();
+
+        assert_eq!(meter.frame_count(), 0);
+        assert_eq!(meter.left().sample_peak(), Some(0.0));
+        assert_eq!(meter.left().block_rms(), Some(0.0));
+        assert_eq!(meter.right().sample_peak(), Some(0.0));
+        assert_eq!(meter.right().block_rms(), Some(0.0));
     }
 
     #[test]

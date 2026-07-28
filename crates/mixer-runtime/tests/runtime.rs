@@ -442,11 +442,12 @@ fn interleaved_callback_executes_the_transport_runtime() {
     ];
     let mut interleaved = [9.0_f32; 4];
 
-    let cycle = callback
+    let processed = callback
         .process(&mut interleaved, |output| {
             transport.process_cycle(&mut scratch, output)
         })
         .unwrap();
+    let (cycle, meter) = processed.into_parts();
 
     assert_eq!(cycle.applied_command_count(), 1);
     assert_eq!(cycle.state(), TransportState::Rolling);
@@ -460,6 +461,19 @@ fn interleaved_callback_executes_the_transport_runtime() {
     );
     assert!(interleaved.iter().all(|sample| sample.is_finite()));
     assert!(interleaved.iter().any(|sample| sample.abs() > f32::EPSILON));
+    let expected_left_peak = interleaved
+        .chunks_exact(2)
+        .map(|frame| frame[0].abs())
+        .fold(0.0_f32, f32::max);
+    let expected_right_peak = interleaved
+        .chunks_exact(2)
+        .map(|frame| frame[1].abs())
+        .fold(0.0_f32, f32::max);
+    assert_eq!(meter.frame_count(), 2);
+    assert_eq!(meter.left().sample_peak(), Some(expected_left_peak));
+    assert_eq!(meter.right().sample_peak(), Some(expected_right_peak));
+    assert_eq!(meter.left().non_finite_sample_count(), 0);
+    assert_eq!(meter.right().non_finite_sample_count(), 0);
 }
 
 #[test]
