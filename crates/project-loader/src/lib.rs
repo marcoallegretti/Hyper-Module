@@ -328,6 +328,41 @@ pub fn prepare_project_playback(
         &captured.nested_playback_ids,
     )?;
 
+    let decoded = decode_project_assets(&package, limits)?;
+
+    let session = assemble_playback_session(PlaybackSessionAssemblyInput {
+        documents: captured.playback,
+        decoded_assets: decoded.assets,
+        limits: limits.session,
+    })
+    .map_err(ProjectPlaybackError::Assembly)?;
+    validate_recording_media(&session, &captured.recording_metadata, &decoded.facts)?;
+    package.confirm_unchanged()?;
+    Ok(PreparedProjectPlayback {
+        package,
+        session,
+        recording_metadata: captured
+            .recording_metadata
+            .into_iter()
+            .map(|record| record.document)
+            .collect(),
+    })
+}
+
+struct DecodedProjectAssets<'project> {
+    assets: Vec<DecodedPlaybackAsset>,
+    facts: Vec<DecodedAssetFact<'project>>,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "decode authority, preallocation limits, and post-decode accounting form one fail-closed transaction"
+)]
+fn decode_project_assets(
+    package: &StructurallyVerifiedProject,
+    limits: ProjectPlaybackLimits,
+) -> Result<DecodedProjectAssets<'_>, ProjectPlaybackError> {
+    let cache_limits = limits.session.media_cache;
     let asset_count = package.manifest().assets().len();
     if asset_count > cache_limits.max_assets {
         return Err(ProjectPlaybackError::AssetCountLimit {
@@ -335,26 +370,70 @@ pub fn prepare_project_playback(
             maximum: cache_limits.max_assets,
         });
     }
-    let mut decoded_assets = Vec::new();
-    decoded_assets
+    let mut assets = Vec::new();
+    assets
         .try_reserve_exact(asset_count)
         .map_err(|_| ProjectPlaybackError::ResourceCapacityUnavailable)?;
-    let mut decoded_facts = Vec::new();
-    decoded_facts
+    let mut facts = Vec::new();
+    facts
         .try_reserve_exact(asset_count)
         .map_err(|_| ProjectPlaybackError::ResourceCapacityUnavailable)?;
     let mut decoded_bytes = 0_usize;
     for descriptor in package.manifest().assets() {
+        let remaining_decoded_bytes = cache_limits
+            .max_decoded_sample_bytes
+            .checked_sub(decoded_bytes)
+            .ok_or(ProjectPlaybackError::DecodedBytesLimit {
+                actual: decoded_bytes,
+                maximum: cache_limits.max_decoded_sample_bytes,
+            })?;
+        if remaining_decoded_bytes == 0 {
+            return Err(ProjectPlaybackError::DecodedBytesLimit {
+                actual: decoded_bytes.saturating_add(1),
+                maximum: cache_limits.max_decoded_sample_bytes,
+            });
+        }
+        let cache_frame_limit =
+            u64::try_from(cache_limits.max_frames_per_asset).unwrap_or(u64::MAX);
+        let decode_limits = DecodeLimits::new(
+            limits.audio.max_file_bytes(),
+            limits.audio.max_frames().min(cache_frame_limit),
+            limits
+                .audio
+                .max_decoded_sample_bytes()
+                .min(remaining_decoded_bytes),
+        )
+        .map_err(|source| ProjectPlaybackError::Audio {
+            asset_id: descriptor.id().to_owned(),
+            source,
+        })?;
         let bytes = package.read_asset(descriptor.id(), limits.audio.max_file_bytes())?;
         let audio = decode_bytes(
             bytes,
             audio_container(descriptor.media_type()),
             package.manifest().sample_rate_hz(),
-            limits.audio,
+            decode_limits,
         )
-        .map_err(|source| ProjectPlaybackError::Audio {
-            asset_id: descriptor.id().to_owned(),
-            source,
+        .map_err(|source| match source {
+            DecodeError::FrameLimitExceeded { declared, .. } if declared > cache_frame_limit => {
+                ProjectPlaybackError::AssetFrameLimit {
+                    asset_id: descriptor.id().to_owned(),
+                    actual: usize::try_from(declared).unwrap_or(usize::MAX),
+                    maximum: cache_limits.max_frames_per_asset,
+                }
+            }
+            DecodeError::DecodedSampleByteLimitExceeded { declared, .. }
+                if declared > remaining_decoded_bytes =>
+            {
+                ProjectPlaybackError::DecodedBytesLimit {
+                    actual: decoded_bytes.saturating_add(declared),
+                    maximum: cache_limits.max_decoded_sample_bytes,
+                }
+            }
+            source => ProjectPlaybackError::Audio {
+                asset_id: descriptor.id().to_owned(),
+                source,
+            },
         })?;
         let frame_count = audio.frame_count();
         if frame_count > cache_limits.max_frames_per_asset {
@@ -383,31 +462,14 @@ pub fn prepare_project_playback(
                 maximum: cache_limits.max_decoded_sample_bytes,
             });
         }
-        decoded_facts.push(DecodedAssetFact {
+        facts.push(DecodedAssetFact {
             id: descriptor.id(),
             channels: audio.channels(),
             frames: audio.frame_count(),
         });
-        decoded_assets.push(DecodedPlaybackAsset::new(descriptor.id().to_owned(), audio));
+        assets.push(DecodedPlaybackAsset::new(descriptor.id().to_owned(), audio));
     }
-
-    let session = assemble_playback_session(PlaybackSessionAssemblyInput {
-        documents: captured.playback,
-        decoded_assets,
-        limits: limits.session,
-    })
-    .map_err(ProjectPlaybackError::Assembly)?;
-    validate_recording_media(&session, &captured.recording_metadata, &decoded_facts)?;
-    package.confirm_unchanged()?;
-    Ok(PreparedProjectPlayback {
-        package,
-        session,
-        recording_metadata: captured
-            .recording_metadata
-            .into_iter()
-            .map(|record| record.document)
-            .collect(),
-    })
+    Ok(DecodedProjectAssets { assets, facts })
 }
 
 fn audio_container(media_type: AudioMediaType) -> AudioContainer {

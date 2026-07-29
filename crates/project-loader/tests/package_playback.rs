@@ -611,7 +611,7 @@ fn rejects_resource_budget_and_mismatched_audio_container() {
 fn limits() -> ProjectPlaybackLimits {
     ProjectPlaybackLimits {
         max_total_resource_bytes: 5 * 1_048_576,
-        audio: DecodeLimits::new(1_048_576, 100).unwrap(),
+        audio: DecodeLimits::new(1_048_576, 100, 800).unwrap(),
         session: PlaybackSessionAssemblyLimits {
             documents: LoaderLimits::VERSION_1,
             media_cache: CacheLimits {

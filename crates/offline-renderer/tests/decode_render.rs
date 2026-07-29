@@ -54,7 +54,7 @@ fn decoded_wave_reaches_the_shared_offline_mixer() {
         &wave.path,
         AudioContainer::Wav,
         48_000,
-        DecodeLimits::new(1_000, 4).unwrap(),
+        DecodeLimits::new(1_000, 4, 32).unwrap(),
     )
     .unwrap();
     let output = render_aligned(

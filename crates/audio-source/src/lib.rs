@@ -34,44 +34,56 @@ impl AudioContainer {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecodeLimits {
-    max_file_bytes: u64,
-    max_frames: u64,
+    file_bytes: u64,
+    frames: u64,
+    decoded_sample_bytes: usize,
 }
 
 impl DecodeLimits {
-    /// Creates explicit file-size and decoded-frame limits.
+    /// Creates explicit encoded-size, decoded-frame, and decoded-sample limits.
     ///
     /// # Errors
     ///
-    /// Returns [`DecodeError::InvalidLimits`] when either limit is zero or the
+    /// Returns [`DecodeError::InvalidLimits`] when any limit is zero or the
     /// frame limit cannot be represented by the current platform.
-    pub fn new(max_file_bytes: u64, max_frames: u64) -> Result<Self, DecodeError> {
+    pub fn new(
+        max_file_bytes: u64,
+        max_frames: u64,
+        max_decoded_sample_bytes: usize,
+    ) -> Result<Self, DecodeError> {
         let stereo_samples_are_addressable = max_frames
             .checked_mul(2)
             .and_then(|samples| usize::try_from(samples).ok())
             .is_some();
         if max_file_bytes == 0
             || max_frames == 0
+            || max_decoded_sample_bytes == 0
             || usize::try_from(max_frames).is_err()
             || !stereo_samples_are_addressable
         {
             Err(DecodeError::InvalidLimits)
         } else {
             Ok(Self {
-                max_file_bytes,
-                max_frames,
+                file_bytes: max_file_bytes,
+                frames: max_frames,
+                decoded_sample_bytes: max_decoded_sample_bytes,
             })
         }
     }
 
     #[must_use]
     pub const fn max_file_bytes(self) -> u64 {
-        self.max_file_bytes
+        self.file_bytes
     }
 
     #[must_use]
     pub const fn max_frames(self) -> u64 {
-        self.max_frames
+        self.frames
+    }
+
+    #[must_use]
+    pub const fn max_decoded_sample_bytes(self) -> usize {
+        self.decoded_sample_bytes
     }
 }
 
@@ -162,6 +174,7 @@ pub enum DecodeError {
     SampleRateMismatch { expected: u32, actual: u32 },
     UnsupportedChannelLayout { channels: usize },
     FrameLimitExceeded { declared: u64, maximum: u64 },
+    DecodedSampleByteLimitExceeded { declared: usize, maximum: usize },
     FrameCountMismatch { declared: u64, decoded: u64 },
     VerificationFailed,
     NonFiniteSample { frame: u64, channel: usize },
@@ -216,6 +229,10 @@ impl fmt::Display for DecodeError {
                     "audio stream declares {declared} frames; maximum is {maximum}"
                 )
             }
+            Self::DecodedSampleByteLimitExceeded { declared, maximum } => write!(
+                formatter,
+                "audio stream declares {declared} decoded sample bytes; maximum is {maximum}"
+            ),
             Self::FrameCountMismatch { declared, decoded } => {
                 write!(
                     formatter,
@@ -310,10 +327,10 @@ pub fn decode_bytes(
 }
 
 fn require_file_limit(file_length: u64, limits: DecodeLimits) -> Result<(), DecodeError> {
-    if file_length > limits.max_file_bytes {
+    if file_length > limits.file_bytes {
         Err(DecodeError::FileTooLarge {
             actual: file_length,
-            maximum: limits.max_file_bytes,
+            maximum: limits.file_bytes,
         })
     } else {
         Ok(())
@@ -388,10 +405,21 @@ fn decode_source(
             "declared frame count must be positive",
         ));
     }
-    if declared_frames > limits.max_frames {
+    if declared_frames > limits.frames {
         return Err(DecodeError::FrameLimitExceeded {
             declared: declared_frames,
-            maximum: limits.max_frames,
+            maximum: limits.frames,
+        });
+    }
+    let declared_sample_bytes = usize::try_from(declared_frames)
+        .ok()
+        .and_then(|frames| frames.checked_mul(channel_count))
+        .and_then(|samples| samples.checked_mul(size_of::<f32>()))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    if declared_sample_bytes > limits.decoded_sample_bytes {
+        return Err(DecodeError::DecodedSampleByteLimitExceeded {
+            declared: declared_sample_bytes,
+            maximum: limits.decoded_sample_bytes,
         });
     }
 
@@ -466,10 +494,10 @@ fn decode_source(
         let next_frame_count = decoded_frames
             .checked_add(packet_frames)
             .ok_or(DecodeError::CapacityUnavailable)?;
-        if next_frame_count > limits.max_frames || next_frame_count > declared_frames {
+        if next_frame_count > limits.frames || next_frame_count > declared_frames {
             return Err(DecodeError::FrameLimitExceeded {
                 declared: next_frame_count,
-                maximum: limits.max_frames.min(declared_frames),
+                maximum: limits.frames.min(declared_frames),
             });
         }
 

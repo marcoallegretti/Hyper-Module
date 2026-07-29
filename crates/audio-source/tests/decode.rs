@@ -81,7 +81,7 @@ fn float32_wav(sample: f32) -> Vec<u8> {
 }
 
 fn limits() -> DecodeLimits {
-    DecodeLimits::new(1_000_000, 300_000).unwrap()
+    DecodeLimits::new(1_000_000, 300_000, 2_400_000).unwrap()
 }
 
 fn assert_samples(actual: &[f32], expected: &[f32]) {
@@ -156,7 +156,7 @@ fn rejects_wrong_container_rate_layout_and_limits() {
             file.path(),
             AudioContainer::Wav,
             48_000,
-            DecodeLimits::new(43, 10).unwrap()
+            DecodeLimits::new(43, 10, 80).unwrap()
         ),
         Err(DecodeError::FileTooLarge { .. })
     ));
@@ -165,11 +165,23 @@ fn rejects_wrong_container_rate_layout_and_limits() {
             file.path(),
             AudioContainer::Wav,
             48_000,
-            DecodeLimits::new(1_000, 3).unwrap()
+            DecodeLimits::new(1_000, 3, 24).unwrap()
         ),
         Err(DecodeError::FrameLimitExceeded {
             declared: 4,
             maximum: 3
+        })
+    ));
+    assert!(matches!(
+        decode_file(
+            file.path(),
+            AudioContainer::Wav,
+            48_000,
+            DecodeLimits::new(1_000, 10, 15).unwrap()
+        ),
+        Err(DecodeError::DecodedSampleByteLimitExceeded {
+            declared: 16,
+            maximum: 15
         })
     ));
 
@@ -208,11 +220,15 @@ fn rejects_truncation_malformed_media_and_non_finite_samples() {
 #[test]
 fn validates_limits_and_in_memory_sources() {
     assert!(matches!(
-        DecodeLimits::new(0, 1),
+        DecodeLimits::new(0, 1, 8),
         Err(DecodeError::InvalidLimits)
     ));
     assert!(matches!(
-        DecodeLimits::new(1, 0),
+        DecodeLimits::new(1, 0, 8),
+        Err(DecodeError::InvalidLimits)
+    ));
+    assert!(matches!(
+        DecodeLimits::new(1, 1, 0),
         Err(DecodeError::InvalidLimits)
     ));
     assert!(matches!(
