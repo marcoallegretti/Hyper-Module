@@ -302,6 +302,7 @@ dependencies = [
  "hyper-playback-json",
  "hyper-playback-session",
  "hyper-recording-journal",
+ "hyper-recording-metadata",
  "hyper-recording-transport",
  "hyper-recording-worker",
  "libspa-sys",

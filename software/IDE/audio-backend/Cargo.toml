@@ -16,6 +16,7 @@ hyper-playback-compiler = { path = "../../../crates/playback-compiler" }
 hyper-playback-json = { path = "../../../crates/playback-json" }
 hyper-playback-session = { path = "../../../crates/playback-session" }
 hyper-recording-journal = { path = "../../../crates/recording-journal" }
+hyper-recording-metadata = { path = "../../../crates/recording-metadata" }
 hyper-recording-transport = { path = "../../../crates/recording-transport" }
 hyper-recording-worker = { path = "../../../crates/recording-worker" }
 

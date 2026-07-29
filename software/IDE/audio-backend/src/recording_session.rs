@@ -8,6 +8,9 @@ use super::{
 use core::error::Error;
 use core::fmt;
 use hyper_recording_journal::PublishedRecording;
+use hyper_recording_metadata::{
+    FinalizedRecordingMetadata, RecordingMetadataBuildError, RecordingMetadataContext,
+};
 use hyper_recording_transport::{RecordingTransportBuildError, try_recording_transport};
 use hyper_recording_worker::{
     RecordingDispositionError, RecordingWorker, RecordingWorkerCompletion, RecordingWorkerConfig,
@@ -184,6 +187,7 @@ impl Error for DesktopRecordingSessionStopError {
 }
 
 pub type DesktopPublishedRecording = PublishedRecording;
+pub type DesktopFinalizedRecording = FinalizedRecordingMetadata;
 
 #[derive(Debug)]
 pub enum DesktopRecordingSessionCommitError {
@@ -230,6 +234,32 @@ impl Error for DesktopRecordingSessionCommitError {
             Self::Stop(source) => Some(source),
             Self::Failed { source, .. } => Some(source),
             Self::UnexpectedAbort { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum DesktopRecordingSessionFinalizeError {
+    Commit(DesktopRecordingSessionCommitError),
+    Metadata(RecordingMetadataBuildError),
+}
+
+impl fmt::Display for DesktopRecordingSessionFinalizeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Commit(source) => source.fmt(formatter),
+            Self::Metadata(source) => {
+                write!(formatter, "recording metadata validation failed: {source}")
+            }
+        }
+    }
+}
+
+impl Error for DesktopRecordingSessionFinalizeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Commit(source) => Some(source),
+            Self::Metadata(source) => Some(source),
         }
     }
 }
@@ -314,6 +344,27 @@ impl DesktopRecordingSession {
             .finish(true)
             .map_err(DesktopRecordingSessionCommitError::Stop)?;
         published_recording(completion)
+    }
+
+    /// Stops capture, publishes verified WAV, and binds project-owned
+    /// provenance to the publication authority.
+    ///
+    /// This does not mutate a project package. The returned value is the
+    /// validated input to the project-storage recording transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a commit error when capture cannot be published. Metadata
+    /// validation errors retain both the verified publication authority and
+    /// rejected context so the caller can correct provenance and retry.
+    pub fn finalize(
+        self,
+        context: RecordingMetadataContext,
+    ) -> Result<DesktopFinalizedRecording, DesktopRecordingSessionFinalizeError> {
+        let publication = self
+            .commit()
+            .map_err(DesktopRecordingSessionFinalizeError::Commit)?;
+        finalized_recording(publication, context)
     }
 
     /// Stops capture, drains every accepted frame, and preserves the journal
@@ -413,10 +464,19 @@ fn published_recording(
     }
 }
 
+fn finalized_recording(
+    publication: DesktopPublishedRecording,
+    context: RecordingMetadataContext,
+) -> Result<DesktopFinalizedRecording, DesktopRecordingSessionFinalizeError> {
+    FinalizedRecordingMetadata::try_new(publication, context)
+        .map_err(DesktopRecordingSessionFinalizeError::Metadata)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use hyper_recording_journal::{JournalConfig, JournalWriter, PublicationOutcome, publish_wav};
+    use hyper_recording_metadata::{RecordingCaptureKind, RecordingMetadataError};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -437,6 +497,19 @@ mod tests {
                 drain_frames: 256,
             },
             completion_timeout: Duration::from_secs(1),
+        }
+    }
+
+    fn metadata_context() -> RecordingMetadataContext {
+        RecordingMetadataContext {
+            id: "018f47a2-6b2d-7c11-8a44-001122334477".to_owned(),
+            project_id: "018f47a2-6b2d-7c11-8a44-001122334455".to_owned(),
+            asset_id: "018f47a2-6b2d-7c11-8a44-001122334478".to_owned(),
+            track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
+            capture_kind: RecordingCaptureKind::New,
+            captured_at_utc: "2026-07-29T14:00:00.000Z".to_owned(),
+            timeline_start_tick: 7_680,
+            source_input_indices: vec![0, 1],
         }
     }
 
@@ -535,6 +608,60 @@ mod tests {
             },),
             Err(DesktopRecordingSessionCommitError::UnexpectedAbort { frames: 511, .. })
         ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn finalized_recording_binds_metadata_without_reissuing_media_facts() {
+        let id = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "hyper-desktop-finalized-recording-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let journal = directory.join("take.journal");
+        let wav = directory.join("take.wav");
+        let mut writer = JournalWriter::create(
+            &journal,
+            JournalConfig {
+                sample_rate: 48_000,
+                max_chunk_frames: 2,
+                max_total_frames: 2,
+            },
+        )
+        .unwrap();
+        writer.append(&[0.25, -0.25, 0.5, -0.5]).unwrap();
+        drop(writer);
+        let authority = publish_wav(&journal, &wav).unwrap();
+
+        let finalized = finalized_recording(authority.clone(), metadata_context()).unwrap();
+        assert_eq!(finalized.publication().final_wav_path(), wav);
+        assert_eq!(
+            finalized.publication().byte_length(),
+            authority.byte_length()
+        );
+        assert_eq!(finalized.publication().wav_sha256(), authority.wav_sha256());
+        assert_eq!(finalized.publication().frames(), 2);
+        let json = String::from_utf8(finalized.to_canonical_json().unwrap()).unwrap();
+        assert!(json.contains("\"frame_count\":2"));
+        assert!(json.contains("\"sample_rate_hz\":48000"));
+
+        let mut rejected_context = metadata_context();
+        rejected_context.project_id.make_ascii_uppercase();
+        let error = finalized_recording(authority, rejected_context).unwrap_err();
+        let DesktopRecordingSessionFinalizeError::Metadata(error) = error else {
+            panic!("metadata validation must fail after verified publication");
+        };
+        assert_eq!(
+            error.reason(),
+            RecordingMetadataError::InvalidId("project_id")
+        );
+        assert_eq!(error.publication().final_wav_path(), wav);
+        assert_eq!(error.publication().frames(), 2);
+        assert_eq!(
+            error.context().project_id,
+            "018F47A2-6B2D-7C11-8A44-001122334455"
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 }
