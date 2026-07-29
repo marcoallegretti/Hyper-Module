@@ -18,6 +18,7 @@ import {
   syncPublishedEntry,
   syncRemovedEntry,
 } from "../lib/durable-files.mjs";
+import { readBoundedDirectory } from "../lib/filesystem-tree.mjs";
 
 const root = await mkdtemp(join(tmpdir(), "hyper-durable-files-"));
 try {
@@ -30,6 +31,19 @@ try {
   assert.equal(await readFile(published, "utf8"), "durable");
   assert.equal((await readStableFile(published, 7)).toString("utf8"), "durable");
   await assert.rejects(readStableFile(published, 6), /exceeds 6 bytes/);
+
+  const bounded = join(root, "bounded");
+  await mkdir(bounded);
+  await writeFile(join(bounded, "a"), "a");
+  await writeFile(join(bounded, "b"), "b");
+  await assert.rejects(
+    readBoundedDirectory(bounded, {
+      maximumEntries: 1,
+      maximumNameBytes: 2,
+      label: "test directory",
+    }),
+    /test directory exceeds 1 entries/,
+  );
 
   const tree = join(root, "tree");
   await mkdir(join(tree, "nested"), { recursive: true });

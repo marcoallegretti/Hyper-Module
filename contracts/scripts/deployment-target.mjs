@@ -6,7 +6,6 @@ import {
   mkdir,
   open,
   readFile,
-  readdir,
   realpath,
   rename,
   rm,
@@ -40,12 +39,16 @@ import {
 } from "../lib/durable-files.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
 import { inspectDeploymentBundle } from "../lib/deployment-bundle.mjs";
+import { readBoundedDirectory } from "../lib/filesystem-tree.mjs";
 
 const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const MAX_DEPLOYMENT_METADATA_BYTES = 64 * 1024;
 const MAX_AUTHORIZATION_STATE_BYTES = 1024 * 1024;
+const MAX_TRANSACTION_RESIDUES = 4096;
+const MAX_TARGET_ROOT_ENTRIES = MAX_TRANSACTION_RESIDUES + 8;
+const MAX_TARGET_ROOT_NAME_BYTES = MAX_TARGET_ROOT_ENTRIES * 1024;
 const DEPLOYMENT_FAULT_BOUNDARIES = new Set([
   "after-authorization-publication",
   "after-authorization-sync",
@@ -363,9 +366,13 @@ function protectedBundleIdentities(state) {
   );
 }
 
-async function inspectInstalledBundles(targetRoot) {
+async function inspectInstalledBundles(targetRoot, maximumBundles) {
   const bundlesRoot = await requireBundlesRoot(targetRoot);
-  const entries = await readdir(bundlesRoot, { withFileTypes: true });
+  const entries = await readBoundedDirectory(bundlesRoot, {
+    maximumEntries: maximumBundles,
+    maximumNameBytes: maximumBundles * 64,
+    label: "installed bundle directory",
+  });
   const bundles = [];
   for (const entry of entries.sort((left, right) =>
     left.name.localeCompare(right.name),
@@ -435,7 +442,10 @@ async function assertStorageWithinPolicy(targetRoot) {
   const policy = await readStoragePolicy(targetRoot);
   assert(policy, "deployment storage policy is not configured");
   const state = await readState(targetRoot);
-  const bundles = await inspectInstalledBundles(targetRoot);
+  const bundles = await inspectInstalledBundles(
+    targetRoot,
+    policy.max_installed_bundles,
+  );
   assertPolicyCapacity(
     policy,
     summarizeStorage(bundles, protectedBundleIdentities(state)),
@@ -443,10 +453,13 @@ async function assertStorageWithinPolicy(targetRoot) {
   );
 }
 
-async function collectUnprotectedBundles(targetRoot) {
+async function collectUnprotectedBundles(targetRoot, policy) {
   const state = await readState(targetRoot);
   const protectedIdentities = protectedBundleIdentities(state);
-  const bundles = await inspectInstalledBundles(targetRoot);
+  const bundles = await inspectInstalledBundles(
+    targetRoot,
+    policy.max_installed_bundles,
+  );
   const removed = [];
   const retained = [];
   for (const bundle of bundles) {
@@ -496,7 +509,10 @@ export async function configureDeploymentStorage(targetPath, policy) {
     }
     const state = await readState(targetRoot);
     const protectedIdentities = protectedBundleIdentities(state);
-    const bundles = await inspectInstalledBundles(targetRoot);
+    const bundles = await inspectInstalledBundles(
+      targetRoot,
+      policy.max_installed_bundles,
+    );
     const usage = summarizeStorage(bundles, protectedIdentities);
     assertPolicyCapacity(policy, usage, await availableBytes(targetRoot));
     await writeCanonicalFile(targetRoot, "policy", policy);
@@ -510,7 +526,10 @@ export async function readDeploymentStorage(targetPath) {
     const policy = await readStoragePolicy(targetRoot);
     assert(policy, "deployment storage policy is not configured");
     const state = await readState(targetRoot);
-    const bundles = await inspectInstalledBundles(targetRoot);
+    const bundles = await inspectInstalledBundles(
+      targetRoot,
+      policy.max_installed_bundles,
+    );
     return {
       policy,
       ...summarizeStorage(bundles, protectedBundleIdentities(state)),
@@ -524,7 +543,7 @@ export async function collectDeploymentGarbage(targetPath) {
   return withDeploymentLock(targetRoot, async () => {
     const policy = await readStoragePolicy(targetRoot);
     assert(policy, "deployment storage policy is not configured");
-    const collected = await collectUnprotectedBundles(targetRoot);
+    const collected = await collectUnprotectedBundles(targetRoot, policy);
     const usage = summarizeStorage(
       collected.bundles,
       collected.protectedIdentities,
@@ -633,7 +652,11 @@ const FILE_RESIDUE_PATTERN = new RegExp(
 
 async function removeTransactionResidue(targetRoot) {
   const removed = [];
-  const entries = await readdir(targetRoot, { withFileTypes: true });
+  const entries = await readBoundedDirectory(targetRoot, {
+    maximumEntries: MAX_TARGET_ROOT_ENTRIES,
+    maximumNameBytes: MAX_TARGET_ROOT_NAME_BYTES,
+    label: "deployment recovery directory",
+  });
   for (const entry of entries.sort((left, right) =>
     left.name.localeCompare(right.name),
   )) {
@@ -710,7 +733,10 @@ export async function recoverDeploymentTarget(
     let storage = null;
     if (policy) {
       const state = await readState(targetRoot);
-      const bundles = await inspectInstalledBundles(targetRoot);
+      const bundles = await inspectInstalledBundles(
+        targetRoot,
+        policy.max_installed_bundles,
+      );
       const usage = summarizeStorage(
         bundles,
         protectedBundleIdentities(state),
@@ -744,7 +770,10 @@ async function installIdentity(sourceRoot, targetRoot, faultAt = undefined) {
   }
 
   const state = await readState(targetRoot);
-  const bundles = await inspectInstalledBundles(targetRoot);
+  const bundles = await inspectInstalledBundles(
+    targetRoot,
+    policy.max_installed_bundles,
+  );
   const usage = summarizeStorage(bundles, protectedBundleIdentities(state));
   assertPolicyCapacity(
     policy,

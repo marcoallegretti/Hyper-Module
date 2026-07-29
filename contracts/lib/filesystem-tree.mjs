@@ -1,6 +1,41 @@
 import assert from "node:assert/strict";
-import { lstat, readdir } from "node:fs/promises";
+import { lstat, opendir } from "node:fs/promises";
 import { join } from "node:path";
+
+export async function readBoundedDirectory(
+  path,
+  {
+    maximumEntries,
+    maximumNameBytes,
+    label = "directory",
+  },
+) {
+  for (const [name, value] of Object.entries({
+    maximumEntries,
+    maximumNameBytes,
+  })) {
+    assert(
+      Number.isSafeInteger(value) && value >= 0,
+      `${name} must be a non-negative safe integer`,
+    );
+  }
+  const entries = [];
+  let nameBytes = 0;
+  const directory = await opendir(path);
+  for await (const entry of directory) {
+    assert(
+      entries.length < maximumEntries,
+      `${label} exceeds ${maximumEntries} entries`,
+    );
+    nameBytes += Buffer.byteLength(entry.name, "utf8");
+    assert(
+      nameBytes <= maximumNameBytes,
+      `${label} entry names exceed ${maximumNameBytes} bytes`,
+    );
+    entries.push(entry);
+  }
+  return entries;
+}
 
 export function directoryPrefixes(paths) {
   const directories = new Set();
@@ -52,8 +87,8 @@ export async function collectRegularFiles(
 
   while (pending.length > 0) {
     const { directory, prefix, depth } = pending.pop();
-    const entries = await readdir(directory, { withFileTypes: true });
-    for (const entry of entries) {
+    const entries = await opendir(directory);
+    for await (const entry of entries) {
       const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
       const absolutePath = join(directory, entry.name);
       entryCount += 1;

@@ -6,7 +6,6 @@ import {
   mkdir,
   open,
   readFile,
-  readdir,
   rename,
   rm,
   rmdir,
@@ -22,7 +21,10 @@ import {
   syncPublishedEntry,
   syncRemovedEntry,
 } from "../lib/durable-files.mjs";
-import { collectRegularFiles } from "../lib/filesystem-tree.mjs";
+import {
+  collectRegularFiles,
+  readBoundedDirectory,
+} from "../lib/filesystem-tree.mjs";
 import { assertRecordingMetadataInvariants } from "../lib/recording-metadata.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
 import { readStableRegularFile } from "./verify-bundle.mjs";
@@ -35,6 +37,8 @@ const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_HANDOFF_BYTES = 2 * 1024 * 1024;
 const MAX_RECORDING_BYTES = 4_294_967_295;
 const MAX_SAFE_INTEGER = 9_007_199_254_740_991;
+const MAX_RECOVERY_ENTRIES = 4098;
+const MAX_RECOVERY_NAME_BYTES = MAX_RECOVERY_ENTRIES * 1024;
 const ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
@@ -972,7 +976,11 @@ export async function recoverRecordingImports(
 
   return withProjectLock(backupsRoot, async () => {
     const results = [];
-    const entries = await readdir(backupsRoot, { withFileTypes: true });
+    const entries = await readBoundedDirectory(backupsRoot, {
+      maximumEntries: MAX_RECOVERY_ENTRIES,
+      maximumNameBytes: MAX_RECOVERY_NAME_BYTES,
+      label: "recording recovery directory",
+    });
     for (const entry of entries.sort((left, right) =>
       left.name.localeCompare(right.name),
     )) {
