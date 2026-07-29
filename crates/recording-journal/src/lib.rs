@@ -1,6 +1,7 @@
 #![doc = "Recoverable recording journals and verified WAV publication."]
 
 use crc32fast::Hasher;
+use same_file::Handle;
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
@@ -890,16 +891,54 @@ fn visit_payloads(
 }
 
 fn verify_wav(path: &Path, report: RecoveryReport) -> Option<VerifiedWav> {
-    let before = hash_regular_file(path)?;
-    if !verify_wav_samples(path, report) {
-        return None;
-    }
-    let after = hash_regular_file(path)?;
-    (before == after).then_some(after)
+    verify_wav_observed(path, report, || {})
 }
 
-fn verify_wav_samples(path: &Path, report: RecoveryReport) -> bool {
-    let Ok(mut reader) = hound::WavReader::open(path) else {
+fn verify_wav_observed(
+    path: &Path,
+    report: RecoveryReport,
+    after_samples: impl FnOnce(),
+) -> Option<VerifiedWav> {
+    let path_before = fs::symlink_metadata(path).ok()?;
+    if is_link_like(&path_before) || !path_before.is_file() {
+        return None;
+    }
+    let mut handle = Handle::from_path(path).ok()?;
+    let file_before = handle.as_file().metadata().ok()?;
+    if !file_before.is_file()
+        || file_before.len() != path_before.len()
+        || metadata_stamp(&file_before) != metadata_stamp(&path_before)
+    {
+        return None;
+    }
+    let before = hash_open_file(handle.as_file_mut())?;
+    handle.as_file_mut().seek(SeekFrom::Start(0)).ok()?;
+    if !verify_wav_samples(handle.as_file_mut(), report) {
+        return None;
+    }
+    after_samples();
+    handle.as_file_mut().seek(SeekFrom::Start(0)).ok()?;
+    let after = hash_open_file(handle.as_file_mut())?;
+    if before != after {
+        return None;
+    }
+    let file_after = handle.as_file().metadata().ok()?;
+    let path_after = fs::symlink_metadata(path).ok()?;
+    if is_link_like(&path_after)
+        || !path_after.is_file()
+        || file_after.len() != file_before.len()
+        || metadata_stamp(&file_after) != metadata_stamp(&file_before)
+        || path_after.len() != file_after.len()
+        || metadata_stamp(&path_after) != metadata_stamp(&file_after)
+        || Handle::from_path(path).ok()? != handle
+    {
+        return None;
+    }
+    Some(after)
+}
+
+fn verify_wav_samples(file: &mut File, report: RecoveryReport) -> bool {
+    let Ok(mut reader) = hound::WavReader::new(file) else {
         return false;
     };
     let spec = reader.spec();
@@ -919,23 +958,19 @@ fn verify_wav_samples(path: &Path, report: RecoveryReport) -> bool {
             _ => return false,
         };
         hasher.update(&sample.to_le_bytes());
-        samples += 1;
+        let Some(next) = samples.checked_add(1) else {
+            return false;
+        };
+        samples = next;
     }
-    samples == report.frames * u64::from(CHANNELS) && hasher.finalize() == report.content_crc32
+    report
+        .frames
+        .checked_mul(u64::from(CHANNELS))
+        .is_some_and(|expected| samples == expected)
+        && hasher.finalize() == report.content_crc32
 }
 
-fn hash_regular_file(path: &Path) -> Option<VerifiedWav> {
-    let path_before = fs::symlink_metadata(path).ok()?;
-    if !path_before.file_type().is_file() {
-        return None;
-    }
-
-    let mut file = File::open(path).ok()?;
-    let file_before = file.metadata().ok()?;
-    if !file_before.is_file() || file_before.len() != path_before.len() {
-        return None;
-    }
-    let modified = file_before.modified().ok()?;
+fn hash_open_file(file: &mut File) -> Option<VerifiedWav> {
     let mut hasher = Sha256::new();
     let mut byte_length = 0_u64;
     let mut buffer = [0_u8; 16 * 1024];
@@ -947,23 +982,50 @@ fn hash_regular_file(path: &Path) -> Option<VerifiedWav> {
         byte_length = byte_length.checked_add(read as u64)?;
         hasher.update(&buffer[..read]);
     }
-
-    let file_after = file.metadata().ok()?;
-    let path_after = fs::symlink_metadata(path).ok()?;
-    if !file_after.is_file()
-        || !path_after.file_type().is_file()
-        || byte_length != file_before.len()
-        || file_after.len() != file_before.len()
-        || path_after.len() != file_before.len()
-        || file_after.modified().ok()? != modified
-        || path_after.modified().ok()? != modified
-    {
-        return None;
-    }
     Some(VerifiedWav {
         byte_length,
         sha256: hasher.finalize().into(),
     })
+}
+
+#[cfg(unix)]
+type MetadataStamp = (i64, i64, i64, i64);
+
+#[cfg(unix)]
+fn metadata_stamp(metadata: &fs::Metadata) -> MetadataStamp {
+    use std::os::unix::fs::MetadataExt;
+    (
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
+#[cfg(windows)]
+type MetadataStamp = (u64, u64, u32);
+
+#[cfg(windows)]
+fn metadata_stamp(metadata: &fs::Metadata) -> MetadataStamp {
+    use std::os::windows::fs::MetadataExt;
+    (
+        metadata.last_write_time(),
+        metadata.creation_time(),
+        metadata.file_attributes(),
+    )
+}
+
+#[cfg(unix)]
+fn is_link_like(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn is_link_like(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 fn staging_path(final_path: &Path) -> Result<PathBuf, JournalError> {
@@ -1062,4 +1124,61 @@ fn read_u32(bytes: &[u8]) -> u32 {
 
 fn read_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes.try_into().expect("u64 field has eight bytes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn wav_verification_rejects_a_byte_identical_path_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "hyper-wav-identity-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("take.wav");
+        let replacement = root.join("replacement.wav");
+        let displaced = root.join("displaced.wav");
+        let samples = [0.25_f32, -0.25_f32];
+        let spec = hound::WavSpec {
+            channels: CHANNELS,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for sample in samples {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        fs::copy(&path, &replacement).unwrap();
+        let mut content = Vec::new();
+        for sample in samples {
+            content.extend_from_slice(&sample.to_le_bytes());
+        }
+        let report = RecoveryReport {
+            config: JournalConfig {
+                sample_rate: 48_000,
+                max_chunk_frames: 1,
+                max_total_frames: 1,
+            },
+            chunks: 1,
+            frames: 1,
+            discarded_bytes: 0,
+            content_crc32: crc32(&content),
+        };
+
+        let verified = verify_wav_observed(&path, report, || {
+            fs::rename(&path, &displaced).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+        });
+
+        assert!(verified.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

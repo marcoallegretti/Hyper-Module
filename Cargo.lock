@@ -403,6 +403,7 @@ dependencies = [
  "crc32fast",
  "hound",
  "hyper-recording-transport",
+ "same-file",
  "sha2",
 ]
 
