@@ -75,6 +75,34 @@ Licenses:
 - <https://github.com/mgeier/rtrb/blob/0.3.4/LICENSE-MIT>
 - <https://github.com/mgeier/rtrb/blob/0.3.4/LICENSE-APACHE>
 
+## ringbuf 0.5.1
+
+The `hyper-recording-transport` crate uses `ringbuf` 0.5.1 and its
+`crossbeam-utils` 0.8.22 dependency for bounded single-producer/single-consumer
+audio transfer.
+
+Both packages are licensed under either the MIT License or Apache License 2.0.
+
+Sources:
+
+- <https://github.com/agerasev/ringbuf/tree/f76754f1ce15790406358bef3dcf231c400bcfd8>
+- <https://github.com/crossbeam-rs/crossbeam/tree/crossbeam-utils-0.8.22>
+
+## Hound 3.5.1 and crc32fast 1.5.0
+
+The `hyper-recording-journal` crate uses Hound 3.5.1 to write and independently
+read 32-bit IEEE-float WAV media. Hound is licensed under Apache License 2.0.
+
+The crate uses `crc32fast` 1.5.0 and its `cfg-if` 1.0.4 dependency to verify
+journal headers, chunks, and finalized sample content. Both packages are
+licensed under either the MIT License or Apache License 2.0.
+
+Sources:
+
+- <https://github.com/ruuda/hound/tree/v3.5.1>
+- <https://github.com/srijs/rust-crc32fast/tree/v1.5.0>
+- <https://github.com/rust-lang/cfg-if/tree/1.0.4>
+
 ## PipeWire Rust bindings 0.10.0
 
 The Linux portion of `hyper-desktop-audio` uses the `pipewire`, `libspa`,
