@@ -17,7 +17,10 @@ import { tmpdir } from "node:os";
 import canonicalize from "canonicalize";
 
 import { verifyDescribedFile } from "./verify-bundle.mjs";
-import { verifyProject } from "./verify-project.mjs";
+import {
+  verifyProject,
+  verifyProjectCandidate,
+} from "./verify-project.mjs";
 
 // MIT-licensed reference fixture from music-metadata 11.14.0:
 // test/samples/flac/libFLAC.flac at commit 959f0f3d464578ddd3dfc2a5cbcd0068799dd394.
@@ -612,6 +615,53 @@ try {
   const first = await verifyProject(valid);
   const second = await verifyProject(valid);
   assert.equal(first.identity, second.identity);
+
+  const activeManifestPath = join(valid, "project.json");
+  const activeManifestBytes = await readFile(activeManifestPath);
+  const candidateProject = JSON.parse(activeManifestBytes);
+  candidateProject.revision += 1;
+  const candidateManifestBytes = Buffer.from(
+    canonicalize(candidateProject),
+    "utf8",
+  );
+  const candidate = await verifyProjectCandidate(
+    valid,
+    candidateManifestBytes,
+  );
+  assert.equal(
+    candidate.identity,
+    `sha256:${createHash("sha256")
+      .update(candidateManifestBytes)
+      .digest("hex")}`,
+  );
+  assert(
+    (await readFile(activeManifestPath)).equals(activeManifestBytes),
+    "candidate verification changed the active project manifest",
+  );
+  await assert.rejects(
+    verifyProjectCandidate(
+      valid,
+      Buffer.from(JSON.stringify(candidateProject, null, 2), "utf8"),
+    ),
+    /project.json is not canonical/,
+  );
+  const missingPayloadCandidate = structuredClone(candidateProject);
+  missingPayloadCandidate.assets.push({
+    id: "018f47a2-6b2d-7c11-8a44-001122334499",
+    role: "recording",
+    path: "assets/recordings/018f47a2-6b2d-7c11-8a44-001122334499.wav",
+    media_type: "audio/wav",
+    byte_length: 64,
+    sha256: "0".repeat(64),
+    extensions: {},
+  });
+  await assert.rejects(
+    verifyProjectCandidate(
+      valid,
+      Buffer.from(canonicalize(missingPayloadCandidate), "utf8"),
+    ),
+    /managed project files do not exactly match project.json/,
+  );
 
   const validFlac = await createValidProject(temporaryRoot, "valid-flac", {
     bytes: Buffer.from(flacFixtureBase64, "base64"),
@@ -1755,7 +1805,7 @@ try {
     /project must contain at most one control-mapping resource/,
   );
 
-  console.log("Project verifier passed: 69 filesystem cases");
+  console.log("Project verifier passed: 72 filesystem cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

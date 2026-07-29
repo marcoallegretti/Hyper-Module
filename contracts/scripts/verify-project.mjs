@@ -183,6 +183,34 @@ export async function verifyProject(
   projectPath,
   { ignoredManagedPaths = [] } = {},
 ) {
+  return verifyProjectManifest(projectPath, ignoredManagedPaths);
+}
+
+export async function verifyProjectCandidate(
+  projectPath,
+  candidateManifestBytes,
+  { ignoredManagedPaths = [] } = {},
+) {
+  assert(
+    Buffer.isBuffer(candidateManifestBytes),
+    "candidate project manifest must be a Buffer",
+  );
+  assert(
+    candidateManifestBytes.length <= manifestLimitBytes,
+    `candidate project manifest exceeds ${manifestLimitBytes} bytes`,
+  );
+  return verifyProjectManifest(
+    projectPath,
+    ignoredManagedPaths,
+    Buffer.from(candidateManifestBytes),
+  );
+}
+
+async function verifyProjectManifest(
+  projectPath,
+  ignoredManagedPaths,
+  candidateManifestBytes = undefined,
+) {
   const ignoredManagedPathSet = new Set(ignoredManagedPaths);
   const rootPath = resolve(projectPath);
   const rootStatus = await lstat(rootPath);
@@ -193,11 +221,12 @@ export async function verifyProject(
   const rootRealPath = await realpath(rootPath);
 
   const manifestPath = join(rootPath, "project.json");
-  const manifestBytes = await readStableRegularFile(
+  const activeManifestBytes = await readStableRegularFile(
     manifestPath,
     "project.json",
     manifestLimitBytes,
   );
+  const manifestBytes = candidateManifestBytes ?? activeManifestBytes;
   assert(
     !manifestBytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])),
     "project.json must not contain a byte-order mark",
@@ -834,7 +863,7 @@ export async function verifyProject(
     "managed project files changed during verification",
   );
   assert(
-    (await readFile(manifestPath)).equals(manifestBytes),
+    (await readFile(manifestPath)).equals(activeManifestBytes),
     "project.json changed during verification",
   );
 
