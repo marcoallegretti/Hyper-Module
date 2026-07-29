@@ -21,9 +21,15 @@ use std::time::Duration;
 pub const STEREO_CHANNELS: usize = 2;
 pub const MAXIMUM_BLOCK_FRAMES: usize = 4_096;
 
+mod capture;
+pub use capture::{
+    CaptureCallback, CaptureCallbackConfigError, CaptureCallbackStatus, CaptureStreamCounters,
+    CaptureStreamSnapshot, InterleavedStereoCaptureProcessor,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
-pub enum OutputStreamState {
+pub enum StreamState {
     /// Backend construction has not yet published readiness.
     Starting,
     /// The backend published a usable stream and still owns it.
@@ -36,39 +42,37 @@ pub enum OutputStreamState {
     Failed,
 }
 
-/// Cloneable, lock-free observer for one output thread's lifecycle.
+/// Cloneable, lock-free observer for one native audio thread's lifecycle.
 #[derive(Clone, Debug)]
-pub struct OutputStreamStatus {
+pub struct StreamStatus {
     state: Arc<AtomicU8>,
 }
 
-impl Default for OutputStreamStatus {
+impl Default for StreamStatus {
     fn default() -> Self {
         Self {
-            state: Arc::new(AtomicU8::new(OutputStreamState::Starting as u8)),
+            state: Arc::new(AtomicU8::new(StreamState::Starting as u8)),
         }
     }
 }
 
-impl OutputStreamStatus {
+impl StreamStatus {
     /// Returns the latest lifecycle state.
     #[must_use]
-    pub fn state(&self) -> OutputStreamState {
+    pub fn state(&self) -> StreamState {
         match self.state.load(Ordering::Acquire) {
-            value if value == OutputStreamState::Starting as u8 => OutputStreamState::Starting,
-            value if value == OutputStreamState::Running as u8 => OutputStreamState::Running,
-            value if value == OutputStreamState::StopRequested as u8 => {
-                OutputStreamState::StopRequested
-            }
-            value if value == OutputStreamState::Stopped as u8 => OutputStreamState::Stopped,
-            _ => OutputStreamState::Failed,
+            value if value == StreamState::Starting as u8 => StreamState::Starting,
+            value if value == StreamState::Running as u8 => StreamState::Running,
+            value if value == StreamState::StopRequested as u8 => StreamState::StopRequested,
+            value if value == StreamState::Stopped as u8 => StreamState::Stopped,
+            _ => StreamState::Failed,
         }
     }
 
     fn mark_running(&self) {
         let _ = self.state.compare_exchange(
-            OutputStreamState::Starting as u8,
-            OutputStreamState::Running as u8,
+            StreamState::Starting as u8,
+            StreamState::Running as u8,
             Ordering::Release,
             Ordering::Relaxed,
         );
@@ -81,10 +85,10 @@ impl OutputStreamStatus {
                 Ordering::Relaxed,
                 |current| match current {
                     value
-                        if value == OutputStreamState::Starting as u8
-                            || value == OutputStreamState::Running as u8 =>
+                        if value == StreamState::Starting as u8
+                            || value == StreamState::Running as u8 =>
                     {
-                        Some(OutputStreamState::StopRequested as u8)
+                        Some(StreamState::StopRequested as u8)
                     }
                     _ => None,
                 },
@@ -97,8 +101,8 @@ impl OutputStreamStatus {
                 Ordering::Release,
                 Ordering::Relaxed,
                 |current| match current {
-                    value if value == OutputStreamState::Failed as u8 => None,
-                    _ => Some(OutputStreamState::Stopped as u8),
+                    value if value == StreamState::Failed as u8 => None,
+                    _ => Some(StreamState::Stopped as u8),
                 },
             );
     }
@@ -110,16 +114,19 @@ impl OutputStreamStatus {
                 Ordering::Relaxed,
                 |current| match current {
                     value
-                        if value == OutputStreamState::Starting as u8
-                            || value == OutputStreamState::Running as u8 =>
+                        if value == StreamState::Starting as u8
+                            || value == StreamState::Running as u8 =>
                     {
-                        Some(OutputStreamState::Failed as u8)
+                        Some(StreamState::Failed as u8)
                     }
                     _ => None,
                 },
             );
     }
 }
+
+pub type OutputStreamState = StreamState;
+pub type OutputStreamStatus = StreamStatus;
 
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
@@ -186,7 +193,7 @@ impl BoundedBackendThread {
 ))]
 struct BackendThreadCompletion {
     sender: SyncSender<()>,
-    status: OutputStreamStatus,
+    status: StreamStatus,
 }
 
 #[cfg(any(
@@ -441,8 +448,9 @@ pub use desktop_output::{
 mod pipewire_devices;
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 pub use pipewire_devices::{
-    PipeWireOutputTarget, PipeWireOutputTargets, PipeWireTargetDiscoveryError,
-    PipeWireTargetDiscoveryStage, discover_pipewire_output_targets,
+    PipeWireInputTarget, PipeWireInputTargets, PipeWireOutputTarget, PipeWireOutputTargets,
+    PipeWireTarget, PipeWireTargetDiscoveryError, PipeWireTargetDiscoveryStage, PipeWireTargets,
+    discover_pipewire_input_targets, discover_pipewire_output_targets,
 };
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 mod pipewire_output;
@@ -451,6 +459,10 @@ pub use pipewire_output::{
     PipeWireOutputConfig, PipeWireOutputConfigError, PipeWireOutputStream, PipeWireStartError,
     PipeWireStartupStage, PipeWireStopError,
 };
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+mod pipewire_input;
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+pub use pipewire_input::{PipeWireInputConfig, PipeWireInputConfigError, PipeWireInputStream};
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
@@ -482,8 +494,9 @@ pub use playback_session::{
 mod wasapi_devices;
 #[cfg(target_os = "windows")]
 pub use wasapi_devices::{
-    WasapiEndpointDiscoveryError, WasapiEndpointDiscoveryStage, WasapiOutputEndpoint,
-    WasapiOutputEndpoints, discover_wasapi_output_endpoints,
+    WasapiEndpoint, WasapiEndpointDiscoveryError, WasapiEndpointDiscoveryStage, WasapiEndpoints,
+    WasapiInputEndpoint, WasapiInputEndpoints, WasapiOutputEndpoint, WasapiOutputEndpoints,
+    discover_wasapi_input_endpoints, discover_wasapi_output_endpoints,
 };
 #[cfg(target_os = "windows")]
 mod wasapi_output;
@@ -492,6 +505,10 @@ pub use wasapi_output::{
     WasapiDisconnectReason, WasapiOutputConfig, WasapiOutputConfigError, WasapiOutputStream,
     WasapiStartError, WasapiStartupStage, WasapiStopError,
 };
+#[cfg(target_os = "windows")]
+mod wasapi_input;
+#[cfg(target_os = "windows")]
+pub use wasapi_input::{WasapiInputConfig, WasapiInputConfigError, WasapiInputStream};
 
 #[cfg(test)]
 mod tests {

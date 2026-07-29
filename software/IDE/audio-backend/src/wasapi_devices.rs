@@ -4,15 +4,15 @@ use std::collections::HashSet;
 use std::thread;
 use wasapi::{Direction, Role};
 
-/// One active Windows render endpoint available for explicit selection.
+/// One active Windows audio endpoint available for explicit selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WasapiOutputEndpoint {
+pub struct WasapiEndpoint {
     device_id: String,
     display_name: String,
     default: bool,
 }
 
-impl WasapiOutputEndpoint {
+impl WasapiEndpoint {
     #[must_use]
     pub fn device_id(&self) -> &str {
         &self.device_id
@@ -34,40 +34,45 @@ impl WasapiOutputEndpoint {
     }
 }
 
-/// A consistent snapshot of active Windows render endpoints.
+/// A consistent snapshot of active Windows audio endpoints.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct WasapiOutputEndpoints {
-    endpoints: Vec<WasapiOutputEndpoint>,
+pub struct WasapiEndpoints {
+    endpoints: Vec<WasapiEndpoint>,
 }
 
-impl WasapiOutputEndpoints {
+impl WasapiEndpoints {
     #[must_use]
-    pub fn endpoints(&self) -> &[WasapiOutputEndpoint] {
+    pub fn endpoints(&self) -> &[WasapiEndpoint] {
         &self.endpoints
     }
 
     #[must_use]
-    pub fn targets(&self) -> &[WasapiOutputEndpoint] {
+    pub fn targets(&self) -> &[WasapiEndpoint] {
         self.endpoints()
     }
 
     #[must_use]
-    pub fn default_endpoint(&self) -> Option<&WasapiOutputEndpoint> {
+    pub fn default_endpoint(&self) -> Option<&WasapiEndpoint> {
         self.endpoints.iter().find(|endpoint| endpoint.default)
     }
 
     #[must_use]
-    pub fn endpoint_by_id(&self, device_id: &str) -> Option<&WasapiOutputEndpoint> {
+    pub fn endpoint_by_id(&self, device_id: &str) -> Option<&WasapiEndpoint> {
         self.endpoints
             .iter()
             .find(|endpoint| endpoint.device_id == device_id)
     }
 
     #[must_use]
-    pub fn target_by_routing_id(&self, routing_id: &str) -> Option<&WasapiOutputEndpoint> {
+    pub fn target_by_routing_id(&self, routing_id: &str) -> Option<&WasapiEndpoint> {
         self.endpoint_by_id(routing_id)
     }
 }
+
+pub type WasapiOutputEndpoint = WasapiEndpoint;
+pub type WasapiInputEndpoint = WasapiEndpoint;
+pub type WasapiOutputEndpoints = WasapiEndpoints;
+pub type WasapiInputEndpoints = WasapiEndpoints;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WasapiEndpointDiscoveryStage {
@@ -89,11 +94,11 @@ impl fmt::Display for WasapiEndpointDiscoveryStage {
         formatter.write_str(match self {
             Self::Com => "COM initialization",
             Self::Enumerator => "device enumeration",
-            Self::Collection => "render endpoint collection",
-            Self::Count => "render endpoint count",
-            Self::DefaultDevice => "default render endpoint",
+            Self::Collection => "audio endpoint collection",
+            Self::Count => "audio endpoint count",
+            Self::DefaultDevice => "default audio endpoint",
             Self::DefaultIdentifier => "default endpoint identifier",
-            Self::Device => "render endpoint",
+            Self::Device => "audio endpoint",
             Self::Identifier => "endpoint identifier",
             Self::DisplayName => "endpoint display name",
             Self::Allocation => "endpoint snapshot allocation",
@@ -159,30 +164,50 @@ impl Error for WasapiEndpointDiscoveryError {
 /// validation fails.
 pub fn discover_wasapi_output_endpoints()
 -> Result<WasapiOutputEndpoints, WasapiEndpointDiscoveryError> {
+    discover_wasapi_endpoints(Direction::Render, "hyper-wasapi-output-discovery")
+}
+
+/// Discovers active Windows capture endpoints on a dedicated COM thread.
+///
+/// # Errors
+///
+/// Returns [`WasapiEndpointDiscoveryError`] if discovery or snapshot
+/// validation fails.
+pub fn discover_wasapi_input_endpoints()
+-> Result<WasapiInputEndpoints, WasapiEndpointDiscoveryError> {
+    discover_wasapi_endpoints(Direction::Capture, "hyper-wasapi-input-discovery")
+}
+
+fn discover_wasapi_endpoints(
+    direction: Direction,
+    thread_name: &str,
+) -> Result<WasapiEndpoints, WasapiEndpointDiscoveryError> {
     thread::Builder::new()
-        .name("hyper-wasapi-discovery".to_owned())
-        .spawn(discover_on_com_thread)
+        .name(thread_name.to_owned())
+        .spawn(move || discover_on_com_thread(direction))
         .map_err(WasapiEndpointDiscoveryError::ThreadSpawn)?
         .join()
         .map_err(|_| WasapiEndpointDiscoveryError::ThreadPanicked)?
 }
 
-fn discover_on_com_thread() -> Result<WasapiOutputEndpoints, WasapiEndpointDiscoveryError> {
+fn discover_on_com_thread(
+    direction: Direction,
+) -> Result<WasapiEndpoints, WasapiEndpointDiscoveryError> {
     let _com = ComGuard::initialize()?;
     let enumerator = wasapi::DeviceEnumerator::new()
         .map_err(|source| backend_error(WasapiEndpointDiscoveryStage::Enumerator, None, source))?;
     let collection = enumerator
-        .get_device_collection(&Direction::Render)
+        .get_device_collection(&direction)
         .map_err(|source| backend_error(WasapiEndpointDiscoveryStage::Collection, None, source))?;
     let count = collection
         .get_nbr_devices()
         .map_err(|source| backend_error(WasapiEndpointDiscoveryStage::Count, None, source))?;
     if count == 0 {
-        return Ok(WasapiOutputEndpoints::default());
+        return Ok(WasapiEndpoints::default());
     }
 
     let default = enumerator
-        .get_default_device_for_role(&Direction::Render, &Role::Console)
+        .get_default_device_for_role(&direction, &Role::Console)
         .map_err(|source| {
             backend_error(WasapiEndpointDiscoveryStage::DefaultDevice, None, source)
         })?;
@@ -242,7 +267,7 @@ struct EndpointRecord {
 fn assemble_snapshot(
     records: Vec<EndpointRecord>,
     default_id: Option<&str>,
-) -> Result<WasapiOutputEndpoints, WasapiEndpointDiscoveryError> {
+) -> Result<WasapiEndpoints, WasapiEndpointDiscoveryError> {
     {
         let mut identifiers = HashSet::new();
         identifiers.try_reserve(records.len()).map_err(|_| {
@@ -265,7 +290,7 @@ fn assemble_snapshot(
         }
         if default_id.is_some_and(|identifier| !identifiers.contains(identifier)) {
             return Err(snapshot_error(
-                "default endpoint is absent from the active render collection",
+                "default endpoint is absent from the active endpoint collection",
             ));
         }
     }
@@ -279,7 +304,7 @@ fn assemble_snapshot(
         }
     })?;
     for record in records {
-        endpoints.push(WasapiOutputEndpoint {
+        endpoints.push(WasapiEndpoint {
             default: default_id == Some(record.device_id.as_str()),
             device_id: record.device_id,
             display_name: record.display_name,
@@ -290,7 +315,7 @@ fn assemble_snapshot(
             .cmp(&right.display_name)
             .then_with(|| left.device_id.cmp(&right.device_id))
     });
-    Ok(WasapiOutputEndpoints { endpoints })
+    Ok(WasapiEndpoints { endpoints })
 }
 
 fn backend_error(
@@ -416,7 +441,7 @@ mod tests {
                 stage: WasapiEndpointDiscoveryStage::Snapshot,
                 detail,
                 ..
-            }) if detail == "default endpoint is absent from the active render collection"
+            }) if detail == "default endpoint is absent from the active endpoint collection"
         ));
     }
 

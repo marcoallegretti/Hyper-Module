@@ -8,14 +8,14 @@ use std::time::Duration;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One `PipeWire` audio sink available for explicit playback routing.
+/// One `PipeWire` audio node available for explicit routing.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PipeWireOutputTarget {
+pub struct PipeWireTarget {
     target: String,
     display_name: String,
 }
 
-impl PipeWireOutputTarget {
+impl PipeWireTarget {
     /// Returns the `node.name` accepted by
     /// [`crate::PipeWireOutputConfig::with_target`].
     #[must_use]
@@ -34,30 +34,35 @@ impl PipeWireOutputTarget {
     }
 }
 
-/// A validated, deterministic snapshot of `PipeWire` audio sinks.
+/// A validated, deterministic snapshot of `PipeWire` audio nodes.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PipeWireOutputTargets {
-    targets: Vec<PipeWireOutputTarget>,
+pub struct PipeWireTargets {
+    targets: Vec<PipeWireTarget>,
 }
 
-impl PipeWireOutputTargets {
+impl PipeWireTargets {
     #[must_use]
-    pub fn targets(&self) -> &[PipeWireOutputTarget] {
+    pub fn targets(&self) -> &[PipeWireTarget] {
         &self.targets
     }
 
     #[must_use]
-    pub fn target_by_name(&self, target: &str) -> Option<&PipeWireOutputTarget> {
+    pub fn target_by_name(&self, target: &str) -> Option<&PipeWireTarget> {
         self.targets
             .iter()
             .find(|candidate| candidate.target == target)
     }
 
     #[must_use]
-    pub fn target_by_routing_id(&self, routing_id: &str) -> Option<&PipeWireOutputTarget> {
+    pub fn target_by_routing_id(&self, routing_id: &str) -> Option<&PipeWireTarget> {
         self.target_by_name(routing_id)
     }
 }
+
+pub type PipeWireOutputTarget = PipeWireTarget;
+pub type PipeWireInputTarget = PipeWireTarget;
+pub type PipeWireOutputTargets = PipeWireTargets;
+pub type PipeWireInputTargets = PipeWireTargets;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PipeWireTargetDiscoveryStage {
@@ -131,6 +136,23 @@ impl Error for PipeWireTargetDiscoveryError {}
 /// allocation, registry validation, or the bounded discovery interval fails.
 pub fn discover_pipewire_output_targets()
 -> Result<PipeWireOutputTargets, PipeWireTargetDiscoveryError> {
+    discover_pipewire_targets("Audio/Sink")
+}
+
+/// Discovers the initial `PipeWire` `Audio/Source` registry snapshot.
+///
+/// # Errors
+///
+/// Returns [`PipeWireTargetDiscoveryError`] if bounded discovery or snapshot
+/// validation fails.
+pub fn discover_pipewire_input_targets()
+-> Result<PipeWireInputTargets, PipeWireTargetDiscoveryError> {
+    discover_pipewire_targets("Audio/Source")
+}
+
+fn discover_pipewire_targets(
+    media_class: &'static str,
+) -> Result<PipeWireTargets, PipeWireTargetDiscoveryError> {
     pw::init();
     let main_loop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|source| backend_error(PipeWireTargetDiscoveryStage::MainLoop, None, source))?;
@@ -145,8 +167,13 @@ pub fn discover_pipewire_output_targets()
 
     let records = Rc::new(RefCell::new(Vec::new()));
     let failure = Rc::new(RefCell::new(None));
-    let registry_listener =
-        register_target_listener(&registry, &main_loop, records.clone(), failure.clone());
+    let registry_listener = register_target_listener(
+        &registry,
+        &main_loop,
+        records.clone(),
+        failure.clone(),
+        media_class,
+    );
 
     let pending = core
         .sync(0)
@@ -211,6 +238,7 @@ fn register_target_listener(
     main_loop: &pw::main_loop::MainLoopRc,
     records: Rc<RefCell<Vec<TargetRecord>>>,
     failure: Rc<RefCell<Option<PipeWireTargetDiscoveryError>>>,
+    media_class: &'static str,
 ) -> pw::registry::Listener {
     let main_loop = main_loop.clone();
     registry
@@ -222,7 +250,10 @@ fn register_target_listener(
             let Some(properties) = global.props else {
                 return;
             };
-            if properties.get("media.class") != Some("Audio/Sink") {
+            if !properties
+                .get("media.class")
+                .is_some_and(|actual| media_class_matches(actual, media_class))
+            {
                 return;
             }
             let Some(target) = properties.get("node.name") else {
@@ -285,6 +316,13 @@ fn register_target_listener(
         .register()
 }
 
+fn media_class_matches(actual: &str, requested: &str) -> bool {
+    actual == requested
+        || actual
+            .strip_prefix(requested)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TargetRecord {
     target: String,
@@ -310,7 +348,7 @@ fn try_record(target: &str, display_name: &str) -> Result<TargetRecord, ()> {
 
 fn assemble_snapshot(
     records: Vec<TargetRecord>,
-) -> Result<PipeWireOutputTargets, PipeWireTargetDiscoveryError> {
+) -> Result<PipeWireTargets, PipeWireTargetDiscoveryError> {
     let mut identities = HashSet::new();
     identities.try_reserve(records.len()).map_err(|_| {
         backend_error(
@@ -339,7 +377,7 @@ fn assemble_snapshot(
             "validated target capacity is unavailable",
         )
     })?;
-    targets.extend(records.into_iter().map(|record| PipeWireOutputTarget {
+    targets.extend(records.into_iter().map(|record| PipeWireTarget {
         target: record.target,
         display_name: record.display_name,
     }));
@@ -348,7 +386,7 @@ fn assemble_snapshot(
             .cmp(&right.display_name)
             .then_with(|| left.target.cmp(&right.target))
     });
-    Ok(PipeWireOutputTargets { targets })
+    Ok(PipeWireTargets { targets })
 }
 
 fn publish_failure(
@@ -449,5 +487,13 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn media_class_family_includes_virtual_nodes_without_prefix_collisions() {
+        assert!(media_class_matches("Audio/Source", "Audio/Source"));
+        assert!(media_class_matches("Audio/Source/Virtual", "Audio/Source"));
+        assert!(!media_class_matches("Audio/SourceMonitor", "Audio/Source"));
+        assert!(!media_class_matches("Audio/Sink", "Audio/Source"));
     }
 }

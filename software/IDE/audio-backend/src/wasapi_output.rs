@@ -153,6 +153,7 @@ pub enum WasapiStartupStage {
     State,
     Event,
     RenderClient,
+    CaptureClient,
     Buffer,
     Start,
     Callback,
@@ -172,7 +173,8 @@ impl fmt::Display for WasapiStartupStage {
             Self::State => "stream state",
             Self::Event => "event handle",
             Self::RenderClient => "render client",
-            Self::Buffer => "render buffer",
+            Self::CaptureClient => "capture client",
+            Self::Buffer => "audio buffer",
             Self::Start => "stream start",
             Self::Callback => "callback",
         })
@@ -830,7 +832,7 @@ const fn map_disconnect_reason(reason: &DisconnectReason) -> WasapiDisconnectRea
     }
 }
 
-const fn decode_disconnect_reason(value: u8) -> Option<WasapiDisconnectReason> {
+pub(crate) const fn decode_disconnect_reason(value: u8) -> Option<WasapiDisconnectReason> {
     match value {
         value if value == WasapiDisconnectReason::DeviceRemoval as u8 => {
             Some(WasapiDisconnectReason::DeviceRemoval)
@@ -857,7 +859,7 @@ const fn decode_disconnect_reason(value: u8) -> Option<WasapiDisconnectReason> {
     }
 }
 
-fn publish_disconnect(
+pub(crate) fn publish_disconnect(
     reason: &DisconnectReason,
     status: &OutputStreamStatus,
     destination: &AtomicU8,

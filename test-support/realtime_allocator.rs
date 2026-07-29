@@ -3,11 +3,13 @@
 use core::alloc::{GlobalAlloc, Layout};
 use std::alloc::System;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 struct CountingAllocator;
 
 static COUNTING: AtomicBool = AtomicBool::new(false);
 static HEAP_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
+static MEASUREMENT_LOCK: Mutex<()> = Mutex::new(());
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -42,13 +44,20 @@ fn record_operation() {
 
 pub struct HeapMeasurement {
     active: bool,
+    _guard: MutexGuard<'static, ()>,
 }
 
 impl HeapMeasurement {
     pub fn start() -> Self {
+        let guard = MEASUREMENT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         HEAP_OPERATIONS.store(0, Ordering::SeqCst);
         COUNTING.store(true, Ordering::SeqCst);
-        Self { active: true }
+        Self {
+            active: true,
+            _guard: guard,
+        }
     }
 
     pub fn finish(mut self) -> usize {

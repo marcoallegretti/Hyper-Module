@@ -42,16 +42,31 @@ pw-cli create-node adapter '{
   audio.position = [ FL FR ]
 }' >/dev/null
 
+pw-cli create-node adapter '{
+  factory.name = support.null-audio-sink
+  node.name = hyper-ci-source
+  node.description = "Hyper CI Source"
+  media.class = Audio/Source/Virtual
+  object.linger = true
+  audio.position = [ FL FR ]
+}' >/dev/null
+
 for _ in $(seq 1 50); do
   pw-dump >"$runtime_directory/graph.json"
-  if grep -q '"node.name": "hyper-ci-sink"' "$runtime_directory/graph.json"; then
+  if grep -q '"node.name": "hyper-ci-sink"' "$runtime_directory/graph.json" \
+    && grep -q '"node.name": "hyper-ci-source"' "$runtime_directory/graph.json"; then
     break
   fi
   sleep 0.1
 done
 pw-dump >"$runtime_directory/graph.json"
 grep -q '"node.name": "hyper-ci-sink"' "$runtime_directory/graph.json"
+grep -q '"node.name": "hyper-ci-source"' "$runtime_directory/graph.json"
 
 cargo test -p hyper-desktop-audio \
   pipewire_output::tests::live_pipewire_null_sink_processes_audio \
+  -- --ignored --exact
+
+cargo test -p hyper-desktop-audio \
+  pipewire_input::tests::live_pipewire_source_captures_audio \
   -- --ignored --exact
