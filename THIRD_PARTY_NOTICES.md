@@ -59,6 +59,51 @@ Sources:
 - <https://github.com/dtolnay/unicode-ident>
 - <https://github.com/dtolnay/zmij>
 
+## serde_json_canonicalizer 0.3.2 and ryu-js 1.0.3
+
+The `hyper-storage-engine` crate uses `serde_json_canonicalizer` 0.3.2 and its
+`ryu-js` 1.0.3 dependency to verify RFC 8785 JSON Canonicalization Scheme bytes
+against the existing cross-language project contract.
+
+`serde_json_canonicalizer` is Copyright its contributors and licensed under
+the MIT License. `ryu-js` is Copyright its contributors and licensed under the
+Apache License 2.0 or Boost Software License 1.0.
+
+Sources:
+
+- <https://github.com/evik42/serde-json-canonicalizer/tree/db8ae9eaef2a17b8c829062aa8fcbea7635b33ae>
+- <https://github.com/boa-dev/ryu-js/tree/f8d66267a2f5c92d1d9d634c92d06d1541640506>
+
+Licenses:
+
+- <https://github.com/evik42/serde-json-canonicalizer/blob/db8ae9eaef2a17b8c829062aa8fcbea7635b33ae/LICENSE>
+- <https://github.com/boa-dev/ryu-js/blob/f8d66267a2f5c92d1d9d634c92d06d1541640506/LICENSE-APACHE>
+- <https://github.com/boa-dev/ryu-js/blob/f8d66267a2f5c92d1d9d634c92d06d1541640506/LICENSE-BOOST>
+
+## same-file 1.0.6
+
+The `hyper-storage-engine` crate uses `same-file` 1.0.6 for safe,
+cross-platform comparison of open files and final filesystem paths during
+stable reads. It uses `winapi-util` 0.1.11 and the locked Microsoft
+`windows-sys` packages on Windows.
+
+`same-file` is licensed under the MIT License or the Unlicense.
+`winapi-util` is licensed under the Unlicense or MIT License. The Microsoft
+packages are licensed under the MIT License or Apache License 2.0.
+
+Sources:
+
+- <https://github.com/BurntSushi/same-file/tree/1.0.6>
+- <https://github.com/BurntSushi/winapi-util/tree/0.1.11>
+- <https://github.com/microsoft/windows-rs>
+
+Licenses:
+
+- <https://github.com/BurntSushi/same-file/blob/1.0.6/LICENSE-MIT>
+- <https://github.com/BurntSushi/same-file/blob/1.0.6/UNLICENSE>
+- <https://github.com/BurntSushi/winapi-util/blob/0.1.11/LICENSE-MIT>
+- <https://github.com/BurntSushi/winapi-util/blob/0.1.11/UNLICENSE>
+
 ## rtrb 0.3.4
 
 The `hyper-mixer-runtime` crate uses `rtrb` 0.3.4 for bounded
@@ -100,8 +145,10 @@ licensed under either the MIT License or Apache License 2.0.
 The crate uses RustCrypto `sha2` 0.10.9 and the locked `digest` 0.10.7,
 `block-buffer` 0.10.4, `crypto-common` 0.1.7, `generic-array` 0.14.7,
 `typenum` 1.20.1, `cpufeatures` 0.2.17, and `version_check` 0.9.5 packages to
-issue project-compatible SHA-256 descriptors for verified WAV files. These
-packages are licensed under either the MIT License or Apache License 2.0.
+issue project-compatible SHA-256 descriptors for verified WAV files. The
+`hyper-storage-engine` crate uses the same locked SHA-256 implementation to
+verify project descriptors. These packages are licensed under either the MIT
+License or Apache License 2.0.
 
 Sources:
 

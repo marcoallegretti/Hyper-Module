@@ -29,6 +29,14 @@ pub struct StrictJsonError {
     pub message: String,
 }
 
+impl fmt::Display for StrictJsonError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StrictJsonError {}
+
 /// Decodes one complete JSON document after enforcing the shared
 /// interoperable-number, duplicate-name, BOM, and byte-size rules.
 ///
