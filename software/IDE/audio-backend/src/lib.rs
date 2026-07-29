@@ -340,6 +340,7 @@ where
 pub enum OutputCallbackStatus {
     Rendered,
     ProcessorFailed,
+    NonFiniteOutput,
     SampleCountNotStereoAligned { samples: usize },
     BlockTooLarge { frames: usize, maximum: usize },
 }
@@ -351,6 +352,7 @@ pub struct OutputStreamSnapshot {
     pub rendered_frame_count: u64,
     pub silent_frame_count: u64,
     pub processor_failure_count: u64,
+    pub non_finite_output_count: u64,
     pub invalid_shape_count: u64,
     pub oversized_block_count: u64,
     pub unavailable_buffer_count: u64,
@@ -365,6 +367,7 @@ struct OutputStreamCounterState {
     rendered_frames: AtomicU64,
     silent_frames: AtomicU64,
     processor_failures: AtomicU64,
+    non_finite_outputs: AtomicU64,
     invalid_shapes: AtomicU64,
     oversized_blocks: AtomicU64,
     unavailable_buffers: AtomicU64,
@@ -386,6 +389,7 @@ impl OutputStreamCounters {
             rendered_frame_count: self.state.rendered_frames.load(Ordering::Relaxed),
             silent_frame_count: self.state.silent_frames.load(Ordering::Relaxed),
             processor_failure_count: self.state.processor_failures.load(Ordering::Relaxed),
+            non_finite_output_count: self.state.non_finite_outputs.load(Ordering::Relaxed),
             invalid_shape_count: self.state.invalid_shapes.load(Ordering::Relaxed),
             oversized_block_count: self.state.oversized_blocks.load(Ordering::Relaxed),
             unavailable_buffer_count: self.state.unavailable_buffers.load(Ordering::Relaxed),
@@ -515,16 +519,21 @@ impl<P: InterleavedStereoProcessor> OutputCallback<P> {
 
         output.fill(0.0);
         OutputStreamCounters::add(&self.counters.state.callbacks, 1);
-        if self.processor.process(output).is_ok() {
-            OutputStreamCounters::add(&self.counters.state.rendered_callbacks, 1);
-            OutputStreamCounters::add(&self.counters.state.rendered_frames, frames);
-            OutputCallbackStatus::Rendered
-        } else {
+        if self.processor.process(output).is_err() {
             output.fill(0.0);
             OutputStreamCounters::add(&self.counters.state.processor_failures, 1);
             OutputStreamCounters::add(&self.counters.state.silent_frames, frames);
-            OutputCallbackStatus::ProcessorFailed
+            return OutputCallbackStatus::ProcessorFailed;
         }
+        if output.iter().any(|sample| !sample.is_finite()) {
+            output.fill(0.0);
+            OutputStreamCounters::add(&self.counters.state.non_finite_outputs, 1);
+            OutputStreamCounters::add(&self.counters.state.silent_frames, frames);
+            return OutputCallbackStatus::NonFiniteOutput;
+        }
+        OutputStreamCounters::add(&self.counters.state.rendered_callbacks, 1);
+        OutputStreamCounters::add(&self.counters.state.rendered_frames, frames);
+        OutputCallbackStatus::Rendered
     }
 }
 
@@ -629,7 +638,14 @@ mod tests {
                 move |output: &mut [f32]| -> Result<(), &'static str> {
                     call += 1;
                     output.fill(f32::from(call));
-                    if call == 1 { Ok(()) } else { Err("failure") }
+                    match call {
+                        1 => Ok(()),
+                        2 => Err("failure"),
+                        _ => {
+                            output[0] = f32::NAN;
+                            Ok(())
+                        }
+                    }
                 }
             },
             2,
@@ -651,6 +667,13 @@ mod tests {
         );
         assert_samples(&failed, 0.0);
 
+        let mut non_finite = [9.0_f32; 4];
+        assert_eq!(
+            callback.process(&mut non_finite),
+            OutputCallbackStatus::NonFiniteOutput
+        );
+        assert_samples(&non_finite, 0.0);
+
         let mut malformed = [9.0_f32; 3];
         assert_eq!(
             callback.process(&mut malformed),
@@ -671,11 +694,12 @@ mod tests {
         assert_eq!(
             counters.snapshot(),
             OutputStreamSnapshot {
-                callback_count: 4,
+                callback_count: 5,
                 rendered_callback_count: 1,
                 rendered_frame_count: 2,
-                silent_frame_count: 5,
+                silent_frame_count: 7,
                 processor_failure_count: 1,
+                non_finite_output_count: 1,
                 invalid_shape_count: 1,
                 oversized_block_count: 1,
                 ..OutputStreamSnapshot::default()

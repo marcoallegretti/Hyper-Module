@@ -14,25 +14,36 @@ fn callback_processing_performs_zero_heap_allocations() {
         move |output: &mut [f32]| -> Result<(), u8> {
             invocation = invocation.saturating_add(1);
             output.fill(0.25);
-            if invocation == 1 { Ok(()) } else { Err(7) }
+            match invocation {
+                1 => Ok(()),
+                2 => Err(7),
+                _ => {
+                    output[0] = f32::NAN;
+                    Ok(())
+                }
+            }
         },
         128,
     )
     .unwrap();
     let mut rendered = [0.0_f32; 256];
     let mut failed = [1.0_f32; 256];
+    let mut non_finite = [1.0_f32; 256];
     let mut invalid = [1.0_f32; 3];
     let mut oversized = [1.0_f32; 258];
 
     let measurement = HeapMeasurement::start_verified();
     let rendered_status = callback.process(&mut rendered);
     let failed_status = callback.process(&mut failed);
+    let non_finite_status = callback.process(&mut non_finite);
     let invalid_status = callback.process(&mut invalid);
     let oversized_status = callback.process(&mut oversized);
     let heap_operations = measurement.finish();
 
     assert_eq!(rendered_status, OutputCallbackStatus::Rendered);
     assert_eq!(failed_status, OutputCallbackStatus::ProcessorFailed);
+    assert_eq!(non_finite_status, OutputCallbackStatus::NonFiniteOutput);
+    assert!(non_finite.iter().all(|sample| *sample == 0.0));
     assert_eq!(
         invalid_status,
         OutputCallbackStatus::SampleCountNotStereoAligned { samples: 3 }
