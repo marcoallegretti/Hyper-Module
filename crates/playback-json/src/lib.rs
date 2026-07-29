@@ -875,6 +875,13 @@ impl LoadedPlaybackProject {
     }
 
     #[must_use]
+    pub fn is_audio_track(&self, track_id: &str) -> bool {
+        self.tracks
+            .iter()
+            .any(|track| track.id == track_id && track.kind == TrackKind::Audio)
+    }
+
+    #[must_use]
     pub fn clip_count(&self) -> usize {
         self.clips.len()
     }

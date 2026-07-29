@@ -3,6 +3,7 @@
 
 use core::error::Error;
 use core::fmt;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use hyper_audio_source::{AudioContainer, DecodeError, DecodeLimits, decode_bytes};
@@ -12,6 +13,7 @@ use hyper_playback_session::{
     assemble_playback_session,
 };
 use hyper_project_model::{AssetRole, AudioMediaType, ResourceDescriptor, ResourceRole};
+use hyper_recording_metadata::{RecordingMetadataDocument, RecordingMetadataParseError};
 use hyper_storage_engine::{StorageError, StructurallyVerifiedProject, verify_project_package};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +27,7 @@ pub struct ProjectPlaybackLimits {
 pub struct PreparedProjectPlayback {
     package: StructurallyVerifiedProject,
     session: PreparedPlaybackSession,
+    recording_metadata: Vec<RecordingMetadataDocument>,
 }
 
 impl PreparedProjectPlayback {
@@ -39,10 +42,100 @@ impl PreparedProjectPlayback {
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (StructurallyVerifiedProject, PreparedPlaybackSession) {
-        (self.package, self.session)
+    pub fn recording_metadata(&self) -> &[RecordingMetadataDocument] {
+        &self.recording_metadata
+    }
+
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        StructurallyVerifiedProject,
+        PreparedPlaybackSession,
+        Vec<RecordingMetadataDocument>,
+    ) {
+        (self.package, self.session, self.recording_metadata)
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordingBindingErrorKind {
+    CountMismatch { metadata: usize, assets: usize },
+    ResourceIdMismatch,
+    ProjectIdMismatch,
+    DuplicateAssetReference,
+    AssetNotRecording,
+    TrackNotAudio,
+    InputUnavailable { index: u8, available: u8 },
+    SampleRateMismatch { metadata: u32, project: u32 },
+    ChannelMismatch { metadata: u8, audio: usize },
+    FrameCountMismatch { metadata: u64, audio: usize },
+}
+
+#[derive(Debug)]
+pub struct RecordingBindingError {
+    metadata_id: Option<String>,
+    kind: RecordingBindingErrorKind,
+}
+
+impl RecordingBindingError {
+    #[must_use]
+    pub const fn kind(&self) -> RecordingBindingErrorKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn metadata_id(&self) -> Option<&str> {
+        self.metadata_id.as_deref()
+    }
+}
+
+impl fmt::Display for RecordingBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(metadata_id) = &self.metadata_id {
+            write!(formatter, "recording metadata {metadata_id}: ")?;
+        }
+        match self.kind {
+            RecordingBindingErrorKind::CountMismatch { metadata, assets } => write!(
+                formatter,
+                "{metadata} metadata resources cannot describe {assets} recording assets"
+            ),
+            RecordingBindingErrorKind::ResourceIdMismatch => {
+                formatter.write_str("document ID does not match its resource descriptor")
+            }
+            RecordingBindingErrorKind::ProjectIdMismatch => {
+                formatter.write_str("document belongs to another project")
+            }
+            RecordingBindingErrorKind::DuplicateAssetReference => {
+                formatter.write_str("recording asset is described more than once")
+            }
+            RecordingBindingErrorKind::AssetNotRecording => {
+                formatter.write_str("asset reference does not identify a recording")
+            }
+            RecordingBindingErrorKind::TrackNotAudio => {
+                formatter.write_str("track reference does not identify an audio track")
+            }
+            RecordingBindingErrorKind::InputUnavailable { index, available } => write!(
+                formatter,
+                "input {index} is unavailable when the project declares {available} inputs"
+            ),
+            RecordingBindingErrorKind::SampleRateMismatch { metadata, project } => write!(
+                formatter,
+                "sample rate {metadata} Hz does not match project rate {project} Hz"
+            ),
+            RecordingBindingErrorKind::ChannelMismatch { metadata, audio } => write!(
+                formatter,
+                "{metadata} metadata channels do not match {audio} decoded channels"
+            ),
+            RecordingBindingErrorKind::FrameCountMismatch { metadata, audio } => write!(
+                formatter,
+                "{metadata} metadata frames do not match {audio} decoded frames"
+            ),
+        }
+    }
+}
+
+impl Error for RecordingBindingError {}
 
 #[derive(Debug)]
 pub enum ProjectPlaybackError {
@@ -69,8 +162,12 @@ pub enum ProjectPlaybackError {
     MultipleArrangements,
     MultipleMixers,
     UnsupportedResourceRole(ResourceRole),
-    UnsupportedAssetRole(AssetRole),
     Storage(StorageError),
+    RecordingMetadata {
+        resource_id: String,
+        source: RecordingMetadataParseError,
+    },
+    RecordingBinding(RecordingBindingError),
     Audio {
         asset_id: String,
         source: DecodeError,
@@ -117,10 +214,15 @@ impl fmt::Display for ProjectPlaybackError {
             Self::UnsupportedResourceRole(role) => {
                 write!(formatter, "resource role {role:?} is not a playback input")
             }
-            Self::UnsupportedAssetRole(role) => {
-                write!(formatter, "asset role {role:?} is not a playback input")
-            }
             Self::Storage(source) => write!(formatter, "package verification failed: {source}"),
+            Self::RecordingMetadata {
+                resource_id,
+                source,
+            } => write!(
+                formatter,
+                "recording metadata resource {resource_id} is invalid: {source}"
+            ),
+            Self::RecordingBinding(source) => source.fmt(formatter),
             Self::Audio { asset_id, source } => {
                 write!(formatter, "asset {asset_id} could not be decoded: {source}")
             }
@@ -133,6 +235,8 @@ impl Error for ProjectPlaybackError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Storage(source) => Some(source),
+            Self::RecordingMetadata { source, .. } => Some(source),
+            Self::RecordingBinding(source) => Some(source),
             Self::Audio { source, .. } => Some(source),
             Self::Assembly(source) => Some(source),
             Self::InvalidLimits
@@ -144,8 +248,7 @@ impl Error for ProjectPlaybackError {
             | Self::MissingMixer
             | Self::MultipleArrangements
             | Self::MultipleMixers
-            | Self::UnsupportedResourceRole(_)
-            | Self::UnsupportedAssetRole(_) => None,
+            | Self::UnsupportedResourceRole(_) => None,
         }
     }
 }
@@ -159,9 +262,10 @@ impl From<StorageError> for ProjectPlaybackError {
 /// Verifies, snapshots, semantically resolves, and decodes one playback-ready
 /// project package.
 ///
-/// Mapping and recording resources are rejected explicitly because they are
-/// not inputs to the native playback runtime. No resource role is silently
-/// ignored.
+/// Recording metadata is bound to verified recording assets, decoded media
+/// facts, project input capabilities, and loaded audio tracks. Control
+/// mappings remain explicitly rejected because they are not playback inputs.
+/// No resource role is silently ignored.
 ///
 /// # Errors
 ///
@@ -181,7 +285,8 @@ pub fn prepare_project_playback(
     }
     let package = verify_project_package(root)?;
     let inventory = ResourceInventory::new(&package, limits.max_total_resource_bytes)?;
-    let documents = inventory.read(&package)?;
+    let captured = inventory.read(&package)?;
+    validate_recording_inventory(&package, &captured.recording_metadata)?;
 
     let asset_count = package.manifest().assets().len();
     if asset_count > cache_limits.max_assets {
@@ -194,13 +299,12 @@ pub fn prepare_project_playback(
     decoded_assets
         .try_reserve_exact(asset_count)
         .map_err(|_| ProjectPlaybackError::ResourceCapacityUnavailable)?;
+    let mut decoded_facts = Vec::new();
+    decoded_facts
+        .try_reserve_exact(asset_count)
+        .map_err(|_| ProjectPlaybackError::ResourceCapacityUnavailable)?;
     let mut decoded_bytes = 0_usize;
     for descriptor in package.manifest().assets() {
-        if descriptor.role() != AssetRole::Sample {
-            return Err(ProjectPlaybackError::UnsupportedAssetRole(
-                descriptor.role(),
-            ));
-        }
         let bytes = package.read_asset(descriptor.id(), limits.audio.max_file_bytes())?;
         let audio = decode_bytes(
             bytes,
@@ -239,17 +343,31 @@ pub fn prepare_project_playback(
                 maximum: cache_limits.max_decoded_sample_bytes,
             });
         }
+        decoded_facts.push(DecodedAssetFact {
+            id: descriptor.id(),
+            channels: audio.channels(),
+            frames: audio.frame_count(),
+        });
         decoded_assets.push(DecodedPlaybackAsset::new(descriptor.id().to_owned(), audio));
     }
 
     let session = assemble_playback_session(PlaybackSessionAssemblyInput {
-        documents,
+        documents: captured.playback,
         decoded_assets,
         limits: limits.session,
     })
     .map_err(ProjectPlaybackError::Assembly)?;
+    validate_recording_media(&session, &captured.recording_metadata, &decoded_facts)?;
     package.confirm_unchanged()?;
-    Ok(PreparedProjectPlayback { package, session })
+    Ok(PreparedProjectPlayback {
+        package,
+        session,
+        recording_metadata: captured
+            .recording_metadata
+            .into_iter()
+            .map(|record| record.document)
+            .collect(),
+    })
 }
 
 fn audio_container(media_type: AudioMediaType) -> AudioContainer {
@@ -267,6 +385,7 @@ struct ResourceInventory<'manifest> {
     arrangement: Option<&'manifest ResourceDescriptor>,
     mixer: &'manifest ResourceDescriptor,
     automation_takes: Vec<&'manifest ResourceDescriptor>,
+    recording_metadata: Vec<&'manifest ResourceDescriptor>,
 }
 
 impl<'manifest> ResourceInventory<'manifest> {
@@ -299,6 +418,7 @@ impl<'manifest> ResourceInventory<'manifest> {
         let mut arrangement = None;
         let mut mixer = None;
         let mut automation_takes = Vec::new();
+        let mut recording_metadata = Vec::new();
         for descriptor in resources {
             match descriptor.role() {
                 ResourceRole::Timeline => {}
@@ -318,10 +438,13 @@ impl<'manifest> ResourceInventory<'manifest> {
                 ResourceRole::AutomationTake => {
                     push_descriptor(&mut automation_takes, descriptor)?;
                 }
-                ResourceRole::Mapping | ResourceRole::RecordingMetadata => {
+                ResourceRole::Mapping => {
                     return Err(ProjectPlaybackError::UnsupportedResourceRole(
                         descriptor.role(),
                     ));
+                }
+                ResourceRole::RecordingMetadata => {
+                    push_descriptor(&mut recording_metadata, descriptor)?;
                 }
             }
         }
@@ -334,28 +457,48 @@ impl<'manifest> ResourceInventory<'manifest> {
             arrangement,
             mixer,
             automation_takes,
+            recording_metadata,
         })
     }
 
     fn read(
         &self,
         package: &StructurallyVerifiedProject,
-    ) -> Result<PlaybackDocumentBytes, ProjectPlaybackError> {
-        Ok(PlaybackDocumentBytes {
-            project_id: package.manifest().project_id().to_owned(),
-            sample_rate_hz: package.manifest().sample_rate_hz(),
-            timeline: package.read_resource(self.timeline.id())?,
-            tracks: read_documents(package, &self.tracks)?,
-            clips: read_documents(package, &self.clips)?,
-            scenes: read_documents(package, &self.scenes)?,
-            arrangement: self
-                .arrangement
-                .map(|descriptor| package.read_resource(descriptor.id()))
-                .transpose()?,
-            mixer: package.read_resource(self.mixer.id())?,
-            automation_takes: read_documents(package, &self.automation_takes)?,
+    ) -> Result<CapturedPackage, ProjectPlaybackError> {
+        Ok(CapturedPackage {
+            playback: PlaybackDocumentBytes {
+                project_id: package.manifest().project_id().to_owned(),
+                sample_rate_hz: package.manifest().sample_rate_hz(),
+                timeline: package.read_resource(self.timeline.id())?,
+                tracks: read_documents(package, &self.tracks)?,
+                clips: read_documents(package, &self.clips)?,
+                scenes: read_documents(package, &self.scenes)?,
+                arrangement: self
+                    .arrangement
+                    .map(|descriptor| package.read_resource(descriptor.id()))
+                    .transpose()?,
+                mixer: package.read_resource(self.mixer.id())?,
+                automation_takes: read_documents(package, &self.automation_takes)?,
+            },
+            recording_metadata: read_recording_metadata(package, &self.recording_metadata)?,
         })
     }
+}
+
+struct CapturedPackage {
+    playback: PlaybackDocumentBytes,
+    recording_metadata: Vec<CapturedRecordingMetadata>,
+}
+
+struct CapturedRecordingMetadata {
+    descriptor_id: String,
+    document: RecordingMetadataDocument,
+}
+
+struct DecodedAssetFact<'asset> {
+    id: &'asset str,
+    channels: usize,
+    frames: usize,
 }
 
 fn push_descriptor<'manifest>(
@@ -381,4 +524,155 @@ fn read_documents(
         documents.push(package.read_resource(descriptor.id())?);
     }
     Ok(documents)
+}
+
+fn read_recording_metadata(
+    package: &StructurallyVerifiedProject,
+    descriptors: &[&ResourceDescriptor],
+) -> Result<Vec<CapturedRecordingMetadata>, ProjectPlaybackError> {
+    let mut documents = Vec::new();
+    documents
+        .try_reserve_exact(descriptors.len())
+        .map_err(|_| ProjectPlaybackError::ResourceCapacityUnavailable)?;
+    for descriptor in descriptors {
+        let bytes = package.read_resource(descriptor.id())?;
+        let document = RecordingMetadataDocument::parse(&bytes).map_err(|source| {
+            ProjectPlaybackError::RecordingMetadata {
+                resource_id: descriptor.id().to_owned(),
+                source,
+            }
+        })?;
+        documents.push(CapturedRecordingMetadata {
+            descriptor_id: descriptor.id().to_owned(),
+            document,
+        });
+    }
+    Ok(documents)
+}
+
+fn validate_recording_inventory(
+    package: &StructurallyVerifiedProject,
+    metadata: &[CapturedRecordingMetadata],
+) -> Result<(), ProjectPlaybackError> {
+    let recording_assets = package
+        .manifest()
+        .assets()
+        .iter()
+        .filter(|asset| asset.role() == AssetRole::Recording)
+        .count();
+    if metadata.len() != recording_assets {
+        return Err(recording_binding(
+            None,
+            RecordingBindingErrorKind::CountMismatch {
+                metadata: metadata.len(),
+                assets: recording_assets,
+            },
+        ));
+    }
+
+    let mut described_assets = BTreeSet::new();
+    for captured in metadata {
+        let document = &captured.document;
+        if captured.descriptor_id != document.id() {
+            return Err(recording_binding(
+                Some(document.id()),
+                RecordingBindingErrorKind::ResourceIdMismatch,
+            ));
+        }
+        if document.project_id() != package.manifest().project_id() {
+            return Err(recording_binding(
+                Some(document.id()),
+                RecordingBindingErrorKind::ProjectIdMismatch,
+            ));
+        }
+        if !described_assets.insert(document.asset_id()) {
+            return Err(recording_binding(
+                Some(document.id()),
+                RecordingBindingErrorKind::DuplicateAssetReference,
+            ));
+        }
+        let asset = package
+            .manifest()
+            .assets()
+            .iter()
+            .find(|asset| asset.id() == document.asset_id());
+        if asset.is_none_or(|asset| asset.role() != AssetRole::Recording) {
+            return Err(recording_binding(
+                Some(document.id()),
+                RecordingBindingErrorKind::AssetNotRecording,
+            ));
+        }
+        let project_rate = package.manifest().sample_rate_hz();
+        if document.sample_rate_hz() != project_rate {
+            return Err(recording_binding(
+                Some(document.id()),
+                RecordingBindingErrorKind::SampleRateMismatch {
+                    metadata: document.sample_rate_hz(),
+                    project: project_rate,
+                },
+            ));
+        }
+        let available = package.manifest().required_capabilities().audio_inputs();
+        for &index in document.source_input_indices() {
+            if index >= available {
+                return Err(recording_binding(
+                    Some(document.id()),
+                    RecordingBindingErrorKind::InputUnavailable { index, available },
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_recording_media(
+    session: &PreparedPlaybackSession,
+    metadata: &[CapturedRecordingMetadata],
+    assets: &[DecodedAssetFact<'_>],
+) -> Result<(), ProjectPlaybackError> {
+    let project = session.parts().0;
+    for captured in metadata {
+        let document = &captured.document;
+        if !project.is_audio_track(document.track_id()) {
+            return Err(recording_binding(
+                Some(document.id()),
+                RecordingBindingErrorKind::TrackNotAudio,
+            ));
+        }
+        let Some(asset) = assets.iter().find(|asset| asset.id == document.asset_id()) else {
+            return Err(recording_binding(
+                Some(document.id()),
+                RecordingBindingErrorKind::AssetNotRecording,
+            ));
+        };
+        if usize::from(document.channels()) != asset.channels {
+            return Err(recording_binding(
+                Some(document.id()),
+                RecordingBindingErrorKind::ChannelMismatch {
+                    metadata: document.channels(),
+                    audio: asset.channels,
+                },
+            ));
+        }
+        if usize::try_from(document.frame_count()) != Ok(asset.frames) {
+            return Err(recording_binding(
+                Some(document.id()),
+                RecordingBindingErrorKind::FrameCountMismatch {
+                    metadata: document.frame_count(),
+                    audio: asset.frames,
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn recording_binding(
+    metadata_id: Option<&str>,
+    kind: RecordingBindingErrorKind,
+) -> ProjectPlaybackError {
+    ProjectPlaybackError::RecordingBinding(RecordingBindingError {
+        metadata_id: metadata_id.map(str::to_owned),
+        kind,
+    })
 }

@@ -1,13 +1,18 @@
 use hyper_recording_journal::{JournalConfig, JournalWriter, publish_wav};
 use hyper_recording_metadata::{
     FinalizedRecordingMetadata, RecordingCaptureKind, RecordingMetadataContext,
-    RecordingMetadataError,
+    RecordingMetadataDocument, RecordingMetadataError, RecordingMetadataParseErrorKind,
 };
+use hyper_strict_json::StrictJsonErrorKind;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+const VALID_METADATA: &[u8] =
+    include_bytes!("../../../contracts/fixtures/valid/recording-metadata.json");
+const INVALID_CHANNELS: &[u8] =
+    include_bytes!("../../../contracts/fixtures/invalid/recording-metadata-channel-mismatch.json");
 
 struct TestDirectory(PathBuf);
 
@@ -183,5 +188,66 @@ fn rejects_invalid_provenance_and_media_domains() {
             .unwrap_err()
             .reason(),
         RecordingMetadataError::InvalidSourceInput { index: 2 }
+    );
+}
+
+#[test]
+fn strict_reader_preserves_the_published_recording_contract() {
+    let metadata = RecordingMetadataDocument::parse(VALID_METADATA).unwrap();
+    assert_eq!(metadata.id(), "018f47a2-6b2d-7c11-8a44-001122334477");
+    assert_eq!(
+        metadata.project_id(),
+        "018f47a2-6b2d-7c11-8a44-001122334455"
+    );
+    assert_eq!(metadata.asset_id(), "018f47a2-6b2d-7c11-8a44-001122334478");
+    assert_eq!(metadata.track_id(), "018f47a2-6b2d-7c11-8a44-001122334456");
+    assert_eq!(metadata.capture_kind(), RecordingCaptureKind::Overdub);
+    assert_eq!(metadata.captured_at_utc(), "2026-07-27T12:00:00.000Z");
+    assert_eq!(metadata.timeline_start_tick(), 7_680);
+    assert_eq!(metadata.source_input_indices(), &[0, 1]);
+    assert_eq!(metadata.sample_rate_hz(), 48_000);
+    assert_eq!(metadata.channels(), 2);
+    assert_eq!(metadata.frame_count(), 96_000);
+    assert!(metadata.extensions().is_empty());
+}
+
+#[test]
+fn strict_reader_rejects_schema_and_domain_failures() {
+    assert_eq!(
+        RecordingMetadataDocument::parse(INVALID_CHANNELS)
+            .unwrap_err()
+            .kind(),
+        RecordingMetadataParseErrorKind::InvalidDomain
+    );
+
+    let unknown = String::from_utf8(VALID_METADATA.to_vec()).unwrap().replace(
+        r#""extensions": {}"#,
+        r#""unknown": true, "extensions": {}"#,
+    );
+    assert_eq!(
+        RecordingMetadataDocument::parse(unknown.as_bytes())
+            .unwrap_err()
+            .kind(),
+        RecordingMetadataParseErrorKind::Json(StrictJsonErrorKind::TypedDocumentMismatch)
+    );
+
+    let duplicate = String::from_utf8(VALID_METADATA.to_vec()).unwrap().replace(
+        r#""format_version": 1,"#,
+        r#""format_version": 1, "format_version": 1,"#,
+    );
+    assert_eq!(
+        RecordingMetadataDocument::parse(duplicate.as_bytes())
+            .unwrap_err()
+            .kind(),
+        RecordingMetadataParseErrorKind::Json(StrictJsonErrorKind::DuplicateObjectName)
+    );
+
+    let mut invalid_extension: serde_json::Value = serde_json::from_slice(VALID_METADATA).unwrap();
+    invalid_extension["extensions"]["not_namespaced"] = true.into();
+    assert_eq!(
+        RecordingMetadataDocument::parse(&serde_json::to_vec(&invalid_extension).unwrap())
+            .unwrap_err()
+            .kind(),
+        RecordingMetadataParseErrorKind::InvalidDomain
     );
 }

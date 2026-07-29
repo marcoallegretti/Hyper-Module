@@ -6,7 +6,10 @@ use hyper_audio_source::{DecodeError, DecodeLimits};
 use hyper_media_cache::CacheLimits;
 use hyper_playback_json::LoaderLimits;
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
-use hyper_project_loader::{ProjectPlaybackError, ProjectPlaybackLimits, prepare_project_playback};
+use hyper_project_loader::{
+    ProjectPlaybackError, ProjectPlaybackLimits, RecordingBindingErrorKind,
+    prepare_project_playback,
+};
 use hyper_project_model::ResourceRole;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -23,6 +26,8 @@ const MAPPING_ID: &str = "018f47a2-6b2d-7c11-8a44-00112233445d";
 const SECOND_ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-00112233445e";
 const SECOND_MIXER_ID: &str = "018f47a2-6b2d-7c11-8a44-00112233445f";
 const SECOND_ARRANGEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334460";
+const RECORDING_METADATA_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334461";
+const FOREIGN_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334462";
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -296,6 +301,21 @@ impl Fixture {
         self.write_manifest(&manifest);
     }
 
+    fn add_recording_metadata(&self, value: &Value) {
+        self.add_resource(
+            RECORDING_METADATA_ID,
+            "recording-metadata",
+            "assets/recordings/metadata.json",
+            value,
+        );
+    }
+
+    fn set_audio_inputs(&self, inputs: u8) {
+        let mut manifest = self.manifest();
+        manifest["required_capabilities"]["audio_inputs"] = inputs.into();
+        self.write_manifest(&manifest);
+    }
+
     fn manifest(&self) -> Value {
         serde_json::from_slice(&fs::read(self.root.join("project.json")).unwrap()).unwrap()
     }
@@ -320,7 +340,21 @@ fn prepares_one_verified_owned_playback_session() {
     assert_eq!(prepared.session().project_id(), PROJECT_ID);
     assert_eq!(prepared.session().media_asset_count(), 1);
     assert!(!prepared.session().has_automation());
+    assert!(prepared.recording_metadata().is_empty());
     prepared.package().confirm_unchanged().unwrap();
+}
+
+#[test]
+fn binds_recording_metadata_to_verified_media_and_audio_tracks() {
+    let fixture = Fixture::new();
+    fixture.make_asset_a_recording();
+    fixture.add_recording_metadata(&recording_metadata(PROJECT_ID, TRACK_ID, &[0], 1, 100));
+
+    let prepared = prepare_project_playback(&fixture.root, limits()).unwrap();
+
+    assert_eq!(prepared.recording_metadata().len(), 1);
+    assert_eq!(prepared.recording_metadata()[0].asset_id(), ASSET_ID);
+    assert_eq!(prepared.session().media_asset_count(), 1);
 }
 
 #[test]
@@ -371,10 +405,13 @@ fn rejects_every_role_that_the_playback_runtime_does_not_own() {
 
     let recording = Fixture::new();
     recording.make_asset_a_recording();
-    assert!(matches!(
+    assert_binding_kind(
         prepare_project_playback(&recording.root, limits()),
-        Err(ProjectPlaybackError::UnsupportedAssetRole(_))
-    ));
+        RecordingBindingErrorKind::CountMismatch {
+            metadata: 0,
+            assets: 1,
+        },
+    );
 
     let duplicate_mixer = Fixture::new();
     duplicate_mixer.add_resource(SECOND_MIXER_ID, "mixer", "mixer/second.json", &json!({}));
@@ -394,6 +431,74 @@ fn rejects_every_role_that_the_playback_runtime_does_not_own() {
         prepare_project_playback(&duplicate_arrangement.root, limits()),
         Err(ProjectPlaybackError::MultipleArrangements)
     ));
+}
+
+#[test]
+fn rejects_recording_metadata_that_does_not_match_project_or_decoded_media() {
+    let sample_rate = Fixture::new();
+    sample_rate.replace_asset_bytes(&pcm16_wav_at_rate(&[0; 100], 44_100));
+    sample_rate.make_asset_a_recording();
+    sample_rate.add_recording_metadata(&recording_metadata(PROJECT_ID, TRACK_ID, &[0], 1, 100));
+    assert!(matches!(
+        prepare_project_playback(&sample_rate.root, limits()),
+        Err(ProjectPlaybackError::Audio {
+            source: DecodeError::SampleRateMismatch {
+                expected: 48_000,
+                actual: 44_100
+            },
+            ..
+        })
+    ));
+
+    let channels = Fixture::new();
+    channels.make_asset_a_recording();
+    channels.add_recording_metadata(&recording_metadata(PROJECT_ID, TRACK_ID, &[0, 1], 2, 100));
+    assert_binding_kind(
+        prepare_project_playback(&channels.root, limits()),
+        RecordingBindingErrorKind::ChannelMismatch {
+            metadata: 2,
+            audio: 1,
+        },
+    );
+
+    let frames = Fixture::new();
+    frames.make_asset_a_recording();
+    frames.add_recording_metadata(&recording_metadata(PROJECT_ID, TRACK_ID, &[0], 1, 99));
+    assert_binding_kind(
+        prepare_project_playback(&frames.root, limits()),
+        RecordingBindingErrorKind::FrameCountMismatch {
+            metadata: 99,
+            audio: 100,
+        },
+    );
+
+    let input = Fixture::new();
+    input.make_asset_a_recording();
+    input.set_audio_inputs(1);
+    input.add_recording_metadata(&recording_metadata(PROJECT_ID, TRACK_ID, &[1], 1, 100));
+    assert_binding_kind(
+        prepare_project_playback(&input.root, limits()),
+        RecordingBindingErrorKind::InputUnavailable {
+            index: 1,
+            available: 1,
+        },
+    );
+
+    let track = Fixture::new();
+    track.make_asset_a_recording();
+    track.add_recording_metadata(&recording_metadata(PROJECT_ID, MIXER_ID, &[0], 1, 100));
+    assert_binding_kind(
+        prepare_project_playback(&track.root, limits()),
+        RecordingBindingErrorKind::TrackNotAudio,
+    );
+
+    let project = Fixture::new();
+    project.make_asset_a_recording();
+    project.add_recording_metadata(&recording_metadata(FOREIGN_ID, TRACK_ID, &[0], 1, 100));
+    assert_binding_kind(
+        prepare_project_playback(&project.root, limits()),
+        RecordingBindingErrorKind::ProjectIdMismatch,
+    );
 }
 
 #[test]
@@ -470,6 +575,43 @@ fn descriptor(id: &str, role: &str, path: &str, bytes: &[u8]) -> Value {
     })
 }
 
+fn recording_metadata(
+    project_id: &str,
+    track_id: &str,
+    source_input_indices: &[u8],
+    channels: u8,
+    frame_count: u64,
+) -> Value {
+    json!({
+        "format": "hyper-recording-metadata",
+        "format_version": 1,
+        "id": RECORDING_METADATA_ID,
+        "project_id": project_id,
+        "asset_id": ASSET_ID,
+        "track_id": track_id,
+        "capture_kind": "new",
+        "captured_at_utc": "2026-07-29T12:00:00.000Z",
+        "timeline_start_tick": 0,
+        "source_input_indices": source_input_indices,
+        "sample_rate_hz": 48_000,
+        "channels": channels,
+        "frame_count": frame_count,
+        "extensions": {}
+    })
+}
+
+fn assert_binding_kind(
+    result: Result<hyper_project_loader::PreparedProjectPlayback, ProjectPlaybackError>,
+    expected: RecordingBindingErrorKind,
+) {
+    match result {
+        Err(ProjectPlaybackError::RecordingBinding(error)) => {
+            assert_eq!(error.kind(), expected);
+        }
+        other => panic!("expected recording binding error, got {other:?}"),
+    }
+}
+
 fn write_file(root: &Path, relative: &str, bytes: &[u8]) {
     let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -490,6 +632,10 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 fn pcm16_wav(samples: &[i16]) -> Vec<u8> {
+    pcm16_wav_at_rate(samples, 48_000)
+}
+
+fn pcm16_wav_at_rate(samples: &[i16], sample_rate_hz: u32) -> Vec<u8> {
     let data_bytes = u32::try_from(samples.len() * 2).unwrap();
     let mut bytes = Vec::with_capacity(44 + samples.len() * 2);
     bytes.extend_from_slice(b"RIFF");
@@ -498,8 +644,8 @@ fn pcm16_wav(samples: &[i16]) -> Vec<u8> {
     bytes.extend_from_slice(&16_u32.to_le_bytes());
     bytes.extend_from_slice(&1_u16.to_le_bytes());
     bytes.extend_from_slice(&1_u16.to_le_bytes());
-    bytes.extend_from_slice(&48_000_u32.to_le_bytes());
-    bytes.extend_from_slice(&96_000_u32.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate_hz.to_le_bytes());
+    bytes.extend_from_slice(&(sample_rate_hz * 2).to_le_bytes());
     bytes.extend_from_slice(&2_u16.to_le_bytes());
     bytes.extend_from_slice(&16_u16.to_le_bytes());
     bytes.extend_from_slice(b"data");

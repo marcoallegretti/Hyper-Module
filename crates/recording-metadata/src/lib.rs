@@ -1,7 +1,8 @@
 #![doc = "Validated metadata for verified recording publications."]
 
 use hyper_recording_journal::PublishedRecording;
-use serde::Serialize;
+use hyper_strict_json::{StrictJsonError, StrictJsonErrorKind};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -12,12 +13,166 @@ const HANDOFF_FORMAT: &str = "hyper-finalized-recording-handoff";
 const HANDOFF_FORMAT_VERSION: u8 = 1;
 const VERSION_ONE_SAMPLE_RATE: u32 = 48_000;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_METADATA_BYTES: usize = 1_048_576;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RecordingCaptureKind {
     New,
     Overdub,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordingMetadataDocument {
+    id: String,
+    project_id: String,
+    asset_id: String,
+    track_id: String,
+    capture_kind: RecordingCaptureKind,
+    captured_at_utc: String,
+    timeline_start_tick: u64,
+    source_input_indices: Vec<u8>,
+    sample_rate_hz: u32,
+    channels: u8,
+    frame_count: u64,
+    extensions: BTreeMap<String, serde_json::Value>,
+}
+
+impl RecordingMetadataDocument {
+    /// Parses and validates one complete version-1 recording metadata
+    /// document.
+    ///
+    /// Filesystem canonicalization and descriptor integrity remain the storage
+    /// layer's responsibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns a strict JSON or recording-domain rejection.
+    pub fn parse(bytes: &[u8]) -> Result<Self, RecordingMetadataParseError> {
+        let raw: RawRecordingMetadata = hyper_strict_json::parse(bytes, MAX_METADATA_BYTES)?;
+        validate_document(raw)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    #[must_use]
+    pub fn asset_id(&self) -> &str {
+        &self.asset_id
+    }
+
+    #[must_use]
+    pub fn track_id(&self) -> &str {
+        &self.track_id
+    }
+
+    #[must_use]
+    pub const fn capture_kind(&self) -> RecordingCaptureKind {
+        self.capture_kind
+    }
+
+    #[must_use]
+    pub fn captured_at_utc(&self) -> &str {
+        &self.captured_at_utc
+    }
+
+    #[must_use]
+    pub const fn timeline_start_tick(&self) -> u64 {
+        self.timeline_start_tick
+    }
+
+    #[must_use]
+    pub fn source_input_indices(&self) -> &[u8] {
+        &self.source_input_indices
+    }
+
+    #[must_use]
+    pub const fn sample_rate_hz(&self) -> u32 {
+        self.sample_rate_hz
+    }
+
+    #[must_use]
+    pub const fn channels(&self) -> u8 {
+        self.channels
+    }
+
+    #[must_use]
+    pub const fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    #[must_use]
+    pub const fn extensions(&self) -> &BTreeMap<String, serde_json::Value> {
+        &self.extensions
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordingMetadataParseErrorKind {
+    Json(StrictJsonErrorKind),
+    InvalidDomain,
+}
+
+#[derive(Debug)]
+pub struct RecordingMetadataParseError {
+    kind: RecordingMetadataParseErrorKind,
+    message: String,
+    source: Option<StrictJsonError>,
+}
+
+impl RecordingMetadataParseError {
+    #[must_use]
+    pub const fn kind(&self) -> RecordingMetadataParseErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for RecordingMetadataParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for RecordingMetadataParseError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source.as_ref().map(|source| source as _)
+    }
+}
+
+impl From<StrictJsonError> for RecordingMetadataParseError {
+    fn from(error: StrictJsonError) -> Self {
+        Self {
+            kind: RecordingMetadataParseErrorKind::Json(error.kind),
+            message: error.message.clone(),
+            source: Some(error),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRecordingMetadata {
+    format: String,
+    format_version: u8,
+    id: String,
+    project_id: String,
+    asset_id: String,
+    track_id: String,
+    capture_kind: RecordingCaptureKind,
+    captured_at_utc: String,
+    timeline_start_tick: u64,
+    source_input_indices: Vec<u8>,
+    sample_rate_hz: u32,
+    channels: u8,
+    frame_count: u64,
+    extensions: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -283,6 +438,99 @@ impl FinalizedRecordingMetadata {
     }
 }
 
+fn validate_document(
+    raw: RawRecordingMetadata,
+) -> Result<RecordingMetadataDocument, RecordingMetadataParseError> {
+    require_document(raw.format == FORMAT, "recording metadata format is invalid")?;
+    require_document(
+        raw.format_version == FORMAT_VERSION,
+        "recording metadata format version is unsupported",
+    )?;
+    require_document(canonical_id(&raw.id), "recording metadata ID is invalid")?;
+    require_document(
+        canonical_id(&raw.project_id),
+        "recording metadata project ID is invalid",
+    )?;
+    require_document(
+        canonical_id(&raw.asset_id),
+        "recording metadata asset ID is invalid",
+    )?;
+    require_document(
+        canonical_id(&raw.track_id),
+        "recording metadata track ID is invalid",
+    )?;
+    require_document(
+        canonical_utc(&raw.captured_at_utc),
+        "recording capture time is invalid",
+    )?;
+    require_document(
+        raw.timeline_start_tick <= MAX_SAFE_INTEGER,
+        "recording timeline start exceeds the interoperable integer range",
+    )?;
+    require_document(
+        raw.sample_rate_hz == VERSION_ONE_SAMPLE_RATE,
+        "recording sample rate is unsupported",
+    )?;
+    require_document(
+        (1..=2).contains(&raw.channels),
+        "recording channel count is invalid",
+    )?;
+    require_document(
+        raw.frame_count > 0 && raw.frame_count <= MAX_SAFE_INTEGER,
+        "recording frame count is invalid",
+    )?;
+    require_document(
+        raw.source_input_indices.len() == usize::from(raw.channels),
+        "recording source input count does not match its channels",
+    )?;
+    let mut seen = [false; 2];
+    for &index in &raw.source_input_indices {
+        let Some(slot) = seen.get_mut(usize::from(index)) else {
+            return Err(document_error("recording source input is invalid"));
+        };
+        require_document(!*slot, "recording source inputs are not unique")?;
+        *slot = true;
+    }
+    require_document(
+        raw.extensions.keys().all(|key| valid_extension_key(key)),
+        "recording metadata extensions contain an invalid key",
+    )?;
+
+    Ok(RecordingMetadataDocument {
+        id: raw.id,
+        project_id: raw.project_id,
+        asset_id: raw.asset_id,
+        track_id: raw.track_id,
+        capture_kind: raw.capture_kind,
+        captured_at_utc: raw.captured_at_utc,
+        timeline_start_tick: raw.timeline_start_tick,
+        source_input_indices: raw.source_input_indices,
+        sample_rate_hz: raw.sample_rate_hz,
+        channels: raw.channels,
+        frame_count: raw.frame_count,
+        extensions: raw.extensions,
+    })
+}
+
+fn require_document(
+    condition: bool,
+    message: &'static str,
+) -> Result<(), RecordingMetadataParseError> {
+    if condition {
+        Ok(())
+    } else {
+        Err(document_error(message))
+    }
+}
+
+fn document_error(message: &'static str) -> RecordingMetadataParseError {
+    RecordingMetadataParseError {
+        kind: RecordingMetadataParseErrorKind::InvalidDomain,
+        message: message.to_owned(),
+        source: None,
+    }
+}
+
 fn validate(
     publication: &PublishedRecording,
     context: &RecordingMetadataContext,
@@ -368,17 +616,39 @@ fn hex_sha256(digest: &[u8; 32]) -> String {
 }
 
 fn validate_id(field: &'static str, value: &str) -> Result<(), RecordingMetadataError> {
-    let bytes = value.as_bytes();
-    let valid = bytes.len() == 36
-        && bytes.iter().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => *byte == b'-',
-            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(byte),
-        });
-    if valid {
+    if canonical_id(value) {
         Ok(())
     } else {
         Err(RecordingMetadataError::InvalidId(field))
     }
+}
+
+fn canonical_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(byte),
+        })
+}
+
+fn valid_extension_key(value: &str) -> bool {
+    let mut labels = 0_usize;
+    for label in value.split('.') {
+        labels += 1;
+        let bytes = label.as_bytes();
+        if bytes.is_empty()
+            || !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit()
+            || !bytes[bytes.len() - 1].is_ascii_lowercase()
+                && !bytes[bytes.len() - 1].is_ascii_digit()
+            || !bytes
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        {
+            return false;
+        }
+    }
+    labels >= 2
 }
 
 fn canonical_utc(value: &str) -> bool {

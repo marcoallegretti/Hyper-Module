@@ -380,6 +380,7 @@ dependencies = [
  "hyper-playback-json",
  "hyper-playback-session",
  "hyper-project-model",
+ "hyper-recording-metadata",
  "hyper-storage-engine",
  "serde_json",
  "serde_json_canonicalizer",
@@ -410,6 +411,7 @@ name = "hyper-recording-metadata"
 version = "0.1.0"
 dependencies = [
  "hyper-recording-journal",
+ "hyper-strict-json",
  "serde",
  "serde_json",
 ]
