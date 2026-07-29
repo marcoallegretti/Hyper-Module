@@ -7,7 +7,7 @@ use super::{
 };
 use core::error::Error;
 use core::fmt;
-use hyper_recording_journal::PublicationOutcome;
+use hyper_recording_journal::PublishedRecording;
 use hyper_recording_transport::{RecordingTransportBuildError, try_recording_transport};
 use hyper_recording_worker::{
     RecordingDispositionError, RecordingWorker, RecordingWorkerCompletion, RecordingWorkerConfig,
@@ -183,46 +183,7 @@ impl Error for DesktopRecordingSessionStopError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DesktopPublishedRecording {
-    final_wav_path: PathBuf,
-    journal_path: PathBuf,
-    sample_rate_hz: u32,
-    frames: u64,
-    publication: PublicationOutcome,
-}
-
-impl DesktopPublishedRecording {
-    #[must_use]
-    pub fn final_wav_path(&self) -> &Path {
-        &self.final_wav_path
-    }
-
-    #[must_use]
-    pub fn journal_path(&self) -> &Path {
-        &self.journal_path
-    }
-
-    #[must_use]
-    pub const fn sample_rate_hz(&self) -> u32 {
-        self.sample_rate_hz
-    }
-
-    #[must_use]
-    pub const fn channels(&self) -> u16 {
-        2
-    }
-
-    #[must_use]
-    pub const fn frames(&self) -> u64 {
-        self.frames
-    }
-
-    #[must_use]
-    pub const fn publication(&self) -> PublicationOutcome {
-        self.publication
-    }
-}
+pub type DesktopPublishedRecording = PublishedRecording;
 
 #[derive(Debug)]
 pub enum DesktopRecordingSessionCommitError {
@@ -278,8 +239,6 @@ pub struct DesktopRecordingSession {
     input: NativeInputStream,
     writer: RecordingWorker,
     journal_path: PathBuf,
-    final_wav_path: PathBuf,
-    sample_rate_hz: u32,
     completion_timeout: Duration,
 }
 
@@ -299,8 +258,6 @@ impl DesktopRecordingSession {
         let (mut producer, consumer) = try_recording_transport(config.transport_capacity_frames)
             .map_err(DesktopRecordingSessionStartError::Transport)?;
         let journal_path = config.writer.journal_path.clone();
-        let final_wav_path = config.writer.final_wav_path.clone();
-        let sample_rate_hz = config.input.sample_rate_hz();
         let writer = RecordingWorker::start(config.writer, consumer)
             .map_err(DesktopRecordingSessionStartError::Writer)?;
         let native = NativeInputConfig::from(&config.input);
@@ -319,8 +276,6 @@ impl DesktopRecordingSession {
             input,
             writer,
             journal_path,
-            final_wav_path,
-            sample_rate_hz,
             completion_timeout: config.completion_timeout,
         })
     }
@@ -355,13 +310,10 @@ impl DesktopRecordingSession {
     /// failures also retain the journal path and cannot produce a publication
     /// token.
     pub fn commit(self) -> Result<DesktopPublishedRecording, DesktopRecordingSessionCommitError> {
-        let final_wav_path = self.final_wav_path.clone();
-        let journal_path = self.journal_path.clone();
-        let sample_rate_hz = self.sample_rate_hz;
         let completion = self
             .finish(true)
             .map_err(DesktopRecordingSessionCommitError::Stop)?;
-        published_recording(final_wav_path, journal_path, sample_rate_hz, completion)
+        published_recording(completion)
     }
 
     /// Stops capture, drains every accepted frame, and preserves the journal
@@ -383,8 +335,6 @@ impl DesktopRecordingSession {
             input,
             mut writer,
             journal_path,
-            final_wav_path: _,
-            sample_rate_hz: _,
             completion_timeout,
         } = self;
         if let Err(source) = input.stop() {
@@ -440,22 +390,10 @@ fn validate_config(
 }
 
 fn published_recording(
-    final_wav_path: PathBuf,
-    journal_path: PathBuf,
-    sample_rate_hz: u32,
     completion: RecordingWorkerCompletion,
 ) -> Result<DesktopPublishedRecording, DesktopRecordingSessionCommitError> {
     match completion {
-        RecordingWorkerCompletion::Published {
-            frames,
-            publication,
-        } => Ok(DesktopPublishedRecording {
-            final_wav_path,
-            journal_path,
-            sample_rate_hz,
-            frames,
-            publication,
-        }),
+        RecordingWorkerCompletion::Published(recording) => Ok(recording),
         RecordingWorkerCompletion::Aborted {
             frames,
             journal_path,
@@ -478,7 +416,7 @@ fn published_recording(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper_recording_journal::JournalConfig;
+    use hyper_recording_journal::{JournalConfig, JournalWriter, PublicationOutcome, publish_wav};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -560,34 +498,43 @@ mod tests {
 
     #[test]
     fn publication_token_exists_only_for_published_completion() {
-        let published = published_recording(
-            PathBuf::from("take.wav"),
-            PathBuf::from("take.journal"),
-            48_000,
-            RecordingWorkerCompletion::Published {
-                frames: 512,
-                publication: PublicationOutcome::Published,
+        let id = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "hyper-desktop-publication-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let journal = directory.join("take.journal");
+        let wav = directory.join("take.wav");
+        let mut writer = JournalWriter::create(
+            &journal,
+            JournalConfig {
+                sample_rate: 48_000,
+                max_chunk_frames: 2,
+                max_total_frames: 2,
             },
         )
         .unwrap();
-        assert_eq!(published.final_wav_path(), Path::new("take.wav"));
-        assert_eq!(published.journal_path(), Path::new("take.journal"));
+        writer.append(&[0.25, -0.25, 0.5, -0.5]).unwrap();
+        drop(writer);
+        let authority = publish_wav(&journal, &wav).unwrap();
+
+        let published =
+            published_recording(RecordingWorkerCompletion::Published(authority)).unwrap();
+        assert_eq!(published.final_wav_path(), wav);
+        assert_eq!(published.journal_path(), journal);
         assert_eq!(published.sample_rate_hz(), 48_000);
         assert_eq!(published.channels(), 2);
-        assert_eq!(published.frames(), 512);
-        assert_eq!(published.publication(), PublicationOutcome::Published);
+        assert_eq!(published.frames(), 2);
+        assert_eq!(published.outcome(), PublicationOutcome::Published);
 
         assert!(matches!(
-            published_recording(
-                PathBuf::from("take.wav"),
-                PathBuf::from("take.journal"),
-                48_000,
-                RecordingWorkerCompletion::Aborted {
-                    frames: 511,
-                    journal_path: PathBuf::from("take.journal"),
-                },
-            ),
+            published_recording(RecordingWorkerCompletion::Aborted {
+                frames: 511,
+                journal_path: PathBuf::from("take.journal"),
+            },),
             Err(DesktopRecordingSessionCommitError::UnexpectedAbort { frames: 511, .. })
         ));
+        fs::remove_dir_all(directory).unwrap();
     }
 }

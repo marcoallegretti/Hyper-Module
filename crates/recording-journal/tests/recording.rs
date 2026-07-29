@@ -195,12 +195,16 @@ fn publishes_exact_float_wav_and_is_idempotent() {
     writer.append(&samples).unwrap();
     drop(writer);
 
+    let published = publish_wav(&journal, &wav).unwrap();
+    assert_eq!(published.journal_path(), journal);
+    assert_eq!(published.final_wav_path(), wav);
+    assert_eq!(published.sample_rate_hz(), 48_000);
+    assert_eq!(published.channels(), 2);
+    assert_eq!(published.frames(), 3);
+    assert_ne!(published.content_crc32(), 0);
+    assert_eq!(published.outcome(), PublicationOutcome::Published);
     assert_eq!(
-        publish_wav(&journal, &wav).unwrap(),
-        PublicationOutcome::Published
-    );
-    assert_eq!(
-        publish_wav(&journal, &wav).unwrap(),
+        publish_wav(&journal, &wav).unwrap().outcome(),
         PublicationOutcome::AlreadyPublished
     );
     let mut reader = hound::WavReader::open(&wav).unwrap();
@@ -233,7 +237,7 @@ fn resumes_a_verified_staging_file_after_interruption() {
     fs::rename(&wav, &staging).unwrap();
 
     assert_eq!(
-        publish_wav(&journal, &wav).unwrap(),
+        publish_wav(&journal, &wav).unwrap().outcome(),
         PublicationOutcome::Published
     );
     assert!(wav.exists());

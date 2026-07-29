@@ -61,10 +61,9 @@ fn commit_drains_every_frame_before_verified_publication() {
 
     assert!(matches!(
         worker.wait(WAIT).unwrap(),
-        RecordingWorkerCompletion::Published {
-            frames: 3,
-            publication: PublicationOutcome::Published
-        }
+        RecordingWorkerCompletion::Published(recording)
+            if recording.frames() == 3
+                && recording.outcome() == PublicationOutcome::Published
     ));
     assert_eq!(recover(journal).unwrap().frames, 3);
     let mut reader = hound::WavReader::open(wav).unwrap();

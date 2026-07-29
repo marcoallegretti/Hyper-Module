@@ -188,6 +188,54 @@ pub enum PublicationOutcome {
     AlreadyPublished,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishedRecording {
+    journal_path: PathBuf,
+    final_wav_path: PathBuf,
+    sample_rate_hz: u32,
+    channels: u16,
+    frames: u64,
+    content_crc32: u32,
+    outcome: PublicationOutcome,
+}
+
+impl PublishedRecording {
+    #[must_use]
+    pub fn journal_path(&self) -> &Path {
+        &self.journal_path
+    }
+
+    #[must_use]
+    pub fn final_wav_path(&self) -> &Path {
+        &self.final_wav_path
+    }
+
+    #[must_use]
+    pub const fn sample_rate_hz(&self) -> u32 {
+        self.sample_rate_hz
+    }
+
+    #[must_use]
+    pub const fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    #[must_use]
+    pub const fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    #[must_use]
+    pub const fn content_crc32(&self) -> u32 {
+        self.content_crc32
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> PublicationOutcome {
+        self.outcome
+    }
+}
+
 pub struct JournalWriter {
     path: PathBuf,
     file: BufWriter<File>,
@@ -458,7 +506,7 @@ fn recover_file(file: &mut File) -> Result<RecoveryReport, JournalError> {
 pub fn publish_wav(
     journal_path: impl AsRef<Path>,
     final_path: impl AsRef<Path>,
-) -> Result<PublicationOutcome, JournalError> {
+) -> Result<PublishedRecording, JournalError> {
     let journal_path = journal_path.as_ref();
     let final_path = final_path.as_ref();
     let mut journal_lock = open_locked(journal_path)?;
@@ -479,7 +527,12 @@ pub fn publish_wav(
                 fs::remove_file(&staging_path)?;
                 sync_parent(final_path)?;
             }
-            return Ok(PublicationOutcome::AlreadyPublished);
+            return Ok(published_recording(
+                journal_path,
+                final_path,
+                report,
+                PublicationOutcome::AlreadyPublished,
+            ));
         }
         return Err(JournalError::PublishedRecordingConflict(
             final_path.to_owned(),
@@ -503,7 +556,12 @@ pub fn publish_wav(
             if verify_wav(final_path, report) {
                 fs::remove_file(&staging_path)?;
                 sync_published(final_path)?;
-                return Ok(PublicationOutcome::AlreadyPublished);
+                return Ok(published_recording(
+                    journal_path,
+                    final_path,
+                    report,
+                    PublicationOutcome::AlreadyPublished,
+                ));
             }
             return Err(JournalError::PublishedRecordingConflict(
                 final_path.to_owned(),
@@ -514,7 +572,29 @@ pub fn publish_wav(
     sync_published(final_path)?;
     fs::remove_file(&staging_path)?;
     sync_parent(final_path)?;
-    Ok(PublicationOutcome::Published)
+    Ok(published_recording(
+        journal_path,
+        final_path,
+        report,
+        PublicationOutcome::Published,
+    ))
+}
+
+fn published_recording(
+    journal_path: &Path,
+    final_wav_path: &Path,
+    report: RecoveryReport,
+    outcome: PublicationOutcome,
+) -> PublishedRecording {
+    PublishedRecording {
+        journal_path: journal_path.to_owned(),
+        final_wav_path: final_wav_path.to_owned(),
+        sample_rate_hz: report.config.sample_rate,
+        channels: CHANNELS,
+        frames: report.frames,
+        content_crc32: report.content_crc32,
+        outcome,
+    }
 }
 
 #[derive(Clone, Copy)]
