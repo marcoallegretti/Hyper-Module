@@ -41,6 +41,20 @@ pub use desktop_input::{
     DesktopInputTargets, discover_desktop_input_targets,
 };
 
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+mod recording_session;
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+pub use recording_session::{
+    DesktopRecordingSession, DesktopRecordingSessionConfig, DesktopRecordingSessionConfigError,
+    DesktopRecordingSessionStartError, DesktopRecordingSessionStopError,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum StreamState {
