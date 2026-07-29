@@ -12,6 +12,7 @@ members = [
     "crates/playback-session",
     "crates/recording-journal",
     "crates/recording-transport",
+    "crates/recording-worker",
     "software/IDE/audio-backend",
 ]
 resolver = "3"

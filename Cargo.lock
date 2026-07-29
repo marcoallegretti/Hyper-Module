@@ -336,6 +336,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-recording-worker"
+version = "0.1.0"
+dependencies = [
+ "hound",
+ "hyper-recording-journal",
+ "hyper-recording-transport",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

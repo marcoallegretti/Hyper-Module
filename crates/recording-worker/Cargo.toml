@@ -1,0 +1,16 @@
+[package]
+name = "hyper-recording-worker"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+hyper-recording-journal = { path = "../recording-journal" }
+hyper-recording-transport = { path = "../recording-transport" }
+
+[dev-dependencies]
+hound = "=3.5.1"
+
+[lints]
+workspace = true
