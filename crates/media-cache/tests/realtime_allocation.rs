@@ -7,7 +7,7 @@ use hyper_clip_engine::ClipOutput;
 use hyper_media_cache::{CacheLimits, DecodedMediaCacheBuilder};
 
 use common::one_clip_schedule;
-use realtime_allocator::{HeapMeasurement, assert_allocator_positive_control};
+use realtime_allocator::HeapMeasurement;
 
 #[test]
 fn prepared_cache_rendering_performs_zero_heap_allocations() {
@@ -24,8 +24,7 @@ fn prepared_cache_rendering_performs_zero_heap_allocations() {
     let prepared = cache.prepare_schedule(&schedule).unwrap();
     let mut output = [0.0_f32; 100];
 
-    assert_allocator_positive_control();
-    let measurement = HeapMeasurement::start();
+    let measurement = HeapMeasurement::start_verified();
     let result = prepared.entries()[0].render_block(0, ClipOutput::Mono(&mut output));
     let heap_operations = measurement.finish();
 

@@ -16,6 +16,9 @@ hyper-playback-compiler = { path = "../../../crates/playback-compiler" }
 hyper-playback-json = { path = "../../../crates/playback-json" }
 hyper-playback-session = { path = "../../../crates/playback-session" }
 
+[dev-dependencies]
+hyper-recording-transport = { path = "../../../crates/recording-transport" }
+
 [target.'cfg(all(target_os = "linux", target_endian = "little"))'.dependencies]
 bytemuck = "=1.24.0"
 pipewire = "=0.10.0"

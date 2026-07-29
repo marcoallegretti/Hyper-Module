@@ -6,7 +6,7 @@ use hyper_clip_engine::{
     ClipOutput, ClipRenderPlan, FrameRange, NativeClipSpec, PlacementSpec, TimeMapping,
 };
 
-use realtime_allocator::{HeapMeasurement, assert_allocator_positive_control};
+use realtime_allocator::HeapMeasurement;
 
 #[test]
 fn clip_block_rendering_performs_zero_heap_allocations() {
@@ -35,8 +35,7 @@ fn clip_block_rendering_performs_zero_heap_allocations() {
     let mut left = [0.0_f32; 128];
     let mut right = [0.0_f32; 128];
 
-    assert_allocator_positive_control();
-    let measurement = HeapMeasurement::start();
+    let measurement = HeapMeasurement::start_verified();
     let result = plan.render_block(
         placement,
         64,

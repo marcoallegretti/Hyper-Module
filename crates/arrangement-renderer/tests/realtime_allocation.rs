@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use hyper_arrangement_renderer::{ArrangementRenderer, RenderScratchSlot};
 
 use common::fixture;
-use realtime_allocator::{HeapMeasurement, assert_allocator_positive_control};
+use realtime_allocator::HeapMeasurement;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -26,8 +26,7 @@ fn prepared_window_rendering_performs_zero_heap_allocations() {
         RenderScratchSlot::new(&mut left_b, &mut right_b),
     ];
 
-    assert_allocator_positive_control();
-    let measurement = HeapMeasurement::start();
+    let measurement = HeapMeasurement::start_verified();
     let result = renderer.render_window(90, 80, &mut slots);
     let heap_operations = measurement.finish();
 
@@ -55,8 +54,7 @@ fn fixed_track_window_rendering_performs_zero_heap_allocations() {
         RenderScratchSlot::new(&mut left_c, &mut right_c),
     ];
 
-    assert_allocator_positive_control();
-    let measurement = HeapMeasurement::start();
+    let measurement = HeapMeasurement::start_verified();
     let result = renderer.render_track_window(190, 160, &mut slots);
     let heap_operations = measurement.finish();
 

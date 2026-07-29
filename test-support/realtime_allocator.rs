@@ -48,10 +48,17 @@ pub struct HeapMeasurement {
 }
 
 impl HeapMeasurement {
-    pub fn start() -> Self {
+    pub fn start_verified() -> Self {
         let guard = MEASUREMENT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        HEAP_OPERATIONS.store(0, Ordering::SeqCst);
+        COUNTING.store(true, Ordering::SeqCst);
+        let value = Box::new(7_u8);
+        std::hint::black_box(&value);
+        drop(value);
+        COUNTING.store(false, Ordering::SeqCst);
+        assert!(HEAP_OPERATIONS.load(Ordering::SeqCst) >= 2);
         HEAP_OPERATIONS.store(0, Ordering::SeqCst);
         COUNTING.store(true, Ordering::SeqCst);
         Self {
@@ -73,12 +80,4 @@ impl Drop for HeapMeasurement {
             COUNTING.store(false, Ordering::SeqCst);
         }
     }
-}
-
-pub fn assert_allocator_positive_control() {
-    let measurement = HeapMeasurement::start();
-    let value = Box::new(7_u8);
-    std::hint::black_box(&value);
-    drop(value);
-    assert!(measurement.finish() >= 2);
 }

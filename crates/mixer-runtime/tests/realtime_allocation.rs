@@ -13,7 +13,7 @@ use hyper_mixer_runtime::{
 };
 
 use common::{fixture, graph_fixture, playback_fixture};
-use realtime_allocator::{HeapMeasurement, assert_allocator_positive_control};
+use realtime_allocator::HeapMeasurement;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -32,8 +32,7 @@ fn prepared_arrangement_to_main_mix_performs_zero_heap_allocations() {
     let mut output_left = [0.0_f32; 64];
     let mut output_right = [0.0_f32; 64];
 
-    assert_allocator_positive_control();
-    let measurement = HeapMeasurement::start();
+    let measurement = HeapMeasurement::start_verified();
     let result = runtime.process_window(
         0,
         &mut scratch,
@@ -89,8 +88,7 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
     let (mut meter_sender, _meter_receiver) = output_meter_channel();
     let mut interleaved = [0.0_f32; 128];
 
-    assert_allocator_positive_control();
-    let measurement = HeapMeasurement::start();
+    let measurement = HeapMeasurement::start_verified();
     let result = runtime.process_window(
         0,
         &mut scratch,
@@ -150,8 +148,7 @@ fn prepared_combined_playback_performs_zero_heap_allocations() {
     let mut output_left = [0.0_f32; 64];
     let mut output_right = [0.0_f32; 64];
 
-    assert_allocator_positive_control();
-    let measurement = HeapMeasurement::start();
+    let measurement = HeapMeasurement::start_verified();
     let result = transport.process_cycle(
         &mut scratch,
         StereoOutput {
@@ -197,8 +194,7 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
     let mut first = [0.0_f32; 100];
     let mut second = [0.0_f32; 50];
 
-    assert_allocator_positive_control();
-    let measurement = HeapMeasurement::start();
+    let measurement = HeapMeasurement::start_verified();
     let start_result = command_sender.try_send(TransportCommand::Start);
     let first_result = processor.process(&mut first);
     let second_result = processor.process(&mut second);

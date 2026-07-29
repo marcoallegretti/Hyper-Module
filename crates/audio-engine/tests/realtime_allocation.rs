@@ -6,7 +6,7 @@ use hyper_audio_engine::{
     Pan, StereoMixer, StereoOutput,
 };
 
-use realtime_allocator::{HeapMeasurement, assert_allocator_positive_control};
+use realtime_allocator::HeapMeasurement;
 
 #[test]
 fn processing_performs_zero_heap_allocations() {
@@ -39,8 +39,7 @@ fn processing_performs_zero_heap_allocations() {
     let mut failed_interleaved = [1.0_f32; 256];
     let mut invalid_interleaved = [1.0_f32; 3];
 
-    assert_allocator_positive_control();
-    let measurement = HeapMeasurement::start();
+    let measurement = HeapMeasurement::start_verified();
     let result = mixer.process(
         &inputs,
         &parameters,
