@@ -25,6 +25,14 @@ function sameIdentity(left, right) {
   );
 }
 
+function sameStableIdentity(left, right) {
+  return (
+    sameIdentity(left, right) &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
+}
+
 function assertSameIdentity(expected, actual, path) {
   assert(
     sameIdentity(expected, actual),
@@ -49,6 +57,54 @@ async function openRetainedFile(path) {
   } catch (error) {
     await handle.close();
     throw error;
+  }
+}
+
+async function readOpenFile(handle, length, path) {
+  const output = Buffer.alloc(length);
+  let offset = 0;
+  while (offset < output.byteLength) {
+    const { bytesRead } = await handle.read(
+      output,
+      offset,
+      output.byteLength - offset,
+      offset,
+    );
+    assert(bytesRead > 0, `file became shorter while being read: ${path}`);
+    offset += bytesRead;
+  }
+  const overflow = Buffer.alloc(1);
+  const { bytesRead } = await handle.read(overflow, 0, 1, output.byteLength);
+  assert.equal(bytesRead, 0, `file became longer while being read: ${path}`);
+  return output;
+}
+
+export async function readStableFile(path, maximumBytes, label = "file") {
+  assert(
+    Number.isSafeInteger(maximumBytes) && maximumBytes >= 0,
+    "stable file byte limit must be a non-negative safe integer",
+  );
+  const handle = await openRetainedFile(path);
+  try {
+    const before = await handle.stat({ bigint: true });
+    assert(
+      before.size <= BigInt(maximumBytes),
+      `${label} exceeds ${maximumBytes} bytes`,
+    );
+    const length = Number(before.size);
+    const bytes = await readOpenFile(handle, length, path);
+    const confirmed = await readOpenFile(handle, length, path);
+    assert(bytes.equals(confirmed), `file changed while being read: ${path}`);
+    const after = await handle.stat({ bigint: true });
+    const published = await lstat(path, { bigint: true });
+    assert(
+      sameStableIdentity(before, after),
+      `file metadata changed while being read: ${path}`,
+    );
+    assertSameIdentity(after, published, path);
+    return bytes;
+  } finally {
+    await handle.close();
   }
 }
 

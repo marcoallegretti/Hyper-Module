@@ -32,6 +32,7 @@ import {
   verifyDeploymentRequestBundle,
 } from "../lib/deployment-authorization.mjs";
 import {
+  readStableFile,
   syncDirectoryTree,
   syncPublishedDirectory,
   syncPublishedEntry,
@@ -188,16 +189,7 @@ async function readCanonicalValidatedFile(
 ) {
   let bytes;
   try {
-    const status = await lstat(path);
-    assert(
-      status.isFile() && !status.isSymbolicLink(),
-      `${label} must be a real regular file`,
-    );
-    assert(
-      status.size <= maxBytes,
-      `${label} exceeds ${maxBytes} bytes`,
-    );
-    bytes = await readFile(path);
+    bytes = await readStableFile(path, maxBytes, label);
   } catch (error) {
     if (error.code === "ENOENT") return missingValue;
     throw error;

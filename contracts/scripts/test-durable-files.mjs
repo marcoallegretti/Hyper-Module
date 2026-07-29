@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  readStableFile,
   syncDirectoryTree,
   syncPublishedDirectory,
   syncPublishedEntry,
@@ -27,6 +28,8 @@ try {
   await rename(stage, published);
   await syncPublishedEntry(published);
   assert.equal(await readFile(published, "utf8"), "durable");
+  assert.equal((await readStableFile(published, 7)).toString("utf8"), "durable");
+  await assert.rejects(readStableFile(published, 6), /exceeds 6 bytes/);
 
   const tree = join(root, "tree");
   await mkdir(join(tree, "nested"), { recursive: true });
