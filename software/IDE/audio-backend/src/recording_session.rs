@@ -7,10 +7,11 @@ use super::{
 };
 use core::error::Error;
 use core::fmt;
+use hyper_recording_journal::PublicationOutcome;
 use hyper_recording_transport::{RecordingTransportBuildError, try_recording_transport};
 use hyper_recording_worker::{
     RecordingDispositionError, RecordingWorker, RecordingWorkerCompletion, RecordingWorkerConfig,
-    RecordingWorkerStartError, RecordingWorkerWaitError,
+    RecordingWorkerFailure, RecordingWorkerStartError, RecordingWorkerWaitError,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -182,11 +183,103 @@ impl Error for DesktopRecordingSessionStopError {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopPublishedRecording {
+    final_wav_path: PathBuf,
+    journal_path: PathBuf,
+    sample_rate_hz: u32,
+    frames: u64,
+    publication: PublicationOutcome,
+}
+
+impl DesktopPublishedRecording {
+    #[must_use]
+    pub fn final_wav_path(&self) -> &Path {
+        &self.final_wav_path
+    }
+
+    #[must_use]
+    pub fn journal_path(&self) -> &Path {
+        &self.journal_path
+    }
+
+    #[must_use]
+    pub const fn sample_rate_hz(&self) -> u32 {
+        self.sample_rate_hz
+    }
+
+    #[must_use]
+    pub const fn channels(&self) -> u16 {
+        2
+    }
+
+    #[must_use]
+    pub const fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    #[must_use]
+    pub const fn publication(&self) -> PublicationOutcome {
+        self.publication
+    }
+}
+
+#[derive(Debug)]
+pub enum DesktopRecordingSessionCommitError {
+    Stop(DesktopRecordingSessionStopError),
+    UnexpectedAbort {
+        frames: u64,
+        journal_path: PathBuf,
+    },
+    Failed {
+        frames: u64,
+        journal_path: PathBuf,
+        source: RecordingWorkerFailure,
+    },
+}
+
+impl fmt::Display for DesktopRecordingSessionCommitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stop(source) => source.fmt(formatter),
+            Self::UnexpectedAbort {
+                frames,
+                journal_path,
+            } => write!(
+                formatter,
+                "recording commit ended as abort after {frames} frames; journal remains at {}",
+                journal_path.display()
+            ),
+            Self::Failed {
+                frames,
+                journal_path,
+                source,
+            } => write!(
+                formatter,
+                "recording commit failed after {frames} frames; journal remains at {}: {source}",
+                journal_path.display()
+            ),
+        }
+    }
+}
+
+impl Error for DesktopRecordingSessionCommitError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Stop(source) => Some(source),
+            Self::Failed { source, .. } => Some(source),
+            Self::UnexpectedAbort { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DesktopRecordingSession {
     input: NativeInputStream,
     writer: RecordingWorker,
     journal_path: PathBuf,
+    final_wav_path: PathBuf,
+    sample_rate_hz: u32,
     completion_timeout: Duration,
 }
 
@@ -206,6 +299,8 @@ impl DesktopRecordingSession {
         let (mut producer, consumer) = try_recording_transport(config.transport_capacity_frames)
             .map_err(DesktopRecordingSessionStartError::Transport)?;
         let journal_path = config.writer.journal_path.clone();
+        let final_wav_path = config.writer.final_wav_path.clone();
+        let sample_rate_hz = config.input.sample_rate_hz();
         let writer = RecordingWorker::start(config.writer, consumer)
             .map_err(DesktopRecordingSessionStartError::Writer)?;
         let native = NativeInputConfig::from(&config.input);
@@ -224,6 +319,8 @@ impl DesktopRecordingSession {
             input,
             writer,
             journal_path,
+            final_wav_path,
+            sample_rate_hz,
             completion_timeout: config.completion_timeout,
         })
     }
@@ -254,10 +351,17 @@ impl DesktopRecordingSession {
     /// # Errors
     ///
     /// Native shutdown failure prevents commit and leaves the journal
-    /// unpublished. Disposition and writer completion errors also retain the
-    /// journal path.
-    pub fn commit(self) -> Result<RecordingWorkerCompletion, DesktopRecordingSessionStopError> {
-        self.finish(true)
+    /// unpublished. Disposition, writer completion, abort, and terminal writer
+    /// failures also retain the journal path and cannot produce a publication
+    /// token.
+    pub fn commit(self) -> Result<DesktopPublishedRecording, DesktopRecordingSessionCommitError> {
+        let final_wav_path = self.final_wav_path.clone();
+        let journal_path = self.journal_path.clone();
+        let sample_rate_hz = self.sample_rate_hz;
+        let completion = self
+            .finish(true)
+            .map_err(DesktopRecordingSessionCommitError::Stop)?;
+        published_recording(final_wav_path, journal_path, sample_rate_hz, completion)
     }
 
     /// Stops capture, drains every accepted frame, and preserves the journal
@@ -279,6 +383,8 @@ impl DesktopRecordingSession {
             input,
             mut writer,
             journal_path,
+            final_wav_path: _,
+            sample_rate_hz: _,
             completion_timeout,
         } = self;
         if let Err(source) = input.stop() {
@@ -331,6 +437,42 @@ fn validate_config(
         return Err(DesktopRecordingSessionConfigError::ZeroCompletionTimeout);
     }
     Ok(())
+}
+
+fn published_recording(
+    final_wav_path: PathBuf,
+    journal_path: PathBuf,
+    sample_rate_hz: u32,
+    completion: RecordingWorkerCompletion,
+) -> Result<DesktopPublishedRecording, DesktopRecordingSessionCommitError> {
+    match completion {
+        RecordingWorkerCompletion::Published {
+            frames,
+            publication,
+        } => Ok(DesktopPublishedRecording {
+            final_wav_path,
+            journal_path,
+            sample_rate_hz,
+            frames,
+            publication,
+        }),
+        RecordingWorkerCompletion::Aborted {
+            frames,
+            journal_path,
+        } => Err(DesktopRecordingSessionCommitError::UnexpectedAbort {
+            frames,
+            journal_path,
+        }),
+        RecordingWorkerCompletion::Failed {
+            frames,
+            journal_path,
+            error,
+        } => Err(DesktopRecordingSessionCommitError::Failed {
+            frames,
+            journal_path,
+            source: error,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -414,5 +556,38 @@ mod tests {
         ));
         assert!(fs::read_dir(&directory).unwrap().next().is_none());
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn publication_token_exists_only_for_published_completion() {
+        let published = published_recording(
+            PathBuf::from("take.wav"),
+            PathBuf::from("take.journal"),
+            48_000,
+            RecordingWorkerCompletion::Published {
+                frames: 512,
+                publication: PublicationOutcome::Published,
+            },
+        )
+        .unwrap();
+        assert_eq!(published.final_wav_path(), Path::new("take.wav"));
+        assert_eq!(published.journal_path(), Path::new("take.journal"));
+        assert_eq!(published.sample_rate_hz(), 48_000);
+        assert_eq!(published.channels(), 2);
+        assert_eq!(published.frames(), 512);
+        assert_eq!(published.publication(), PublicationOutcome::Published);
+
+        assert!(matches!(
+            published_recording(
+                PathBuf::from("take.wav"),
+                PathBuf::from("take.journal"),
+                48_000,
+                RecordingWorkerCompletion::Aborted {
+                    frames: 511,
+                    journal_path: PathBuf::from("take.journal"),
+                },
+            ),
+            Err(DesktopRecordingSessionCommitError::UnexpectedAbort { frames: 511, .. })
+        ));
     }
 }

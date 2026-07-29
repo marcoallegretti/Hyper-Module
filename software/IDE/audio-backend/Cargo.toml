@@ -15,11 +15,9 @@ hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
 hyper-playback-compiler = { path = "../../../crates/playback-compiler" }
 hyper-playback-json = { path = "../../../crates/playback-json" }
 hyper-playback-session = { path = "../../../crates/playback-session" }
+hyper-recording-journal = { path = "../../../crates/recording-journal" }
 hyper-recording-transport = { path = "../../../crates/recording-transport" }
 hyper-recording-worker = { path = "../../../crates/recording-worker" }
-
-[dev-dependencies]
-hyper-recording-journal = { path = "../../../crates/recording-journal" }
 
 [target.'cfg(all(target_os = "linux", target_endian = "little"))'.dependencies]
 bytemuck = "=1.24.0"

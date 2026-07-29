@@ -51,7 +51,8 @@ mod recording_session;
     target_os = "windows"
 ))]
 pub use recording_session::{
-    DesktopRecordingSession, DesktopRecordingSessionConfig, DesktopRecordingSessionConfigError,
+    DesktopPublishedRecording, DesktopRecordingSession, DesktopRecordingSessionCommitError,
+    DesktopRecordingSessionConfig, DesktopRecordingSessionConfigError,
     DesktopRecordingSessionStartError, DesktopRecordingSessionStopError,
 };
 
