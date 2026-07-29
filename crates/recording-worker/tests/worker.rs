@@ -7,7 +7,8 @@ use hyper_recording_worker::{
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 const WAIT: Duration = Duration::from_secs(2);
@@ -178,10 +179,20 @@ fn dropping_the_owner_stops_the_worker_and_closes_the_consumer() {
     let worker = RecordingWorker::start(directory.config(1), consumer).unwrap();
     drop(worker);
 
-    assert!(matches!(
-        producer.push(&[0.25, -0.25]),
-        Err(RecordingPushError::ConsumerClosed { .. })
-    ));
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if matches!(
+            producer.push(&[0.25, -0.25]),
+            Err(RecordingPushError::ConsumerClosed { .. })
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recording worker did not observe owner cancellation"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]

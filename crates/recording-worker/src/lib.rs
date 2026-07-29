@@ -382,10 +382,9 @@ impl RecordingWorker {
 
 impl Drop for RecordingWorker {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
+        if self.handle.take().is_some() {
             self.hard_cancel.store(true, Ordering::Release);
             self.wake_thread.unpark();
-            let _ = handle.join();
         }
     }
 }
