@@ -35,6 +35,7 @@ import {
 
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_HANDOFF_BYTES = 2 * 1024 * 1024;
+const MAX_HANDOFF_PATH_UTF8_BYTES = 4096;
 const MAX_RECORDING_BYTES = 4_294_967_295;
 const MAX_SAFE_INTEGER = 9_007_199_254_740_991;
 const MAX_RECOVERY_ENTRIES = 4098;
@@ -467,7 +468,8 @@ export function decodeFinalizedRecordingHandoff(handoffBytes) {
   assert(
     typeof handoff.recording.path === "string" &&
       handoff.recording.path.length > 0 &&
-      Buffer.byteLength(handoff.recording.path, "utf8") <= 4096 &&
+      Buffer.byteLength(handoff.recording.path, "utf8") <=
+        MAX_HANDOFF_PATH_UTF8_BYTES &&
       !handoff.recording.path.includes("\0"),
     "recording handoff path is invalid",
   );

@@ -36,7 +36,8 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 4096,
-          "pattern": "^[^\\u0000]+$"
+          "pattern": "^[^\\u0000]+$",
+          "$comment": "The application contract additionally requires an absolute same-platform path whose UTF-8 encoding is at most 4096 bytes."
         },
         "byte_length": {
           "type": "integer",

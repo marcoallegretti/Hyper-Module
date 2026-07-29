@@ -11,7 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 
 import canonicalize from "canonicalize";
 
@@ -213,6 +213,39 @@ try {
       ),
     ),
     /must be absolute/,
+  );
+  const unicodePath = join(temporaryRoot, "registrazione-\u00e8.wav");
+  assert.equal(
+    decodeFinalizedRecordingHandoff(
+      handoffBytes(unicodePath, recordingBytes),
+    ).recordingPath,
+    unicodePath,
+  );
+  const pathRoot = parse(recordingPath).root;
+  const exactBoundaryPath = `${pathRoot}${"a".repeat(
+    4096 - Buffer.byteLength(pathRoot, "utf8"),
+  )}`;
+  assert.equal(Buffer.byteLength(exactBoundaryPath, "utf8"), 4096);
+  assert.doesNotThrow(() =>
+    decodeFinalizedRecordingHandoff(
+      handoffBytes(exactBoundaryPath, recordingBytes),
+    ),
+  );
+  await assert.rejects(
+    Promise.resolve().then(() =>
+      decodeFinalizedRecordingHandoff(
+        handoffBytes(`${exactBoundaryPath}a`, recordingBytes),
+      ),
+    ),
+    /path is invalid/,
+  );
+  await assert.rejects(
+    Promise.resolve().then(() =>
+      decodeFinalizedRecordingHandoff(
+        handoffBytes(`${pathRoot}bad\0.wav`, recordingBytes),
+      ),
+    ),
+    /path is invalid/,
   );
   await assert.rejects(
     Promise.resolve().then(() =>

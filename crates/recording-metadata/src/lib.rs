@@ -6,11 +6,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 
 const FORMAT: &str = "hyper-recording-metadata";
 const FORMAT_VERSION: u8 = 1;
 const HANDOFF_FORMAT: &str = "hyper-finalized-recording-handoff";
 const HANDOFF_FORMAT_VERSION: u8 = 1;
+const MAX_HANDOFF_PATH_UTF8_BYTES: usize = 4096;
 const VERSION_ONE_SAMPLE_RATE: u32 = 48_000;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_METADATA_BYTES: usize = 1_048_576;
@@ -292,6 +294,7 @@ pub enum RecordingHandoffError {
     NonAbsolutePublicationPath,
     NonUnicodePublicationPath,
     PublicationPathContainsNul,
+    PublicationPathTooLong { actual_bytes: usize, maximum: usize },
     Serialization(serde_json::Error),
 }
 
@@ -307,6 +310,13 @@ impl fmt::Display for RecordingHandoffError {
             Self::PublicationPathContainsNul => {
                 formatter.write_str("recording publication path contains NUL")
             }
+            Self::PublicationPathTooLong {
+                actual_bytes,
+                maximum,
+            } => write!(
+                formatter,
+                "recording publication path has {actual_bytes} UTF-8 bytes; maximum is {maximum}"
+            ),
             Self::Serialization(source) => {
                 write!(
                     formatter,
@@ -323,7 +333,8 @@ impl Error for RecordingHandoffError {
             Self::Serialization(source) => Some(source),
             Self::NonAbsolutePublicationPath
             | Self::NonUnicodePublicationPath
-            | Self::PublicationPathContainsNul => None,
+            | Self::PublicationPathContainsNul
+            | Self::PublicationPathTooLong { .. } => None,
         }
     }
 }
@@ -390,19 +401,10 @@ impl FinalizedRecordingMetadata {
     /// # Errors
     ///
     /// Returns an error when the publication path is not absolute, cannot be
-    /// represented losslessly as Unicode, contains NUL, or JSON serialization
-    /// fails.
+    /// represented losslessly as Unicode, contains NUL, exceeds 4096 UTF-8
+    /// bytes, or JSON serialization fails.
     pub fn to_handoff_json(&self) -> Result<Vec<u8>, RecordingHandoffError> {
-        let path = self.publication.final_wav_path();
-        if !path.is_absolute() {
-            return Err(RecordingHandoffError::NonAbsolutePublicationPath);
-        }
-        let path = path
-            .to_str()
-            .ok_or(RecordingHandoffError::NonUnicodePublicationPath)?;
-        if path.contains('\0') {
-            return Err(RecordingHandoffError::PublicationPathContainsNul);
-        }
+        let path = handoff_publication_path(self.publication.final_wav_path())?;
         serde_json::to_vec(&CanonicalHandoff {
             extensions: BTreeMap::new(),
             format: HANDOFF_FORMAT,
@@ -436,6 +438,26 @@ impl FinalizedRecordingMetadata {
             track_id: &self.context.track_id,
         }
     }
+}
+
+fn handoff_publication_path(path: &Path) -> Result<&str, RecordingHandoffError> {
+    if !path.is_absolute() {
+        return Err(RecordingHandoffError::NonAbsolutePublicationPath);
+    }
+    let path = path
+        .to_str()
+        .ok_or(RecordingHandoffError::NonUnicodePublicationPath)?;
+    if path.contains('\0') {
+        return Err(RecordingHandoffError::PublicationPathContainsNul);
+    }
+    let actual_bytes = path.len();
+    if actual_bytes > MAX_HANDOFF_PATH_UTF8_BYTES {
+        return Err(RecordingHandoffError::PublicationPathTooLong {
+            actual_bytes,
+            maximum: MAX_HANDOFF_PATH_UTF8_BYTES,
+        });
+    }
+    Ok(path)
 }
 
 fn validate_document(
@@ -706,4 +728,64 @@ fn decimal(bytes: &[u8], start: usize, length: usize) -> Option<u32> {
                 None
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    const ABSOLUTE_PREFIX: &str = "/";
+    #[cfg(windows)]
+    const ABSOLUTE_PREFIX: &str = "C:\\";
+
+    #[test]
+    fn handoff_paths_share_one_utf8_boundary_contract() {
+        assert!(matches!(
+            handoff_publication_path(Path::new("relative.wav")),
+            Err(RecordingHandoffError::NonAbsolutePublicationPath)
+        ));
+
+        let unicode = format!("{ABSOLUTE_PREFIX}registrazione-\u{e8}.wav");
+        assert_eq!(
+            handoff_publication_path(Path::new(&unicode)).unwrap(),
+            unicode
+        );
+
+        let exact = format!(
+            "{ABSOLUTE_PREFIX}{}",
+            "a".repeat(MAX_HANDOFF_PATH_UTF8_BYTES - ABSOLUTE_PREFIX.len())
+        );
+        assert_eq!(exact.len(), MAX_HANDOFF_PATH_UTF8_BYTES);
+        assert!(handoff_publication_path(Path::new(&exact)).is_ok());
+
+        let oversized = format!("{exact}a");
+        assert!(matches!(
+            handoff_publication_path(Path::new(&oversized)),
+            Err(RecordingHandoffError::PublicationPathTooLong {
+                actual_bytes: 4097,
+                maximum: 4096
+            })
+        ));
+
+        let nul = format!("{ABSOLUTE_PREFIX}bad\0.wav");
+        assert!(matches!(
+            handoff_publication_path(Path::new(&nul)),
+            Err(RecordingHandoffError::PublicationPathContainsNul)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_path_must_be_lossless_unicode() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+
+        let invalid = PathBuf::from(OsString::from_vec(vec![b'/', 0xff]));
+        assert!(matches!(
+            handoff_publication_path(&invalid),
+            Err(RecordingHandoffError::NonUnicodePublicationPath)
+        ));
+    }
 }
