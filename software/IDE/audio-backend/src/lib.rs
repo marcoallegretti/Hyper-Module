@@ -27,6 +27,20 @@ pub use capture::{
     CaptureStreamSnapshot, InterleavedStereoCaptureProcessor,
 };
 
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+mod desktop_input;
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+pub use desktop_input::{
+    DesktopInputConfig, DesktopInputConfigError, DesktopInputDiscoveryError, DesktopInputTarget,
+    DesktopInputTargets, discover_desktop_input_targets,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum StreamState {

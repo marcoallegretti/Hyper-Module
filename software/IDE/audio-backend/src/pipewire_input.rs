@@ -30,6 +30,18 @@ pub struct PipeWireInputConfig {
 }
 
 impl PipeWireInputConfig {
+    pub(crate) const fn from_desktop(
+        sample_rate_hz: u32,
+        maximum_block_frames: usize,
+        target: Option<String>,
+    ) -> Self {
+        Self {
+            sample_rate_hz,
+            maximum_block_frames,
+            target,
+        }
+    }
+
     /// Creates a fixed-rate stereo `PipeWire` capture configuration.
     ///
     /// # Errors
