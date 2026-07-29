@@ -1,4 +1,4 @@
-use super::{CaptureStreamCounters, DesktopInputConfig, StreamStatus};
+use super::{CaptureStreamCounters, CaptureStreamSnapshot, DesktopInputConfig, StreamStatus};
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::{PipeWireInputConfig, PipeWireInputStream, PipeWireStartError, PipeWireStopError};
 #[cfg(target_os = "windows")]
@@ -134,14 +134,22 @@ pub enum DesktopRecordingSessionStopError {
     Input {
         journal_path: PathBuf,
         source: Box<NativeInputStopError>,
+        pending: Option<Box<DesktopRecordingPendingCompletion>>,
+    },
+    CaptureIntegrity {
+        journal_path: PathBuf,
+        capture: Box<CaptureStreamSnapshot>,
+        pending: Option<Box<DesktopRecordingPendingCompletion>>,
     },
     Disposition {
         journal_path: PathBuf,
         source: RecordingDispositionError,
+        pending: Option<Box<DesktopRecordingPendingCompletion>>,
     },
     Writer {
         journal_path: PathBuf,
         source: RecordingWorkerWaitError,
+        pending: Option<Box<DesktopRecordingPendingCompletion>>,
     },
 }
 
@@ -151,14 +159,32 @@ impl fmt::Display for DesktopRecordingSessionStopError {
             Self::Input {
                 journal_path,
                 source,
+                ..
             } => write!(
                 formatter,
                 "desktop input shutdown failed; recording was not published and its journal remains at {}: {source}",
                 journal_path.display()
             ),
+            Self::CaptureIntegrity {
+                journal_path,
+                capture,
+                ..
+            } => write!(
+                formatter,
+                "capture integrity failed; recording was not published and its journal remains at {}: callbacks={}, captured={}, dropped_frames={}, discontinuities={}, timestamp_errors={}, unavailable_buffers={}, malformed_buffers={}",
+                journal_path.display(),
+                capture.callback_count,
+                capture.captured_callback_count,
+                capture.dropped_frame_count,
+                capture.discontinuity_count,
+                capture.timestamp_error_count,
+                capture.unavailable_buffer_count,
+                capture.malformed_buffer_count
+            ),
             Self::Disposition {
                 journal_path,
                 source,
+                ..
             } => write!(
                 formatter,
                 "recording disposition failed; journal remains at {}: {source}",
@@ -167,6 +193,7 @@ impl fmt::Display for DesktopRecordingSessionStopError {
             Self::Writer {
                 journal_path,
                 source,
+                ..
             } => write!(
                 formatter,
                 "recording writer shutdown failed; journal remains at {}: {source}",
@@ -180,9 +207,58 @@ impl Error for DesktopRecordingSessionStopError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Input { source, .. } => Some(source.as_ref()),
+            Self::CaptureIntegrity { .. } => None,
             Self::Disposition { source, .. } => Some(source),
             Self::Writer { source, .. } => Some(source),
         }
+    }
+}
+
+impl DesktopRecordingSessionStopError {
+    #[must_use]
+    pub fn pending_completion(&self) -> Option<&DesktopRecordingPendingCompletion> {
+        match self {
+            Self::Input { pending, .. }
+            | Self::CaptureIntegrity { pending, .. }
+            | Self::Disposition { pending, .. }
+            | Self::Writer { pending, .. } => pending.as_deref(),
+        }
+    }
+
+    #[must_use]
+    pub fn into_pending_completion(self) -> Option<DesktopRecordingPendingCompletion> {
+        match self {
+            Self::Input { pending, .. }
+            | Self::CaptureIntegrity { pending, .. }
+            | Self::Disposition { pending, .. }
+            | Self::Writer { pending, .. } => pending.map(|pending| *pending),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DesktopRecordingPendingCompletion {
+    writer: RecordingWorker,
+    journal_path: PathBuf,
+}
+
+impl DesktopRecordingPendingCompletion {
+    #[must_use]
+    pub fn journal_path(&self) -> &Path {
+        &self.journal_path
+    }
+
+    /// Waits again for the terminal writer result without relinquishing
+    /// ownership on timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded wait error while preserving this owner for retry.
+    pub fn wait(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<RecordingWorkerCompletion, RecordingWorkerWaitError> {
+        self.writer.wait(timeout)
     }
 }
 
@@ -388,12 +464,24 @@ impl DesktopRecordingSession {
             journal_path,
             completion_timeout,
         } = self;
+        let capture = input.counters();
         if let Err(source) = input.stop() {
             let _ = writer.request_abort();
-            let _ = writer.wait(completion_timeout);
+            let pending = pending_after_wait_timeout(writer, &journal_path, completion_timeout);
             return Err(DesktopRecordingSessionStopError::Input {
                 journal_path,
                 source: Box::new(source),
+                pending,
+            });
+        }
+        let capture = capture.snapshot();
+        if commit && !capture_is_publishable(capture) {
+            let _ = writer.request_abort();
+            let pending = pending_after_wait_timeout(writer, &journal_path, completion_timeout);
+            return Err(DesktopRecordingSessionStopError::CaptureIntegrity {
+                journal_path,
+                capture: Box::new(capture),
+                pending,
             });
         }
         let disposition = if commit {
@@ -401,17 +489,61 @@ impl DesktopRecordingSession {
         } else {
             writer.request_abort()
         };
-        disposition.map_err(|source| DesktopRecordingSessionStopError::Disposition {
-            journal_path: journal_path.clone(),
-            source,
-        })?;
-        writer
-            .wait(completion_timeout)
-            .map_err(|source| DesktopRecordingSessionStopError::Writer {
+        if let Err(source) = disposition {
+            let pending = pending_after_wait_timeout(writer, &journal_path, completion_timeout);
+            return Err(DesktopRecordingSessionStopError::Disposition {
                 journal_path,
                 source,
-            })
+                pending,
+            });
+        }
+        match writer.wait(completion_timeout) {
+            Ok(completion) => Ok(completion),
+            Err(source) => {
+                let pending = (source == RecordingWorkerWaitError::TimedOut).then(|| {
+                    Box::new(DesktopRecordingPendingCompletion {
+                        writer,
+                        journal_path: journal_path.clone(),
+                    })
+                });
+                Err(DesktopRecordingSessionStopError::Writer {
+                    journal_path,
+                    source,
+                    pending,
+                })
+            }
+        }
     }
+}
+
+fn pending_after_wait_timeout(
+    mut writer: RecordingWorker,
+    journal_path: &Path,
+    timeout: Duration,
+) -> Option<Box<DesktopRecordingPendingCompletion>> {
+    match writer.wait(timeout) {
+        Err(RecordingWorkerWaitError::TimedOut) => {
+            Some(Box::new(DesktopRecordingPendingCompletion {
+                writer,
+                journal_path: journal_path.to_owned(),
+            }))
+        }
+        Ok(_) | Err(_) => None,
+    }
+}
+
+fn capture_is_publishable(capture: CaptureStreamSnapshot) -> bool {
+    capture.callback_count == capture.captured_callback_count
+        && capture.dropped_frame_count == 0
+        && capture.processor_failure_count == 0
+        && capture.invalid_shape_count == 0
+        && capture.oversized_block_count == 0
+        && capture.non_finite_block_count == 0
+        && capture.unavailable_buffer_count == 0
+        && capture.malformed_buffer_count == 0
+        && capture.discontinuity_count == 0
+        && capture.timestamp_error_count == 0
+        && capture.stream_error_count == 0
 }
 
 fn validate_config(
@@ -544,6 +676,85 @@ mod tests {
             validate_config(&zero_timeout),
             Err(DesktopRecordingSessionConfigError::ZeroCompletionTimeout)
         );
+    }
+
+    #[test]
+    fn publication_requires_a_lossless_capture_snapshot() {
+        assert!(capture_is_publishable(CaptureStreamSnapshot {
+            callback_count: 2,
+            captured_callback_count: 2,
+            captured_frame_count: 512,
+            ..CaptureStreamSnapshot::default()
+        }));
+
+        for rejected in [
+            CaptureStreamSnapshot {
+                callback_count: 2,
+                captured_callback_count: 1,
+                ..CaptureStreamSnapshot::default()
+            },
+            CaptureStreamSnapshot {
+                unavailable_buffer_count: 1,
+                ..CaptureStreamSnapshot::default()
+            },
+            CaptureStreamSnapshot {
+                discontinuity_count: 1,
+                ..CaptureStreamSnapshot::default()
+            },
+            CaptureStreamSnapshot {
+                timestamp_error_count: 1,
+                ..CaptureStreamSnapshot::default()
+            },
+            CaptureStreamSnapshot {
+                non_finite_block_count: 1,
+                ..CaptureStreamSnapshot::default()
+            },
+        ] {
+            assert!(!capture_is_publishable(rejected));
+        }
+    }
+
+    #[test]
+    fn pending_completion_retains_the_eventual_writer_result() {
+        let id = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "hyper-desktop-pending-recording-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let journal_path = directory.join("take.journal");
+        let (producer, consumer) = try_recording_transport(2).unwrap();
+        let mut writer = RecordingWorker::start(
+            RecordingWorkerConfig {
+                journal_path: journal_path.clone(),
+                final_wav_path: directory.join("take.wav"),
+                journal: JournalConfig {
+                    sample_rate: 48_000,
+                    max_chunk_frames: 2,
+                    max_total_frames: 2,
+                },
+                drain_frames: 2,
+            },
+            consumer,
+        )
+        .unwrap();
+        writer.request_abort().unwrap();
+        let mut pending = DesktopRecordingPendingCompletion {
+            writer,
+            journal_path: journal_path.clone(),
+        };
+
+        assert_eq!(pending.journal_path(), journal_path);
+        assert!(matches!(
+            pending.wait(Duration::from_millis(1)),
+            Err(RecordingWorkerWaitError::TimedOut)
+        ));
+        drop(producer);
+        assert!(matches!(
+            pending.wait(Duration::from_secs(1)).unwrap(),
+            RecordingWorkerCompletion::Aborted { frames: 0, .. }
+        ));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
