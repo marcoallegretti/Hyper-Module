@@ -2,6 +2,7 @@ use hyper_recording_journal::{
     JournalConfig, JournalError, JournalWriter, PublicationOutcome, publish_wav, recover,
 };
 use hyper_recording_transport::try_recording_transport;
+use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -45,6 +46,11 @@ fn append_bytes(path: &Path, bytes: &[u8]) {
     let mut file = OpenOptions::new().append(true).open(path).unwrap();
     file.write_all(bytes).unwrap();
     file.sync_all().unwrap();
+}
+
+#[cfg(unix)]
+fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(original, link)
 }
 
 #[test]
@@ -202,11 +208,16 @@ fn publishes_exact_float_wav_and_is_idempotent() {
     assert_eq!(published.channels(), 2);
     assert_eq!(published.frames(), 3);
     assert_ne!(published.content_crc32(), 0);
-    assert_eq!(published.outcome(), PublicationOutcome::Published);
+    assert_eq!(published.byte_length(), fs::metadata(&wav).unwrap().len());
     assert_eq!(
-        publish_wav(&journal, &wav).unwrap().outcome(),
-        PublicationOutcome::AlreadyPublished
+        published.wav_sha256(),
+        &<[u8; 32]>::from(Sha256::digest(fs::read(&wav).unwrap()))
     );
+    assert_eq!(published.outcome(), PublicationOutcome::Published);
+    let republished = publish_wav(&journal, &wav).unwrap();
+    assert_eq!(republished.outcome(), PublicationOutcome::AlreadyPublished);
+    assert_eq!(republished.byte_length(), published.byte_length());
+    assert_eq!(republished.wav_sha256(), published.wav_sha256());
     let mut reader = hound::WavReader::open(&wav).unwrap();
     let decoded = reader
         .samples::<f32>()
@@ -278,6 +289,34 @@ fn never_overwrites_existing_published_media() {
         Err(JournalError::PublishedRecordingConflict(_))
     ));
     assert_eq!(fs::read(&wav).unwrap(), b"existing media");
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_links_even_when_they_resolve_to_matching_media() {
+    let directory = TestDirectory::new();
+    let journal = directory.join("take.journal");
+    let target = directory.join("verified.wav");
+    let linked_final = directory.join("linked.wav");
+    let staged_final = directory.join("staged.wav");
+    let linked_staging = directory.join(".staged.wav.hyper-staging");
+    let mut writer = JournalWriter::create(&journal, config()).unwrap();
+    writer.append(&[0.25, -0.25]).unwrap();
+    drop(writer);
+    publish_wav(&journal, &target).unwrap();
+
+    symlink_file(&target, &linked_final).unwrap();
+    assert!(matches!(
+        publish_wav(&journal, &linked_final),
+        Err(JournalError::PublishedRecordingConflict(path)) if path == linked_final
+    ));
+
+    symlink_file(&target, &linked_staging).unwrap();
+    assert!(matches!(
+        publish_wav(&journal, &staged_final),
+        Err(JournalError::StagingConflict(path)) if path == linked_staging
+    ));
+    assert!(!staged_final.exists());
 }
 
 #[test]

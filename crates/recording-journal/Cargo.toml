@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 crc32fast = "=1.5.0"
 hound = "=3.5.1"
+sha2 = "=0.10.9"
 
 [dev-dependencies]
 hyper-recording-transport = { path = "../recording-transport" }

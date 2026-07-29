@@ -1,6 +1,7 @@
 #![doc = "Recoverable recording journals and verified WAV publication."]
 
 use crc32fast::Hasher;
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -196,6 +197,8 @@ pub struct PublishedRecording {
     channels: u16,
     frames: u64,
     content_crc32: u32,
+    byte_length: u64,
+    wav_sha256: [u8; 32],
     outcome: PublicationOutcome,
 }
 
@@ -228,6 +231,16 @@ impl PublishedRecording {
     #[must_use]
     pub const fn content_crc32(&self) -> u32 {
         self.content_crc32
+    }
+
+    #[must_use]
+    pub const fn byte_length(&self) -> u64 {
+        self.byte_length
+    }
+
+    #[must_use]
+    pub const fn wav_sha256(&self) -> &[u8; 32] {
+        &self.wav_sha256
     }
 
     #[must_use]
@@ -519,9 +532,9 @@ pub fn publish_wav(
     let staging_path = staging_path(final_path)?;
 
     if final_path.exists() {
-        if verify_wav(final_path, report) {
+        if let Some(verified) = verify_wav(final_path, report) {
             if staging_path.exists() {
-                if !verify_wav(&staging_path, report) {
+                if verify_wav(&staging_path, report).is_none() {
                     return Err(JournalError::StagingConflict(staging_path));
                 }
                 fs::remove_file(&staging_path)?;
@@ -531,6 +544,7 @@ pub fn publish_wav(
                 journal_path,
                 final_path,
                 report,
+                verified,
                 PublicationOutcome::AlreadyPublished,
             ));
         }
@@ -540,12 +554,12 @@ pub fn publish_wav(
     }
 
     if staging_path.exists() {
-        if !verify_wav(&staging_path, report) {
+        if verify_wav(&staging_path, report).is_none() {
             return Err(JournalError::StagingConflict(staging_path));
         }
     } else {
         write_staging_wav(&mut journal_lock, &staging_path, report)?;
-        if !verify_wav(&staging_path, report) {
+        if verify_wav(&staging_path, report).is_none() {
             return Err(JournalError::StagingConflict(staging_path));
         }
     }
@@ -553,13 +567,14 @@ pub fn publish_wav(
     match fs::hard_link(&staging_path, final_path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if verify_wav(final_path, report) {
+            if let Some(verified) = verify_wav(final_path, report) {
                 fs::remove_file(&staging_path)?;
                 sync_published(final_path)?;
                 return Ok(published_recording(
                     journal_path,
                     final_path,
                     report,
+                    verified,
                     PublicationOutcome::AlreadyPublished,
                 ));
             }
@@ -570,20 +585,30 @@ pub fn publish_wav(
         Err(error) => return Err(error.into()),
     }
     sync_published(final_path)?;
+    let verified = verify_wav(final_path, report)
+        .ok_or_else(|| JournalError::PublishedRecordingConflict(final_path.to_owned()))?;
     fs::remove_file(&staging_path)?;
     sync_parent(final_path)?;
     Ok(published_recording(
         journal_path,
         final_path,
         report,
+        verified,
         PublicationOutcome::Published,
     ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VerifiedWav {
+    byte_length: u64,
+    sha256: [u8; 32],
 }
 
 fn published_recording(
     journal_path: &Path,
     final_wav_path: &Path,
     report: RecoveryReport,
+    verified: VerifiedWav,
     outcome: PublicationOutcome,
 ) -> PublishedRecording {
     PublishedRecording {
@@ -593,6 +618,8 @@ fn published_recording(
         channels: CHANNELS,
         frames: report.frames,
         content_crc32: report.content_crc32,
+        byte_length: verified.byte_length,
+        wav_sha256: verified.sha256,
         outcome,
     }
 }
@@ -869,7 +896,16 @@ fn visit_payloads(
     }
 }
 
-fn verify_wav(path: &Path, report: RecoveryReport) -> bool {
+fn verify_wav(path: &Path, report: RecoveryReport) -> Option<VerifiedWav> {
+    let before = hash_regular_file(path)?;
+    if !verify_wav_samples(path, report) {
+        return None;
+    }
+    let after = hash_regular_file(path)?;
+    (before == after).then_some(after)
+}
+
+fn verify_wav_samples(path: &Path, report: RecoveryReport) -> bool {
     let Ok(mut reader) = hound::WavReader::open(path) else {
         return false;
     };
@@ -893,6 +929,48 @@ fn verify_wav(path: &Path, report: RecoveryReport) -> bool {
         samples += 1;
     }
     samples == report.frames * u64::from(CHANNELS) && hasher.finalize() == report.content_crc32
+}
+
+fn hash_regular_file(path: &Path) -> Option<VerifiedWav> {
+    let path_before = fs::symlink_metadata(path).ok()?;
+    if !path_before.file_type().is_file() {
+        return None;
+    }
+
+    let mut file = File::open(path).ok()?;
+    let file_before = file.metadata().ok()?;
+    if !file_before.is_file() || file_before.len() != path_before.len() {
+        return None;
+    }
+    let modified = file_before.modified().ok()?;
+    let mut hasher = Sha256::new();
+    let mut byte_length = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        byte_length = byte_length.checked_add(read as u64)?;
+        hasher.update(&buffer[..read]);
+    }
+
+    let file_after = file.metadata().ok()?;
+    let path_after = fs::symlink_metadata(path).ok()?;
+    if !file_after.is_file()
+        || !path_after.file_type().is_file()
+        || byte_length != file_before.len()
+        || file_after.len() != file_before.len()
+        || path_after.len() != file_before.len()
+        || file_after.modified().ok()? != modified
+        || path_after.modified().ok()? != modified
+    {
+        return None;
+    }
+    Some(VerifiedWav {
+        byte_length,
+        sha256: hasher.finalize().into(),
+    })
 }
 
 fn staging_path(final_path: &Path) -> Result<PathBuf, JournalError> {

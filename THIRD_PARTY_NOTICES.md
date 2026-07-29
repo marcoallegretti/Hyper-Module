@@ -88,7 +88,7 @@ Sources:
 - <https://github.com/agerasev/ringbuf/tree/f76754f1ce15790406358bef3dcf231c400bcfd8>
 - <https://github.com/crossbeam-rs/crossbeam/tree/crossbeam-utils-0.8.22>
 
-## Hound 3.5.1 and crc32fast 1.5.0
+## Hound 3.5.1, crc32fast 1.5.0, and sha2 0.10.9
 
 The `hyper-recording-journal` crate uses Hound 3.5.1 to write and independently
 read 32-bit IEEE-float WAV media. Hound is licensed under Apache License 2.0.
@@ -97,11 +97,25 @@ The crate uses `crc32fast` 1.5.0 and its `cfg-if` 1.0.4 dependency to verify
 journal headers, chunks, and finalized sample content. Both packages are
 licensed under either the MIT License or Apache License 2.0.
 
+The crate uses RustCrypto `sha2` 0.10.9 and the locked `digest` 0.10.7,
+`block-buffer` 0.10.4, `crypto-common` 0.1.7, `generic-array` 0.14.7,
+`typenum` 1.20.1, `cpufeatures` 0.2.17, and `version_check` 0.9.5 packages to
+issue project-compatible SHA-256 descriptors for verified WAV files. These
+packages are licensed under either the MIT License or Apache License 2.0.
+
 Sources:
 
 - <https://github.com/ruuda/hound/tree/v3.5.1>
 - <https://github.com/srijs/rust-crc32fast/tree/v1.5.0>
 - <https://github.com/rust-lang/cfg-if/tree/1.0.4>
+- <https://github.com/RustCrypto/hashes/tree/sha2-v0.10.9>
+- <https://github.com/RustCrypto/traits/tree/digest-v0.10.7>
+- <https://github.com/RustCrypto/utils/tree/block-buffer-v0.10.4>
+- <https://github.com/RustCrypto/traits/tree/crypto-common-v0.1.7>
+- <https://github.com/fizyk20/generic-array/tree/0.14.7>
+- <https://github.com/paholg/typenum/tree/v1.20.1>
+- <https://github.com/RustCrypto/utils/tree/cpufeatures-v0.2.17>
+- <https://github.com/SergioBenitez/version_check/tree/v0.9.5>
 
 ## PipeWire Rust bindings 0.10.0
 
