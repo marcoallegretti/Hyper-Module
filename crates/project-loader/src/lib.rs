@@ -15,6 +15,8 @@ use hyper_playback_session::{
 use hyper_project_model::{AssetRole, AudioMediaType, ResourceDescriptor, ResourceRole};
 use hyper_recording_metadata::{RecordingMetadataDocument, RecordingMetadataParseError};
 use hyper_storage_engine::{StorageError, StructurallyVerifiedProject, verify_project_package};
+use hyper_strict_json::StrictJsonError;
+use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProjectPlaybackLimits {
@@ -62,6 +64,7 @@ impl PreparedProjectPlayback {
 pub enum RecordingBindingErrorKind {
     CountMismatch { metadata: usize, assets: usize },
     ResourceIdMismatch,
+    IdentityCollision,
     ProjectIdMismatch,
     DuplicateAssetReference,
     AssetNotRecording,
@@ -102,6 +105,9 @@ impl fmt::Display for RecordingBindingError {
             ),
             RecordingBindingErrorKind::ResourceIdMismatch => {
                 formatter.write_str("document ID does not match its resource descriptor")
+            }
+            RecordingBindingErrorKind::IdentityCollision => {
+                formatter.write_str("document ID collides with a nested playback identity")
             }
             RecordingBindingErrorKind::ProjectIdMismatch => {
                 formatter.write_str("document belongs to another project")
@@ -167,6 +173,14 @@ pub enum ProjectPlaybackError {
         resource_id: String,
         source: RecordingMetadataParseError,
     },
+    ResourceJson {
+        resource_id: String,
+        source: StrictJsonError,
+    },
+    ResourceIdMismatch {
+        descriptor_id: String,
+        document_id: Option<String>,
+    },
     RecordingBinding(RecordingBindingError),
     Audio {
         asset_id: String,
@@ -222,6 +236,26 @@ impl fmt::Display for ProjectPlaybackError {
                 formatter,
                 "recording metadata resource {resource_id} is invalid: {source}"
             ),
+            Self::ResourceJson {
+                resource_id,
+                source,
+            } => write!(
+                formatter,
+                "playback resource {resource_id} has invalid strict JSON: {source}"
+            ),
+            Self::ResourceIdMismatch {
+                descriptor_id,
+                document_id,
+            } => match document_id {
+                Some(document_id) => write!(
+                    formatter,
+                    "playback resource descriptor {descriptor_id} does not match document ID {document_id}"
+                ),
+                None => write!(
+                    formatter,
+                    "playback resource descriptor {descriptor_id} has no string document ID"
+                ),
+            },
             Self::RecordingBinding(source) => source.fmt(formatter),
             Self::Audio { asset_id, source } => {
                 write!(formatter, "asset {asset_id} could not be decoded: {source}")
@@ -236,6 +270,7 @@ impl Error for ProjectPlaybackError {
         match self {
             Self::Storage(source) => Some(source),
             Self::RecordingMetadata { source, .. } => Some(source),
+            Self::ResourceJson { source, .. } => Some(source),
             Self::RecordingBinding(source) => Some(source),
             Self::Audio { source, .. } => Some(source),
             Self::Assembly(source) => Some(source),
@@ -248,6 +283,7 @@ impl Error for ProjectPlaybackError {
             | Self::MissingMixer
             | Self::MultipleArrangements
             | Self::MultipleMixers
+            | Self::ResourceIdMismatch { .. }
             | Self::UnsupportedResourceRole(_) => None,
         }
     }
@@ -286,7 +322,11 @@ pub fn prepare_project_playback(
     let package = verify_project_package(root)?;
     let inventory = ResourceInventory::new(&package, limits.max_total_resource_bytes)?;
     let captured = inventory.read(&package)?;
-    validate_recording_inventory(&package, &captured.recording_metadata)?;
+    validate_recording_inventory(
+        &package,
+        &captured.recording_metadata,
+        &captured.nested_playback_ids,
+    )?;
 
     let asset_count = package.manifest().assets().len();
     if asset_count > cache_limits.max_assets {
@@ -465,22 +505,30 @@ impl<'manifest> ResourceInventory<'manifest> {
         &self,
         package: &StructurallyVerifiedProject,
     ) -> Result<CapturedPackage, ProjectPlaybackError> {
+        let mut nested_playback_ids = BTreeSet::new();
         Ok(CapturedPackage {
             playback: PlaybackDocumentBytes {
                 project_id: package.manifest().project_id().to_owned(),
                 sample_rate_hz: package.manifest().sample_rate_hz(),
-                timeline: package.read_resource(self.timeline.id())?,
-                tracks: read_documents(package, &self.tracks)?,
-                clips: read_documents(package, &self.clips)?,
-                scenes: read_documents(package, &self.scenes)?,
+                timeline: read_playback_document(package, self.timeline, &mut nested_playback_ids)?,
+                tracks: read_documents(package, &self.tracks, &mut nested_playback_ids)?,
+                clips: read_documents(package, &self.clips, &mut nested_playback_ids)?,
+                scenes: read_documents(package, &self.scenes, &mut nested_playback_ids)?,
                 arrangement: self
                     .arrangement
-                    .map(|descriptor| package.read_resource(descriptor.id()))
+                    .map(|descriptor| {
+                        read_playback_document(package, descriptor, &mut nested_playback_ids)
+                    })
                     .transpose()?,
-                mixer: package.read_resource(self.mixer.id())?,
-                automation_takes: read_documents(package, &self.automation_takes)?,
+                mixer: read_playback_document(package, self.mixer, &mut nested_playback_ids)?,
+                automation_takes: read_documents(
+                    package,
+                    &self.automation_takes,
+                    &mut nested_playback_ids,
+                )?,
             },
             recording_metadata: read_recording_metadata(package, &self.recording_metadata)?,
+            nested_playback_ids,
         })
     }
 }
@@ -488,6 +536,7 @@ impl<'manifest> ResourceInventory<'manifest> {
 struct CapturedPackage {
     playback: PlaybackDocumentBytes,
     recording_metadata: Vec<CapturedRecordingMetadata>,
+    nested_playback_ids: BTreeSet<String>,
 }
 
 struct CapturedRecordingMetadata {
@@ -515,15 +564,70 @@ fn push_descriptor<'manifest>(
 fn read_documents(
     package: &StructurallyVerifiedProject,
     descriptors: &[&ResourceDescriptor],
+    nested_ids: &mut BTreeSet<String>,
 ) -> Result<Vec<Vec<u8>>, ProjectPlaybackError> {
     let mut documents = Vec::new();
     documents
         .try_reserve_exact(descriptors.len())
         .map_err(|_| ProjectPlaybackError::ResourceCapacityUnavailable)?;
     for descriptor in descriptors {
-        documents.push(package.read_resource(descriptor.id())?);
+        documents.push(read_playback_document(package, descriptor, nested_ids)?);
     }
     Ok(documents)
+}
+
+fn read_playback_document(
+    package: &StructurallyVerifiedProject,
+    descriptor: &ResourceDescriptor,
+    nested_ids: &mut BTreeSet<String>,
+) -> Result<Vec<u8>, ProjectPlaybackError> {
+    let bytes = package.read_resource(descriptor.id())?;
+    let document: Value =
+        hyper_strict_json::parse(&bytes, bytes.len().max(1)).map_err(|source| {
+            ProjectPlaybackError::ResourceJson {
+                resource_id: descriptor.id().to_owned(),
+                source,
+            }
+        })?;
+    let document_id = document
+        .as_object()
+        .and_then(|object| object.get("id"))
+        .and_then(Value::as_str);
+    if document_id != Some(descriptor.id()) {
+        return Err(ProjectPlaybackError::ResourceIdMismatch {
+            descriptor_id: descriptor.id().to_owned(),
+            document_id: document_id.map(str::to_owned),
+        });
+    }
+    if let Some(object) = document.as_object() {
+        for (key, value) in object {
+            if key != "id" && key != "extensions" {
+                collect_nested_ids(value, nested_ids);
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn collect_nested_ids(value: &Value, identities: &mut BTreeSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_nested_ids(value, identities);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(id) = object.get("id").and_then(Value::as_str) {
+                identities.insert(id.to_owned());
+            }
+            for (key, value) in object {
+                if key != "extensions" {
+                    collect_nested_ids(value, identities);
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 fn read_recording_metadata(
@@ -553,6 +657,7 @@ fn read_recording_metadata(
 fn validate_recording_inventory(
     package: &StructurallyVerifiedProject,
     metadata: &[CapturedRecordingMetadata],
+    nested_playback_ids: &BTreeSet<String>,
 ) -> Result<(), ProjectPlaybackError> {
     let recording_assets = package
         .manifest()
@@ -577,6 +682,12 @@ fn validate_recording_inventory(
             return Err(recording_binding(
                 Some(document.id()),
                 RecordingBindingErrorKind::ResourceIdMismatch,
+            ));
+        }
+        if nested_playback_ids.contains(document.id()) {
+            return Err(recording_binding(
+                Some(document.id()),
+                RecordingBindingErrorKind::IdentityCollision,
             ));
         }
         if document.project_id() != package.manifest().project_id() {

@@ -381,6 +381,66 @@ fn rejects_semantic_identity_failure_without_publishing_a_session() {
 }
 
 #[test]
+fn rejects_a_playback_document_id_that_does_not_match_its_descriptor() {
+    let fixture = Fixture::new();
+    fixture.replace_resource(
+        "timeline/timeline.json",
+        &json!({
+            "format": "hyper-timeline",
+            "format_version": 1,
+            "id": FOREIGN_ID,
+            "project_id": PROJECT_ID,
+            "ticks_per_quarter": 1920,
+            "tempo_events": [{"tick": 0, "microseconds_per_quarter": 1_000_000}],
+            "meter_events": [{"tick": 0, "numerator": 4, "denominator": 4}],
+            "extensions": {}
+        }),
+    );
+
+    assert!(matches!(
+        prepare_project_playback(&fixture.root, limits()),
+        Err(ProjectPlaybackError::ResourceIdMismatch {
+            descriptor_id,
+            document_id: Some(document_id),
+        }) if descriptor_id == TIMELINE_ID && document_id == FOREIGN_ID
+    ));
+}
+
+#[test]
+fn recording_metadata_id_cannot_collide_with_a_nested_playback_identity() {
+    let fixture = Fixture::new();
+    fixture.replace_resource(
+        "arrangement/main.json",
+        &json!({
+            "format": "hyper-arrangement",
+            "format_version": 1,
+            "id": ARRANGEMENT_ID,
+            "project_id": PROJECT_ID,
+            "name": "Main",
+            "enabled": true,
+            "placements": [{
+                "id": RECORDING_METADATA_ID,
+                "track_id": TRACK_ID,
+                "clip_id": CLIP_ID,
+                "start_tick": 0,
+                "clip_start_tick": 0,
+                "duration_ticks": 4,
+                "enabled": true
+            }],
+            "scene_launches": [],
+            "extensions": {}
+        }),
+    );
+    fixture.make_asset_a_recording();
+    fixture.add_recording_metadata(&recording_metadata(PROJECT_ID, TRACK_ID, &[0], 1, 100));
+
+    assert_binding_kind(
+        prepare_project_playback(&fixture.root, limits()),
+        RecordingBindingErrorKind::IdentityCollision,
+    );
+}
+
+#[test]
 fn rejects_every_role_that_the_playback_runtime_does_not_own() {
     let mapping = Fixture::new();
     mapping.add_resource(

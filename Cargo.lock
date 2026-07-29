@@ -382,6 +382,7 @@ dependencies = [
  "hyper-project-model",
  "hyper-recording-metadata",
  "hyper-storage-engine",
+ "hyper-strict-json",
  "serde_json",
  "serde_json_canonicalizer",
  "sha2",

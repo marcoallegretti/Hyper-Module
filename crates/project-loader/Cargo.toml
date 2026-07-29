@@ -11,6 +11,8 @@ hyper-playback-session = { path = "../playback-session" }
 hyper-project-model = { path = "../project-model" }
 hyper-recording-metadata = { path = "../recording-metadata" }
 hyper-storage-engine = { path = "../storage-engine" }
+hyper-strict-json = { path = "../strict-json" }
+serde_json = "=1.0.151"
 
 [dev-dependencies]
 hyper-media-cache = { path = "../media-cache" }
