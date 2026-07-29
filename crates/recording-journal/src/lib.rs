@@ -296,6 +296,11 @@ impl JournalWriter {
             let _ = fs::remove_file(path);
             return Err(error.into());
         }
+        if let Err(error) = sync_parent(path) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(error);
+        }
 
         Ok(Self {
             path: path.to_owned(),
@@ -1054,6 +1059,18 @@ fn sync_parent(path: &Path) -> Result<(), JournalError> {
     fs::metadata(parent)?;
     #[cfg(unix)]
     File::open(parent)?.sync_all()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(parent)?
+            .sync_all()?;
+    }
     Ok(())
 }
 

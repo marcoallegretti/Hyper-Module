@@ -59,9 +59,11 @@ async function openRetainedDirectory(path) {
     `directory path is not a real directory: ${path}`,
   );
   const flags =
-    constants.O_RDONLY |
-    (constants.O_DIRECTORY ?? 0) |
-    (constants.O_NOFOLLOW ?? 0);
+    process.platform === "win32"
+      ? constants.O_RDWR
+      : constants.O_RDONLY |
+        (constants.O_DIRECTORY ?? 0) |
+        (constants.O_NOFOLLOW ?? 0);
   const handle = await open(path, flags);
   try {
     const opened = await handle.stat({ bigint: true });
@@ -76,10 +78,7 @@ async function openRetainedDirectory(path) {
 }
 
 async function syncDirectory(path) {
-  if (process.platform === "win32") {
-    return;
-  }
-  const handle = await open(path, constants.O_RDONLY);
+  const handle = await openRetainedDirectory(path);
   try {
     await handle.sync();
   } finally {
@@ -141,24 +140,22 @@ export async function syncDirectoryTree(rootPath, declaredFiles) {
         handle: await openRetainedFile(join(rootPath, ...path.split("/"))),
       });
     }
-    if (process.platform !== "win32") {
-      for (const path of [...directories].sort(
-        (left, right) =>
-          right.split("/").length - left.split("/").length ||
-          right.localeCompare(left),
-      )) {
-        retainedDirectories.push({
-          path,
-          handle: await openRetainedDirectory(
-            join(rootPath, ...path.split("/")),
-          ),
-        });
-      }
+    for (const path of [...directories].sort(
+      (left, right) =>
+        right.split("/").length - left.split("/").length ||
+        right.localeCompare(left),
+    )) {
       retainedDirectories.push({
-        path: "",
-        handle: await openRetainedDirectory(rootPath),
+        path,
+        handle: await openRetainedDirectory(
+          join(rootPath, ...path.split("/")),
+        ),
       });
     }
+    retainedDirectories.push({
+      path: "",
+      handle: await openRetainedDirectory(rootPath),
+    });
 
     for (const { handle } of retainedFiles) {
       await handle.sync();
