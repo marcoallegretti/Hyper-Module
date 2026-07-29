@@ -8,11 +8,70 @@ import {
 } from "./filesystem-tree.mjs";
 
 async function syncFile(path) {
-  const handle = await open(path, process.platform === "win32" ? "r+" : "r");
+  const handle = await openRetainedFile(path);
   try {
     await handle.sync();
   } finally {
     await handle.close();
+  }
+}
+
+function sameIdentity(left, right) {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.size === right.size
+  );
+}
+
+function assertSameIdentity(expected, actual, path) {
+  assert(
+    sameIdentity(expected, actual),
+    `filesystem object changed while being retained: ${path}`,
+  );
+}
+
+async function openRetainedFile(path) {
+  const before = await lstat(path, { bigint: true });
+  assert(!before.isSymbolicLink(), `file path is a symbolic link: ${path}`);
+  assert(before.isFile(), `file path is not a regular file: ${path}`);
+  const flags =
+    (process.platform === "win32" ? constants.O_RDWR : constants.O_RDONLY) |
+    (constants.O_NOFOLLOW ?? 0);
+  const handle = await open(path, flags);
+  try {
+    const opened = await handle.stat({ bigint: true });
+    const after = await lstat(path, { bigint: true });
+    assertSameIdentity(before, opened, path);
+    assertSameIdentity(opened, after, path);
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+async function openRetainedDirectory(path) {
+  const before = await lstat(path, { bigint: true });
+  assert(
+    before.isDirectory() && !before.isSymbolicLink(),
+    `directory path is not a real directory: ${path}`,
+  );
+  const flags =
+    constants.O_RDONLY |
+    (constants.O_DIRECTORY ?? 0) |
+    (constants.O_NOFOLLOW ?? 0);
+  const handle = await open(path, flags);
+  try {
+    const opened = await handle.stat({ bigint: true });
+    const after = await lstat(path, { bigint: true });
+    assertSameIdentity(before, opened, path);
+    assertSameIdentity(opened, after, path);
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
   }
 }
 
@@ -73,20 +132,65 @@ async function assertDeclaredTree(rootPath, expected, traversal) {
 export async function syncDirectoryTree(rootPath, declaredFiles) {
   const { files, directories, traversal } = declaredTreeOptions(declaredFiles);
   await assertDeclaredTree(rootPath, files, traversal);
+  const retainedFiles = [];
+  const retainedDirectories = [];
+  try {
+    for (const path of files) {
+      retainedFiles.push({
+        path,
+        handle: await openRetainedFile(join(rootPath, ...path.split("/"))),
+      });
+    }
+    if (process.platform !== "win32") {
+      for (const path of [...directories].sort(
+        (left, right) =>
+          right.split("/").length - left.split("/").length ||
+          right.localeCompare(left),
+      )) {
+        retainedDirectories.push({
+          path,
+          handle: await openRetainedDirectory(
+            join(rootPath, ...path.split("/")),
+          ),
+        });
+      }
+      retainedDirectories.push({
+        path: "",
+        handle: await openRetainedDirectory(rootPath),
+      });
+    }
 
-  for (const path of files) {
-    await syncFile(join(rootPath, ...path.split("/")));
-  }
-  for (const path of [...directories].sort(
-    (left, right) =>
-      right.split("/").length - left.split("/").length ||
-      right.localeCompare(left),
-  )) {
-    await syncDirectory(join(rootPath, ...path.split("/")));
-  }
-  await syncDirectory(rootPath);
+    for (const { handle } of retainedFiles) {
+      await handle.sync();
+    }
+    for (const { handle } of retainedDirectories) {
+      await handle.sync();
+    }
 
-  await assertDeclaredTree(rootPath, files, traversal);
+    await assertDeclaredTree(rootPath, files, traversal);
+    for (const { path, handle } of retainedFiles) {
+      assertSameIdentity(
+        await handle.stat({ bigint: true }),
+        await lstat(join(rootPath, ...path.split("/")), { bigint: true }),
+        path,
+      );
+    }
+    for (const { path, handle } of retainedDirectories) {
+      const absolute = path
+        ? join(rootPath, ...path.split("/"))
+        : rootPath;
+      assertSameIdentity(
+        await handle.stat({ bigint: true }),
+        await lstat(absolute, { bigint: true }),
+        path || ".",
+      );
+    }
+  } finally {
+    await Promise.allSettled([
+      ...retainedFiles.map(({ handle }) => handle.close()),
+      ...retainedDirectories.map(({ handle }) => handle.close()),
+    ]);
+  }
 }
 
 export async function syncPublishedEntry(path) {
