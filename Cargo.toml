@@ -11,6 +11,7 @@ members = [
     "crates/playback-json",
     "crates/playback-session",
     "crates/recording-journal",
+    "crates/recording-metadata",
     "crates/recording-transport",
     "crates/recording-worker",
     "software/IDE/audio-backend",

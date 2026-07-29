@@ -1,0 +1,148 @@
+use hyper_recording_journal::{JournalConfig, JournalWriter, publish_wav};
+use hyper_recording_metadata::{
+    FinalizedRecordingMetadata, RecordingCaptureKind, RecordingMetadataContext,
+    RecordingMetadataError,
+};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new() -> Self {
+        let id = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "hyper-recording-metadata-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn publication(&self, sample_rate: u32) -> hyper_recording_journal::PublishedRecording {
+        let journal = self.0.join("take.journal");
+        let wav = self.0.join("take.wav");
+        let mut writer = JournalWriter::create(
+            &journal,
+            JournalConfig {
+                sample_rate,
+                max_chunk_frames: 2,
+                max_total_frames: 2,
+            },
+        )
+        .unwrap();
+        writer.append(&[0.25, -0.25, 0.5, -0.5]).unwrap();
+        drop(writer);
+        publish_wav(journal, wav).unwrap()
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+
+fn context() -> RecordingMetadataContext {
+    RecordingMetadataContext {
+        id: "018f47a2-6b2d-7c11-8a44-001122334477".to_owned(),
+        project_id: "018f47a2-6b2d-7c11-8a44-001122334455".to_owned(),
+        asset_id: "018f47a2-6b2d-7c11-8a44-001122334478".to_owned(),
+        track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
+        capture_kind: RecordingCaptureKind::Overdub,
+        captured_at_utc: "2026-07-27T12:00:00.000Z".to_owned(),
+        timeline_start_tick: 7_680,
+        source_input_indices: vec![0, 1],
+    }
+}
+
+#[test]
+fn verified_publication_produces_canonical_contract_json() {
+    let directory = TestDirectory::new();
+    let metadata =
+        FinalizedRecordingMetadata::try_new(directory.publication(48_000), context()).unwrap();
+    let json = String::from_utf8(metadata.to_canonical_json().unwrap()).unwrap();
+
+    assert_eq!(
+        json,
+        "{\"asset_id\":\"018f47a2-6b2d-7c11-8a44-001122334478\",\"capture_kind\":\"overdub\",\"captured_at_utc\":\"2026-07-27T12:00:00.000Z\",\"channels\":2,\"extensions\":{},\"format\":\"hyper-recording-metadata\",\"format_version\":1,\"frame_count\":2,\"id\":\"018f47a2-6b2d-7c11-8a44-001122334477\",\"project_id\":\"018f47a2-6b2d-7c11-8a44-001122334455\",\"sample_rate_hz\":48000,\"source_input_indices\":[0,1],\"timeline_start_tick\":7680,\"track_id\":\"018f47a2-6b2d-7c11-8a44-001122334456\"}"
+    );
+}
+
+#[test]
+fn rejects_invalid_provenance_and_media_domains() {
+    let directory = TestDirectory::new();
+    let mut invalid_id = context();
+    invalid_id.id.make_ascii_uppercase();
+    let rejected =
+        FinalizedRecordingMetadata::try_new(directory.publication(48_000), invalid_id).unwrap_err();
+    assert_eq!(rejected.reason(), RecordingMetadataError::InvalidId("id"));
+    let (reason, publication, rejected_context) = rejected.into_parts();
+    assert_eq!(reason, RecordingMetadataError::InvalidId("id"));
+    assert_eq!(publication.frames(), 2);
+    assert_eq!(rejected_context.id, "018F47A2-6B2D-7C11-8A44-001122334477");
+
+    let directory = TestDirectory::new();
+    let mut invalid_date = context();
+    invalid_date.captured_at_utc = "2026-02-29T12:00:00.000Z".to_owned();
+    assert_eq!(
+        FinalizedRecordingMetadata::try_new(directory.publication(48_000), invalid_date)
+            .unwrap_err()
+            .reason(),
+        RecordingMetadataError::InvalidCapturedAt
+    );
+
+    let directory = TestDirectory::new();
+    let mut duplicate_input = context();
+    duplicate_input.source_input_indices = vec![0, 0];
+    assert_eq!(
+        FinalizedRecordingMetadata::try_new(directory.publication(48_000), duplicate_input)
+            .unwrap_err()
+            .reason(),
+        RecordingMetadataError::DuplicateSourceInput { index: 0 }
+    );
+
+    let directory = TestDirectory::new();
+    assert_eq!(
+        FinalizedRecordingMetadata::try_new(directory.publication(44_100), context())
+            .unwrap_err()
+            .reason(),
+        RecordingMetadataError::UnsupportedSampleRate { actual: 44_100 }
+    );
+
+    let directory = TestDirectory::new();
+    let mut oversized_timeline = context();
+    oversized_timeline.timeline_start_tick = 9_007_199_254_740_992;
+    assert_eq!(
+        FinalizedRecordingMetadata::try_new(directory.publication(48_000), oversized_timeline)
+            .unwrap_err()
+            .reason(),
+        RecordingMetadataError::TimelineStartOutOfRange
+    );
+
+    let directory = TestDirectory::new();
+    let mut missing_input = context();
+    missing_input.source_input_indices = vec![0];
+    assert_eq!(
+        FinalizedRecordingMetadata::try_new(directory.publication(48_000), missing_input)
+            .unwrap_err()
+            .reason(),
+        RecordingMetadataError::InvalidSourceInputCount {
+            actual: 1,
+            expected: 2
+        }
+    );
+
+    let directory = TestDirectory::new();
+    let mut unavailable_input = context();
+    unavailable_input.source_input_indices = vec![0, 2];
+    assert_eq!(
+        FinalizedRecordingMetadata::try_new(directory.publication(48_000), unavailable_input)
+            .unwrap_err()
+            .reason(),
+        RecordingMetadataError::InvalidSourceInput { index: 2 }
+    );
+}

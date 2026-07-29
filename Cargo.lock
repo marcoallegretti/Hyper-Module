@@ -331,6 +331,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-recording-metadata"
+version = "0.1.0"
+dependencies = [
+ "hyper-recording-journal",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hyper-recording-transport"
 version = "0.1.0"
 dependencies = [
