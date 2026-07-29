@@ -6,7 +6,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 use std::collections::TryReserveError;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::thread::Thread;
 
 pub const RECORDING_CHANNELS: usize = 2;
 
@@ -116,6 +117,19 @@ impl fmt::Display for RecordingDrainError {
 impl Error for RecordingDrainError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordingWakeRegistrationError {
+    AlreadyRegistered,
+}
+
+impl fmt::Display for RecordingWakeRegistrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a recording consumer wake thread is already registered")
+    }
+}
+
+impl Error for RecordingWakeRegistrationError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecordingDrain {
     pub frames: usize,
     pub producer_closed: bool,
@@ -139,6 +153,7 @@ struct RecordingTransportState {
     rejected_blocks: AtomicU64,
     rejected_frames: AtomicU64,
     drained_frames: AtomicU64,
+    wake_thread: OnceLock<Thread>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -232,6 +247,7 @@ impl RecordingProducer {
         debug_assert_eq!(pushed, samples.len());
         RecordingTransportCounters::add(&self.counters.state.accepted_blocks, 1);
         RecordingTransportCounters::add(&self.counters.state.accepted_frames, frames);
+        self.counters.state.wake_writer();
         Ok(())
     }
 
@@ -269,6 +285,36 @@ impl fmt::Debug for RecordingConsumer {
 }
 
 impl RecordingConsumer {
+    /// Registers the current non-real-time writer thread for producer wakeups.
+    ///
+    /// Registration is permanent for this transport. A successful producer
+    /// push unparks this thread after publishing the complete block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordingWakeRegistrationError::AlreadyRegistered`] if any
+    /// thread was registered previously.
+    pub fn register_current_thread_waker(&self) -> Result<(), RecordingWakeRegistrationError> {
+        self.register_thread_waker(std::thread::current())
+    }
+
+    /// Registers a non-real-time writer thread for producer wakeups.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordingWakeRegistrationError::AlreadyRegistered`] if any
+    /// thread was registered previously.
+    pub fn register_thread_waker(
+        &self,
+        thread: Thread,
+    ) -> Result<(), RecordingWakeRegistrationError> {
+        self.counters
+            .state
+            .wake_thread
+            .set(thread)
+            .map_err(|_| RecordingWakeRegistrationError::AlreadyRegistered)
+    }
+
     /// Drains complete stereo frames without blocking.
     ///
     /// # Errors
@@ -305,6 +351,14 @@ impl RecordingConsumer {
     #[must_use]
     pub fn counters(&self) -> RecordingTransportCounters {
         self.counters.clone()
+    }
+}
+
+impl RecordingTransportState {
+    fn wake_writer(&self) {
+        if let Some(thread) = self.wake_thread.get() {
+            thread.unpark();
+        }
     }
 }
 
@@ -469,5 +523,45 @@ mod tests {
         );
         let mut output = [0.0; 2];
         assert_eq!(consumer.drain(&mut output).unwrap().frames, 1);
+    }
+
+    #[test]
+    fn accepted_blocks_wake_the_registered_consumer_thread() {
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        let (mut producer, consumer) = try_recording_transport(2).unwrap();
+        let (ready_sender, ready_receiver) = sync_channel(1);
+        let (samples_sender, samples_receiver) = sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            consumer.register_current_thread_waker().unwrap();
+            ready_sender.send(()).unwrap();
+            std::thread::park();
+            let mut consumer = consumer;
+            let mut output = [0.0_f32; 4];
+            let drained = consumer.drain(&mut output).unwrap();
+            samples_sender
+                .send((drained, output.map(f32::to_bits)))
+                .unwrap();
+        });
+
+        ready_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        producer.push(&[0.25, -0.25]).unwrap();
+        let (drained, samples) = samples_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(drained.frames, 1);
+        assert_eq!(samples[..2], [0.25_f32.to_bits(), (-0.25_f32).to_bits()]);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn consumer_wake_thread_can_only_be_registered_once() {
+        let (_producer, consumer) = try_recording_transport(1).unwrap();
+        consumer.register_current_thread_waker().unwrap();
+        assert_eq!(
+            consumer.register_current_thread_waker(),
+            Err(RecordingWakeRegistrationError::AlreadyRegistered)
+        );
     }
 }

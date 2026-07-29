@@ -7,6 +7,7 @@ use realtime_allocator::HeapMeasurement;
 #[test]
 fn producer_paths_perform_zero_heap_allocations() {
     let (mut producer, consumer) = try_recording_transport(2).unwrap();
+    consumer.register_current_thread_waker().unwrap();
     let accepted = [0.0_f32, 1.0];
     let saturated = [2.0_f32, 3.0, 4.0, 5.0];
     let malformed = [0.0_f32; 3];
