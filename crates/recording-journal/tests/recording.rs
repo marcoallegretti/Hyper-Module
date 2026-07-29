@@ -165,7 +165,7 @@ fn rejects_interior_corruption_without_truncating_it() {
 }
 
 #[test]
-fn discards_a_checksum_failed_final_chunk() {
+fn rejects_a_checksum_failed_final_chunk_without_truncating_it() {
     let directory = TestDirectory::new();
     let path = directory.join("take.journal");
     let mut writer = JournalWriter::create(&path, config()).unwrap();
@@ -184,11 +184,14 @@ fn discards_a_checksum_failed_final_chunk() {
     file.sync_all().unwrap();
     drop(file);
 
-    let report = recover(&path).unwrap();
-    assert_eq!(report.frames, 1);
-    assert_eq!(report.chunks, 1);
-    assert_eq!(report.discarded_bytes, 40);
-    assert_eq!(fs::metadata(path).unwrap().len(), original_length - 40);
+    assert!(matches!(
+        recover(&path),
+        Err(JournalError::CorruptJournal {
+            reason: "final chunk payload checksum failed",
+            ..
+        })
+    ));
+    assert_eq!(fs::metadata(path).unwrap().len(), original_length);
 }
 
 #[test]

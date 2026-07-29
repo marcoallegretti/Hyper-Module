@@ -477,20 +477,13 @@ fn recover_file(file: &mut File) -> Result<RecoveryReport, JournalError> {
         resize_zeroed(&mut payload, decoded.payload_bytes as usize)?;
         file.read_exact(&mut payload)?;
         if crc32(&payload) != decoded.payload_crc32 {
-            if chunk_end == length {
-                return truncate_tail(
-                    file,
-                    config,
-                    sequence,
-                    frames,
-                    verified_offset,
-                    length - verified_offset,
-                    content_hasher,
-                );
-            }
             return Err(JournalError::CorruptJournal {
                 offset: verified_offset,
-                reason: "interior chunk payload checksum failed",
+                reason: if chunk_end == length {
+                    "final chunk payload checksum failed"
+                } else {
+                    "interior chunk payload checksum failed"
+                },
             });
         }
         content_hasher.update(&payload);
