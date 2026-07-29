@@ -1,8 +1,8 @@
 use super::{
     BackendThreadCompletion, BackendThreadJoin, BoundedBackendThread, CaptureCallback,
     CaptureCallbackStatus, CaptureStreamCounters, InterleavedStereoCaptureProcessor,
-    PipeWireInputTarget, PipeWireStartError, PipeWireStartupStage, PipeWireStopError,
-    STEREO_CHANNELS, StreamState, StreamStatus,
+    PendingNativeShutdown, PipeWireInputTarget, PipeWireStartError, PipeWireStartupStage,
+    PipeWireStopError, STEREO_CHANNELS, StreamState, StreamStatus,
 };
 use core::error::Error;
 use core::fmt;
@@ -234,7 +234,10 @@ impl PipeWireInputStream {
                 stop_requested.store(true, Ordering::Release);
                 match thread.wait(shutdown_timeout) {
                     BackendThreadJoin::Panicked => Err(PipeWireStartError::ThreadPanicked),
-                    BackendThreadJoin::Completed | BackendThreadJoin::TimedOut => Err(error),
+                    BackendThreadJoin::Completed => Err(error),
+                    BackendThreadJoin::TimedOut => Err(PipeWireStartError::CancellationPending {
+                        shutdown: Box::new(PendingNativeShutdown::new(thread, status)),
+                    }),
                 }
             }
         }

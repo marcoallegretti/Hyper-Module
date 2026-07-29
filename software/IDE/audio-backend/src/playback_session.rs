@@ -3,8 +3,8 @@ use super::pipewire_output::PipeWireThreadRunner;
 #[cfg(target_os = "windows")]
 use super::wasapi_output::WasapiThreadRunner;
 use super::{
-    DesktopOutputConfig, OutputStreamCounters, OutputStreamStatus, PlaybackRecoveryCheckpoint,
-    PlaybackRecoverySnapshot,
+    DesktopOutputConfig, OutputStreamCounters, OutputStreamStatus, PendingNativeShutdown,
+    PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
 };
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::{PipeWireOutputStream, PipeWireStartError, PipeWireStartupStage, PipeWireStopError};
@@ -46,6 +46,9 @@ pub enum DesktopOutputStartError {
     ThreadSpawn(std::io::Error),
     ThreadPanicked,
     StartupTimeout,
+    CancellationPending {
+        shutdown: Box<PendingNativeShutdown>,
+    },
     ThreadTerminated,
     Backend {
         source: Box<dyn Error + Send + Sync>,
@@ -58,6 +61,9 @@ impl fmt::Display for DesktopOutputStartError {
             Self::ThreadSpawn(_) => formatter.write_str("desktop output thread could not start"),
             Self::ThreadPanicked => formatter.write_str("desktop output thread panicked"),
             Self::StartupTimeout => formatter.write_str("desktop output startup timed out"),
+            Self::CancellationPending { .. } => {
+                formatter.write_str("desktop output startup cancellation is still pending")
+            }
             Self::ThreadTerminated => {
                 formatter.write_str("desktop output thread terminated during startup")
             }
@@ -71,7 +77,10 @@ impl Error for DesktopOutputStartError {
         match self {
             Self::ThreadSpawn(source) => Some(source),
             Self::Backend { source } => Some(source.as_ref()),
-            Self::ThreadPanicked | Self::StartupTimeout | Self::ThreadTerminated => None,
+            Self::ThreadPanicked
+            | Self::StartupTimeout
+            | Self::CancellationPending { .. }
+            | Self::ThreadTerminated => None,
         }
     }
 }
@@ -101,6 +110,9 @@ impl From<NativeDesktopOutputStartError> for DesktopOutputStartError {
             NativeDesktopOutputStartError::ThreadSpawn(source) => Self::ThreadSpawn(source),
             NativeDesktopOutputStartError::ThreadPanicked => Self::ThreadPanicked,
             NativeDesktopOutputStartError::StartupTimeout => Self::StartupTimeout,
+            NativeDesktopOutputStartError::CancellationPending { shutdown } => {
+                Self::CancellationPending { shutdown }
+            }
             NativeDesktopOutputStartError::ThreadTerminated => Self::ThreadTerminated,
             source @ (NativeDesktopOutputStartError::Backend { .. }
             | NativeDesktopOutputStartError::BackendSource { .. }) => Self::Backend {

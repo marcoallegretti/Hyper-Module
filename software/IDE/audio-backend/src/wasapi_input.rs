@@ -2,8 +2,8 @@ use super::wasapi_output::{decode_disconnect_reason, publish_disconnect};
 use super::{
     BackendThreadCompletion, BackendThreadJoin, BoundedBackendThread, CaptureCallback,
     CaptureCallbackStatus, CaptureStreamCounters, InterleavedStereoCaptureProcessor,
-    STEREO_CHANNELS, StreamState, StreamStatus, WasapiDisconnectReason, WasapiInputEndpoint,
-    WasapiStartError, WasapiStartupStage, WasapiStopError,
+    PendingNativeShutdown, STEREO_CHANNELS, StreamState, StreamStatus, WasapiDisconnectReason,
+    WasapiInputEndpoint, WasapiStartError, WasapiStartupStage, WasapiStopError,
 };
 use core::error::Error;
 use core::fmt;
@@ -236,7 +236,10 @@ impl WasapiInputStream {
                 stop_requested.store(true, Ordering::Release);
                 match thread.wait(shutdown_timeout) {
                     BackendThreadJoin::Panicked => Err(WasapiStartError::ThreadPanicked),
-                    BackendThreadJoin::Completed | BackendThreadJoin::TimedOut => Err(error),
+                    BackendThreadJoin::Completed => Err(error),
+                    BackendThreadJoin::TimedOut => Err(WasapiStartError::CancellationPending {
+                        shutdown: Box::new(PendingNativeShutdown::new(thread, status)),
+                    }),
                 }
             }
         }

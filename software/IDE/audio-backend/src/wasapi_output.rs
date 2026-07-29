@@ -1,7 +1,8 @@
 use super::{
     BackendThreadCompletion, BackendThreadJoin, BoundedBackendThread, InterleavedStereoProcessor,
     OutputCallback, OutputCallbackStatus, OutputStreamCounters, OutputStreamState,
-    OutputStreamStatus, PlaybackRecoveryCheckpoint, STEREO_CHANNELS, WasapiOutputEndpoint,
+    OutputStreamStatus, PendingNativeShutdown, PlaybackRecoveryCheckpoint, STEREO_CHANNELS,
+    WasapiOutputEndpoint,
 };
 use core::cell::Cell;
 use core::error::Error;
@@ -186,6 +187,9 @@ pub enum WasapiStartError {
     ThreadSpawn(std::io::Error),
     ThreadPanicked,
     StartupTimeout,
+    CancellationPending {
+        shutdown: Box<PendingNativeShutdown>,
+    },
     ThreadTerminated,
     Backend {
         stage: WasapiStartupStage,
@@ -203,6 +207,9 @@ impl fmt::Display for WasapiStartError {
             Self::ThreadSpawn(source) => write!(formatter, "cannot start WASAPI thread: {source}"),
             Self::ThreadPanicked => formatter.write_str("WASAPI thread panicked during startup"),
             Self::StartupTimeout => formatter.write_str("WASAPI startup timed out"),
+            Self::CancellationPending { .. } => {
+                formatter.write_str("WASAPI startup cancellation is still pending")
+            }
             Self::ThreadTerminated => {
                 formatter.write_str("WASAPI thread terminated during startup")
             }
@@ -222,6 +229,7 @@ impl Error for WasapiStartError {
             Self::ThreadSpawn(source) => Some(source),
             Self::ThreadPanicked
             | Self::StartupTimeout
+            | Self::CancellationPending { .. }
             | Self::ThreadTerminated
             | Self::Backend { .. } => None,
             Self::BackendSource { source, .. } => Some(source.as_ref()),
@@ -460,7 +468,10 @@ impl WasapiOutputStream {
                 stop_requested.store(true, Ordering::Release);
                 match thread.wait(shutdown_timeout) {
                     BackendThreadJoin::Panicked => Err(WasapiStartError::ThreadPanicked),
-                    BackendThreadJoin::Completed | BackendThreadJoin::TimedOut => Err(error),
+                    BackendThreadJoin::Completed => Err(error),
+                    BackendThreadJoin::TimedOut => Err(WasapiStartError::CancellationPending {
+                        shutdown: Box::new(PendingNativeShutdown::new(thread, status)),
+                    }),
                 }
             }
         }
@@ -907,6 +918,7 @@ impl Drop for StartedStream<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PendingNativeShutdownWait;
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
@@ -994,9 +1006,19 @@ mod tests {
             Duration::from_millis(20),
         );
 
-        assert!(matches!(result, Err(WasapiStartError::StartupTimeout)));
+        let Err(WasapiStartError::CancellationPending { mut shutdown }) = result else {
+            panic!("startup cancellation must retain native thread ownership");
+        };
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            shutdown.wait(Duration::from_millis(1)),
+            PendingNativeShutdownWait::TimedOut
+        );
         release_sender.send(()).unwrap();
+        assert_eq!(
+            shutdown.wait(Duration::from_secs(1)),
+            PendingNativeShutdownWait::Completed
+        );
     }
 
     #[test]
@@ -1087,7 +1109,10 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(20),
         );
-        assert!(matches!(startup, Err(WasapiStartError::StartupTimeout)));
+        assert!(matches!(
+            startup,
+            Err(WasapiStartError::CancellationPending { .. })
+        ));
 
         let stream = WasapiOutputStream::start_with_thread_initializer_timeouts(
             config,

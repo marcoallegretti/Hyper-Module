@@ -6,6 +6,11 @@ use std::sync::Arc;
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
+use std::sync::Mutex;
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
@@ -170,6 +175,20 @@ enum BackendThreadJoin {
     TimedOut,
 }
 
+/// Result of a bounded wait for a native thread whose startup cancellation is
+/// still pending.
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingNativeShutdownWait {
+    Completed,
+    Failed,
+    Panicked,
+    TimedOut,
+}
+
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
@@ -177,7 +196,7 @@ enum BackendThreadJoin {
 #[derive(Debug)]
 struct BoundedBackendThread {
     handle: Option<JoinHandle<()>>,
-    completed: Receiver<()>,
+    completed: Mutex<Receiver<()>>,
 }
 
 #[cfg(any(
@@ -188,33 +207,81 @@ impl BoundedBackendThread {
     fn new(handle: JoinHandle<()>, completed: Receiver<()>) -> Self {
         Self {
             handle: Some(handle),
-            completed,
+            completed: Mutex::new(completed),
         }
     }
 
     fn wait(&mut self, timeout: Duration) -> BackendThreadJoin {
-        let completion = self.completed.recv_timeout(timeout);
+        let completion = self
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv_timeout(timeout);
+        match completion {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => self.join_completed(),
+            Err(RecvTimeoutError::Timeout) => BackendThreadJoin::TimedOut,
+        }
+    }
+
+    fn join_completed(&mut self) -> BackendThreadJoin {
         let Some(handle) = self.handle.take() else {
             return BackendThreadJoin::Completed;
         };
-        match completion {
-            Ok(()) => match handle.join() {
-                Ok(()) => BackendThreadJoin::Completed,
-                Err(_) => BackendThreadJoin::Panicked,
-            },
-            Err(RecvTimeoutError::Disconnected) => {
-                if handle.join().is_ok() {
-                    BackendThreadJoin::Completed
-                } else {
-                    BackendThreadJoin::Panicked
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => BackendThreadJoin::TimedOut,
+        if handle.join().is_ok() {
+            BackendThreadJoin::Completed
+        } else {
+            BackendThreadJoin::Panicked
         }
     }
 
     fn detach(&mut self) {
         let _ = self.handle.take();
+    }
+}
+
+/// Monitorable ownership of a native audio thread that did not terminate
+/// within the bounded startup-cancellation deadline.
+///
+/// Call [`Self::wait`] again to observe eventual termination. Dropping this
+/// value relinquishes monitoring but does not terminate the native thread.
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+#[derive(Debug)]
+pub struct PendingNativeShutdown {
+    thread: BoundedBackendThread,
+    status: StreamStatus,
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+impl PendingNativeShutdown {
+    fn new(thread: BoundedBackendThread, status: StreamStatus) -> Self {
+        Self { thread, status }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> StreamStatus {
+        self.status.clone()
+    }
+
+    /// Waits up to `timeout` for the native thread to terminate.
+    ///
+    /// A timeout retains the join permission, so this method can be called
+    /// again on the same value.
+    #[must_use]
+    pub fn wait(&mut self, timeout: Duration) -> PendingNativeShutdownWait {
+        match self.thread.wait(timeout) {
+            BackendThreadJoin::Completed if self.status.state() == StreamState::Failed => {
+                PendingNativeShutdownWait::Failed
+            }
+            BackendThreadJoin::Completed => PendingNativeShutdownWait::Completed,
+            BackendThreadJoin::Panicked => PendingNativeShutdownWait::Panicked,
+            BackendThreadJoin::TimedOut => PendingNativeShutdownWait::TimedOut,
+        }
     }
 }
 

@@ -1,7 +1,8 @@
 use super::{
     BackendThreadCompletion, BackendThreadJoin, BoundedBackendThread, InterleavedStereoProcessor,
     OutputCallback, OutputCallbackStatus, OutputStreamCounters, OutputStreamState,
-    OutputStreamStatus, PipeWireOutputTarget, PlaybackRecoveryCheckpoint, STEREO_CHANNELS,
+    OutputStreamStatus, PendingNativeShutdown, PipeWireOutputTarget, PlaybackRecoveryCheckpoint,
+    STEREO_CHANNELS,
 };
 use core::cell::Cell;
 use core::error::Error;
@@ -177,6 +178,9 @@ pub enum PipeWireStartError {
     ThreadSpawn(std::io::Error),
     ThreadPanicked,
     StartupTimeout,
+    CancellationPending {
+        shutdown: Box<PendingNativeShutdown>,
+    },
     ThreadTerminated,
     Backend {
         stage: PipeWireStartupStage,
@@ -196,6 +200,9 @@ impl fmt::Display for PipeWireStartError {
             }
             Self::ThreadPanicked => formatter.write_str("PipeWire thread panicked during startup"),
             Self::StartupTimeout => formatter.write_str("PipeWire startup timed out"),
+            Self::CancellationPending { .. } => {
+                formatter.write_str("PipeWire startup cancellation is still pending")
+            }
             Self::ThreadTerminated => {
                 formatter.write_str("PipeWire thread terminated during startup")
             }
@@ -215,6 +222,7 @@ impl Error for PipeWireStartError {
             Self::ThreadSpawn(source) => Some(source),
             Self::ThreadPanicked
             | Self::StartupTimeout
+            | Self::CancellationPending { .. }
             | Self::ThreadTerminated
             | Self::Backend { .. } => None,
             Self::BackendSource { source, .. } => Some(source.as_ref()),
@@ -441,7 +449,10 @@ impl PipeWireOutputStream {
                 stop_requested.store(true, Ordering::Release);
                 match thread.wait(shutdown_timeout) {
                     BackendThreadJoin::Panicked => Err(PipeWireStartError::ThreadPanicked),
-                    BackendThreadJoin::Completed | BackendThreadJoin::TimedOut => Err(error),
+                    BackendThreadJoin::Completed => Err(error),
+                    BackendThreadJoin::TimedOut => Err(PipeWireStartError::CancellationPending {
+                        shutdown: Box::new(PendingNativeShutdown::new(thread, status)),
+                    }),
                 }
             }
         }
@@ -735,6 +746,7 @@ fn validate_transport_capacity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PendingNativeShutdownWait;
     use core::sync::atomic::AtomicUsize;
     use std::process::{Command, Stdio};
     use std::time::Instant;
@@ -866,9 +878,19 @@ mod tests {
             Duration::from_millis(20),
         );
 
-        assert!(matches!(result, Err(PipeWireStartError::StartupTimeout)));
+        let Err(PipeWireStartError::CancellationPending { mut shutdown }) = result else {
+            panic!("startup cancellation must retain native thread ownership");
+        };
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            shutdown.wait(Duration::from_millis(1)),
+            PendingNativeShutdownWait::TimedOut
+        );
         release_sender.send(()).unwrap();
+        assert_eq!(
+            shutdown.wait(Duration::from_secs(1)),
+            PendingNativeShutdownWait::Completed
+        );
     }
 
     #[test]
@@ -959,7 +981,10 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(20),
         );
-        assert!(matches!(startup, Err(PipeWireStartError::StartupTimeout)));
+        assert!(matches!(
+            startup,
+            Err(PipeWireStartError::CancellationPending { .. })
+        ));
 
         let stream = PipeWireOutputStream::start_with_thread_initializer_timeouts(
             config,
