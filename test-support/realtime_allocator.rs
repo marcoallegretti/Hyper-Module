@@ -2,14 +2,14 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use std::alloc::System;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::cell::Cell;
 
 struct CountingAllocator;
 
-static COUNTING: AtomicBool = AtomicBool::new(false);
-static HEAP_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
-static MEASUREMENT_LOCK: Mutex<()> = Mutex::new(());
+thread_local! {
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+    static HEAP_OPERATIONS: Cell<usize> = const { Cell::new(0) };
+}
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -37,47 +37,40 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
 
 fn record_operation() {
-    if COUNTING.load(Ordering::Relaxed) {
-        HEAP_OPERATIONS.fetch_add(1, Ordering::Relaxed);
+    if COUNTING.get() {
+        HEAP_OPERATIONS.set(HEAP_OPERATIONS.get().saturating_add(1));
     }
 }
 
 pub struct HeapMeasurement {
     active: bool,
-    _guard: MutexGuard<'static, ()>,
 }
 
 impl HeapMeasurement {
     pub fn start_verified() -> Self {
-        let guard = MEASUREMENT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        HEAP_OPERATIONS.store(0, Ordering::SeqCst);
-        COUNTING.store(true, Ordering::SeqCst);
+        HEAP_OPERATIONS.set(0);
+        COUNTING.set(true);
         let value = Box::new(7_u8);
         std::hint::black_box(&value);
         drop(value);
-        COUNTING.store(false, Ordering::SeqCst);
-        assert!(HEAP_OPERATIONS.load(Ordering::SeqCst) >= 2);
-        HEAP_OPERATIONS.store(0, Ordering::SeqCst);
-        COUNTING.store(true, Ordering::SeqCst);
-        Self {
-            active: true,
-            _guard: guard,
-        }
+        COUNTING.set(false);
+        assert!(HEAP_OPERATIONS.get() >= 2);
+        HEAP_OPERATIONS.set(0);
+        COUNTING.set(true);
+        Self { active: true }
     }
 
     pub fn finish(mut self) -> usize {
-        COUNTING.store(false, Ordering::SeqCst);
+        COUNTING.set(false);
         self.active = false;
-        HEAP_OPERATIONS.load(Ordering::SeqCst)
+        HEAP_OPERATIONS.get()
     }
 }
 
 impl Drop for HeapMeasurement {
     fn drop(&mut self) {
         if self.active {
-            COUNTING.store(false, Ordering::SeqCst);
+            COUNTING.set(false);
         }
     }
 }
