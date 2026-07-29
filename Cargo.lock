@@ -372,6 +372,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-project-loader"
+version = "0.1.0"
+dependencies = [
+ "hyper-audio-source",
+ "hyper-media-cache",
+ "hyper-playback-json",
+ "hyper-playback-session",
+ "hyper-project-model",
+ "hyper-storage-engine",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
+]
+
+[[package]]
 name = "hyper-project-model"
 version = "0.1.0"
 dependencies = [

@@ -112,6 +112,23 @@ fn verifies_owned_canonical_bytes_and_allows_local_state() {
         ))
     );
     assert!(verified.root().is_absolute());
+    assert_eq!(
+        verified
+            .read_resource("018f47a2-6b2d-7c11-8a44-001122334456")
+            .unwrap(),
+        br#"{"format":"fixture-timeline"}"#
+    );
+    assert_eq!(
+        verified
+            .read_asset("018f47a2-6b2d-7c11-8a44-001122334457", 1_024)
+            .unwrap(),
+        b"RIFFstructural-fixture"
+    );
+    assert_eq!(
+        verified.read_resource("absent").unwrap_err().kind(),
+        StorageErrorKind::DescriptorNotFound
+    );
+    verified.confirm_unchanged().unwrap();
 }
 
 #[test]
@@ -171,6 +188,36 @@ fn rejects_corruption_missing_payloads_and_undeclared_entries() {
             StorageErrorKind::UndeclaredEntry
         );
     }
+}
+
+#[test]
+fn issued_authority_rejects_later_payload_changes_and_caller_limits() {
+    let fixture = Fixture::new();
+    let verified = verify_project_package(&fixture.root).unwrap();
+    assert_eq!(
+        verified
+            .read_asset("018f47a2-6b2d-7c11-8a44-001122334457", 4)
+            .unwrap_err()
+            .kind(),
+        StorageErrorKind::LimitExceeded
+    );
+
+    fs::write(
+        fixture.root.join("assets/samples/sample.wav"),
+        b"RIFFstructural-corrupt",
+    )
+    .unwrap();
+    assert_eq!(
+        verified
+            .read_asset("018f47a2-6b2d-7c11-8a44-001122334457", 1_024)
+            .unwrap_err()
+            .kind(),
+        StorageErrorKind::Sha256Mismatch
+    );
+    assert_eq!(
+        verified.confirm_unchanged().unwrap_err().kind(),
+        StorageErrorKind::Sha256Mismatch
+    );
 }
 
 #[test]

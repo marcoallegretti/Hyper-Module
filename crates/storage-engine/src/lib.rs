@@ -41,6 +41,7 @@ pub enum StorageErrorKind {
     Sha256Mismatch,
     ManagedTreeMismatch,
     ChangedDuringVerification,
+    DescriptorNotFound,
 }
 
 #[derive(Debug)]
@@ -96,6 +97,100 @@ impl StructurallyVerifiedProject {
     #[must_use]
     pub const fn manifest_sha256(&self) -> &[u8; 32] {
         &self.manifest_sha256
+    }
+
+    /// Re-reads one declared resource as stable, digest-verified bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified rejection when the identifier is absent or the
+    /// current file no longer matches this authority's manifest.
+    pub fn read_resource(&self, resource_id: &str) -> Result<Vec<u8>, StorageError> {
+        let descriptor = self
+            .manifest
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == resource_id)
+            .ok_or_else(|| descriptor_not_found(resource_id))?;
+        self.read_descriptor(
+            descriptor.path(),
+            descriptor.byte_length(),
+            descriptor.sha256(),
+            MAX_JSON_FILE_BYTES,
+        )
+    }
+
+    /// Re-reads one declared asset as stable, digest-verified bytes.
+    ///
+    /// The caller-supplied bound must be at least the declared file length and
+    /// prevents an encoded asset from exhausting process memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified rejection for an absent identifier, exceeded
+    /// bound, path change, or content mismatch.
+    pub fn read_asset(&self, asset_id: &str, maximum_bytes: u64) -> Result<Vec<u8>, StorageError> {
+        let descriptor = self
+            .manifest
+            .assets()
+            .iter()
+            .find(|descriptor| descriptor.id() == asset_id)
+            .ok_or_else(|| descriptor_not_found(asset_id))?;
+        self.read_descriptor(
+            descriptor.path(),
+            descriptor.byte_length(),
+            descriptor.sha256(),
+            maximum_bytes,
+        )
+    }
+
+    /// Confirms that the package still satisfies this structural authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a verification rejection when any owned file, manifest byte, or
+    /// filesystem boundary has changed.
+    pub fn confirm_unchanged(&self) -> Result<(), StorageError> {
+        let current = verify_project_package(&self.root)?;
+        if current.manifest_sha256 != self.manifest_sha256 {
+            return Err(rejection(
+                StorageErrorKind::ChangedDuringVerification,
+                MANIFEST_NAME,
+                "project manifest changed after structural verification",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_descriptor(
+        &self,
+        relative: &str,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        if expected_bytes > maximum_bytes {
+            return Err(rejection(
+                StorageErrorKind::LimitExceeded,
+                relative,
+                "declared file exceeds the caller's byte limit",
+            ));
+        }
+        let path = confined_declared_path(&self.root, &self.root, relative)?;
+        let verified = verify_stable(
+            &path,
+            relative,
+            expected_bytes,
+            decode_sha256(expected_sha256, relative)?,
+            true,
+        )?;
+        verified.bytes.ok_or_else(|| {
+            rejection(
+                StorageErrorKind::Io,
+                relative,
+                "verified file bytes are unavailable",
+            )
+        })
     }
 }
 
@@ -469,6 +564,14 @@ fn invalid_sha256(path: &str) -> StorageError {
         StorageErrorKind::ManifestInvalid,
         path,
         "descriptor SHA-256 is invalid",
+    )
+}
+
+fn descriptor_not_found(identifier: &str) -> StorageError {
+    rejection(
+        StorageErrorKind::DescriptorNotFound,
+        identifier,
+        "project descriptor does not exist",
     )
 }
 

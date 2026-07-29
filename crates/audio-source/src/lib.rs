@@ -4,14 +4,14 @@
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use symphonia::core::audio::{Channels, SampleBuffer};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
@@ -270,32 +270,75 @@ impl From<SymphoniaError> for DecodeError {
 /// Returns [`DecodeError`] for I/O failure, a mismatched container, unsupported
 /// or incomplete stream metadata, malformed media, an exceeded bound,
 /// integrity failure, a non-finite sample, or decoded/header frame mismatch.
-// Keep the validation and decode transaction visible as one fail-closed pipeline.
-#[allow(clippy::too_many_lines)]
 pub fn decode_file(
     path: &Path,
     container: AudioContainer,
     expected_sample_rate_hz: u32,
     limits: DecodeLimits,
 ) -> Result<DecodedAudio, DecodeError> {
-    if expected_sample_rate_hz == 0 {
-        return Err(DecodeError::InvalidDecodedAudio(
-            "expected sample rate must be positive",
-        ));
-    }
-
+    require_expected_sample_rate(expected_sample_rate_hz)?;
     let mut file = File::open(path)?;
     let file_length = file.metadata()?.len();
-    if file_length > limits.max_file_bytes {
-        return Err(DecodeError::FileTooLarge {
-            actual: file_length,
-            maximum: limits.max_file_bytes,
-        });
-    }
+    require_file_limit(file_length, limits)?;
     verify_container_signature(&mut file, container)?;
     file.seek(SeekFrom::Start(0))?;
+    decode_source(Box::new(file), container, expected_sample_rate_hz, limits)
+}
 
-    let media_stream = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
+/// Decodes complete verified WAV or native FLAC bytes outside the real-time
+/// path.
+///
+/// Owning the encoded bytes keeps the decoded media tied to the exact package
+/// payload that was hashed by the caller.
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] under the same rules as [`decode_file`].
+pub fn decode_bytes(
+    bytes: Vec<u8>,
+    container: AudioContainer,
+    expected_sample_rate_hz: u32,
+    limits: DecodeLimits,
+) -> Result<DecodedAudio, DecodeError> {
+    require_expected_sample_rate(expected_sample_rate_hz)?;
+    let file_length = u64::try_from(bytes.len()).map_err(|_| DecodeError::CapacityUnavailable)?;
+    require_file_limit(file_length, limits)?;
+    let mut cursor = Cursor::new(bytes);
+    verify_container_signature(&mut cursor, container)?;
+    cursor.seek(SeekFrom::Start(0))?;
+    decode_source(Box::new(cursor), container, expected_sample_rate_hz, limits)
+}
+
+fn require_file_limit(file_length: u64, limits: DecodeLimits) -> Result<(), DecodeError> {
+    if file_length > limits.max_file_bytes {
+        Err(DecodeError::FileTooLarge {
+            actual: file_length,
+            maximum: limits.max_file_bytes,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn require_expected_sample_rate(expected_sample_rate_hz: u32) -> Result<(), DecodeError> {
+    if expected_sample_rate_hz == 0 {
+        Err(DecodeError::InvalidDecodedAudio(
+            "expected sample rate must be positive",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+// Keep the validation and decode transaction visible as one fail-closed pipeline.
+#[allow(clippy::too_many_lines)]
+fn decode_source(
+    source: Box<dyn MediaSource>,
+    container: AudioContainer,
+    expected_sample_rate_hz: u32,
+    limits: DecodeLimits,
+) -> Result<DecodedAudio, DecodeError> {
+    let media_stream = MediaSourceStream::new(source, MediaSourceStreamOptions::default());
     let mut hint = Hint::new();
     hint.with_extension(container.extension());
     let probed = symphonia::default::get_probe().format(
@@ -510,8 +553,8 @@ fn validate_channel_layout(channels: Channels) -> Result<usize, DecodeError> {
     }
 }
 
-fn verify_container_signature(
-    file: &mut File,
+fn verify_container_signature<R: Read>(
+    file: &mut R,
     container: AudioContainer,
 ) -> Result<(), DecodeError> {
     let mut header = [0_u8; 12];

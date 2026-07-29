@@ -3,7 +3,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hyper_audio_source::{AudioContainer, DecodeError, DecodeLimits, DecodedAudio, decode_file};
+use hyper_audio_source::{
+    AudioContainer, DecodeError, DecodeLimits, DecodedAudio, decode_bytes, decode_file,
+};
 
 static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(0);
 const EPSILON: f32 = 1.0e-6;
@@ -94,11 +96,11 @@ fn assert_samples(actual: &[f32], expected: &[f32]) {
 
 #[test]
 fn decodes_pcm16_mono_and_stereo_to_planar_f32() {
-    let mono_file = TemporaryAudioFile::create(
-        "wav",
-        &pcm16_wav(1, 48_000, &[-32_768, -16_384, 0, 16_384, 32_767]),
-    );
+    let mono_bytes = pcm16_wav(1, 48_000, &[-32_768, -16_384, 0, 16_384, 32_767]);
+    let mono_file = TemporaryAudioFile::create("wav", &mono_bytes);
     let mono = decode_file(mono_file.path(), AudioContainer::Wav, 48_000, limits()).unwrap();
+    let memory_mono = decode_bytes(mono_bytes, AudioContainer::Wav, 48_000, limits()).unwrap();
+    assert_eq!(memory_mono, mono);
     assert_eq!(mono.sample_rate_hz(), 48_000);
     assert_eq!(mono.channels(), 1);
     assert_eq!(mono.frame_count(), 5);
@@ -227,6 +229,10 @@ fn validates_limits_and_in_memory_sources() {
             frame: 0,
             channel: 0
         })
+    ));
+    assert!(matches!(
+        decode_bytes(Vec::new(), AudioContainer::Wav, 0, limits()),
+        Err(DecodeError::InvalidDecodedAudio(_))
     ));
 }
 

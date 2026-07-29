@@ -1,0 +1,511 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use hyper_audio_source::{DecodeError, DecodeLimits};
+use hyper_media_cache::CacheLimits;
+use hyper_playback_json::LoaderLimits;
+use hyper_playback_session::PlaybackSessionAssemblyLimits;
+use hyper_project_loader::{ProjectPlaybackError, ProjectPlaybackLimits, prepare_project_playback};
+use hyper_project_model::ResourceRole;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+const PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334455";
+const TIMELINE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334456";
+const TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334457";
+const CLIP_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334458";
+const ARRANGEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334459";
+const MIXER_ID: &str = "018f47a2-6b2d-7c11-8a44-00112233445a";
+const ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-00112233445b";
+const PLACEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-00112233445c";
+const MAPPING_ID: &str = "018f47a2-6b2d-7c11-8a44-00112233445d";
+const SECOND_ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-00112233445e";
+const SECOND_MIXER_ID: &str = "018f47a2-6b2d-7c11-8a44-00112233445f";
+const SECOND_ARRANGEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334460";
+
+static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+struct Fixture {
+    root: PathBuf,
+}
+
+impl Fixture {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one constructor keeps the coherent package graph and its exact descriptor bytes visible together"
+    )]
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "hyper-project-loader-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let resources = [
+            (
+                TIMELINE_ID,
+                "timeline",
+                "timeline/timeline.json",
+                json!({
+                    "format": "hyper-timeline",
+                    "format_version": 1,
+                    "id": TIMELINE_ID,
+                    "project_id": PROJECT_ID,
+                    "ticks_per_quarter": 1920,
+                    "tempo_events": [{
+                        "tick": 0,
+                        "microseconds_per_quarter": 1_000_000
+                    }],
+                    "meter_events": [{
+                        "tick": 0,
+                        "numerator": 4,
+                        "denominator": 4
+                    }],
+                    "extensions": {}
+                }),
+            ),
+            (
+                TRACK_ID,
+                "track",
+                "tracks/audio.json",
+                json!({
+                    "format": "hyper-track",
+                    "format_version": 1,
+                    "id": TRACK_ID,
+                    "project_id": PROJECT_ID,
+                    "name": "Audio",
+                    "kind": "audio",
+                    "order": 0,
+                    "active": true,
+                    "clip_ids": [CLIP_ID],
+                    "extensions": {}
+                }),
+            ),
+            (
+                CLIP_ID,
+                "clip",
+                "clips/clip.json",
+                json!({
+                    "format": "hyper-audio-clip",
+                    "format_version": 1,
+                    "id": CLIP_ID,
+                    "project_id": PROJECT_ID,
+                    "track_id": TRACK_ID,
+                    "name": "Clip",
+                    "enabled": true,
+                    "duration_ticks": 4,
+                    "source": {
+                        "asset_id": ASSET_ID,
+                        "start_frame": 0,
+                        "frame_count": 100
+                    },
+                    "loop": {
+                        "enabled": false,
+                        "start_tick": 0,
+                        "end_tick": 4
+                    },
+                    "playback": {
+                        "gain_decibels": 0,
+                        "reverse": false,
+                        "transpose_cents": 0
+                    },
+                    "fades": {
+                        "curve": "linear-amplitude",
+                        "in_ticks": 0,
+                        "out_ticks": 0
+                    },
+                    "warp_markers": [
+                        {"tick": 0, "source_frame_offset": 0},
+                        {"tick": 4, "source_frame_offset": 100}
+                    ],
+                    "extensions": {}
+                }),
+            ),
+            (
+                ARRANGEMENT_ID,
+                "arrangement",
+                "arrangement/main.json",
+                json!({
+                    "format": "hyper-arrangement",
+                    "format_version": 1,
+                    "id": ARRANGEMENT_ID,
+                    "project_id": PROJECT_ID,
+                    "name": "Main",
+                    "enabled": true,
+                    "placements": [{
+                        "id": PLACEMENT_ID,
+                        "track_id": TRACK_ID,
+                        "clip_id": CLIP_ID,
+                        "start_tick": 0,
+                        "clip_start_tick": 0,
+                        "duration_ticks": 4,
+                        "enabled": true
+                    }],
+                    "scene_launches": [],
+                    "extensions": {}
+                }),
+            ),
+            (
+                MIXER_ID,
+                "mixer",
+                "mixer/main.json",
+                json!({
+                    "format": "hyper-mixer",
+                    "format_version": 1,
+                    "id": MIXER_ID,
+                    "project_id": PROJECT_ID,
+                    "channels": [{
+                        "track_id": TRACK_ID,
+                        "gain_millionths": 1_000_000,
+                        "pan_millionths": 0,
+                        "mute": false,
+                        "solo": false,
+                        "destination": {"kind": "main"},
+                        "sends": []
+                    }],
+                    "return_buses": [],
+                    "main": {"gain_millionths": 1_000_000, "mute": false},
+                    "cue": {
+                        "source": "main",
+                        "gain_millionths": 1_000_000,
+                        "mute": false
+                    },
+                    "extensions": {}
+                }),
+            ),
+        ];
+
+        let mut manifest_resources = Vec::new();
+        for (id, role, path, value) in resources {
+            let bytes = canonical(&value);
+            write_file(&root, path, &bytes);
+            manifest_resources.push(descriptor(id, role, path, &bytes));
+        }
+        let audio = pcm16_wav(&[0; 100]);
+        write_file(&root, "assets/samples/sample.wav", &audio);
+        let manifest = json!({
+            "format": "hyper-project",
+            "format_version": 1,
+            "project_id": PROJECT_ID,
+            "revision": 1,
+            "name": "Native playback package",
+            "sample_rate_hz": 48_000,
+            "required_capabilities": {
+                "format": "hyper-hardware-capabilities",
+                "format_version": 1,
+                "audio_inputs": 2,
+                "audio_outputs": 2,
+                "cv_inputs": 0,
+                "cv_outputs": 0,
+                "gate_outputs": 0,
+                "has_clock_input": false,
+                "has_reset_input": false,
+                "has_clock_output": false,
+                "usb_mode": "none",
+                "has_ethernet": true,
+                "extensions": {}
+            },
+            "resources": manifest_resources,
+            "assets": [{
+                "id": ASSET_ID,
+                "role": "sample",
+                "path": "assets/samples/sample.wav",
+                "media_type": "audio/wav",
+                "byte_length": audio.len(),
+                "sha256": sha256(&audio),
+                "extensions": {}
+            }],
+            "extensions": {}
+        });
+        fs::write(root.join("project.json"), canonical(&manifest)).unwrap();
+        Self { root }
+    }
+
+    fn replace_resource(&self, path: &str, value: &Value) {
+        let bytes = canonical(value);
+        write_file(&self.root, path, &bytes);
+        let mut manifest = self.manifest();
+        let record = manifest["resources"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|record| record["path"] == path)
+            .unwrap();
+        record["byte_length"] = bytes.len().into();
+        record["sha256"] = sha256(&bytes).into();
+        self.write_manifest(&manifest);
+    }
+
+    fn add_resource(&self, id: &str, role: &str, path: &str, value: &Value) {
+        let bytes = canonical(value);
+        write_file(&self.root, path, &bytes);
+        let mut manifest = self.manifest();
+        manifest["resources"]
+            .as_array_mut()
+            .unwrap()
+            .push(descriptor(id, role, path, &bytes));
+        self.write_manifest(&manifest);
+    }
+
+    fn remove_mixer(&self) {
+        fs::remove_file(self.root.join("mixer/main.json")).unwrap();
+        fs::remove_dir(self.root.join("mixer")).unwrap();
+        let mut manifest = self.manifest();
+        manifest["resources"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|record| record["role"] != "mixer");
+        self.write_manifest(&manifest);
+    }
+
+    fn replace_asset_bytes(&self, bytes: &[u8]) {
+        write_file(&self.root, "assets/samples/sample.wav", bytes);
+        let mut manifest = self.manifest();
+        let asset = &mut manifest["assets"][0];
+        asset["byte_length"] = bytes.len().into();
+        asset["sha256"] = sha256(bytes).into();
+        self.write_manifest(&manifest);
+    }
+
+    fn add_sample_asset(&self) {
+        let bytes = fs::read(self.root.join("assets/samples/sample.wav")).unwrap();
+        write_file(&self.root, "assets/samples/second.wav", &bytes);
+        let mut manifest = self.manifest();
+        manifest["assets"].as_array_mut().unwrap().push(json!({
+            "id": SECOND_ASSET_ID,
+            "role": "sample",
+            "path": "assets/samples/second.wav",
+            "media_type": "audio/wav",
+            "byte_length": bytes.len(),
+            "sha256": sha256(&bytes),
+            "extensions": {}
+        }));
+        self.write_manifest(&manifest);
+    }
+
+    fn make_asset_a_recording(&self) {
+        let old_path = self.root.join("assets/samples/sample.wav");
+        let new_path = self.root.join("assets/recordings/recording.wav");
+        fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        fs::rename(old_path, new_path).unwrap();
+        fs::remove_dir(self.root.join("assets/samples")).unwrap();
+        let mut manifest = self.manifest();
+        manifest["assets"][0]["role"] = "recording".into();
+        manifest["assets"][0]["path"] = "assets/recordings/recording.wav".into();
+        self.write_manifest(&manifest);
+    }
+
+    fn manifest(&self) -> Value {
+        serde_json::from_slice(&fs::read(self.root.join("project.json")).unwrap()).unwrap()
+    }
+
+    fn write_manifest(&self, manifest: &Value) {
+        fs::write(self.root.join("project.json"), canonical(manifest)).unwrap();
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.root).unwrap();
+    }
+}
+
+#[test]
+fn prepares_one_verified_owned_playback_session() {
+    let fixture = Fixture::new();
+    let prepared = prepare_project_playback(&fixture.root, limits()).unwrap();
+
+    assert_eq!(prepared.package().manifest().project_id(), PROJECT_ID);
+    assert_eq!(prepared.session().project_id(), PROJECT_ID);
+    assert_eq!(prepared.session().media_asset_count(), 1);
+    assert!(!prepared.session().has_automation());
+    prepared.package().confirm_unchanged().unwrap();
+}
+
+#[test]
+fn rejects_semantic_identity_failure_without_publishing_a_session() {
+    let fixture = Fixture::new();
+    fixture.replace_resource(
+        "timeline/timeline.json",
+        &json!({
+            "format": "hyper-timeline",
+            "format_version": 1,
+            "id": TIMELINE_ID,
+            "project_id": "018f47a2-6b2d-7c11-8a44-0011223344ff",
+            "ticks_per_quarter": 1920,
+            "tempo_events": [{"tick": 0, "microseconds_per_quarter": 1_000_000}],
+            "meter_events": [{"tick": 0, "numerator": 4, "denominator": 4}],
+            "extensions": {}
+        }),
+    );
+
+    assert!(matches!(
+        prepare_project_playback(&fixture.root, limits()),
+        Err(ProjectPlaybackError::Assembly(_))
+    ));
+}
+
+#[test]
+fn rejects_every_role_that_the_playback_runtime_does_not_own() {
+    let mapping = Fixture::new();
+    mapping.add_resource(
+        MAPPING_ID,
+        "mapping",
+        "mappings/controller.json",
+        &json!({}),
+    );
+    assert!(matches!(
+        prepare_project_playback(&mapping.root, limits()),
+        Err(ProjectPlaybackError::UnsupportedResourceRole(
+            ResourceRole::Mapping
+        ))
+    ));
+
+    let missing_mixer = Fixture::new();
+    missing_mixer.remove_mixer();
+    assert!(matches!(
+        prepare_project_playback(&missing_mixer.root, limits()),
+        Err(ProjectPlaybackError::MissingMixer)
+    ));
+
+    let recording = Fixture::new();
+    recording.make_asset_a_recording();
+    assert!(matches!(
+        prepare_project_playback(&recording.root, limits()),
+        Err(ProjectPlaybackError::UnsupportedAssetRole(_))
+    ));
+
+    let duplicate_mixer = Fixture::new();
+    duplicate_mixer.add_resource(SECOND_MIXER_ID, "mixer", "mixer/second.json", &json!({}));
+    assert!(matches!(
+        prepare_project_playback(&duplicate_mixer.root, limits()),
+        Err(ProjectPlaybackError::MultipleMixers)
+    ));
+
+    let duplicate_arrangement = Fixture::new();
+    duplicate_arrangement.add_resource(
+        SECOND_ARRANGEMENT_ID,
+        "arrangement",
+        "arrangement/second.json",
+        &json!({}),
+    );
+    assert!(matches!(
+        prepare_project_playback(&duplicate_arrangement.root, limits()),
+        Err(ProjectPlaybackError::MultipleArrangements)
+    ));
+}
+
+#[test]
+fn rejects_resource_budget_and_mismatched_audio_container() {
+    let budget = Fixture::new();
+    let mut tiny = limits();
+    tiny.max_total_resource_bytes = 1;
+    assert!(matches!(
+        prepare_project_playback(&budget.root, tiny),
+        Err(ProjectPlaybackError::ResourceBytesLimit { .. })
+    ));
+
+    let frames = Fixture::new();
+    let mut frame_limited = limits();
+    frame_limited.session.media_cache.max_frames_per_asset = 99;
+    assert!(matches!(
+        prepare_project_playback(&frames.root, frame_limited),
+        Err(ProjectPlaybackError::AssetFrameLimit { .. })
+    ));
+
+    let decoded_bytes = Fixture::new();
+    let mut byte_limited = limits();
+    byte_limited.session.media_cache.max_decoded_sample_bytes = 399;
+    assert!(matches!(
+        prepare_project_playback(&decoded_bytes.root, byte_limited),
+        Err(ProjectPlaybackError::DecodedBytesLimit { .. })
+    ));
+
+    let asset_count = Fixture::new();
+    asset_count.add_sample_asset();
+    assert!(matches!(
+        prepare_project_playback(&asset_count.root, limits()),
+        Err(ProjectPlaybackError::AssetCountLimit {
+            actual: 2,
+            maximum: 1
+        })
+    ));
+
+    let media = Fixture::new();
+    media.replace_asset_bytes(b"fLaCnot-a-wave-container");
+    assert!(matches!(
+        prepare_project_playback(&media.root, limits()),
+        Err(ProjectPlaybackError::Audio {
+            source: DecodeError::ContainerMismatch { .. },
+            ..
+        })
+    ));
+}
+
+fn limits() -> ProjectPlaybackLimits {
+    ProjectPlaybackLimits {
+        max_total_resource_bytes: 5 * 1_048_576,
+        audio: DecodeLimits::new(1_048_576, 100).unwrap(),
+        session: PlaybackSessionAssemblyLimits {
+            documents: LoaderLimits::VERSION_1,
+            media_cache: CacheLimits {
+                max_assets: 1,
+                max_frames_per_asset: 100,
+                max_decoded_sample_bytes: 400,
+            },
+        },
+    }
+}
+
+fn descriptor(id: &str, role: &str, path: &str, bytes: &[u8]) -> Value {
+    json!({
+        "id": id,
+        "role": role,
+        "path": path,
+        "media_type": "application/json",
+        "byte_length": bytes.len(),
+        "sha256": sha256(bytes),
+        "extensions": {}
+    })
+}
+
+fn write_file(root: &Path, relative: &str, bytes: &[u8]) {
+    let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+}
+
+fn canonical(value: &Value) -> Vec<u8> {
+    serde_json_canonicalizer::to_vec(value).unwrap()
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        use core::fmt::Write;
+        write!(&mut output, "{byte:02x}").unwrap();
+    }
+    output
+}
+
+fn pcm16_wav(samples: &[i16]) -> Vec<u8> {
+    let data_bytes = u32::try_from(samples.len() * 2).unwrap();
+    let mut bytes = Vec::with_capacity(44 + samples.len() * 2);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&48_000_u32.to_le_bytes());
+    bytes.extend_from_slice(&96_000_u32.to_le_bytes());
+    bytes.extend_from_slice(&2_u16.to_le_bytes());
+    bytes.extend_from_slice(&16_u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_bytes.to_le_bytes());
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
