@@ -6,6 +6,8 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+cap-std = "=4.0.2"
+cap-fs-ext = "=4.0.2"
 hyper-project-model = { path = "../project-model" }
 hyper-strict-json = { path = "../strict-json" }
 same-file = "=1.0.6"

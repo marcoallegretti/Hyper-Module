@@ -1,6 +1,5 @@
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
 
 use same_file::Handle;
 use sha2::{Digest, Sha256};
@@ -14,26 +13,26 @@ pub(crate) struct StableFile {
     pub bytes: Option<Vec<u8>>,
 }
 
-pub(crate) fn read_stable(
-    path: &Path,
+pub(crate) fn read_open_stable(
+    file: fs::File,
     label: &str,
     maximum_bytes: u64,
 ) -> Result<Vec<u8>, StorageError> {
-    let verified = read_file(path, label, maximum_bytes, None, true)?;
+    let verified = read_open_file(file, label, maximum_bytes, None, true)?;
     verified
         .bytes
         .ok_or_else(|| rejection(StorageErrorKind::Io, label, "file bytes are unavailable"))
 }
 
-pub(crate) fn verify_stable(
-    path: &Path,
+pub(crate) fn verify_open_stable(
+    file: fs::File,
     label: &str,
     expected_bytes: u64,
     expected_sha256: [u8; 32],
     capture: bool,
 ) -> Result<StableFile, StorageError> {
-    read_file(
-        path,
+    read_open_file(
+        file,
         label,
         expected_bytes,
         Some((expected_bytes, expected_sha256)),
@@ -41,18 +40,8 @@ pub(crate) fn verify_stable(
     )
 }
 
-fn read_file(
-    path: &Path,
-    label: &str,
-    maximum_bytes: u64,
-    expected: Option<(u64, [u8; 32])>,
-    capture: bool,
-) -> Result<StableFile, StorageError> {
-    read_file_observed(path, label, maximum_bytes, expected, capture, || Ok(()))
-}
-
-fn read_file_observed<F>(
-    path: &Path,
+fn read_open_file_observed<F>(
+    file: fs::File,
     label: &str,
     maximum_bytes: u64,
     expected: Option<(u64, [u8; 32])>,
@@ -62,8 +51,62 @@ fn read_file_observed<F>(
 where
     F: FnOnce() -> io::Result<()>,
 {
-    let (mut handle, before) = open_stable(path, label, maximum_bytes, expected)?;
-    let before_stamp = metadata_stamp(&before);
+    let handle = Handle::from_file(file).map_err(|error| io_error(label, "open file", error))?;
+    let before = handle
+        .as_file()
+        .metadata()
+        .map_err(|error| io_error(label, "inspect open file", error))?;
+    require_regular_non_link(&before, label)?;
+    if before.len() > maximum_bytes {
+        return Err(rejection(
+            StorageErrorKind::ByteLengthMismatch,
+            label,
+            "file exceeds its byte limit",
+        ));
+    }
+    if let Some((expected_bytes, _)) = expected
+        && before.len() != expected_bytes
+    {
+        return Err(rejection(
+            StorageErrorKind::ByteLengthMismatch,
+            label,
+            "declared byte length does not match the file",
+        ));
+    }
+    read_retained_handle(
+        handle,
+        &before,
+        label,
+        maximum_bytes,
+        expected,
+        capture,
+        after_read,
+    )
+}
+
+fn read_open_file(
+    file: fs::File,
+    label: &str,
+    maximum_bytes: u64,
+    expected: Option<(u64, [u8; 32])>,
+    capture: bool,
+) -> Result<StableFile, StorageError> {
+    read_open_file_observed(file, label, maximum_bytes, expected, capture, || Ok(()))
+}
+
+fn read_retained_handle<F>(
+    mut handle: Handle,
+    before: &fs::Metadata,
+    label: &str,
+    maximum_bytes: u64,
+    expected: Option<(u64, [u8; 32])>,
+    capture: bool,
+    after_read: F,
+) -> Result<StableFile, StorageError>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    let before_stamp = metadata_stamp(before);
     let mut bytes = if capture {
         let capacity = usize::try_from(before.len()).map_err(|_| {
             rejection(
@@ -108,7 +151,17 @@ where
         return Err(changed(label));
     }
 
-    verify_final_state(path, label, &handle, &before, before_stamp, confirmed_total)?;
+    let after = handle
+        .as_file()
+        .metadata()
+        .map_err(|error| io_error(label, "reinspect open file", error))?;
+    if !after.is_file()
+        || confirmed_total != after.len()
+        || before.len() != after.len()
+        || before_stamp != metadata_stamp(&after)
+    {
+        return Err(changed(label));
+    }
 
     if let Some((_, expected_sha256)) = expected
         && sha256 != expected_sha256
@@ -158,78 +211,6 @@ fn read_pass(
         }
     }
     Ok((hasher.finalize().into(), total))
-}
-
-fn open_stable(
-    path: &Path,
-    label: &str,
-    maximum_bytes: u64,
-    expected: Option<(u64, [u8; 32])>,
-) -> Result<(Handle, fs::Metadata), StorageError> {
-    let path_metadata =
-        fs::symlink_metadata(path).map_err(|error| io_error(label, "inspect file path", error))?;
-    require_regular_non_link(&path_metadata, label)?;
-    if path_metadata.len() > maximum_bytes {
-        return Err(rejection(
-            StorageErrorKind::ByteLengthMismatch,
-            label,
-            "file exceeds its byte limit",
-        ));
-    }
-    let handle = Handle::from_path(path).map_err(|error| io_error(label, "open file", error))?;
-    let before = handle
-        .as_file()
-        .metadata()
-        .map_err(|error| io_error(label, "inspect open file", error))?;
-    require_regular_non_link(&before, label)?;
-    if before.len() != path_metadata.len() {
-        return Err(changed(label));
-    }
-    if let Some((expected_bytes, _)) = expected
-        && before.len() != expected_bytes
-    {
-        return Err(rejection(
-            StorageErrorKind::ByteLengthMismatch,
-            label,
-            "declared byte length does not match the file",
-        ));
-    }
-    Ok((handle, before))
-}
-
-fn verify_final_state(
-    path: &Path,
-    label: &str,
-    handle: &Handle,
-    before: &fs::Metadata,
-    before_stamp: MetadataStamp,
-    total: u64,
-) -> Result<(), StorageError> {
-    let after = handle
-        .as_file()
-        .metadata()
-        .map_err(|error| io_error(label, "reinspect open file", error))?;
-    if !after.is_file()
-        || total != after.len()
-        || before.len() != after.len()
-        || before_stamp != metadata_stamp(&after)
-    {
-        return Err(changed(label));
-    }
-    let final_path_metadata = fs::symlink_metadata(path)
-        .map_err(|error| io_error(label, "reinspect file path", error))?;
-    require_regular_non_link(&final_path_metadata, label)?;
-    if final_path_metadata.len() != after.len()
-        || metadata_stamp(&final_path_metadata) != metadata_stamp(&after)
-    {
-        return Err(changed(label));
-    }
-    let final_handle =
-        Handle::from_path(path).map_err(|error| io_error(label, "reopen file path", error))?;
-    if *handle != final_handle {
-        return Err(changed(label));
-    }
-    Ok(())
 }
 
 fn require_regular_non_link(metadata: &fs::Metadata, label: &str) -> Result<(), StorageError> {
@@ -322,7 +303,8 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let path = root.join("payload");
         fs::write(&path, b"original").unwrap();
-        let result = read_file_observed(&path, "payload", 8, None, true, || {
+        let file = fs::File::open(&path).unwrap();
+        let result = read_open_file_observed(file, "payload", 8, None, true, || {
             fs::write(&path, b"changed!")
         });
         assert_eq!(

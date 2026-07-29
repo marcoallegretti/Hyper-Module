@@ -9,12 +9,17 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use hyper_project_model::{AssetDescriptor, ProjectManifest, ResourceDescriptor};
+use same_file::Handle;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::stable_file::{is_link_like, read_stable, verify_stable};
+use crate::stable_file::{is_link_like, read_open_stable, verify_open_stable};
 
 const MANIFEST_NAME: &str = "project.json";
 const MAX_JSON_BYTES: usize = 1_048_576;
@@ -76,9 +81,10 @@ impl Error for StorageError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct StructurallyVerifiedProject {
     root: PathBuf,
+    root_dir: Arc<Dir>,
     manifest: ProjectManifest,
     manifest_sha256: [u8; 32],
 }
@@ -152,7 +158,9 @@ impl StructurallyVerifiedProject {
     /// filesystem boundary has changed.
     pub fn confirm_unchanged(&self) -> Result<(), StorageError> {
         let current = verify_project_package(&self.root)?;
-        if current.manifest_sha256 != self.manifest_sha256 {
+        if !same_directory(&self.root_dir, &current.root_dir)?
+            || current.manifest_sha256 != self.manifest_sha256
+        {
             return Err(rejection(
                 StorageErrorKind::ChangedDuringVerification,
                 MANIFEST_NAME,
@@ -176,9 +184,9 @@ impl StructurallyVerifiedProject {
                 "declared file exceeds the caller's byte limit",
             ));
         }
-        let path = confined_declared_path(&self.root, &self.root, relative)?;
-        let verified = verify_stable(
-            &path,
+        let file = open_declared_file(&self.root_dir, relative)?;
+        let verified = verify_open_stable(
+            file,
             relative,
             expected_bytes,
             decode_sha256(expected_sha256, relative)?,
@@ -227,8 +235,25 @@ pub fn verify_project_package(
     }
     let canonical_root =
         fs::canonicalize(root).map_err(|error| io_error(".", "resolve project root", error))?;
-    let manifest_path = root.join(MANIFEST_NAME);
-    let manifest_bytes = read_stable(&manifest_path, MANIFEST_NAME, MAX_JSON_FILE_BYTES)?;
+    let root_dir = Arc::new(
+        Dir::open_ambient_dir(root, ambient_authority())
+            .map_err(|error| io_error(".", "open project root", error))?,
+    );
+    let path_root_handle =
+        Handle::from_path(root).map_err(|error| io_error(".", "reopen project root", error))?;
+    let opened_root_handle = directory_handle(&root_dir)?;
+    if opened_root_handle != path_root_handle {
+        return Err(rejection(
+            StorageErrorKind::ChangedDuringVerification,
+            ".",
+            "project root changed while it was being opened",
+        ));
+    }
+    let manifest_bytes = read_open_stable(
+        open_declared_file(&root_dir, MANIFEST_NAME)?,
+        MANIFEST_NAME,
+        MAX_JSON_FILE_BYTES,
+    )?;
     assert_canonical_json(&manifest_bytes, MANIFEST_NAME)?;
     let manifest = ProjectManifest::parse(&manifest_bytes).map_err(|error| StorageError {
         kind: StorageErrorKind::ManifestInvalid,
@@ -240,7 +265,7 @@ pub fn verify_project_package(
     let policy = TreePolicy::new(&manifest);
     let initial_files = collect_owned_tree(root, &policy)?;
     require_managed_tree(&initial_files, &policy)?;
-    verify_records(root, &canonical_root, &manifest)?;
+    verify_records(&root_dir, &manifest)?;
 
     let final_files = collect_owned_tree(root, &policy)?;
     if initial_files != final_files {
@@ -251,7 +276,11 @@ pub fn verify_project_package(
         ));
     }
     require_managed_tree(&final_files, &policy)?;
-    let final_manifest = read_stable(&manifest_path, MANIFEST_NAME, MAX_JSON_FILE_BYTES)?;
+    let final_manifest = read_open_stable(
+        open_declared_file(&root_dir, MANIFEST_NAME)?,
+        MANIFEST_NAME,
+        MAX_JSON_FILE_BYTES,
+    )?;
     if manifest_bytes != final_manifest {
         return Err(rejection(
             StorageErrorKind::ChangedDuringVerification,
@@ -262,16 +291,13 @@ pub fn verify_project_package(
 
     Ok(StructurallyVerifiedProject {
         root: canonical_root,
+        root_dir,
         manifest,
         manifest_sha256: Sha256::digest(&manifest_bytes).into(),
     })
 }
 
-fn verify_records(
-    root: &Path,
-    canonical_root: &Path,
-    manifest: &ProjectManifest,
-) -> Result<(), StorageError> {
+fn verify_records(root: &Dir, manifest: &ProjectManifest) -> Result<(), StorageError> {
     for descriptor in manifest.resources() {
         if descriptor.byte_length() > MAX_JSON_FILE_BYTES {
             return Err(rejection(
@@ -280,9 +306,8 @@ fn verify_records(
                 "resource exceeds the JSON byte limit",
             ));
         }
-        let path = confined_declared_path(root, canonical_root, descriptor.path())?;
-        let verified = verify_stable(
-            &path,
+        let verified = verify_open_stable(
+            open_declared_file(root, descriptor.path())?,
             descriptor.path(),
             descriptor.byte_length(),
             decode_sha256(descriptor.sha256(), descriptor.path())?,
@@ -298,9 +323,8 @@ fn verify_records(
         assert_canonical_json(&bytes, descriptor.path())?;
     }
     for descriptor in manifest.assets() {
-        let path = confined_declared_path(root, canonical_root, descriptor.path())?;
-        verify_stable(
-            &path,
+        verify_open_stable(
+            open_declared_file(root, descriptor.path())?,
             descriptor.path(),
             descriptor.byte_length(),
             decode_sha256(descriptor.sha256(), descriptor.path())?,
@@ -334,42 +358,75 @@ fn assert_canonical_json(bytes: &[u8], path: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn confined_declared_path(
-    root: &Path,
-    canonical_root: &Path,
-    relative: &str,
-) -> Result<PathBuf, StorageError> {
-    let mut path = root.to_path_buf();
-    for segment in relative.split('/') {
-        path.push(segment);
+fn open_declared_file(root: &Dir, relative: &str) -> Result<fs::File, StorageError> {
+    let mut segments = relative.split('/').peekable();
+    let mut directory = root
+        .try_clone()
+        .map_err(|error| io_error(relative, "clone project root handle", error))?;
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            let metadata = directory
+                .symlink_metadata(segment)
+                .map_err(|error| io_error(relative, "inspect declared file", error))?;
+            if metadata.file_type().is_symlink() {
+                return Err(rejection(
+                    StorageErrorKind::LinkForbidden,
+                    relative,
+                    "declared file cannot be a link or reparse point",
+                ));
+            }
+            if !metadata.is_file() {
+                return Err(rejection(
+                    StorageErrorKind::UnsupportedEntry,
+                    relative,
+                    "declared path must end at a regular file",
+                ));
+            }
+            let mut options = OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            return directory
+                .open_with(segment, &options)
+                .map(cap_std::fs::File::into_std)
+                .map_err(|error| io_error(relative, "open declared file", error));
+        }
+        let metadata = directory
+            .symlink_metadata(segment)
+            .map_err(|error| io_error(relative, "inspect declared directory", error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(rejection(
+                StorageErrorKind::LinkForbidden,
+                relative,
+                "declared path cannot traverse a link or reparse point",
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(rejection(
+                StorageErrorKind::UnsupportedEntry,
+                relative,
+                "declared path ancestor must be a directory",
+            ));
+        }
+        directory = directory
+            .open_dir_nofollow(segment)
+            .map_err(|error| io_error(relative, "open declared directory", error))?;
     }
-    let canonical = fs::canonicalize(&path)
-        .map_err(|error| io_error(relative, "resolve declared path", error))?;
-    if !is_within(canonical_root, &canonical) {
-        return Err(rejection(
-            StorageErrorKind::PathEscape,
-            relative,
-            "resolved path escapes the project root",
-        ));
-    }
-    Ok(path)
+    Err(rejection(
+        StorageErrorKind::PathEscape,
+        relative,
+        "declared path has no file component",
+    ))
 }
 
-#[cfg(unix)]
-fn is_within(root: &Path, candidate: &Path) -> bool {
-    candidate != root && candidate.starts_with(root)
+fn directory_handle(directory: &Dir) -> Result<Handle, StorageError> {
+    let file = directory
+        .try_clone()
+        .map_err(|error| io_error(".", "clone project root handle", error))?
+        .into_std_file();
+    Handle::from_file(file).map_err(|error| io_error(".", "inspect project root handle", error))
 }
 
-#[cfg(windows)]
-fn is_within(root: &Path, candidate: &Path) -> bool {
-    let root = root.to_string_lossy().to_lowercase();
-    let candidate = candidate.to_string_lossy().to_lowercase();
-    let prefix = if root.ends_with('\\') {
-        root
-    } else {
-        format!("{root}\\")
-    };
-    candidate.starts_with(&prefix)
+fn same_directory(left: &Dir, right: &Dir) -> Result<bool, StorageError> {
+    Ok(directory_handle(left)? == directory_handle(right)?)
 }
 
 struct TreePolicy {
