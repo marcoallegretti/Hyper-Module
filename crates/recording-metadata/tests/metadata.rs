@@ -59,6 +59,16 @@ fn context() -> RecordingMetadataContext {
     }
 }
 
+fn digest_hex(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
 #[test]
 fn verified_publication_produces_canonical_contract_json() {
     let directory = TestDirectory::new();
@@ -70,6 +80,35 @@ fn verified_publication_produces_canonical_contract_json() {
         json,
         "{\"asset_id\":\"018f47a2-6b2d-7c11-8a44-001122334478\",\"capture_kind\":\"overdub\",\"captured_at_utc\":\"2026-07-27T12:00:00.000Z\",\"channels\":2,\"extensions\":{},\"format\":\"hyper-recording-metadata\",\"format_version\":1,\"frame_count\":2,\"id\":\"018f47a2-6b2d-7c11-8a44-001122334477\",\"project_id\":\"018f47a2-6b2d-7c11-8a44-001122334455\",\"sample_rate_hz\":48000,\"source_input_indices\":[0,1],\"timeline_start_tick\":7680,\"track_id\":\"018f47a2-6b2d-7c11-8a44-001122334456\"}"
     );
+}
+
+#[test]
+fn verified_publication_produces_canonical_storage_handoff() {
+    let directory = TestDirectory::new();
+    let publication = directory.publication(48_000);
+    let expected_path = publication.final_wav_path().to_string_lossy().into_owned();
+    let expected_length = publication.byte_length();
+    let expected_sha256 = digest_hex(publication.wav_sha256());
+    let metadata = FinalizedRecordingMetadata::try_new(publication, context()).unwrap();
+    let bytes = metadata.to_handoff_json().unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    let handoff: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert!(text.starts_with(
+        "{\"extensions\":{},\"format\":\"hyper-finalized-recording-handoff\",\"format_version\":1,"
+    ));
+    assert_eq!(
+        handoff["format"],
+        serde_json::Value::String("hyper-finalized-recording-handoff".to_owned())
+    );
+    assert_eq!(handoff["format_version"], 1);
+    assert_eq!(handoff["recording"]["path"], expected_path);
+    assert_eq!(handoff["recording"]["media_type"], "audio/wav");
+    assert_eq!(handoff["recording"]["byte_length"], expected_length);
+    assert_eq!(handoff["recording"]["sha256"], expected_sha256);
+    assert_eq!(handoff["metadata"]["frame_count"], 2);
+    assert_eq!(handoff["metadata"]["sample_rate_hz"], 48_000);
+    assert_eq!(handoff["metadata"]["asset_id"], context().asset_id);
 }
 
 #[test]

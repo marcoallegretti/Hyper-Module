@@ -8,6 +8,8 @@ use std::fmt;
 
 const FORMAT: &str = "hyper-recording-metadata";
 const FORMAT_VERSION: u8 = 1;
+const HANDOFF_FORMAT: &str = "hyper-finalized-recording-handoff";
+const HANDOFF_FORMAT_VERSION: u8 = 1;
 const VERSION_ONE_SAMPLE_RATE: u32 = 48_000;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -131,6 +133,47 @@ impl Error for RecordingMetadataBuildError {
 }
 
 #[derive(Debug)]
+pub enum RecordingHandoffError {
+    NonAbsolutePublicationPath,
+    NonUnicodePublicationPath,
+    PublicationPathContainsNul,
+    Serialization(serde_json::Error),
+}
+
+impl fmt::Display for RecordingHandoffError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonAbsolutePublicationPath => {
+                formatter.write_str("recording publication path must be absolute")
+            }
+            Self::NonUnicodePublicationPath => {
+                formatter.write_str("recording publication path is not valid Unicode")
+            }
+            Self::PublicationPathContainsNul => {
+                formatter.write_str("recording publication path contains NUL")
+            }
+            Self::Serialization(source) => {
+                write!(
+                    formatter,
+                    "recording handoff serialization failed: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for RecordingHandoffError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Serialization(source) => Some(source),
+            Self::NonAbsolutePublicationPath
+            | Self::NonUnicodePublicationPath
+            | Self::PublicationPathContainsNul => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct FinalizedRecordingMetadata {
     publication: PublishedRecording,
     context: RecordingMetadataContext,
@@ -180,7 +223,48 @@ impl FinalizedRecordingMetadata {
     ///
     /// Returns a serialization error if JSON encoding fails.
     pub fn to_canonical_json(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(&CanonicalMetadata {
+        serde_json::to_vec(&self.canonical_metadata())
+    }
+
+    /// Serializes the verified publication and metadata as one canonical
+    /// application handoff document.
+    ///
+    /// The destination project is deliberately absent and remains owned by
+    /// the receiving application.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the publication path is not absolute, cannot be
+    /// represented losslessly as Unicode, contains NUL, or JSON serialization
+    /// fails.
+    pub fn to_handoff_json(&self) -> Result<Vec<u8>, RecordingHandoffError> {
+        let path = self.publication.final_wav_path();
+        if !path.is_absolute() {
+            return Err(RecordingHandoffError::NonAbsolutePublicationPath);
+        }
+        let path = path
+            .to_str()
+            .ok_or(RecordingHandoffError::NonUnicodePublicationPath)?;
+        if path.contains('\0') {
+            return Err(RecordingHandoffError::PublicationPathContainsNul);
+        }
+        serde_json::to_vec(&CanonicalHandoff {
+            extensions: BTreeMap::new(),
+            format: HANDOFF_FORMAT,
+            format_version: HANDOFF_FORMAT_VERSION,
+            metadata: self.canonical_metadata(),
+            recording: CanonicalRecording {
+                byte_length: self.publication.byte_length(),
+                media_type: "audio/wav",
+                path,
+                sha256: hex_sha256(self.publication.wav_sha256()),
+            },
+        })
+        .map_err(RecordingHandoffError::Serialization)
+    }
+
+    fn canonical_metadata(&self) -> CanonicalMetadata<'_> {
+        CanonicalMetadata {
             asset_id: &self.context.asset_id,
             capture_kind: self.context.capture_kind,
             captured_at_utc: &self.context.captured_at_utc,
@@ -195,7 +279,7 @@ impl FinalizedRecordingMetadata {
             source_input_indices: &self.context.source_input_indices,
             timeline_start_tick: self.context.timeline_start_tick,
             track_id: &self.context.track_id,
-        })
+        }
     }
 }
 
@@ -254,6 +338,33 @@ struct CanonicalMetadata<'a> {
     source_input_indices: &'a [u8],
     timeline_start_tick: u64,
     track_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct CanonicalHandoff<'a> {
+    extensions: BTreeMap<String, serde_json::Value>,
+    format: &'static str,
+    format_version: u8,
+    metadata: CanonicalMetadata<'a>,
+    recording: CanonicalRecording<'a>,
+}
+
+#[derive(Serialize)]
+struct CanonicalRecording<'a> {
+    byte_length: u64,
+    media_type: &'static str,
+    path: &'a str,
+    sha256: String,
+}
+
+fn hex_sha256(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 fn validate_id(field: &'static str, value: &str) -> Result<(), RecordingMetadataError> {

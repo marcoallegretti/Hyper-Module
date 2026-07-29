@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/finalized-recording-handoff.schema.json",
+  "title": "Hyper Module finalized recording application handoff version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "metadata",
+    "recording",
+    "extensions"
+  ],
+  "properties": {
+    "format": {
+      "const": "hyper-finalized-recording-handoff"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "metadata": {
+      "$ref": "recording-metadata.schema.json"
+    },
+    "recording": {
+      "$ref": "#/$defs/recording"
+    },
+    "extensions": {
+      "const": {}
+    }
+  },
+  "$defs": {
+    "recording": {
+      "type": "object",
+      "required": ["path", "media_type", "byte_length", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^[^\\u0000]+$"
+        },
+        "byte_length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "media_type": {
+          "const": "audio/wav"
+        },
+        "sha256": {
+          "$ref": "common.schema.json#/$defs/sha256"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

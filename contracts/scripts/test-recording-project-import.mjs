@@ -16,7 +16,9 @@ import { join } from "node:path";
 import canonicalize from "canonicalize";
 
 import {
+  decodeFinalizedRecordingHandoff,
   importFinalizedRecording,
+  importFinalizedRecordingHandoff,
   recoverRecordingImports,
 } from "./recording-project-import.mjs";
 import { createMinimalProject } from "./test-project-fixture.mjs";
@@ -122,6 +124,23 @@ function importRequest(recordingPath, recordingBytes, faultAt = undefined) {
   };
 }
 
+function handoffBytes(recordingPath, recordingBytes, mutate = () => {}) {
+  const handoff = {
+    format: "hyper-finalized-recording-handoff",
+    format_version: 1,
+    metadata: JSON.parse(metadataBytes()),
+    recording: {
+      path: recordingPath,
+      media_type: "audio/wav",
+      byte_length: recordingBytes.length,
+      sha256: sha256(recordingBytes),
+    },
+    extensions: {},
+  };
+  mutate(handoff);
+  return Buffer.from(canonicalize(handoff), "utf8");
+}
+
 async function transactionResidue(projectRoot) {
   const entries = await readdir(join(projectRoot, "backups"));
   return entries.filter((name) => name.startsWith(".recording-import-"));
@@ -151,6 +170,79 @@ try {
   assert(
     (await readFile(recordingPath)).equals(recordingBytes),
     "recording import changed its source publication",
+  );
+
+  const handoff = handoffBytes(recordingPath, recordingBytes);
+  const decodedHandoff = decodeFinalizedRecordingHandoff(handoff);
+  assert.equal(decodedHandoff.recordingPath, recordingPath);
+  assert.deepEqual(decodedHandoff.recordingDescriptor, {
+    byte_length: recordingBytes.length,
+    sha256: sha256(recordingBytes),
+  });
+  assert(decodedHandoff.metadataBytes.equals(metadataBytes()));
+
+  const handoffRoot = await createProject(temporaryRoot, "handoff");
+  const handoffResult = await importFinalizedRecordingHandoff(
+    handoffRoot,
+    handoff,
+  );
+  assert.equal((await verifyProject(handoffRoot)).identity, handoffResult.project_identity);
+
+  await assert.rejects(
+    Promise.resolve().then(() =>
+      decodeFinalizedRecordingHandoff(
+        Buffer.concat([handoff, Buffer.from("\n", "utf8")]),
+      ),
+    ),
+    /not canonical/,
+  );
+  await assert.rejects(
+    Promise.resolve().then(() =>
+      decodeFinalizedRecordingHandoff(
+        handoffBytes(recordingPath, recordingBytes, (value) => {
+          value.destination_project = temporaryRoot;
+        }),
+      ),
+    ),
+    /Expected values to be strictly deep-equal/,
+  );
+  await assert.rejects(
+    Promise.resolve().then(() =>
+      decodeFinalizedRecordingHandoff(
+        handoffBytes("relative.wav", recordingBytes),
+      ),
+    ),
+    /must be absolute/,
+  );
+  await assert.rejects(
+    Promise.resolve().then(() =>
+      decodeFinalizedRecordingHandoff(
+        handoffBytes(recordingPath, recordingBytes, (value) => {
+          value.recording.media_type = "audio/flac";
+        }),
+      ),
+    ),
+    /audio\/wav/,
+  );
+  await assert.rejects(
+    Promise.resolve().then(() =>
+      decodeFinalizedRecordingHandoff(
+        handoffBytes(recordingPath, recordingBytes, (value) => {
+          value.metadata.untrusted = true;
+        }),
+      ),
+    ),
+    /Expected values to be strictly deep-equal/,
+  );
+  await assert.rejects(
+    Promise.resolve().then(() =>
+      decodeFinalizedRecordingHandoff(
+        handoffBytes(recordingPath, recordingBytes, (value) => {
+          value.metadata.source_input_indices = [0];
+        }),
+      ),
+    ),
+    /source input count must match channel count/,
   );
 
   const invalidDescriptorRoot = await createProject(
@@ -354,7 +446,7 @@ try {
   );
 
   console.log(
-    "Recording project import passed: 23 commit, recovery, and refusal cases",
+    "Recording project import passed: 31 handoff, commit, recovery, and refusal cases",
   );
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });

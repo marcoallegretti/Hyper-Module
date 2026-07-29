@@ -124,6 +124,7 @@ const schemaPaths = [
   "schemas/v1/deployment-authorization-state.schema.json",
   "schemas/v1/timing-simulator-profile.schema.json",
   "schemas/v1/timing-frame.schema.json",
+  "schemas/v1/finalized-recording-handoff.schema.json",
 ];
 const schemas = await Promise.all(schemaPaths.map(loadJson));
 const ajv = new Ajv2020({
@@ -425,6 +426,16 @@ const cases = [
     schema: schemas[21].$id,
     valid: false,
     invariants: assertTimingFrameInvariants,
+  },
+  {
+    path: "fixtures/valid/finalized-recording-handoff.json",
+    schema: schemas[22].$id,
+    valid: true,
+  },
+  {
+    path: "fixtures/invalid/finalized-recording-handoff-extra-property.json",
+    schema: schemas[22].$id,
+    valid: false,
   },
 ];
 

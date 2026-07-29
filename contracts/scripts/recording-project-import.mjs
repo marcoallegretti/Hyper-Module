@@ -12,7 +12,7 @@ import {
   rmdir,
   unlink,
 } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import canonicalize from "canonicalize";
 
@@ -23,6 +23,7 @@ import {
   syncRemovedEntry,
 } from "../lib/durable-files.mjs";
 import { collectRegularFiles } from "../lib/filesystem-tree.mjs";
+import { assertRecordingMetadataInvariants } from "../lib/recording-metadata.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
 import { readStableRegularFile } from "./verify-bundle.mjs";
 import {
@@ -31,10 +32,14 @@ import {
 } from "./verify-project.mjs";
 
 const MAX_MANIFEST_BYTES = 1024 * 1024;
+const MAX_HANDOFF_BYTES = 2 * 1024 * 1024;
 const MAX_RECORDING_BYTES = 4_294_967_295;
+const MAX_SAFE_INTEGER = 9_007_199_254_740_991;
 const ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const EXTENSION_KEY_PATTERN =
+  /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/;
 const TRANSACTION_PATTERN = new RegExp(
   `^\\.recording-import-(${ID_PATTERN.source.slice(1, -1)})$`,
 );
@@ -53,6 +58,29 @@ const FAULT_BOUNDARIES = new Set([
   "after-manifest-sync",
   "after-manifest-publication",
 ]);
+const HANDOFF_KEYS = [
+  "extensions",
+  "format",
+  "format_version",
+  "metadata",
+  "recording",
+];
+const METADATA_KEYS = [
+  "asset_id",
+  "capture_kind",
+  "captured_at_utc",
+  "channels",
+  "extensions",
+  "format",
+  "format_version",
+  "frame_count",
+  "id",
+  "project_id",
+  "sample_rate_hz",
+  "source_input_indices",
+  "timeline_start_tick",
+  "track_id",
+];
 
 export class InjectedRecordingImportFault extends Error {
   constructor(boundary) {
@@ -350,6 +378,7 @@ function metadataValue(metadataBytes) {
   const metadata = strictParse(
     new TextDecoder("utf-8", { fatal: true }).decode(metadataBytes),
   );
+  assert.deepEqual(Object.keys(metadata).sort(), METADATA_KEYS);
   assert(
     metadataBytes.equals(Buffer.from(canonicalize(metadata), "utf8")),
     "recording metadata is not canonical RFC 8785 JSON",
@@ -362,7 +391,108 @@ function metadataValue(metadataBytes) {
       `recording metadata ${field} is invalid`,
     );
   }
+  assert(
+    metadata.capture_kind === "new" || metadata.capture_kind === "overdub",
+    "recording metadata capture kind is invalid",
+  );
+  assert(
+    Number.isSafeInteger(metadata.timeline_start_tick) &&
+      metadata.timeline_start_tick >= 0 &&
+      metadata.timeline_start_tick <= MAX_SAFE_INTEGER,
+    "recording metadata timeline start is invalid",
+  );
+  assert.equal(metadata.sample_rate_hz, 48_000);
+  assert(
+    Number.isSafeInteger(metadata.channels) &&
+      metadata.channels >= 1 &&
+      metadata.channels <= 2,
+    "recording metadata channel count is invalid",
+  );
+  assert(
+    Number.isSafeInteger(metadata.frame_count) &&
+      metadata.frame_count > 0 &&
+      metadata.frame_count <= MAX_SAFE_INTEGER,
+    "recording metadata frame count is invalid",
+  );
+  assert(
+    Array.isArray(metadata.source_input_indices) &&
+      metadata.source_input_indices.length >= 1 &&
+      metadata.source_input_indices.length <= 2 &&
+      metadata.source_input_indices.every(
+        (index) => Number.isSafeInteger(index) && index >= 0 && index <= 1,
+      ),
+    "recording metadata source inputs are invalid",
+  );
+  assert(
+    metadata.extensions !== null &&
+      typeof metadata.extensions === "object" &&
+      !Array.isArray(metadata.extensions) &&
+      Object.keys(metadata.extensions).every((key) =>
+        EXTENSION_KEY_PATTERN.test(key),
+      ),
+    "recording metadata extensions are invalid",
+  );
+  assertRecordingMetadataInvariants(metadata);
   return metadata;
+}
+
+export function decodeFinalizedRecordingHandoff(handoffBytes) {
+  assert(Buffer.isBuffer(handoffBytes), "recording handoff must be a Buffer");
+  assert(
+    handoffBytes.length > 0 && handoffBytes.length <= MAX_HANDOFF_BYTES,
+    "recording handoff size is invalid",
+  );
+  const handoff = strictParse(
+    new TextDecoder("utf-8", { fatal: true }).decode(handoffBytes),
+  );
+  assert(
+    handoffBytes.equals(Buffer.from(canonicalize(handoff), "utf8")),
+    "recording handoff is not canonical RFC 8785 JSON",
+  );
+  assert.deepEqual(Object.keys(handoff).sort(), HANDOFF_KEYS);
+  assert.equal(handoff.format, "hyper-finalized-recording-handoff");
+  assert.equal(handoff.format_version, 1);
+  assert.deepEqual(handoff.extensions, {});
+  assert.deepEqual(Object.keys(handoff.recording).sort(), [
+    "byte_length",
+    "media_type",
+    "path",
+    "sha256",
+  ]);
+  assert.equal(handoff.recording.media_type, "audio/wav");
+  assert(
+    typeof handoff.recording.path === "string" &&
+      handoff.recording.path.length > 0 &&
+      Buffer.byteLength(handoff.recording.path, "utf8") <= 4096 &&
+      !handoff.recording.path.includes("\0"),
+    "recording handoff path is invalid",
+  );
+  assert(
+    isAbsolute(handoff.recording.path),
+    "recording handoff path must be absolute",
+  );
+  const recordingDescriptor = validateDescriptor(
+    handoff.recording,
+    "recording handoff",
+  );
+  const metadataBytes = Buffer.from(canonicalize(handoff.metadata), "utf8");
+  metadataValue(metadataBytes);
+  return {
+    recordingPath: resolve(handoff.recording.path),
+    recordingDescriptor,
+    metadataBytes,
+  };
+}
+
+export async function importFinalizedRecordingHandoff(
+  projectPath,
+  handoffBytes,
+  { faultAt = undefined } = {},
+) {
+  return importFinalizedRecording(projectPath, {
+    ...decodeFinalizedRecordingHandoff(handoffBytes),
+    faultAt,
+  });
 }
 
 async function missingRecordingDirectories(root) {
