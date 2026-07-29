@@ -271,6 +271,9 @@ impl WasapiInputStream {
 
     fn join(&mut self) -> Result<(), WasapiStopError> {
         match self.thread.wait(self.shutdown_timeout) {
+            BackendThreadJoin::Completed if self.status.state() == StreamState::Failed => {
+                Err(WasapiStopError::RuntimeFailed)
+            }
             BackendThreadJoin::Completed => Ok(()),
             BackendThreadJoin::Panicked => Err(WasapiStopError::ThreadPanicked),
             BackendThreadJoin::TimedOut => Err(WasapiStopError::ShutdownTimeout),

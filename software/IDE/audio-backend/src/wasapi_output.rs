@@ -231,6 +231,7 @@ impl Error for WasapiStartError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WasapiStopError {
+    RuntimeFailed,
     ThreadPanicked,
     ShutdownTimeout,
 }
@@ -238,6 +239,7 @@ pub enum WasapiStopError {
 impl fmt::Display for WasapiStopError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::RuntimeFailed => "WASAPI stream failed before shutdown completed",
             Self::ThreadPanicked => "WASAPI thread panicked during shutdown",
             Self::ShutdownTimeout => "WASAPI shutdown timed out",
         })
@@ -495,6 +497,9 @@ impl WasapiOutputStream {
 
     fn join(&mut self) -> Result<(), WasapiStopError> {
         match self.thread.wait(self.shutdown_timeout) {
+            BackendThreadJoin::Completed if self.status.state() == OutputStreamState::Failed => {
+                Err(WasapiStopError::RuntimeFailed)
+            }
             BackendThreadJoin::Completed => Ok(()),
             BackendThreadJoin::Panicked => Err(WasapiStopError::ThreadPanicked),
             BackendThreadJoin::TimedOut => Err(WasapiStopError::ShutdownTimeout),
@@ -1017,6 +1022,25 @@ mod tests {
         assert_eq!(result, Err(WasapiStopError::ShutdownTimeout));
         assert!(started.elapsed() < Duration::from_secs(1));
         release_sender.send(()).unwrap();
+    }
+
+    #[test]
+    fn completed_runtime_failure_is_not_reported_as_clean_shutdown() {
+        let config = WasapiOutputConfig::try_new(48_000, 64).unwrap();
+        let stream = WasapiOutputStream::start_with_thread_initializer_timeouts(
+            config,
+            |runner| {
+                runner.status.mark_running();
+                let _ = runner.startup.try_send(Ok(()));
+                runner.status.mark_failed();
+                Ok(())
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        assert_eq!(stream.stop(), Err(WasapiStopError::RuntimeFailed));
     }
 
     #[test]

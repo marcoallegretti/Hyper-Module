@@ -264,6 +264,9 @@ impl PipeWireInputStream {
 
     fn join(&mut self) -> Result<(), PipeWireStopError> {
         match self.thread.wait(self.shutdown_timeout) {
+            BackendThreadJoin::Completed if self.status.state() == StreamState::Failed => {
+                Err(PipeWireStopError::RuntimeFailed)
+            }
             BackendThreadJoin::Completed => Ok(()),
             BackendThreadJoin::Panicked => Err(PipeWireStopError::ThreadPanicked),
             BackendThreadJoin::TimedOut => Err(PipeWireStopError::ShutdownTimeout),

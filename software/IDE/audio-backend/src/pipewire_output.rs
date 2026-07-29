@@ -224,6 +224,7 @@ impl Error for PipeWireStartError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PipeWireStopError {
+    RuntimeFailed,
     ThreadPanicked,
     ShutdownTimeout,
 }
@@ -231,6 +232,7 @@ pub enum PipeWireStopError {
 impl fmt::Display for PipeWireStopError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::RuntimeFailed => "PipeWire stream failed before shutdown completed",
             Self::ThreadPanicked => "PipeWire thread panicked during shutdown",
             Self::ShutdownTimeout => "PipeWire shutdown timed out",
         })
@@ -469,6 +471,9 @@ impl PipeWireOutputStream {
 
     fn join(&mut self) -> Result<(), PipeWireStopError> {
         match self.thread.wait(self.shutdown_timeout) {
+            BackendThreadJoin::Completed if self.status.state() == OutputStreamState::Failed => {
+                Err(PipeWireStopError::RuntimeFailed)
+            }
             BackendThreadJoin::Completed => Ok(()),
             BackendThreadJoin::Panicked => Err(PipeWireStopError::ThreadPanicked),
             BackendThreadJoin::TimedOut => Err(PipeWireStopError::ShutdownTimeout),
@@ -889,6 +894,25 @@ mod tests {
         assert_eq!(result, Err(PipeWireStopError::ShutdownTimeout));
         assert!(started.elapsed() < Duration::from_secs(1));
         release_sender.send(()).unwrap();
+    }
+
+    #[test]
+    fn completed_runtime_failure_is_not_reported_as_clean_shutdown() {
+        let config = PipeWireOutputConfig::try_new(48_000, 64).unwrap();
+        let stream = PipeWireOutputStream::start_with_thread_initializer_timeouts(
+            config,
+            |runner| {
+                runner.status.mark_running();
+                let _ = runner.startup.try_send(Ok(()));
+                runner.status.mark_failed();
+                Ok(())
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        assert_eq!(stream.stop(), Err(PipeWireStopError::RuntimeFailed));
     }
 
     #[test]

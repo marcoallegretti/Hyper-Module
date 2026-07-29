@@ -145,7 +145,8 @@ impl StreamStatus {
                 |current| match current {
                     value
                         if value == StreamState::Starting as u8
-                            || value == StreamState::Running as u8 =>
+                            || value == StreamState::Running as u8
+                            || value == StreamState::StopRequested as u8 =>
                     {
                         Some(StreamState::Failed as u8)
                     }
@@ -624,9 +625,9 @@ mod tests {
         stopped.request_stop();
         assert_eq!(stopped.state(), OutputStreamState::StopRequested);
         stopped.mark_failed();
-        assert_eq!(stopped.state(), OutputStreamState::StopRequested);
+        assert_eq!(stopped.state(), OutputStreamState::Failed);
         stopped.mark_stopped();
-        assert_eq!(stopped.state(), OutputStreamState::Stopped);
+        assert_eq!(stopped.state(), OutputStreamState::Failed);
 
         let failed = OutputStreamStatus::default();
         failed.mark_running();

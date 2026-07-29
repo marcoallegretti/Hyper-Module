@@ -78,6 +78,7 @@ impl Error for DesktopOutputStartError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DesktopOutputStopError {
+    RuntimeFailed,
     ThreadPanicked,
     ShutdownTimeout,
 }
@@ -85,6 +86,7 @@ pub enum DesktopOutputStopError {
 impl fmt::Display for DesktopOutputStopError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::RuntimeFailed => "desktop output failed before shutdown completed",
             Self::ThreadPanicked => "desktop output thread panicked during shutdown",
             Self::ShutdownTimeout => "desktop output shutdown timed out",
         })
@@ -111,6 +113,7 @@ impl From<NativeDesktopOutputStartError> for DesktopOutputStartError {
 impl From<NativeDesktopOutputStopError> for DesktopOutputStopError {
     fn from(source: NativeDesktopOutputStopError) -> Self {
         match source {
+            NativeDesktopOutputStopError::RuntimeFailed => Self::RuntimeFailed,
             NativeDesktopOutputStopError::ThreadPanicked => Self::ThreadPanicked,
             NativeDesktopOutputStopError::ShutdownTimeout => Self::ShutdownTimeout,
         }
@@ -242,6 +245,10 @@ pub struct DesktopPlaybackRecovery {
 
 #[derive(Debug)]
 pub enum DesktopPlaybackRecoveryStopError {
+    RuntimeFailed {
+        source: DesktopOutputStopError,
+        recovery: DesktopPlaybackRecovery,
+    },
     ThreadPanicked {
         source: DesktopOutputStopError,
         recovery: DesktopPlaybackRecovery,
@@ -254,6 +261,7 @@ pub enum DesktopPlaybackRecoveryStopError {
 impl DesktopPlaybackRecoveryStopError {
     fn from_stop(source: DesktopOutputStopError, recovery: DesktopPlaybackRecovery) -> Self {
         match source {
+            DesktopOutputStopError::RuntimeFailed => Self::RuntimeFailed { source, recovery },
             DesktopOutputStopError::ThreadPanicked => Self::ThreadPanicked { source, recovery },
             DesktopOutputStopError::ShutdownTimeout => Self::ShutdownTimedOut { source },
         }
@@ -264,7 +272,9 @@ impl DesktopPlaybackRecoveryStopError {
     #[must_use]
     pub const fn recovery(&self) -> Option<&DesktopPlaybackRecovery> {
         match self {
-            Self::ThreadPanicked { recovery, .. } => Some(recovery),
+            Self::RuntimeFailed { recovery, .. } | Self::ThreadPanicked { recovery, .. } => {
+                Some(recovery)
+            }
             Self::ShutdownTimedOut { .. } => None,
         }
     }
@@ -274,7 +284,9 @@ impl DesktopPlaybackRecoveryStopError {
     #[must_use]
     pub fn into_recovery(self) -> Option<DesktopPlaybackRecovery> {
         match self {
-            Self::ThreadPanicked { recovery, .. } => Some(recovery),
+            Self::RuntimeFailed { recovery, .. } | Self::ThreadPanicked { recovery, .. } => {
+                Some(recovery)
+            }
             Self::ShutdownTimedOut { .. } => None,
         }
     }
@@ -286,7 +298,9 @@ impl DesktopPlaybackRecoveryStopError {
 
     fn source_error(&self) -> &DesktopOutputStopError {
         match self {
-            Self::ThreadPanicked { source, .. } | Self::ShutdownTimedOut { source } => source,
+            Self::RuntimeFailed { source, .. }
+            | Self::ThreadPanicked { source, .. }
+            | Self::ShutdownTimedOut { source } => source,
         }
     }
 }
@@ -772,6 +786,23 @@ mod tests {
         };
         let error = DesktopPlaybackRecoveryStopError::from_stop(
             DesktopOutputStopError::ThreadPanicked,
+            recovery,
+        );
+
+        assert!(!error.is_shutdown_timeout());
+        assert!(error.recovery().is_some());
+        assert!(error.into_recovery().is_some());
+    }
+
+    #[test]
+    fn joined_runtime_failure_retains_restart_authority() {
+        let recovery = DesktopPlaybackRecovery {
+            config: DesktopOutputConfig::try_new(48_000, 256).unwrap(),
+            source: None,
+            checkpoint: PlaybackRecoveryCheckpoint::default().snapshot(),
+        };
+        let error = DesktopPlaybackRecoveryStopError::from_stop(
+            DesktopOutputStopError::RuntimeFailed,
             recovery,
         );
 
