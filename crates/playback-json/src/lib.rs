@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 mod automation;
-mod strict;
 
 pub use automation::{
     AutomationChannelParameter, AutomationCompileError, AutomationEvaluationError,
@@ -32,7 +31,7 @@ use hyper_playback_compiler::{
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 
-use crate::strict::{StrictJsonError, StrictJsonErrorKind};
+use hyper_strict_json::{self as strict, StrictJsonError, StrictJsonErrorKind};
 
 const VERSION_1_SAMPLE_RATE_HZ: u32 = 48_000;
 const VERSION_1_TICKS_PER_QUARTER: u64 = 1_920;

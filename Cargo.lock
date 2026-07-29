@@ -356,6 +356,7 @@ dependencies = [
  "hyper-audio-engine",
  "hyper-audio-source",
  "hyper-playback-compiler",
+ "hyper-strict-json",
  "serde",
  "serde_json",
 ]
@@ -368,6 +369,15 @@ dependencies = [
  "hyper-media-cache",
  "hyper-playback-compiler",
  "hyper-playback-json",
+]
+
+[[package]]
+name = "hyper-project-model"
+version = "0.1.0"
+dependencies = [
+ "hyper-strict-json",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -403,6 +413,14 @@ dependencies = [
  "hound",
  "hyper-recording-journal",
  "hyper-recording-transport",
+]
+
+[[package]]
+name = "hyper-strict-json"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

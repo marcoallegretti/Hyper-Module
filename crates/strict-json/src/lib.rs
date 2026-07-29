@@ -1,3 +1,6 @@
+#![doc = "Strict, bounded JSON decoding for Hyper Module data contracts."]
+#![forbid(unsafe_code)]
+
 use core::fmt;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -7,7 +10,7 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StrictJsonErrorKind {
+pub enum StrictJsonErrorKind {
     EmptyDocument,
     DocumentTooLarge,
     Utf8Bom,
@@ -19,14 +22,21 @@ pub(crate) enum StrictJsonErrorKind {
 }
 
 #[derive(Debug)]
-pub(crate) struct StrictJsonError {
+pub struct StrictJsonError {
     pub kind: StrictJsonErrorKind,
     pub line: usize,
     pub column: usize,
     pub message: String,
 }
 
-pub(crate) fn parse<T>(bytes: &[u8], maximum_bytes: usize) -> Result<T, StrictJsonError>
+/// Decodes one complete JSON document after enforcing the shared
+/// interoperable-number, duplicate-name, BOM, and byte-size rules.
+///
+/// # Errors
+///
+/// Returns a classified rejection with the parser location when the document
+/// or requested typed representation is invalid.
+pub fn parse<T>(bytes: &[u8], maximum_bytes: usize) -> Result<T, StrictJsonError>
 where
     T: for<'de> Deserialize<'de>,
 {
