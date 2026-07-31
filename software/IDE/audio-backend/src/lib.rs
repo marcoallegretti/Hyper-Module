@@ -593,6 +593,7 @@ mod playback_session;
 ))]
 pub use playback_session::{
     DesktopOutputStartError, DesktopOutputStopError, DesktopPlaybackRecovery,
+    DesktopPlaybackRecoveryPendingStart, DesktopPlaybackRecoveryPendingWait,
     DesktopPlaybackRecoveryStartError, DesktopPlaybackRecoveryStopError, DesktopPlaybackSession,
     DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
     DesktopPlaybackSessionStartError, DesktopProjectOpenError,

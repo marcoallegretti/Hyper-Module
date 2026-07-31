@@ -4,7 +4,7 @@ use super::pipewire_output::PipeWireThreadRunner;
 use super::wasapi_output::WasapiThreadRunner;
 use super::{
     DesktopOutputConfig, OutputStreamCounters, OutputStreamStatus, PendingNativeShutdown,
-    PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
+    PendingNativeShutdownWait, PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
 };
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::{PipeWireOutputStream, PipeWireStartError, PipeWireStartupStage, PipeWireStopError};
@@ -398,6 +398,9 @@ impl Error for DesktopPlaybackRecoveryStopError {
 pub enum DesktopPlaybackRecoveryStartError {
     OutputNotPinned,
     AlreadyRestarted,
+    CancellationPending {
+        pending: Box<DesktopPlaybackRecoveryPendingStart>,
+    },
     Start(DesktopPlaybackSessionStartError),
 }
 
@@ -410,6 +413,9 @@ impl fmt::Display for DesktopPlaybackRecoveryStartError {
             Self::AlreadyRestarted => {
                 formatter.write_str("desktop playback recovery was already restarted")
             }
+            Self::CancellationPending { .. } => {
+                formatter.write_str("desktop playback restart cancellation is still pending")
+            }
             Self::Start(source) => source.fmt(formatter),
         }
     }
@@ -418,8 +424,72 @@ impl fmt::Display for DesktopPlaybackRecoveryStartError {
 impl Error for DesktopPlaybackRecoveryStartError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::OutputNotPinned | Self::AlreadyRestarted => None,
+            Self::OutputNotPinned | Self::AlreadyRestarted | Self::CancellationPending { .. } => {
+                None
+            }
             Self::Start(source) => Some(source),
+        }
+    }
+}
+
+impl DesktopPlaybackRecoveryStartError {
+    /// Returns the sole pending restart authority when native cancellation has
+    /// not yet completed.
+    #[must_use]
+    pub fn into_pending(self) -> Option<DesktopPlaybackRecoveryPendingStart> {
+        match self {
+            Self::CancellationPending { pending } => Some(*pending),
+            Self::OutputNotPinned | Self::AlreadyRestarted | Self::Start(_) => None,
+        }
+    }
+}
+
+/// Sole restart authority while a cancelled native startup still owns its
+/// output thread.
+///
+/// This value is intentionally not cloneable. A retry becomes available only
+/// after [`Self::wait`] observes terminal native-thread teardown.
+#[derive(Debug)]
+pub struct DesktopPlaybackRecoveryPendingStart {
+    shutdown: PendingNativeShutdown,
+    recovery: DesktopPlaybackRecovery,
+}
+
+/// Result of waiting for a cancellation-pending playback restart.
+#[derive(Debug)]
+pub enum DesktopPlaybackRecoveryPendingWait {
+    Completed(DesktopPlaybackRecovery),
+    Failed(DesktopPlaybackRecovery),
+    Panicked(DesktopPlaybackRecovery),
+    TimedOut(DesktopPlaybackRecoveryPendingStart),
+}
+
+impl DesktopPlaybackRecoveryPendingStart {
+    /// Returns the latest state reported by the native output thread.
+    #[must_use]
+    pub fn status(&self) -> OutputStreamStatus {
+        self.shutdown.status()
+    }
+
+    /// Waits for native teardown while retaining exactly one retry authority.
+    ///
+    /// A timeout returns this pending value. Every terminal result returns the
+    /// recovery value that may create the next output.
+    #[must_use]
+    pub fn wait(mut self, timeout: std::time::Duration) -> DesktopPlaybackRecoveryPendingWait {
+        match self.shutdown.wait(timeout) {
+            PendingNativeShutdownWait::Completed => {
+                DesktopPlaybackRecoveryPendingWait::Completed(self.recovery)
+            }
+            PendingNativeShutdownWait::Failed => {
+                DesktopPlaybackRecoveryPendingWait::Failed(self.recovery)
+            }
+            PendingNativeShutdownWait::Panicked => {
+                DesktopPlaybackRecoveryPendingWait::Panicked(self.recovery)
+            }
+            PendingNativeShutdownWait::TimedOut => {
+                DesktopPlaybackRecoveryPendingWait::TimedOut(self)
+            }
         }
     }
 }
@@ -442,8 +512,9 @@ impl DesktopPlaybackRecovery {
 
     /// Rebuilds playback against the same explicitly selected output.
     ///
-    /// A failed attempt retains restart authority for another try. A successful
-    /// attempt consumes it so the same recovery cannot create parallel outputs.
+    /// A joined failed attempt retains restart authority for another try. A
+    /// successful attempt consumes it. Cancellation pending returns the sole
+    /// authority together with its native-thread monitor.
     ///
     /// # Errors
     ///
@@ -472,16 +543,43 @@ impl DesktopPlaybackRecovery {
         }
         let source = self
             .source
-            .as_ref()
+            .take()
             .ok_or(DesktopPlaybackRecoveryStartError::AlreadyRestarted)?;
         let session = DesktopPlaybackSession::start_source(
-            config,
+            config.clone(),
             source.clone(),
             Some(Box::new(*self.checkpoint)),
-        )
-        .map_err(DesktopPlaybackRecoveryStartError::Start)?;
-        self.source = None;
-        Ok(session)
+        );
+        match session {
+            Ok(session) => Ok(session),
+            Err(error) => Err(self.failed_restart(config, source, error)),
+        }
+    }
+
+    fn failed_restart(
+        &mut self,
+        config: DesktopOutputConfig,
+        source: Arc<dyn DesktopPlaybackSource>,
+        error: DesktopPlaybackSessionStartError,
+    ) -> DesktopPlaybackRecoveryStartError {
+        match error {
+            DesktopPlaybackSessionStartError::Output(
+                DesktopOutputStartError::CancellationPending { shutdown },
+            ) => DesktopPlaybackRecoveryStartError::CancellationPending {
+                pending: Box::new(DesktopPlaybackRecoveryPendingStart {
+                    shutdown: *shutdown,
+                    recovery: DesktopPlaybackRecovery {
+                        config,
+                        source: Some(source),
+                        checkpoint: self.checkpoint.clone(),
+                    },
+                }),
+            },
+            error => {
+                self.source = Some(source);
+                DesktopPlaybackRecoveryStartError::Start(error)
+            }
+        }
     }
 }
 
@@ -578,10 +676,10 @@ impl DesktopPlaybackSession {
                 }
                 Err(_) => Err(DesktopPlaybackSessionStartError::PublicationUnavailable),
             },
-            Err(source) => match failed_build(&publication_receiver) {
-                Some(build) => Err(DesktopPlaybackSessionStartError::Build(build)),
-                None => Err(DesktopPlaybackSessionStartError::Output(source.into())),
-            },
+            Err(source) => Err(classify_output_start_failure(
+                source.into(),
+                &publication_receiver,
+            )),
         }
     }
 
@@ -700,6 +798,19 @@ fn failed_build(
         Ok(SessionPublication::Failed(source)) => Some(source),
         Ok(SessionPublication::Prepared(_))
         | Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+    }
+}
+
+fn classify_output_start_failure(
+    output: DesktopOutputStartError,
+    receiver: &Receiver<SessionPublication>,
+) -> DesktopPlaybackSessionStartError {
+    if matches!(output, DesktopOutputStartError::CancellationPending { .. }) {
+        DesktopPlaybackSessionStartError::Output(output)
+    } else if let Some(build) = failed_build(receiver) {
+        DesktopPlaybackSessionStartError::Build(build)
+    } else {
+        DesktopPlaybackSessionStartError::Output(output)
     }
 }
 
@@ -855,10 +966,41 @@ fn callback_error(detail: String) -> NativeDesktopOutputStartError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BoundedBackendThread;
     use hyper_audio_source::DecodeLimits;
     use hyper_media_cache::CacheLimits;
     use hyper_playback_json::LoaderLimits;
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
+    use std::sync::mpsc::SyncSender;
+    use std::thread;
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct UnusedPlaybackSource;
+
+    impl DesktopPlaybackSource for UnusedPlaybackSource {
+        fn session(&self) -> &PreparedPlaybackSession {
+            unreachable!("the authority-state fixture never builds a playback session")
+        }
+
+        fn project(&self) -> Option<&PreparedProjectPlayback> {
+            None
+        }
+    }
+
+    fn pending_shutdown_fixture() -> (PendingNativeShutdown, SyncSender<()>) {
+        let (release_sender, release_receiver) = sync_channel(1);
+        let (completed_sender, completed_receiver) = sync_channel(1);
+        let handle = thread::spawn(move || {
+            release_receiver.recv().unwrap();
+            completed_sender.send(()).unwrap();
+        });
+        let thread = BoundedBackendThread::new(handle, completed_receiver);
+        (
+            PendingNativeShutdown::new(thread, OutputStreamStatus::default()),
+            release_sender,
+        )
+    }
 
     fn project_limits() -> ProjectPlaybackLimits {
         ProjectPlaybackLimits {
@@ -939,6 +1081,113 @@ mod tests {
                 output: 48_000,
             })
         ));
+    }
+
+    #[test]
+    fn cancellation_pending_precedes_a_published_build_failure() {
+        let (publication_sender, publication_receiver) = sync_channel(1);
+        publication_sender
+            .send(SessionPublication::Failed(
+                DesktopPlaybackSessionBuildError::SampleRateMismatch {
+                    project: 44_100,
+                    output: 48_000,
+                },
+            ))
+            .unwrap();
+        let (shutdown, release) = pending_shutdown_fixture();
+
+        let error = classify_output_start_failure(
+            DesktopOutputStartError::CancellationPending {
+                shutdown: Box::new(shutdown),
+            },
+            &publication_receiver,
+        );
+        let DesktopPlaybackSessionStartError::Output(
+            DesktopOutputStartError::CancellationPending { mut shutdown },
+        ) = error
+        else {
+            panic!("pending native ownership must take precedence")
+        };
+        release.send(()).unwrap();
+        assert_eq!(
+            shutdown.wait(Duration::from_secs(1)),
+            PendingNativeShutdownWait::Completed
+        );
+    }
+
+    #[test]
+    fn pending_restart_moves_and_returns_the_only_retry_authority() {
+        let pinned = DesktopOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_routing_id("opaque-route")
+            .unwrap();
+        let source: Arc<dyn DesktopPlaybackSource> = Arc::new(UnusedPlaybackSource);
+        let mut original = DesktopPlaybackRecovery {
+            config: pinned.clone(),
+            source: None,
+            checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
+        };
+        let (shutdown, release) = pending_shutdown_fixture();
+
+        let error = original.failed_restart(
+            pinned,
+            source,
+            DesktopPlaybackSessionStartError::Output(
+                DesktopOutputStartError::CancellationPending {
+                    shutdown: Box::new(shutdown),
+                },
+            ),
+        );
+        assert!(matches!(
+            original.restart(),
+            Err(DesktopPlaybackRecoveryStartError::AlreadyRestarted)
+        ));
+        let pending = error
+            .into_pending()
+            .expect("pending cancellation must retain retry authority");
+        let pending = match pending.wait(Duration::from_millis(1)) {
+            DesktopPlaybackRecoveryPendingWait::TimedOut(pending) => pending,
+            other => panic!("unreleased native thread cannot be terminal: {other:?}"),
+        };
+
+        release.send(()).unwrap();
+        let recovered = match pending.wait(Duration::from_secs(1)) {
+            DesktopPlaybackRecoveryPendingWait::Completed(recovery) => recovery,
+            other => panic!("released native thread must return authority: {other:?}"),
+        };
+        assert!(recovered.source.is_some());
+        assert!(matches!(
+            original.restart(),
+            Err(DesktopPlaybackRecoveryStartError::AlreadyRestarted)
+        ));
+    }
+
+    #[test]
+    fn joined_restart_failure_restores_retry_authority_in_place() {
+        let pinned = DesktopOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_routing_id("opaque-route")
+            .unwrap();
+        let source: Arc<dyn DesktopPlaybackSource> = Arc::new(UnusedPlaybackSource);
+        let mut recovery = DesktopPlaybackRecovery {
+            config: pinned.clone(),
+            source: None,
+            checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
+        };
+
+        let error = recovery.failed_restart(
+            pinned,
+            source,
+            DesktopPlaybackSessionStartError::PublicationUnavailable,
+        );
+
+        assert!(matches!(
+            error,
+            DesktopPlaybackRecoveryStartError::Start(
+                DesktopPlaybackSessionStartError::PublicationUnavailable
+            )
+        ));
+        assert!(recovery.source.is_some());
     }
 
     #[test]
