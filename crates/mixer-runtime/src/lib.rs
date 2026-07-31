@@ -422,17 +422,17 @@ impl MixerParameterStateSnapshot {
     }
 
     #[must_use]
-    pub const fn layout_signature(self) -> [u8; 32] {
+    pub const fn layout_signature(&self) -> [u8; 32] {
         self.layout_signature
     }
 
     #[must_use]
-    pub const fn channel_count(self) -> usize {
+    pub const fn channel_count(&self) -> usize {
         self.channel_count
     }
 
     #[must_use]
-    pub const fn channel(self, index: usize) -> Option<MixerChannelParameterState> {
+    pub const fn channel(&self, index: usize) -> Option<MixerChannelParameterState> {
         if index < self.channel_count {
             Some(self.channels[index])
         } else {
@@ -441,12 +441,12 @@ impl MixerParameterStateSnapshot {
     }
 
     #[must_use]
-    pub const fn main_gain(self) -> LinearGain {
+    pub const fn main_gain(&self) -> LinearGain {
         self.main_gain
     }
 
     #[must_use]
-    pub const fn main_muted(self) -> bool {
+    pub const fn main_muted(&self) -> bool {
         self.main_muted
     }
 }
@@ -1217,20 +1217,20 @@ pub struct InterleavedTransportCycle {
 
 impl InterleavedTransportCycle {
     #[must_use]
-    pub const fn snapshot(self) -> OutputMeterSnapshot {
+    pub const fn snapshot(&self) -> OutputMeterSnapshot {
         self.snapshot
     }
 
     #[must_use]
-    pub const fn publication(self) -> OutputMeterPublication {
+    pub const fn publication(&self) -> OutputMeterPublication {
         self.publication
     }
 
     /// Returns the newly committed base state when this callback applied mixer
     /// commands. Callbacks without mixer changes omit the duplicate snapshot.
     #[must_use]
-    pub const fn mixer_parameter_state(self) -> Option<MixerParameterStateSnapshot> {
-        self.mixer_parameter_state
+    pub const fn mixer_parameter_state(&self) -> Option<&MixerParameterStateSnapshot> {
+        self.mixer_parameter_state.as_ref()
     }
 }
 

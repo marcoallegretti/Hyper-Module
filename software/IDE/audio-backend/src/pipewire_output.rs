@@ -335,14 +335,17 @@ impl PipeWireThreadRunner {
             |output: &mut [f32]| {
                 pending_cycle.set(None);
                 processor.process(output).map(|rendered| {
-                    pending_cycle.set(Some(rendered.snapshot().cycle()));
+                    pending_cycle.set(Some((
+                        rendered.snapshot().cycle(),
+                        rendered.mixer_parameter_state().copied(),
+                    )));
                 })
             },
             || {
-                let cycle = pending_cycle
+                let (cycle, mixer_parameter_state) = pending_cycle
                     .take()
                     .expect("a rendered PipeWire block has a pending recovery cycle");
-                checkpoint.publish_cycle(cycle);
+                checkpoint.publish_cycle(cycle, mixer_parameter_state.as_ref());
             },
         )
     }

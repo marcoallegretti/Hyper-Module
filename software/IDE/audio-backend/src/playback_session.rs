@@ -18,10 +18,10 @@ use core::fmt;
 use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_media_cache::PreparePlaybackError;
 use hyper_mixer_runtime::{
-    LoudnessCommandSender, MixerParameterCommandSender, OutputMeterReceiver, RoutedMainRuntime,
-    RoutedTransportRuntime, RuntimeCreationError, TransportCommandSender,
-    TransportOutputCreationError, TransportOutputProcessor, loudness_command_channel,
-    output_meter_channel,
+    LoudnessCommandSender, MixerParameterCommandSender, MixerParameterStateRestoreError,
+    OutputMeterReceiver, RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError,
+    TransportCommandSender, TransportOutputCreationError, TransportOutputProcessor,
+    loudness_command_channel, output_meter_channel,
 };
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
@@ -180,6 +180,7 @@ pub enum DesktopPlaybackSessionBuildError {
     Playback(AdapterCompileError),
     Media(PreparePlaybackError),
     Runtime(RuntimeCreationError),
+    MixerRecovery(MixerParameterStateRestoreError),
     ScratchCapacityUnavailable,
     Output(TransportOutputCreationError),
 }
@@ -197,6 +198,9 @@ impl fmt::Display for DesktopPlaybackSessionBuildError {
             Self::Playback(source) => write!(formatter, "playback compilation failed: {source}"),
             Self::Media(source) => write!(formatter, "media preparation failed: {source}"),
             Self::Runtime(source) => write!(formatter, "runtime construction failed: {source}"),
+            Self::MixerRecovery(source) => {
+                write!(formatter, "mixer recovery failed: {source}")
+            }
             Self::ScratchCapacityUnavailable => {
                 formatter.write_str("render scratch capacity is unavailable")
             }
@@ -213,6 +217,7 @@ impl Error for DesktopPlaybackSessionBuildError {
             Self::Playback(source) => Some(source),
             Self::Media(source) => Some(source),
             Self::Runtime(source) => Some(source),
+            Self::MixerRecovery(source) => Some(source),
             Self::Output(source) => Some(source),
             Self::SampleRateMismatch { .. }
             | Self::AssetFactCapacityUnavailable
@@ -312,7 +317,7 @@ pub struct DesktopPlaybackSession {
 pub struct DesktopPlaybackRecovery {
     config: DesktopOutputConfig,
     source: Option<Arc<dyn DesktopPlaybackSource>>,
-    checkpoint: PlaybackRecoverySnapshot,
+    checkpoint: Box<PlaybackRecoverySnapshot>,
 }
 
 #[derive(Debug)]
@@ -422,7 +427,7 @@ impl Error for DesktopPlaybackRecoveryStartError {
 impl DesktopPlaybackRecovery {
     #[must_use]
     pub const fn checkpoint(&self) -> PlaybackRecoverySnapshot {
-        self.checkpoint
+        *self.checkpoint
     }
 
     /// Returns the verified project retained for a future restart, when this
@@ -469,9 +474,12 @@ impl DesktopPlaybackRecovery {
             .source
             .as_ref()
             .ok_or(DesktopPlaybackRecoveryStartError::AlreadyRestarted)?;
-        let session =
-            DesktopPlaybackSession::start_source(config, source.clone(), Some(self.checkpoint))
-                .map_err(DesktopPlaybackRecoveryStartError::Start)?;
+        let session = DesktopPlaybackSession::start_source(
+            config,
+            source.clone(),
+            Some(Box::new(*self.checkpoint)),
+        )
+        .map_err(DesktopPlaybackRecoveryStartError::Start)?;
         self.source = None;
         Ok(session)
     }
@@ -535,7 +543,7 @@ impl DesktopPlaybackSession {
     fn start_source(
         config: DesktopOutputConfig,
         source: Arc<dyn DesktopPlaybackSource>,
-        initial_checkpoint: Option<PlaybackRecoverySnapshot>,
+        initial_checkpoint: Option<Box<PlaybackRecoverySnapshot>>,
     ) -> Result<Self, DesktopPlaybackSessionStartError> {
         let sample_rate_hz = config.sample_rate_hz();
         let maximum_block_frames = config.maximum_block_frames();
@@ -548,7 +556,7 @@ impl DesktopPlaybackSession {
                     thread_source.session(),
                     sample_rate_hz,
                     maximum_block_frames,
-                    initial_checkpoint,
+                    initial_checkpoint.as_deref(),
                     &publication_sender,
                 )
             });
@@ -646,7 +654,7 @@ impl DesktopPlaybackSession {
         let recovery = DesktopPlaybackRecovery {
             config,
             source: Some(source),
-            checkpoint: recovery.snapshot(),
+            checkpoint: Box::new(recovery.snapshot()),
         };
         match stop_result {
             Ok(()) => Ok(recovery),
@@ -700,7 +708,7 @@ fn initialize_session(
     input: &DesktopPlaybackSessionInput,
     sample_rate_hz: u32,
     maximum_block_frames: usize,
-    initial_checkpoint: Option<PlaybackRecoverySnapshot>,
+    initial_checkpoint: Option<&PlaybackRecoverySnapshot>,
     publication: &SyncSender<SessionPublication>,
 ) -> Result<(), NativeDesktopOutputStartError> {
     let (project, mixer, automation, media) = input.parts();
@@ -763,6 +771,12 @@ fn initialize_session(
         RoutedTransportRuntime::with_command_queues(runtime);
     if let Some(checkpoint) = initial_checkpoint {
         transport.apply_command(checkpoint.restore_command());
+        if let Some(mixer_parameter_state) = checkpoint.mixer_parameter_state() {
+            transport
+                .restore_mixer_parameter_state(&mixer_parameter_state)
+                .map_err(DesktopPlaybackSessionBuildError::MixerRecovery)
+                .or_else(|source| fail_build(publication, source))?;
+        }
     }
     let (mut meter_sender, meters) = output_meter_channel();
     let (loudness_commands, loudness_command_receiver) = loudness_command_channel();
@@ -956,7 +970,7 @@ mod tests {
         let mut spent = DesktopPlaybackRecovery {
             config: pinned,
             source: None,
-            checkpoint: PlaybackRecoveryCheckpoint::default().snapshot(),
+            checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
         };
         assert!(matches!(
             spent.restart(),
@@ -969,7 +983,7 @@ mod tests {
         let recovery = DesktopPlaybackRecovery {
             config: DesktopOutputConfig::try_new(48_000, 256).unwrap(),
             source: None,
-            checkpoint: PlaybackRecoveryCheckpoint::default().snapshot(),
+            checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
         };
         let error = DesktopPlaybackRecoveryStopError::from_stop(
             DesktopOutputStopError::ShutdownTimeout,
@@ -986,7 +1000,7 @@ mod tests {
         let recovery = DesktopPlaybackRecovery {
             config: DesktopOutputConfig::try_new(48_000, 256).unwrap(),
             source: None,
-            checkpoint: PlaybackRecoveryCheckpoint::default().snapshot(),
+            checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
         };
         let error = DesktopPlaybackRecoveryStopError::from_stop(
             DesktopOutputStopError::ThreadPanicked,
@@ -1003,7 +1017,7 @@ mod tests {
         let recovery = DesktopPlaybackRecovery {
             config: DesktopOutputConfig::try_new(48_000, 256).unwrap(),
             source: None,
-            checkpoint: PlaybackRecoveryCheckpoint::default().snapshot(),
+            checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
         };
         let error = DesktopPlaybackRecoveryStopError::from_stop(
             DesktopOutputStopError::RuntimeFailed,
