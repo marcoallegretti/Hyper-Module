@@ -1267,7 +1267,7 @@ async function probeInstalledBundle(
     "bundle requires a newer runtime version",
   );
   assert.equal(
-    await probe({ bundle_path: bundlePath, manifest: installed.manifest }),
+    await probe({ manifest: installed.manifest }),
     true,
     "runtime health probe rejected the bundle",
   );

@@ -204,7 +204,11 @@ try {
   const healthConfirmed7 = await resolveStartupDeployment(
     healthTarget,
     "1.0.0",
-    async () => true,
+    async (authority) => {
+      assert.deepEqual(Object.keys(authority), ["manifest"]);
+      assert(Object.isFrozen(authority.manifest));
+      return true;
+    },
   );
   assert.equal(healthConfirmed7.state.generation, 2);
   assert.equal(healthConfirmed7.state.active.status, "healthy");
