@@ -416,6 +416,26 @@ impl JournalWriter {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Consumes this writer and publishes WAV from the still-locked journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer is poisoned, the journal is empty or
+    /// corrupt, publication conflicts, allocation fails, or I/O fails.
+    pub fn publish_wav(
+        mut self,
+        final_path: impl AsRef<Path>,
+    ) -> Result<PublishedRecording, JournalError> {
+        if self.poisoned {
+            return Err(JournalError::WriterPoisoned);
+        }
+        self.file.flush()?;
+        let journal_path = self.path.clone();
+        let journal = self.file.get_mut();
+        let report = recover_file(journal)?;
+        publish_locked_wav(&journal_path, journal, final_path.as_ref(), report)
+    }
 }
 
 /// Verifies committed chunks and durably removes an incomplete trailing chunk.
@@ -523,6 +543,15 @@ pub fn publish_wav(
     let final_path = final_path.as_ref();
     let mut journal_lock = open_locked(journal_path)?;
     let report = recover_file(&mut journal_lock)?;
+    publish_locked_wav(journal_path, &mut journal_lock, final_path, report)
+}
+
+fn publish_locked_wav(
+    journal_path: &Path,
+    journal_lock: &mut File,
+    final_path: &Path,
+    report: RecoveryReport,
+) -> Result<PublishedRecording, JournalError> {
     if report.frames == 0 {
         return Err(JournalError::InvalidJournal(
             "an empty recording cannot be published",
@@ -557,7 +586,7 @@ pub fn publish_wav(
             return Err(JournalError::StagingConflict(staging_path));
         }
     } else {
-        write_staging_wav(&mut journal_lock, &staging_path, report)?;
+        write_staging_wav(journal_lock, &staging_path, report)?;
         if verify_wav(&staging_path, report).is_none() {
             return Err(JournalError::StagingConflict(staging_path));
         }

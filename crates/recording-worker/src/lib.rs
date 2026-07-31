@@ -1,8 +1,6 @@
 #![doc = "Owned non-real-time recording persistence workers."]
 
-use hyper_recording_journal::{
-    JournalConfig, JournalError, JournalWriter, PublishedRecording, publish_wav,
-};
+use hyper_recording_journal::{JournalConfig, JournalError, JournalWriter, PublishedRecording};
 use hyper_recording_transport::{
     RECORDING_CHANNELS, RecordingConsumer, RecordingDrainError, RecordingTransportSnapshot,
     RecordingWakeRegistrationError,
@@ -529,8 +527,7 @@ fn run_worker(
                     },
                 );
             }
-            drop(writer);
-            return match publish_wav(&journal_path, final_wav_path) {
+            return match writer.publish_wav(final_wav_path) {
                 Ok(recording) => RecordingWorkerCompletion::Published(recording),
                 Err(error) => failed(frames, journal_path, error.into()),
             };

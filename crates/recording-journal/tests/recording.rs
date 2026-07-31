@@ -246,6 +246,42 @@ fn publishes_exact_float_wav_and_is_idempotent() {
 }
 
 #[test]
+fn owned_writer_publication_uses_the_locked_journal_after_path_replacement() {
+    let directory = TestDirectory::new();
+    let journal = directory.join("take.journal");
+    let displaced = directory.join("displaced.journal");
+    let replacement = directory.join("replacement.journal");
+    let wav = directory.join("take.wav");
+    let expected = [0.25_f32, -0.25_f32];
+    let mut writer = JournalWriter::create(&journal, config()).unwrap();
+    writer.append(&expected).unwrap();
+
+    let mut replacement_writer = JournalWriter::create(&replacement, config()).unwrap();
+    replacement_writer.append(&[0.75, -0.75]).unwrap();
+    drop(replacement_writer);
+    fs::rename(&journal, &displaced).unwrap();
+    fs::rename(&replacement, &journal).unwrap();
+
+    let published = writer.publish_wav(&wav).unwrap();
+    assert_eq!(published.frames(), 1);
+    let decoded = hound::WavReader::open(&wav)
+        .unwrap()
+        .samples::<f32>()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        decoded
+            .iter()
+            .map(|sample| sample.to_bits())
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|sample| sample.to_bits())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn resumes_a_verified_staging_file_after_interruption() {
     let directory = TestDirectory::new();
     let journal = directory.join("take.journal");
