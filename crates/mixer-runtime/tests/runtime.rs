@@ -9,8 +9,9 @@ use hyper_mixer_runtime::{
     MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, OutputMeterPublication,
     OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot, PreparedPlaybackMainRuntime,
     PreparedPlaybackTransportRuntime, RuntimeCreationError, RuntimeProcessError,
-    RuntimeProjectComponent, TransportCommand, TransportCommandSendError, TransportCycle,
-    TransportOutputCreationError, TransportOutputProcessor, TransportState, output_meter_channel,
+    RuntimeProjectComponent, SamplePeakBallisticsConfig, StereoSamplePeakBallistics,
+    TransportCommand, TransportCommandSendError, TransportCycle, TransportOutputCreationError,
+    TransportOutputProcessor, TransportState, output_meter_channel,
 };
 
 use common::{fixture, graph_fixture, playback_fixture};
@@ -47,6 +48,10 @@ fn assert_meter_delivery_and_backpressure(
     assert_eq!(first_read.coalesced_snapshot_count(), 0);
     assert_eq!(first_read.dropped_snapshot_count(), 0);
     assert!(!first_read.sender_disconnected());
+    assert_eq!(
+        first_snapshot.processed_frame_end(),
+        u64::try_from(first_snapshot.meter().frame_count()).unwrap()
+    );
 
     for _ in 0..MAX_QUEUED_OUTPUT_METER_SNAPSHOTS {
         let report = transport
@@ -58,7 +63,11 @@ fn assert_meter_delivery_and_backpressure(
         .process_interleaved_cycle(callback, scratch, interleaved, meter_sender)
         .unwrap();
     assert_eq!(full.publication(), OutputMeterPublication::QueueFull);
-    let latest = meter_receiver.read_latest();
+    let mut ballistics = StereoSamplePeakBallistics::new(
+        SamplePeakBallisticsConfig::try_new(48_000, -90.0, 13.3, 0).unwrap(),
+    );
+    let ballistic_read = meter_receiver.read_ballistics(&mut ballistics);
+    let latest = ballistic_read.latest();
     assert!(latest.snapshot().is_some());
     assert_eq!(
         latest.coalesced_snapshot_count(),
@@ -66,15 +75,44 @@ fn assert_meter_delivery_and_backpressure(
     );
     assert_eq!(latest.dropped_snapshot_count(), 0);
     assert!(!latest.sender_disconnected());
+    assert!(!ballistic_read.ballistics_reset());
+    assert_eq!(
+        ballistic_read.ballistics().unwrap().processed_frame_end(),
+        latest.snapshot().unwrap().processed_frame_end()
+    );
+    let frame_count = u64::try_from(full.snapshot().meter().frame_count()).unwrap();
+    assert_eq!(
+        full.snapshot().processed_frame_end(),
+        latest
+            .snapshot()
+            .unwrap()
+            .processed_frame_end()
+            .saturating_add(frame_count)
+    );
 
     let recovered = transport
         .process_interleaved_cycle(callback, scratch, interleaved, meter_sender)
         .unwrap();
     assert_eq!(recovered.publication(), OutputMeterPublication::Published);
     assert_eq!(recovered.snapshot().dropped_before(), 1);
-    let recovery_read = meter_receiver.read_latest();
+    assert_eq!(
+        recovered.snapshot().processed_frame_end(),
+        full.snapshot()
+            .processed_frame_end()
+            .saturating_add(frame_count)
+    );
+    let recovery_ballistics = meter_receiver.read_ballistics(&mut ballistics);
+    let recovery_read = recovery_ballistics.latest();
     assert_eq!(recovery_read.snapshot(), Some(recovered.snapshot()));
     assert_eq!(recovery_read.dropped_snapshot_count(), 1);
+    assert_eq!(
+        recovery_ballistics
+            .ballistics()
+            .unwrap()
+            .processed_frame_end(),
+        recovered.snapshot().processed_frame_end()
+    );
+    assert!(!recovery_ballistics.ballistics_reset());
 
     drop(meter_receiver);
     let disconnected = transport

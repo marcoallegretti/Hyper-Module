@@ -3,7 +3,7 @@
 
 use core::error::Error;
 use core::fmt;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 use hyper_arrangement_renderer::{
     ArrangementRenderer, PlaybackRenderError, PlaybackRenderer, PlaybackRendererCreationError,
@@ -23,10 +23,25 @@ use hyper_playback_json::{
 };
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 
+mod meter_ballistics;
+pub use meter_ballistics::{
+    ChannelSamplePeakBallistics, SamplePeakBallisticsConfig, SamplePeakBallisticsConfigError,
+    StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot,
+};
+
 pub const MAX_MAIN_MIXER_SLOTS: usize = 8;
 pub const MAX_QUEUED_TRANSPORT_COMMANDS: usize = 64;
 pub const MAX_QUEUED_OUTPUT_METER_SNAPSHOTS: usize = 64;
 const MAX_SENDS_PER_SLOT: usize = 2;
+static NEXT_OUTPUT_METER_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_output_meter_channel_id() -> u64 {
+    NEXT_OUTPUT_METER_CHANNEL_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("output meter channel identity space exhausted")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeProjectComponent {
@@ -294,6 +309,7 @@ impl TransportCycle {
 pub struct OutputMeterSnapshot {
     cycle: TransportCycle,
     meter: StereoBlockMeter,
+    processed_frame_end: u64,
     dropped_before: usize,
 }
 
@@ -306,6 +322,13 @@ impl OutputMeterSnapshot {
     #[must_use]
     pub const fn meter(self) -> StereoBlockMeter {
         self.meter
+    }
+
+    /// Successful output frames processed since this meter channel was
+    /// created, including frames whose snapshots could not be queued.
+    #[must_use]
+    pub const fn processed_frame_end(self) -> u64 {
+        self.processed_frame_end
     }
 
     /// Snapshots rejected by a full queue since the preceding successful
@@ -348,6 +371,7 @@ impl Error for OutputMeterPublishError {}
 #[derive(Debug)]
 pub struct OutputMeterSender {
     producer: Producer<OutputMeterSnapshot>,
+    processed_frame_end: u64,
     dropped_snapshot_count: usize,
 }
 
@@ -374,10 +398,17 @@ impl OutputMeterSender {
     /// Returns the snapshot if the queue is full or its receiver has been
     /// destroyed. A full queue increments a local saturating counter that is
     /// attached to the next successfully published snapshot.
+    #[allow(
+        clippy::result_large_err,
+        reason = "returning the fixed-size snapshot preserves ownership without a real-time allocation"
+    )]
     pub fn try_publish(
         &mut self,
         mut snapshot: OutputMeterSnapshot,
     ) -> Result<OutputMeterSnapshot, OutputMeterPublishError> {
+        let frame_count = u64::try_from(snapshot.meter().frame_count()).unwrap_or(u64::MAX);
+        self.processed_frame_end = self.processed_frame_end.saturating_add(frame_count);
+        snapshot.processed_frame_end = self.processed_frame_end;
         if self.is_disconnected() {
             return Err(OutputMeterPublishError::Disconnected(snapshot));
         }
@@ -430,6 +461,7 @@ impl LatestOutputMeterSnapshot {
 #[derive(Debug)]
 pub struct OutputMeterReceiver {
     consumer: Consumer<OutputMeterSnapshot>,
+    channel_id: u64,
 }
 
 impl OutputMeterReceiver {
@@ -445,6 +477,42 @@ impl OutputMeterReceiver {
     /// was full. Both counts are explicit and independent.
     #[must_use]
     pub fn read_latest(&mut self) -> LatestOutputMeterSnapshot {
+        self.drain_with(|_| {})
+    }
+
+    /// Drains every available snapshot through one persistent sample-peak
+    /// ballistic state and returns the newest raw and ballistic values.
+    ///
+    /// Delivered snapshots that are coalesced from the raw result still update
+    /// the ballistic state in FIFO order. Queue-rejected snapshots cannot
+    /// contribute their peak values; their count remains explicit in the raw
+    /// result, while the processed-frame clock preserves elapsed falloff time.
+    /// Once a display uses this method, it must not consume intervening
+    /// snapshots through [`Self::read_latest`].
+    #[must_use]
+    pub fn read_ballistics(
+        &mut self,
+        ballistics: &mut StereoSamplePeakBallistics,
+    ) -> OutputMeterBallisticsRead {
+        let mut latest_ballistics = None;
+        let mut ballistics_reset = false;
+        let channel_id = self.channel_id;
+        let latest = self.drain_with(|snapshot| {
+            let update = ballistics.update(channel_id, snapshot);
+            ballistics_reset |= update.ballistics_reset();
+            latest_ballistics = Some(update.snapshot());
+        });
+        OutputMeterBallisticsRead {
+            latest,
+            ballistics: latest_ballistics,
+            ballistics_reset,
+        }
+    }
+
+    fn drain_with(
+        &mut self,
+        mut observe: impl FnMut(OutputMeterSnapshot),
+    ) -> LatestOutputMeterSnapshot {
         let mut snapshot = None;
         let mut delivered_snapshot_count = 0_usize;
         let mut dropped_snapshot_count = 0_usize;
@@ -453,6 +521,7 @@ impl OutputMeterReceiver {
                 break;
             };
             dropped_snapshot_count = dropped_snapshot_count.saturating_add(next.dropped_before());
+            observe(next);
             snapshot = Some(next);
             delivered_snapshot_count += 1;
         }
@@ -469,16 +538,48 @@ impl OutputMeterReceiver {
     }
 }
 
+/// Result of one bounded receiver drain with sample-peak ballistics applied.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OutputMeterBallisticsRead {
+    latest: LatestOutputMeterSnapshot,
+    ballistics: Option<StereoSamplePeakBallisticsSnapshot>,
+    ballistics_reset: bool,
+}
+
+impl OutputMeterBallisticsRead {
+    #[must_use]
+    pub const fn latest(self) -> LatestOutputMeterSnapshot {
+        self.latest
+    }
+
+    #[must_use]
+    pub const fn ballistics(self) -> Option<StereoSamplePeakBallisticsSnapshot> {
+        self.ballistics
+    }
+
+    /// True when reused state observed a different meter channel or a
+    /// regressed frame clock and reset before applying the next snapshot.
+    #[must_use]
+    pub const fn ballistics_reset(self) -> bool {
+        self.ballistics_reset
+    }
+}
+
 /// Allocates the fixed output meter queue before callback processing starts.
 #[must_use]
 pub fn output_meter_channel() -> (OutputMeterSender, OutputMeterReceiver) {
     let (producer, consumer) = RingBuffer::new(MAX_QUEUED_OUTPUT_METER_SNAPSHOTS);
+    let channel_id = next_output_meter_channel_id();
     (
         OutputMeterSender {
             producer,
+            processed_frame_end: 0,
             dropped_snapshot_count: 0,
         },
-        OutputMeterReceiver { consumer },
+        OutputMeterReceiver {
+            consumer,
+            channel_id,
+        },
     )
 }
 
@@ -1646,6 +1747,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         let snapshot = OutputMeterSnapshot {
             cycle,
             meter,
+            processed_frame_end: 0,
             dropped_before: 0,
         };
         let (snapshot, publication) = match meter_sender.try_publish(snapshot) {
