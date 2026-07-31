@@ -10,10 +10,10 @@ use hyper_mixer_runtime::{
     GraphTransportRuntime, LocateState, LoudnessCommandSendError, LoudnessCommandSender,
     LoudnessDisplayUnit, MAX_QUEUED_LOUDNESS_COMMANDS, MAX_QUEUED_MIXER_PARAMETER_COMMANDS,
     MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, MixerParameterCommand,
-    MixerParameterCommandSendError, MixerParameterResolveError, MixerParameterTargetError,
-    OutputMeterPublication, OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot,
-    PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime, RuntimeCreationError,
-    RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig,
+    MixerParameterCommandSendError, MixerParameterResolveError, MixerParameterStateRestoreError,
+    MixerParameterTargetError, OutputMeterPublication, OutputMeterReceiver, OutputMeterSender,
+    OutputMeterSnapshot, PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime,
+    RuntimeCreationError, RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig,
     StereoSamplePeakBallistics, TransportCommand, TransportCommandSendError, TransportCycle,
     TransportOutputCreationError, TransportOutputProcessor, TransportState,
     loudness_command_channel, output_meter_channel,
@@ -1132,6 +1132,216 @@ fn live_mixer_commands_apply_while_stopped_and_without_a_block_ramp() {
 }
 
 #[test]
+fn committed_mixer_snapshot_restores_exact_base_state_to_the_same_layout() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (_transport_sender, mut parameter_sender, mut transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+    let source = parameter_sender.resolve_channel("source").unwrap();
+    let send_a = parameter_sender.resolve_send("send-a").unwrap();
+    let gain = LinearGain::new(0.75).unwrap();
+    let pan = Pan::new(0.25).unwrap();
+    let send_gain = LinearGain::new(0.625).unwrap();
+    let send_pan = Pan::new(-0.375).unwrap();
+    let main_gain = LinearGain::new(0.5).unwrap();
+    for command in [
+        MixerParameterCommand::ChannelGain {
+            channel: source,
+            gain,
+        },
+        MixerParameterCommand::ChannelPan {
+            channel: source,
+            pan,
+        },
+        MixerParameterCommand::ChannelMute {
+            channel: source,
+            muted: true,
+        },
+        MixerParameterCommand::ChannelSolo {
+            channel: source,
+            solo: true,
+        },
+        MixerParameterCommand::SendGain {
+            send: send_a,
+            gain: send_gain,
+        },
+        MixerParameterCommand::SendPan {
+            send: send_a,
+            pan: send_pan,
+        },
+        MixerParameterCommand::SendEnabled {
+            send: send_a,
+            enabled: false,
+        },
+        MixerParameterCommand::MainGain { gain: main_gain },
+        MixerParameterCommand::MainMute { muted: true },
+    ] {
+        parameter_sender.try_send(command).unwrap();
+    }
+    let mut left = [9.0_f32; 1];
+    let mut right = [9.0_f32; 1];
+
+    let cycle = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(cycle.applied_mixer_parameter_command_count(), 9);
+    let snapshot = transport.mixer_parameter_state();
+    assert_eq!(snapshot.channel_count(), 5);
+    let source_state = snapshot.channel(0).unwrap();
+    assert_eq!(source_state.parameters().gain, gain);
+    assert_eq!(source_state.parameters().pan, pan);
+    assert!(source_state.muted());
+    assert!(source_state.solo());
+    assert_eq!(source_state.send_count(), 2);
+    let send_state = source_state.send(0).unwrap();
+    assert_eq!(send_state.parameters().gain, send_gain);
+    assert_eq!(send_state.parameters().pan, send_pan);
+    assert!(!send_state.enabled());
+    assert_eq!(source_state.send(2), None);
+    assert_eq!(snapshot.main_gain(), main_gain);
+    assert!(snapshot.main_muted());
+    assert_eq!(
+        process_transport(&mut transport, &mut left, &mut right)
+            .unwrap()
+            .applied_mixer_parameter_command_count(),
+        0
+    );
+
+    let replacement_runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (_replacement_transport_sender, mut replacement_parameter_sender, mut replacement) =
+        GraphTransportRuntime::with_command_queues(replacement_runtime);
+    let replacement_source = replacement_parameter_sender
+        .resolve_channel("source")
+        .unwrap();
+    assert_ne!(source, replacement_source);
+    replacement
+        .restore_mixer_parameter_state(&snapshot)
+        .unwrap();
+    replacement_parameter_sender
+        .try_send(MixerParameterCommand::MainMute { muted: false })
+        .unwrap();
+    process_transport(&mut replacement, &mut left, &mut right).unwrap();
+    let restored = replacement.mixer_parameter_state();
+    assert_eq!(restored.channel(0), snapshot.channel(0));
+    assert_eq!(restored.main_gain(), main_gain);
+    assert!(!restored.main_muted());
+}
+
+#[test]
+fn interleaved_cycle_carries_mixer_state_only_when_controls_changed() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 1).unwrap();
+    let (_transport_sender, mut parameter_sender, mut transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+    let mut callback = InterleavedStereoCallback::try_new(1, 48_000).unwrap();
+    let mut scratch_left = [[0.0_f32; 1]; 5];
+    let mut scratch_right = [[0.0_f32; 1]; 5];
+    let [left_0, left_1, left_2, left_3, left_4] = &mut scratch_left;
+    let [right_0, right_1, right_2, right_3, right_4] = &mut scratch_right;
+    let mut scratch = [
+        RenderScratchSlot::new(left_0, right_0),
+        RenderScratchSlot::new(left_1, right_1),
+        RenderScratchSlot::new(left_2, right_2),
+        RenderScratchSlot::new(left_3, right_3),
+        RenderScratchSlot::new(left_4, right_4),
+    ];
+    let (mut meter_sender, _meter_receiver) = output_meter_channel();
+    let mut interleaved = [0.0_f32; 2];
+    parameter_sender
+        .try_send(MixerParameterCommand::MainMute { muted: true })
+        .unwrap();
+
+    let changed = transport
+        .process_interleaved_cycle(
+            &mut callback,
+            &mut scratch,
+            &mut interleaved,
+            &mut meter_sender,
+        )
+        .unwrap();
+    assert!(changed.mixer_parameter_state().unwrap().main_muted());
+
+    let unchanged = transport
+        .process_interleaved_cycle(
+            &mut callback,
+            &mut scratch,
+            &mut interleaved,
+            &mut meter_sender,
+        )
+        .unwrap();
+    assert_eq!(unchanged.mixer_parameter_state(), None);
+}
+
+#[test]
+fn mixer_snapshot_layout_mismatch_is_rejected_without_partial_restoration() {
+    let source_fixture = graph_fixture();
+    let source_prepared = source_fixture
+        .cache
+        .prepare_schedule(&source_fixture.schedule)
+        .unwrap();
+    let source_runtime =
+        GraphMainRuntime::try_new(&source_prepared, &source_fixture.mixer, 1).unwrap();
+    let (_source_transport_sender, mut source_parameter_sender, mut source_transport) =
+        GraphTransportRuntime::with_command_queues(source_runtime);
+    source_parameter_sender
+        .try_send(MixerParameterCommand::MainMute { muted: true })
+        .unwrap();
+    let mut source_left = [0.0_f32; 1];
+    let mut source_right = [0.0_f32; 1];
+    process_transport(&mut source_transport, &mut source_left, &mut source_right).unwrap();
+    let foreign = source_transport.mixer_parameter_state();
+
+    let target_fixture = playback_fixture();
+    let target_graph = target_fixture.compile_playback();
+    let target_prepared = target_fixture
+        .cache
+        .prepare_playback(&target_graph)
+        .unwrap();
+    let target_runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback(
+        &target_prepared,
+        &target_fixture.mixer,
+        1,
+    )
+    .unwrap();
+    let (_target_transport_sender, mut target_parameter_sender, mut target_transport) =
+        PreparedPlaybackTransportRuntime::with_command_queues(target_runtime);
+    let mut target_left = [0.0_f32; 1];
+    let mut target_right = [0.0_f32; 1];
+    target_parameter_sender
+        .try_send(MixerParameterCommand::MainMute { muted: false })
+        .unwrap();
+    target_transport
+        .process_cycle(
+            &mut [],
+            StereoOutput {
+                left: &mut target_left,
+                right: &mut target_right,
+            },
+        )
+        .unwrap();
+    let baseline = target_transport.mixer_parameter_state();
+
+    assert_eq!(
+        target_transport.restore_mixer_parameter_state(&foreign),
+        Err(MixerParameterStateRestoreError::LayoutMismatch)
+    );
+    target_parameter_sender
+        .try_send(MixerParameterCommand::MainMute { muted: false })
+        .unwrap();
+    target_transport
+        .process_cycle(
+            &mut [],
+            StereoOutput {
+                left: &mut target_left,
+                right: &mut target_right,
+            },
+        )
+        .unwrap();
+    let after_rejection = target_transport.mixer_parameter_state();
+    assert_eq!(after_rejection, baseline);
+}
+
+#[test]
 fn every_live_mixer_parameter_domain_changes_the_resolved_graph() {
     let commands = [
         LiveMixerCommandKind::ChannelGain,
@@ -1243,6 +1453,7 @@ fn interleaved_callback_executes_the_transport_runtime() {
             &mut meter_sender,
         )
         .unwrap();
+    assert_eq!(reported.mixer_parameter_state(), None);
     let snapshot = reported.snapshot();
     let cycle = snapshot.cycle();
     let meter = snapshot.meter();

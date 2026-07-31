@@ -23,6 +23,7 @@ use hyper_playback_json::{
     CompiledMixerGraph, CompiledMixerTap, CompiledMixerTrackKind,
 };
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
+use sha2::{Digest, Sha256};
 
 mod loudness_presentation;
 mod meter_ballistics;
@@ -36,11 +37,12 @@ pub use meter_ballistics::{
 };
 
 pub const MAX_MAIN_MIXER_SLOTS: usize = 8;
+pub const MAX_MIXER_SENDS_PER_SLOT: usize = 2;
 pub const MAX_QUEUED_TRANSPORT_COMMANDS: usize = 64;
 pub const MAX_QUEUED_MIXER_PARAMETER_COMMANDS: usize = 64;
 pub const MAX_QUEUED_LOUDNESS_COMMANDS: usize = 32;
 pub const MAX_QUEUED_OUTPUT_METER_SNAPSHOTS: usize = 64;
-const MAX_SENDS_PER_SLOT: usize = 2;
+const MIXER_PARAMETER_LAYOUT_SIGNATURE_VERSION: &[u8] = b"hyper-mixer-parameter-layout-v1";
 static NEXT_OUTPUT_METER_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MIXER_PARAMETER_LAYOUT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -285,6 +287,183 @@ pub enum MixerParameterCommand {
     },
 }
 
+/// Base parameters for one send in a recoverable mixer-state snapshot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MixerSendParameterState {
+    parameters: ChannelParameters,
+    enabled: bool,
+}
+
+impl Eq for MixerSendParameterState {}
+
+impl MixerSendParameterState {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn from_recovery_parts(parameters: ChannelParameters, enabled: bool) -> Self {
+        Self {
+            parameters,
+            enabled,
+        }
+    }
+
+    #[must_use]
+    pub const fn parameters(self) -> ChannelParameters {
+        self.parameters
+    }
+
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        self.enabled
+    }
+}
+
+/// Base parameters for one channel in a recoverable mixer-state snapshot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MixerChannelParameterState {
+    parameters: ChannelParameters,
+    muted: bool,
+    solo: bool,
+    sends: [MixerSendParameterState; MAX_MIXER_SENDS_PER_SLOT],
+    send_count: usize,
+}
+
+impl Eq for MixerChannelParameterState {}
+
+impl MixerChannelParameterState {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn from_recovery_parts(
+        parameters: ChannelParameters,
+        muted: bool,
+        solo: bool,
+        sends: [MixerSendParameterState; MAX_MIXER_SENDS_PER_SLOT],
+        send_count: usize,
+    ) -> Option<Self> {
+        if send_count <= MAX_MIXER_SENDS_PER_SLOT {
+            Some(Self {
+                parameters,
+                muted,
+                solo,
+                sends,
+                send_count,
+            })
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn parameters(self) -> ChannelParameters {
+        self.parameters
+    }
+
+    #[must_use]
+    pub const fn muted(self) -> bool {
+        self.muted
+    }
+
+    #[must_use]
+    pub const fn solo(self) -> bool {
+        self.solo
+    }
+
+    #[must_use]
+    pub const fn send_count(self) -> usize {
+        self.send_count
+    }
+
+    #[must_use]
+    pub const fn send(self, index: usize) -> Option<MixerSendParameterState> {
+        if index < self.send_count {
+            Some(self.sends[index])
+        } else {
+            None
+        }
+    }
+}
+
+/// Exact live mixer base state bound to one compiled parameter layout.
+///
+/// The layout signature is derived from persisted project, channel, route, and
+/// send identities. It is stable when the same mixer graph is rebuilt but does
+/// not make runtime-local command handles transferable between runtimes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MixerParameterStateSnapshot {
+    layout_signature: [u8; 32],
+    channels: [MixerChannelParameterState; MAX_MAIN_MIXER_SLOTS],
+    channel_count: usize,
+    main_gain: LinearGain,
+    main_muted: bool,
+}
+
+impl Eq for MixerParameterStateSnapshot {}
+
+impl MixerParameterStateSnapshot {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn from_recovery_parts(
+        layout_signature: [u8; 32],
+        channels: [MixerChannelParameterState; MAX_MAIN_MIXER_SLOTS],
+        channel_count: usize,
+        main_gain: LinearGain,
+        main_muted: bool,
+    ) -> Option<Self> {
+        if channel_count <= MAX_MAIN_MIXER_SLOTS {
+            Some(Self {
+                layout_signature,
+                channels,
+                channel_count,
+                main_gain,
+                main_muted,
+            })
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn layout_signature(self) -> [u8; 32] {
+        self.layout_signature
+    }
+
+    #[must_use]
+    pub const fn channel_count(self) -> usize {
+        self.channel_count
+    }
+
+    #[must_use]
+    pub const fn channel(self, index: usize) -> Option<MixerChannelParameterState> {
+        if index < self.channel_count {
+            Some(self.channels[index])
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn main_gain(self) -> LinearGain {
+        self.main_gain
+    }
+
+    #[must_use]
+    pub const fn main_muted(self) -> bool {
+        self.main_muted
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MixerParameterStateRestoreError {
+    LayoutMismatch,
+}
+
+impl fmt::Display for MixerParameterStateRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("mixer parameter snapshot belongs to a different compiled layout")
+    }
+}
+
+impl Error for MixerParameterStateRestoreError {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MixerParameterResolveError {
     ChannelNotFound,
@@ -374,6 +553,7 @@ impl Error for MixerParameterCommandSendError {
 #[derive(Debug)]
 struct MixerParameterLayout {
     id: u64,
+    signature: [u8; 32],
     channels: Vec<MixerParameterChannelLayout>,
 }
 
@@ -1032,6 +1212,7 @@ pub enum OutputMeterPublication {
 pub struct InterleavedTransportCycle {
     snapshot: OutputMeterSnapshot,
     publication: OutputMeterPublication,
+    mixer_parameter_state: Option<MixerParameterStateSnapshot>,
 }
 
 impl InterleavedTransportCycle {
@@ -1043,6 +1224,13 @@ impl InterleavedTransportCycle {
     #[must_use]
     pub const fn publication(self) -> OutputMeterPublication {
         self.publication
+    }
+
+    /// Returns the newly committed base state when this callback applied mixer
+    /// commands. Callbacks without mixer changes omit the duplicate snapshot.
+    #[must_use]
+    pub const fn mixer_parameter_state(self) -> Option<MixerParameterStateSnapshot> {
+        self.mixer_parameter_state
     }
 }
 
@@ -1238,7 +1426,7 @@ struct MainOverrides {
 #[derive(Clone, Copy, Debug, Default)]
 struct FrameOverrides {
     channels: [ChannelOverrides; MAX_MAIN_MIXER_SLOTS],
-    sends: [[SendOverrides; MAX_SENDS_PER_SLOT]; MAX_MAIN_MIXER_SLOTS],
+    sends: [[SendOverrides; MAX_MIXER_SENDS_PER_SLOT]; MAX_MAIN_MIXER_SLOTS],
     main: MainOverrides,
     mismatch: bool,
 }
@@ -1384,6 +1572,7 @@ pub struct RoutedMainRuntime<R> {
     master_controls: Vec<LinearGain>,
     automation: Option<CompiledAutomation>,
     parameter_layout: Option<MixerParameterLayout>,
+    parameter_layout_signature: [u8; 32],
     live_parameters_enabled: bool,
     max_block_frames: usize,
 }
@@ -1605,6 +1794,7 @@ fn build_routed_main_runtime<R>(
     let slot_count = compiled.slots().len();
     let control_frame_count = max_block_frames;
     let parameter_layout = build_mixer_parameter_layout(compiled)?;
+    let parameter_layout_signature = parameter_layout.signature;
     let mut slots = Vec::new();
     slots
         .try_reserve_exact(slot_count)
@@ -1673,6 +1863,7 @@ fn build_routed_main_runtime<R>(
         master_controls: try_filled(control_frame_count, compiled.master_gain())?,
         automation,
         parameter_layout: Some(parameter_layout),
+        parameter_layout_signature,
         live_parameters_enabled: false,
         max_block_frames,
     })
@@ -1682,6 +1873,7 @@ fn build_mixer_parameter_layout(
     compiled: &CompiledMixerGraph,
 ) -> Result<MixerParameterLayout, RuntimeCreationError> {
     let layout_id = next_mixer_parameter_layout_id();
+    let signature = mixer_parameter_layout_signature(compiled);
     let mut channels = Vec::new();
     channels
         .try_reserve_exact(compiled.slots().len())
@@ -1710,8 +1902,46 @@ fn build_mixer_parameter_layout(
     }
     Ok(MixerParameterLayout {
         id: layout_id,
+        signature,
         channels,
     })
+}
+
+fn mixer_parameter_layout_signature(compiled: &CompiledMixerGraph) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hash_identity(&mut hasher, MIXER_PARAMETER_LAYOUT_SIGNATURE_VERSION);
+    hash_identity(&mut hasher, compiled.project_id().as_bytes());
+    hasher.update((compiled.slots().len() as u64).to_le_bytes());
+    for slot in compiled.slots() {
+        hash_identity(&mut hasher, slot.track_id().as_bytes());
+        hasher.update([match slot.kind() {
+            CompiledMixerTrackKind::Audio => 0,
+            CompiledMixerTrackKind::Group => 1,
+            CompiledMixerTrackKind::Return => 2,
+        }]);
+        match slot.destination() {
+            CompiledMixerDestination::Main => hasher.update([0]),
+            CompiledMixerDestination::Slot(target) => {
+                hasher.update([1]);
+                hasher.update((target as u64).to_le_bytes());
+            }
+        }
+        hasher.update((slot.sends().len() as u64).to_le_bytes());
+        for send in slot.sends() {
+            hash_identity(&mut hasher, send.id().as_bytes());
+            hasher.update((send.target_slot() as u64).to_le_bytes());
+            hasher.update([match send.tap() {
+                CompiledMixerTap::PreFader => 0,
+                CompiledMixerTap::PostFader => 1,
+            }]);
+        }
+    }
+    hasher.finalize().into()
+}
+
+fn hash_identity(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 fn try_runtime_identity(value: &str) -> Result<String, RuntimeCreationError> {
@@ -1780,37 +2010,70 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
         }
     }
 
-    fn capture_parameter_state(&self) -> MixerParameterState {
-        let default = ChannelParameters::new(LinearGain::UNITY, Pan::CENTER, true);
-        let mut state = MixerParameterState {
-            channel_parameters: [default; MAX_MAIN_MIXER_SLOTS],
-            muted: [false; MAX_MAIN_MIXER_SLOTS],
-            solo: [false; MAX_MAIN_MIXER_SLOTS],
-            send_parameters: [[default; MAX_SENDS_PER_SLOT]; MAX_MAIN_MIXER_SLOTS],
-            send_enabled: [[false; MAX_SENDS_PER_SLOT]; MAX_MAIN_MIXER_SLOTS],
+    fn capture_parameter_state(&self) -> MixerParameterStateSnapshot {
+        let parameters = ChannelParameters::new(LinearGain::UNITY, Pan::CENTER, true);
+        let send = MixerSendParameterState {
+            parameters,
+            enabled: false,
+        };
+        let channel = MixerChannelParameterState {
+            parameters,
+            muted: false,
+            solo: false,
+            sends: [send; MAX_MIXER_SENDS_PER_SLOT],
+            send_count: 0,
+        };
+        let mut state = MixerParameterStateSnapshot {
+            layout_signature: self.parameter_layout_signature,
+            channels: [channel; MAX_MAIN_MIXER_SLOTS],
+            channel_count: self.slots.len(),
             main_gain: self.main_gain,
             main_muted: self.main_muted,
         };
         for (slot_index, slot) in self.slots.iter().enumerate() {
-            state.channel_parameters[slot_index] = slot.parameters;
-            state.muted[slot_index] = slot.muted;
-            state.solo[slot_index] = slot.solo;
+            let channel = &mut state.channels[slot_index];
+            channel.parameters = slot.parameters;
+            channel.muted = slot.muted;
+            channel.solo = slot.solo;
+            channel.send_count = slot.sends.len();
             for (send_index, send) in slot.sends.iter().enumerate() {
-                state.send_parameters[slot_index][send_index] = send.parameters;
-                state.send_enabled[slot_index][send_index] = send.enabled;
+                channel.sends[send_index] = MixerSendParameterState {
+                    parameters: send.parameters,
+                    enabled: send.enabled,
+                };
             }
         }
         state
     }
 
-    fn restore_parameter_state(&mut self, state: &MixerParameterState) {
+    fn restore_parameter_state(
+        &mut self,
+        state: &MixerParameterStateSnapshot,
+    ) -> Result<(), MixerParameterStateRestoreError> {
+        if state.layout_signature != self.parameter_layout_signature
+            || state.channel_count != self.slots.len()
+            || self
+                .slots
+                .iter()
+                .enumerate()
+                .any(|(index, slot)| state.channels[index].send_count != slot.sends.len())
+        {
+            return Err(MixerParameterStateRestoreError::LayoutMismatch);
+        }
+        self.restore_parameter_state_unchecked(state);
+        Ok(())
+    }
+
+    fn restore_parameter_state_unchecked(&mut self, state: &MixerParameterStateSnapshot) {
         for (slot_index, slot) in self.slots.iter_mut().enumerate() {
-            slot.parameters = state.channel_parameters[slot_index];
-            slot.muted = state.muted[slot_index];
-            slot.solo = state.solo[slot_index];
+            let channel = state.channels[slot_index];
+            slot.parameters = channel.parameters;
+            slot.muted = channel.muted;
+            slot.solo = channel.solo;
             for (send_index, send) in slot.sends.iter_mut().enumerate() {
-                send.parameters = state.send_parameters[slot_index][send_index];
-                send.enabled = state.send_enabled[slot_index][send_index];
+                let recovered_send = channel.sends[send_index];
+                send.parameters = recovered_send.parameters;
+                send.enabled = recovered_send.enabled;
             }
         }
         self.main_gain = state.main_gain;
@@ -1924,7 +2187,7 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
 
             let mut muted = [false; MAX_MAIN_MIXER_SLOTS];
             let mut solo = [false; MAX_MAIN_MIXER_SLOTS];
-            let mut send_enabled = [[false; MAX_SENDS_PER_SLOT]; MAX_MAIN_MIXER_SLOTS];
+            let mut send_enabled = [[false; MAX_MIXER_SENDS_PER_SLOT]; MAX_MAIN_MIXER_SLOTS];
             for (slot_index, slot) in self.slots.iter_mut().enumerate() {
                 let channel = overrides.channels[slot_index];
                 let gain = automated_gain(channel.gain, slot.parameters.gain)?;
@@ -2116,17 +2379,6 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct MixerParameterState {
-    channel_parameters: [ChannelParameters; MAX_MAIN_MIXER_SLOTS],
-    muted: [bool; MAX_MAIN_MIXER_SLOTS],
-    solo: [bool; MAX_MAIN_MIXER_SLOTS],
-    send_parameters: [[ChannelParameters; MAX_SENDS_PER_SLOT]; MAX_MAIN_MIXER_SLOTS],
-    send_enabled: [[bool; MAX_SENDS_PER_SLOT]; MAX_MAIN_MIXER_SLOTS],
-    main_gain: LinearGain,
-    main_muted: bool,
-}
-
 /// Single-owner transport state for the routed main-output engine.
 ///
 /// Transport commands can be applied synchronously or through an optional
@@ -2234,6 +2486,30 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         self.runtime.slot_count()
     }
 
+    /// Restores a previously committed live mixer base-state snapshot.
+    ///
+    /// Runtime-local channel and send handles are intentionally unaffected;
+    /// callers must resolve fresh handles from the replacement runtime's
+    /// [`MixerParameterCommandSender`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MixerParameterStateRestoreError::LayoutMismatch`] before any
+    /// state changes when the snapshot was captured from another compiled
+    /// mixer layout.
+    pub fn restore_mixer_parameter_state(
+        &mut self,
+        snapshot: &MixerParameterStateSnapshot,
+    ) -> Result<(), MixerParameterStateRestoreError> {
+        self.runtime.restore_parameter_state(snapshot)
+    }
+
+    /// Captures the current live mixer base state without allocation or locks.
+    #[must_use]
+    pub fn mixer_parameter_state(&self) -> MixerParameterStateSnapshot {
+        self.runtime.capture_parameter_state()
+    }
+
     /// Applies one transport command for the next process cycle.
     pub fn apply_command(&mut self, command: TransportCommand) {
         match command {
@@ -2325,7 +2601,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 self.state = committed_state;
                 self.position_frame = committed_position;
                 self.runtime.seek(committed_position);
-                self.runtime.restore_parameter_state(&committed_parameters);
+                self.runtime
+                    .restore_parameter_state_unchecked(&committed_parameters);
                 return Err(source);
             }
         };
@@ -2384,6 +2661,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             self.process_cycle(scratch, output)
         })?;
         let (cycle, meter) = processed.into_parts();
+        let mixer_parameter_state = (cycle.applied_mixer_parameter_command_count() > 0)
+            .then(|| self.runtime.capture_parameter_state());
         let snapshot = OutputMeterSnapshot {
             cycle,
             meter,
@@ -2404,6 +2683,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         Ok(InterleavedTransportCycle {
             snapshot,
             publication,
+            mixer_parameter_state,
         })
     }
 

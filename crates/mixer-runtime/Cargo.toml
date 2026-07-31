@@ -12,6 +12,7 @@ hyper-media-cache = { path = "../media-cache" }
 hyper-playback-compiler = { path = "../playback-compiler" }
 hyper-playback-json = { path = "../playback-json" }
 rtrb = "=0.3.4"
+sha2 = "=0.10.9"
 
 [dev-dependencies]
 hyper-audio-source = { path = "../audio-source" }

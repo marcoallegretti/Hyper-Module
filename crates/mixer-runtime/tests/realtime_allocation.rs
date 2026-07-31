@@ -224,7 +224,16 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
     assert!(parameter_result.is_ok_and(|result| result.is_ok()));
     assert!(loudness_result.is_ok());
     assert!(first_result.is_ok());
+    assert!(
+        first_result
+            .as_ref()
+            .is_ok_and(|cycle| cycle.mixer_parameter_state().is_some())
+    );
     assert!(loudness_presentation.is_some());
-    assert!(second_result.is_ok());
+    assert!(
+        second_result
+            .as_ref()
+            .is_ok_and(|cycle| cycle.mixer_parameter_state().is_none())
+    );
     assert_eq!(heap_operations, 0);
 }

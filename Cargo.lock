@@ -393,6 +393,7 @@ dependencies = [
  "hyper-playback-compiler",
  "hyper-playback-json",
  "rtrb",
+ "sha2",
 ]
 
 [[package]]
