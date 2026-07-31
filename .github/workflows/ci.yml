@@ -55,10 +55,16 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint all targets and features
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Test workspace
         run: cargo test --workspace --all-targets --locked
+
+      - name: Build optimized workspace
+        run: cargo build --workspace --all-targets --locked --release
+
+      - name: Test optimized audio paths
+        run: cargo test --locked --release -p hyper-audio-engine -p hyper-mixer-runtime -p hyper-desktop-audio
 
       - name: Test live PipeWire output
         if: runner.os == 'Linux'
