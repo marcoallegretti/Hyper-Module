@@ -552,6 +552,16 @@ fn publish_locked_wav(
     final_path: &Path,
     report: RecoveryReport,
 ) -> Result<PublishedRecording, JournalError> {
+    publish_locked_wav_observed(journal_path, journal_lock, final_path, report, |_| {})
+}
+
+fn publish_locked_wav_observed(
+    journal_path: &Path,
+    journal_lock: &mut File,
+    final_path: &Path,
+    report: RecoveryReport,
+    before_link: impl FnOnce(&Path),
+) -> Result<PublishedRecording, JournalError> {
     if report.frames == 0 {
         return Err(JournalError::InvalidJournal(
             "an empty recording cannot be published",
@@ -581,22 +591,21 @@ fn publish_locked_wav(
         ));
     }
 
-    if staging_path.exists() {
-        if verify_wav(&staging_path, report).is_none() {
-            return Err(JournalError::StagingConflict(staging_path));
-        }
+    let staging_authority = if staging_path.exists() {
+        verify_wav_authority(&staging_path, report)
+            .ok_or_else(|| JournalError::StagingConflict(staging_path.clone()))?
     } else {
         write_staging_wav(journal_lock, &staging_path, report)?;
-        if verify_wav(&staging_path, report).is_none() {
-            return Err(JournalError::StagingConflict(staging_path));
-        }
-    }
+        verify_wav_authority(&staging_path, report)
+            .ok_or_else(|| JournalError::StagingConflict(staging_path.clone()))?
+    };
 
-    match fs::hard_link(&staging_path, final_path) {
+    before_link(&staging_path);
+    match hard_link_verified(&staging_authority.handle, &staging_path, final_path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             if let Some(verified) = verify_wav(final_path, report) {
-                fs::remove_file(&staging_path)?;
+                remove_staging_if_owned(staging_authority, &staging_path)?;
                 sync_published(final_path)?;
                 return Ok(published_recording(
                     journal_path,
@@ -612,10 +621,17 @@ fn publish_locked_wav(
         }
         Err(error) => return Err(error.into()),
     }
-    sync_published(final_path)?;
+    if !matches!(Handle::from_path(final_path), Ok(published) if published == staging_authority.handle)
+    {
+        remove_created_link(final_path)?;
+        return Err(JournalError::PublishedRecordingConflict(
+            final_path.to_owned(),
+        ));
+    }
+    sync_parent(final_path)?;
     let verified = verify_wav(final_path, report)
         .ok_or_else(|| JournalError::PublishedRecordingConflict(final_path.to_owned()))?;
-    fs::remove_file(&staging_path)?;
+    remove_staging_if_owned(staging_authority, &staging_path)?;
     sync_parent(final_path)?;
     Ok(published_recording(
         journal_path,
@@ -630,6 +646,11 @@ fn publish_locked_wav(
 struct VerifiedWav {
     byte_length: u64,
     sha256: [u8; 32],
+}
+
+struct VerifiedWavAuthority {
+    verified: VerifiedWav,
+    handle: Handle,
 }
 
 fn published_recording(
@@ -925,19 +946,32 @@ fn visit_payloads(
 }
 
 fn verify_wav(path: &Path, report: RecoveryReport) -> Option<VerifiedWav> {
-    verify_wav_observed(path, report, || {})
+    verify_wav_authority(path, report).map(|authority| authority.verified)
 }
 
+#[cfg(test)]
 fn verify_wav_observed(
     path: &Path,
     report: RecoveryReport,
     after_samples: impl FnOnce(),
 ) -> Option<VerifiedWav> {
+    verify_wav_authority_observed(path, report, after_samples).map(|authority| authority.verified)
+}
+
+fn verify_wav_authority(path: &Path, report: RecoveryReport) -> Option<VerifiedWavAuthority> {
+    verify_wav_authority_observed(path, report, || {})
+}
+
+fn verify_wav_authority_observed(
+    path: &Path,
+    report: RecoveryReport,
+    after_samples: impl FnOnce(),
+) -> Option<VerifiedWavAuthority> {
     let path_before = fs::symlink_metadata(path).ok()?;
     if is_link_like(&path_before) || !path_before.is_file() {
         return None;
     }
-    let mut handle = Handle::from_path(path).ok()?;
+    let mut handle = open_verification_handle(path).ok()?;
     let file_before = handle.as_file().metadata().ok()?;
     if !file_before.is_file()
         || file_before.len() != path_before.len()
@@ -968,7 +1002,64 @@ fn verify_wav_observed(
     {
         return None;
     }
-    Some(after)
+    Some(VerifiedWavAuthority {
+        verified: after,
+        handle,
+    })
+}
+
+#[cfg(not(windows))]
+fn open_verification_handle(path: &Path) -> io::Result<Handle> {
+    Handle::from_path(path)
+}
+
+#[cfg(windows)]
+fn open_verification_handle(path: &Path) -> io::Result<Handle> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const FILE_SHARE_DELETE: u32 = 4;
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)?;
+    Handle::from_file(file)
+}
+
+fn remove_created_link(path: &Path) -> Result<(), JournalError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn hard_link_verified(source: &Handle, _source_path: &Path, final_path: &Path) -> io::Result<()> {
+    use rustix::fs::{AtFlags, CWD, linkat};
+    use std::os::fd::AsRawFd;
+
+    let source_path = format!("/proc/self/fd/{}", source.as_raw_fd());
+    linkat(CWD, source_path, CWD, final_path, AtFlags::SYMLINK_FOLLOW)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn hard_link_verified(_source: &Handle, source_path: &Path, final_path: &Path) -> io::Result<()> {
+    fs::hard_link(source_path, final_path)
+}
+
+fn remove_staging_if_owned(
+    authority: VerifiedWavAuthority,
+    staging_path: &Path,
+) -> Result<(), JournalError> {
+    let owned = Handle::from_path(staging_path).is_ok_and(|current| current == authority.handle);
+    drop(authority);
+    if owned {
+        fs::remove_file(staging_path)?;
+    }
+    Ok(())
 }
 
 fn verify_wav_samples(file: &mut File, report: RecoveryReport) -> bool {
@@ -1179,13 +1270,17 @@ mod tests {
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
-    #[test]
-    fn wav_verification_rejects_a_byte_identical_path_replacement() {
-        let root = std::env::temp_dir().join(format!(
-            "hyper-wav-identity-{}-{}",
+    fn test_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "hyper-{label}-{}-{}",
             std::process::id(),
             NEXT_TEST.fetch_add(1, Ordering::Relaxed)
-        ));
+        ))
+    }
+
+    #[test]
+    fn wav_verification_rejects_a_byte_identical_path_replacement() {
+        let root = test_root("wav-identity");
         fs::create_dir(&root).unwrap();
         let path = root.join("take.wav");
         let replacement = root.join("replacement.wav");
@@ -1225,6 +1320,93 @@ mod tests {
         });
 
         assert!(verified.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_links_the_verified_file_when_the_staging_path_is_replaced() {
+        let root = test_root("staging-publication");
+        fs::create_dir(&root).unwrap();
+        let journal = root.join("take.journal");
+        let final_path = root.join("take.wav");
+        let staging = root.join(".take.wav.hyper-staging");
+        let displaced = root.join("displaced.wav");
+        let replacement = root.join("replacement.wav");
+        let samples = [0.25_f32, -0.25_f32];
+        let config = JournalConfig {
+            sample_rate: 48_000,
+            max_chunk_frames: 1,
+            max_total_frames: 1,
+        };
+        let mut writer = JournalWriter::create(&journal, config).unwrap();
+        writer.append(&samples).unwrap();
+        drop(writer);
+        fs::write(&replacement, b"foreign staging data").unwrap();
+        let mut journal_lock = open_locked(&journal).unwrap();
+        let report = recover_file(&mut journal_lock).unwrap();
+
+        let published =
+            publish_locked_wav_observed(&journal, &mut journal_lock, &final_path, report, |_| {
+                fs::rename(&staging, &displaced).unwrap();
+                fs::rename(&replacement, &staging).unwrap();
+            })
+            .unwrap();
+
+        assert_eq!(published.outcome(), PublicationOutcome::Published);
+        let decoded = hound::WavReader::open(&final_path)
+            .unwrap()
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|sample| sample.to_bits())
+                .collect::<Vec<_>>(),
+            samples
+                .iter()
+                .map(|sample| sample.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(fs::read(&staging).unwrap(), b"foreign staging data");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_removes_a_link_to_a_replaced_staging_file() {
+        let root = test_root("staging-publication");
+        fs::create_dir(&root).unwrap();
+        let journal = root.join("take.journal");
+        let final_path = root.join("take.wav");
+        let staging = root.join(".take.wav.hyper-staging");
+        let displaced = root.join("displaced.wav");
+        let replacement = root.join("replacement.wav");
+        let config = JournalConfig {
+            sample_rate: 48_000,
+            max_chunk_frames: 1,
+            max_total_frames: 1,
+        };
+        let mut writer = JournalWriter::create(&journal, config).unwrap();
+        writer.append(&[0.25, -0.25]).unwrap();
+        drop(writer);
+        fs::write(&replacement, b"foreign staging data").unwrap();
+        let mut journal_lock = open_locked(&journal).unwrap();
+        let report = recover_file(&mut journal_lock).unwrap();
+
+        let result =
+            publish_locked_wav_observed(&journal, &mut journal_lock, &final_path, report, |_| {
+                fs::rename(&staging, &displaced).unwrap();
+                fs::rename(&replacement, &staging).unwrap();
+            });
+
+        assert!(matches!(
+            result,
+            Err(JournalError::PublishedRecordingConflict(path)) if path == final_path
+        ));
+        assert!(!final_path.exists());
+        assert_eq!(fs::read(&staging).unwrap(), b"foreign staging data");
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -469,6 +469,7 @@ dependencies = [
  "hound",
  "hyper-recording-transport",
  "junction",
+ "rustix",
  "same-file",
  "sha2",
 ]
