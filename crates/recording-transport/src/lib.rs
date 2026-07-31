@@ -330,6 +330,10 @@ impl RecordingConsumer {
                 samples: output.len(),
             });
         }
+        // Observe producer closure before sampling the final write index. When
+        // closure is visible, its acquire ordering makes every preceding push
+        // visible to the occupancy read below.
+        let producer_closed = !self.inner.write_is_held();
         let available_samples = self.inner.occupied_len();
         let sample_count = available_samples.min(output.len());
         debug_assert_eq!(sample_count % RECORDING_CHANNELS, 0);
@@ -339,7 +343,7 @@ impl RecordingConsumer {
         RecordingTransportCounters::add(&self.counters.state.drained_frames, frames);
         Ok(RecordingDrain {
             frames,
-            producer_closed: !self.inner.write_is_held(),
+            producer_closed,
         })
     }
 

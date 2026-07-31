@@ -95,10 +95,14 @@ fn abort_waits_for_producer_closure_and_preserves_only_the_journal() {
     producer.push(&[0.5, -0.5]).unwrap();
     drop(producer);
 
-    assert!(matches!(
-        worker.wait(WAIT).unwrap(),
-        RecordingWorkerCompletion::Aborted { frames: 2, .. }
-    ));
+    let completion = worker.wait(WAIT).unwrap();
+    assert!(
+        matches!(
+            completion,
+            RecordingWorkerCompletion::Aborted { frames: 2, .. }
+        ),
+        "unexpected completion: {completion:?}"
+    );
     assert_eq!(recover(journal).unwrap().frames, 2);
     assert!(!wav.exists());
 }
