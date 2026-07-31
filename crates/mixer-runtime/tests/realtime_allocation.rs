@@ -203,8 +203,13 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
 
     let measurement = HeapMeasurement::start_verified();
     let start_result = command_sender.try_send(TransportCommand::Start);
-    let parameter_result =
-        mixer_parameter_sender.try_send(MixerParameterCommand::MainMute { muted: false });
+    let channel_result = mixer_parameter_sender.resolve_channel("arrangement-track");
+    let parameter_result = channel_result.map(|channel| {
+        mixer_parameter_sender.try_send(MixerParameterCommand::ChannelMute {
+            channel,
+            muted: false,
+        })
+    });
     let loudness_result = loudness_sender.try_send(LoudnessMeasurementCommand::Reset);
     let first_result = processor.process(&mut first);
     let loudness_presentation = first_result.as_ref().ok().map(|cycle| {
@@ -216,7 +221,7 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
     let heap_operations = measurement.finish();
 
     assert!(start_result.is_ok());
-    assert!(parameter_result.is_ok());
+    assert!(parameter_result.is_ok_and(|result| result.is_ok()));
     assert!(loudness_result.is_ok());
     assert!(first_result.is_ok());
     assert!(loudness_presentation.is_some());

@@ -10,12 +10,13 @@ use hyper_mixer_runtime::{
     GraphTransportRuntime, LocateState, LoudnessCommandSendError, LoudnessCommandSender,
     LoudnessDisplayUnit, MAX_QUEUED_LOUDNESS_COMMANDS, MAX_QUEUED_MIXER_PARAMETER_COMMANDS,
     MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, MixerParameterCommand,
-    MixerParameterCommandSendError, MixerParameterTargetError, OutputMeterPublication,
-    OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot, PreparedPlaybackMainRuntime,
-    PreparedPlaybackTransportRuntime, RuntimeCreationError, RuntimeProcessError,
-    RuntimeProjectComponent, SamplePeakBallisticsConfig, StereoSamplePeakBallistics,
-    TransportCommand, TransportCommandSendError, TransportCycle, TransportOutputCreationError,
-    TransportOutputProcessor, TransportState, loudness_command_channel, output_meter_channel,
+    MixerParameterCommandSendError, MixerParameterResolveError, MixerParameterTargetError,
+    OutputMeterPublication, OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot,
+    PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime, RuntimeCreationError,
+    RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig,
+    StereoSamplePeakBallistics, TransportCommand, TransportCommandSendError, TransportCycle,
+    TransportOutputCreationError, TransportOutputProcessor, TransportState,
+    loudness_command_channel, output_meter_channel,
 };
 
 use common::{fixture, graph_fixture, playback_fixture};
@@ -238,12 +239,61 @@ fn process_transport<const FRAMES: usize>(
     )
 }
 
-fn process_one_live_mixer_command(command: MixerParameterCommand) -> (f32, f32) {
+#[derive(Clone, Copy, Debug)]
+enum LiveMixerCommandKind {
+    ChannelGain,
+    ChannelPan,
+    ChannelMute,
+    ChannelSolo,
+    SendGain,
+    SendPan,
+    SendEnabled,
+    MainGain,
+    MainMute,
+}
+
+fn process_one_live_mixer_command(kind: LiveMixerCommandKind) -> (f32, f32) {
     let fixture = graph_fixture();
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
     let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 1).unwrap();
     let (mut transport_sender, mut parameter_sender, mut transport) =
         GraphTransportRuntime::with_command_queues(runtime);
+    let source = parameter_sender.resolve_channel("source").unwrap();
+    let send_a = parameter_sender.resolve_send("send-a").unwrap();
+    let command = match kind {
+        LiveMixerCommandKind::ChannelGain => MixerParameterCommand::ChannelGain {
+            channel: source,
+            gain: LinearGain::SILENCE,
+        },
+        LiveMixerCommandKind::ChannelPan => MixerParameterCommand::ChannelPan {
+            channel: source,
+            pan: Pan::CENTER,
+        },
+        LiveMixerCommandKind::ChannelMute => MixerParameterCommand::ChannelMute {
+            channel: source,
+            muted: true,
+        },
+        LiveMixerCommandKind::ChannelSolo => MixerParameterCommand::ChannelSolo {
+            channel: source,
+            solo: false,
+        },
+        LiveMixerCommandKind::SendGain => MixerParameterCommand::SendGain {
+            send: send_a,
+            gain: LinearGain::SILENCE,
+        },
+        LiveMixerCommandKind::SendPan => MixerParameterCommand::SendPan {
+            send: send_a,
+            pan: Pan::HARD_LEFT,
+        },
+        LiveMixerCommandKind::SendEnabled => MixerParameterCommand::SendEnabled {
+            send: send_a,
+            enabled: false,
+        },
+        LiveMixerCommandKind::MainGain => MixerParameterCommand::MainGain {
+            gain: LinearGain::new(0.5).unwrap(),
+        },
+        LiveMixerCommandKind::MainMute => MixerParameterCommand::MainMute { muted: true },
+    };
     transport_sender
         .try_send(TransportCommand::Locate {
             frame: 25,
@@ -948,46 +998,63 @@ fn live_mixer_command_queue_validates_targets_backpressure_and_disconnection() {
     let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
     let (_transport_sender, mut sender, transport) =
         GraphTransportRuntime::with_command_queues(runtime);
+    let source = sender.resolve_channel("source").unwrap();
+    let group = sender.resolve_channel("group").unwrap();
+    let send_a = sender.resolve_send("send-a").unwrap();
+    assert_eq!(
+        sender.resolve_channel("missing"),
+        Err(MixerParameterResolveError::ChannelNotFound)
+    );
+    assert_eq!(
+        sender.resolve_send("missing"),
+        Err(MixerParameterResolveError::SendNotFound)
+    );
+
+    let foreign_fixture = graph_fixture();
+    let foreign_prepared = foreign_fixture
+        .cache
+        .prepare_schedule(&foreign_fixture.schedule)
+        .unwrap();
+    let foreign_runtime =
+        GraphMainRuntime::try_new(&foreign_prepared, &foreign_fixture.mixer, 8).unwrap();
+    let (_foreign_transport_sender, foreign_sender, foreign_transport) =
+        GraphTransportRuntime::with_command_queues(foreign_runtime);
+    let foreign_channel = foreign_sender.resolve_channel("source").unwrap();
+    let foreign_send = foreign_sender.resolve_send("send-a").unwrap();
+    assert_ne!(source, foreign_channel);
+    assert_ne!(send_a, foreign_send);
 
     let invalid_channel = MixerParameterCommand::ChannelPan {
-        slot: 5,
+        channel: foreign_channel,
         pan: Pan::CENTER,
     };
     assert_eq!(
         sender.try_send(invalid_channel),
         Err(MixerParameterCommandSendError::InvalidTarget {
             command: invalid_channel,
-            source: MixerParameterTargetError::ChannelOutOfRange {
-                slot: 5,
-                slot_count: 5,
-            },
+            source: MixerParameterTargetError::ForeignChannel(foreign_channel),
         })
     );
     let invalid_send = MixerParameterCommand::SendGain {
-        slot: 1,
-        send: 0,
+        send: foreign_send,
         gain: LinearGain::UNITY,
     };
     assert_eq!(
         sender.try_send(invalid_send),
         Err(MixerParameterCommandSendError::InvalidTarget {
             command: invalid_send,
-            source: MixerParameterTargetError::SendOutOfRange {
-                slot: 1,
-                send: 0,
-                send_count: 0,
-            },
+            source: MixerParameterTargetError::ForeignSend(foreign_send),
         })
     );
     let invalid_solo = MixerParameterCommand::ChannelSolo {
-        slot: 2,
+        channel: group,
         solo: true,
     };
     assert_eq!(
         sender.try_send(invalid_solo),
         Err(MixerParameterCommandSendError::InvalidTarget {
             command: invalid_solo,
-            source: MixerParameterTargetError::SoloUnavailable { slot: 2 },
+            source: MixerParameterTargetError::SoloUnavailable { channel: group },
         })
     );
 
@@ -1004,10 +1071,7 @@ fn live_mixer_command_queue_validates_targets_backpressure_and_disconnection() {
         sender.try_send(invalid_channel),
         Err(MixerParameterCommandSendError::InvalidTarget {
             command: invalid_channel,
-            source: MixerParameterTargetError::ChannelOutOfRange {
-                slot: 5,
-                slot_count: 5,
-            },
+            source: MixerParameterTargetError::ForeignChannel(foreign_channel),
         })
     );
 
@@ -1021,12 +1085,10 @@ fn live_mixer_command_queue_validates_targets_backpressure_and_disconnection() {
         sender.try_send(invalid_channel),
         Err(MixerParameterCommandSendError::InvalidTarget {
             command: invalid_channel,
-            source: MixerParameterTargetError::ChannelOutOfRange {
-                slot: 5,
-                slot_count: 5,
-            },
+            source: MixerParameterTargetError::ForeignChannel(foreign_channel),
         })
     );
+    drop(foreign_transport);
 }
 
 #[test]
@@ -1072,41 +1134,15 @@ fn live_mixer_commands_apply_while_stopped_and_without_a_block_ramp() {
 #[test]
 fn every_live_mixer_parameter_domain_changes_the_resolved_graph() {
     let commands = [
-        MixerParameterCommand::ChannelGain {
-            slot: 0,
-            gain: LinearGain::SILENCE,
-        },
-        MixerParameterCommand::ChannelPan {
-            slot: 0,
-            pan: Pan::CENTER,
-        },
-        MixerParameterCommand::ChannelMute {
-            slot: 0,
-            muted: true,
-        },
-        MixerParameterCommand::ChannelSolo {
-            slot: 0,
-            solo: false,
-        },
-        MixerParameterCommand::SendGain {
-            slot: 0,
-            send: 0,
-            gain: LinearGain::SILENCE,
-        },
-        MixerParameterCommand::SendPan {
-            slot: 0,
-            send: 0,
-            pan: Pan::HARD_LEFT,
-        },
-        MixerParameterCommand::SendEnabled {
-            slot: 0,
-            send: 0,
-            enabled: false,
-        },
-        MixerParameterCommand::MainGain {
-            gain: LinearGain::new(0.5).unwrap(),
-        },
-        MixerParameterCommand::MainMute { muted: true },
+        LiveMixerCommandKind::ChannelGain,
+        LiveMixerCommandKind::ChannelPan,
+        LiveMixerCommandKind::ChannelMute,
+        LiveMixerCommandKind::ChannelSolo,
+        LiveMixerCommandKind::SendGain,
+        LiveMixerCommandKind::SendPan,
+        LiveMixerCommandKind::SendEnabled,
+        LiveMixerCommandKind::MainGain,
+        LiveMixerCommandKind::MainMute,
     ];
     let baseline = (0.25 * 0.375, 0.25 * 0.25);
 

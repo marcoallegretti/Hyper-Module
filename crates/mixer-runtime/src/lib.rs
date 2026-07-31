@@ -42,6 +42,7 @@ pub const MAX_QUEUED_LOUDNESS_COMMANDS: usize = 32;
 pub const MAX_QUEUED_OUTPUT_METER_SNAPSHOTS: usize = 64;
 const MAX_SENDS_PER_SLOT: usize = 2;
 static NEXT_OUTPUT_METER_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_MIXER_PARAMETER_LAYOUT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_output_meter_channel_id() -> u64 {
     NEXT_OUTPUT_METER_CHANNEL_ID
@@ -49,6 +50,14 @@ fn next_output_meter_channel_id() -> u64 {
             current.checked_add(1)
         })
         .expect("output meter channel identity space exhausted")
+}
+
+fn next_mixer_parameter_layout_id() -> u64 {
+    NEXT_MIXER_PARAMETER_LAYOUT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("mixer parameter layout identity space exhausted")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,6 +227,21 @@ impl fmt::Display for TransportCommandSendError {
 
 impl Error for TransportCommandSendError {}
 
+/// Opaque channel target bound to one prepared mixer runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MixerChannelHandle {
+    layout_id: u64,
+    slot: usize,
+}
+
+/// Opaque send target bound to one prepared mixer runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MixerSendHandle {
+    layout_id: u64,
+    slot: usize,
+    send: usize,
+}
+
 /// One live mixer-state change resolved to the runtime's fixed slot layout.
 ///
 /// These commands change the base mixer state at a process-cycle boundary.
@@ -226,34 +250,31 @@ impl Error for TransportCommandSendError {}
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MixerParameterCommand {
     ChannelGain {
-        slot: usize,
+        channel: MixerChannelHandle,
         gain: LinearGain,
     },
     ChannelPan {
-        slot: usize,
+        channel: MixerChannelHandle,
         pan: Pan,
     },
     ChannelMute {
-        slot: usize,
+        channel: MixerChannelHandle,
         muted: bool,
     },
     ChannelSolo {
-        slot: usize,
+        channel: MixerChannelHandle,
         solo: bool,
     },
     SendGain {
-        slot: usize,
-        send: usize,
+        send: MixerSendHandle,
         gain: LinearGain,
     },
     SendPan {
-        slot: usize,
-        send: usize,
+        send: MixerSendHandle,
         pan: Pan,
     },
     SendEnabled {
-        slot: usize,
-        send: usize,
+        send: MixerSendHandle,
         enabled: bool,
     },
     MainGain {
@@ -265,38 +286,40 @@ pub enum MixerParameterCommand {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MixerParameterResolveError {
+    ChannelNotFound,
+    SendNotFound,
+}
+
+impl fmt::Display for MixerParameterResolveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ChannelNotFound => "mixer channel identity was not found",
+            Self::SendNotFound => "mixer send identity was not found",
+        })
+    }
+}
+
+impl Error for MixerParameterResolveError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MixerParameterTargetError {
-    ChannelOutOfRange {
-        slot: usize,
-        slot_count: usize,
-    },
-    SendOutOfRange {
-        slot: usize,
-        send: usize,
-        send_count: usize,
-    },
-    SoloUnavailable {
-        slot: usize,
-    },
+    ForeignChannel(MixerChannelHandle),
+    ForeignSend(MixerSendHandle),
+    SoloUnavailable { channel: MixerChannelHandle },
 }
 
 impl fmt::Display for MixerParameterTargetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ChannelOutOfRange { slot, slot_count } => write!(
-                formatter,
-                "mixer slot {slot} is outside the runtime's {slot_count} slots"
-            ),
-            Self::SendOutOfRange {
-                slot,
-                send,
-                send_count,
-            } => write!(
-                formatter,
-                "mixer send {send} is outside slot {slot}'s {send_count} sends"
-            ),
-            Self::SoloUnavailable { slot } => {
-                write!(formatter, "mixer slot {slot} is not an audio channel")
+            Self::ForeignChannel(_) => {
+                formatter.write_str("mixer channel handle belongs to another runtime")
+            }
+            Self::ForeignSend(_) => {
+                formatter.write_str("mixer send handle belongs to another runtime")
+            }
+            Self::SoloUnavailable { .. } => {
+                formatter.write_str("mixer channel is not an audio channel")
             }
         }
     }
@@ -348,54 +371,88 @@ impl Error for MixerParameterCommandSendError {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct MixerParameterLayout {
-    slot_count: usize,
-    send_counts: [usize; MAX_MAIN_MIXER_SLOTS],
-    audio_slots: [bool; MAX_MAIN_MIXER_SLOTS],
+    id: u64,
+    channels: Vec<MixerParameterChannelLayout>,
+}
+
+#[derive(Debug)]
+struct MixerParameterChannelLayout {
+    track_id: String,
+    handle: MixerChannelHandle,
+    audio: bool,
+    sends: Vec<MixerParameterSendLayout>,
+}
+
+#[derive(Debug)]
+struct MixerParameterSendLayout {
+    id: String,
+    handle: MixerSendHandle,
 }
 
 impl MixerParameterLayout {
-    fn validate(self, command: MixerParameterCommand) -> Result<(), MixerParameterTargetError> {
-        let slot = match command {
-            MixerParameterCommand::ChannelGain { slot, .. }
-            | MixerParameterCommand::ChannelPan { slot, .. }
-            | MixerParameterCommand::ChannelMute { slot, .. }
-            | MixerParameterCommand::ChannelSolo { slot, .. }
-            | MixerParameterCommand::SendGain { slot, .. }
-            | MixerParameterCommand::SendPan { slot, .. }
-            | MixerParameterCommand::SendEnabled { slot, .. } => Some(slot),
-            MixerParameterCommand::MainGain { .. } | MixerParameterCommand::MainMute { .. } => None,
-        };
-        let Some(slot) = slot else {
-            return Ok(());
-        };
-        if slot >= self.slot_count {
-            return Err(MixerParameterTargetError::ChannelOutOfRange {
-                slot,
-                slot_count: self.slot_count,
-            });
-        }
-        if matches!(command, MixerParameterCommand::ChannelSolo { .. }) && !self.audio_slots[slot] {
-            return Err(MixerParameterTargetError::SoloUnavailable { slot });
-        }
-        let send = match command {
+    fn resolve_channel(
+        &self,
+        track_id: &str,
+    ) -> Result<MixerChannelHandle, MixerParameterResolveError> {
+        self.channels
+            .iter()
+            .find(|channel| channel.track_id == track_id)
+            .map(|channel| channel.handle)
+            .ok_or(MixerParameterResolveError::ChannelNotFound)
+    }
+
+    fn resolve_send(&self, send_id: &str) -> Result<MixerSendHandle, MixerParameterResolveError> {
+        self.channels
+            .iter()
+            .flat_map(|channel| &channel.sends)
+            .find(|send| send.id == send_id)
+            .map(|send| send.handle)
+            .ok_or(MixerParameterResolveError::SendNotFound)
+    }
+
+    fn validate(&self, command: MixerParameterCommand) -> Result<(), MixerParameterTargetError> {
+        match command {
+            MixerParameterCommand::ChannelGain { channel, .. }
+            | MixerParameterCommand::ChannelPan { channel, .. }
+            | MixerParameterCommand::ChannelMute { channel, .. } => {
+                self.validate_channel(channel).map(|_| ())
+            }
+            MixerParameterCommand::ChannelSolo { channel, .. } => {
+                let resolved = self.validate_channel(channel)?;
+                if resolved.audio {
+                    Ok(())
+                } else {
+                    Err(MixerParameterTargetError::SoloUnavailable { channel })
+                }
+            }
             MixerParameterCommand::SendGain { send, .. }
             | MixerParameterCommand::SendPan { send, .. }
-            | MixerParameterCommand::SendEnabled { send, .. } => Some(send),
-            _ => None,
-        };
-        if let Some(send) = send {
-            let send_count = self.send_counts[slot];
-            if send >= send_count {
-                return Err(MixerParameterTargetError::SendOutOfRange {
-                    slot,
-                    send,
-                    send_count,
-                });
+            | MixerParameterCommand::SendEnabled { send, .. } => self.validate_send(send),
+            MixerParameterCommand::MainGain { .. } | MixerParameterCommand::MainMute { .. } => {
+                Ok(())
             }
         }
-        Ok(())
+    }
+
+    fn validate_channel(
+        &self,
+        channel: MixerChannelHandle,
+    ) -> Result<&MixerParameterChannelLayout, MixerParameterTargetError> {
+        self.channels
+            .get(channel.slot)
+            .filter(|resolved| self.id == channel.layout_id && resolved.handle == channel)
+            .ok_or(MixerParameterTargetError::ForeignChannel(channel))
+    }
+
+    fn validate_send(&self, send: MixerSendHandle) -> Result<(), MixerParameterTargetError> {
+        self.channels
+            .get(send.slot)
+            .and_then(|channel| channel.sends.get(send.send))
+            .filter(|resolved| self.id == send.layout_id && resolved.handle == send)
+            .map(|_| ())
+            .ok_or(MixerParameterTargetError::ForeignSend(send))
     }
 }
 
@@ -419,6 +476,32 @@ impl MixerParameterCommandSender {
             fence(Ordering::Acquire);
         }
         disconnected
+    }
+
+    /// Resolves one persisted track identity into a handle bound to this runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MixerParameterResolveError::ChannelNotFound`] when the
+    /// prepared mixer has no channel for `track_id`.
+    pub fn resolve_channel(
+        &self,
+        track_id: &str,
+    ) -> Result<MixerChannelHandle, MixerParameterResolveError> {
+        self.layout.resolve_channel(track_id)
+    }
+
+    /// Resolves one persisted send identity into a handle bound to this runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MixerParameterResolveError::SendNotFound`] when the prepared
+    /// mixer has no send with `send_id`.
+    pub fn resolve_send(
+        &self,
+        send_id: &str,
+    ) -> Result<MixerSendHandle, MixerParameterResolveError> {
+        self.layout.resolve_send(send_id)
     }
 
     /// Validates and enqueues one base-state change without waiting or allocating.
@@ -1300,6 +1383,7 @@ pub struct RoutedMainRuntime<R> {
     unity_master_controls: Vec<LinearGain>,
     master_controls: Vec<LinearGain>,
     automation: Option<CompiledAutomation>,
+    parameter_layout: Option<MixerParameterLayout>,
     live_parameters_enabled: bool,
     max_block_frames: usize,
 }
@@ -1520,6 +1604,7 @@ fn build_routed_main_runtime<R>(
 ) -> Result<RoutedMainRuntime<R>, RuntimeCreationError> {
     let slot_count = compiled.slots().len();
     let control_frame_count = max_block_frames;
+    let parameter_layout = build_mixer_parameter_layout(compiled)?;
     let mut slots = Vec::new();
     slots
         .try_reserve_exact(slot_count)
@@ -1587,9 +1672,55 @@ fn build_routed_main_runtime<R>(
         unity_master_controls: try_filled(control_frame_count, LinearGain::UNITY)?,
         master_controls: try_filled(control_frame_count, compiled.master_gain())?,
         automation,
+        parameter_layout: Some(parameter_layout),
         live_parameters_enabled: false,
         max_block_frames,
     })
+}
+
+fn build_mixer_parameter_layout(
+    compiled: &CompiledMixerGraph,
+) -> Result<MixerParameterLayout, RuntimeCreationError> {
+    let layout_id = next_mixer_parameter_layout_id();
+    let mut channels = Vec::new();
+    channels
+        .try_reserve_exact(compiled.slots().len())
+        .map_err(|_| RuntimeCreationError::CapacityUnavailable)?;
+    for (slot, compiled_slot) in compiled.slots().iter().enumerate() {
+        let mut sends = Vec::new();
+        sends
+            .try_reserve_exact(compiled_slot.sends().len())
+            .map_err(|_| RuntimeCreationError::CapacityUnavailable)?;
+        for (send, compiled_send) in compiled_slot.sends().iter().enumerate() {
+            sends.push(MixerParameterSendLayout {
+                id: try_runtime_identity(compiled_send.id())?,
+                handle: MixerSendHandle {
+                    layout_id,
+                    slot,
+                    send,
+                },
+            });
+        }
+        channels.push(MixerParameterChannelLayout {
+            track_id: try_runtime_identity(compiled_slot.track_id())?,
+            handle: MixerChannelHandle { layout_id, slot },
+            audio: compiled_slot.kind() == CompiledMixerTrackKind::Audio,
+            sends,
+        });
+    }
+    Ok(MixerParameterLayout {
+        id: layout_id,
+        channels,
+    })
+}
+
+fn try_runtime_identity(value: &str) -> Result<String, RuntimeCreationError> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| RuntimeCreationError::CapacityUnavailable)?;
+    owned.push_str(value);
+    Ok(owned)
 }
 
 impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
@@ -1607,18 +1738,10 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
         self.renderer.seek(frame);
     }
 
-    fn parameter_layout(&self) -> MixerParameterLayout {
-        let mut send_counts = [0; MAX_MAIN_MIXER_SLOTS];
-        let mut audio_slots = [false; MAX_MAIN_MIXER_SLOTS];
-        for (slot, runtime) in self.slots.iter().enumerate() {
-            send_counts[slot] = runtime.sends.len();
-            audio_slots[slot] = runtime.kind == CompiledMixerTrackKind::Audio;
-        }
-        MixerParameterLayout {
-            slot_count: self.slots.len(),
-            send_counts,
-            audio_slots,
-        }
+    fn take_parameter_layout(&mut self) -> MixerParameterLayout {
+        self.parameter_layout
+            .take()
+            .expect("a routed runtime owns its parameter identity layout")
     }
 
     const fn controls_enabled(&self) -> bool {
@@ -1631,30 +1754,26 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
 
     fn apply_mixer_parameter_command(&mut self, command: MixerParameterCommand) {
         match command {
-            MixerParameterCommand::ChannelGain { slot, gain } => {
-                self.slots[slot].parameters.gain = gain;
+            MixerParameterCommand::ChannelGain { channel, gain } => {
+                self.slots[channel.slot].parameters.gain = gain;
             }
-            MixerParameterCommand::ChannelPan { slot, pan } => {
-                self.slots[slot].parameters.pan = pan;
+            MixerParameterCommand::ChannelPan { channel, pan } => {
+                self.slots[channel.slot].parameters.pan = pan;
             }
-            MixerParameterCommand::ChannelMute { slot, muted } => {
-                self.slots[slot].muted = muted;
+            MixerParameterCommand::ChannelMute { channel, muted } => {
+                self.slots[channel.slot].muted = muted;
             }
-            MixerParameterCommand::ChannelSolo { slot, solo } => {
-                self.slots[slot].solo = solo;
+            MixerParameterCommand::ChannelSolo { channel, solo } => {
+                self.slots[channel.slot].solo = solo;
             }
-            MixerParameterCommand::SendGain { slot, send, gain } => {
-                self.slots[slot].sends[send].parameters.gain = gain;
+            MixerParameterCommand::SendGain { send, gain } => {
+                self.slots[send.slot].sends[send.send].parameters.gain = gain;
             }
-            MixerParameterCommand::SendPan { slot, send, pan } => {
-                self.slots[slot].sends[send].parameters.pan = pan;
+            MixerParameterCommand::SendPan { send, pan } => {
+                self.slots[send.slot].sends[send.send].parameters.pan = pan;
             }
-            MixerParameterCommand::SendEnabled {
-                slot,
-                send,
-                enabled,
-            } => {
-                self.slots[slot].sends[send].enabled = enabled;
+            MixerParameterCommand::SendEnabled { send, enabled } => {
+                self.slots[send.slot].sends[send.send].enabled = enabled;
             }
             MixerParameterCommand::MainGain { gain } => self.main_gain = gain,
             MixerParameterCommand::MainMute { muted } => self.main_muted = muted,
@@ -2071,7 +2190,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     pub fn with_command_queues(
         mut runtime: RoutedMainRuntime<R>,
     ) -> (TransportCommandSender, MixerParameterCommandSender, Self) {
-        let layout = runtime.parameter_layout();
+        let layout = runtime.take_parameter_layout();
         runtime.enable_live_parameters();
         let (transport_producer, transport_consumer) =
             RingBuffer::new(MAX_QUEUED_TRANSPORT_COMMANDS);

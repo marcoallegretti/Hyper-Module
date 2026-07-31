@@ -488,8 +488,9 @@ pub enum CompiledMixerDestination {
     Slot(usize),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CompiledMixerSend {
+    id: String,
     target_slot: usize,
     tap: CompiledMixerTap,
     parameters: ChannelParameters,
@@ -498,22 +499,27 @@ pub struct CompiledMixerSend {
 
 impl CompiledMixerSend {
     #[must_use]
-    pub const fn target_slot(self) -> usize {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn target_slot(&self) -> usize {
         self.target_slot
     }
 
     #[must_use]
-    pub const fn tap(self) -> CompiledMixerTap {
+    pub const fn tap(&self) -> CompiledMixerTap {
         self.tap
     }
 
     #[must_use]
-    pub const fn parameters(self) -> ChannelParameters {
+    pub const fn parameters(&self) -> ChannelParameters {
         self.parameters
     }
 
     #[must_use]
-    pub const fn enabled(self) -> bool {
+    pub const fn enabled(&self) -> bool {
         self.enabled
     }
 }
@@ -702,6 +708,7 @@ impl LoadedMixer {
                 let mut parameters = send.parameters;
                 parameters.audible &= channel.parameters.audible && eligible[channel_index];
                 sends.push(CompiledMixerSend {
+                    id: try_owned_compile(&send.id)?,
                     target_slot: self
                         .channel_index(return_track)
                         .ok_or(MixerCompileError::InvalidGraph)?,
@@ -3135,6 +3142,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the complete route fixture keeps identity and graph rejection evidence together"
+    )]
     fn mixer_loader_resolves_valid_group_send_and_return_graphs_before_capability_rejection() {
         let group = br#"{
             "format":"hyper-track","format_version":1,"id":"group",
@@ -3197,6 +3208,7 @@ mod tests {
             CompiledMixerDestination::Slot(1)
         );
         assert_eq!(graph.slots()[0].sends().len(), 1);
+        assert_eq!(graph.slots()[0].sends()[0].id(), "send-a");
         assert_eq!(graph.slots()[0].sends()[0].target_slot(), 2);
         assert_eq!(
             graph.slots()[0].sends()[0].tap(),
