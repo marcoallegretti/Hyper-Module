@@ -84,7 +84,7 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
     ];
     let mut output_left = [0.0_f32; 64];
     let mut output_right = [0.0_f32; 64];
-    let mut callback = InterleavedStereoCallback::try_new(64).unwrap();
+    let mut callback = InterleavedStereoCallback::try_new(64, 48_000).unwrap();
     let (mut meter_sender, _meter_receiver) = output_meter_channel();
     let mut interleaved = [0.0_f32; 128];
 
@@ -190,7 +190,8 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
     ];
     let (mut meter_sender, _meter_receiver) = output_meter_channel();
     let mut processor =
-        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender).unwrap();
+        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender, 48_000)
+            .unwrap();
     let mut first = [0.0_f32; 100];
     let mut second = [0.0_f32; 50];
 

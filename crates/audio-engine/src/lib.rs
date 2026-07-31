@@ -6,6 +6,11 @@ pub use test_tone::{
     StereoSineTestTone, StereoSineTestToneConfig, StereoSineTestToneConfigError,
     StereoSineTestToneRenderError,
 };
+mod true_peak;
+pub use true_peak::{
+    StereoTruePeakBlock, StereoTruePeakError, StereoTruePeakMeter, TRUE_PEAK_OVERSAMPLE_FACTOR,
+    TRUE_PEAK_SAMPLE_RATE_HZ,
+};
 
 use core::error::Error;
 use core::fmt;
@@ -278,6 +283,7 @@ impl Error for ProcessError {}
 pub enum CallbackAdapterCreationError {
     InvalidMaximumFrames { actual: usize, maximum: usize },
     CapacityUnavailable,
+    TruePeak(StereoTruePeakError),
 }
 
 impl fmt::Display for CallbackAdapterCreationError {
@@ -290,17 +296,28 @@ impl fmt::Display for CallbackAdapterCreationError {
             Self::CapacityUnavailable => {
                 formatter.write_str("callback planar buffer capacity is unavailable")
             }
+            Self::TruePeak(source) => {
+                write!(formatter, "callback true-peak meter failed: {source}")
+            }
         }
     }
 }
 
-impl Error for CallbackAdapterCreationError {}
+impl Error for CallbackAdapterCreationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::TruePeak(source) => Some(source),
+            Self::InvalidMaximumFrames { .. } | Self::CapacityUnavailable => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StereoCallbackError<E> {
     SampleCountNotStereoAligned { samples: usize },
     BlockTooLarge { actual: usize, maximum: usize },
     NonFiniteOutput { samples: usize },
+    TruePeak(StereoTruePeakError),
     Processor(E),
 }
 
@@ -319,6 +336,7 @@ impl<E: fmt::Display> fmt::Display for StereoCallbackError<E> {
                 formatter,
                 "stereo processing produced {samples} non-finite output samples"
             ),
+            Self::TruePeak(source) => write!(formatter, "true-peak measurement failed: {source}"),
             Self::Processor(source) => write!(formatter, "stereo processing failed: {source}"),
         }
     }
@@ -328,6 +346,7 @@ impl<E: Error + 'static> Error for StereoCallbackError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Processor(source) => Some(source),
+            Self::TruePeak(source) => Some(source),
             Self::SampleCountNotStereoAligned { .. }
             | Self::BlockTooLarge { .. }
             | Self::NonFiniteOutput { .. } => None,
@@ -337,13 +356,15 @@ impl<E: Error + 'static> Error for StereoCallbackError<E> {
 
 /// Per-channel measurements for one successful device callback.
 ///
-/// `sample_peak` is the largest absolute sample value; it is not an
-/// oversampled true-peak measurement. `block_rms` covers only this callback
-/// block and has no loudness weighting or meter ballistics. Both readings are
-/// unavailable when the channel contains any non-finite sample.
+/// `sample_peak` is the largest absolute sample value. `true_peak` is a 4x
+/// streaming estimate at a 192 kHz effective meter rate and includes about 24
+/// frames of preceding filter history. `block_rms` covers only this callback
+/// block and has no loudness weighting or meter ballistics. All three readings
+/// are unavailable when the channel contains any non-finite sample.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChannelBlockMeter {
     sample_peak: Option<f32>,
+    true_peak: Option<f32>,
     block_rms: Option<f32>,
     full_scale_sample_count: usize,
     non_finite_sample_count: usize,
@@ -353,6 +374,13 @@ impl ChannelBlockMeter {
     #[must_use]
     pub const fn sample_peak(self) -> Option<f32> {
         self.sample_peak
+    }
+
+    /// Returns the linear 4x true-peak estimate for samples emitted during
+    /// this block, including retained interpolation history.
+    #[must_use]
+    pub const fn true_peak(self) -> Option<f32> {
+        self.true_peak
     }
 
     #[must_use]
@@ -451,7 +479,7 @@ impl ChannelMeterAccumulator {
         clippy::cast_precision_loss,
         reason = "the validated frame count is at most 65,536 and f64 RMS intentionally returns f32"
     )]
-    fn finish(self, frame_count: usize) -> ChannelBlockMeter {
+    fn finish(self, frame_count: usize, true_peak: f32) -> ChannelBlockMeter {
         let readings = if self.non_finite_sample_count == 0 {
             let rms = if frame_count == 0 {
                 0.0
@@ -464,6 +492,7 @@ impl ChannelMeterAccumulator {
         };
         ChannelBlockMeter {
             sample_peak: readings.map(|(peak, _)| peak),
+            true_peak: readings.map(|_| true_peak),
             block_rms: readings.map(|(_, rms)| rms),
             full_scale_sample_count: self.full_scale_sample_count,
             non_finite_sample_count: self.non_finite_sample_count,
@@ -481,16 +510,22 @@ impl ChannelMeterAccumulator {
 pub struct InterleavedStereoCallback {
     left: Vec<f32>,
     right: Vec<f32>,
+    true_peak: StereoTruePeakMeter,
 }
 
 impl InterleavedStereoCallback {
-    /// Allocates both planar callback buffers before device processing starts.
+    /// Allocates both planar callback buffers and constructs the true-peak
+    /// filter before device processing starts.
     ///
     /// # Errors
     ///
     /// Returns [`CallbackAdapterCreationError`] for a zero or unsupported frame
-    /// bound, or if either planar buffer cannot be reserved.
-    pub fn try_new(maximum_frames: usize) -> Result<Self, CallbackAdapterCreationError> {
+    /// bound, an unsupported true-peak sample rate, or if either planar buffer
+    /// cannot be reserved.
+    pub fn try_new(
+        maximum_frames: usize,
+        sample_rate_hz: u32,
+    ) -> Result<Self, CallbackAdapterCreationError> {
         if maximum_frames == 0 || maximum_frames > MAX_PROCESS_FRAMES {
             return Err(CallbackAdapterCreationError::InvalidMaximumFrames {
                 actual: maximum_frames,
@@ -506,7 +541,13 @@ impl InterleavedStereoCallback {
             .try_reserve_exact(maximum_frames)
             .map_err(|_| CallbackAdapterCreationError::CapacityUnavailable)?;
         right.resize(maximum_frames, 0.0);
-        Ok(Self { left, right })
+        let true_peak = StereoTruePeakMeter::try_new(sample_rate_hz)
+            .map_err(CallbackAdapterCreationError::TruePeak)?;
+        Ok(Self {
+            left,
+            right,
+            true_peak,
+        })
     }
 
     #[must_use]
@@ -570,6 +611,16 @@ impl InterleavedStereoCallback {
                 samples: non_finite_samples,
             });
         }
+        let true_peak = match self
+            .true_peak
+            .process(&self.left[..frame_count], &self.right[..frame_count])
+        {
+            Ok(true_peak) => true_peak,
+            Err(source) => {
+                interleaved_output.fill(0.0);
+                return Err(StereoCallbackError::TruePeak(source));
+            }
+        };
         let mut left_meter = ChannelMeterAccumulator::default();
         let mut right_meter = ChannelMeterAccumulator::default();
         for (frame, samples) in interleaved_output.chunks_exact_mut(2).enumerate() {
@@ -584,8 +635,8 @@ impl InterleavedStereoCallback {
             processor_result: value,
             meter: StereoBlockMeter {
                 frame_count,
-                left: left_meter.finish(frame_count),
-                right: right_meter.finish(frame_count),
+                left: left_meter.finish(frame_count, true_peak.left_linear()),
+                right: right_meter.finish(frame_count, true_peak.right_linear()),
             },
         })
     }
@@ -968,7 +1019,7 @@ mod tests {
 
     #[test]
     fn callback_adapter_interleaves_exact_variable_sized_blocks() {
-        let mut adapter = InterleavedStereoCallback::try_new(4).unwrap();
+        let mut adapter = InterleavedStereoCallback::try_new(4, 48_000).unwrap();
         assert_eq!(adapter.maximum_frames(), 4);
         let mut output = [9.0_f32; 6];
 
@@ -1007,7 +1058,7 @@ mod tests {
 
     #[test]
     fn callback_adapter_measures_final_sample_peak_and_block_rms() {
-        let mut adapter = InterleavedStereoCallback::try_new(4).unwrap();
+        let mut adapter = InterleavedStereoCallback::try_new(4, 48_000).unwrap();
         let mut output = [9.0_f32; 8];
 
         let processed = adapter
@@ -1022,10 +1073,12 @@ mod tests {
         assert_eq!(processor_result, "rendered");
         assert_eq!(meter.frame_count(), 4);
         assert_eq!(meter.left().sample_peak(), Some(1.5));
+        assert!(meter.left().true_peak().unwrap() >= 1.5);
         assert_eq!(meter.left().full_scale_sample_count(), 2);
         assert_eq!(meter.left().non_finite_sample_count(), 0);
         assert!((meter.left().block_rms().unwrap() - (3.5_f32 / 4.0).sqrt()).abs() <= EPSILON);
         assert_eq!(meter.right().sample_peak(), Some(0.25));
+        assert!(meter.right().true_peak().unwrap() >= 0.25);
         assert_eq!(meter.right().block_rms(), Some(0.25));
         assert_eq!(meter.right().full_scale_sample_count(), 0);
         assert_eq!(meter.right().non_finite_sample_count(), 0);
@@ -1033,7 +1086,7 @@ mod tests {
 
     #[test]
     fn callback_rejects_and_silences_non_finite_samples() {
-        let mut adapter = InterleavedStereoCallback::try_new(3).unwrap();
+        let mut adapter = InterleavedStereoCallback::try_new(3, 48_000).unwrap();
         let mut output = [9.0_f32; 6];
 
         let result = adapter.process(&mut output, |planar| {
@@ -1051,7 +1104,7 @@ mod tests {
 
     #[test]
     fn callback_rejects_overflow_from_finite_samples() {
-        let mut adapter = InterleavedStereoCallback::try_new(1).unwrap();
+        let mut adapter = InterleavedStereoCallback::try_new(1, 48_000).unwrap();
         let mut output = [9.0_f32; 2];
 
         let result = adapter.process(&mut output, |planar| {
@@ -1070,7 +1123,7 @@ mod tests {
 
     #[test]
     fn callback_meter_reports_zero_for_an_empty_block() {
-        let mut adapter = InterleavedStereoCallback::try_new(1).unwrap();
+        let mut adapter = InterleavedStereoCallback::try_new(1, 48_000).unwrap();
         let mut output = [];
 
         let meter = adapter
@@ -1080,29 +1133,38 @@ mod tests {
 
         assert_eq!(meter.frame_count(), 0);
         assert_eq!(meter.left().sample_peak(), Some(0.0));
+        assert_eq!(meter.left().true_peak(), Some(0.0));
         assert_eq!(meter.left().block_rms(), Some(0.0));
         assert_eq!(meter.right().sample_peak(), Some(0.0));
+        assert_eq!(meter.right().true_peak(), Some(0.0));
         assert_eq!(meter.right().block_rms(), Some(0.0));
     }
 
     #[test]
     fn callback_adapter_silences_every_rejected_or_failed_block() {
         assert_eq!(
-            InterleavedStereoCallback::try_new(0).unwrap_err(),
+            InterleavedStereoCallback::try_new(0, 48_000).unwrap_err(),
             CallbackAdapterCreationError::InvalidMaximumFrames {
                 actual: 0,
                 maximum: MAX_PROCESS_FRAMES,
             }
         );
         assert_eq!(
-            InterleavedStereoCallback::try_new(MAX_PROCESS_FRAMES + 1).unwrap_err(),
+            InterleavedStereoCallback::try_new(MAX_PROCESS_FRAMES + 1, 48_000).unwrap_err(),
             CallbackAdapterCreationError::InvalidMaximumFrames {
                 actual: MAX_PROCESS_FRAMES + 1,
                 maximum: MAX_PROCESS_FRAMES,
             }
         );
+        assert_eq!(
+            InterleavedStereoCallback::try_new(4, 44_100).unwrap_err(),
+            CallbackAdapterCreationError::TruePeak(StereoTruePeakError::UnsupportedSampleRate {
+                actual: 44_100,
+                supported: TRUE_PEAK_SAMPLE_RATE_HZ,
+            })
+        );
 
-        let mut adapter = InterleavedStereoCallback::try_new(4).unwrap();
+        let mut adapter = InterleavedStereoCallback::try_new(4, 48_000).unwrap();
         let mut odd = [9.0_f32; 3];
         assert_eq!(
             adapter.process(&mut odd, |_| -> Result<(), &'static str> {

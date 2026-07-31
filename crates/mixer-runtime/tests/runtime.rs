@@ -318,7 +318,8 @@ fn transport_output_processor_reuses_maximum_scratch_for_variable_quanta() {
     ];
     let (mut meter_sender, mut meter_receiver) = output_meter_channel();
     let mut processor =
-        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender).unwrap();
+        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender, 48_000)
+            .unwrap();
 
     command_sender.try_send(TransportCommand::Start).unwrap();
     let mut first = [9.0_f32; 100];
@@ -400,8 +401,13 @@ fn transport_output_processor_rejects_incomplete_scratch_before_processing() {
     let mut no_scratch = [];
 
     assert_eq!(
-        TransportOutputProcessor::try_new(&mut transport, &mut no_scratch, &mut meter_sender)
-            .unwrap_err(),
+        TransportOutputProcessor::try_new(
+            &mut transport,
+            &mut no_scratch,
+            &mut meter_sender,
+            48_000,
+        )
+        .unwrap_err(),
         TransportOutputCreationError::ScratchSlotCountMismatch {
             expected: 2,
             actual: 0
@@ -417,7 +423,7 @@ fn transport_output_processor_rejects_incomplete_scratch_before_processing() {
         RenderScratchSlot::new(&mut left_full, &mut right_full_2),
     ];
     assert_eq!(
-        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender)
+        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender, 48_000,)
             .unwrap_err(),
         TransportOutputCreationError::ScratchCapacity {
             slot: 0,
@@ -448,7 +454,8 @@ fn transport_output_processor_is_fail_silent_before_transport_mutation() {
     ];
     let (mut meter_sender, _meter_receiver) = output_meter_channel();
     let mut processor =
-        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender).unwrap();
+        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender, 48_000)
+            .unwrap();
     command_sender.try_send(TransportCommand::Start).unwrap();
 
     let mut malformed = [9.0_f32; 3];
@@ -831,7 +838,7 @@ fn interleaved_callback_executes_the_transport_runtime() {
         GraphMainRuntime::try_new_automated(&prepared, &fixture.mixer, fixture.automation, 8)
             .unwrap();
     let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(runtime);
-    let mut callback = InterleavedStereoCallback::try_new(8).unwrap();
+    let mut callback = InterleavedStereoCallback::try_new(8, 48_000).unwrap();
     let (mut meter_sender, mut meter_receiver) = output_meter_channel();
     sender.try_send(TransportCommand::Start).unwrap();
     let mut scratch_left = [[9.0_f32; 2]; 5];
@@ -896,6 +903,8 @@ fn interleaved_callback_executes_the_transport_runtime() {
     assert_eq!(meter.frame_count(), 2);
     assert_eq!(meter.left().sample_peak(), Some(expected_left_peak));
     assert_eq!(meter.right().sample_peak(), Some(expected_right_peak));
+    assert!(meter.left().true_peak().unwrap() >= expected_left_peak);
+    assert!(meter.right().true_peak().unwrap() >= expected_right_peak);
     assert_eq!(meter.left().non_finite_sample_count(), 0);
     assert_eq!(meter.right().non_finite_sample_count(), 0);
 

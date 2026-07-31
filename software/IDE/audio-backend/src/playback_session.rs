@@ -743,10 +743,14 @@ fn initialize_session(
         transport.apply_command(checkpoint.restore_command());
     }
     let (mut meter_sender, meters) = output_meter_channel();
-    let processor =
-        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender)
-            .map_err(DesktopPlaybackSessionBuildError::Output)
-            .or_else(|source| fail_build(publication, source))?;
+    let processor = TransportOutputProcessor::try_new(
+        &mut transport,
+        &mut scratch,
+        &mut meter_sender,
+        sample_rate_hz,
+    )
+    .map_err(DesktopPlaybackSessionBuildError::Output)
+    .or_else(|source| fail_build(publication, source))?;
     let recovery = initial_checkpoint
         .map(PlaybackRecoveryCheckpoint::from_snapshot)
         .unwrap_or_default();

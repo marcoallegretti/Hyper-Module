@@ -34,7 +34,7 @@ fn processing_performs_zero_heap_allocations() {
     let mut controlled_mixer = StereoMixer::try_new(&parameters[..1], LinearGain::UNITY).unwrap();
     let mut output_left = [0.0_f32; 128];
     let mut output_right = [0.0_f32; 128];
-    let mut callback = InterleavedStereoCallback::try_new(128).unwrap();
+    let mut callback = InterleavedStereoCallback::try_new(128, 48_000).unwrap();
     let mut interleaved = [0.0_f32; 256];
     let mut failed_interleaved = [1.0_f32; 256];
     let mut invalid_interleaved = [1.0_f32; 3];

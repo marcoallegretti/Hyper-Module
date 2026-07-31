@@ -340,7 +340,7 @@ mod tests {
         left_peak: f32,
         right_peak: f32,
     ) -> OutputMeterSnapshot {
-        let mut callback = InterleavedStereoCallback::try_new(frame_count).unwrap();
+        let mut callback = InterleavedStereoCallback::try_new(frame_count, 48_000).unwrap();
         let mut interleaved = vec![0.0_f32; frame_count * 2];
         let processed = callback
             .process(&mut interleaved, |output| {

@@ -1858,11 +1858,13 @@ impl<'state, 'buffers, R: TrackWindowRenderer> TransportOutputProcessor<'state, 
     /// # Errors
     ///
     /// Returns [`TransportOutputCreationError`] when callback storage cannot be
-    /// allocated or scratch slot count/capacity cannot serve every callback.
+    /// allocated, the true-peak sample rate is unsupported, or scratch slot
+    /// count/capacity cannot serve every callback.
     pub fn try_new(
         transport: &'state mut RoutedTransportRuntime<R>,
         scratch: &'state mut [RenderScratchSlot<'buffers>],
         meter_sender: &'state mut OutputMeterSender,
+        sample_rate_hz: u32,
     ) -> Result<Self, TransportOutputCreationError> {
         let expected_slots = transport.slot_count();
         if scratch.len() != expected_slots {
@@ -1884,7 +1886,7 @@ impl<'state, 'buffers, R: TrackWindowRenderer> TransportOutputProcessor<'state, 
                 });
             }
         }
-        let callback = InterleavedStereoCallback::try_new(required)
+        let callback = InterleavedStereoCallback::try_new(required, sample_rate_hz)
             .map_err(TransportOutputCreationError::Callback)?;
         Ok(Self {
             transport,
