@@ -644,6 +644,63 @@ fn arm_stop_timer(timer: &pw::loop_::TimerSource<'_>) -> Result<(), PipeWireStar
         .map_err(|source| backend_error(PipeWireStartupStage::MainLoop, source))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedPipeWireBuffer {
+    Rendered,
+    Silent,
+    Terminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PipeWireSubmission {
+    Committed,
+    Silent,
+    Terminal,
+    QueueRejected,
+}
+
+fn submit_pipewire_buffer<E, Q, C>(
+    prepared: PreparedPipeWireBuffer,
+    queue: Q,
+    commit: C,
+) -> PipeWireSubmission
+where
+    Q: FnOnce() -> Result<(), E>,
+    C: FnOnce(),
+{
+    if queue().is_err() {
+        return PipeWireSubmission::QueueRejected;
+    }
+    match prepared {
+        PreparedPipeWireBuffer::Rendered => {
+            commit();
+            PipeWireSubmission::Committed
+        }
+        PreparedPipeWireBuffer::Silent => PipeWireSubmission::Silent,
+        PreparedPipeWireBuffer::Terminal => PipeWireSubmission::Terminal,
+    }
+}
+
+fn fail_pipewire_callback(state: &mut PipeWireCallback<'_>, queue_rejected: bool) {
+    if queue_rejected {
+        state.output.counters().record_stream_error();
+    }
+    state.status.mark_failed();
+    state.main_loop.quit();
+}
+
+fn terminate_pipewire_buffer(buffer: pw::buffer::Buffer<'_>, state: &mut PipeWireCallback<'_>) {
+    let queue_rejected = buffer.queue().is_err();
+    fail_pipewire_callback(state, queue_rejected);
+}
+
+fn set_pipewire_chunk(data: &mut spa::buffer::Data, size: usize) {
+    let chunk = data.chunk_mut();
+    *chunk.offset_mut() = 0;
+    *chunk.size_mut() = u32::try_from(size).unwrap_or(u32::MAX);
+    *chunk.stride_mut() = i32::try_from(FRAME_STRIDE).expect("stereo f32 stride fits i32");
+}
+
 fn process_pipewire_buffer(stream: &pw::stream::Stream, state: &mut PipeWireCallback<'_>) {
     let Some(mut buffer) = stream.dequeue_buffer() else {
         state.output.counters().record_unavailable_buffer();
@@ -651,8 +708,14 @@ fn process_pipewire_buffer(stream: &pw::stream::Stream, state: &mut PipeWireCall
     };
     let Some(data) = buffer.datas_mut().first_mut() else {
         state.output.counters().record_malformed_buffer(0);
+        terminate_pipewire_buffer(buffer, state);
         return;
     };
+    if data.as_raw().chunk.is_null() {
+        state.output.counters().record_malformed_buffer(0);
+        terminate_pipewire_buffer(buffer, state);
+        return;
+    }
     let requested_bytes = usize::try_from(data.chunk().size()).unwrap_or(usize::MAX);
     let maximum_bytes = state
         .output
@@ -660,6 +723,8 @@ fn process_pipewire_buffer(stream: &pw::stream::Stream, state: &mut PipeWireCall
         .saturating_mul(FRAME_STRIDE);
     let Some(bytes) = data.data() else {
         state.output.counters().record_malformed_buffer(0);
+        set_pipewire_chunk(data, 0);
+        terminate_pipewire_buffer(buffer, state);
         return;
     };
     let callback_bytes = if requested_bytes == 0 {
@@ -668,32 +733,38 @@ fn process_pipewire_buffer(stream: &pw::stream::Stream, state: &mut PipeWireCall
         requested_bytes.min(bytes.len())
     };
     let aligned_bytes = callback_bytes - (callback_bytes % FRAME_STRIDE);
-    if requested_bytes > bytes.len() || aligned_bytes != callback_bytes || aligned_bytes == 0 {
-        bytes[..callback_bytes].fill(0);
-        state
-            .output
-            .counters()
-            .record_malformed_buffer(aligned_bytes / FRAME_STRIDE);
-    } else if let Ok(samples) = bytemuck::try_cast_slice_mut::<u8, f32>(&mut bytes[..aligned_bytes])
-    {
-        let callback_status = state.output.process(samples);
-        if callback_status == OutputCallbackStatus::Rendered {
-            (state.commit)();
+    let prepared =
+        if requested_bytes > bytes.len() || aligned_bytes != callback_bytes || aligned_bytes == 0 {
+            bytes[..callback_bytes].fill(0);
+            state
+                .output
+                .counters()
+                .record_malformed_buffer(aligned_bytes / FRAME_STRIDE);
+            PreparedPipeWireBuffer::Silent
+        } else if let Ok(samples) =
+            bytemuck::try_cast_slice_mut::<u8, f32>(&mut bytes[..aligned_bytes])
+        {
+            let callback_status = state.output.process(samples);
+            if callback_status == OutputCallbackStatus::Rendered {
+                PreparedPipeWireBuffer::Rendered
+            } else {
+                PreparedPipeWireBuffer::Terminal
+            }
         } else {
-            state.status.mark_failed();
-            state.main_loop.quit();
-        }
-    } else {
-        bytes[..aligned_bytes].fill(0);
-        state
-            .output
-            .counters()
-            .record_malformed_buffer(aligned_bytes / FRAME_STRIDE);
+            bytes[..aligned_bytes].fill(0);
+            state
+                .output
+                .counters()
+                .record_malformed_buffer(aligned_bytes / FRAME_STRIDE);
+            PreparedPipeWireBuffer::Silent
+        };
+    set_pipewire_chunk(data, aligned_bytes);
+    let submission = submit_pipewire_buffer(prepared, || buffer.queue(), || (state.commit)());
+    match submission {
+        PipeWireSubmission::Committed | PipeWireSubmission::Silent => {}
+        PipeWireSubmission::Terminal => fail_pipewire_callback(state, false),
+        PipeWireSubmission::QueueRejected => fail_pipewire_callback(state, true),
     }
-    let chunk = data.chunk_mut();
-    *chunk.offset_mut() = 0;
-    *chunk.size_mut() = u32::try_from(aligned_bytes).unwrap_or(u32::MAX);
-    *chunk.stride_mut() = i32::try_from(FRAME_STRIDE).expect("stereo f32 stride fits i32");
 }
 
 fn build_format(sample_rate_hz: u32) -> Result<Vec<u8>, PipeWireStartError> {
@@ -750,6 +821,7 @@ fn validate_transport_capacity(
 mod tests {
     use super::*;
     use crate::PendingNativeShutdownWait;
+    use core::cell::RefCell;
     use core::sync::atomic::AtomicUsize;
     use std::process::{Command, Stdio};
     use std::time::Instant;
@@ -776,6 +848,63 @@ mod tests {
                 .with_target("target\0object"),
             Err(PipeWireOutputConfigError::TargetContainsNul)
         );
+    }
+
+    #[test]
+    fn recovery_commit_follows_checked_queue_acceptance() {
+        let events = RefCell::new(Vec::new());
+
+        let submission = submit_pipewire_buffer(
+            PreparedPipeWireBuffer::Rendered,
+            || {
+                events.borrow_mut().push("queue accepted");
+                Ok::<_, ()>(())
+            },
+            || events.borrow_mut().push("checkpoint committed"),
+        );
+
+        assert_eq!(submission, PipeWireSubmission::Committed);
+        assert_eq!(
+            events.into_inner(),
+            ["queue accepted", "checkpoint committed"]
+        );
+    }
+
+    #[test]
+    fn rejected_queue_never_commits_recovery() {
+        let committed = Cell::new(false);
+
+        let submission = submit_pipewire_buffer(
+            PreparedPipeWireBuffer::Rendered,
+            || Err::<(), _>(()),
+            || committed.set(true),
+        );
+
+        assert_eq!(submission, PipeWireSubmission::QueueRejected);
+        assert!(!committed.get());
+    }
+
+    #[test]
+    fn silent_and_terminal_buffers_never_commit_recovery() {
+        let committed = Cell::new(0_u8);
+
+        assert_eq!(
+            submit_pipewire_buffer(
+                PreparedPipeWireBuffer::Silent,
+                || Ok::<_, ()>(()),
+                || committed.set(committed.get() + 1),
+            ),
+            PipeWireSubmission::Silent
+        );
+        assert_eq!(
+            submit_pipewire_buffer(
+                PreparedPipeWireBuffer::Terminal,
+                || Ok::<_, ()>(()),
+                || committed.set(committed.get() + 1),
+            ),
+            PipeWireSubmission::Terminal
+        );
+        assert_eq!(committed.get(), 0);
     }
 
     #[test]
@@ -806,20 +935,30 @@ mod tests {
             .unwrap();
         let processed = Arc::new(AtomicUsize::new(0));
         let callback_processed = Arc::clone(&processed);
-        let stream = PipeWireOutputStream::start(config, move |output: &mut [f32]| {
-            output.fill(0.25);
-            callback_processed.fetch_add(output.len(), Ordering::Relaxed);
-            Ok::<_, u8>(())
+        let committed = Arc::new(AtomicUsize::new(0));
+        let callback_committed = Arc::clone(&committed);
+        let stream = PipeWireOutputStream::start_with_thread_initializer(config, move |runner| {
+            runner.run_with_commit(
+                move |output: &mut [f32]| {
+                    output.fill(0.25);
+                    callback_processed.fetch_add(output.len(), Ordering::Relaxed);
+                    Ok::<_, u8>(())
+                },
+                move || {
+                    callback_committed.fetch_add(1, Ordering::Relaxed);
+                },
+            )
         })
         .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        while processed.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+        while committed.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
         stream.stop().unwrap();
 
         assert!(processed.load(Ordering::Relaxed) > 0);
+        assert!(committed.load(Ordering::Relaxed) > 0);
     }
 
     #[test]

@@ -20,7 +20,11 @@ members = [
     "crates/strict-json",
     "software/IDE/audio-backend",
 ]
+exclude = ["third_party/pipewire"]
 resolver = "3"
+
+[patch.crates-io]
+pipewire = { path = "third_party/pipewire" }
 
 [workspace.package]
 edition = "2024"
