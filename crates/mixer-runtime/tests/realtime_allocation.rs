@@ -8,8 +8,8 @@ use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{InterleavedStereoCallback, LoudnessMeasurementCommand, StereoOutput};
 use hyper_mixer_runtime::{
     EbuLoudnessPresentationConfig, FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime,
-    PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime, TransportCommand,
-    TransportOutputProcessor, loudness_command_channel, output_meter_channel,
+    MixerParameterCommand, PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime,
+    TransportCommand, TransportOutputProcessor, loudness_command_channel, output_meter_channel,
 };
 
 use common::{fixture, graph_fixture, playback_fixture};
@@ -178,8 +178,8 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
     let runtime =
         PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 64)
             .unwrap();
-    let (mut command_sender, mut transport) =
-        PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+    let (mut command_sender, mut mixer_parameter_sender, mut transport) =
+        PreparedPlaybackTransportRuntime::with_command_queues(runtime);
     let mut arrangement_left = [0.0_f32; 64];
     let mut arrangement_right = [0.0_f32; 64];
     let mut scene_left = [0.0_f32; 64];
@@ -203,6 +203,8 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
 
     let measurement = HeapMeasurement::start_verified();
     let start_result = command_sender.try_send(TransportCommand::Start);
+    let parameter_result =
+        mixer_parameter_sender.try_send(MixerParameterCommand::MainMute { muted: false });
     let loudness_result = loudness_sender.try_send(LoudnessMeasurementCommand::Reset);
     let first_result = processor.process(&mut first);
     let loudness_presentation = first_result.as_ref().ok().map(|cycle| {
@@ -214,6 +216,7 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
     let heap_operations = measurement.finish();
 
     assert!(start_result.is_ok());
+    assert!(parameter_result.is_ok());
     assert!(loudness_result.is_ok());
     assert!(first_result.is_ok());
     assert!(loudness_presentation.is_some());

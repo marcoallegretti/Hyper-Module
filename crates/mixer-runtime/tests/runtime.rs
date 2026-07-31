@@ -2,19 +2,20 @@ mod common;
 
 use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{
-    InterleavedStereoCallback, LoudnessMeasurementCommand, LoudnessMeasurementState,
-    MAX_PROCESS_FRAMES, StereoCallbackError, StereoOutput,
+    InterleavedStereoCallback, LinearGain, LoudnessMeasurementCommand, LoudnessMeasurementState,
+    MAX_PROCESS_FRAMES, Pan, StereoCallbackError, StereoOutput,
 };
 use hyper_mixer_runtime::{
     EbuLoudnessPresentationConfig, EbuLoudnessScale, FlatMainRuntime, GraphMainRuntime,
     GraphTransportRuntime, LocateState, LoudnessCommandSendError, LoudnessCommandSender,
-    LoudnessDisplayUnit, MAX_QUEUED_LOUDNESS_COMMANDS, MAX_QUEUED_OUTPUT_METER_SNAPSHOTS,
-    MAX_QUEUED_TRANSPORT_COMMANDS, OutputMeterPublication, OutputMeterReceiver, OutputMeterSender,
-    OutputMeterSnapshot, PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime,
-    RuntimeCreationError, RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig,
-    StereoSamplePeakBallistics, TransportCommand, TransportCommandSendError, TransportCycle,
-    TransportOutputCreationError, TransportOutputProcessor, TransportState,
-    loudness_command_channel, output_meter_channel,
+    LoudnessDisplayUnit, MAX_QUEUED_LOUDNESS_COMMANDS, MAX_QUEUED_MIXER_PARAMETER_COMMANDS,
+    MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, MixerParameterCommand,
+    MixerParameterCommandSendError, MixerParameterTargetError, OutputMeterPublication,
+    OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot, PreparedPlaybackMainRuntime,
+    PreparedPlaybackTransportRuntime, RuntimeCreationError, RuntimeProcessError,
+    RuntimeProjectComponent, SamplePeakBallisticsConfig, StereoSamplePeakBallistics,
+    TransportCommand, TransportCommandSendError, TransportCycle, TransportOutputCreationError,
+    TransportOutputProcessor, TransportState, loudness_command_channel, output_meter_channel,
 };
 
 use common::{fixture, graph_fixture, playback_fixture};
@@ -235,6 +236,26 @@ fn process_transport<const FRAMES: usize>(
             right: output_right,
         },
     )
+}
+
+fn process_one_live_mixer_command(command: MixerParameterCommand) -> (f32, f32) {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 1).unwrap();
+    let (mut transport_sender, mut parameter_sender, mut transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+    transport_sender
+        .try_send(TransportCommand::Locate {
+            frame: 25,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    parameter_sender.try_send(command).unwrap();
+    let mut left = [9.0_f32; 1];
+    let mut right = [9.0_f32; 1];
+    let cycle = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(cycle.applied_mixer_parameter_command_count(), 1);
+    (left[0], right[0])
 }
 
 #[test]
@@ -921,6 +942,227 @@ fn queued_transport_commands_preserve_fifo_order_across_threads() {
 }
 
 #[test]
+fn live_mixer_command_queue_validates_targets_backpressure_and_disconnection() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (_transport_sender, mut sender, transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+
+    let invalid_channel = MixerParameterCommand::ChannelPan {
+        slot: 5,
+        pan: Pan::CENTER,
+    };
+    assert_eq!(
+        sender.try_send(invalid_channel),
+        Err(MixerParameterCommandSendError::InvalidTarget {
+            command: invalid_channel,
+            source: MixerParameterTargetError::ChannelOutOfRange {
+                slot: 5,
+                slot_count: 5,
+            },
+        })
+    );
+    let invalid_send = MixerParameterCommand::SendGain {
+        slot: 1,
+        send: 0,
+        gain: LinearGain::UNITY,
+    };
+    assert_eq!(
+        sender.try_send(invalid_send),
+        Err(MixerParameterCommandSendError::InvalidTarget {
+            command: invalid_send,
+            source: MixerParameterTargetError::SendOutOfRange {
+                slot: 1,
+                send: 0,
+                send_count: 0,
+            },
+        })
+    );
+    let invalid_solo = MixerParameterCommand::ChannelSolo {
+        slot: 2,
+        solo: true,
+    };
+    assert_eq!(
+        sender.try_send(invalid_solo),
+        Err(MixerParameterCommandSendError::InvalidTarget {
+            command: invalid_solo,
+            source: MixerParameterTargetError::SoloUnavailable { slot: 2 },
+        })
+    );
+
+    let valid = MixerParameterCommand::MainMute { muted: true };
+    assert_eq!(sender.capacity(), MAX_QUEUED_MIXER_PARAMETER_COMMANDS);
+    for _ in 0..MAX_QUEUED_MIXER_PARAMETER_COMMANDS {
+        sender.try_send(valid).unwrap();
+    }
+    assert_eq!(
+        sender.try_send(valid),
+        Err(MixerParameterCommandSendError::Full(valid))
+    );
+    assert_eq!(
+        sender.try_send(invalid_channel),
+        Err(MixerParameterCommandSendError::InvalidTarget {
+            command: invalid_channel,
+            source: MixerParameterTargetError::ChannelOutOfRange {
+                slot: 5,
+                slot_count: 5,
+            },
+        })
+    );
+
+    drop(transport);
+    assert!(sender.is_disconnected());
+    assert_eq!(
+        sender.try_send(valid),
+        Err(MixerParameterCommandSendError::Disconnected(valid))
+    );
+    assert_eq!(
+        sender.try_send(invalid_channel),
+        Err(MixerParameterCommandSendError::InvalidTarget {
+            command: invalid_channel,
+            source: MixerParameterTargetError::ChannelOutOfRange {
+                slot: 5,
+                slot_count: 5,
+            },
+        })
+    );
+}
+
+#[test]
+fn live_mixer_commands_apply_while_stopped_and_without_a_block_ramp() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (mut transport_sender, mut parameter_sender, mut transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+    let mut left = [9.0_f32; 8];
+    let mut right = [9.0_f32; 8];
+
+    parameter_sender
+        .try_send(MixerParameterCommand::MainMute { muted: true })
+        .unwrap();
+    let stopped = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(stopped.applied_mixer_parameter_command_count(), 1);
+    assert!(!stopped.mixer_parameter_command_sender_disconnected());
+    assert_constant(&left, 0.0);
+    assert_constant(&right, 0.0);
+
+    transport_sender.try_send(TransportCommand::Start).unwrap();
+    let muted = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(muted.applied_command_count(), 1);
+    assert_eq!(muted.applied_mixer_parameter_command_count(), 0);
+    assert_constant(&left, 0.0);
+    assert_constant(&right, 0.0);
+
+    parameter_sender
+        .try_send(MixerParameterCommand::MainMute { muted: true })
+        .unwrap();
+    parameter_sender
+        .try_send(MixerParameterCommand::MainMute { muted: false })
+        .unwrap();
+    let audible = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(audible.applied_mixer_parameter_command_count(), 2);
+    for ((left, right), source) in left.iter().zip(right).zip(&fixture.samples[8..16]) {
+        assert!((*left - source * 0.375).abs() <= f32::EPSILON);
+        assert!((right - source * 0.25).abs() <= f32::EPSILON);
+    }
+}
+
+#[test]
+fn every_live_mixer_parameter_domain_changes_the_resolved_graph() {
+    let commands = [
+        MixerParameterCommand::ChannelGain {
+            slot: 0,
+            gain: LinearGain::SILENCE,
+        },
+        MixerParameterCommand::ChannelPan {
+            slot: 0,
+            pan: Pan::CENTER,
+        },
+        MixerParameterCommand::ChannelMute {
+            slot: 0,
+            muted: true,
+        },
+        MixerParameterCommand::ChannelSolo {
+            slot: 0,
+            solo: false,
+        },
+        MixerParameterCommand::SendGain {
+            slot: 0,
+            send: 0,
+            gain: LinearGain::SILENCE,
+        },
+        MixerParameterCommand::SendPan {
+            slot: 0,
+            send: 0,
+            pan: Pan::HARD_LEFT,
+        },
+        MixerParameterCommand::SendEnabled {
+            slot: 0,
+            send: 0,
+            enabled: false,
+        },
+        MixerParameterCommand::MainGain {
+            gain: LinearGain::new(0.5).unwrap(),
+        },
+        MixerParameterCommand::MainMute { muted: true },
+    ];
+    let baseline = (0.25 * 0.375, 0.25 * 0.25);
+
+    for command in commands {
+        let actual = process_one_live_mixer_command(command);
+        assert!(
+            (actual.0 - baseline.0).abs() > f32::EPSILON
+                || (actual.1 - baseline.1).abs() > f32::EPSILON,
+            "{command:?} did not change the resolved graph output"
+        );
+    }
+}
+
+#[test]
+fn compiled_automation_precedes_live_base_parameters_per_sample() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime =
+        GraphMainRuntime::try_new_automated(&prepared, &fixture.mixer, fixture.automation, 25)
+            .unwrap();
+    let (mut transport_sender, mut parameter_sender, mut transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+    transport_sender
+        .try_send(TransportCommand::Locate {
+            frame: 25,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    parameter_sender
+        .try_send(MixerParameterCommand::MainMute { muted: true })
+        .unwrap();
+    let mut left = [9.0_f32; 25];
+    let mut right = [9.0_f32; 25];
+
+    let cycle = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(cycle.start_frame(), 25);
+    assert_eq!(cycle.applied_mixer_parameter_command_count(), 1);
+    assert!(left.iter().any(|sample| sample.abs() > f32::EPSILON));
+    assert!(right.iter().any(|sample| sample.abs() > f32::EPSILON));
+
+    parameter_sender
+        .try_send(MixerParameterCommand::MainMute { muted: false })
+        .unwrap();
+    let muted_by_automation = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(muted_by_automation.start_frame(), 50);
+    assert_constant(&left, 0.0);
+    assert_constant(&right, 0.0);
+
+    let automation_released_mute =
+        process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(automation_released_mute.start_frame(), 75);
+    assert!(left.iter().any(|sample| sample.abs() > f32::EPSILON));
+    assert!(right.iter().any(|sample| sample.abs() > f32::EPSILON));
+}
+
+#[test]
 fn interleaved_callback_executes_the_transport_runtime() {
     let fixture = graph_fixture();
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
@@ -1151,6 +1393,36 @@ fn invalid_cycle_does_not_consume_queued_commands() {
 }
 
 #[test]
+fn invalid_cycle_does_not_consume_live_mixer_commands() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (_transport_sender, mut parameter_sender, mut transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+    parameter_sender
+        .try_send(MixerParameterCommand::MainMute { muted: true })
+        .unwrap();
+    let mut scratch = [];
+    let mut invalid_left = [8.0_f32; 2];
+    let mut invalid_right = [8.0_f32; 1];
+
+    assert_eq!(
+        transport.process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut invalid_left,
+                right: &mut invalid_right,
+            },
+        ),
+        Err(RuntimeProcessError::OutputLengthMismatch { left: 2, right: 1 })
+    );
+    let mut left = [9.0_f32; 1];
+    let mut right = [9.0_f32; 1];
+    let stopped = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(stopped.applied_mixer_parameter_command_count(), 1);
+}
+
+#[test]
 fn queued_command_is_rolled_back_when_later_cycle_work_fails() {
     let fixture = graph_fixture();
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
@@ -1211,6 +1483,44 @@ fn queued_start_is_rolled_back_when_track_rendering_fails() {
     assert_eq!(transport.position_frame(), 0);
     assert_constant(&left, 9.0);
     assert_constant(&right, 9.0);
+}
+
+#[test]
+fn live_mixer_state_is_rolled_back_when_later_cycle_work_fails() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (mut transport_sender, mut parameter_sender, mut transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+    transport_sender.try_send(TransportCommand::Start).unwrap();
+    parameter_sender
+        .try_send(MixerParameterCommand::MainMute { muted: true })
+        .unwrap();
+    let mut scratch = [];
+    let mut left = [9.0_f32; 1];
+    let mut right = [9.0_f32; 1];
+
+    let failed = transport.process_cycle(
+        &mut scratch,
+        StereoOutput {
+            left: &mut left,
+            right: &mut right,
+        },
+    );
+    assert!(matches!(failed, Err(RuntimeProcessError::Render(_))));
+    assert_eq!(transport.state(), TransportState::Stopped);
+
+    transport_sender.try_send(TransportCommand::Start).unwrap();
+    let recovered = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(recovered.applied_mixer_parameter_command_count(), 0);
+    assert!(left[0].abs() <= f32::EPSILON);
+    assert!(right[0].abs() <= f32::EPSILON);
+
+    let mut next_left = [9.0_f32; 1];
+    let mut next_right = [9.0_f32; 1];
+    process_transport(&mut transport, &mut next_left, &mut next_right).unwrap();
+    assert!(next_left[0] > 0.0);
+    assert!(next_right[0] > 0.0);
 }
 
 #[test]

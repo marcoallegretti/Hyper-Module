@@ -18,9 +18,10 @@ use core::fmt;
 use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_media_cache::PreparePlaybackError;
 use hyper_mixer_runtime::{
-    LoudnessCommandSender, OutputMeterReceiver, RoutedMainRuntime, RoutedTransportRuntime,
-    RuntimeCreationError, TransportCommandSender, TransportOutputCreationError,
-    TransportOutputProcessor, loudness_command_channel, output_meter_channel,
+    LoudnessCommandSender, MixerParameterCommandSender, OutputMeterReceiver, RoutedMainRuntime,
+    RoutedTransportRuntime, RuntimeCreationError, TransportCommandSender,
+    TransportOutputCreationError, TransportOutputProcessor, loudness_command_channel,
+    output_meter_channel,
 };
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
@@ -277,6 +278,7 @@ impl Error for DesktopProjectOpenError {
 #[derive(Debug)]
 struct SessionHandles {
     commands: TransportCommandSender,
+    mixer_parameter_commands: MixerParameterCommandSender,
     loudness_commands: LoudnessCommandSender,
     meters: OutputMeterReceiver,
     recovery: PlaybackRecoveryCheckpoint,
@@ -293,6 +295,7 @@ enum SessionPublication {
 pub struct DesktopPlaybackSession {
     output: DesktopOutputStream,
     commands: TransportCommandSender,
+    mixer_parameter_commands: MixerParameterCommandSender,
     loudness_commands: LoudnessCommandSender,
     meters: OutputMeterReceiver,
     recovery: PlaybackRecoveryCheckpoint,
@@ -555,6 +558,7 @@ impl DesktopPlaybackSession {
                 Ok(SessionPublication::Prepared(handles)) => Ok(Self {
                     output,
                     commands: handles.commands,
+                    mixer_parameter_commands: handles.mixer_parameter_commands,
                     loudness_commands: handles.loudness_commands,
                     meters: handles.meters,
                     recovery: handles.recovery,
@@ -576,6 +580,11 @@ impl DesktopPlaybackSession {
     #[must_use]
     pub fn command_sender(&mut self) -> &mut TransportCommandSender {
         &mut self.commands
+    }
+
+    #[must_use]
+    pub fn mixer_parameter_command_sender(&mut self) -> &mut MixerParameterCommandSender {
+        &mut self.mixer_parameter_commands
     }
 
     #[must_use]
@@ -626,6 +635,7 @@ impl DesktopPlaybackSession {
         let Self {
             output,
             commands: _,
+            mixer_parameter_commands: _,
             loudness_commands: _,
             meters: _,
             recovery,
@@ -664,6 +674,7 @@ impl DesktopPlaybackSession {
         let Self {
             output,
             commands: _,
+            mixer_parameter_commands: _,
             loudness_commands: _,
             meters: _,
             recovery: _,
@@ -748,7 +759,8 @@ fn initialize_session(
             .map(|(left, right)| RenderScratchSlot::new(left, right)),
     );
 
-    let (commands, mut transport) = RoutedTransportRuntime::with_command_queue(runtime);
+    let (commands, mixer_parameter_commands, mut transport) =
+        RoutedTransportRuntime::with_command_queues(runtime);
     if let Some(checkpoint) = initial_checkpoint {
         transport.apply_command(checkpoint.restore_command());
     }
@@ -769,6 +781,7 @@ fn initialize_session(
     publication
         .try_send(SessionPublication::Prepared(SessionHandles {
             commands,
+            mixer_parameter_commands,
             loudness_commands,
             meters,
             recovery: recovery.clone(),

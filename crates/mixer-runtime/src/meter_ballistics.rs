@@ -358,6 +358,8 @@ mod tests {
                 active_slot_count: 1,
                 applied_command_count: 0,
                 command_sender_disconnected: false,
+                applied_mixer_parameter_command_count: 0,
+                mixer_parameter_command_sender_disconnected: false,
             },
             meter,
             processed_frame_end,

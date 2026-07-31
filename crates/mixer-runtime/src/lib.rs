@@ -37,6 +37,7 @@ pub use meter_ballistics::{
 
 pub const MAX_MAIN_MIXER_SLOTS: usize = 8;
 pub const MAX_QUEUED_TRANSPORT_COMMANDS: usize = 64;
+pub const MAX_QUEUED_MIXER_PARAMETER_COMMANDS: usize = 64;
 pub const MAX_QUEUED_LOUDNESS_COMMANDS: usize = 32;
 pub const MAX_QUEUED_OUTPUT_METER_SNAPSHOTS: usize = 64;
 const MAX_SENDS_PER_SLOT: usize = 2;
@@ -217,6 +218,231 @@ impl fmt::Display for TransportCommandSendError {
 
 impl Error for TransportCommandSendError {}
 
+/// One live mixer-state change resolved to the runtime's fixed slot layout.
+///
+/// These commands change the base mixer state at a process-cycle boundary.
+/// Compiled automation, when present at a sample, has precedence over that
+/// base state for the same parameter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MixerParameterCommand {
+    ChannelGain {
+        slot: usize,
+        gain: LinearGain,
+    },
+    ChannelPan {
+        slot: usize,
+        pan: Pan,
+    },
+    ChannelMute {
+        slot: usize,
+        muted: bool,
+    },
+    ChannelSolo {
+        slot: usize,
+        solo: bool,
+    },
+    SendGain {
+        slot: usize,
+        send: usize,
+        gain: LinearGain,
+    },
+    SendPan {
+        slot: usize,
+        send: usize,
+        pan: Pan,
+    },
+    SendEnabled {
+        slot: usize,
+        send: usize,
+        enabled: bool,
+    },
+    MainGain {
+        gain: LinearGain,
+    },
+    MainMute {
+        muted: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MixerParameterTargetError {
+    ChannelOutOfRange {
+        slot: usize,
+        slot_count: usize,
+    },
+    SendOutOfRange {
+        slot: usize,
+        send: usize,
+        send_count: usize,
+    },
+    SoloUnavailable {
+        slot: usize,
+    },
+}
+
+impl fmt::Display for MixerParameterTargetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ChannelOutOfRange { slot, slot_count } => write!(
+                formatter,
+                "mixer slot {slot} is outside the runtime's {slot_count} slots"
+            ),
+            Self::SendOutOfRange {
+                slot,
+                send,
+                send_count,
+            } => write!(
+                formatter,
+                "mixer send {send} is outside slot {slot}'s {send_count} sends"
+            ),
+            Self::SoloUnavailable { slot } => {
+                write!(formatter, "mixer slot {slot} is not an audio channel")
+            }
+        }
+    }
+}
+
+impl Error for MixerParameterTargetError {}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MixerParameterCommandSendError {
+    InvalidTarget {
+        command: MixerParameterCommand,
+        source: MixerParameterTargetError,
+    },
+    Full(MixerParameterCommand),
+    Disconnected(MixerParameterCommand),
+}
+
+impl MixerParameterCommandSendError {
+    #[must_use]
+    pub const fn command(self) -> MixerParameterCommand {
+        match self {
+            Self::InvalidTarget { command, .. }
+            | Self::Full(command)
+            | Self::Disconnected(command) => command,
+        }
+    }
+}
+
+impl fmt::Display for MixerParameterCommandSendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTarget { source, .. } => {
+                write!(formatter, "invalid mixer target: {source}")
+            }
+            Self::Full(_) => formatter.write_str("mixer parameter command queue is full"),
+            Self::Disconnected(_) => {
+                formatter.write_str("mixer parameter command receiver is disconnected")
+            }
+        }
+    }
+}
+
+impl Error for MixerParameterCommandSendError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidTarget { source, .. } => Some(source),
+            Self::Full(_) | Self::Disconnected(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MixerParameterLayout {
+    slot_count: usize,
+    send_counts: [usize; MAX_MAIN_MIXER_SLOTS],
+    audio_slots: [bool; MAX_MAIN_MIXER_SLOTS],
+}
+
+impl MixerParameterLayout {
+    fn validate(self, command: MixerParameterCommand) -> Result<(), MixerParameterTargetError> {
+        let slot = match command {
+            MixerParameterCommand::ChannelGain { slot, .. }
+            | MixerParameterCommand::ChannelPan { slot, .. }
+            | MixerParameterCommand::ChannelMute { slot, .. }
+            | MixerParameterCommand::ChannelSolo { slot, .. }
+            | MixerParameterCommand::SendGain { slot, .. }
+            | MixerParameterCommand::SendPan { slot, .. }
+            | MixerParameterCommand::SendEnabled { slot, .. } => Some(slot),
+            MixerParameterCommand::MainGain { .. } | MixerParameterCommand::MainMute { .. } => None,
+        };
+        let Some(slot) = slot else {
+            return Ok(());
+        };
+        if slot >= self.slot_count {
+            return Err(MixerParameterTargetError::ChannelOutOfRange {
+                slot,
+                slot_count: self.slot_count,
+            });
+        }
+        if matches!(command, MixerParameterCommand::ChannelSolo { .. }) && !self.audio_slots[slot] {
+            return Err(MixerParameterTargetError::SoloUnavailable { slot });
+        }
+        let send = match command {
+            MixerParameterCommand::SendGain { send, .. }
+            | MixerParameterCommand::SendPan { send, .. }
+            | MixerParameterCommand::SendEnabled { send, .. } => Some(send),
+            _ => None,
+        };
+        if let Some(send) = send {
+            let send_count = self.send_counts[slot];
+            if send >= send_count {
+                return Err(MixerParameterTargetError::SendOutOfRange {
+                    slot,
+                    send,
+                    send_count,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Application-thread half of the bounded live mixer-control queue.
+#[derive(Debug)]
+pub struct MixerParameterCommandSender {
+    producer: Producer<MixerParameterCommand>,
+    layout: MixerParameterLayout,
+}
+
+impl MixerParameterCommandSender {
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        MAX_QUEUED_MIXER_PARAMETER_COMMANDS
+    }
+
+    #[must_use]
+    pub fn is_disconnected(&self) -> bool {
+        let disconnected = self.producer.is_abandoned();
+        if disconnected {
+            fence(Ordering::Acquire);
+        }
+        disconnected
+    }
+
+    /// Validates and enqueues one base-state change without waiting or allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original command for an invalid target, a full queue, or a
+    /// destroyed receiving runtime. Target validation precedes queue state.
+    pub fn try_send(
+        &mut self,
+        command: MixerParameterCommand,
+    ) -> Result<(), MixerParameterCommandSendError> {
+        self.layout
+            .validate(command)
+            .map_err(|source| MixerParameterCommandSendError::InvalidTarget { command, source })?;
+        if self.is_disconnected() {
+            return Err(MixerParameterCommandSendError::Disconnected(command));
+        }
+        self.producer.push(command).map_err(|error| match error {
+            PushError::Full(command) => MixerParameterCommandSendError::Full(command),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoudnessCommandSendError {
     Full(LoudnessMeasurementCommand),
@@ -349,6 +575,8 @@ pub struct TransportCycle {
     active_slot_count: usize,
     applied_command_count: usize,
     command_sender_disconnected: bool,
+    applied_mixer_parameter_command_count: usize,
+    mixer_parameter_command_sender_disconnected: bool,
 }
 
 impl TransportCycle {
@@ -385,6 +613,7 @@ impl TransportCycle {
     }
 
     #[must_use]
+    /// Transport commands applied at the beginning of this successful cycle.
     pub const fn applied_command_count(self) -> usize {
         self.applied_command_count
     }
@@ -392,6 +621,17 @@ impl TransportCycle {
     #[must_use]
     pub const fn command_sender_disconnected(self) -> bool {
         self.command_sender_disconnected
+    }
+
+    #[must_use]
+    /// Live mixer base-state commands applied at the beginning of this cycle.
+    pub const fn applied_mixer_parameter_command_count(self) -> usize {
+        self.applied_mixer_parameter_command_count
+    }
+
+    #[must_use]
+    pub const fn mixer_parameter_command_sender_disconnected(self) -> bool {
+        self.mixer_parameter_command_sender_disconnected
     }
 }
 
@@ -1060,6 +1300,7 @@ pub struct RoutedMainRuntime<R> {
     unity_master_controls: Vec<LinearGain>,
     master_controls: Vec<LinearGain>,
     automation: Option<CompiledAutomation>,
+    live_parameters_enabled: bool,
     max_block_frames: usize,
 }
 
@@ -1278,11 +1519,7 @@ fn build_routed_main_runtime<R>(
     max_block_frames: usize,
 ) -> Result<RoutedMainRuntime<R>, RuntimeCreationError> {
     let slot_count = compiled.slots().len();
-    let control_frame_count = if automation.is_some() {
-        max_block_frames
-    } else {
-        0
-    };
+    let control_frame_count = max_block_frames;
     let mut slots = Vec::new();
     slots
         .try_reserve_exact(slot_count)
@@ -1350,6 +1587,7 @@ fn build_routed_main_runtime<R>(
         unity_master_controls: try_filled(control_frame_count, LinearGain::UNITY)?,
         master_controls: try_filled(control_frame_count, compiled.master_gain())?,
         automation,
+        live_parameters_enabled: false,
         max_block_frames,
     })
 }
@@ -1367,6 +1605,97 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
 
     pub fn seek(&mut self, frame: usize) {
         self.renderer.seek(frame);
+    }
+
+    fn parameter_layout(&self) -> MixerParameterLayout {
+        let mut send_counts = [0; MAX_MAIN_MIXER_SLOTS];
+        let mut audio_slots = [false; MAX_MAIN_MIXER_SLOTS];
+        for (slot, runtime) in self.slots.iter().enumerate() {
+            send_counts[slot] = runtime.sends.len();
+            audio_slots[slot] = runtime.kind == CompiledMixerTrackKind::Audio;
+        }
+        MixerParameterLayout {
+            slot_count: self.slots.len(),
+            send_counts,
+            audio_slots,
+        }
+    }
+
+    const fn controls_enabled(&self) -> bool {
+        self.live_parameters_enabled || self.automation.is_some()
+    }
+
+    fn enable_live_parameters(&mut self) {
+        self.live_parameters_enabled = true;
+    }
+
+    fn apply_mixer_parameter_command(&mut self, command: MixerParameterCommand) {
+        match command {
+            MixerParameterCommand::ChannelGain { slot, gain } => {
+                self.slots[slot].parameters.gain = gain;
+            }
+            MixerParameterCommand::ChannelPan { slot, pan } => {
+                self.slots[slot].parameters.pan = pan;
+            }
+            MixerParameterCommand::ChannelMute { slot, muted } => {
+                self.slots[slot].muted = muted;
+            }
+            MixerParameterCommand::ChannelSolo { slot, solo } => {
+                self.slots[slot].solo = solo;
+            }
+            MixerParameterCommand::SendGain { slot, send, gain } => {
+                self.slots[slot].sends[send].parameters.gain = gain;
+            }
+            MixerParameterCommand::SendPan { slot, send, pan } => {
+                self.slots[slot].sends[send].parameters.pan = pan;
+            }
+            MixerParameterCommand::SendEnabled {
+                slot,
+                send,
+                enabled,
+            } => {
+                self.slots[slot].sends[send].enabled = enabled;
+            }
+            MixerParameterCommand::MainGain { gain } => self.main_gain = gain,
+            MixerParameterCommand::MainMute { muted } => self.main_muted = muted,
+        }
+    }
+
+    fn capture_parameter_state(&self) -> MixerParameterState {
+        let default = ChannelParameters::new(LinearGain::UNITY, Pan::CENTER, true);
+        let mut state = MixerParameterState {
+            channel_parameters: [default; MAX_MAIN_MIXER_SLOTS],
+            muted: [false; MAX_MAIN_MIXER_SLOTS],
+            solo: [false; MAX_MAIN_MIXER_SLOTS],
+            send_parameters: [[default; MAX_SENDS_PER_SLOT]; MAX_MAIN_MIXER_SLOTS],
+            send_enabled: [[false; MAX_SENDS_PER_SLOT]; MAX_MAIN_MIXER_SLOTS],
+            main_gain: self.main_gain,
+            main_muted: self.main_muted,
+        };
+        for (slot_index, slot) in self.slots.iter().enumerate() {
+            state.channel_parameters[slot_index] = slot.parameters;
+            state.muted[slot_index] = slot.muted;
+            state.solo[slot_index] = slot.solo;
+            for (send_index, send) in slot.sends.iter().enumerate() {
+                state.send_parameters[slot_index][send_index] = send.parameters;
+                state.send_enabled[slot_index][send_index] = send.enabled;
+            }
+        }
+        state
+    }
+
+    fn restore_parameter_state(&mut self, state: &MixerParameterState) {
+        for (slot_index, slot) in self.slots.iter_mut().enumerate() {
+            slot.parameters = state.channel_parameters[slot_index];
+            slot.muted = state.muted[slot_index];
+            slot.solo = state.solo[slot_index];
+            for (send_index, send) in slot.sends.iter_mut().enumerate() {
+                send.parameters = state.send_parameters[slot_index][send_index];
+                send.enabled = state.send_enabled[slot_index][send_index];
+            }
+        }
+        self.main_gain = state.main_gain;
+        self.main_muted = state.main_muted;
     }
 
     /// Renders and executes one bounded graph window into the main output.
@@ -1406,8 +1735,8 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
             return Ok(rendered);
         }
         let result = (|| {
-            if self.automation.is_some() {
-                self.prepare_automation_controls(arrangement_start_frame, frame_count)?;
+            if self.controls_enabled() {
+                self.prepare_controls(arrangement_start_frame, frame_count)?;
             }
 
             for buffer in &mut self.route_buffers {
@@ -1432,7 +1761,7 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                 left: &self.main_input.left[..frame_count],
                 right: &self.main_input.right[..frame_count],
             }];
-            if self.automation.is_some() {
+            if self.controls_enabled() {
                 let controlled = [ControlledInputBlock {
                     input: main_input[0],
                     parameters: &self.main_input_controls[..frame_count],
@@ -1453,7 +1782,7 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
         result
     }
 
-    fn prepare_automation_controls(
+    fn prepare_controls(
         &mut self,
         arrangement_start_frame: usize,
         frame_count: usize,
@@ -1463,13 +1792,13 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                 .checked_add(frame)
                 .ok_or(RuntimeProcessError::FrameRangeOverflow)?;
             let mut overrides = FrameOverrides::default();
-            self.automation
-                .as_ref()
-                .ok_or(RuntimeProcessError::AutomationValueMismatch)?
-                .visit_frame_values(absolute_frame, |target, value| {
-                    overrides.apply(target, value);
-                })
-                .map_err(RuntimeProcessError::Automation)?;
+            if let Some(automation) = self.automation.as_ref() {
+                automation
+                    .visit_frame_values(absolute_frame, |target, value| {
+                        overrides.apply(target, value);
+                    })
+                    .map_err(RuntimeProcessError::Automation)?;
+            }
             if overrides.mismatch {
                 return Err(RuntimeProcessError::AutomationValueMismatch);
             }
@@ -1563,7 +1892,7 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                 }
             };
             let inputs = [input];
-            if self.automation.is_some() {
+            if self.controls_enabled() {
                 let send = &mut self.slots[slot_index].sends[send_index];
                 let controlled = [ControlledInputBlock {
                     input,
@@ -1619,7 +1948,7 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
             }
         };
         let inputs = [input];
-        if self.automation.is_some() {
+        if self.controls_enabled() {
             let slot = &mut self.slots[slot_index];
             let controlled = [ControlledInputBlock {
                 input,
@@ -1668,10 +1997,22 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MixerParameterState {
+    channel_parameters: [ChannelParameters; MAX_MAIN_MIXER_SLOTS],
+    muted: [bool; MAX_MAIN_MIXER_SLOTS],
+    solo: [bool; MAX_MAIN_MIXER_SLOTS],
+    send_parameters: [[ChannelParameters; MAX_SENDS_PER_SLOT]; MAX_MAIN_MIXER_SLOTS],
+    send_enabled: [[bool; MAX_SENDS_PER_SLOT]; MAX_MAIN_MIXER_SLOTS],
+    main_gain: LinearGain,
+    main_muted: bool,
+}
+
 /// Single-owner transport state for the routed main-output engine.
 ///
-/// Commands can be applied synchronously or through the optional bounded
-/// cross-thread queue. This type does not provide device I/O. Stopped cycles
+/// Transport commands can be applied synchronously or through an optional
+/// bounded cross-thread queue. A second optional queue owns typed live mixer
+/// base-state changes. This type does not provide device I/O. Stopped cycles
 /// produce silence and retain the current frame; rolling cycles advance only
 /// after the complete routed window succeeds.
 #[derive(Debug)]
@@ -1680,6 +2021,7 @@ pub struct RoutedTransportRuntime<R> {
     state: TransportState,
     position_frame: usize,
     command_consumer: Option<Consumer<TransportCommand>>,
+    mixer_parameter_command_consumer: Option<Consumer<MixerParameterCommand>>,
 }
 
 pub type GraphTransportRuntime<'prepared, 'cache, 'schedule> =
@@ -1696,6 +2038,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             state: TransportState::Stopped,
             position_frame: 0,
             command_consumer: None,
+            mixer_parameter_command_consumer: None,
         }
     }
 
@@ -1713,6 +2056,41 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 state: TransportState::Stopped,
                 position_frame: 0,
                 command_consumer: Some(consumer),
+                mixer_parameter_command_consumer: None,
+            },
+        )
+    }
+
+    /// Creates one transport with bounded application-thread transport and
+    /// live mixer-control queues.
+    ///
+    /// The mixer sender validates resolved slot/send targets before enqueueing.
+    /// Both queues and exact per-sample control storage are fully allocated
+    /// before the runtime is returned.
+    #[must_use]
+    pub fn with_command_queues(
+        mut runtime: RoutedMainRuntime<R>,
+    ) -> (TransportCommandSender, MixerParameterCommandSender, Self) {
+        let layout = runtime.parameter_layout();
+        runtime.enable_live_parameters();
+        let (transport_producer, transport_consumer) =
+            RingBuffer::new(MAX_QUEUED_TRANSPORT_COMMANDS);
+        let (parameter_producer, parameter_consumer) =
+            RingBuffer::new(MAX_QUEUED_MIXER_PARAMETER_COMMANDS);
+        (
+            TransportCommandSender {
+                producer: transport_producer,
+            },
+            MixerParameterCommandSender {
+                producer: parameter_producer,
+                layout,
+            },
+            Self {
+                runtime,
+                state: TransportState::Stopped,
+                position_frame: 0,
+                command_consumer: Some(transport_consumer),
+                mixer_parameter_command_consumer: Some(parameter_consumer),
             },
         )
     }
@@ -1757,12 +2135,12 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     /// Processes the next transport-owned callback window.
     ///
     /// Output shape and block capacity are validated before queued commands are
-    /// consumed. A valid cycle applies a bounded FIFO batch provisionally
+    /// consumed. A valid cycle applies bounded FIFO batches provisionally
     /// before it captures the cycle's state and start frame. If later work
-    /// fails, transport state and renderer position return to their preceding
-    /// committed values; consumed commands are not replayed. Arbitrary mixer
-    /// processor state is not transactional, so callers must not continue
-    /// processing after a mixer failure.
+    /// fails, transport state, renderer position, and mixer base parameters
+    /// return to their preceding committed values; consumed commands are not
+    /// replayed. Arbitrary mixer processor state is not transactional, so
+    /// callers must not continue processing after a mixer failure.
     ///
     /// Stopped cycles clear the output without reading arrangement scratch or
     /// advancing the position. Rolling cycles render from the current absolute
@@ -1772,7 +2150,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     ///
     /// Returns [`RuntimeProcessError`] for output shape, block capacity, frame
     /// range, rendering, automation, or mixer failures. A failed cycle never
-    /// commits queued command state or advances the transport position.
+    /// commits queued transport or mixer base state and never advances the
+    /// transport position.
     pub fn process_cycle(
         &mut self,
         scratch: &mut [RenderScratchSlot<'_>],
@@ -1793,8 +2172,12 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         }
         let committed_state = self.state;
         let committed_position = self.position_frame;
+        let committed_parameters = self.runtime.capture_parameter_state();
         let applied_command_count = self.drain_commands();
         let command_sender_disconnected = self.command_sender_disconnected();
+        let applied_mixer_parameter_command_count = self.drain_mixer_parameter_commands();
+        let mixer_parameter_command_sender_disconnected =
+            self.mixer_parameter_command_sender_disconnected();
         let start_frame = self.position_frame;
         if self.state == TransportState::Stopped {
             output.left.fill(0.0);
@@ -1806,6 +2189,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 active_slot_count: 0,
                 applied_command_count,
                 command_sender_disconnected,
+                applied_mixer_parameter_command_count,
+                mixer_parameter_command_sender_disconnected,
             });
         }
         let rendered = (|| {
@@ -1821,6 +2206,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 self.state = committed_state;
                 self.position_frame = committed_position;
                 self.runtime.seek(committed_position);
+                self.runtime.restore_parameter_state(&committed_parameters);
                 return Err(source);
             }
         };
@@ -1832,6 +2218,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             active_slot_count: rendered.active_slot_count,
             applied_command_count,
             command_sender_disconnected,
+            applied_mixer_parameter_command_count,
+            mixer_parameter_command_sender_disconnected,
         })
     }
 
@@ -1919,6 +2307,33 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     fn command_sender_disconnected(&self) -> bool {
         let disconnected = self
             .command_consumer
+            .as_ref()
+            .is_some_and(Consumer::is_abandoned);
+        if disconnected {
+            fence(Ordering::Acquire);
+        }
+        disconnected
+    }
+
+    fn drain_mixer_parameter_commands(&mut self) -> usize {
+        let mut applied = 0;
+        for _ in 0..MAX_QUEUED_MIXER_PARAMETER_COMMANDS {
+            let command = self
+                .mixer_parameter_command_consumer
+                .as_mut()
+                .and_then(|consumer| consumer.pop().ok());
+            let Some(command) = command else {
+                break;
+            };
+            self.runtime.apply_mixer_parameter_command(command);
+            applied += 1;
+        }
+        applied
+    }
+
+    fn mixer_parameter_command_sender_disconnected(&self) -> bool {
+        let disconnected = self
+            .mixer_parameter_command_consumer
             .as_ref()
             .is_some_and(Consumer::is_abandoned);
         if disconnected {
