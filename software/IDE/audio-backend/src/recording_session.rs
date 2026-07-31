@@ -134,17 +134,17 @@ pub enum DesktopRecordingSessionStopError {
     Input {
         journal_path: PathBuf,
         source: Box<NativeInputStopError>,
-        pending: Option<Box<DesktopRecordingPendingCompletion>>,
+        writer: Box<DesktopRecordingWriterSettlement>,
     },
     CaptureIntegrity {
         journal_path: PathBuf,
         capture: Box<CaptureStreamSnapshot>,
-        pending: Option<Box<DesktopRecordingPendingCompletion>>,
+        writer: Box<DesktopRecordingWriterSettlement>,
     },
     Disposition {
         journal_path: PathBuf,
         source: RecordingDispositionError,
-        pending: Option<Box<DesktopRecordingPendingCompletion>>,
+        writer: Box<DesktopRecordingWriterSettlement>,
     },
     Writer {
         journal_path: PathBuf,
@@ -218,20 +218,102 @@ impl DesktopRecordingSessionStopError {
     #[must_use]
     pub fn pending_completion(&self) -> Option<&DesktopRecordingPendingCompletion> {
         match self {
-            Self::Input { pending, .. }
-            | Self::CaptureIntegrity { pending, .. }
-            | Self::Disposition { pending, .. }
-            | Self::Writer { pending, .. } => pending.as_deref(),
+            Self::Input { writer, .. }
+            | Self::CaptureIntegrity { writer, .. }
+            | Self::Disposition { writer, .. } => writer.pending_completion(),
+            Self::Writer { pending, .. } => pending.as_deref(),
         }
     }
 
-    #[must_use]
-    pub fn into_pending_completion(self) -> Option<DesktopRecordingPendingCompletion> {
+    /// Extracts retryable writer ownership without discarding a terminal
+    /// settlement or the primary stop error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unchanged boxed error when the writer is already settled.
+    pub fn into_pending_completion(self) -> Result<DesktopRecordingPendingCompletion, Box<Self>> {
         match self {
-            Self::Input { pending, .. }
-            | Self::CaptureIntegrity { pending, .. }
-            | Self::Disposition { pending, .. }
-            | Self::Writer { pending, .. } => pending.map(|pending| *pending),
+            Self::Input {
+                journal_path,
+                source,
+                writer,
+            } => (*writer).into_pending_completion().map_err(|writer| {
+                Box::new(Self::Input {
+                    journal_path,
+                    source,
+                    writer: Box::new(writer),
+                })
+            }),
+            Self::CaptureIntegrity {
+                journal_path,
+                capture,
+                writer,
+            } => (*writer).into_pending_completion().map_err(|writer| {
+                Box::new(Self::CaptureIntegrity {
+                    journal_path,
+                    capture,
+                    writer: Box::new(writer),
+                })
+            }),
+            Self::Disposition {
+                journal_path,
+                source,
+                writer,
+            } => (*writer).into_pending_completion().map_err(|writer| {
+                Box::new(Self::Disposition {
+                    journal_path,
+                    source,
+                    writer: Box::new(writer),
+                })
+            }),
+            Self::Writer {
+                pending: Some(pending),
+                ..
+            } => Ok(*pending),
+            settled @ Self::Writer { pending: None, .. } => Err(Box::new(settled)),
+        }
+    }
+
+    /// Returns the terminal or pending writer outcome retained alongside an
+    /// earlier native, integrity, or disposition failure.
+    #[must_use]
+    pub const fn writer_settlement(&self) -> Option<&DesktopRecordingWriterSettlement> {
+        match self {
+            Self::Input { writer, .. }
+            | Self::CaptureIntegrity { writer, .. }
+            | Self::Disposition { writer, .. } => Some(writer),
+            Self::Writer { .. } => None,
+        }
+    }
+}
+
+/// Writer authority retained when an earlier recording shutdown step fails.
+#[derive(Debug)]
+pub enum DesktopRecordingWriterSettlement {
+    Completed(Box<RecordingWorkerCompletion>),
+    Failed(RecordingWorkerWaitError),
+    Pending(Box<DesktopRecordingPendingCompletion>),
+}
+
+impl DesktopRecordingWriterSettlement {
+    #[must_use]
+    pub const fn pending_completion(&self) -> Option<&DesktopRecordingPendingCompletion> {
+        match self {
+            Self::Pending(pending) => Some(pending),
+            Self::Completed(_) | Self::Failed(_) => None,
+        }
+    }
+
+    /// Extracts retryable writer ownership without discarding terminal evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns this settlement unchanged when the writer already completed or
+    /// failed.
+    pub fn into_pending_completion(self) -> Result<DesktopRecordingPendingCompletion, Self> {
+        match self {
+            Self::Pending(pending) => Ok(*pending),
+            settled @ (Self::Completed(_) | Self::Failed(_)) => Err(settled),
         }
     }
 }
@@ -467,21 +549,21 @@ impl DesktopRecordingSession {
         let capture = input.counters();
         if let Err(source) = input.stop() {
             let _ = writer.request_abort();
-            let pending = pending_after_wait_timeout(writer, &journal_path, completion_timeout);
+            let writer = Box::new(settle_writer(writer, &journal_path, completion_timeout));
             return Err(DesktopRecordingSessionStopError::Input {
                 journal_path,
                 source: Box::new(source),
-                pending,
+                writer,
             });
         }
         let capture = capture.snapshot();
         if commit && !capture_is_publishable(capture) {
             let _ = writer.request_abort();
-            let pending = pending_after_wait_timeout(writer, &journal_path, completion_timeout);
+            let writer = Box::new(settle_writer(writer, &journal_path, completion_timeout));
             return Err(DesktopRecordingSessionStopError::CaptureIntegrity {
                 journal_path,
                 capture: Box::new(capture),
-                pending,
+                writer,
             });
         }
         let disposition = if commit {
@@ -490,11 +572,11 @@ impl DesktopRecordingSession {
             writer.request_abort()
         };
         if let Err(source) = disposition {
-            let pending = pending_after_wait_timeout(writer, &journal_path, completion_timeout);
+            let writer = Box::new(settle_writer(writer, &journal_path, completion_timeout));
             return Err(DesktopRecordingSessionStopError::Disposition {
                 journal_path,
                 source,
-                pending,
+                writer,
             });
         }
         match writer.wait(completion_timeout) {
@@ -516,19 +598,20 @@ impl DesktopRecordingSession {
     }
 }
 
-fn pending_after_wait_timeout(
+fn settle_writer(
     mut writer: RecordingWorker,
     journal_path: &Path,
     timeout: Duration,
-) -> Option<Box<DesktopRecordingPendingCompletion>> {
+) -> DesktopRecordingWriterSettlement {
     match writer.wait(timeout) {
+        Ok(completion) => DesktopRecordingWriterSettlement::Completed(Box::new(completion)),
         Err(RecordingWorkerWaitError::TimedOut) => {
-            Some(Box::new(DesktopRecordingPendingCompletion {
+            DesktopRecordingWriterSettlement::Pending(Box::new(DesktopRecordingPendingCompletion {
                 writer,
                 journal_path: journal_path.to_owned(),
             }))
         }
-        Ok(_) | Err(_) => None,
+        Err(source) => DesktopRecordingWriterSettlement::Failed(source),
     }
 }
 
@@ -752,6 +835,45 @@ mod tests {
         drop(producer);
         assert!(matches!(
             pending.wait(Duration::from_secs(1)).unwrap(),
+            RecordingWorkerCompletion::Aborted { frames: 0, .. }
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn exceptional_shutdown_retains_a_completed_writer_result() {
+        let id = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "hyper-desktop-settled-recording-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let journal_path = directory.join("take.journal");
+        let (producer, consumer) = try_recording_transport(2).unwrap();
+        let mut writer = RecordingWorker::start(
+            RecordingWorkerConfig {
+                journal_path: journal_path.clone(),
+                final_wav_path: directory.join("take.wav"),
+                journal: JournalConfig {
+                    sample_rate: 48_000,
+                    max_chunk_frames: 2,
+                    max_total_frames: 2,
+                },
+                drain_frames: 2,
+            },
+            consumer,
+        )
+        .unwrap();
+        writer.request_abort().unwrap();
+        drop(producer);
+
+        let settlement = Box::new(settle_writer(writer, &journal_path, Duration::from_secs(1)));
+        let settlement = (*settlement).into_pending_completion().unwrap_err();
+        let DesktopRecordingWriterSettlement::Completed(completion) = settlement else {
+            panic!("the completed writer result must remain available");
+        };
+        assert!(matches!(
+            *completion,
             RecordingWorkerCompletion::Aborted { frames: 0, .. }
         ));
         fs::remove_dir_all(directory).unwrap();

@@ -141,7 +141,7 @@ impl Error for WasapiInputConfigError {}
 #[derive(Debug)]
 pub struct WasapiInputStream {
     stop_requested: Arc<AtomicBool>,
-    thread: BoundedBackendThread,
+    thread: Option<BoundedBackendThread>,
     counters: CaptureStreamCounters,
     status: StreamStatus,
     disconnect_reason: Arc<AtomicU8>,
@@ -265,7 +265,7 @@ impl WasapiInputStream {
         match wait_for_startup(&startup_receiver, startup_timeout) {
             Ok(()) => Ok(Self {
                 stop_requested,
-                thread,
+                thread: Some(thread),
                 counters,
                 status,
                 disconnect_reason,
@@ -312,13 +312,25 @@ impl WasapiInputStream {
     }
 
     fn join(&mut self) -> Result<(), WasapiStopError> {
-        match self.thread.wait(self.shutdown_timeout) {
+        let result = self
+            .thread
+            .as_mut()
+            .expect("a running WASAPI input owns its backend thread")
+            .wait(self.shutdown_timeout);
+        match result {
             BackendThreadJoin::Completed if self.status.state() == StreamState::Failed => {
                 Err(WasapiStopError::RuntimeFailed)
             }
             BackendThreadJoin::Completed => Ok(()),
             BackendThreadJoin::Panicked => Err(WasapiStopError::ThreadPanicked),
-            BackendThreadJoin::TimedOut => Err(WasapiStopError::ShutdownTimeout),
+            BackendThreadJoin::TimedOut => Err(WasapiStopError::ShutdownPending {
+                shutdown: Box::new(PendingNativeShutdown::new(
+                    self.thread
+                        .take()
+                        .expect("a timed-out WASAPI input retains its backend thread"),
+                    self.status.clone(),
+                )),
+            }),
         }
     }
 }
@@ -327,7 +339,9 @@ impl Drop for WasapiInputStream {
     fn drop(&mut self) {
         self.status.request_stop();
         self.stop_requested.store(true, Ordering::Release);
-        self.thread.detach();
+        if let Some(thread) = self.thread.as_mut() {
+            thread.detach();
+        }
     }
 }
 
@@ -781,7 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn uncooperative_shutdown_returns_a_timeout() {
+    fn uncooperative_shutdown_retains_eventual_completion() {
         let config = WasapiInputConfig::try_new(48_000, 64).unwrap();
         let (release_sender, release_receiver) = sync_channel(1);
         let stream = WasapiInputStream::start_with_thread_initializer_timeouts(
@@ -798,9 +812,15 @@ mod tests {
         .unwrap();
         let started = Instant::now();
 
-        assert_eq!(stream.stop(), Err(WasapiStopError::ShutdownTimeout));
+        let Err(WasapiStopError::ShutdownPending { mut shutdown }) = stream.stop() else {
+            panic!("shutdown timeout must retain native thread ownership");
+        };
         assert!(started.elapsed() < Duration::from_secs(1));
         release_sender.send(()).unwrap();
+        assert_eq!(
+            shutdown.wait(Duration::from_secs(1)),
+            PendingNativeShutdownWait::Completed
+        );
     }
 
     #[test]
@@ -819,7 +839,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(stream.stop(), Err(WasapiStopError::RuntimeFailed));
+        assert!(matches!(stream.stop(), Err(WasapiStopError::RuntimeFailed)));
     }
 
     #[test]
@@ -837,7 +857,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(stream.stop(), Err(WasapiStopError::ThreadPanicked));
+        assert!(matches!(
+            stream.stop(),
+            Err(WasapiStopError::ThreadPanicked)
+        ));
     }
 
     #[test]
@@ -902,6 +925,9 @@ mod tests {
             Duration::from_millis(20),
         )
         .unwrap();
-        assert_eq!(stream.stop(), Err(WasapiStopError::ShutdownTimeout));
+        assert!(matches!(
+            stream.stop(),
+            Err(WasapiStopError::ShutdownPending { .. })
+        ));
     }
 }

@@ -144,7 +144,7 @@ impl Error for PipeWireInputConfigError {}
 #[derive(Debug)]
 pub struct PipeWireInputStream {
     stop_requested: Arc<AtomicBool>,
-    thread: BoundedBackendThread,
+    thread: Option<BoundedBackendThread>,
     counters: CaptureStreamCounters,
     status: StreamStatus,
     shutdown_timeout: Duration,
@@ -259,7 +259,7 @@ impl PipeWireInputStream {
         match wait_for_startup(&startup_receiver, startup_timeout) {
             Ok(()) => Ok(Self {
                 stop_requested,
-                thread,
+                thread: Some(thread),
                 counters,
                 status,
                 shutdown_timeout,
@@ -300,13 +300,25 @@ impl PipeWireInputStream {
     }
 
     fn join(&mut self) -> Result<(), PipeWireStopError> {
-        match self.thread.wait(self.shutdown_timeout) {
+        let result = self
+            .thread
+            .as_mut()
+            .expect("a running PipeWire input owns its backend thread")
+            .wait(self.shutdown_timeout);
+        match result {
             BackendThreadJoin::Completed if self.status.state() == StreamState::Failed => {
                 Err(PipeWireStopError::RuntimeFailed)
             }
             BackendThreadJoin::Completed => Ok(()),
             BackendThreadJoin::Panicked => Err(PipeWireStopError::ThreadPanicked),
-            BackendThreadJoin::TimedOut => Err(PipeWireStopError::ShutdownTimeout),
+            BackendThreadJoin::TimedOut => Err(PipeWireStopError::ShutdownPending {
+                shutdown: Box::new(PendingNativeShutdown::new(
+                    self.thread
+                        .take()
+                        .expect("a timed-out PipeWire input retains its backend thread"),
+                    self.status.clone(),
+                )),
+            }),
         }
     }
 }
@@ -315,7 +327,9 @@ impl Drop for PipeWireInputStream {
     fn drop(&mut self) {
         self.status.request_stop();
         self.stop_requested.store(true, Ordering::Release);
-        self.thread.detach();
+        if let Some(thread) = self.thread.as_mut() {
+            thread.detach();
+        }
     }
 }
 
@@ -450,6 +464,100 @@ where
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedPipeWireInput {
+    Continue,
+    Terminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PipeWireInputSubmission {
+    Continued,
+    Terminal,
+    QueueRejected,
+}
+
+fn submit_pipewire_input<E, Q>(prepared: PreparedPipeWireInput, queue: Q) -> PipeWireInputSubmission
+where
+    Q: FnOnce() -> Result<(), E>,
+{
+    if queue().is_err() {
+        return PipeWireInputSubmission::QueueRejected;
+    }
+    match prepared {
+        PreparedPipeWireInput::Continue => PipeWireInputSubmission::Continued,
+        PreparedPipeWireInput::Terminal => PipeWireInputSubmission::Terminal,
+    }
+}
+
+fn input_chunk_fields(chunk: *const spa_sys::spa_chunk) -> Option<(usize, usize, i32)> {
+    // PipeWire owns the SPA buffer and guarantees a valid chunk object when
+    // this pointer is non-null for the duration of the process callback.
+    let chunk = unsafe { chunk.as_ref()? };
+    Some((
+        usize::try_from(chunk.offset).unwrap_or(usize::MAX),
+        usize::try_from(chunk.size).unwrap_or(usize::MAX),
+        chunk.stride,
+    ))
+}
+
+fn prepare_pipewire_input<P>(
+    datas: &mut [spa::buffer::Data],
+    state: &mut PipeWireInputCallback<P>,
+) -> PreparedPipeWireInput
+where
+    P: InterleavedStereoCaptureProcessor,
+{
+    let Some(data) = datas.first_mut() else {
+        state.input.counters().record_malformed_buffer(0);
+        return PreparedPipeWireInput::Continue;
+    };
+    let Some((offset, size, stride)) = input_chunk_fields(data.as_raw().chunk) else {
+        state.input.counters().record_malformed_buffer(0);
+        return PreparedPipeWireInput::Terminal;
+    };
+    let Some(bytes) = data.data() else {
+        state.input.counters().record_malformed_buffer(0);
+        return PreparedPipeWireInput::Continue;
+    };
+    let Some(end) = offset.checked_add(size) else {
+        state.input.counters().record_malformed_buffer(0);
+        return PreparedPipeWireInput::Continue;
+    };
+    let frames = size / FRAME_STRIDE;
+    if size == 0 {
+        return PreparedPipeWireInput::Continue;
+    }
+    if end > bytes.len()
+        || size % FRAME_STRIDE != 0
+        || (stride != 0 && usize::try_from(stride).ok() != Some(FRAME_STRIDE))
+    {
+        state.input.counters().record_malformed_buffer(frames);
+        return PreparedPipeWireInput::Continue;
+    }
+    let Ok(samples) = bytemuck::try_cast_slice::<u8, f32>(&bytes[offset..end]) else {
+        state.input.counters().record_malformed_buffer(frames);
+        return PreparedPipeWireInput::Continue;
+    };
+
+    match state.input.process(samples) {
+        CaptureCallbackStatus::Captured | CaptureCallbackStatus::NonFiniteInput => {
+            PreparedPipeWireInput::Continue
+        }
+        CaptureCallbackStatus::ProcessorFailed
+        | CaptureCallbackStatus::SampleCountNotStereoAligned { .. }
+        | CaptureCallbackStatus::BlockTooLarge { .. } => PreparedPipeWireInput::Terminal,
+    }
+}
+
+fn fail_pipewire_input<P>(state: &mut PipeWireInputCallback<P>, queue_rejected: bool) {
+    if queue_rejected {
+        state.input.counters().record_stream_error();
+    }
+    state.status.mark_failed();
+    state.main_loop.quit();
+}
+
 fn process_pipewire_input<P>(stream: &pw::stream::Stream, state: &mut PipeWireInputCallback<P>)
 where
     P: InterleavedStereoCaptureProcessor,
@@ -458,45 +566,11 @@ where
         state.input.counters().record_unavailable_buffer();
         return;
     };
-    let Some(data) = buffer.datas_mut().first_mut() else {
-        state.input.counters().record_malformed_buffer(0);
-        return;
-    };
-    let offset = usize::try_from(data.chunk().offset()).unwrap_or(usize::MAX);
-    let size = usize::try_from(data.chunk().size()).unwrap_or(usize::MAX);
-    let stride = data.chunk().stride();
-    let Some(bytes) = data.data() else {
-        state.input.counters().record_malformed_buffer(0);
-        return;
-    };
-    let Some(end) = offset.checked_add(size) else {
-        state.input.counters().record_malformed_buffer(0);
-        return;
-    };
-    let frames = size / FRAME_STRIDE;
-    if size == 0 {
-        return;
-    }
-    if end > bytes.len()
-        || size % FRAME_STRIDE != 0
-        || (stride != 0 && usize::try_from(stride).ok() != Some(FRAME_STRIDE))
-    {
-        state.input.counters().record_malformed_buffer(frames);
-        return;
-    }
-    let Ok(samples) = bytemuck::try_cast_slice::<u8, f32>(&bytes[offset..end]) else {
-        state.input.counters().record_malformed_buffer(frames);
-        return;
-    };
-
-    match state.input.process(samples) {
-        CaptureCallbackStatus::Captured | CaptureCallbackStatus::NonFiniteInput => {}
-        CaptureCallbackStatus::ProcessorFailed
-        | CaptureCallbackStatus::SampleCountNotStereoAligned { .. }
-        | CaptureCallbackStatus::BlockTooLarge { .. } => {
-            state.status.mark_failed();
-            state.main_loop.quit();
-        }
+    let prepared = prepare_pipewire_input(buffer.datas_mut(), state);
+    match submit_pipewire_input(prepared, || buffer.queue()) {
+        PipeWireInputSubmission::Continued => {}
+        PipeWireInputSubmission::Terminal => fail_pipewire_input(state, false),
+        PipeWireInputSubmission::QueueRejected => fail_pipewire_input(state, true),
     }
 }
 
@@ -574,6 +648,38 @@ mod tests {
     }
 
     #[test]
+    fn null_input_chunk_is_rejected_without_dereferencing_it() {
+        assert_eq!(input_chunk_fields(std::ptr::null()), None);
+
+        let chunk = spa_sys::spa_chunk {
+            offset: 8,
+            size: 16,
+            stride: i32::try_from(FRAME_STRIDE).unwrap(),
+            flags: 0,
+        };
+        assert_eq!(
+            input_chunk_fields(std::ptr::from_ref(&chunk)),
+            Some((8, 16, i32::try_from(FRAME_STRIDE).unwrap()))
+        );
+    }
+
+    #[test]
+    fn input_submission_reports_native_queue_rejection() {
+        assert_eq!(
+            submit_pipewire_input(PreparedPipeWireInput::Continue, || Err::<(), _>("rejected")),
+            PipeWireInputSubmission::QueueRejected
+        );
+        assert_eq!(
+            submit_pipewire_input(PreparedPipeWireInput::Terminal, || Ok::<_, ()>(())),
+            PipeWireInputSubmission::Terminal
+        );
+        assert_eq!(
+            submit_pipewire_input(PreparedPipeWireInput::Continue, || Ok::<_, ()>(())),
+            PipeWireInputSubmission::Continued
+        );
+    }
+
+    #[test]
     fn thread_local_initializer_failure_is_reported_before_backend_start() {
         let config = PipeWireInputConfig::try_new(48_000, 64).unwrap();
         let result = PipeWireInputStream::start_with_thread_initializer(config, |_| {
@@ -642,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn uncooperative_shutdown_returns_a_timeout() {
+    fn uncooperative_shutdown_retains_eventual_completion() {
         let config = PipeWireInputConfig::try_new(48_000, 64).unwrap();
         let (release_sender, release_receiver) = sync_channel(1);
         let stream = PipeWireInputStream::start_with_thread_initializer_timeouts(
@@ -659,9 +765,15 @@ mod tests {
         .unwrap();
         let started = Instant::now();
 
-        assert_eq!(stream.stop(), Err(PipeWireStopError::ShutdownTimeout));
+        let Err(PipeWireStopError::ShutdownPending { mut shutdown }) = stream.stop() else {
+            panic!("shutdown timeout must retain native thread ownership");
+        };
         assert!(started.elapsed() < Duration::from_secs(1));
         release_sender.send(()).unwrap();
+        assert_eq!(
+            shutdown.wait(Duration::from_secs(1)),
+            PendingNativeShutdownWait::Completed
+        );
     }
 
     #[test]
@@ -680,7 +792,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(stream.stop(), Err(PipeWireStopError::RuntimeFailed));
+        assert!(matches!(
+            stream.stop(),
+            Err(PipeWireStopError::RuntimeFailed)
+        ));
     }
 
     #[test]
@@ -698,7 +813,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(stream.stop(), Err(PipeWireStopError::ThreadPanicked));
+        assert!(matches!(
+            stream.stop(),
+            Err(PipeWireStopError::ThreadPanicked)
+        ));
     }
 
     #[test]
@@ -763,7 +881,10 @@ mod tests {
             Duration::from_millis(20),
         )
         .unwrap();
-        assert_eq!(stream.stop(), Err(PipeWireStopError::ShutdownTimeout));
+        assert!(matches!(
+            stream.stop(),
+            Err(PipeWireStopError::ShutdownPending { .. })
+        ));
     }
 
     #[test]

@@ -116,11 +116,13 @@ impl Error for DesktopOutputStartError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum DesktopOutputStopError {
     RuntimeFailed,
     ThreadPanicked,
-    ShutdownTimeout,
+    ShutdownPending {
+        shutdown: Box<PendingNativeShutdown>,
+    },
 }
 
 impl fmt::Display for DesktopOutputStopError {
@@ -128,12 +130,23 @@ impl fmt::Display for DesktopOutputStopError {
         formatter.write_str(match self {
             Self::RuntimeFailed => "desktop output failed before shutdown completed",
             Self::ThreadPanicked => "desktop output thread panicked during shutdown",
-            Self::ShutdownTimeout => "desktop output shutdown timed out",
+            Self::ShutdownPending { .. } => "desktop output shutdown is still pending",
         })
     }
 }
 
 impl Error for DesktopOutputStopError {}
+
+impl DesktopOutputStopError {
+    /// Returns the sole native-thread owner when shutdown has not completed.
+    #[must_use]
+    pub fn into_pending_shutdown(self) -> Option<PendingNativeShutdown> {
+        match self {
+            Self::ShutdownPending { shutdown } => Some(*shutdown),
+            Self::RuntimeFailed | Self::ThreadPanicked => None,
+        }
+    }
+}
 
 impl From<NativeDesktopOutputStartError> for DesktopOutputStartError {
     fn from(source: NativeDesktopOutputStartError) -> Self {
@@ -158,7 +171,9 @@ impl From<NativeDesktopOutputStopError> for DesktopOutputStopError {
         match source {
             NativeDesktopOutputStopError::RuntimeFailed => Self::RuntimeFailed,
             NativeDesktopOutputStopError::ThreadPanicked => Self::ThreadPanicked,
-            NativeDesktopOutputStopError::ShutdownTimeout => Self::ShutdownTimeout,
+            NativeDesktopOutputStopError::ShutdownPending { shutdown } => {
+                Self::ShutdownPending { shutdown }
+            }
         }
     }
 }
@@ -330,8 +345,9 @@ pub enum DesktopPlaybackRecoveryStopError {
         source: DesktopOutputStopError,
         recovery: DesktopPlaybackRecovery,
     },
-    ShutdownTimedOut {
+    ShutdownPending {
         source: DesktopOutputStopError,
+        recovery: DesktopPlaybackRecovery,
     },
 }
 
@@ -340,7 +356,9 @@ impl DesktopPlaybackRecoveryStopError {
         match source {
             DesktopOutputStopError::RuntimeFailed => Self::RuntimeFailed { source, recovery },
             DesktopOutputStopError::ThreadPanicked => Self::ThreadPanicked { source, recovery },
-            DesktopOutputStopError::ShutdownTimeout => Self::ShutdownTimedOut { source },
+            DesktopOutputStopError::ShutdownPending { .. } => {
+                Self::ShutdownPending { source, recovery }
+            }
         }
     }
 
@@ -352,32 +370,54 @@ impl DesktopPlaybackRecoveryStopError {
             Self::RuntimeFailed { recovery, .. } | Self::ThreadPanicked { recovery, .. } => {
                 Some(recovery)
             }
-            Self::ShutdownTimedOut { .. } => None,
+            Self::ShutdownPending { .. } => None,
         }
     }
 
     /// Returns restart authority only when the backend thread is known to have
     /// terminated.
-    #[must_use]
-    pub fn into_recovery(self) -> Option<DesktopPlaybackRecovery> {
+    /// Consumes a joined stop error and returns its restart authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unchanged error while native shutdown remains pending.
+    pub fn into_recovery(self) -> Result<DesktopPlaybackRecovery, Self> {
         match self {
             Self::RuntimeFailed { recovery, .. } | Self::ThreadPanicked { recovery, .. } => {
-                Some(recovery)
+                Ok(recovery)
             }
-            Self::ShutdownTimedOut { .. } => None,
+            pending @ Self::ShutdownPending { .. } => Err(pending),
         }
     }
 
     #[must_use]
-    pub const fn is_shutdown_timeout(&self) -> bool {
-        matches!(self, Self::ShutdownTimedOut { .. })
+    pub const fn is_shutdown_pending(&self) -> bool {
+        matches!(self, Self::ShutdownPending { .. })
     }
 
     fn source_error(&self) -> &DesktopOutputStopError {
         match self {
             Self::RuntimeFailed { source, .. }
             | Self::ThreadPanicked { source, .. }
-            | Self::ShutdownTimedOut { source } => source,
+            | Self::ShutdownPending { source, .. } => source,
+        }
+    }
+
+    /// Returns the sole pending native owner together with restart authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unchanged error when native teardown already completed.
+    pub fn into_pending(self) -> Result<DesktopPlaybackRecoveryPendingStop, Self> {
+        match self {
+            Self::ShutdownPending {
+                source: DesktopOutputStopError::ShutdownPending { shutdown },
+                recovery,
+            } => Ok(DesktopPlaybackRecoveryPendingStop {
+                shutdown: *shutdown,
+                recovery,
+            }),
+            other => Err(other),
         }
     }
 }
@@ -391,6 +431,47 @@ impl fmt::Display for DesktopPlaybackRecoveryStopError {
 impl Error for DesktopPlaybackRecoveryStopError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(self.source_error())
+    }
+}
+
+/// Sole restart authority while ordinary output shutdown remains pending.
+#[derive(Debug)]
+pub struct DesktopPlaybackRecoveryPendingStop {
+    shutdown: PendingNativeShutdown,
+    recovery: DesktopPlaybackRecovery,
+}
+
+#[derive(Debug)]
+pub enum DesktopPlaybackRecoveryPendingStopWait {
+    Completed(DesktopPlaybackRecovery),
+    Failed(DesktopPlaybackRecovery),
+    Panicked(DesktopPlaybackRecovery),
+    TimedOut(DesktopPlaybackRecoveryPendingStop),
+}
+
+impl DesktopPlaybackRecoveryPendingStop {
+    #[must_use]
+    pub fn status(&self) -> OutputStreamStatus {
+        self.shutdown.status()
+    }
+
+    /// Waits for teardown while retaining exactly one restart authority.
+    #[must_use]
+    pub fn wait(mut self, timeout: std::time::Duration) -> DesktopPlaybackRecoveryPendingStopWait {
+        match self.shutdown.wait(timeout) {
+            PendingNativeShutdownWait::Completed => {
+                DesktopPlaybackRecoveryPendingStopWait::Completed(self.recovery)
+            }
+            PendingNativeShutdownWait::Failed => {
+                DesktopPlaybackRecoveryPendingStopWait::Failed(self.recovery)
+            }
+            PendingNativeShutdownWait::Panicked => {
+                DesktopPlaybackRecoveryPendingStopWait::Panicked(self.recovery)
+            }
+            PendingNativeShutdownWait::TimedOut => {
+                DesktopPlaybackRecoveryPendingStopWait::TimedOut(self)
+            }
+        }
     }
 }
 
@@ -732,9 +813,9 @@ impl DesktopPlaybackSession {
     /// # Errors
     ///
     /// A joined backend panic returns an error that retains recovery authority.
-    /// A shutdown timeout does not: the detached backend thread may still own
-    /// the native output, so starting a replacement would violate single-owner
-    /// playback.
+    /// A shutdown timeout returns one pending value that retains both the
+    /// native-thread owner and recovery authority; a replacement cannot start
+    /// until a later wait observes terminal teardown.
     pub fn into_recovery(
         self,
     ) -> Result<DesktopPlaybackRecovery, DesktopPlaybackRecoveryStopError> {
@@ -1396,20 +1477,33 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_timeout_never_releases_restart_authority() {
+    fn shutdown_timeout_retains_restart_authority_until_join() {
         let recovery = DesktopPlaybackRecovery {
             config: DesktopOutputConfig::try_new(48_000, 256).unwrap(),
             source: None,
             checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
         };
+        let (shutdown, release_sender) = pending_shutdown_fixture();
         let error = DesktopPlaybackRecoveryStopError::from_stop(
-            DesktopOutputStopError::ShutdownTimeout,
+            DesktopOutputStopError::ShutdownPending {
+                shutdown: Box::new(shutdown),
+            },
             recovery,
         );
 
-        assert!(error.is_shutdown_timeout());
+        assert!(error.is_shutdown_pending());
         assert!(error.recovery().is_none());
-        assert!(error.into_recovery().is_none());
+        let pending = error.into_pending().unwrap();
+        let DesktopPlaybackRecoveryPendingStopWait::TimedOut(pending) =
+            pending.wait(Duration::from_millis(1))
+        else {
+            panic!("the fixture must remain pending before release");
+        };
+        release_sender.send(()).unwrap();
+        assert!(matches!(
+            pending.wait(Duration::from_secs(1)),
+            DesktopPlaybackRecoveryPendingStopWait::Completed(_)
+        ));
     }
 
     #[test]
@@ -1424,9 +1518,9 @@ mod tests {
             recovery,
         );
 
-        assert!(!error.is_shutdown_timeout());
+        assert!(!error.is_shutdown_pending());
         assert!(error.recovery().is_some());
-        assert!(error.into_recovery().is_some());
+        assert!(error.into_recovery().is_ok());
     }
 
     #[test]
@@ -1441,8 +1535,8 @@ mod tests {
             recovery,
         );
 
-        assert!(!error.is_shutdown_timeout());
+        assert!(!error.is_shutdown_pending());
         assert!(error.recovery().is_some());
-        assert!(error.into_recovery().is_some());
+        assert!(error.into_recovery().is_ok());
     }
 }

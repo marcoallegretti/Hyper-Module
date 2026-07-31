@@ -60,6 +60,7 @@ pub use recording_session::{
     DesktopRecordingSession, DesktopRecordingSessionCommitError, DesktopRecordingSessionConfig,
     DesktopRecordingSessionConfigError, DesktopRecordingSessionFinalizeError,
     DesktopRecordingSessionStartError, DesktopRecordingSessionStopError,
+    DesktopRecordingWriterSettlement,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -593,7 +594,8 @@ mod playback_session;
 ))]
 pub use playback_session::{
     DesktopOutputStartError, DesktopOutputStopError, DesktopPlaybackRecovery,
-    DesktopPlaybackRecoveryPendingStart, DesktopPlaybackRecoveryPendingWait,
+    DesktopPlaybackRecoveryPendingStart, DesktopPlaybackRecoveryPendingStop,
+    DesktopPlaybackRecoveryPendingStopWait, DesktopPlaybackRecoveryPendingWait,
     DesktopPlaybackRecoveryStartError, DesktopPlaybackRecoveryStopError, DesktopPlaybackSession,
     DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
     DesktopPlaybackSessionStartError, DesktopProjectOpenError,

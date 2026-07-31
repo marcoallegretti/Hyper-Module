@@ -230,11 +230,13 @@ impl Error for PipeWireStartError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum PipeWireStopError {
     RuntimeFailed,
     ThreadPanicked,
-    ShutdownTimeout,
+    ShutdownPending {
+        shutdown: Box<PendingNativeShutdown>,
+    },
 }
 
 impl fmt::Display for PipeWireStopError {
@@ -242,7 +244,7 @@ impl fmt::Display for PipeWireStopError {
         formatter.write_str(match self {
             Self::RuntimeFailed => "PipeWire stream failed before shutdown completed",
             Self::ThreadPanicked => "PipeWire thread panicked during shutdown",
-            Self::ShutdownTimeout => "PipeWire shutdown timed out",
+            Self::ShutdownPending { .. } => "PipeWire shutdown is still pending",
         })
     }
 }
@@ -252,7 +254,7 @@ impl Error for PipeWireStopError {}
 #[derive(Debug)]
 pub struct PipeWireOutputStream {
     stop_requested: Arc<AtomicBool>,
-    thread: BoundedBackendThread,
+    thread: Option<BoundedBackendThread>,
     counters: OutputStreamCounters,
     status: OutputStreamStatus,
     shutdown_timeout: Duration,
@@ -443,7 +445,7 @@ impl PipeWireOutputStream {
         match wait_for_startup(&startup_receiver, startup_timeout) {
             Ok(()) => Ok(Self {
                 stop_requested,
-                thread,
+                thread: Some(thread),
                 counters,
                 status,
                 shutdown_timeout,
@@ -484,13 +486,25 @@ impl PipeWireOutputStream {
     }
 
     fn join(&mut self) -> Result<(), PipeWireStopError> {
-        match self.thread.wait(self.shutdown_timeout) {
+        let result = self
+            .thread
+            .as_mut()
+            .expect("a running PipeWire output owns its backend thread")
+            .wait(self.shutdown_timeout);
+        match result {
             BackendThreadJoin::Completed if self.status.state() == OutputStreamState::Failed => {
                 Err(PipeWireStopError::RuntimeFailed)
             }
             BackendThreadJoin::Completed => Ok(()),
             BackendThreadJoin::Panicked => Err(PipeWireStopError::ThreadPanicked),
-            BackendThreadJoin::TimedOut => Err(PipeWireStopError::ShutdownTimeout),
+            BackendThreadJoin::TimedOut => Err(PipeWireStopError::ShutdownPending {
+                shutdown: Box::new(PendingNativeShutdown::new(
+                    self.thread
+                        .take()
+                        .expect("a timed-out PipeWire output retains its backend thread"),
+                    self.status.clone(),
+                )),
+            }),
         }
     }
 }
@@ -499,7 +513,9 @@ impl Drop for PipeWireOutputStream {
     fn drop(&mut self) {
         self.status.request_stop();
         self.stop_requested.store(true, Ordering::Release);
-        self.thread.detach();
+        if let Some(thread) = self.thread.as_mut() {
+            thread.detach();
+        }
     }
 }
 
@@ -1036,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn uncooperative_shutdown_returns_a_timeout() {
+    fn uncooperative_shutdown_retains_eventual_completion() {
         let config = PipeWireOutputConfig::try_new(48_000, 64).unwrap();
         let (release_sender, release_receiver) = sync_channel(1);
         let stream = PipeWireOutputStream::start_with_thread_initializer_timeouts(
@@ -1055,9 +1071,15 @@ mod tests {
 
         let result = stream.stop();
 
-        assert_eq!(result, Err(PipeWireStopError::ShutdownTimeout));
+        let Err(PipeWireStopError::ShutdownPending { mut shutdown }) = result else {
+            panic!("shutdown timeout must retain native thread ownership");
+        };
         assert!(started.elapsed() < Duration::from_secs(1));
         release_sender.send(()).unwrap();
+        assert_eq!(
+            shutdown.wait(Duration::from_secs(1)),
+            PendingNativeShutdownWait::Completed
+        );
     }
 
     #[test]
@@ -1076,7 +1098,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(stream.stop(), Err(PipeWireStopError::RuntimeFailed));
+        assert!(matches!(
+            stream.stop(),
+            Err(PipeWireStopError::RuntimeFailed)
+        ));
     }
 
     #[test]
@@ -1141,7 +1166,10 @@ mod tests {
             Duration::from_millis(20),
         )
         .unwrap();
-        assert_eq!(stream.stop(), Err(PipeWireStopError::ShutdownTimeout));
+        assert!(matches!(
+            stream.stop(),
+            Err(PipeWireStopError::ShutdownPending { .. })
+        ));
     }
 
     #[test]
