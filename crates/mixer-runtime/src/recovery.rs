@@ -231,29 +231,21 @@ struct PlaybackRecoveryState {
 /// Meter delivery is deliberately independent and may be coalesced or dropped.
 /// This checkpoint therefore publishes the recovery position directly from a
 /// successful transport cycle without allocation or locking on the audio thread.
+///
+/// The observer does not expose publication authority:
+///
+/// ```compile_fail
+/// use hyper_mixer_runtime::playback_recovery_channel;
+///
+/// let (_, observer) = playback_recovery_channel(None);
+/// observer.publish_cycle(todo!(), None);
+/// ```
 #[derive(Clone, Debug, Default)]
 pub struct PlaybackRecoveryCheckpoint {
     inner: Arc<PlaybackRecoveryState>,
 }
 
 impl PlaybackRecoveryCheckpoint {
-    /// Initializes a checkpoint from a previously published recovery snapshot.
-    #[must_use]
-    pub fn from_snapshot(snapshot: &PlaybackRecoverySnapshot) -> Self {
-        let mixer_parameters = AtomicMixerParameterState::default();
-        if let Some(state) = snapshot.mixer_parameter_state.as_ref() {
-            mixer_parameters.store(state);
-        }
-        Self {
-            inner: Arc::new(PlaybackRecoveryState {
-                sequence: AtomicU64::new(snapshot.committed_cycle_count * 2),
-                position_frame: AtomicUsize::new(snapshot.position_frame),
-                transport_state: AtomicU8::new(snapshot.state as u8),
-                mixer_parameters,
-            }),
-        }
-    }
-
     /// Returns one coherent recovery snapshot.
     #[must_use]
     pub fn snapshot(&self) -> PlaybackRecoverySnapshot {
@@ -279,10 +271,29 @@ impl PlaybackRecoveryCheckpoint {
             spin_loop();
         }
     }
+}
 
+/// Sole publisher for recovery cycles accepted by the native audio output.
+///
+/// This capability is intentionally not cloneable. Its mutable publication
+/// method structurally preserves the checkpoint's single-writer seqlock
+/// invariant while observers remain freely cloneable.
+///
+/// ```compile_fail
+/// use hyper_mixer_runtime::playback_recovery_channel;
+///
+/// let (publisher, _) = playback_recovery_channel(None);
+/// let duplicate = publisher.clone();
+/// ```
+#[derive(Debug)]
+pub struct PlaybackRecoveryPublisher {
+    inner: Arc<PlaybackRecoveryState>,
+}
+
+impl PlaybackRecoveryPublisher {
     /// Publishes one committed transport cycle and its optional mixer state.
     pub fn publish_cycle(
-        &self,
+        &mut self,
         cycle: TransportCycle,
         mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
     ) {
@@ -297,7 +308,7 @@ impl PlaybackRecoveryCheckpoint {
     }
 
     fn publish(
-        &self,
+        &mut self,
         state: PlaybackRecoveryTransportState,
         position_frame: usize,
         mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
@@ -317,6 +328,33 @@ impl PlaybackRecoveryCheckpoint {
             .sequence
             .store(odd.wrapping_add(1), Ordering::Release);
     }
+}
+
+/// Creates one single-writer recovery publisher and its cloneable observer.
+#[must_use]
+pub fn playback_recovery_channel(
+    snapshot: Option<&PlaybackRecoverySnapshot>,
+) -> (PlaybackRecoveryPublisher, PlaybackRecoveryCheckpoint) {
+    let mixer_parameters = AtomicMixerParameterState::default();
+    if let Some(state) = snapshot.and_then(|snapshot| snapshot.mixer_parameter_state.as_ref()) {
+        mixer_parameters.store(state);
+    }
+    let inner = Arc::new(PlaybackRecoveryState {
+        sequence: AtomicU64::new(snapshot.map_or(0, |snapshot| snapshot.committed_cycle_count * 2)),
+        position_frame: AtomicUsize::new(snapshot.map_or(0, |snapshot| snapshot.position_frame)),
+        transport_state: AtomicU8::new(
+            snapshot.map_or(PlaybackRecoveryTransportState::Stopped as u8, |snapshot| {
+                snapshot.state as u8
+            }),
+        ),
+        mixer_parameters,
+    });
+    (
+        PlaybackRecoveryPublisher {
+            inner: Arc::clone(&inner),
+        },
+        PlaybackRecoveryCheckpoint { inner },
+    )
 }
 
 fn default_send_state() -> MixerSendParameterState {
@@ -424,8 +462,8 @@ mod tests {
 
     #[test]
     fn publication_updates_state_position_and_count() {
-        let checkpoint = PlaybackRecoveryCheckpoint::default();
-        checkpoint.publish(PlaybackRecoveryTransportState::Rolling, 256, None);
+        let (mut publisher, checkpoint) = playback_recovery_channel(None);
+        publisher.publish(PlaybackRecoveryTransportState::Rolling, 256, None);
         assert_eq!(
             checkpoint.snapshot(),
             PlaybackRecoverySnapshot {
@@ -442,7 +480,7 @@ mod tests {
                 state: LocateState::Rolling,
             }
         );
-        checkpoint.publish(PlaybackRecoveryTransportState::Stopped, 256, None);
+        publisher.publish(PlaybackRecoveryTransportState::Stopped, 256, None);
         assert_eq!(
             checkpoint.snapshot(),
             PlaybackRecoverySnapshot {
@@ -463,13 +501,13 @@ mod tests {
 
     #[test]
     fn mixer_state_updates_only_with_a_committed_change_and_then_remains_current() {
-        let checkpoint = PlaybackRecoveryCheckpoint::default();
+        let (mut publisher, checkpoint) = playback_recovery_channel(None);
         let mixer = mixer_snapshot(7, true);
 
-        checkpoint.publish(PlaybackRecoveryTransportState::Rolling, 128, Some(&mixer));
+        publisher.publish(PlaybackRecoveryTransportState::Rolling, 128, Some(&mixer));
         assert_eq!(checkpoint.snapshot().mixer_parameter_state(), Some(mixer));
 
-        checkpoint.publish(PlaybackRecoveryTransportState::Rolling, 256, None);
+        publisher.publish(PlaybackRecoveryTransportState::Rolling, 256, None);
         let unchanged = checkpoint.snapshot();
         assert_eq!(unchanged.position_frame(), 256);
         assert_eq!(unchanged.mixer_parameter_state(), Some(mixer));
@@ -478,8 +516,7 @@ mod tests {
     #[test]
     fn concurrent_snapshots_do_not_mix_publications() {
         const PUBLICATIONS: usize = 20_000;
-        let checkpoint = PlaybackRecoveryCheckpoint::default();
-        let writer_checkpoint = checkpoint.clone();
+        let (mut publisher, checkpoint) = playback_recovery_channel(None);
         let barrier = Arc::new(Barrier::new(2));
         let writer_barrier = barrier.clone();
         let writer = thread::spawn(move || {
@@ -494,7 +531,7 @@ mod tests {
                     u8::from(generation.is_multiple_of(2)),
                     generation.is_multiple_of(2),
                 );
-                writer_checkpoint.publish(state, generation, Some(&mixer));
+                publisher.publish(state, generation, Some(&mixer));
             }
         });
 
@@ -525,7 +562,7 @@ mod tests {
             committed_cycle_count: 7,
             mixer_parameter_state: Some(mixer),
         };
-        let checkpoint = PlaybackRecoveryCheckpoint::from_snapshot(&snapshot);
+        let (mut publisher, checkpoint) = playback_recovery_channel(Some(&snapshot));
 
         assert_eq!(
             checkpoint.snapshot(),
@@ -536,7 +573,7 @@ mod tests {
                 mixer_parameter_state: Some(mixer),
             }
         );
-        checkpoint.publish(PlaybackRecoveryTransportState::Rolling, 640, None);
+        publisher.publish(PlaybackRecoveryTransportState::Rolling, 640, None);
         assert_eq!(checkpoint.snapshot().committed_cycle_count(), 8);
     }
 }

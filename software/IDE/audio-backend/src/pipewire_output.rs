@@ -1,14 +1,15 @@
 use super::{
     BackendThreadCompletion, BackendThreadJoin, BoundedBackendThread, InterleavedStereoProcessor,
     OutputCallback, OutputCallbackStatus, OutputStreamCounters, OutputStreamState,
-    OutputStreamStatus, PendingNativeShutdown, PipeWireOutputTarget, PlaybackRecoveryCheckpoint,
-    STEREO_CHANNELS,
+    OutputStreamStatus, PendingNativeShutdown, PipeWireOutputTarget, STEREO_CHANNELS,
 };
 use core::cell::Cell;
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
-use hyper_mixer_runtime::{TrackWindowRenderer, TransportOutputProcessor};
+use hyper_mixer_runtime::{
+    PlaybackRecoveryPublisher, TrackWindowRenderer, TransportOutputProcessor,
+};
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
@@ -323,7 +324,7 @@ impl PipeWireThreadRunner {
     pub(crate) fn run_transport_output_with_checkpoint<R>(
         self,
         mut processor: TransportOutputProcessor<'_, '_, R>,
-        checkpoint: &PlaybackRecoveryCheckpoint,
+        mut publisher: PlaybackRecoveryPublisher,
     ) -> Result<(), PipeWireStartError>
     where
         R: TrackWindowRenderer,
@@ -347,7 +348,7 @@ impl PipeWireThreadRunner {
                 let (cycle, mixer_parameter_state) = pending_cycle
                     .take()
                     .expect("a rendered PipeWire block has a pending recovery cycle");
-                checkpoint.publish_cycle(cycle, mixer_parameter_state.as_ref());
+                publisher.publish_cycle(cycle, mixer_parameter_state.as_ref());
             },
         )
     }

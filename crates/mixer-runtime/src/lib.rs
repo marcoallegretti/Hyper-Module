@@ -37,7 +37,8 @@ pub use meter_ballistics::{
     StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot,
 };
 pub use recovery::{
-    PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot, PlaybackRecoveryTransportState,
+    PlaybackRecoveryCheckpoint, PlaybackRecoveryPublisher, PlaybackRecoverySnapshot,
+    PlaybackRecoveryTransportState, playback_recovery_channel,
 };
 
 pub const MAX_MAIN_MIXER_SLOTS: usize = 8;

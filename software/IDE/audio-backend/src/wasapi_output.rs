@@ -1,14 +1,15 @@
 use super::{
     BackendThreadCompletion, BackendThreadJoin, BoundedBackendThread, InterleavedStereoProcessor,
     OutputCallback, OutputCallbackStatus, OutputStreamCounters, OutputStreamState,
-    OutputStreamStatus, PendingNativeShutdown, PlaybackRecoveryCheckpoint, STEREO_CHANNELS,
-    WasapiOutputEndpoint,
+    OutputStreamStatus, PendingNativeShutdown, STEREO_CHANNELS, WasapiOutputEndpoint,
 };
 use core::cell::Cell;
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use hyper_mixer_runtime::{TrackWindowRenderer, TransportOutputProcessor};
+use hyper_mixer_runtime::{
+    PlaybackRecoveryPublisher, TrackWindowRenderer, TransportOutputProcessor,
+};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
@@ -342,7 +343,7 @@ impl WasapiThreadRunner {
     pub(crate) fn run_transport_output_with_checkpoint<R>(
         self,
         mut processor: TransportOutputProcessor<'_, '_, R>,
-        checkpoint: &PlaybackRecoveryCheckpoint,
+        mut publisher: PlaybackRecoveryPublisher,
     ) -> Result<(), WasapiStartError>
     where
         R: TrackWindowRenderer,
@@ -366,7 +367,7 @@ impl WasapiThreadRunner {
                 let (cycle, mixer_parameter_state) = pending_cycle
                     .take()
                     .expect("a rendered WASAPI block has a pending recovery cycle");
-                checkpoint.publish_cycle(cycle, mixer_parameter_state.as_ref());
+                publisher.publish_cycle(cycle, mixer_parameter_state.as_ref());
             },
         )
     }

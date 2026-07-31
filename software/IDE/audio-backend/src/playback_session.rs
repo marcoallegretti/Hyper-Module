@@ -21,7 +21,7 @@ use hyper_mixer_runtime::{
     LoudnessCommandSender, MixerParameterCommandSender, MixerParameterStateRestoreError,
     OutputMeterReceiver, RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError,
     TransportCommandSender, TransportOutputCreationError, TransportOutputProcessor,
-    loudness_command_channel, output_meter_channel,
+    loudness_command_channel, output_meter_channel, playback_recovery_channel,
 };
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
@@ -981,9 +981,7 @@ fn initialize_session(
     )
     .map_err(DesktopPlaybackSessionBuildError::Output)
     .or_else(|source| fail_build(publication, source))?;
-    let recovery = initial_checkpoint
-        .map(PlaybackRecoveryCheckpoint::from_snapshot)
-        .unwrap_or_default();
+    let (publisher, recovery) = playback_recovery_channel(initial_checkpoint);
     publication
         .try_send(SessionPublication::Prepared(SessionHandles {
             commands,
@@ -993,7 +991,7 @@ fn initialize_session(
             recovery: recovery.clone(),
         }))
         .map_err(|_| callback_error("playback control publication failed".to_owned()))?;
-    runner.run_transport_output_with_checkpoint(processor, &recovery)
+    runner.run_transport_output_with_checkpoint(processor, publisher)
 }
 
 fn output_is_pinned(config: &DesktopOutputConfig) -> bool {
