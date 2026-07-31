@@ -564,6 +564,11 @@ fn rejects_recording_metadata_that_does_not_match_project_or_decoded_media() {
 #[test]
 fn rejects_resource_budget_and_mismatched_audio_container() {
     let budget = Fixture::new();
+    fs::write(
+        budget.root.join("timeline/timeline.json"),
+        br#"{"format":"corrupt"}"#,
+    )
+    .unwrap();
     let mut tiny = limits();
     tiny.max_total_resource_bytes = 1;
     assert!(matches!(
@@ -589,11 +594,31 @@ fn rejects_resource_budget_and_mismatched_audio_container() {
 
     let asset_count = Fixture::new();
     asset_count.add_sample_asset();
+    fs::write(asset_count.root.join("undeclared"), b"must not be scanned").unwrap();
     assert!(matches!(
         prepare_project_playback(&asset_count.root, limits()),
         Err(ProjectPlaybackError::AssetCountLimit {
             actual: 2,
             maximum: 1
+        })
+    ));
+
+    let encoded_bytes = Fixture::new();
+    fs::write(
+        encoded_bytes.root.join("undeclared"),
+        b"must not be scanned",
+    )
+    .unwrap();
+    let mut encoded_limited = limits();
+    encoded_limited.audio = DecodeLimits::new(1, 100, 800).unwrap();
+    assert!(matches!(
+        prepare_project_playback(&encoded_bytes.root, encoded_limited),
+        Err(ProjectPlaybackError::Audio {
+            source: DecodeError::FileTooLarge {
+                actual: 244,
+                maximum: 1
+            },
+            ..
         })
     ));
 

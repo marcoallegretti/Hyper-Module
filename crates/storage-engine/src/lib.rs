@@ -49,11 +49,38 @@ pub enum StorageErrorKind {
     DescriptorNotFound,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProjectPackageLimit {
+    TotalResourceBytes {
+        actual: u64,
+        maximum: u64,
+    },
+    AssetCount {
+        actual: usize,
+        maximum: usize,
+    },
+    AssetFileBytes {
+        asset_id: String,
+        actual: u64,
+        maximum: u64,
+    },
+}
+
+/// Application-specific bounds checked against validated manifest declarations
+/// before the owned tree or any payload file is scanned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectPackageVerificationLimits {
+    pub max_total_resource_bytes: u64,
+    pub max_assets: usize,
+    pub max_asset_file_bytes: u64,
+}
+
 #[derive(Debug)]
 pub struct StorageError {
     kind: StorageErrorKind,
     path: String,
     message: String,
+    limit: Option<ProjectPackageLimit>,
     source: Option<Box<dyn Error + Send + Sync>>,
 }
 
@@ -66,6 +93,11 @@ impl StorageError {
     #[must_use]
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    #[must_use]
+    pub const fn limit(&self) -> Option<&ProjectPackageLimit> {
+        self.limit.as_ref()
     }
 }
 
@@ -87,6 +119,7 @@ pub struct StructurallyVerifiedProject {
     root_dir: Arc<Dir>,
     manifest: ProjectManifest,
     manifest_sha256: [u8; 32],
+    verification_limits: Option<ProjectPackageVerificationLimits>,
 }
 
 impl StructurallyVerifiedProject {
@@ -157,7 +190,7 @@ impl StructurallyVerifiedProject {
     /// Returns a verification rejection when any owned file, manifest byte, or
     /// filesystem boundary has changed.
     pub fn confirm_unchanged(&self) -> Result<(), StorageError> {
-        let current = verify_project_package(&self.root)?;
+        let current = verify_project_package_inner(&self.root, self.verification_limits)?;
         if !same_directory(&self.root_dir, &current.root_dir)?
             || current.manifest_sha256 != self.manifest_sha256
         {
@@ -216,7 +249,41 @@ impl StructurallyVerifiedProject {
 pub fn verify_project_package(
     root: impl AsRef<Path>,
 ) -> Result<StructurallyVerifiedProject, StorageError> {
-    let root = root.as_ref();
+    verify_project_package_inner(root.as_ref(), None)
+}
+
+/// Verifies a project package with application-specific declaration bounds.
+///
+/// The limits are checked after the bounded manifest is parsed and before any
+/// owned-tree traversal or payload hashing. The resulting authority retains
+/// the limits and reapplies them during [`StructurallyVerifiedProject::confirm_unchanged`].
+///
+/// # Errors
+///
+/// Returns a classified rejection for invalid limits, an excessive manifest
+/// declaration, or any error reported by [`verify_project_package`].
+pub fn verify_project_package_with_limits(
+    root: impl AsRef<Path>,
+    limits: ProjectPackageVerificationLimits,
+) -> Result<StructurallyVerifiedProject, StorageError> {
+    verify_project_package_inner(root.as_ref(), Some(limits))
+}
+
+fn verify_project_package_inner(
+    root: &Path,
+    limits: Option<ProjectPackageVerificationLimits>,
+) -> Result<StructurallyVerifiedProject, StorageError> {
+    if let Some(limits) = limits
+        && (limits.max_total_resource_bytes == 0
+            || limits.max_assets == 0
+            || limits.max_asset_file_bytes == 0)
+    {
+        return Err(rejection(
+            StorageErrorKind::LimitExceeded,
+            ".",
+            "project verification limits must be positive",
+        ));
+    }
     let root_metadata =
         fs::symlink_metadata(root).map_err(|error| io_error(".", "inspect project root", error))?;
     if is_link_like(&root_metadata) {
@@ -259,8 +326,11 @@ pub fn verify_project_package(
         kind: StorageErrorKind::ManifestInvalid,
         path: MANIFEST_NAME.to_owned(),
         message: "project manifest is invalid".to_owned(),
+        limit: None,
         source: Some(Box::new(error)),
     })?;
+
+    preflight_manifest(&manifest, limits)?;
 
     let policy = TreePolicy::new(&manifest);
     let initial_files = collect_owned_tree(root, &policy)?;
@@ -294,10 +364,15 @@ pub fn verify_project_package(
         root_dir,
         manifest,
         manifest_sha256: Sha256::digest(&manifest_bytes).into(),
+        verification_limits: limits,
     })
 }
 
-fn verify_records(root: &Dir, manifest: &ProjectManifest) -> Result<(), StorageError> {
+fn preflight_manifest(
+    manifest: &ProjectManifest,
+    limits: Option<ProjectPackageVerificationLimits>,
+) -> Result<(), StorageError> {
+    let mut total_resource_bytes = 0_u64;
     for descriptor in manifest.resources() {
         if descriptor.byte_length() > MAX_JSON_FILE_BYTES {
             return Err(rejection(
@@ -306,6 +381,59 @@ fn verify_records(root: &Dir, manifest: &ProjectManifest) -> Result<(), StorageE
                 "resource exceeds the JSON byte limit",
             ));
         }
+        total_resource_bytes = total_resource_bytes
+            .checked_add(descriptor.byte_length())
+            .ok_or_else(|| {
+                rejection(
+                    StorageErrorKind::LimitExceeded,
+                    MANIFEST_NAME,
+                    "declared resource byte total overflowed",
+                )
+            })?;
+    }
+
+    let Some(limits) = limits else {
+        return Ok(());
+    };
+    if total_resource_bytes > limits.max_total_resource_bytes {
+        return Err(limit_rejection(
+            MANIFEST_NAME,
+            "declared resource bytes exceed the verification limit",
+            ProjectPackageLimit::TotalResourceBytes {
+                actual: total_resource_bytes,
+                maximum: limits.max_total_resource_bytes,
+            },
+        ));
+    }
+    let asset_count = manifest.assets().len();
+    if asset_count > limits.max_assets {
+        return Err(limit_rejection(
+            MANIFEST_NAME,
+            "declared asset count exceeds the verification limit",
+            ProjectPackageLimit::AssetCount {
+                actual: asset_count,
+                maximum: limits.max_assets,
+            },
+        ));
+    }
+    for descriptor in manifest.assets() {
+        if descriptor.byte_length() > limits.max_asset_file_bytes {
+            return Err(limit_rejection(
+                descriptor.path(),
+                "declared asset bytes exceed the verification limit",
+                ProjectPackageLimit::AssetFileBytes {
+                    asset_id: descriptor.id().to_owned(),
+                    actual: descriptor.byte_length(),
+                    maximum: limits.max_asset_file_bytes,
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_records(root: &Dir, manifest: &ProjectManifest) -> Result<(), StorageError> {
+    for descriptor in manifest.resources() {
         let verified = verify_open_stable(
             open_declared_file(root, descriptor.path())?,
             descriptor.path(),
@@ -340,12 +468,14 @@ fn assert_canonical_json(bytes: &[u8], path: &str) -> Result<(), StorageError> {
             kind: StorageErrorKind::JsonInvalid,
             path: path.to_owned(),
             message: "JSON document is invalid".to_owned(),
+            limit: None,
             source: Some(Box::new(error)),
         })?;
     let canonical = serde_json_canonicalizer::to_vec(&value).map_err(|error| StorageError {
         kind: StorageErrorKind::ManifestInvalid,
         path: path.to_owned(),
         message: "JSON document cannot be canonicalized".to_owned(),
+        limit: None,
         source: Some(Box::new(error)),
     })?;
     if bytes != canonical {
@@ -645,6 +775,17 @@ pub(crate) fn rejection(kind: StorageErrorKind, path: &str, message: &str) -> St
         kind,
         path: path.to_owned(),
         message: message.to_owned(),
+        limit: None,
+        source: None,
+    }
+}
+
+fn limit_rejection(path: &str, message: &str, limit: ProjectPackageLimit) -> StorageError {
+    StorageError {
+        kind: StorageErrorKind::LimitExceeded,
+        path: path.to_owned(),
+        message: message.to_owned(),
+        limit: Some(limit),
         source: None,
     }
 }
@@ -654,6 +795,7 @@ pub(crate) fn io_error(path: &str, action: &str, source: io::Error) -> StorageEr
         kind: StorageErrorKind::Io,
         path: path.to_owned(),
         message: action.to_owned(),
+        limit: None,
         source: Some(Box::new(source)),
     }
 }

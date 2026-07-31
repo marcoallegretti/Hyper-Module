@@ -14,7 +14,10 @@ use hyper_playback_session::{
 };
 use hyper_project_model::{AssetRole, AudioMediaType, ResourceDescriptor, ResourceRole};
 use hyper_recording_metadata::{RecordingMetadataDocument, RecordingMetadataParseError};
-use hyper_storage_engine::{StorageError, StructurallyVerifiedProject, verify_project_package};
+use hyper_storage_engine::{
+    ProjectPackageLimit, ProjectPackageVerificationLimits, StorageError,
+    StructurallyVerifiedProject, verify_project_package_with_limits,
+};
 use hyper_strict_json::StrictJsonError;
 use serde_json::Value;
 
@@ -319,7 +322,14 @@ pub fn prepare_project_playback(
     {
         return Err(ProjectPlaybackError::InvalidLimits);
     }
-    let package = verify_project_package(root)?;
+    let verification_limits = ProjectPackageVerificationLimits {
+        max_total_resource_bytes: u64::try_from(limits.max_total_resource_bytes)
+            .unwrap_or(u64::MAX),
+        max_assets: cache_limits.max_assets,
+        max_asset_file_bytes: limits.audio.max_file_bytes(),
+    };
+    let package = verify_project_package_with_limits(root, verification_limits)
+        .map_err(playback_storage_error)?;
     let inventory = ResourceInventory::new(&package, limits.max_total_resource_bytes)?;
     let captured = inventory.read(&package)?;
     validate_recording_inventory(
@@ -347,6 +357,35 @@ pub fn prepare_project_playback(
             .map(|record| record.document)
             .collect(),
     })
+}
+
+fn playback_storage_error(error: StorageError) -> ProjectPlaybackError {
+    match error.limit() {
+        Some(ProjectPackageLimit::TotalResourceBytes { actual, maximum }) => {
+            ProjectPlaybackError::ResourceBytesLimit {
+                actual: *actual,
+                maximum: usize::try_from(*maximum).unwrap_or(usize::MAX),
+            }
+        }
+        Some(ProjectPackageLimit::AssetCount { actual, maximum }) => {
+            ProjectPlaybackError::AssetCountLimit {
+                actual: *actual,
+                maximum: *maximum,
+            }
+        }
+        Some(ProjectPackageLimit::AssetFileBytes {
+            asset_id,
+            actual,
+            maximum,
+        }) => ProjectPlaybackError::Audio {
+            asset_id: asset_id.clone(),
+            source: DecodeError::FileTooLarge {
+                actual: *actual,
+                maximum: *maximum,
+            },
+        },
+        None => ProjectPlaybackError::Storage(error),
+    }
 }
 
 struct DecodedProjectAssets<'project> {

@@ -2,7 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hyper_storage_engine::{StorageErrorKind, verify_project_package};
+use hyper_storage_engine::{
+    ProjectPackageLimit, ProjectPackageVerificationLimits, StorageErrorKind,
+    verify_project_package, verify_project_package_with_limits,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -149,6 +152,124 @@ fn rejects_noncanonical_manifest_and_resource_json() {
     let error = verify_project_package(&resource_fixture.root).unwrap_err();
     assert_eq!(error.kind(), StorageErrorKind::NonCanonicalJson);
     assert_eq!(error.path(), "timeline/timeline.json");
+}
+
+#[test]
+fn rejects_application_limits_before_tree_or_payload_scans() {
+    let invalid = verify_project_package_with_limits(
+        "path-that-must-not-be-inspected",
+        ProjectPackageVerificationLimits {
+            max_total_resource_bytes: 0,
+            max_assets: 0,
+            max_asset_file_bytes: 0,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(invalid.kind(), StorageErrorKind::LimitExceeded);
+    assert_eq!(invalid.path(), ".");
+
+    let resource_bytes = Fixture::new();
+    fs::write(
+        resource_bytes.root.join("undeclared"),
+        b"must not be scanned",
+    )
+    .unwrap();
+    let error = verify_project_package_with_limits(
+        &resource_bytes.root,
+        ProjectPackageVerificationLimits {
+            max_total_resource_bytes: 1,
+            max_assets: 1,
+            max_asset_file_bytes: 1_024,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::LimitExceeded);
+    assert!(matches!(
+        error.limit(),
+        Some(ProjectPackageLimit::TotalResourceBytes {
+            actual: 29,
+            maximum: 1
+        })
+    ));
+
+    let asset_count = Fixture::new();
+    let manifest_path = asset_count.root.join("project.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["assets"].as_array_mut().unwrap().push(json!({
+        "id": "018f47a2-6b2d-7c11-8a44-001122334458",
+        "role": "sample",
+        "path": "assets/samples/missing.wav",
+        "media_type": "audio/wav",
+        "byte_length": 1,
+        "sha256": sha256(b"x"),
+        "extensions": {}
+    }));
+    write_canonical(&manifest_path, &manifest);
+    let error = verify_project_package_with_limits(
+        &asset_count.root,
+        ProjectPackageVerificationLimits {
+            max_total_resource_bytes: 1_024,
+            max_assets: 1,
+            max_asset_file_bytes: 1_024,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.limit(),
+        Some(ProjectPackageLimit::AssetCount {
+            actual: 2,
+            maximum: 1
+        })
+    ));
+
+    let asset_bytes = Fixture::new();
+    fs::write(asset_bytes.root.join("undeclared"), b"must not be scanned").unwrap();
+    let error = verify_project_package_with_limits(
+        &asset_bytes.root,
+        ProjectPackageVerificationLimits {
+            max_total_resource_bytes: 1_024,
+            max_assets: 1,
+            max_asset_file_bytes: 4,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.limit(),
+        Some(ProjectPackageLimit::AssetFileBytes {
+            actual: 22,
+            maximum: 4,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn issued_authority_reapplies_its_verification_limits() {
+    let fixture = Fixture::new();
+    let verified = verify_project_package_with_limits(
+        &fixture.root,
+        ProjectPackageVerificationLimits {
+            max_total_resource_bytes: 1_024,
+            max_assets: 1,
+            max_asset_file_bytes: 22,
+        },
+    )
+    .unwrap();
+
+    let manifest_path = fixture.root.join("project.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["assets"][0]["byte_length"] = 23.into();
+    write_canonical(&manifest_path, &manifest);
+
+    let error = verified.confirm_unchanged().unwrap_err();
+    assert!(matches!(
+        error.limit(),
+        Some(ProjectPackageLimit::AssetFileBytes {
+            actual: 23,
+            maximum: 22,
+            ..
+        })
+    ));
 }
 
 #[test]
