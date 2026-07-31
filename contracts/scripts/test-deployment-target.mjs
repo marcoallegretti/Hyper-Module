@@ -75,6 +75,24 @@ async function createTarget(root, name, policy = storagePolicy()) {
   return target;
 }
 
+async function writeDeploymentStateFixture(target, state) {
+  await writeFile(
+    join(target, "state.json"),
+    Buffer.from(canonicalize(state), "utf8"),
+  );
+}
+
+async function assertGenerationExhaustionIsAtomic(target, operation) {
+  const statePath = join(target, "state.json");
+  const before = await readFile(statePath);
+  await assert.rejects(operation, /deployment generation is exhausted/);
+  assert.deepEqual(await readFile(statePath), before);
+  assert.deepEqual(
+    (await readdir(target)).filter((name) => name.startsWith(".state-")),
+    [],
+  );
+}
+
 try {
   const source7 = await createMinimalProject(temporaryRoot, "source-7", {
     revision: 7,
@@ -109,6 +127,49 @@ try {
   assert.equal(rolledBack.generation, 3);
   assert.equal(rolledBack.active.bundle_sha256, identity7);
   assert.equal(rolledBack.previous_bundle_sha256, state2.active.bundle_sha256);
+
+  const generationTarget = await createTarget(
+    temporaryRoot,
+    "generation-target",
+  );
+  await installBundle(bundle7, generationTarget);
+  await installBundle(bundle8, generationTarget);
+  await writeDeploymentStateFixture(generationTarget, {
+    ...state1,
+    generation: Number.MAX_SAFE_INTEGER,
+    active: { ...state1.active, status: "healthy" },
+  });
+  await assertGenerationExhaustionIsAtomic(generationTarget, () =>
+    activateBundle(
+      generationTarget,
+      state2.active.bundle_sha256,
+      "1.0.0",
+    ),
+  );
+
+  await writeDeploymentStateFixture(generationTarget, {
+    ...state1,
+    generation: Number.MAX_SAFE_INTEGER,
+    active: { ...state1.active, status: "pending" },
+  });
+  let exhaustedPromotionProbeCalls = 0;
+  await assertGenerationExhaustionIsAtomic(generationTarget, () =>
+    resolveStartupDeployment(generationTarget, "1.0.0", async () => {
+      exhaustedPromotionProbeCalls += 1;
+      return true;
+    }),
+  );
+  assert.equal(exhaustedPromotionProbeCalls, 0);
+
+  await writeDeploymentStateFixture(generationTarget, {
+    ...state2,
+    generation: Number.MAX_SAFE_INTEGER,
+    active: { ...state2.active, status: "healthy" },
+    previous_bundle_sha256: identity7,
+  });
+  await assertGenerationExhaustionIsAtomic(generationTarget, () =>
+    rollbackDeployment(generationTarget, "1.0.0"),
+  );
 
   await assert.rejects(
     activateBundle(target, state2.active.bundle_sha256, "0.9.0"),

@@ -309,7 +309,21 @@ async function readState(targetRoot) {
 }
 
 async function writeState(targetRoot, state, faultAt = undefined) {
+  const { state: validate } = await deploymentValidators;
+  assert(
+    validate(state),
+    `deployment state schema validation failed: ${JSON.stringify(validate.errors)}`,
+  );
   await writeCanonicalFile(targetRoot, "state", state, faultAt);
+}
+
+function nextDeploymentGeneration(current) {
+  const generation = current?.generation ?? 0;
+  assert(
+    generation < Number.MAX_SAFE_INTEGER,
+    "deployment generation is exhausted",
+  );
+  return generation + 1;
 }
 
 async function readStoragePolicy(targetRoot) {
@@ -1027,7 +1041,7 @@ async function activateIdentity(
   const state = {
     format: "hyper-deployment-state",
     format_version: 1,
-    generation: (current?.generation ?? 0) + 1,
+    generation: nextDeploymentGeneration(current),
     active: {
       bundle_sha256: bundleSha256,
       project_id: installed.manifest.project_id,
@@ -1271,6 +1285,12 @@ export async function resolveStartupDeployment(
   return withDeploymentLock(targetRoot, async () => {
     const current = await readState(targetRoot);
     assert(current, "deployment target has no active bundle");
+    const promotionGeneration =
+      current.active.status === "healthy"
+        ? null
+        : nextDeploymentGeneration(current);
+    let activeProbeSucceeded = false;
+    let activeError;
     try {
       await probeInstalledBundle(
         targetRoot,
@@ -1278,55 +1298,60 @@ export async function resolveStartupDeployment(
         runtimeVersion,
         probe,
       );
+      activeProbeSucceeded = true;
+    } catch (error) {
+      activeError = error;
+    }
+    if (activeProbeSucceeded) {
       if (current.active.status === "healthy") {
         return { state: current, recovered_from_bundle_sha256: null };
       }
       const healthy = {
         ...current,
-        generation: current.generation + 1,
+        generation: promotionGeneration,
         active: { ...current.active, status: "healthy" },
       };
       await writeState(targetRoot, healthy);
       return { state: healthy, recovered_from_bundle_sha256: null };
-    } catch (activeError) {
-      assert(
-        current.previous_bundle_sha256,
-        "active bundle failed and no previous bundle is available",
-      );
-      let previous;
-      try {
-        previous = await probeInstalledBundle(
-          targetRoot,
-          current.previous_bundle_sha256,
-          runtimeVersion,
-          probe,
-        );
-      } catch (previousError) {
-        throw new AggregateError(
-          [activeError, previousError],
-          "active and previous bundles both failed startup health checks",
-        );
-      }
-      const recovered = {
-        format: "hyper-deployment-state",
-        format_version: 1,
-        generation: current.generation + 1,
-        active: {
-          bundle_sha256: current.previous_bundle_sha256,
-          project_id: previous.manifest.project_id,
-          project_revision: previous.manifest.project_revision,
-          minimum_runtime_version: previous.manifest.minimum_runtime_version,
-          status: "healthy",
-        },
-        previous_bundle_sha256: current.active.bundle_sha256,
-        extensions: {},
-      };
-      await writeState(targetRoot, recovered);
-      return {
-        state: recovered,
-        recovered_from_bundle_sha256: current.active.bundle_sha256,
-      };
     }
+    assert(
+      current.previous_bundle_sha256,
+      "active bundle failed and no previous bundle is available",
+    );
+    const recoveryGeneration = nextDeploymentGeneration(current);
+    let previous;
+    try {
+      previous = await probeInstalledBundle(
+        targetRoot,
+        current.previous_bundle_sha256,
+        runtimeVersion,
+        probe,
+      );
+    } catch (previousError) {
+      throw new AggregateError(
+        [activeError, previousError],
+        "active and previous bundles both failed startup health checks",
+      );
+    }
+    const recovered = {
+      format: "hyper-deployment-state",
+      format_version: 1,
+      generation: recoveryGeneration,
+      active: {
+        bundle_sha256: current.previous_bundle_sha256,
+        project_id: previous.manifest.project_id,
+        project_revision: previous.manifest.project_revision,
+        minimum_runtime_version: previous.manifest.minimum_runtime_version,
+        status: "healthy",
+      },
+      previous_bundle_sha256: current.active.bundle_sha256,
+      extensions: {},
+    };
+    await writeState(targetRoot, recovered);
+    return {
+      state: recovered,
+      recovered_from_bundle_sha256: current.active.bundle_sha256,
+    };
   });
 }
 
