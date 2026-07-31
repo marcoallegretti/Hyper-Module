@@ -355,11 +355,13 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "hyper-arrangement-renderer",
+ "hyper-audio-source",
  "hyper-media-cache",
  "hyper-mixer-runtime",
  "hyper-playback-compiler",
  "hyper-playback-json",
  "hyper-playback-session",
+ "hyper-project-loader",
  "hyper-recording-journal",
  "hyper-recording-metadata",
  "hyper-recording-transport",

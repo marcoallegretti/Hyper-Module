@@ -595,7 +595,7 @@ pub use playback_session::{
     DesktopOutputStartError, DesktopOutputStopError, DesktopPlaybackRecovery,
     DesktopPlaybackRecoveryStartError, DesktopPlaybackRecoveryStopError, DesktopPlaybackSession,
     DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
-    DesktopPlaybackSessionStartError,
+    DesktopPlaybackSessionStartError, DesktopProjectOpenError,
 };
 #[cfg(target_os = "windows")]
 mod wasapi_devices;

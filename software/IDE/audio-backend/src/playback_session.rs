@@ -26,10 +26,40 @@ use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
 use hyper_playback_json::{AdapterCompileError, MediaAssetFact};
 use hyper_playback_session::PreparedPlaybackSession;
+use hyper_project_loader::{
+    PreparedProjectPlayback, ProjectPlaybackError, ProjectPlaybackLimits, prepare_project_playback,
+};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 
 pub type DesktopPlaybackSessionInput = PreparedPlaybackSession;
+
+trait DesktopPlaybackSource: fmt::Debug + Send + Sync {
+    fn session(&self) -> &PreparedPlaybackSession;
+
+    fn project(&self) -> Option<&PreparedProjectPlayback>;
+}
+
+impl DesktopPlaybackSource for PreparedPlaybackSession {
+    fn session(&self) -> &PreparedPlaybackSession {
+        self
+    }
+
+    fn project(&self) -> Option<&PreparedProjectPlayback> {
+        None
+    }
+}
+
+impl DesktopPlaybackSource for PreparedProjectPlayback {
+    fn session(&self) -> &PreparedPlaybackSession {
+        PreparedProjectPlayback::session(self)
+    }
+
+    fn project(&self) -> Option<&PreparedProjectPlayback> {
+        Some(self)
+    }
+}
 
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 type NativeDesktopOutputStartError = PipeWireStartError;
@@ -219,6 +249,31 @@ impl Error for DesktopPlaybackSessionStartError {
     }
 }
 
+/// Failure to load and start one verified project on a desktop output.
+#[derive(Debug)]
+pub enum DesktopProjectOpenError {
+    Load(ProjectPlaybackError),
+    Start(DesktopPlaybackSessionStartError),
+}
+
+impl fmt::Display for DesktopProjectOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Load(source) => write!(formatter, "project loading failed: {source}"),
+            Self::Start(source) => write!(formatter, "desktop playback startup failed: {source}"),
+        }
+    }
+}
+
+impl Error for DesktopProjectOpenError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Load(source) => Some(source),
+            Self::Start(source) => Some(source),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SessionHandles {
     commands: TransportCommandSender,
@@ -240,7 +295,7 @@ pub struct DesktopPlaybackSession {
     meters: OutputMeterReceiver,
     recovery: PlaybackRecoveryCheckpoint,
     config: DesktopOutputConfig,
-    source: Arc<DesktopPlaybackSessionInput>,
+    source: Arc<dyn DesktopPlaybackSource>,
 }
 
 /// Restart authority retained after a desktop output has been fully torn down.
@@ -251,7 +306,7 @@ pub struct DesktopPlaybackSession {
 #[derive(Debug)]
 pub struct DesktopPlaybackRecovery {
     config: DesktopOutputConfig,
-    source: Option<Arc<DesktopPlaybackSessionInput>>,
+    source: Option<Arc<dyn DesktopPlaybackSource>>,
     checkpoint: PlaybackRecoverySnapshot,
 }
 
@@ -365,6 +420,16 @@ impl DesktopPlaybackRecovery {
         self.checkpoint
     }
 
+    /// Returns the verified project retained for a future restart, when this
+    /// recovery originated from [`DesktopPlaybackSession::open_project`] or
+    /// [`DesktopPlaybackSession::start_project`].
+    #[must_use]
+    pub fn prepared_project(&self) -> Option<&PreparedProjectPlayback> {
+        self.source
+            .as_deref()
+            .and_then(DesktopPlaybackSource::project)
+    }
+
     /// Rebuilds playback against the same explicitly selected output.
     ///
     /// A failed attempt retains restart authority for another try. A successful
@@ -400,7 +465,7 @@ impl DesktopPlaybackRecovery {
             .as_ref()
             .ok_or(DesktopPlaybackRecoveryStartError::AlreadyRestarted)?;
         let session =
-            DesktopPlaybackSession::start_retained(config, source.clone(), Some(self.checkpoint))
+            DesktopPlaybackSession::start_source(config, source.clone(), Some(self.checkpoint))
                 .map_err(DesktopPlaybackRecoveryStartError::Start)?;
         self.source = None;
         Ok(session)
@@ -408,6 +473,44 @@ impl DesktopPlaybackRecovery {
 }
 
 impl DesktopPlaybackSession {
+    /// Verifies, snapshots, decodes, and starts one project package.
+    ///
+    /// Project loading is a blocking application-thread operation and must not
+    /// be called from an audio callback. The native output is not opened until
+    /// the complete project has passed structural and semantic verification.
+    /// The verified package, decoded media, and recording metadata remain
+    /// owned by the live session and any recovery value derived from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DesktopProjectOpenError::Load`] before native startup when the
+    /// project is invalid, changes during capture, exceeds a limit, or cannot
+    /// be decoded. Returns [`DesktopProjectOpenError::Start`] when the verified
+    /// project cannot be bound to the selected output.
+    pub fn open_project(
+        config: DesktopOutputConfig,
+        root: impl AsRef<Path>,
+        limits: ProjectPlaybackLimits,
+    ) -> Result<Self, DesktopProjectOpenError> {
+        let project =
+            prepare_project_playback(root, limits).map_err(DesktopProjectOpenError::Load)?;
+        Self::start_project(config, project).map_err(DesktopProjectOpenError::Start)
+    }
+
+    /// Starts an already verified project while retaining its package and
+    /// recording metadata for the complete native-output and recovery lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DesktopPlaybackSessionStartError`] if session construction or
+    /// output startup fails. No partial session is published.
+    pub fn start_project(
+        config: DesktopOutputConfig,
+        project: PreparedProjectPlayback,
+    ) -> Result<Self, DesktopPlaybackSessionStartError> {
+        Self::start_source(config, Arc::new(project), None)
+    }
+
     /// Compiles and binds one prepared session entirely on the output thread.
     ///
     /// Controls are returned only after the native backend reports a usable
@@ -421,12 +524,12 @@ impl DesktopPlaybackSession {
         config: DesktopOutputConfig,
         input: DesktopPlaybackSessionInput,
     ) -> Result<Self, DesktopPlaybackSessionStartError> {
-        Self::start_retained(config, Arc::new(input), None)
+        Self::start_source(config, Arc::new(input), None)
     }
 
-    fn start_retained(
+    fn start_source(
         config: DesktopOutputConfig,
-        source: Arc<DesktopPlaybackSessionInput>,
+        source: Arc<dyn DesktopPlaybackSource>,
         initial_checkpoint: Option<PlaybackRecoverySnapshot>,
     ) -> Result<Self, DesktopPlaybackSessionStartError> {
         let sample_rate_hz = config.sample_rate_hz();
@@ -437,7 +540,7 @@ impl DesktopPlaybackSession {
             DesktopOutputStream::start_with_thread_initializer(config.native(), move |runner| {
                 initialize_session(
                     runner,
-                    &thread_source,
+                    thread_source.session(),
                     sample_rate_hz,
                     maximum_block_frames,
                     initial_checkpoint,
@@ -475,6 +578,13 @@ impl DesktopPlaybackSession {
     #[must_use]
     pub fn meter_receiver(&mut self) -> &mut OutputMeterReceiver {
         &mut self.meters
+    }
+
+    /// Returns the verified project retained by this session when it was
+    /// started through [`Self::open_project`] or [`Self::start_project`].
+    #[must_use]
+    pub fn prepared_project(&self) -> Option<&PreparedProjectPlayback> {
+        self.source.project()
     }
 
     #[must_use]
@@ -701,6 +811,58 @@ fn callback_error(detail: String) -> NativeDesktopOutputStartError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper_audio_source::DecodeLimits;
+    use hyper_media_cache::CacheLimits;
+    use hyper_playback_json::LoaderLimits;
+    use hyper_playback_session::PlaybackSessionAssemblyLimits;
+
+    fn project_limits() -> ProjectPlaybackLimits {
+        ProjectPlaybackLimits {
+            max_total_resource_bytes: 1_048_576,
+            audio: DecodeLimits::new(1_048_576, 48_000, 384_000).unwrap(),
+            session: PlaybackSessionAssemblyLimits {
+                documents: LoaderLimits::VERSION_1,
+                media_cache: CacheLimits {
+                    max_assets: 16,
+                    max_frames_per_asset: 48_000,
+                    max_decoded_sample_bytes: 3_072_000,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn project_load_failure_precedes_native_output_startup() {
+        let not_a_project = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let config = DesktopOutputConfig::try_new(48_000, 256).unwrap();
+        let error = DesktopPlaybackSession::open_project(config, &not_a_project, project_limits())
+            .expect_err("a non-project path must fail before native output startup");
+
+        assert!(matches!(
+            error,
+            DesktopProjectOpenError::Load(ProjectPlaybackError::Storage(_))
+        ));
+    }
+
+    #[test]
+    fn project_open_error_preserves_start_failure_source() {
+        let error = DesktopProjectOpenError::Start(DesktopPlaybackSessionStartError::Build(
+            DesktopPlaybackSessionBuildError::SampleRateMismatch {
+                project: 44_100,
+                output: 48_000,
+            },
+        ));
+
+        assert_eq!(
+            error.to_string(),
+            "desktop playback startup failed: project sample rate is 44100 Hz; output is configured for 48000 Hz"
+        );
+        assert!(matches!(
+            error.source(),
+            Some(source) if source.to_string()
+                == "project sample rate is 44100 Hz; output is configured for 48000 Hz"
+        ));
+    }
 
     #[test]
     fn scratch_planes_have_the_exact_session_shape() {
