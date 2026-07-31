@@ -362,6 +362,8 @@ mod tests {
             meter,
             processed_frame_end,
             dropped_before: 0,
+            applied_loudness_command_count: 0,
+            loudness_command_sender_disconnected: false,
         }
     }
 

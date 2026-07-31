@@ -11,8 +11,9 @@ use hyper_arrangement_renderer::{
 };
 use hyper_audio_engine::{
     CallbackAdapterCreationError, ChannelParameters, ControlledInputBlock, InputBlock,
-    InterleavedStereoCallback, LinearGain, MAX_PROCESS_FRAMES, MixerCreationError, Pan,
-    ParameterError, ProcessError, StereoBlockMeter, StereoCallbackError, StereoMixer, StereoOutput,
+    InterleavedStereoCallback, LinearGain, LoudnessMeasurementCommand, MAX_PROCESS_FRAMES,
+    MixerCreationError, Pan, ParameterError, ProcessError, StereoBlockMeter, StereoCallbackError,
+    StereoMixer, StereoOutput,
 };
 use hyper_media_cache::{PreparedPlayback, PreparedSchedule};
 use hyper_playback_compiler::FrameTimelineError;
@@ -31,6 +32,7 @@ pub use meter_ballistics::{
 
 pub const MAX_MAIN_MIXER_SLOTS: usize = 8;
 pub const MAX_QUEUED_TRANSPORT_COMMANDS: usize = 64;
+pub const MAX_QUEUED_LOUDNESS_COMMANDS: usize = 32;
 pub const MAX_QUEUED_OUTPUT_METER_SNAPSHOTS: usize = 64;
 const MAX_SENDS_PER_SLOT: usize = 2;
 static NEXT_OUTPUT_METER_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -210,6 +212,90 @@ impl fmt::Display for TransportCommandSendError {
 
 impl Error for TransportCommandSendError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoudnessCommandSendError {
+    Full(LoudnessMeasurementCommand),
+    Disconnected(LoudnessMeasurementCommand),
+}
+
+impl LoudnessCommandSendError {
+    #[must_use]
+    pub const fn command(self) -> LoudnessMeasurementCommand {
+        match self {
+            Self::Full(command) | Self::Disconnected(command) => command,
+        }
+    }
+}
+
+impl fmt::Display for LoudnessCommandSendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full(_) => formatter.write_str("loudness command queue is full"),
+            Self::Disconnected(_) => {
+                formatter.write_str("loudness command receiver is disconnected")
+            }
+        }
+    }
+}
+
+impl Error for LoudnessCommandSendError {}
+
+/// Application-thread half of the bounded live-loudness control queue.
+#[derive(Debug)]
+pub struct LoudnessCommandSender {
+    producer: Producer<LoudnessMeasurementCommand>,
+}
+
+impl LoudnessCommandSender {
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        MAX_QUEUED_LOUDNESS_COMMANDS
+    }
+
+    #[must_use]
+    pub fn is_disconnected(&self) -> bool {
+        let disconnected = self.producer.is_abandoned();
+        if disconnected {
+            fence(Ordering::Acquire);
+        }
+        disconnected
+    }
+
+    /// Attempts to enqueue one run/standby/reset command without waiting or
+    /// allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original command when the fixed queue is full or its audio
+    /// owner has been destroyed.
+    pub fn try_send(
+        &mut self,
+        command: LoudnessMeasurementCommand,
+    ) -> Result<(), LoudnessCommandSendError> {
+        if self.is_disconnected() {
+            return Err(LoudnessCommandSendError::Disconnected(command));
+        }
+        self.producer.push(command).map_err(|error| match error {
+            PushError::Full(command) => LoudnessCommandSendError::Full(command),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct LoudnessCommandReceiver {
+    consumer: Consumer<LoudnessMeasurementCommand>,
+}
+
+/// Allocates one fixed live-loudness command queue before callback processing.
+#[must_use]
+pub fn loudness_command_channel() -> (LoudnessCommandSender, LoudnessCommandReceiver) {
+    let (producer, consumer) = RingBuffer::new(MAX_QUEUED_LOUDNESS_COMMANDS);
+    (
+        LoudnessCommandSender { producer },
+        LoudnessCommandReceiver { consumer },
+    )
+}
+
 /// Application-thread half of the bounded transport command queue.
 #[derive(Debug)]
 pub struct TransportCommandSender {
@@ -311,6 +397,8 @@ pub struct OutputMeterSnapshot {
     meter: StereoBlockMeter,
     processed_frame_end: u64,
     dropped_before: usize,
+    applied_loudness_command_count: usize,
+    loudness_command_sender_disconnected: bool,
 }
 
 impl OutputMeterSnapshot {
@@ -336,6 +424,17 @@ impl OutputMeterSnapshot {
     #[must_use]
     pub const fn dropped_before(self) -> usize {
         self.dropped_before
+    }
+
+    /// Loudness commands applied at the beginning of this callback.
+    #[must_use]
+    pub const fn applied_loudness_command_count(self) -> usize {
+        self.applied_loudness_command_count
+    }
+
+    #[must_use]
+    pub const fn loudness_command_sender_disconnected(self) -> bool {
+        self.loudness_command_sender_disconnected
     }
 }
 
@@ -1740,6 +1839,25 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         interleaved_output: &mut [f32],
         meter_sender: &mut OutputMeterSender,
     ) -> Result<InterleavedTransportCycle, StereoCallbackError<RuntimeProcessError>> {
+        self.process_interleaved_cycle_with_loudness_control(
+            callback,
+            scratch,
+            interleaved_output,
+            meter_sender,
+            0,
+            false,
+        )
+    }
+
+    fn process_interleaved_cycle_with_loudness_control(
+        &mut self,
+        callback: &mut InterleavedStereoCallback,
+        scratch: &mut [RenderScratchSlot<'_>],
+        interleaved_output: &mut [f32],
+        meter_sender: &mut OutputMeterSender,
+        applied_loudness_command_count: usize,
+        loudness_command_sender_disconnected: bool,
+    ) -> Result<InterleavedTransportCycle, StereoCallbackError<RuntimeProcessError>> {
         let processed = callback.process(interleaved_output, |output| {
             self.process_cycle(scratch, output)
         })?;
@@ -1749,6 +1867,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             meter,
             processed_frame_end: 0,
             dropped_before: 0,
+            applied_loudness_command_count,
+            loudness_command_sender_disconnected,
         };
         let (snapshot, publication) = match meter_sender.try_publish(snapshot) {
             Ok(snapshot) => (snapshot, OutputMeterPublication::Published),
@@ -1850,6 +1970,7 @@ pub struct TransportOutputProcessor<'state, 'buffers, R> {
     callback: InterleavedStereoCallback,
     scratch: &'state mut [RenderScratchSlot<'buffers>],
     meter_sender: &'state mut OutputMeterSender,
+    loudness_commands: LoudnessCommandReceiver,
 }
 
 impl<'state, 'buffers, R: TrackWindowRenderer> TransportOutputProcessor<'state, 'buffers, R> {
@@ -1864,6 +1985,7 @@ impl<'state, 'buffers, R: TrackWindowRenderer> TransportOutputProcessor<'state, 
         transport: &'state mut RoutedTransportRuntime<R>,
         scratch: &'state mut [RenderScratchSlot<'buffers>],
         meter_sender: &'state mut OutputMeterSender,
+        loudness_commands: LoudnessCommandReceiver,
         sample_rate_hz: u32,
     ) -> Result<Self, TransportOutputCreationError> {
         let expected_slots = transport.slot_count();
@@ -1893,6 +2015,7 @@ impl<'state, 'buffers, R: TrackWindowRenderer> TransportOutputProcessor<'state, 
             callback,
             scratch,
             meter_sender,
+            loudness_commands,
         })
     }
 
@@ -1912,12 +2035,47 @@ impl<'state, 'buffers, R: TrackWindowRenderer> TransportOutputProcessor<'state, 
         &mut self,
         interleaved_output: &mut [f32],
     ) -> Result<InterleavedTransportCycle, StereoCallbackError<RuntimeProcessError>> {
-        self.transport.process_interleaved_cycle(
-            &mut self.callback,
-            self.scratch,
-            interleaved_output,
-            self.meter_sender,
-        )
+        if !interleaved_output.len().is_multiple_of(2)
+            || interleaved_output.len() / 2 > self.callback.maximum_frames()
+        {
+            return self.transport.process_interleaved_cycle(
+                &mut self.callback,
+                self.scratch,
+                interleaved_output,
+                self.meter_sender,
+            );
+        }
+        let applied_loudness_command_count = self.drain_loudness_commands();
+        let loudness_command_sender_disconnected = self.loudness_command_sender_disconnected();
+        self.transport
+            .process_interleaved_cycle_with_loudness_control(
+                &mut self.callback,
+                self.scratch,
+                interleaved_output,
+                self.meter_sender,
+                applied_loudness_command_count,
+                loudness_command_sender_disconnected,
+            )
+    }
+
+    fn drain_loudness_commands(&mut self) -> usize {
+        let mut applied = 0;
+        for _ in 0..MAX_QUEUED_LOUDNESS_COMMANDS {
+            let Ok(command) = self.loudness_commands.consumer.pop() else {
+                break;
+            };
+            self.callback.apply_loudness_command(command);
+            applied += 1;
+        }
+        applied
+    }
+
+    fn loudness_command_sender_disconnected(&self) -> bool {
+        let disconnected = self.loudness_commands.consumer.is_abandoned();
+        if disconnected {
+            fence(Ordering::Acquire);
+        }
+        disconnected
     }
 }
 

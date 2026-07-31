@@ -5,11 +5,11 @@ mod realtime_allocator;
 use std::sync::Mutex;
 
 use hyper_arrangement_renderer::RenderScratchSlot;
-use hyper_audio_engine::{InterleavedStereoCallback, StereoOutput};
+use hyper_audio_engine::{InterleavedStereoCallback, LoudnessMeasurementCommand, StereoOutput};
 use hyper_mixer_runtime::{
     FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, PreparedPlaybackMainRuntime,
     PreparedPlaybackTransportRuntime, TransportCommand, TransportOutputProcessor,
-    output_meter_channel,
+    loudness_command_channel, output_meter_channel,
 };
 
 use common::{fixture, graph_fixture, playback_fixture};
@@ -189,19 +189,27 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
         RenderScratchSlot::new(&mut scene_left, &mut scene_right),
     ];
     let (mut meter_sender, _meter_receiver) = output_meter_channel();
-    let mut processor =
-        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender, 48_000)
-            .unwrap();
+    let (mut loudness_sender, loudness_receiver) = loudness_command_channel();
+    let mut processor = TransportOutputProcessor::try_new(
+        &mut transport,
+        &mut scratch,
+        &mut meter_sender,
+        loudness_receiver,
+        48_000,
+    )
+    .unwrap();
     let mut first = [0.0_f32; 100];
     let mut second = [0.0_f32; 50];
 
     let measurement = HeapMeasurement::start_verified();
     let start_result = command_sender.try_send(TransportCommand::Start);
+    let loudness_result = loudness_sender.try_send(LoudnessMeasurementCommand::Reset);
     let first_result = processor.process(&mut first);
     let second_result = processor.process(&mut second);
     let heap_operations = measurement.finish();
 
     assert!(start_result.is_ok());
+    assert!(loudness_result.is_ok());
     assert!(first_result.is_ok());
     assert!(second_result.is_ok());
     assert_eq!(heap_operations, 0);

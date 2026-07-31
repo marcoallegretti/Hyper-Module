@@ -2,16 +2,18 @@ mod common;
 
 use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{
-    InterleavedStereoCallback, MAX_PROCESS_FRAMES, StereoCallbackError, StereoOutput,
+    InterleavedStereoCallback, LoudnessMeasurementCommand, LoudnessMeasurementState,
+    MAX_PROCESS_FRAMES, StereoCallbackError, StereoOutput,
 };
 use hyper_mixer_runtime::{
     FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, LocateState,
+    LoudnessCommandSendError, LoudnessCommandSender, MAX_QUEUED_LOUDNESS_COMMANDS,
     MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, OutputMeterPublication,
     OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot, PreparedPlaybackMainRuntime,
     PreparedPlaybackTransportRuntime, RuntimeCreationError, RuntimeProcessError,
     RuntimeProjectComponent, SamplePeakBallisticsConfig, StereoSamplePeakBallistics,
     TransportCommand, TransportCommandSendError, TransportCycle, TransportOutputCreationError,
-    TransportOutputProcessor, TransportState, output_meter_channel,
+    TransportOutputProcessor, TransportState, loudness_command_channel, output_meter_channel,
 };
 
 use common::{fixture, graph_fixture, playback_fixture};
@@ -32,6 +34,33 @@ fn assert_samples(actual: &[f32], expected: &[f32]) {
             "expected {expected}, got {actual}"
         );
     }
+}
+
+fn queue_loudness_restart(sender: &mut LoudnessCommandSender) {
+    sender
+        .try_send(LoudnessMeasurementCommand::SetState(
+            LoudnessMeasurementState::Standby,
+        ))
+        .unwrap();
+    sender.try_send(LoudnessMeasurementCommand::Reset).unwrap();
+    sender
+        .try_send(LoudnessMeasurementCommand::SetState(
+            LoudnessMeasurementState::Running,
+        ))
+        .unwrap();
+}
+
+fn assert_started_loudness(snapshot: OutputMeterSnapshot, frame_count: u64) {
+    assert_eq!(snapshot.applied_loudness_command_count(), 3);
+    assert!(!snapshot.loudness_command_sender_disconnected());
+    assert_eq!(
+        snapshot.meter().loudness().state(),
+        LoudnessMeasurementState::Running
+    );
+    assert_eq!(
+        snapshot.meter().loudness().programme_frame_count(),
+        frame_count
+    );
 }
 
 fn assert_meter_delivery_and_backpressure(
@@ -317,16 +346,24 @@ fn transport_output_processor_reuses_maximum_scratch_for_variable_quanta() {
         RenderScratchSlot::new(&mut scene_left, &mut scene_right),
     ];
     let (mut meter_sender, mut meter_receiver) = output_meter_channel();
-    let mut processor =
-        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender, 48_000)
-            .unwrap();
+    let (mut loudness_sender, loudness_receiver) = loudness_command_channel();
+    let mut processor = TransportOutputProcessor::try_new(
+        &mut transport,
+        &mut scratch,
+        &mut meter_sender,
+        loudness_receiver,
+        48_000,
+    )
+    .unwrap();
 
+    queue_loudness_restart(&mut loudness_sender);
     command_sender.try_send(TransportCommand::Start).unwrap();
     let mut first = [9.0_f32; 100];
     let first_cycle = processor.process(&mut first).unwrap();
     assert_eq!(first_cycle.snapshot().cycle().start_frame(), 0);
     assert_eq!(first_cycle.snapshot().cycle().frame_count(), 50);
     assert_eq!(first_cycle.snapshot().cycle().active_slot_count(), 2);
+    assert_started_loudness(first_cycle.snapshot(), 50);
     for (actual, expected) in first
         .chunks_exact(2)
         .map(|frame| frame[0])
@@ -353,10 +390,17 @@ fn transport_output_processor_reuses_maximum_scratch_for_variable_quanta() {
         Some(first_cycle.snapshot())
     );
 
+    drop(loudness_sender);
     let mut second = [9.0_f32; 50];
     let second_cycle = processor.process(&mut second).unwrap();
     assert_eq!(second_cycle.snapshot().cycle().start_frame(), 50);
     assert_eq!(second_cycle.snapshot().cycle().frame_count(), 25);
+    assert_eq!(second_cycle.snapshot().applied_loudness_command_count(), 0);
+    assert!(
+        second_cycle
+            .snapshot()
+            .loudness_command_sender_disconnected()
+    );
     for (actual, expected) in second
         .chunks_exact(2)
         .map(|frame| frame[0])
@@ -401,13 +445,17 @@ fn transport_output_processor_rejects_incomplete_scratch_before_processing() {
     let mut no_scratch = [];
 
     assert_eq!(
-        TransportOutputProcessor::try_new(
-            &mut transport,
-            &mut no_scratch,
-            &mut meter_sender,
-            48_000,
-        )
-        .unwrap_err(),
+        {
+            let (_loudness_sender, loudness_receiver) = loudness_command_channel();
+            TransportOutputProcessor::try_new(
+                &mut transport,
+                &mut no_scratch,
+                &mut meter_sender,
+                loudness_receiver,
+                48_000,
+            )
+            .unwrap_err()
+        },
         TransportOutputCreationError::ScratchSlotCountMismatch {
             expected: 2,
             actual: 0
@@ -423,8 +471,17 @@ fn transport_output_processor_rejects_incomplete_scratch_before_processing() {
         RenderScratchSlot::new(&mut left_full, &mut right_full_2),
     ];
     assert_eq!(
-        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender, 48_000,)
-            .unwrap_err(),
+        {
+            let (_loudness_sender, loudness_receiver) = loudness_command_channel();
+            TransportOutputProcessor::try_new(
+                &mut transport,
+                &mut scratch,
+                &mut meter_sender,
+                loudness_receiver,
+                48_000,
+            )
+            .unwrap_err()
+        },
         TransportOutputCreationError::ScratchCapacity {
             slot: 0,
             required: 64,
@@ -453,10 +510,19 @@ fn transport_output_processor_is_fail_silent_before_transport_mutation() {
         RenderScratchSlot::new(&mut scene_left, &mut scene_right),
     ];
     let (mut meter_sender, _meter_receiver) = output_meter_channel();
-    let mut processor =
-        TransportOutputProcessor::try_new(&mut transport, &mut scratch, &mut meter_sender, 48_000)
-            .unwrap();
+    let (mut loudness_sender, loudness_receiver) = loudness_command_channel();
+    let mut processor = TransportOutputProcessor::try_new(
+        &mut transport,
+        &mut scratch,
+        &mut meter_sender,
+        loudness_receiver,
+        48_000,
+    )
+    .unwrap();
     command_sender.try_send(TransportCommand::Start).unwrap();
+    loudness_sender
+        .try_send(LoudnessMeasurementCommand::Reset)
+        .unwrap();
 
     let mut malformed = [9.0_f32; 3];
     assert_eq!(
@@ -469,6 +535,7 @@ fn transport_output_processor_is_fail_silent_before_transport_mutation() {
     let first_cycle = processor.process(&mut first_valid).unwrap();
     assert_eq!(first_cycle.snapshot().cycle().start_frame(), 0);
     assert_eq!(first_cycle.snapshot().cycle().applied_command_count(), 1);
+    assert_eq!(first_cycle.snapshot().applied_loudness_command_count(), 1);
 
     let mut oversized = [9.0_f32; 130];
     assert_eq!(
@@ -917,6 +984,27 @@ fn interleaved_callback_executes_the_transport_runtime() {
         meter_receiver,
         snapshot,
     );
+}
+
+#[test]
+fn loudness_command_queue_reports_saturation_and_disconnection() {
+    let (mut sender, receiver) = loudness_command_channel();
+    for _ in 0..MAX_QUEUED_LOUDNESS_COMMANDS {
+        sender.try_send(LoudnessMeasurementCommand::Reset).unwrap();
+    }
+    let command = LoudnessMeasurementCommand::SetState(LoudnessMeasurementState::Standby);
+    let full = sender.try_send(command).unwrap_err();
+    assert_eq!(full, LoudnessCommandSendError::Full(command));
+    assert_eq!(full.command(), command);
+
+    drop(receiver);
+    assert!(sender.is_disconnected());
+    let disconnected = sender.try_send(command).unwrap_err();
+    assert_eq!(
+        disconnected,
+        LoudnessCommandSendError::Disconnected(command)
+    );
+    assert_eq!(disconnected.command(), command);
 }
 
 #[test]

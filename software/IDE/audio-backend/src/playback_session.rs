@@ -18,9 +18,9 @@ use core::fmt;
 use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_media_cache::PreparePlaybackError;
 use hyper_mixer_runtime::{
-    OutputMeterReceiver, RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError,
-    TransportCommandSender, TransportOutputCreationError, TransportOutputProcessor,
-    output_meter_channel,
+    LoudnessCommandSender, OutputMeterReceiver, RoutedMainRuntime, RoutedTransportRuntime,
+    RuntimeCreationError, TransportCommandSender, TransportOutputCreationError,
+    TransportOutputProcessor, loudness_command_channel, output_meter_channel,
 };
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
@@ -277,6 +277,7 @@ impl Error for DesktopProjectOpenError {
 #[derive(Debug)]
 struct SessionHandles {
     commands: TransportCommandSender,
+    loudness_commands: LoudnessCommandSender,
     meters: OutputMeterReceiver,
     recovery: PlaybackRecoveryCheckpoint,
 }
@@ -292,6 +293,7 @@ enum SessionPublication {
 pub struct DesktopPlaybackSession {
     output: DesktopOutputStream,
     commands: TransportCommandSender,
+    loudness_commands: LoudnessCommandSender,
     meters: OutputMeterReceiver,
     recovery: PlaybackRecoveryCheckpoint,
     config: DesktopOutputConfig,
@@ -553,6 +555,7 @@ impl DesktopPlaybackSession {
                 Ok(SessionPublication::Prepared(handles)) => Ok(Self {
                     output,
                     commands: handles.commands,
+                    loudness_commands: handles.loudness_commands,
                     meters: handles.meters,
                     recovery: handles.recovery,
                     config,
@@ -573,6 +576,11 @@ impl DesktopPlaybackSession {
     #[must_use]
     pub fn command_sender(&mut self) -> &mut TransportCommandSender {
         &mut self.commands
+    }
+
+    #[must_use]
+    pub fn loudness_command_sender(&mut self) -> &mut LoudnessCommandSender {
+        &mut self.loudness_commands
     }
 
     #[must_use]
@@ -618,6 +626,7 @@ impl DesktopPlaybackSession {
         let Self {
             output,
             commands: _,
+            loudness_commands: _,
             meters: _,
             recovery,
             config,
@@ -655,6 +664,7 @@ impl DesktopPlaybackSession {
         let Self {
             output,
             commands: _,
+            loudness_commands: _,
             meters: _,
             recovery: _,
             config: _,
@@ -743,10 +753,12 @@ fn initialize_session(
         transport.apply_command(checkpoint.restore_command());
     }
     let (mut meter_sender, meters) = output_meter_channel();
+    let (loudness_commands, loudness_command_receiver) = loudness_command_channel();
     let processor = TransportOutputProcessor::try_new(
         &mut transport,
         &mut scratch,
         &mut meter_sender,
+        loudness_command_receiver,
         sample_rate_hz,
     )
     .map_err(DesktopPlaybackSessionBuildError::Output)
@@ -757,6 +769,7 @@ fn initialize_session(
     publication
         .try_send(SessionPublication::Prepared(SessionHandles {
             commands,
+            loudness_commands,
             meters,
             recovery: recovery.clone(),
         }))

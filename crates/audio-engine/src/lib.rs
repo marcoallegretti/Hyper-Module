@@ -6,6 +6,11 @@ pub use test_tone::{
     StereoSineTestTone, StereoSineTestToneConfig, StereoSineTestToneConfigError,
     StereoSineTestToneRenderError,
 };
+mod loudness;
+pub use loudness::{
+    LOUDNESS_SAMPLE_RATE_HZ, LoudnessMeasurementCommand, LoudnessMeasurementState,
+    StereoLoudnessError, StereoLoudnessMeter, StereoLoudnessSnapshot,
+};
 mod true_peak;
 pub use true_peak::{
     StereoTruePeakBlock, StereoTruePeakError, StereoTruePeakMeter, TRUE_PEAK_OVERSAMPLE_FACTOR,
@@ -283,6 +288,7 @@ impl Error for ProcessError {}
 pub enum CallbackAdapterCreationError {
     InvalidMaximumFrames { actual: usize, maximum: usize },
     CapacityUnavailable,
+    Loudness(StereoLoudnessError),
     TruePeak(StereoTruePeakError),
 }
 
@@ -296,6 +302,9 @@ impl fmt::Display for CallbackAdapterCreationError {
             Self::CapacityUnavailable => {
                 formatter.write_str("callback planar buffer capacity is unavailable")
             }
+            Self::Loudness(source) => {
+                write!(formatter, "callback loudness meter failed: {source}")
+            }
             Self::TruePeak(source) => {
                 write!(formatter, "callback true-peak meter failed: {source}")
             }
@@ -306,6 +315,7 @@ impl fmt::Display for CallbackAdapterCreationError {
 impl Error for CallbackAdapterCreationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Loudness(source) => Some(source),
             Self::TruePeak(source) => Some(source),
             Self::InvalidMaximumFrames { .. } | Self::CapacityUnavailable => None,
         }
@@ -317,6 +327,7 @@ pub enum StereoCallbackError<E> {
     SampleCountNotStereoAligned { samples: usize },
     BlockTooLarge { actual: usize, maximum: usize },
     NonFiniteOutput { samples: usize },
+    Loudness(StereoLoudnessError),
     TruePeak(StereoTruePeakError),
     Processor(E),
 }
@@ -336,6 +347,7 @@ impl<E: fmt::Display> fmt::Display for StereoCallbackError<E> {
                 formatter,
                 "stereo processing produced {samples} non-finite output samples"
             ),
+            Self::Loudness(source) => write!(formatter, "loudness measurement failed: {source}"),
             Self::TruePeak(source) => write!(formatter, "true-peak measurement failed: {source}"),
             Self::Processor(source) => write!(formatter, "stereo processing failed: {source}"),
         }
@@ -346,6 +358,7 @@ impl<E: Error + 'static> Error for StereoCallbackError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Processor(source) => Some(source),
+            Self::Loudness(source) => Some(source),
             Self::TruePeak(source) => Some(source),
             Self::SampleCountNotStereoAligned { .. }
             | Self::BlockTooLarge { .. }
@@ -403,12 +416,14 @@ impl ChannelBlockMeter {
     }
 }
 
-/// Measurements derived from the final planar stereo output of one callback.
+/// Measurements derived from the final planar stereo output of one callback,
+/// including the persistent K-weighted stereo loudness programme state.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StereoBlockMeter {
     frame_count: usize,
     left: ChannelBlockMeter,
     right: ChannelBlockMeter,
+    loudness: StereoLoudnessSnapshot,
 }
 
 impl StereoBlockMeter {
@@ -425,6 +440,13 @@ impl StereoBlockMeter {
     #[must_use]
     pub const fn right(self) -> ChannelBlockMeter {
         self.right
+    }
+
+    /// Returns the K-weighted stereo live/programme loudness reading after
+    /// this final-output block.
+    #[must_use]
+    pub const fn loudness(self) -> StereoLoudnessSnapshot {
+        self.loudness
     }
 }
 
@@ -510,6 +532,7 @@ impl ChannelMeterAccumulator {
 pub struct InterleavedStereoCallback {
     left: Vec<f32>,
     right: Vec<f32>,
+    loudness: StereoLoudnessMeter,
     true_peak: StereoTruePeakMeter,
 }
 
@@ -543,9 +566,12 @@ impl InterleavedStereoCallback {
         right.resize(maximum_frames, 0.0);
         let true_peak = StereoTruePeakMeter::try_new(sample_rate_hz)
             .map_err(CallbackAdapterCreationError::TruePeak)?;
+        let loudness = StereoLoudnessMeter::try_new(sample_rate_hz)
+            .map_err(CallbackAdapterCreationError::Loudness)?;
         Ok(Self {
             left,
             right,
+            loudness,
             true_peak,
         })
     }
@@ -553,6 +579,16 @@ impl InterleavedStereoCallback {
     #[must_use]
     pub fn maximum_frames(&self) -> usize {
         self.left.len()
+    }
+
+    /// Applies one Integrated Loudness/LRA control at a callback boundary.
+    pub fn apply_loudness_command(&mut self, command: LoudnessMeasurementCommand) {
+        self.loudness.apply_command(command);
+    }
+
+    #[must_use]
+    pub fn loudness_snapshot(&self) -> StereoLoudnessSnapshot {
+        self.loudness.snapshot()
     }
 
     /// Processes one interleaved stereo `f32` device callback.
@@ -621,6 +657,18 @@ impl InterleavedStereoCallback {
                 return Err(StereoCallbackError::TruePeak(source));
             }
         };
+        let block_true_peak = true_peak.left_linear().max(true_peak.right_linear());
+        let loudness = match self.loudness.process(
+            &self.left[..frame_count],
+            &self.right[..frame_count],
+            block_true_peak,
+        ) {
+            Ok(loudness) => loudness,
+            Err(source) => {
+                interleaved_output.fill(0.0);
+                return Err(StereoCallbackError::Loudness(source));
+            }
+        };
         let mut left_meter = ChannelMeterAccumulator::default();
         let mut right_meter = ChannelMeterAccumulator::default();
         for (frame, samples) in interleaved_output.chunks_exact_mut(2).enumerate() {
@@ -637,6 +685,7 @@ impl InterleavedStereoCallback {
                 frame_count,
                 left: left_meter.finish(frame_count, true_peak.left_linear()),
                 right: right_meter.finish(frame_count, true_peak.right_linear()),
+                loudness,
             },
         })
     }
@@ -1082,6 +1131,9 @@ mod tests {
         assert_eq!(meter.right().block_rms(), Some(0.25));
         assert_eq!(meter.right().full_scale_sample_count(), 0);
         assert_eq!(meter.right().non_finite_sample_count(), 0);
+        assert_eq!(meter.loudness().programme_frame_count(), 4);
+        assert_eq!(meter.loudness().momentary_lufs(), None);
+        assert!(meter.loudness().maximum_true_peak_linear().unwrap() >= 1.5);
     }
 
     #[test]
@@ -1138,6 +1190,8 @@ mod tests {
         assert_eq!(meter.right().sample_peak(), Some(0.0));
         assert_eq!(meter.right().true_peak(), Some(0.0));
         assert_eq!(meter.right().block_rms(), Some(0.0));
+        assert_eq!(meter.loudness().programme_frame_count(), 0);
+        assert_eq!(meter.loudness().maximum_true_peak_linear(), None);
     }
 
     #[test]
