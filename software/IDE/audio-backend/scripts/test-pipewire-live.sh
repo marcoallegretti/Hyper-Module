@@ -68,5 +68,9 @@ cargo test -p hyper-desktop-audio \
   -- --ignored --exact
 
 cargo test -p hyper-desktop-audio \
+  playback_session::tests::live_desktop_recovery_rebuilds_one_operable_session \
+  -- --ignored --exact
+
+cargo test -p hyper-desktop-audio \
   pipewire_input::tests::live_pipewire_source_captures_audio \
   -- --ignored --exact

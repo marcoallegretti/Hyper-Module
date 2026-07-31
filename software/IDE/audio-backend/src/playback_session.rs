@@ -968,15 +968,68 @@ mod tests {
     use super::*;
     use crate::BoundedBackendThread;
     use hyper_audio_source::DecodeLimits;
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    use hyper_audio_source::DecodedAudio;
     use hyper_media_cache::CacheLimits;
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    use hyper_mixer_runtime::{LocateState, PlaybackRecoveryTransportState, TransportCommand};
     use hyper_playback_json::LoaderLimits;
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    use hyper_playback_session::{
+        DecodedPlaybackAsset, PlaybackDocumentBytes, PlaybackSessionAssemblyInput,
+        assemble_playback_session,
+    };
     use std::sync::mpsc::SyncSender;
     use std::thread;
     use std::time::Duration;
 
     #[derive(Debug)]
     struct UnusedPlaybackSource;
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    const LIVE_PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122337500";
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    const LIVE_ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-001122337504";
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    const LIVE_TIMELINE: &[u8] = br#"{
+        "format":"hyper-timeline","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337501",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","ticks_per_quarter":1920,
+        "tempo_events":[{"tick":0,"microseconds_per_quarter":1000000}],
+        "meter_events":[{"tick":0,"numerator":4,"denominator":4}],"extensions":{}
+    }"#;
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    const LIVE_TRACK: &[u8] = br#"{
+        "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337502",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Audio","kind":"audio","order":0,
+        "active":true,"clip_ids":["018f47a2-6b2d-7c11-8a44-001122337503"],"extensions":{}
+    }"#;
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    const LIVE_CLIP: &[u8] = br#"{
+        "format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337503",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","track_id":"018f47a2-6b2d-7c11-8a44-001122337502","name":"Clip","enabled":true,
+        "duration_ticks":4,"source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122337504","start_frame":0,"frame_count":100},
+        "loop":{"enabled":false,"start_tick":0,"end_tick":4},
+        "playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},
+        "fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},
+        "warp_markers":[{"tick":0,"source_frame_offset":0},{"tick":4,"source_frame_offset":100}],
+        "extensions":{}
+    }"#;
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    const LIVE_ARRANGEMENT: &[u8] = br#"{
+        "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337505",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Main","enabled":true,
+        "placements":[{"id":"018f47a2-6b2d-7c11-8a44-001122337506","track_id":"018f47a2-6b2d-7c11-8a44-001122337502","clip_id":"018f47a2-6b2d-7c11-8a44-001122337503","start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}],
+        "scene_launches":[],"extensions":{}
+    }"#;
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    const LIVE_MIXER: &[u8] = br#"{
+        "format":"hyper-mixer","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337507",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122337500",
+        "channels":[{"track_id":"018f47a2-6b2d-7c11-8a44-001122337502","gain_millionths":1000000,"pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},"sends":[]}],
+        "return_buses":[],"main":{"gain_millionths":1000000,"mute":false},
+        "cue":{"source":"main","gain_millionths":1000000,"mute":false},"extensions":{}
+    }"#;
 
     impl DesktopPlaybackSource for UnusedPlaybackSource {
         fn session(&self) -> &PreparedPlaybackSession {
@@ -1015,6 +1068,121 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    fn live_session_input() -> PreparedPlaybackSession {
+        assemble_playback_session(PlaybackSessionAssemblyInput {
+            documents: PlaybackDocumentBytes {
+                project_id: LIVE_PROJECT_ID.to_owned(),
+                sample_rate_hz: 48_000,
+                timeline: LIVE_TIMELINE.to_vec(),
+                tracks: vec![LIVE_TRACK.to_vec()],
+                clips: vec![LIVE_CLIP.to_vec()],
+                scenes: Vec::new(),
+                arrangement: Some(LIVE_ARRANGEMENT.to_vec()),
+                mixer: LIVE_MIXER.to_vec(),
+                automation_takes: Vec::new(),
+            },
+            decoded_assets: vec![DecodedPlaybackAsset::new(
+                LIVE_ASSET_ID.to_owned(),
+                DecodedAudio::from_mono(48_000, vec![0.25; 100]).unwrap(),
+            )],
+            limits: PlaybackSessionAssemblyLimits {
+                documents: LoaderLimits::VERSION_1,
+                media_cache: CacheLimits {
+                    max_assets: 1,
+                    max_frames_per_asset: 100,
+                    max_decoded_sample_bytes: 400,
+                },
+            },
+        })
+        .unwrap()
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    fn wait_for_checkpoint(
+        checkpoint: &PlaybackRecoveryCheckpoint,
+        predicate: impl Fn(PlaybackRecoverySnapshot) -> bool,
+    ) -> PlaybackRecoverySnapshot {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = checkpoint.snapshot();
+            if predicate(snapshot) {
+                return snapshot;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "playback checkpoint did not reach the expected state: {snapshot:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[ignore = "requires a live PipeWire daemon with the hyper-ci-sink null sink"]
+    fn live_desktop_recovery_rebuilds_one_operable_session() {
+        let targets = crate::discover_desktop_output_targets().unwrap();
+        let target = targets
+            .targets()
+            .iter()
+            .find(|target| target.display_name() == "Hyper CI Sink")
+            .expect("CI null sink was not discovered");
+        let config = DesktopOutputConfig::try_new(48_000, 64)
+            .unwrap()
+            .with_output_target(target)
+            .unwrap();
+        let mut session = DesktopPlaybackSession::start(config, live_session_input()).unwrap();
+        let old_checkpoint = session.recovery_checkpoint();
+
+        session
+            .command_sender()
+            .try_send(TransportCommand::Locate {
+                frame: 32,
+                state: LocateState::Stopped,
+            })
+            .unwrap();
+        let located = wait_for_checkpoint(&old_checkpoint, |snapshot| {
+            snapshot.position_frame() == 32
+                && snapshot.state() == PlaybackRecoveryTransportState::Stopped
+                && snapshot.committed_cycle_count() > 0
+        });
+
+        let mut recovery = session.into_recovery().unwrap();
+        let terminal_old = recovery.checkpoint();
+        assert_eq!(terminal_old.position_frame(), 32);
+        assert_eq!(
+            terminal_old.state(),
+            PlaybackRecoveryTransportState::Stopped
+        );
+        assert!(terminal_old.committed_cycle_count() >= located.committed_cycle_count());
+
+        let mut replacement = recovery.restart().unwrap();
+        assert!(matches!(
+            recovery.restart(),
+            Err(DesktopPlaybackRecoveryStartError::AlreadyRestarted)
+        ));
+        let replacement_checkpoint = replacement.recovery_checkpoint();
+        let restored = replacement_checkpoint.snapshot();
+        assert_eq!(restored.position_frame(), 32);
+        assert_eq!(restored.state(), PlaybackRecoveryTransportState::Stopped);
+        assert!(
+            restored.committed_cycle_count() >= terminal_old.committed_cycle_count(),
+            "the rebuilt checkpoint must retain the prior publication sequence"
+        );
+
+        replacement
+            .command_sender()
+            .try_send(TransportCommand::Start)
+            .unwrap();
+        let rolling = wait_for_checkpoint(&replacement_checkpoint, |snapshot| {
+            snapshot.state() == PlaybackRecoveryTransportState::Rolling
+                && snapshot.position_frame() > 32
+        });
+        assert!(rolling.committed_cycle_count() > terminal_old.committed_cycle_count());
+        assert_eq!(old_checkpoint.snapshot(), terminal_old);
+        replacement.stop().unwrap();
     }
 
     #[test]
