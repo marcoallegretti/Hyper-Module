@@ -419,6 +419,7 @@ dependencies = [
  "hyper-audio-engine",
  "hyper-audio-source",
  "hyper-playback-compiler",
+ "hyper-project-model",
  "hyper-strict-json",
  "serde",
  "serde_json",

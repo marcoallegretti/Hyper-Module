@@ -345,6 +345,56 @@ fn prepares_one_verified_owned_playback_session() {
 }
 
 #[test]
+fn shared_playback_domain_cases_match_the_public_preparation_boundary() {
+    let cases: Value = serde_json::from_str(include_str!(
+        "../../../contracts/fixtures/playback-domain-cases.json"
+    ))
+    .unwrap();
+    for test_case in cases.as_array().unwrap() {
+        let fixture = Fixture::new();
+        if let Some(role) = test_case.get("resource_role").and_then(Value::as_str) {
+            let manifest = fixture.manifest();
+            let path = manifest["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| record["role"] == role)
+                .and_then(|record| record["path"].as_str())
+                .unwrap()
+                .to_owned();
+            let mut resource: Value =
+                serde_json::from_slice(&fs::read(fixture.root.join(&path)).unwrap()).unwrap();
+            let pointer = test_case["pointer"].as_str().unwrap();
+            let mut replacement = test_case["value"].clone();
+            replace_case_symbols(&mut replacement);
+            *resource.pointer_mut(pointer).unwrap() = replacement;
+            fixture.replace_resource(&path, &resource);
+        }
+
+        let accepted = test_case["accepted"].as_bool().unwrap();
+        let result = prepare_project_playback(&fixture.root, limits());
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "shared playback-domain case {} disagreed with its expected result",
+            test_case["name"].as_str().unwrap()
+        );
+    }
+}
+
+fn replace_case_symbols(value: &mut Value) {
+    match value {
+        Value::String(text) if text == "$asset_id" => ASSET_ID.clone_into(text),
+        Value::String(text) if text == "$arrangement_event_id" => {
+            PLACEMENT_ID.clone_into(text);
+        }
+        Value::Array(items) => items.iter_mut().for_each(replace_case_symbols),
+        Value::Object(properties) => properties.values_mut().for_each(replace_case_symbols),
+        _ => {}
+    }
+}
+
+#[test]
 fn binds_recording_metadata_to_verified_media_and_audio_tracks() {
     let fixture = Fixture::new();
     fixture.make_asset_a_recording();

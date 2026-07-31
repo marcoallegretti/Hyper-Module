@@ -286,24 +286,6 @@ pub fn assemble_playback_session(
         limits.documents,
     )
     .map_err(PlaybackSessionAssemblyError::Project)?;
-    let loaded_mixer = project
-        .load_mixer(&documents.mixer, limits.documents)
-        .map_err(PlaybackSessionAssemblyError::Mixer)?;
-    let mixer = loaded_mixer
-        .compile_main_graph()
-        .map_err(PlaybackSessionAssemblyError::MixerCompile)?;
-    let automation = if has_automation {
-        let loaded = project
-            .load_automation_takes(&loaded_mixer, &automation_documents, limits.documents)
-            .map_err(PlaybackSessionAssemblyError::Automation)?;
-        Some(
-            project
-                .compile_main_automation(&mixer, &loaded)
-                .map_err(PlaybackSessionAssemblyError::AutomationCompile)?,
-        )
-    } else {
-        None
-    };
 
     let mut media = DecodedMediaCacheBuilder::try_new(limits.media_cache)
         .map_err(PlaybackSessionAssemblyError::MediaCache)?;
@@ -322,6 +304,30 @@ pub fn assemble_playback_session(
         .try_reserve_exact(media.asset_count())
         .map_err(|_| PlaybackSessionAssemblyError::MediaFactCapacityUnavailable)?;
     facts.extend(media.media_asset_facts());
+    let loaded_mixer = project
+        .load_mixer(&documents.mixer, &facts, limits.documents)
+        .map_err(PlaybackSessionAssemblyError::Mixer)?;
+    let mixer = loaded_mixer
+        .compile_main_graph()
+        .map_err(PlaybackSessionAssemblyError::MixerCompile)?;
+    let automation = if has_automation {
+        let loaded = project
+            .load_automation_takes(
+                &loaded_mixer,
+                &facts,
+                &automation_documents,
+                limits.documents,
+            )
+            .map_err(PlaybackSessionAssemblyError::Automation)?;
+        Some(
+            project
+                .compile_main_automation(&mixer, &loaded)
+                .map_err(PlaybackSessionAssemblyError::AutomationCompile)?,
+        )
+    } else {
+        None
+    };
+
     let graph = project
         .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
         .map_err(PlaybackSessionAssemblyError::Playback)?;
@@ -362,22 +368,22 @@ mod tests {
     use super::*;
 
     const TIMELINE: &[u8] = br#"{
-        "format":"hyper-timeline","format_version":1,"id":"timeline",
-        "project_id":"project","ticks_per_quarter":1920,
+        "format":"hyper-timeline","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337501",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","ticks_per_quarter":1920,
         "tempo_events":[{"tick":0,"microseconds_per_quarter":1000000}],
         "meter_events":[{"tick":0,"numerator":4,"denominator":4}],
         "extensions":{}
     }"#;
     const TRACK: &[u8] = br#"{
-        "format":"hyper-track","format_version":1,"id":"track",
-        "project_id":"project","name":"Audio","kind":"audio","order":0,
-        "active":true,"clip_ids":["clip"],"extensions":{}
+        "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337502",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Audio","kind":"audio","order":0,
+        "active":true,"clip_ids":["018f47a2-6b2d-7c11-8a44-001122337503"],"extensions":{}
     }"#;
     const CLIP: &[u8] = br#"{
-        "format":"hyper-audio-clip","format_version":1,"id":"clip",
-        "project_id":"project","track_id":"track","name":"Clip","enabled":true,
+        "format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337503",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","track_id":"018f47a2-6b2d-7c11-8a44-001122337502","name":"Clip","enabled":true,
         "duration_ticks":4,
-        "source":{"asset_id":"asset","start_frame":0,"frame_count":100},
+        "source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122337504","start_frame":0,"frame_count":100},
         "loop":{"enabled":false,"start_tick":0,"end_tick":4},
         "playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},
         "fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},
@@ -388,19 +394,19 @@ mod tests {
         "extensions":{}
     }"#;
     const ARRANGEMENT: &[u8] = br#"{
-        "format":"hyper-arrangement","format_version":1,"id":"arrangement",
-        "project_id":"project","name":"Main","enabled":true,
+        "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337505",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Main","enabled":true,
         "placements":[{
-            "id":"placement","track_id":"track","clip_id":"clip",
+            "id":"018f47a2-6b2d-7c11-8a44-001122337506","track_id":"018f47a2-6b2d-7c11-8a44-001122337502","clip_id":"018f47a2-6b2d-7c11-8a44-001122337503",
             "start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true
         }],
         "scene_launches":[],"extensions":{}
     }"#;
     const MIXER: &[u8] = br#"{
-        "format":"hyper-mixer","format_version":1,"id":"mixer",
-        "project_id":"project",
+        "format":"hyper-mixer","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337507",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122337500",
         "channels":[{
-            "track_id":"track","gain_millionths":1000000,
+            "track_id":"018f47a2-6b2d-7c11-8a44-001122337502","gain_millionths":1000000,
             "pan_millionths":0,"mute":false,"solo":false,
             "destination":{"kind":"main"},"sends":[]
         }],
@@ -411,12 +417,12 @@ mod tests {
     }"#;
     const AUTOMATION: &[u8] = br#"{
         "format":"hyper-automation-take","format_version":1,
-        "id":"take","project_id":"project","name":"Pass","enabled":true,
+        "id":"018f47a2-6b2d-7c11-8a44-001122337508","project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Pass","enabled":true,
         "captured_at_utc":"2026-07-28T12:05:00.000Z",
         "start_tick":0,"end_tick":8,
         "lanes":[{
-            "id":"lane",
-            "target":{"kind":"mixer-channel","track_id":"track","parameter":"gain"},
+            "id":"018f47a2-6b2d-7c11-8a44-001122337509",
+            "target":{"kind":"mixer-channel","track_id":"018f47a2-6b2d-7c11-8a44-001122337502","parameter":"gain"},
             "interpolation":"linear",
             "points":[{"tick":0,"value":1000000},{"tick":3,"value":0}]
         }],
@@ -426,7 +432,7 @@ mod tests {
     fn input(assets: Vec<DecodedPlaybackAsset>) -> PlaybackSessionAssemblyInput {
         PlaybackSessionAssemblyInput {
             documents: PlaybackDocumentBytes {
-                project_id: "project".to_owned(),
+                project_id: "018f47a2-6b2d-7c11-8a44-001122337500".to_owned(),
                 sample_rate_hz: 48_000,
                 timeline: TIMELINE.to_vec(),
                 tracks: vec![TRACK.to_vec()],
@@ -457,9 +463,11 @@ mod tests {
 
     #[test]
     fn canonical_documents_and_media_assemble_as_one_owned_session() {
-        let session = assemble_playback_session(input(vec![asset("asset")])).unwrap();
+        let session =
+            assemble_playback_session(input(vec![asset("018f47a2-6b2d-7c11-8a44-001122337504")]))
+                .unwrap();
 
-        assert_eq!(session.project_id(), "project");
+        assert_eq!(session.project_id(), "018f47a2-6b2d-7c11-8a44-001122337500");
         assert_eq!(session.sample_rate_hz(), 48_000);
         assert_eq!(session.media_asset_count(), 1);
         assert!(session.has_automation());
@@ -469,19 +477,22 @@ mod tests {
             automation.map(CompiledAutomation::project_id),
             Some(project.project_id())
         );
-        assert!(media.contains("asset"));
+        assert!(media.contains("018f47a2-6b2d-7c11-8a44-001122337504"));
         let (project, mixer, automation, media) = session.into_parts();
         assert_eq!(project.project_id(), mixer.project_id());
         assert_eq!(
             automation.as_ref().map(CompiledAutomation::project_id),
             Some(project.project_id())
         );
-        assert!(media.contains("asset"));
+        assert!(media.contains("018f47a2-6b2d-7c11-8a44-001122337504"));
     }
 
     #[test]
     fn duplicate_decoded_identity_rejects_the_entire_session() {
-        let result = assemble_playback_session(input(vec![asset("asset"), asset("asset")]));
+        let result = assemble_playback_session(input(vec![
+            asset("018f47a2-6b2d-7c11-8a44-001122337504"),
+            asset("018f47a2-6b2d-7c11-8a44-001122337504"),
+        ]));
 
         assert!(matches!(
             result,
@@ -494,10 +505,13 @@ mod tests {
 
     #[test]
     fn foreign_mixer_is_rejected_before_media_publication() {
-        let mut input = input(vec![asset("asset")]);
+        let mut input = input(vec![asset("018f47a2-6b2d-7c11-8a44-001122337504")]);
         input.documents.mixer = String::from_utf8(MIXER.to_vec())
             .unwrap()
-            .replace(r#""project_id":"project""#, r#""project_id":"foreign""#)
+            .replace(
+                r#""project_id":"018f47a2-6b2d-7c11-8a44-001122337500""#,
+                r#""project_id":"018f47a2-6b2d-7c11-8a44-001122337579""#,
+            )
             .into_bytes();
 
         assert!(matches!(
@@ -508,7 +522,7 @@ mod tests {
 
     #[test]
     fn document_count_limit_precedes_reference_allocation() {
-        let mut input = input(vec![asset("asset")]);
+        let mut input = input(vec![asset("018f47a2-6b2d-7c11-8a44-001122337504")]);
         input.limits.documents.max_track_documents = 0;
 
         assert!(matches!(
@@ -524,14 +538,14 @@ mod tests {
     #[test]
     fn missing_decoded_binding_rejects_the_entire_session() {
         assert!(matches!(
-            assemble_playback_session(input(vec![asset("foreign")])),
+            assemble_playback_session(input(vec![asset("018f47a2-6b2d-7c11-8a44-001122337579")])),
             Err(PlaybackSessionAssemblyError::Playback(_))
         ));
     }
 
     #[test]
     fn automation_is_absent_only_when_no_take_was_supplied() {
-        let mut input = input(vec![asset("asset")]);
+        let mut input = input(vec![asset("018f47a2-6b2d-7c11-8a44-001122337504")]);
         input.documents.automation_takes.clear();
 
         let session = assemble_playback_session(input).unwrap();

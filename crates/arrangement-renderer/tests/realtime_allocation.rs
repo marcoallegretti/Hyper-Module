@@ -39,9 +39,15 @@ fn fixed_track_window_rendering_performs_zero_heap_allocations() {
     let _guard = TEST_LOCK.lock().unwrap();
     let fixture = fixture();
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
-    let renderer =
-        ArrangementRenderer::try_new_for_tracks(&prepared, &["track-a", "track-b", "track-c"])
-            .unwrap();
+    let renderer = ArrangementRenderer::try_new_for_tracks(
+        &prepared,
+        &[
+            "018f47a2-6b2d-7c11-8a44-001122335002",
+            "018f47a2-6b2d-7c11-8a44-001122335003",
+            "018f47a2-6b2d-7c11-8a44-001122335004",
+        ],
+    )
+    .unwrap();
     let mut left_a = [0.0_f32; 160];
     let mut right_a = [0.0_f32; 160];
     let mut left_b = [0.0_f32; 160];

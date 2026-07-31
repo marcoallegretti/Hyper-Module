@@ -1,0 +1,75 @@
+[
+  {
+    "name": "accepted-baseline",
+    "accepted": true
+  },
+  {
+    "name": "track-scalar-extensions",
+    "accepted": false,
+    "resource_role": "track",
+    "pointer": "/extensions",
+    "value": false
+  },
+  {
+    "name": "track-unqualified-extension-key",
+    "accepted": false,
+    "resource_role": "track",
+    "pointer": "/extensions",
+    "value": {
+      "vendor": true
+    }
+  },
+  {
+    "name": "track-empty-name",
+    "accepted": false,
+    "resource_role": "track",
+    "pointer": "/name",
+    "value": ""
+  },
+  {
+    "name": "track-overlong-name",
+    "accepted": false,
+    "resource_role": "track",
+    "pointer": "/name",
+    "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  },
+  {
+    "name": "placement-malformed-identity",
+    "accepted": false,
+    "resource_role": "arrangement",
+    "pointer": "/placements/0/id",
+    "value": "placement"
+  },
+  {
+    "name": "mixer-send-asset-collision",
+    "accepted": false,
+    "resource_role": "mixer",
+    "pointer": "/channels/0/sends",
+    "value": [
+      {
+        "id": "$asset_id",
+        "bus": "a",
+        "tap": "post-fader",
+        "gain_millionths": 500000,
+        "pan_millionths": 0,
+        "enabled": true
+      }
+    ]
+  },
+  {
+    "name": "mixer-send-arrangement-event-collision",
+    "accepted": false,
+    "resource_role": "mixer",
+    "pointer": "/channels/0/sends",
+    "value": [
+      {
+        "id": "$arrangement_event_id",
+        "bus": "a",
+        "tap": "post-fader",
+        "gain_millionths": 500000,
+        "pan_millionths": 0,
+        "enabled": true
+      }
+    ]
+  }
+]

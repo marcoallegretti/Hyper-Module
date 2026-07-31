@@ -203,7 +203,8 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
 
     let measurement = HeapMeasurement::start_verified();
     let start_result = command_sender.try_send(TransportCommand::Start);
-    let channel_result = mixer_parameter_sender.resolve_channel("arrangement-track");
+    let channel_result =
+        mixer_parameter_sender.resolve_channel("018f47a2-6b2d-7c11-8a44-001122336440");
     let parameter_result = channel_result.map(|channel| {
         mixer_parameter_sender.try_send(MixerParameterCommand::ChannelMute {
             channel,

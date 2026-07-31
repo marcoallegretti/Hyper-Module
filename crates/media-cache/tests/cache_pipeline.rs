@@ -30,27 +30,27 @@ fn builder() -> DecodedMediaCacheBuilder {
 )]
 fn playback_project() -> LoadedPlaybackProject {
     let timeline = br#"{
-        "format":"hyper-timeline","format_version":1,"id":"timeline",
-        "project_id":"project","ticks_per_quarter":1920,
+        "format":"hyper-timeline","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335051",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335050","ticks_per_quarter":1920,
         "tempo_events":[{"tick":0,"microseconds_per_quarter":1000000}],
         "meter_events":[{"tick":0,"numerator":4,"denominator":4}],
         "extensions":{}
     }"#;
     let arrangement_track = br#"{
-        "format":"hyper-track","format_version":1,"id":"arrangement-track",
-        "project_id":"project","name":"Arrangement","kind":"audio","order":0,
-        "active":true,"clip_ids":["arrangement-clip"],"extensions":{}
+        "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335052",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335050","name":"Arrangement","kind":"audio","order":0,
+        "active":true,"clip_ids":["018f47a2-6b2d-7c11-8a44-001122335054"],"extensions":{}
     }"#;
     let scene_track = br#"{
-        "format":"hyper-track","format_version":1,"id":"scene-track",
-        "project_id":"project","name":"Scene","kind":"audio","order":1,
-        "active":true,"clip_ids":["scene-clip"],"extensions":{}
+        "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335053",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335050","name":"Scene","kind":"audio","order":1,
+        "active":true,"clip_ids":["018f47a2-6b2d-7c11-8a44-001122335055"],"extensions":{}
     }"#;
     let arrangement_clip = br#"{
-        "format":"hyper-audio-clip","format_version":1,"id":"arrangement-clip",
-        "project_id":"project","track_id":"arrangement-track","name":"Arrangement Clip",
+        "format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335054",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335050","track_id":"018f47a2-6b2d-7c11-8a44-001122335052","name":"Arrangement Clip",
         "enabled":true,"duration_ticks":4,
-        "source":{"asset_id":"arrangement-asset","start_frame":0,"frame_count":100},
+        "source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122335056","start_frame":0,"frame_count":100},
         "loop":{"enabled":false,"start_tick":0,"end_tick":4},
         "playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},
         "fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},
@@ -61,10 +61,10 @@ fn playback_project() -> LoadedPlaybackProject {
         "extensions":{}
     }"#;
     let scene_clip = br#"{
-        "format":"hyper-audio-clip","format_version":1,"id":"scene-clip",
-        "project_id":"project","track_id":"scene-track","name":"Scene Clip",
+        "format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335055",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335050","track_id":"018f47a2-6b2d-7c11-8a44-001122335053","name":"Scene Clip",
         "enabled":true,"duration_ticks":4,
-        "source":{"asset_id":"scene-asset","start_frame":0,"frame_count":100},
+        "source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122335057","start_frame":0,"frame_count":100},
         "loop":{"enabled":false,"start_tick":0,"end_tick":4},
         "playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},
         "fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},
@@ -75,20 +75,20 @@ fn playback_project() -> LoadedPlaybackProject {
         "extensions":{}
     }"#;
     let play_scene = br#"{
-        "format":"hyper-scene","format_version":1,"id":"play",
-        "project_id":"project","name":"Play","order":0,"enabled":true,
+        "format":"hyper-scene","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335058",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335050","name":"Play","order":0,"enabled":true,
         "launch_quantization":{"mode":"immediate"},
-        "slots":[{"track_id":"scene-track","action":"play","clip_id":"scene-clip"}],
+        "slots":[{"track_id":"018f47a2-6b2d-7c11-8a44-001122335053","action":"play","clip_id":"018f47a2-6b2d-7c11-8a44-001122335055"}],
         "extensions":{}
     }"#;
     let arrangement = br#"{
-        "format":"hyper-arrangement","format_version":1,"id":"arrangement",
-        "project_id":"project","name":"Main","enabled":true,
+        "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335059",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335050","name":"Main","enabled":true,
         "placements":[{
-            "id":"placement","track_id":"arrangement-track","clip_id":"arrangement-clip",
+            "id":"018f47a2-6b2d-7c11-8a44-001122335060","track_id":"018f47a2-6b2d-7c11-8a44-001122335052","clip_id":"018f47a2-6b2d-7c11-8a44-001122335054",
             "start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true
         }],
-        "scene_launches":[{"id":"launch","tick":1,"scene_id":"play"}],
+        "scene_launches":[{"id":"018f47a2-6b2d-7c11-8a44-001122335061","tick":1,"scene_id":"018f47a2-6b2d-7c11-8a44-001122335058"}],
         "extensions":{}
     }"#;
     let tracks: [&[u8]; 2] = [arrangement_track, scene_track];
@@ -96,7 +96,7 @@ fn playback_project() -> LoadedPlaybackProject {
     let scenes: [&[u8]; 1] = [play_scene];
     load(
         PlaybackJsonInput {
-            project_id: "project",
+            project_id: "018f47a2-6b2d-7c11-8a44-001122335050",
             sample_rate_hz: 48_000,
             timeline,
             tracks: &tracks,
@@ -117,18 +117,26 @@ fn cache_binds_compiled_identity_and_renders_prepared_audio() {
         .collect();
     let source = DecodedAudio::from_mono(48_000, source_samples.clone()).unwrap();
     let mut builder = builder();
-    builder.try_insert("asset", source).unwrap();
+    builder
+        .try_insert("018f47a2-6b2d-7c11-8a44-001122335034", source)
+        .unwrap();
     let cache = builder.seal();
 
     let prepared = cache.prepare_schedule(&schedule).unwrap();
-    assert_eq!(prepared.project_id(), "project");
+    assert_eq!(
+        prepared.project_id(),
+        "018f47a2-6b2d-7c11-8a44-001122335030"
+    );
     let entry = &prepared.entries()[0];
     let mut output = [0.0_f32; 100];
     entry
         .render_block(0, ClipOutput::Mono(&mut output))
         .unwrap();
 
-    assert_eq!(entry.schedule_entry().placement_id, "placement");
+    assert_eq!(
+        entry.schedule_entry().placement_id,
+        "018f47a2-6b2d-7c11-8a44-001122335036"
+    );
     assert_eq!(
         entry.schedule_entry().compiled.arrangement_start_frame(),
         100
@@ -153,7 +161,7 @@ fn decoded_rate_mismatch_is_rejected_during_binding() {
     let mut builder = builder();
     builder
         .try_insert(
-            "asset",
+            "018f47a2-6b2d-7c11-8a44-001122335034",
             DecodedAudio::from_mono(44_100, vec![0.0; 100]).unwrap(),
         )
         .unwrap();
@@ -177,7 +185,7 @@ fn decoded_frame_count_mismatch_is_rejected_during_binding() {
     let mut builder = builder();
     builder
         .try_insert(
-            "asset",
+            "018f47a2-6b2d-7c11-8a44-001122335034",
             DecodedAudio::from_mono(48_000, vec![0.0; 101]).unwrap(),
         )
         .unwrap();
@@ -200,12 +208,12 @@ fn complete_playback_preparation_rejects_each_missing_authority_atomically() {
     let project = playback_project();
     let facts = [
         MediaAssetFact {
-            id: "arrangement-asset",
+            id: "018f47a2-6b2d-7c11-8a44-001122335056",
             sample_rate_hz: 48_000,
             frame_count: 100,
         },
         MediaAssetFact {
-            id: "scene-asset",
+            id: "018f47a2-6b2d-7c11-8a44-001122335057",
             sample_rate_hz: 48_000,
             frame_count: 100,
         },
@@ -223,7 +231,7 @@ fn complete_playback_preparation_rejects_each_missing_authority_atomically() {
     let mut arrangement_only = builder();
     arrangement_only
         .try_insert(
-            "arrangement-asset",
+            "018f47a2-6b2d-7c11-8a44-001122335056",
             DecodedAudio::from_mono(48_000, vec![0.0; 100]).unwrap(),
         )
         .unwrap();
@@ -236,19 +244,22 @@ fn complete_playback_preparation_rejects_each_missing_authority_atomically() {
     let mut complete = builder();
     complete
         .try_insert(
-            "arrangement-asset",
+            "018f47a2-6b2d-7c11-8a44-001122335056",
             DecodedAudio::from_mono(48_000, vec![0.0; 100]).unwrap(),
         )
         .unwrap();
     complete
         .try_insert(
-            "scene-asset",
+            "018f47a2-6b2d-7c11-8a44-001122335057",
             DecodedAudio::from_mono(48_000, vec![0.0; 100]).unwrap(),
         )
         .unwrap();
     let complete = complete.seal();
     let prepared = complete.prepare_playback(&graph).unwrap();
-    assert_eq!(prepared.project_id(), "project");
+    assert_eq!(
+        prepared.project_id(),
+        "018f47a2-6b2d-7c11-8a44-001122335050"
+    );
     assert_eq!(prepared.schedule().entries().len(), 1);
     assert_eq!(prepared.scene_audio().entries().len(), 1);
     assert_eq!(prepared.authority().track_count(), 2);

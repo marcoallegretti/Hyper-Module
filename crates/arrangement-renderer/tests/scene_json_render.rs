@@ -14,22 +14,22 @@ const EPSILON: f32 = 1.0e-6;
 )]
 fn strict_scene_json_compiles_binds_and_renders_sample_exact_audio() {
     let timeline = br#"{
-        "format":"hyper-timeline","format_version":1,"id":"timeline",
-        "project_id":"project","ticks_per_quarter":1920,
+        "format":"hyper-timeline","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335021",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335020","ticks_per_quarter":1920,
         "tempo_events":[{"tick":0,"microseconds_per_quarter":1000000}],
         "meter_events":[{"tick":0,"numerator":4,"denominator":4}],
         "extensions":{}
     }"#;
     let track = br#"{
-        "format":"hyper-track","format_version":1,"id":"track",
-        "project_id":"project","name":"Audio","kind":"audio","order":0,
-        "active":true,"clip_ids":["clip"],"extensions":{}
+        "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335022",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335020","name":"Audio","kind":"audio","order":0,
+        "active":true,"clip_ids":["018f47a2-6b2d-7c11-8a44-001122335023"],"extensions":{}
     }"#;
     let clip = br#"{
-        "format":"hyper-audio-clip","format_version":1,"id":"clip",
-        "project_id":"project","track_id":"track","name":"Clip","enabled":true,
+        "format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335023",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335020","track_id":"018f47a2-6b2d-7c11-8a44-001122335022","name":"Clip","enabled":true,
         "duration_ticks":4,
-        "source":{"asset_id":"asset","start_frame":0,"frame_count":100},
+        "source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122335024","start_frame":0,"frame_count":100},
         "loop":{"enabled":false,"start_tick":0,"end_tick":4},
         "playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},
         "fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},
@@ -40,25 +40,25 @@ fn strict_scene_json_compiles_binds_and_renders_sample_exact_audio() {
         "extensions":{}
     }"#;
     let play_scene = br#"{
-        "format":"hyper-scene","format_version":1,"id":"play-scene",
-        "project_id":"project","name":"Play","order":0,"enabled":true,
+        "format":"hyper-scene","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335025",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335020","name":"Play","order":0,"enabled":true,
         "launch_quantization":{"mode":"immediate"},
-        "slots":[{"track_id":"track","action":"play","clip_id":"clip"}],
+        "slots":[{"track_id":"018f47a2-6b2d-7c11-8a44-001122335022","action":"play","clip_id":"018f47a2-6b2d-7c11-8a44-001122335023"}],
         "extensions":{}
     }"#;
     let stop_scene = br#"{
-        "format":"hyper-scene","format_version":1,"id":"stop-scene",
-        "project_id":"project","name":"Stop","order":1,"enabled":true,
+        "format":"hyper-scene","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335026",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335020","name":"Stop","order":1,"enabled":true,
         "launch_quantization":{"mode":"immediate"},
-        "slots":[{"track_id":"track","action":"stop"}],
+        "slots":[{"track_id":"018f47a2-6b2d-7c11-8a44-001122335022","action":"stop"}],
         "extensions":{}
     }"#;
     let arrangement = br#"{
-        "format":"hyper-arrangement","format_version":1,"id":"arrangement",
-        "project_id":"project","name":"Main","enabled":true,"placements":[],
+        "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335027",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335020","name":"Main","enabled":true,"placements":[],
         "scene_launches":[
-            {"id":"play-launch","tick":1,"scene_id":"play-scene"},
-            {"id":"stop-launch","tick":3,"scene_id":"stop-scene"}
+            {"id":"018f47a2-6b2d-7c11-8a44-001122335028","tick":1,"scene_id":"018f47a2-6b2d-7c11-8a44-001122335025"},
+            {"id":"018f47a2-6b2d-7c11-8a44-001122335029","tick":3,"scene_id":"018f47a2-6b2d-7c11-8a44-001122335026"}
         ],
         "extensions":{}
     }"#;
@@ -67,7 +67,7 @@ fn strict_scene_json_compiles_binds_and_renders_sample_exact_audio() {
     let scenes: [&[u8]; 2] = [play_scene, stop_scene];
     let loaded = load(
         PlaybackJsonInput {
-            project_id: "project",
+            project_id: "018f47a2-6b2d-7c11-8a44-001122335020",
             sample_rate_hz: 48_000,
             timeline,
             tracks: &tracks,
@@ -79,7 +79,7 @@ fn strict_scene_json_compiles_binds_and_renders_sample_exact_audio() {
     )
     .unwrap();
     let facts = [MediaAssetFact {
-        id: "asset",
+        id: "018f47a2-6b2d-7c11-8a44-001122335024",
         sample_rate_hz: 48_000,
         frame_count: 100,
     }];
@@ -98,7 +98,7 @@ fn strict_scene_json_compiles_binds_and_renders_sample_exact_audio() {
     .unwrap();
     cache_builder
         .try_insert(
-            "asset",
+            "018f47a2-6b2d-7c11-8a44-001122335024",
             DecodedAudio::from_mono(48_000, source.clone()).unwrap(),
         )
         .unwrap();

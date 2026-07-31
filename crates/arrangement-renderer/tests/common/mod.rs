@@ -36,49 +36,65 @@ pub struct Fixture {
 )]
 pub fn fixture() -> Fixture {
     let timeline = br#"{
-        "format":"hyper-timeline","format_version":1,"id":"timeline",
-        "project_id":"project","ticks_per_quarter":1920,
+        "format":"hyper-timeline","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335001",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335000","ticks_per_quarter":1920,
         "tempo_events":[{"tick":0,"microseconds_per_quarter":1000000}],
         "meter_events":[{"tick":0,"numerator":4,"denominator":4}],
         "extensions":{}
     }"#;
     let track_a = br#"{
-        "format":"hyper-track","format_version":1,"id":"track-a",
-        "project_id":"project","name":"A","kind":"audio","order":0,
-        "active":true,"clip_ids":["clip-a","clip-d"],"extensions":{}
+        "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335002",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335000","name":"A","kind":"audio","order":0,
+        "active":true,"clip_ids":["018f47a2-6b2d-7c11-8a44-001122335005","018f47a2-6b2d-7c11-8a44-001122335008"],"extensions":{}
     }"#;
     let track_b = br#"{
-        "format":"hyper-track","format_version":1,"id":"track-b",
-        "project_id":"project","name":"B","kind":"audio","order":1,
-        "active":true,"clip_ids":["clip-b"],"extensions":{}
+        "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335003",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335000","name":"B","kind":"audio","order":1,
+        "active":true,"clip_ids":["018f47a2-6b2d-7c11-8a44-001122335006"],"extensions":{}
     }"#;
     let track_c = br#"{
-        "format":"hyper-track","format_version":1,"id":"track-c",
-        "project_id":"project","name":"C","kind":"audio","order":2,
-        "active":true,"clip_ids":["clip-c"],"extensions":{}
+        "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335004",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335000","name":"C","kind":"audio","order":2,
+        "active":true,"clip_ids":["018f47a2-6b2d-7c11-8a44-001122335007"],"extensions":{}
     }"#;
-    let clip_a = clip_document("clip-a", "track-a", "asset-a");
-    let clip_b = clip_document("clip-b", "track-b", "asset-b");
-    let clip_c = clip_document("clip-c", "track-c", "asset-c");
-    let clip_d = clip_document("clip-d", "track-a", "asset-d");
+    let clip_a = clip_document(
+        "018f47a2-6b2d-7c11-8a44-001122335005",
+        "018f47a2-6b2d-7c11-8a44-001122335002",
+        "018f47a2-6b2d-7c11-8a44-001122335009",
+    );
+    let clip_b = clip_document(
+        "018f47a2-6b2d-7c11-8a44-001122335006",
+        "018f47a2-6b2d-7c11-8a44-001122335003",
+        "018f47a2-6b2d-7c11-8a44-001122335010",
+    );
+    let clip_c = clip_document(
+        "018f47a2-6b2d-7c11-8a44-001122335007",
+        "018f47a2-6b2d-7c11-8a44-001122335004",
+        "018f47a2-6b2d-7c11-8a44-001122335011",
+    );
+    let clip_d = clip_document(
+        "018f47a2-6b2d-7c11-8a44-001122335008",
+        "018f47a2-6b2d-7c11-8a44-001122335002",
+        "018f47a2-6b2d-7c11-8a44-001122335012",
+    );
     let arrangement = br#"{
-        "format":"hyper-arrangement","format_version":1,"id":"arrangement",
-        "project_id":"project","name":"Main","enabled":true,
+        "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122335013",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122335000","name":"Main","enabled":true,
         "placements":[
             {
-                "id":"placement-a","track_id":"track-a","clip_id":"clip-a",
+                "id":"018f47a2-6b2d-7c11-8a44-001122335014","track_id":"018f47a2-6b2d-7c11-8a44-001122335002","clip_id":"018f47a2-6b2d-7c11-8a44-001122335005",
                 "start_tick":4,"clip_start_tick":0,"duration_ticks":4,"enabled":true
             },
             {
-                "id":"placement-c","track_id":"track-c","clip_id":"clip-c",
+                "id":"018f47a2-6b2d-7c11-8a44-001122335016","track_id":"018f47a2-6b2d-7c11-8a44-001122335004","clip_id":"018f47a2-6b2d-7c11-8a44-001122335007",
                 "start_tick":4,"clip_start_tick":0,"duration_ticks":4,"enabled":false
             },
             {
-                "id":"placement-b","track_id":"track-b","clip_id":"clip-b",
+                "id":"018f47a2-6b2d-7c11-8a44-001122335015","track_id":"018f47a2-6b2d-7c11-8a44-001122335003","clip_id":"018f47a2-6b2d-7c11-8a44-001122335006",
                 "start_tick":5,"clip_start_tick":0,"duration_ticks":4,"enabled":true
             },
             {
-                "id":"placement-d","track_id":"track-a","clip_id":"clip-d",
+                "id":"018f47a2-6b2d-7c11-8a44-001122335017","track_id":"018f47a2-6b2d-7c11-8a44-001122335002","clip_id":"018f47a2-6b2d-7c11-8a44-001122335008",
                 "start_tick":9,"clip_start_tick":0,"duration_ticks":4,"enabled":true
             }
         ],
@@ -88,7 +104,7 @@ pub fn fixture() -> Fixture {
     let clips: [&[u8]; 4] = [&clip_a, &clip_b, &clip_c, &clip_d];
     let loaded = load(
         PlaybackJsonInput {
-            project_id: "project",
+            project_id: "018f47a2-6b2d-7c11-8a44-001122335000",
             sample_rate_hz: 48_000,
             timeline,
             tracks: &tracks,
@@ -101,22 +117,22 @@ pub fn fixture() -> Fixture {
     .unwrap();
     let facts = [
         MediaAssetFact {
-            id: "asset-a",
+            id: "018f47a2-6b2d-7c11-8a44-001122335009",
             sample_rate_hz: 48_000,
             frame_count: 100,
         },
         MediaAssetFact {
-            id: "asset-b",
+            id: "018f47a2-6b2d-7c11-8a44-001122335010",
             sample_rate_hz: 48_000,
             frame_count: 100,
         },
         MediaAssetFact {
-            id: "asset-c",
+            id: "018f47a2-6b2d-7c11-8a44-001122335011",
             sample_rate_hz: 48_000,
             frame_count: 100,
         },
         MediaAssetFact {
-            id: "asset-d",
+            id: "018f47a2-6b2d-7c11-8a44-001122335012",
             sample_rate_hz: 48_000,
             frame_count: 100,
         },
@@ -137,25 +153,25 @@ pub fn fixture() -> Fixture {
     .unwrap();
     builder
         .try_insert(
-            "asset-a",
+            "018f47a2-6b2d-7c11-8a44-001122335009",
             DecodedAudio::from_mono(48_000, mono_samples.clone()).unwrap(),
         )
         .unwrap();
     builder
         .try_insert(
-            "asset-b",
+            "018f47a2-6b2d-7c11-8a44-001122335010",
             DecodedAudio::from_stereo(48_000, stereo_left.clone(), stereo_right.clone()).unwrap(),
         )
         .unwrap();
     builder
         .try_insert(
-            "asset-c",
+            "018f47a2-6b2d-7c11-8a44-001122335011",
             DecodedAudio::from_mono(48_000, vec![1.0; 100]).unwrap(),
         )
         .unwrap();
     builder
         .try_insert(
-            "asset-d",
+            "018f47a2-6b2d-7c11-8a44-001122335012",
             DecodedAudio::from_mono(48_000, sequential_samples.clone()).unwrap(),
         )
         .unwrap();
@@ -174,7 +190,7 @@ fn clip_document(clip_id: &str, track_id: &str, asset_id: &str) -> Vec<u8> {
     format!(
         r#"{{
             "format":"hyper-audio-clip","format_version":1,"id":"{clip_id}",
-            "project_id":"project","track_id":"{track_id}","name":"Clip","enabled":true,
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122335000","track_id":"{track_id}","name":"Clip","enabled":true,
             "duration_ticks":4,
             "source":{{"asset_id":"{asset_id}","start_frame":0,"frame_count":100}},
             "loop":{{"enabled":false,"start_tick":0,"end_tick":4}},

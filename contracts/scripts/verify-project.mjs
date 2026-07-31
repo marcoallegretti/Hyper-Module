@@ -639,6 +639,12 @@ async function verifyProjectManifest(
       );
     }
   }
+  const arrangementEventIds = new Set(
+    arrangements.flatMap((arrangement) => [
+      ...arrangement.placements.map((placement) => placement.id),
+      ...arrangement.scene_launches.map((launch) => launch.id),
+    ]),
+  );
   assert(mixers.length <= 1, "project must contain at most one mixer");
   for (const mixer of mixers) {
     const mixableKinds = new Set([
@@ -666,7 +672,8 @@ async function verifyProjectManifest(
     for (const sendId of nestedSendIds) {
       assert(
         !resources.has(sendId) &&
-          !project.assets.some((asset) => asset.id === sendId),
+          !project.assets.some((asset) => asset.id === sendId) &&
+          !arrangementEventIds.has(sendId),
         "mixer send identifier collides with a project entity",
       );
     }
@@ -715,12 +722,6 @@ async function verifyProjectManifest(
     mixer?.channels.flatMap((channel) =>
       channel.sends.map((send) => send.id),
     ) ?? [],
-  );
-  const arrangementEventIds = new Set(
-    arrangements.flatMap((arrangement) => [
-      ...arrangement.placements.map((placement) => placement.id),
-      ...arrangement.scene_launches.map((launch) => launch.id),
-    ]),
   );
   const mappingBindingIds = new Set(
     mappingSets.flatMap((mappingSet) =>

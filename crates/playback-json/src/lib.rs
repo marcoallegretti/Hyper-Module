@@ -28,14 +28,51 @@ use hyper_playback_compiler::{
     ClipCompileSpec, CompileError, CompiledPlacement, CompiledSceneAudioClip, TempoEvent,
     TickRange, Timeline, TimelineError, WarpMarker, compile_scene_audio_clip,
 };
-use serde::Deserialize;
-use serde::de::IgnoredAny;
+use hyper_project_model::{is_valid_entity_id, is_valid_extension_key};
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use hyper_strict_json::{self as strict, StrictJsonError, StrictJsonErrorKind};
 
 const VERSION_1_SAMPLE_RATE_HZ: u32 = 48_000;
 const VERSION_1_TICKS_PER_QUARTER: u64 = 1_920;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_VERSION_1_TIMELINE_EVENTS: usize = 65_536;
+const MAX_VERSION_1_NAME_CHARACTERS: usize = 120;
+const MAX_VERSION_1_SENDS_PER_CHANNEL: usize = 2;
+
+#[derive(Debug)]
+struct ExtensionsDocument(BTreeSet<String>);
+
+impl<'de> Deserialize<'de> for ExtensionsDocument {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ExtensionsVisitor)
+    }
+}
+
+struct ExtensionsVisitor;
+
+impl<'de> Visitor<'de> for ExtensionsVisitor {
+    type Value = ExtensionsDocument;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a version 1 extensions object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = BTreeSet::new();
+        while let Some((key, _)) = map.next_entry::<String, IgnoredAny>()? {
+            keys.insert(key);
+        }
+        Ok(ExtensionsDocument(keys))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DocumentKind {
@@ -906,14 +943,21 @@ impl LoadedPlaybackProject {
     }
 
     /// Loads and resolves one strict version 1 mixer resource against this
-    /// project's structural tracks.
+    /// project's structural tracks and complete verified asset inventory.
+    /// `assets` must contain every asset declared by the enclosing package;
+    /// identity validation is intentionally performed before graph publication.
     ///
     /// # Errors
     ///
     /// Returns [`LoadError`] for strict JSON, collection, identity, ordering,
     /// routing, send, return, solo, or parameter-domain failure.
-    pub fn load_mixer(&self, bytes: &[u8], limits: LoaderLimits) -> Result<LoadedMixer, LoadError> {
-        load_mixer_document(self, bytes, limits)
+    pub fn load_mixer(
+        &self,
+        bytes: &[u8],
+        assets: &[MediaAssetFact<'_>],
+        limits: LoaderLimits,
+    ) -> Result<LoadedMixer, LoadError> {
+        load_mixer_document(self, bytes, assets, limits)
     }
 
     /// Resolves loaded documents and verified media facts into an owned native
@@ -1153,6 +1197,7 @@ pub fn load(
             index: 0,
         },
     )?;
+    validate_timeline_contract(&timeline_document)?;
     if timeline_document.ticks_per_quarter != VERSION_1_TICKS_PER_QUARTER {
         return domain_error(
             DocumentLocation {
@@ -1235,11 +1280,11 @@ fn validate_loader_inputs(
     input: PlaybackJsonInput<'_>,
     limits: LoaderLimits,
 ) -> Result<(), LoadError> {
-    if input.project_id.is_empty() {
+    if !is_valid_entity_id(input.project_id) {
         return Err(LoadError {
             location: None,
             kind: LoadErrorKind::InvalidProjectIdentity,
-            message: "project identifier must not be empty".to_owned(),
+            message: "project identifier is outside the version 1 schema domain".to_owned(),
         });
     }
     if input.sample_rate_hz != VERSION_1_SAMPLE_RATE_HZ {
@@ -1289,6 +1334,22 @@ fn load_track(
         project_id,
         location,
     )?;
+    validate_contract_document(
+        &document.id,
+        Some(&document.name),
+        &document.extensions,
+        location,
+    )?;
+    if let Some(parent_id) = &document.parent_track_id {
+        validate_entity_reference(parent_id, location)?;
+    }
+    let mut clip_ids = BTreeSet::new();
+    for clip_id in &document.clip_ids {
+        validate_entity_reference(clip_id, location)?;
+        if !clip_ids.insert(clip_id.as_str()) {
+            return domain_error(location, "track clip identifiers must be unique");
+        }
+    }
     if document.order > 7 {
         return domain_error(location, "track order must be from zero through seven");
     }
@@ -1343,6 +1404,14 @@ fn load_clip(
         project_id,
         location,
     )?;
+    validate_contract_document(
+        &document.id,
+        Some(&document.name),
+        &document.extensions,
+        location,
+    )?;
+    validate_entity_reference(&document.track_id, location)?;
+    validate_entity_reference(&document.source.asset_id, location)?;
     enforce_loader_limit(
         CollectionLimit::WarpMarkers,
         document.warp_markers.len(),
@@ -1408,6 +1477,12 @@ fn load_scene(
         project_id,
         location,
     )?;
+    validate_contract_document(
+        &document.id,
+        Some(&document.name),
+        &document.extensions,
+        location,
+    )?;
     enforce_loader_limit(
         CollectionLimit::SceneSlots,
         document.slots.len(),
@@ -1433,9 +1508,14 @@ fn load_scene(
     for slot in document.slots {
         let (track_id, action) = match slot {
             SceneSlotDocument::Play { track_id, clip_id } => {
+                validate_entity_reference(&track_id, location)?;
+                validate_entity_reference(&clip_id, location)?;
                 (track_id, LoadedSceneSlotAction::Play { clip_id })
             }
-            SceneSlotDocument::Stop { track_id } => (track_id, LoadedSceneSlotAction::Stop),
+            SceneSlotDocument::Stop { track_id } => {
+                validate_entity_reference(&track_id, location)?;
+                (track_id, LoadedSceneSlotAction::Stop)
+            }
         };
         if slots
             .iter()
@@ -1495,6 +1575,21 @@ fn load_arrangement(
         project_id,
         location,
     )?;
+    validate_contract_document(
+        &document.id,
+        Some(&document.name),
+        &document.extensions,
+        location,
+    )?;
+    for placement in &document.placements {
+        validate_entity_reference(&placement.id, location)?;
+        validate_entity_reference(&placement.track_id, location)?;
+        validate_entity_reference(&placement.clip_id, location)?;
+    }
+    for launch in &document.scene_launches {
+        validate_entity_reference(&launch.id, location)?;
+        validate_entity_reference(&launch.scene_id, location)?;
+    }
     enforce_loader_limit(
         CollectionLimit::Placements,
         document.placements.len(),
@@ -1545,6 +1640,7 @@ fn load_arrangement(
 fn load_mixer_document(
     project: &LoadedPlaybackProject,
     bytes: &[u8],
+    assets: &[MediaAssetFact<'_>],
     limits: LoaderLimits,
 ) -> Result<LoadedMixer, LoadError> {
     let location = DocumentLocation {
@@ -1560,6 +1656,7 @@ fn load_mixer_document(
         &project.project_id,
         location,
     )?;
+    validate_contract_document(&document.id, None, &document.extensions, location)?;
     enforce_loader_limit(
         CollectionLimit::MixerChannels,
         document.channels.len(),
@@ -1585,7 +1682,7 @@ fn load_mixer_document(
         limits.max_mixer_sends,
         Some(location),
     )?;
-    validate_mixer_document(project, &document, location)?;
+    validate_mixer_document(project, assets, &document, location)?;
 
     let mut channels = Vec::new();
     channels
@@ -1674,10 +1771,14 @@ fn load_mixer_document(
 )]
 fn validate_mixer_document(
     project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
     document: &MixerDocument,
     location: DocumentLocation,
 ) -> Result<(), LoadError> {
-    if document.id.is_empty() || project_contains_identity(project, &document.id) {
+    validate_asset_contract_inventory(project, assets, location)?;
+    if project_contains_identity(project, &document.id)
+        || assets.iter().any(|asset| asset.id == document.id)
+    {
         return domain_error(
             location,
             "mixer identity is empty or collides with the project",
@@ -1730,6 +1831,16 @@ fn validate_mixer_document(
 
     let mut send_ids = BTreeSet::new();
     for (channel_index, channel) in document.channels.iter().enumerate() {
+        validate_entity_reference(&channel.track_id, location)?;
+        if channel.sends.len() > MAX_VERSION_1_SENDS_PER_CHANNEL {
+            return domain_error(
+                location,
+                "mixer channel send count exceeds the version 1 schema domain",
+            );
+        }
+        if let MixerDestinationDocument::Track(destination) = &channel.destination {
+            validate_entity_reference(&destination.track_id, location)?;
+        }
         validate_gain(channel.gain_millionths, location)?;
         validate_pan(channel.pan_millionths, location)?;
         let track = mixable_tracks[channel_index];
@@ -1741,6 +1852,7 @@ fn validate_mixer_document(
         }
         let mut previous_bus = None;
         for send in &channel.sends {
+            validate_entity_reference(&send.id, location)?;
             validate_gain(send.gain_millionths, location)?;
             validate_pan(send.pan_millionths, location)?;
             let bus = mixer_bus(send.bus);
@@ -1755,10 +1867,15 @@ fn validate_mixer_document(
                 || !send_ids.insert(send.id.as_str())
                 || send.id == document.id
                 || project_contains_identity(project, &send.id)
+                || assets.iter().any(|asset| asset.id == send.id)
             {
                 return domain_error(location, "mixer send identity is empty or collides");
             }
         }
+    }
+
+    for return_bus in &document.return_buses {
+        validate_entity_reference(&return_bus.track_id, location)?;
     }
 
     for channel in &document.channels {
@@ -1778,6 +1895,26 @@ fn validate_mixer_document(
         }
     }
     validate_mixer_cycles(document, location)?;
+    Ok(())
+}
+
+fn validate_asset_contract_inventory(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    location: DocumentLocation,
+) -> Result<(), LoadError> {
+    let mut identities = BTreeSet::new();
+    for asset in assets {
+        if !is_valid_entity_id(asset.id)
+            || project_contains_identity(project, asset.id)
+            || !identities.insert(asset.id)
+        {
+            return domain_error(
+                location,
+                "asset identity is invalid, duplicated, or collides with the project",
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1934,6 +2071,51 @@ fn validate_header(
             kind: LoadErrorKind::ForeignProject,
             message: "resource belongs to another project".to_owned(),
         });
+    }
+    Ok(())
+}
+
+fn validate_contract_document(
+    id: &str,
+    name: Option<&str>,
+    extensions: &ExtensionsDocument,
+    location: DocumentLocation,
+) -> Result<(), LoadError> {
+    if !is_valid_entity_id(id)
+        || name.is_some_and(|value| {
+            let length = value.chars().count();
+            !(1..=MAX_VERSION_1_NAME_CHARACTERS).contains(&length)
+        })
+        || !extensions.0.iter().all(|key| is_valid_extension_key(key))
+    {
+        return domain_error(location, "document is outside the version 1 schema domain");
+    }
+    Ok(())
+}
+
+fn validate_timeline_contract(document: &TimelineDocument) -> Result<(), LoadError> {
+    let location = DocumentLocation {
+        kind: DocumentKind::Timeline,
+        index: 0,
+    };
+    validate_contract_document(&document.id, None, &document.extensions, location)?;
+    if !(1..=MAX_VERSION_1_TIMELINE_EVENTS).contains(&document.tempo_events.len())
+        || !(1..=MAX_VERSION_1_TIMELINE_EVENTS).contains(&document.meter_events.len())
+    {
+        return domain_error(
+            location,
+            "timeline event count is outside the version 1 schema domain",
+        );
+    }
+    Ok(())
+}
+
+fn validate_entity_reference(id: &str, location: DocumentLocation) -> Result<(), LoadError> {
+    if !is_valid_entity_id(id) {
+        return domain_error(
+            location,
+            "entity reference is outside the version 1 schema domain",
+        );
     }
     Ok(())
 }
@@ -2135,11 +2317,11 @@ fn validate_loaded_identities(project: &LoadedPlaybackProject) -> Result<(), Loa
 }
 
 fn insert_identity<'a>(identities: &mut BTreeSet<&'a str>, id: &'a str) -> Result<(), LoadError> {
-    if id.is_empty() {
+    if !is_valid_entity_id(id) {
         return Err(LoadError {
             location: None,
             kind: LoadErrorKind::InvalidProjectIdentity,
-            message: "resource identifier must not be empty".to_owned(),
+            message: "resource identifier is outside the version 1 schema domain".to_owned(),
         });
     }
     if !identities.insert(id) {
@@ -2177,7 +2359,7 @@ fn validate_asset_identities(
         );
     }
     for (asset_index, asset) in assets.iter().enumerate() {
-        if !identities.insert(asset.id) {
+        if !is_valid_entity_id(asset.id) || !identities.insert(asset.id) {
             return Err(AdapterCompileError::AssetIdentityCollision { asset_index });
         }
     }
@@ -2586,8 +2768,7 @@ struct TimelineDocument {
     ticks_per_quarter: u64,
     tempo_events: Vec<TempoEventDocument>,
     meter_events: Vec<MeterEventDocument>,
-    #[serde(rename = "extensions")]
-    _extensions: IgnoredAny,
+    extensions: ExtensionsDocument,
 }
 
 #[derive(Deserialize)]
@@ -2612,15 +2793,13 @@ struct TrackDocument {
     format_version: u32,
     id: String,
     project_id: String,
-    #[serde(rename = "name")]
-    _name: String,
+    name: String,
     kind: TrackKindDocument,
     order: u8,
     active: bool,
     parent_track_id: Option<String>,
     clip_ids: Vec<String>,
-    #[serde(rename = "extensions")]
-    _extensions: IgnoredAny,
+    extensions: ExtensionsDocument,
 }
 
 #[derive(Deserialize)]
@@ -2647,8 +2826,7 @@ struct ClipDocument {
     id: String,
     project_id: String,
     track_id: String,
-    #[serde(rename = "name")]
-    _name: String,
+    name: String,
     enabled: bool,
     duration_ticks: u64,
     source: ClipSourceDocument,
@@ -2657,8 +2835,7 @@ struct ClipDocument {
     playback: ClipPlaybackDocument,
     fades: ClipFadesDocument,
     warp_markers: Vec<WarpMarkerDocument>,
-    #[serde(rename = "extensions")]
-    _extensions: IgnoredAny,
+    extensions: ExtensionsDocument,
 }
 
 #[derive(Deserialize)]
@@ -2714,14 +2891,12 @@ struct SceneDocument {
     format_version: u32,
     id: String,
     project_id: String,
-    #[serde(rename = "name")]
-    _name: String,
+    name: String,
     order: u8,
     enabled: bool,
     launch_quantization: SceneQuantizationDocument,
     slots: Vec<SceneSlotDocument>,
-    #[serde(rename = "extensions")]
-    _extensions: IgnoredAny,
+    extensions: ExtensionsDocument,
 }
 
 #[derive(Deserialize)]
@@ -2745,13 +2920,11 @@ struct ArrangementDocument {
     format_version: u32,
     id: String,
     project_id: String,
-    #[serde(rename = "name")]
-    _name: String,
+    name: String,
     enabled: bool,
     placements: Vec<PlacementDocument>,
     scene_launches: Vec<SceneLaunchDocument>,
-    #[serde(rename = "extensions")]
-    _extensions: IgnoredAny,
+    extensions: ExtensionsDocument,
 }
 
 #[derive(Deserialize)]
@@ -2785,8 +2958,7 @@ struct MixerDocument {
     return_buses: Vec<ReturnBusDocument>,
     main: MixerOutputDocument,
     cue: CueOutputDocument,
-    #[serde(rename = "extensions")]
-    _extensions: IgnoredAny,
+    extensions: ExtensionsDocument,
 }
 
 #[derive(Deserialize)]
@@ -2896,24 +3068,24 @@ enum CueSourceDocument {
 mod tests {
     use super::*;
 
-    const PROJECT_ID: &str = "project";
+    const PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334455";
     const TIMELINE: &[u8] = br#"{
-        "format":"hyper-timeline","format_version":1,"id":"timeline",
-        "project_id":"project","ticks_per_quarter":1920,
+        "format":"hyper-timeline","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334458",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","ticks_per_quarter":1920,
         "tempo_events":[{"tick":0,"microseconds_per_quarter":1000000}],
         "meter_events":[{"tick":0,"numerator":4,"denominator":4}],
         "extensions":{}
     }"#;
     const TRACK: &[u8] = br#"{
-        "format":"hyper-track","format_version":1,"id":"track",
-        "project_id":"project","name":"Audio","kind":"audio","order":0,
-        "active":true,"clip_ids":["clip"],"extensions":{}
+        "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334456",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Audio","kind":"audio","order":0,
+        "active":true,"clip_ids":["018f47a2-6b2d-7c11-8a44-001122334460"],"extensions":{}
     }"#;
     const CLIP: &[u8] = br#"{
-        "format":"hyper-audio-clip","format_version":1,"id":"clip",
-        "project_id":"project","track_id":"track","name":"Clip","enabled":true,
+        "format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334460",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","track_id":"018f47a2-6b2d-7c11-8a44-001122334456","name":"Clip","enabled":true,
         "duration_ticks":4,
-        "source":{"asset_id":"asset","start_frame":0,"frame_count":100},
+        "source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122334457","start_frame":0,"frame_count":100},
         "loop":{"enabled":false,"start_tick":0,"end_tick":4},
         "playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},
         "fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},
@@ -2924,26 +3096,26 @@ mod tests {
         "extensions":{}
     }"#;
     const ARRANGEMENT: &[u8] = br#"{
-        "format":"hyper-arrangement","format_version":1,"id":"arrangement",
-        "project_id":"project","name":"Main","enabled":true,
+        "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334463",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Main","enabled":true,
         "placements":[{
-            "id":"placement","track_id":"track","clip_id":"clip",
+            "id":"018f47a2-6b2d-7c11-8a44-001122334464","track_id":"018f47a2-6b2d-7c11-8a44-001122334456","clip_id":"018f47a2-6b2d-7c11-8a44-001122334460",
             "start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true
         }],
         "scene_launches":[],"extensions":{}
     }"#;
     const SCENE: &[u8] = br#"{
-        "format":"hyper-scene","format_version":1,"id":"scene",
-        "project_id":"project","name":"Verse","order":0,"enabled":true,
+        "format":"hyper-scene","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334461",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Verse","order":0,"enabled":true,
         "launch_quantization":{"mode":"immediate"},
-        "slots":[{"track_id":"track","action":"play","clip_id":"clip"}],
+        "slots":[{"track_id":"018f47a2-6b2d-7c11-8a44-001122334456","action":"play","clip_id":"018f47a2-6b2d-7c11-8a44-001122334460"}],
         "extensions":{}
     }"#;
     const MIXER: &[u8] = br#"{
-        "format":"hyper-mixer","format_version":1,"id":"mixer",
-        "project_id":"project",
+        "format":"hyper-mixer","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334468",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122334455",
         "channels":[{
-            "track_id":"track","gain_millionths":500000,
+            "track_id":"018f47a2-6b2d-7c11-8a44-001122334456","gain_millionths":500000,
             "pan_millionths":-1000000,"mute":false,"solo":true,
             "destination":{"kind":"main"},"sends":[]
         }],
@@ -2988,6 +3160,14 @@ mod tests {
         }
     }
 
+    fn asset_facts() -> [MediaAssetFact<'static>; 1] {
+        [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
+            sample_rate_hz: 48_000,
+            frame_count: 100,
+        }]
+    }
+
     #[test]
     fn loads_and_compiles_the_explicit_playback_documents() {
         let tracks: [&[u8]; 1] = [TRACK];
@@ -3004,7 +3184,7 @@ mod tests {
         let schedule = loaded
             .compile(
                 &[MediaAssetFact {
-                    id: "asset",
+                    id: "018f47a2-6b2d-7c11-8a44-001122334457",
                     sample_rate_hz: 48_000,
                     frame_count: 100,
                 }],
@@ -3013,7 +3193,10 @@ mod tests {
             .unwrap();
         assert_eq!(schedule.project_id(), PROJECT_ID);
         assert_eq!(schedule.entries().len(), 1);
-        assert_eq!(schedule.entries()[0].asset_id, "asset");
+        assert_eq!(
+            schedule.entries()[0].asset_id,
+            "018f47a2-6b2d-7c11-8a44-001122334457"
+        );
     }
 
     #[test]
@@ -3025,8 +3208,10 @@ mod tests {
             LoaderLimits::VERSION_1,
         )
         .unwrap();
-        let mixer = loaded.load_mixer(MIXER, LoaderLimits::VERSION_1).unwrap();
-        assert_eq!(mixer.id(), "mixer");
+        let mixer = loaded
+            .load_mixer(MIXER, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+        assert_eq!(mixer.id(), "018f47a2-6b2d-7c11-8a44-001122334468");
         assert_eq!(mixer.channel_count(), 1);
         assert_eq!(mixer.cue_source(), CueSource::Solo);
         assert_eq!(
@@ -3038,7 +3223,10 @@ mod tests {
         let compiled = mixer.compile_flat_main().unwrap();
         assert_eq!(compiled.project_id(), PROJECT_ID);
         assert_eq!(compiled.master_gain(), LinearGain::SILENCE);
-        assert_eq!(compiled.slots()[0].track_id(), "track");
+        assert_eq!(
+            compiled.slots()[0].track_id(),
+            "018f47a2-6b2d-7c11-8a44-001122334456"
+        );
         assert_eq!(
             compiled.slots()[0].parameters(),
             ChannelParameters::new(
@@ -3062,7 +3250,10 @@ mod tests {
         for invalid in [
             String::from_utf8(MIXER.to_vec())
                 .unwrap()
-                .replace("\"id\":\"mixer\"", "\"id\":\"track\""),
+                .replace(
+                    "\"id\":\"018f47a2-6b2d-7c11-8a44-001122334468\"",
+                    "\"id\":\"018f47a2-6b2d-7c11-8a44-001122334456\"",
+                ),
             String::from_utf8(MIXER.to_vec())
                 .unwrap()
                 .replace("\"gain_millionths\":500000", "\"gain_millionths\":2000001"),
@@ -3071,7 +3262,7 @@ mod tests {
                 .replace("\"channels\":[{", "\"unexpected\":true,\"channels\":[{"),
             String::from_utf8(MIXER.to_vec()).unwrap().replace(
                 "\"destination\":{\"kind\":\"main\"}",
-                "\"destination\":{\"kind\":\"track\",\"track_id\":\"missing\"}",
+                "\"destination\":{\"kind\":\"track\",\"track_id\":\"018f47a2-6b2d-7c11-8a44-001122334489\"}",
             ),
             String::from_utf8(MIXER.to_vec())
                 .unwrap()
@@ -3079,7 +3270,7 @@ mod tests {
         ] {
             assert!(
                 loaded
-                    .load_mixer(invalid.as_bytes(), LoaderLimits::VERSION_1)
+                    .load_mixer(invalid.as_bytes(), &asset_facts(), LoaderLimits::VERSION_1)
                     .is_err()
             );
         }
@@ -3089,16 +3280,16 @@ mod tests {
     fn flat_main_compiler_rejects_unimplemented_graph_sources() {
         let parameters = ChannelParameters::new(LinearGain::UNITY, Pan::CENTER, true);
         let channel = LoadedMixerChannel {
-            track_id: "track".to_owned(),
+            track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
             track_kind: TrackKind::Audio,
             parameters,
             solo: false,
-            destination: MixerDestination::Track("group".to_owned()),
+            destination: MixerDestination::Track("018f47a2-6b2d-7c11-8a44-001122334471".to_owned()),
             sends: Vec::new(),
         };
         let mixer = LoadedMixer {
-            project_id: "project".to_owned(),
-            id: "mixer".to_owned(),
+            project_id: "018f47a2-6b2d-7c11-8a44-001122334455".to_owned(),
+            id: "018f47a2-6b2d-7c11-8a44-001122334468".to_owned(),
             channels: vec![channel.clone()],
             return_buses: Vec::new(),
             main_gain: LinearGain::UNITY,
@@ -3148,54 +3339,70 @@ mod tests {
     )]
     fn mixer_loader_resolves_valid_group_send_and_return_graphs_before_capability_rejection() {
         let group = br#"{
-            "format":"hyper-track","format_version":1,"id":"group",
-            "project_id":"project","name":"Group","kind":"group","order":1,
+            "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334471",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Group","kind":"group","order":1,
             "active":true,"clip_ids":[],"extensions":{}
         }"#;
         let return_track = br#"{
-            "format":"hyper-track","format_version":1,"id":"return",
-            "project_id":"project","name":"Return","kind":"return","order":2,
+            "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334472",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Return","kind":"return","order":2,
             "active":true,"clip_ids":[],"extensions":{}
         }"#;
         let tracks: [&[u8]; 3] = [TRACK, group, return_track];
         let clips: [&[u8]; 1] = [CLIP];
         let loaded = load(
-            input(TIMELINE, &tracks, &clips, None),
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
             LoaderLimits::VERSION_1,
         )
         .unwrap();
         let mixer = br#"{
-            "format":"hyper-mixer","format_version":1,"id":"mixer",
-            "project_id":"project",
+            "format":"hyper-mixer","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334468",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122334455",
             "channels":[
                 {
-                    "track_id":"track","gain_millionths":1000000,
+                    "track_id":"018f47a2-6b2d-7c11-8a44-001122334456","gain_millionths":1000000,
                     "pan_millionths":0,"mute":false,"solo":false,
-                    "destination":{"kind":"track","track_id":"group"},
+                    "destination":{"kind":"track","track_id":"018f47a2-6b2d-7c11-8a44-001122334471"},
                     "sends":[{
-                        "id":"send-a","bus":"a","tap":"post-fader",
+                        "id":"018f47a2-6b2d-7c11-8a44-001122334469","bus":"a","tap":"post-fader",
                         "gain_millionths":1000000,"pan_millionths":0,
                         "enabled":true
                     }]
                 },
                 {
-                    "track_id":"group","gain_millionths":1000000,
+                    "track_id":"018f47a2-6b2d-7c11-8a44-001122334471","gain_millionths":1000000,
                     "pan_millionths":0,"mute":false,"solo":false,
                     "destination":{"kind":"main"},"sends":[]
                 },
                 {
-                    "track_id":"return","gain_millionths":1000000,
+                    "track_id":"018f47a2-6b2d-7c11-8a44-001122334472","gain_millionths":1000000,
                     "pan_millionths":0,"mute":false,"solo":false,
                     "destination":{"kind":"main"},"sends":[]
                 }
             ],
-            "return_buses":[{"bus":"a","track_id":"return"}],
+            "return_buses":[{"bus":"a","track_id":"018f47a2-6b2d-7c11-8a44-001122334472"}],
             "main":{"gain_millionths":1000000,"mute":false},
             "cue":{"source":"main","gain_millionths":1000000,"mute":false},
             "extensions":{}
         }"#;
 
-        let mixer = loaded.load_mixer(mixer, LoaderLimits::VERSION_1).unwrap();
+        for colliding_id in [
+            "018f47a2-6b2d-7c11-8a44-001122334457",
+            "018f47a2-6b2d-7c11-8a44-001122334464",
+        ] {
+            let invalid = String::from_utf8(mixer.to_vec())
+                .unwrap()
+                .replace("018f47a2-6b2d-7c11-8a44-001122334469", colliding_id);
+            let error = loaded
+                .load_mixer(invalid.as_bytes(), &asset_facts(), LoaderLimits::VERSION_1)
+                .unwrap_err();
+            assert_eq!(error.kind, LoadErrorKind::InvalidVersionOneDomain);
+            assert!(error.message.contains("collides"));
+        }
+
+        let mixer = loaded
+            .load_mixer(mixer, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
         assert_eq!(
             mixer.compile_flat_main(),
             Err(MixerCompileError::UnsupportedPrimaryRouting)
@@ -3208,7 +3415,10 @@ mod tests {
             CompiledMixerDestination::Slot(1)
         );
         assert_eq!(graph.slots()[0].sends().len(), 1);
-        assert_eq!(graph.slots()[0].sends()[0].id(), "send-a");
+        assert_eq!(
+            graph.slots()[0].sends()[0].id(),
+            "018f47a2-6b2d-7c11-8a44-001122334469"
+        );
         assert_eq!(graph.slots()[0].sends()[0].target_slot(), 2);
         assert_eq!(
             graph.slots()[0].sends()[0].tap(),
@@ -3216,38 +3426,38 @@ mod tests {
         );
 
         let feedback = br#"{
-            "format":"hyper-mixer","format_version":1,"id":"feedback",
-            "project_id":"project",
+            "format":"hyper-mixer","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334487",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122334455",
             "channels":[
                 {
-                    "track_id":"track","gain_millionths":1000000,
+                    "track_id":"018f47a2-6b2d-7c11-8a44-001122334456","gain_millionths":1000000,
                     "pan_millionths":0,"mute":false,"solo":false,
                     "destination":{"kind":"main"},"sends":[]
                 },
                 {
-                    "track_id":"group","gain_millionths":1000000,
+                    "track_id":"018f47a2-6b2d-7c11-8a44-001122334471","gain_millionths":1000000,
                     "pan_millionths":0,"mute":false,"solo":false,
                     "destination":{"kind":"main"},
                     "sends":[{
-                        "id":"feedback-send","bus":"a","tap":"pre-fader",
+                        "id":"018f47a2-6b2d-7c11-8a44-001122334488","bus":"a","tap":"pre-fader",
                         "gain_millionths":1000000,"pan_millionths":0,
                         "enabled":false
                     }]
                 },
                 {
-                    "track_id":"return","gain_millionths":1000000,
+                    "track_id":"018f47a2-6b2d-7c11-8a44-001122334472","gain_millionths":1000000,
                     "pan_millionths":0,"mute":false,"solo":false,
-                    "destination":{"kind":"track","track_id":"group"},"sends":[]
+                    "destination":{"kind":"track","track_id":"018f47a2-6b2d-7c11-8a44-001122334471"},"sends":[]
                 }
             ],
-            "return_buses":[{"bus":"a","track_id":"return"}],
+            "return_buses":[{"bus":"a","track_id":"018f47a2-6b2d-7c11-8a44-001122334472"}],
             "main":{"gain_millionths":1000000,"mute":false},
             "cue":{"source":"main","gain_millionths":1000000,"mute":false},
             "extensions":{}
         }"#;
         assert!(
             loaded
-                .load_mixer(feedback, LoaderLimits::VERSION_1)
+                .load_mixer(feedback, &asset_facts(), LoaderLimits::VERSION_1)
                 .is_err()
         );
     }
@@ -3261,22 +3471,24 @@ mod tests {
             LoaderLimits::VERSION_1,
         )
         .unwrap();
-        let mixer = loaded.load_mixer(MIXER, LoaderLimits::VERSION_1).unwrap();
+        let mixer = loaded
+            .load_mixer(MIXER, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
         let take = br#"{
             "format":"hyper-automation-take","format_version":1,
-            "id":"take","project_id":"project","name":"Pass","enabled":true,
+            "id":"018f47a2-6b2d-7c11-8a44-001122334479","project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Pass","enabled":true,
             "captured_at_utc":"2026-07-28T12:05:00.000Z",
             "start_tick":0,"end_tick":8,
             "lanes":[
                 {
-                    "id":"lane-a",
-                    "target":{"kind":"mixer-channel","track_id":"track","parameter":"gain"},
+                    "id":"018f47a2-6b2d-7c11-8a44-001122334481",
+                    "target":{"kind":"mixer-channel","track_id":"018f47a2-6b2d-7c11-8a44-001122334456","parameter":"gain"},
                     "interpolation":"linear",
                     "points":[{"tick":0,"value":1000000},{"tick":3,"value":0}]
                 },
                 {
-                    "id":"lane-b",
-                    "target":{"kind":"mixer-channel","track_id":"track","parameter":"mute"},
+                    "id":"018f47a2-6b2d-7c11-8a44-001122334482",
+                    "target":{"kind":"mixer-channel","track_id":"018f47a2-6b2d-7c11-8a44-001122334456","parameter":"mute"},
                     "interpolation":"hold",
                     "points":[{"tick":0,"value":false},{"tick":4,"value":true}]
                 }
@@ -3284,7 +3496,7 @@ mod tests {
             "extensions":{}
         }"#;
         let automation = loaded
-            .load_automation_takes(&mixer, &[take], LoaderLimits::VERSION_1)
+            .load_automation_takes(&mixer, &asset_facts(), &[take], LoaderLimits::VERSION_1)
             .unwrap();
         let lanes = automation.takes()[0].lanes();
         assert_eq!(
@@ -3318,25 +3530,75 @@ mod tests {
             loaded
                 .load_automation_takes(
                     &mixer,
+                    &asset_facts(),
                     &[invalid_boolean.as_bytes()],
                     LoaderLimits::VERSION_1
                 )
                 .is_err()
         );
+        assert_automation_schema_domain_rejections(&loaded, &mixer, take);
         let overlapping = String::from_utf8(take.to_vec())
             .unwrap()
-            .replace("\"id\":\"take\"", "\"id\":\"take-2\"")
-            .replace("\"id\":\"lane-a\"", "\"id\":\"lane-c\"")
-            .replace("\"id\":\"lane-b\"", "\"id\":\"lane-d\"");
+            .replace(
+                "\"id\":\"018f47a2-6b2d-7c11-8a44-001122334479\"",
+                "\"id\":\"018f47a2-6b2d-7c11-8a44-001122334484\"",
+            )
+            .replace(
+                "\"id\":\"018f47a2-6b2d-7c11-8a44-001122334481\"",
+                "\"id\":\"018f47a2-6b2d-7c11-8a44-001122334483\"",
+            )
+            .replace(
+                "\"id\":\"018f47a2-6b2d-7c11-8a44-001122334482\"",
+                "\"id\":\"018f47a2-6b2d-7c11-8a44-001122334490\"",
+            );
         assert!(
             loaded
                 .load_automation_takes(
                     &mixer,
+                    &asset_facts(),
                     &[take, overlapping.as_bytes()],
                     LoaderLimits::VERSION_1
                 )
                 .is_err()
         );
+    }
+
+    fn assert_automation_schema_domain_rejections(
+        loaded: &LoadedPlaybackProject,
+        mixer: &LoadedMixer,
+        take: &[u8],
+    ) {
+        for invalid in [
+            String::from_utf8(take.to_vec()).unwrap().replace(
+                "\"id\":\"018f47a2-6b2d-7c11-8a44-001122334479\"",
+                "\"id\":\"take\"",
+            ),
+            String::from_utf8(take.to_vec()).unwrap().replace(
+                "\"id\":\"018f47a2-6b2d-7c11-8a44-001122334481\"",
+                "\"id\":\"lane\"",
+            ),
+            String::from_utf8(take.to_vec())
+                .unwrap()
+                .replace("\"name\":\"Pass\"", "\"name\":\"\""),
+            String::from_utf8(take.to_vec())
+                .unwrap()
+                .replace("\"extensions\":{}", "\"extensions\":false"),
+            String::from_utf8(take.to_vec()).unwrap().replace(
+                "\"track_id\":\"018f47a2-6b2d-7c11-8a44-001122334456\"",
+                "\"track_id\":\"track\"",
+            ),
+        ] {
+            assert!(
+                loaded
+                    .load_automation_takes(
+                        mixer,
+                        &asset_facts(),
+                        &[invalid.as_bytes()],
+                        LoaderLimits::VERSION_1,
+                    )
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -3348,22 +3610,24 @@ mod tests {
             LoaderLimits::VERSION_1,
         )
         .unwrap();
-        let mixer = loaded.load_mixer(MIXER, LoaderLimits::VERSION_1).unwrap();
+        let mixer = loaded
+            .load_mixer(MIXER, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
         let take = br#"{
             "format":"hyper-automation-take","format_version":1,
-            "id":"take","project_id":"project","name":"Pass","enabled":true,
+            "id":"018f47a2-6b2d-7c11-8a44-001122334479","project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Pass","enabled":true,
             "captured_at_utc":"2026-07-28T12:05:00.000Z",
             "start_tick":0,"end_tick":8,
             "lanes":[{
-                "id":"lane",
-                "target":{"kind":"mixer-channel","track_id":"track","parameter":"gain"},
+                "id":"018f47a2-6b2d-7c11-8a44-001122334480",
+                "target":{"kind":"mixer-channel","track_id":"018f47a2-6b2d-7c11-8a44-001122334456","parameter":"gain"},
                 "interpolation":"linear",
                 "points":[{"tick":0,"value":1000000},{"tick":3,"value":0}]
             }],
             "extensions":{}
         }"#;
         let automation = loaded
-            .load_automation_takes(&mixer, &[take], LoaderLimits::VERSION_1)
+            .load_automation_takes(&mixer, &asset_facts(), &[take], LoaderLimits::VERSION_1)
             .unwrap();
         let graph = mixer.compile_main_graph().unwrap();
         let compiled = loaded.compile_main_automation(&graph, &automation).unwrap();
@@ -3399,11 +3663,11 @@ mod tests {
 
         let cue_take = br#"{
             "format":"hyper-automation-take","format_version":1,
-            "id":"cue-take","project_id":"project","name":"Cue pass","enabled":true,
+            "id":"018f47a2-6b2d-7c11-8a44-001122334485","project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Cue pass","enabled":true,
             "captured_at_utc":"2026-07-28T12:06:00.000Z",
             "start_tick":0,"end_tick":8,
             "lanes":[{
-                "id":"cue-lane",
+                "id":"018f47a2-6b2d-7c11-8a44-001122334486",
                 "target":{"kind":"mixer-cue","parameter":"gain"},
                 "interpolation":"linear",
                 "points":[{"tick":0,"value":1000000},{"tick":3,"value":0}]
@@ -3411,7 +3675,7 @@ mod tests {
             "extensions":{}
         }"#;
         let cue_automation = loaded
-            .load_automation_takes(&mixer, &[cue_take], LoaderLimits::VERSION_1)
+            .load_automation_takes(&mixer, &asset_facts(), &[cue_take], LoaderLimits::VERSION_1)
             .unwrap();
         assert!(matches!(
             loaded.compile_main_automation(&graph, &cue_automation),
@@ -3428,15 +3692,17 @@ mod tests {
             LoaderLimits::VERSION_1,
         )
         .unwrap();
-        let mixer = loaded.load_mixer(MIXER, LoaderLimits::VERSION_1).unwrap();
+        let mixer = loaded
+            .load_mixer(MIXER, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
         let take = br#"{
             "format":"hyper-automation-take","format_version":1,
-            "id":"take","project_id":"project","name":"First","enabled":true,
+            "id":"018f47a2-6b2d-7c11-8a44-001122334479","project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"First","enabled":true,
             "captured_at_utc":"2026-07-28T12:05:00.000Z",
             "start_tick":0,"end_tick":8,
             "lanes":[{
-                "id":"lane-a",
-                "target":{"kind":"mixer-channel","track_id":"track","parameter":"gain"},
+                "id":"018f47a2-6b2d-7c11-8a44-001122334481",
+                "target":{"kind":"mixer-channel","track_id":"018f47a2-6b2d-7c11-8a44-001122334456","parameter":"gain"},
                 "interpolation":"linear",
                 "points":[{"tick":0,"value":1000000},{"tick":3,"value":0}]
             }],
@@ -3444,19 +3710,24 @@ mod tests {
         }"#;
         let adjacent = br#"{
             "format":"hyper-automation-take","format_version":1,
-            "id":"take-2","project_id":"project","name":"Adjacent","enabled":true,
+            "id":"018f47a2-6b2d-7c11-8a44-001122334484","project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Adjacent","enabled":true,
             "captured_at_utc":"2026-07-28T12:06:00.000Z",
             "start_tick":8,"end_tick":16,
             "lanes":[{
-                "id":"lane-c",
-                "target":{"kind":"mixer-channel","track_id":"track","parameter":"gain"},
+                "id":"018f47a2-6b2d-7c11-8a44-001122334483",
+                "target":{"kind":"mixer-channel","track_id":"018f47a2-6b2d-7c11-8a44-001122334456","parameter":"gain"},
                 "interpolation":"hold","points":[{"tick":8,"value":500000}]
             }],
             "extensions":{}
         }"#;
         assert!(
             loaded
-                .load_automation_takes(&mixer, &[take, adjacent], LoaderLimits::VERSION_1)
+                .load_automation_takes(
+                    &mixer,
+                    &asset_facts(),
+                    &[take, adjacent],
+                    LoaderLimits::VERSION_1,
+                )
                 .is_ok()
         );
 
@@ -3471,6 +3742,7 @@ mod tests {
             loaded
                 .load_automation_takes(
                     &mixer,
+                    &asset_facts(),
                     &[take, disabled_overlap.as_bytes()],
                     LoaderLimits::VERSION_1
                 )
@@ -3481,7 +3753,7 @@ mod tests {
         point_limit.max_automation_points = 1;
         assert!(matches!(
             loaded
-                .load_automation_takes(&mixer, &[take], point_limit)
+                .load_automation_takes(&mixer, &asset_facts(), &[take], point_limit)
                 .unwrap_err()
                 .kind,
             LoadErrorKind::LimitExceeded {
@@ -3497,6 +3769,7 @@ mod tests {
             loaded
                 .load_automation_takes(
                     &mixer,
+                    &asset_facts(),
                     &[invalid_calendar.as_bytes()],
                     LoaderLimits::VERSION_1
                 )
@@ -3509,8 +3782,8 @@ mod tests {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];
         let foreign_timeline = String::from_utf8(TIMELINE.to_vec()).unwrap().replacen(
-            "\"project_id\":\"project\"",
-            "\"project_id\":\"foreign\"",
+            "\"project_id\":\"018f47a2-6b2d-7c11-8a44-001122334455\"",
+            "\"project_id\":\"018f47a2-6b2d-7c11-8a44-001122334491\"",
             1,
         );
         assert_eq!(
@@ -3529,8 +3802,8 @@ mod tests {
         );
 
         let unknown = br#"{
-            "format":"hyper-timeline","format_version":1,"id":"timeline",
-            "project_id":"project","ticks_per_quarter":1920,
+            "format":"hyper-timeline","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334458",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","ticks_per_quarter":1920,
             "tempo_events":[{"tick":0,"microseconds_per_quarter":1000000}],
             "meter_events":[{"tick":0,"numerator":4,"denominator":4}],
             "unknown":true,"extensions":{}
@@ -3550,7 +3823,7 @@ mod tests {
 
         let duplicate = br#"{
             "format":"hyper-timeline","format":"hyper-timeline",
-            "format_version":1,"id":"timeline","project_id":"project",
+            "format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334458","project_id":"018f47a2-6b2d-7c11-8a44-001122334455",
             "ticks_per_quarter":1920,
             "tempo_events":[{"tick":0,"microseconds_per_quarter":1000000}],
             "meter_events":[{"tick":0,"numerator":4,"denominator":4}],
@@ -3591,9 +3864,9 @@ mod tests {
         ));
 
         let bad_parent = br#"{
-            "format":"hyper-track","format_version":1,"id":"track",
-            "project_id":"project","name":"Audio","kind":"audio","order":0,
-            "active":true,"parent_track_id":"missing","clip_ids":["clip"],
+            "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334456",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Audio","kind":"audio","order":0,
+            "active":true,"parent_track_id":"018f47a2-6b2d-7c11-8a44-001122334489","clip_ids":["018f47a2-6b2d-7c11-8a44-001122334460"],
             "extensions":{}
         }"#;
         let bad_tracks: [&[u8]; 1] = [bad_parent];
@@ -3608,9 +3881,9 @@ mod tests {
         );
 
         let scene_arrangement = br#"{
-            "format":"hyper-arrangement","format_version":1,"id":"arrangement",
-            "project_id":"project","name":"Main","enabled":true,"placements":[],
-            "scene_launches":[{"id":"launch","tick":0,"scene_id":"scene"}],
+            "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334463",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Main","enabled":true,"placements":[],
+            "scene_launches":[{"id":"018f47a2-6b2d-7c11-8a44-001122334465","tick":0,"scene_id":"018f47a2-6b2d-7c11-8a44-001122334461"}],
             "extensions":{}
         }"#;
         let scenes: [&[u8]; 1] = [SCENE];
@@ -3623,7 +3896,7 @@ mod tests {
         assert!(matches!(
             loaded.compile(
                 &[MediaAssetFact {
-                    id: "asset",
+                    id: "018f47a2-6b2d-7c11-8a44-001122334457",
                     sample_rate_hz: 48_000,
                     frame_count: 100
                 }],
@@ -3636,7 +3909,7 @@ mod tests {
         let graph = loaded
             .compile_playback(
                 &[MediaAssetFact {
-                    id: "asset",
+                    id: "018f47a2-6b2d-7c11-8a44-001122334457",
                     sample_rate_hz: 48_000,
                     frame_count: 100,
                 }],
@@ -3648,12 +3921,15 @@ mod tests {
         assert!(graph.arrangement().entries().is_empty());
         assert_eq!(graph.scene_authority().track_count(), 1);
         assert_eq!(graph.scene_audio().len(), 1);
-        assert_eq!(graph.scene_audio()[0].launch_id, "launch");
+        assert_eq!(
+            graph.scene_audio()[0].launch_id,
+            "018f47a2-6b2d-7c11-8a44-001122334465"
+        );
         assert_eq!(graph.scene_audio()[0].compiled.launch_frame(), 0);
 
         let malformed_scene = String::from_utf8(SCENE.to_vec()).unwrap().replace(
-            "\"action\":\"play\",\"clip_id\":\"clip\"",
-            "\"action\":\"stop\",\"clip_id\":\"clip\"",
+            "\"action\":\"play\",\"clip_id\":\"018f47a2-6b2d-7c11-8a44-001122334460\"",
+            "\"action\":\"stop\",\"clip_id\":\"018f47a2-6b2d-7c11-8a44-001122334460\"",
         );
         let malformed_scenes: [&[u8]; 1] = [malformed_scene.as_bytes()];
         assert!(matches!(
@@ -3676,13 +3952,13 @@ mod tests {
         ));
 
         let mixed_arrangement = br#"{
-            "format":"hyper-arrangement","format_version":1,"id":"arrangement",
-            "project_id":"project","name":"Main","enabled":true,
+            "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334463",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Main","enabled":true,
             "placements":[{
-                "id":"placement","track_id":"track","clip_id":"clip",
+                "id":"018f47a2-6b2d-7c11-8a44-001122334464","track_id":"018f47a2-6b2d-7c11-8a44-001122334456","clip_id":"018f47a2-6b2d-7c11-8a44-001122334460",
                 "start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true
             }],
-            "scene_launches":[{"id":"launch","tick":4,"scene_id":"scene"}],
+            "scene_launches":[{"id":"018f47a2-6b2d-7c11-8a44-001122334465","tick":4,"scene_id":"018f47a2-6b2d-7c11-8a44-001122334461"}],
             "extensions":{}
         }"#;
         let mixed = load(
@@ -3693,7 +3969,7 @@ mod tests {
         assert!(matches!(
             mixed.compile_playback(
                 &[MediaAssetFact {
-                    id: "asset",
+                    id: "018f47a2-6b2d-7c11-8a44-001122334457",
                     sample_rate_hz: 48_000,
                     frame_count: 100,
                 }],
@@ -3713,9 +3989,9 @@ mod tests {
         );
         let scenes: [&[u8]; 1] = [off_grid_scene.as_bytes()];
         let arrangement = br#"{
-            "format":"hyper-arrangement","format_version":1,"id":"arrangement",
-            "project_id":"project","name":"Main","enabled":true,"placements":[],
-            "scene_launches":[{"id":"launch","tick":1,"scene_id":"scene"}],
+            "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334463",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Main","enabled":true,"placements":[],
+            "scene_launches":[{"id":"018f47a2-6b2d-7c11-8a44-001122334465","tick":1,"scene_id":"018f47a2-6b2d-7c11-8a44-001122334461"}],
             "extensions":{}
         }"#;
         let clips: [&[u8]; 1] = [CLIP];
@@ -3725,7 +4001,7 @@ mod tests {
         )
         .unwrap();
         let facts = [MediaAssetFact {
-            id: "asset",
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
             sample_rate_hz: 48_000,
             frame_count: 100,
         }];
@@ -3773,7 +4049,18 @@ mod tests {
         assert!(matches!(
             loaded.compile(
                 &[MediaAssetFact {
-                    id: "timeline",
+                    id: "018f47a2-6b2d-7c11-8a44-001122334458",
+                    sample_rate_hz: 48_000,
+                    frame_count: 100
+                }],
+                GraphLimits::VERSION_1
+            ),
+            Err(AdapterCompileError::AssetIdentityCollision { asset_index: 0 })
+        ));
+        assert!(matches!(
+            loaded.compile(
+                &[MediaAssetFact {
+                    id: "asset",
                     sample_rate_hz: 48_000,
                     frame_count: 100
                 }],

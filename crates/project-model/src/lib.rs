@@ -401,7 +401,10 @@ fn validate_manifest(raw: RawManifest) -> Result<ProjectManifest, ManifestError>
         raw.format_version == FORMAT_VERSION,
         "project format version is unsupported",
     )?;
-    require(valid_id(&raw.project_id), "project identifier is invalid")?;
+    require(
+        is_valid_entity_id(&raw.project_id),
+        "project identifier is invalid",
+    )?;
     require(
         raw.revision <= MAX_SAFE_INTEGER,
         "project revision exceeds the interoperable integer range",
@@ -568,7 +571,10 @@ fn validate_record(
     identities: &mut BTreeSet<String>,
     folded_paths: &mut BTreeSet<String>,
 ) -> Result<(), ManifestError> {
-    require(valid_id(id), "project record identifier is invalid")?;
+    require(
+        is_valid_entity_id(id),
+        "project record identifier is invalid",
+    )?;
     require(
         identities.insert(id.to_owned()),
         "project record identifiers are not unique",
@@ -607,7 +613,9 @@ fn asset_root(role: AssetRole) -> &'static str {
     }
 }
 
-fn valid_id(value: &str) -> bool {
+/// Returns whether a string belongs to the version-1 entity identifier domain.
+#[must_use]
+pub fn is_valid_entity_id(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| match index {
             8 | 13 | 18 | 23 => byte == b'-',
@@ -641,12 +649,14 @@ fn validate_extensions(
     label: &str,
 ) -> Result<(), ManifestError> {
     require(
-        extensions.keys().all(|key| valid_extension_key(key)),
+        extensions.keys().all(|key| is_valid_extension_key(key)),
         &format!("{label} contain an invalid key"),
     )
 }
 
-fn valid_extension_key(value: &str) -> bool {
+/// Returns whether a string is a namespaced version-1 extension key.
+#[must_use]
+pub fn is_valid_extension_key(value: &str) -> bool {
     let mut label_count = 0_usize;
     for label in value.split('.') {
         label_count += 1;

@@ -94,7 +94,12 @@ fn fixed_track_rendering_preserves_mixer_order_and_silent_lanes() {
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
     let renderer = ArrangementRenderer::try_new_for_tracks(
         &prepared,
-        &["track-b", "track-a", "track-c", "empty-track"],
+        &[
+            "018f47a2-6b2d-7c11-8a44-001122335003",
+            "018f47a2-6b2d-7c11-8a44-001122335002",
+            "018f47a2-6b2d-7c11-8a44-001122335004",
+            "empty-track",
+        ],
     )
     .unwrap();
     let mut left_b = [9.0_f32; 160];
@@ -143,17 +148,37 @@ fn fixed_track_construction_and_scratch_shape_are_strict() {
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
 
     assert_eq!(
-        ArrangementRenderer::try_new_for_tracks(&prepared, &["track-a", "track-a"]).unwrap_err(),
+        ArrangementRenderer::try_new_for_tracks(
+            &prepared,
+            &[
+                "018f47a2-6b2d-7c11-8a44-001122335002",
+                "018f47a2-6b2d-7c11-8a44-001122335002"
+            ]
+        )
+        .unwrap_err(),
         RendererCreationError::DuplicateTrackId { track_index: 1 }
     );
     assert_eq!(
-        ArrangementRenderer::try_new_for_tracks(&prepared, &["track-a", "track-b"]).unwrap_err(),
+        ArrangementRenderer::try_new_for_tracks(
+            &prepared,
+            &[
+                "018f47a2-6b2d-7c11-8a44-001122335002",
+                "018f47a2-6b2d-7c11-8a44-001122335003"
+            ]
+        )
+        .unwrap_err(),
         RendererCreationError::MissingScheduleTrack { entry_index: 1 }
     );
 
-    let renderer =
-        ArrangementRenderer::try_new_for_tracks(&prepared, &["track-a", "track-b", "track-c"])
-            .unwrap();
+    let renderer = ArrangementRenderer::try_new_for_tracks(
+        &prepared,
+        &[
+            "018f47a2-6b2d-7c11-8a44-001122335002",
+            "018f47a2-6b2d-7c11-8a44-001122335003",
+            "018f47a2-6b2d-7c11-8a44-001122335004",
+        ],
+    )
+    .unwrap();
     let mut left = [7.0_f32; 80];
     let mut right = [7.0_f32; 80];
     let mut one_slot = [RenderScratchSlot::new(&mut left, &mut right)];

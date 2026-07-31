@@ -3,12 +3,12 @@ use core::fmt;
 
 use hyper_playback_compiler::{FrameTickPosition, FrameTimeline, FrameTimelineError};
 use serde::Deserialize;
-use serde::de::IgnoredAny;
 
 use super::{
-    CollectionLimit, CompiledMixerGraph, DocumentKind, DocumentLocation, LoadError, LoadedMixer,
-    LoadedPlaybackProject, LoaderLimits, TrackKind, capacity_error, domain_error,
-    enforce_loader_limit, parse_document, project_contains_identity, validate_header,
+    CollectionLimit, CompiledMixerGraph, DocumentKind, DocumentLocation, ExtensionsDocument,
+    LoadError, LoadedMixer, LoadedPlaybackProject, LoaderLimits, MediaAssetFact, TrackKind,
+    capacity_error, domain_error, enforce_loader_limit, parse_document, project_contains_identity,
+    validate_contract_document, validate_entity_reference, validate_header,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -366,6 +366,8 @@ impl CompiledAutomation {
 
 impl LoadedPlaybackProject {
     /// Loads, resolves, and cross-validates post-verified automation resources.
+    /// `assets` must be the same complete verified inventory supplied while
+    /// loading the mixer so automation identities share one collision domain.
     ///
     /// # Errors
     ///
@@ -374,6 +376,7 @@ impl LoadedPlaybackProject {
     pub fn load_automation_takes(
         &self,
         mixer: &LoadedMixer,
+        assets: &[MediaAssetFact<'_>],
         documents: &[&[u8]],
         limits: LoaderLimits,
     ) -> Result<LoadedAutomationSet, LoadError> {
@@ -404,6 +407,25 @@ impl LoadedPlaybackProject {
                 &self.project_id,
                 location,
             )?;
+            validate_contract_document(
+                &document.id,
+                Some(&document.name),
+                &document.extensions,
+                location,
+            )?;
+            for lane in &document.lanes {
+                validate_entity_reference(&lane.id, location)?;
+                match &lane.target {
+                    AutomationTargetDocument::Channel { track_id, .. } => {
+                        validate_entity_reference(track_id, location)?;
+                    }
+                    AutomationTargetDocument::Send { send_id, .. } => {
+                        validate_entity_reference(send_id, location)?;
+                    }
+                    AutomationTargetDocument::Main { .. }
+                    | AutomationTargetDocument::Cue { .. } => {}
+                }
+            }
             lane_count = lane_count
                 .checked_add(document.lanes.len())
                 .ok_or_else(capacity_error)?;
@@ -424,8 +446,8 @@ impl LoadedPlaybackProject {
                 limits.max_automation_points,
                 Some(location),
             )?;
-            validate_take_identity(self, mixer, &takes, &document, location)?;
-            takes.push(load_take(self, mixer, document, location)?);
+            validate_take_identity(self, mixer, assets, &takes, &document, location)?;
+            takes.push(load_take(self, mixer, assets, document, location)?);
         }
         validate_enabled_overlaps(&takes)?;
         Ok(LoadedAutomationSet { takes })
@@ -549,6 +571,7 @@ fn validate_compiled_target(
 fn load_take(
     project: &LoadedPlaybackProject,
     mixer: &LoadedMixer,
+    assets: &[MediaAssetFact<'_>],
     document: AutomationTakeDocument,
     location: DocumentLocation,
 ) -> Result<AutomationTake, LoadError> {
@@ -573,7 +596,7 @@ fn load_take(
     for lane in &document.lanes {
         if lane.id.is_empty()
             || previous_lane_id.is_some_and(|previous| previous >= lane.id.as_str())
-            || identity_collides(project, mixer, &document.id, &lane.id)
+            || identity_collides(project, mixer, assets, &document.id, &lane.id)
         {
             return domain_error(location, "automation lane identity is invalid or collides");
         }
@@ -774,12 +797,13 @@ const fn target_bounds(target: AutomationTarget) -> (i32, i32) {
 fn validate_take_identity(
     project: &LoadedPlaybackProject,
     mixer: &LoadedMixer,
+    assets: &[MediaAssetFact<'_>],
     takes: &[AutomationTake],
     document: &AutomationTakeDocument,
     location: DocumentLocation,
 ) -> Result<(), LoadError> {
     if document.id.is_empty()
-        || identity_collides(project, mixer, "", &document.id)
+        || identity_collides(project, mixer, assets, "", &document.id)
         || takes.iter().any(|take| take.id == document.id)
         || takes
             .iter()
@@ -804,12 +828,13 @@ fn validate_take_identity(
 fn identity_collides(
     project: &LoadedPlaybackProject,
     mixer: &LoadedMixer,
+    assets: &[MediaAssetFact<'_>],
     take_id: &str,
     id: &str,
 ) -> bool {
     id == take_id
         || project_contains_identity(project, id)
-        || project.clips.iter().any(|clip| clip.asset_id == id)
+        || assets.iter().any(|asset| asset.id == id)
         || mixer.id == id
         || mixer
             .channels
@@ -913,8 +938,7 @@ struct AutomationTakeDocument {
     start_tick: u64,
     end_tick: u64,
     lanes: Vec<AutomationLaneDocument>,
-    #[serde(rename = "extensions")]
-    _extensions: IgnoredAny,
+    extensions: ExtensionsDocument,
 }
 
 #[derive(Deserialize)]

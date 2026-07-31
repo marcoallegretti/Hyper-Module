@@ -21,6 +21,10 @@ use hyper_mixer_runtime::{
 
 use common::{fixture, graph_fixture, playback_fixture};
 
+const GRAPH_SOURCE_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336421";
+const GRAPH_GROUP_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336423";
+const GRAPH_SEND_A_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336433";
+
 fn assert_constant(samples: &[f32], expected: f32) {
     assert!(
         samples
@@ -258,8 +262,10 @@ fn process_one_live_mixer_command(kind: LiveMixerCommandKind) -> (f32, f32) {
     let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 1).unwrap();
     let (mut transport_sender, mut parameter_sender, mut transport) =
         GraphTransportRuntime::with_command_queues(runtime);
-    let source = parameter_sender.resolve_channel("source").unwrap();
-    let send_a = parameter_sender.resolve_send("send-a").unwrap();
+    let source = parameter_sender
+        .resolve_channel(GRAPH_SOURCE_TRACK_ID)
+        .unwrap();
+    let send_a = parameter_sender.resolve_send(GRAPH_SEND_A_ID).unwrap();
     let command = match kind {
         LiveMixerCommandKind::ChannelGain => MixerParameterCommand::ChannelGain {
             channel: source,
@@ -998,9 +1004,9 @@ fn live_mixer_command_queue_validates_targets_backpressure_and_disconnection() {
     let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
     let (_transport_sender, mut sender, transport) =
         GraphTransportRuntime::with_command_queues(runtime);
-    let source = sender.resolve_channel("source").unwrap();
-    let group = sender.resolve_channel("group").unwrap();
-    let send_a = sender.resolve_send("send-a").unwrap();
+    let source = sender.resolve_channel(GRAPH_SOURCE_TRACK_ID).unwrap();
+    let group = sender.resolve_channel(GRAPH_GROUP_TRACK_ID).unwrap();
+    let send_a = sender.resolve_send(GRAPH_SEND_A_ID).unwrap();
     assert_eq!(
         sender.resolve_channel("missing"),
         Err(MixerParameterResolveError::ChannelNotFound)
@@ -1019,8 +1025,10 @@ fn live_mixer_command_queue_validates_targets_backpressure_and_disconnection() {
         GraphMainRuntime::try_new(&foreign_prepared, &foreign_fixture.mixer, 8).unwrap();
     let (_foreign_transport_sender, foreign_sender, foreign_transport) =
         GraphTransportRuntime::with_command_queues(foreign_runtime);
-    let foreign_channel = foreign_sender.resolve_channel("source").unwrap();
-    let foreign_send = foreign_sender.resolve_send("send-a").unwrap();
+    let foreign_channel = foreign_sender
+        .resolve_channel(GRAPH_SOURCE_TRACK_ID)
+        .unwrap();
+    let foreign_send = foreign_sender.resolve_send(GRAPH_SEND_A_ID).unwrap();
     assert_ne!(source, foreign_channel);
     assert_ne!(send_a, foreign_send);
 
@@ -1138,8 +1146,10 @@ fn committed_mixer_snapshot_restores_exact_base_state_to_the_same_layout() {
     let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
     let (_transport_sender, mut parameter_sender, mut transport) =
         GraphTransportRuntime::with_command_queues(runtime);
-    let source = parameter_sender.resolve_channel("source").unwrap();
-    let send_a = parameter_sender.resolve_send("send-a").unwrap();
+    let source = parameter_sender
+        .resolve_channel(GRAPH_SOURCE_TRACK_ID)
+        .unwrap();
+    let send_a = parameter_sender.resolve_send(GRAPH_SEND_A_ID).unwrap();
     let gain = LinearGain::new(0.75).unwrap();
     let pan = Pan::new(0.25).unwrap();
     let send_gain = LinearGain::new(0.625).unwrap();
@@ -1210,7 +1220,7 @@ fn committed_mixer_snapshot_restores_exact_base_state_to_the_same_layout() {
     let (_replacement_transport_sender, mut replacement_parameter_sender, mut replacement) =
         GraphTransportRuntime::with_command_queues(replacement_runtime);
     let replacement_source = replacement_parameter_sender
-        .resolve_channel("source")
+        .resolve_channel(GRAPH_SOURCE_TRACK_ID)
         .unwrap();
     assert_ne!(source, replacement_source);
     replacement

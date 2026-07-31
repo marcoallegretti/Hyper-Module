@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 hyper-audio-engine = { path = "../audio-engine" }
 hyper-playback-compiler = { path = "../playback-compiler" }
+hyper-project-model = { path = "../project-model" }
 hyper-strict-json = { path = "../strict-json" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"

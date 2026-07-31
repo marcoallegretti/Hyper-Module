@@ -22,6 +22,13 @@ import {
   verifyProjectCandidate,
 } from "./verify-project.mjs";
 
+const playbackDomainCases = JSON.parse(
+  await readFile(
+    new URL("../fixtures/playback-domain-cases.json", import.meta.url),
+    "utf8",
+  ),
+);
+
 // MIT-licensed reference fixture from music-metadata 11.14.0:
 // test/samples/flac/libFLAC.flac at commit 959f0f3d464578ddd3dfc2a5cbcd0068799dd394.
 const flacFixtureBase64 =
@@ -405,6 +412,70 @@ async function mutateMixer(root, mutate) {
   await writeFile(projectPath, canonicalize(project));
 }
 
+function replaceCaseSymbols(value, replacements) {
+  if (Array.isArray(value)) {
+    return value.map((item) => replaceCaseSymbols(item, replacements));
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        replaceCaseSymbols(item, replacements),
+      ]),
+    );
+  }
+  return typeof value === "string" && Object.hasOwn(replacements, value)
+    ? replacements[value]
+    : value;
+}
+
+function assignJsonPointer(document, pointer, value) {
+  const tokens = pointer
+    .slice(1)
+    .split("/")
+    .map((token) => token.replaceAll("~1", "/").replaceAll("~0", "~"));
+  const property = tokens.pop();
+  let parent = document;
+  for (const token of tokens) {
+    parent = Array.isArray(parent) ? parent[Number(token)] : parent[token];
+  }
+  parent[property] = value;
+}
+
+async function applyPlaybackDomainCase(root, testCase) {
+  if (testCase.resource_role === undefined) {
+    return;
+  }
+  const projectPath = join(root, "project.json");
+  const project = JSON.parse(await readFile(projectPath, "utf8"));
+  const resourceRecord = project.resources.find(
+    (record) => record.role === testCase.resource_role,
+  );
+  assert(resourceRecord, `${testCase.name}: resource role is absent`);
+  const resourcePath = join(root, ...resourceRecord.path.split("/"));
+  const resource = JSON.parse(await readFile(resourcePath, "utf8"));
+  const arrangementRecord = project.resources.find(
+    (record) => record.role === "arrangement",
+  );
+  const arrangement = JSON.parse(
+    await readFile(join(root, ...arrangementRecord.path.split("/")), "utf8"),
+  );
+  const replacements = {
+    $asset_id: project.assets[0].id,
+    $arrangement_event_id: arrangement.placements[0].id,
+  };
+  assignJsonPointer(
+    resource,
+    testCase.pointer,
+    replaceCaseSymbols(testCase.value, replacements),
+  );
+  const bytes = Buffer.from(canonicalize(resource), "utf8");
+  await writeFile(resourcePath, bytes);
+  resourceRecord.byte_length = bytes.length;
+  resourceRecord.sha256 = createHash("sha256").update(bytes).digest("hex");
+  await writeFile(projectPath, canonicalize(project));
+}
+
 async function addReturnTrack(root) {
   const projectPath = join(root, "project.json");
   const project = JSON.parse(await readFile(projectPath, "utf8"));
@@ -615,6 +686,17 @@ try {
   const first = await verifyProject(valid);
   const second = await verifyProject(valid);
   assert.equal(first.identity, second.identity);
+
+  for (const testCase of playbackDomainCases) {
+    const caseRoot = join(temporaryRoot, `playback-domain-${testCase.name}`);
+    await cp(valid, caseRoot, { recursive: true });
+    await applyPlaybackDomainCase(caseRoot, testCase);
+    if (testCase.accepted) {
+      await verifyProject(caseRoot);
+    } else {
+      await assert.rejects(verifyProject(caseRoot), undefined, testCase.name);
+    }
+  }
 
   const activeManifestPath = join(valid, "project.json");
   const activeManifestBytes = await readFile(activeManifestPath);
@@ -1602,6 +1684,35 @@ try {
   });
   await assert.rejects(
     verifyProject(collidingSendId),
+    /mixer send identifier collides with a project entity/,
+  );
+
+  const collidingSendAndArrangement = join(
+    temporaryRoot,
+    "colliding-send-arrangement",
+  );
+  await cp(valid, collidingSendAndArrangement, { recursive: true });
+  const collidingArrangementPath = join(
+    collidingSendAndArrangement,
+    "arrangement/main.json",
+  );
+  const collidingArrangement = JSON.parse(
+    await readFile(collidingArrangementPath, "utf8"),
+  );
+  await mutateMixer(collidingSendAndArrangement, (mixer) => {
+    mixer.channels[0].sends = [
+      {
+        id: collidingArrangement.placements[0].id,
+        bus: "a",
+        tap: "post-fader",
+        gain_millionths: 500_000,
+        pan_millionths: 0,
+        enabled: true,
+      },
+    ];
+  });
+  await assert.rejects(
+    verifyProject(collidingSendAndArrangement),
     /mixer send identifier collides with a project entity/,
   );
 

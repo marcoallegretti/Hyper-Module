@@ -19,7 +19,9 @@ fn prepared_cache_rendering_performs_zero_heap_allocations() {
         max_decoded_sample_bytes: 400,
     })
     .unwrap();
-    builder.try_insert("asset", source).unwrap();
+    builder
+        .try_insert("018f47a2-6b2d-7c11-8a44-001122335034", source)
+        .unwrap();
     let cache = builder.seal();
     let prepared = cache.prepare_schedule(&schedule).unwrap();
     let mut output = [0.0_f32; 100];
