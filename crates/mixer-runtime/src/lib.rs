@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 
 mod loudness_presentation;
 mod meter_ballistics;
+mod recovery;
 pub use loudness_presentation::{
     EBU_TARGET_LOUDNESS_LUFS, EbuLoudnessPresentationConfig, EbuLoudnessScale, LoudnessDisplayUnit,
     LoudnessPresentationSnapshot, LoudnessScaleRegion, MaximumTruePeakDisplay, ScaledLoudnessValue,
@@ -34,6 +35,9 @@ pub use loudness_presentation::{
 pub use meter_ballistics::{
     ChannelSamplePeakBallistics, SamplePeakBallisticsConfig, SamplePeakBallisticsConfigError,
     StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot,
+};
+pub use recovery::{
+    PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot, PlaybackRecoveryTransportState,
 };
 
 pub const MAX_MAIN_MIXER_SLOTS: usize = 8;
@@ -297,9 +301,8 @@ pub struct MixerSendParameterState {
 impl Eq for MixerSendParameterState {}
 
 impl MixerSendParameterState {
-    #[doc(hidden)]
     #[must_use]
-    pub const fn from_recovery_parts(parameters: ChannelParameters, enabled: bool) -> Self {
+    pub(crate) const fn from_recovery_parts(parameters: ChannelParameters, enabled: bool) -> Self {
         Self {
             parameters,
             enabled,
@@ -330,9 +333,8 @@ pub struct MixerChannelParameterState {
 impl Eq for MixerChannelParameterState {}
 
 impl MixerChannelParameterState {
-    #[doc(hidden)]
     #[must_use]
-    pub const fn from_recovery_parts(
+    pub(crate) const fn from_recovery_parts(
         parameters: ChannelParameters,
         muted: bool,
         solo: bool,
@@ -387,6 +389,14 @@ impl MixerChannelParameterState {
 /// The layout signature is derived from persisted project, channel, route, and
 /// send identities. It is stable when the same mixer graph is rebuilt but does
 /// not make runtime-local command handles transferable between runtimes.
+/// Snapshot construction remains private to the runtime so downstream crates
+/// cannot forge restorable mixer state.
+///
+/// ```compile_fail
+/// use hyper_mixer_runtime::MixerParameterStateSnapshot;
+///
+/// let _constructor = MixerParameterStateSnapshot::from_recovery_parts;
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MixerParameterStateSnapshot {
     layout_signature: [u8; 32],
@@ -399,11 +409,10 @@ pub struct MixerParameterStateSnapshot {
 impl Eq for MixerParameterStateSnapshot {}
 
 impl MixerParameterStateSnapshot {
-    #[doc(hidden)]
     #[must_use]
-    pub const fn from_recovery_parts(
+    pub(crate) const fn from_recovery_parts(
         layout_signature: [u8; 32],
-        channels: [MixerChannelParameterState; MAX_MAIN_MIXER_SLOTS],
+        channels: &[MixerChannelParameterState; MAX_MAIN_MIXER_SLOTS],
         channel_count: usize,
         main_gain: LinearGain,
         main_muted: bool,
@@ -411,7 +420,7 @@ impl MixerParameterStateSnapshot {
         if channel_count <= MAX_MAIN_MIXER_SLOTS {
             Some(Self {
                 layout_signature,
-                channels,
+                channels: *channels,
                 channel_count,
                 main_gain,
                 main_muted,
@@ -422,7 +431,7 @@ impl MixerParameterStateSnapshot {
     }
 
     #[must_use]
-    pub const fn layout_signature(&self) -> [u8; 32] {
+    pub(crate) const fn layout_signature(&self) -> [u8; 32] {
         self.layout_signature
     }
 
