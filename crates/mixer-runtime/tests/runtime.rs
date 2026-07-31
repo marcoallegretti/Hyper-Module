@@ -6,14 +6,15 @@ use hyper_audio_engine::{
     MAX_PROCESS_FRAMES, StereoCallbackError, StereoOutput,
 };
 use hyper_mixer_runtime::{
-    FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, LocateState,
-    LoudnessCommandSendError, LoudnessCommandSender, MAX_QUEUED_LOUDNESS_COMMANDS,
-    MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, OutputMeterPublication,
-    OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot, PreparedPlaybackMainRuntime,
-    PreparedPlaybackTransportRuntime, RuntimeCreationError, RuntimeProcessError,
-    RuntimeProjectComponent, SamplePeakBallisticsConfig, StereoSamplePeakBallistics,
-    TransportCommand, TransportCommandSendError, TransportCycle, TransportOutputCreationError,
-    TransportOutputProcessor, TransportState, loudness_command_channel, output_meter_channel,
+    EbuLoudnessPresentationConfig, EbuLoudnessScale, FlatMainRuntime, GraphMainRuntime,
+    GraphTransportRuntime, LocateState, LoudnessCommandSendError, LoudnessCommandSender,
+    LoudnessDisplayUnit, MAX_QUEUED_LOUDNESS_COMMANDS, MAX_QUEUED_OUTPUT_METER_SNAPSHOTS,
+    MAX_QUEUED_TRANSPORT_COMMANDS, OutputMeterPublication, OutputMeterReceiver, OutputMeterSender,
+    OutputMeterSnapshot, PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime,
+    RuntimeCreationError, RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig,
+    StereoSamplePeakBallistics, TransportCommand, TransportCommandSendError, TransportCycle,
+    TransportOutputCreationError, TransportOutputProcessor, TransportState,
+    loudness_command_channel, output_meter_channel,
 };
 
 use common::{fixture, graph_fixture, playback_fixture};
@@ -108,6 +109,28 @@ fn assert_meter_delivery_and_backpressure(
     assert_eq!(
         ballistic_read.ballistics().unwrap().processed_frame_end(),
         latest.snapshot().unwrap().processed_frame_end()
+    );
+    let loudness = latest
+        .snapshot()
+        .unwrap()
+        .present_loudness(EbuLoudnessPresentationConfig::new(
+            EbuLoudnessScale::Plus18,
+            LoudnessDisplayUnit::RelativeLu,
+        ));
+    assert_eq!(loudness.config().scale(), EbuLoudnessScale::Plus18);
+    assert_eq!(loudness.config().unit(), LoudnessDisplayUnit::RelativeLu);
+    assert_eq!(
+        loudness.state(),
+        latest.snapshot().unwrap().meter().loudness().state()
+    );
+    assert_eq!(
+        loudness.programme_frame_count(),
+        latest
+            .snapshot()
+            .unwrap()
+            .meter()
+            .loudness()
+            .programme_frame_count()
     );
     let frame_count = u64::try_from(full.snapshot().meter().frame_count()).unwrap();
     assert_eq!(

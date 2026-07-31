@@ -7,9 +7,9 @@ use std::sync::Mutex;
 use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{InterleavedStereoCallback, LoudnessMeasurementCommand, StereoOutput};
 use hyper_mixer_runtime::{
-    FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime, PreparedPlaybackMainRuntime,
-    PreparedPlaybackTransportRuntime, TransportCommand, TransportOutputProcessor,
-    loudness_command_channel, output_meter_channel,
+    EbuLoudnessPresentationConfig, FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime,
+    PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime, TransportCommand,
+    TransportOutputProcessor, loudness_command_channel, output_meter_channel,
 };
 
 use common::{fixture, graph_fixture, playback_fixture};
@@ -205,12 +205,18 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
     let start_result = command_sender.try_send(TransportCommand::Start);
     let loudness_result = loudness_sender.try_send(LoudnessMeasurementCommand::Reset);
     let first_result = processor.process(&mut first);
+    let loudness_presentation = first_result.as_ref().ok().map(|cycle| {
+        cycle
+            .snapshot()
+            .present_loudness(EbuLoudnessPresentationConfig::default())
+    });
     let second_result = processor.process(&mut second);
     let heap_operations = measurement.finish();
 
     assert!(start_result.is_ok());
     assert!(loudness_result.is_ok());
     assert!(first_result.is_ok());
+    assert!(loudness_presentation.is_some());
     assert!(second_result.is_ok());
     assert_eq!(heap_operations, 0);
 }

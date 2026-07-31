@@ -24,7 +24,12 @@ use hyper_playback_json::{
 };
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 
+mod loudness_presentation;
 mod meter_ballistics;
+pub use loudness_presentation::{
+    EBU_TARGET_LOUDNESS_LUFS, EbuLoudnessPresentationConfig, EbuLoudnessScale, LoudnessDisplayUnit,
+    LoudnessPresentationSnapshot, LoudnessScaleRegion, MaximumTruePeakDisplay, ScaledLoudnessValue,
+};
 pub use meter_ballistics::{
     ChannelSamplePeakBallistics, SamplePeakBallisticsConfig, SamplePeakBallisticsConfigError,
     StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot,
@@ -410,6 +415,16 @@ impl OutputMeterSnapshot {
     #[must_use]
     pub const fn meter(self) -> StereoBlockMeter {
         self.meter
+    }
+
+    /// Converts the persistent loudness measurement into non-visual display
+    /// data without changing or consuming the underlying snapshot.
+    #[must_use]
+    pub fn present_loudness(
+        self,
+        config: EbuLoudnessPresentationConfig,
+    ) -> LoudnessPresentationSnapshot {
+        LoudnessPresentationSnapshot::from_measurement(self.meter.loudness(), config)
     }
 
     /// Successful output frames processed since this meter channel was
