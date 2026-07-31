@@ -49,8 +49,15 @@ fn append_bytes(path: &Path, bytes: &[u8]) {
 }
 
 #[cfg(unix)]
-fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(original, link)
+fn create_link_like(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+    assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+}
+
+#[cfg(windows)]
+fn create_link_like(target: &Path, link: &Path) {
+    junction::create(target, link).unwrap();
+    assert!(junction::exists(link).unwrap());
 }
 
 #[test]
@@ -294,9 +301,8 @@ fn never_overwrites_existing_published_media() {
     assert_eq!(fs::read(&wav).unwrap(), b"existing media");
 }
 
-#[cfg(unix)]
 #[test]
-fn rejects_links_even_when_they_resolve_to_matching_media() {
+fn rejects_link_like_published_and_staging_conflicts() {
     let directory = TestDirectory::new();
     let journal = directory.join("take.journal");
     let target = directory.join("verified.wav");
@@ -307,14 +313,22 @@ fn rejects_links_even_when_they_resolve_to_matching_media() {
     writer.append(&[0.25, -0.25]).unwrap();
     drop(writer);
     publish_wav(&journal, &target).unwrap();
+    #[cfg(unix)]
+    let link_target = target.clone();
+    #[cfg(windows)]
+    let link_target = {
+        let path = directory.join("junction-target");
+        fs::create_dir(&path).unwrap();
+        path
+    };
 
-    symlink_file(&target, &linked_final).unwrap();
+    create_link_like(&link_target, &linked_final);
     assert!(matches!(
         publish_wav(&journal, &linked_final),
         Err(JournalError::PublishedRecordingConflict(path)) if path == linked_final
     ));
 
-    symlink_file(&target, &linked_staging).unwrap();
+    create_link_like(&link_target, &linked_staging);
     assert!(matches!(
         publish_wav(&journal, &staged_final),
         Err(JournalError::StagingConflict(path)) if path == linked_staging

@@ -342,21 +342,13 @@ fn issued_authority_rejects_later_payload_changes_and_caller_limits() {
 }
 
 #[test]
-fn rejects_links_in_the_owned_tree_when_the_platform_can_create_one() {
+fn rejects_links_in_the_owned_tree() {
     let fixture = Fixture::new();
-    let target = fixture.root.join("timeline/timeline.json");
-    let link = fixture.root.join("linked.json");
-    if let Err(error) = create_file_symlink(&target, &link) {
-        if error.kind() == std::io::ErrorKind::PermissionDenied
-            || error.raw_os_error() == Some(1314)
-        {
-            return;
-        }
-        panic!("could not create link fixture: {error}");
-    }
+    let (link, relative) = create_link_fixture(&fixture.root);
     let error = verify_project_package(&fixture.root).unwrap_err();
     assert_eq!(error.kind(), StorageErrorKind::LinkForbidden);
-    assert_eq!(error.path(), "linked.json");
+    assert_eq!(error.path(), relative);
+    assert!(fs::symlink_metadata(link).is_ok());
 }
 
 #[test]
@@ -394,11 +386,24 @@ fn write_canonical(path: &Path, value: &Value) {
 }
 
 #[cfg(unix)]
-fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
+fn create_link_fixture(root: &Path) -> (PathBuf, &'static str) {
+    let target = root.join("timeline/timeline.json");
+    let link = root.join("linked.json");
+    std::os::unix::fs::symlink(target, &link).unwrap();
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    (link, "linked.json")
 }
 
 #[cfg(windows)]
-fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_file(target, link)
+fn create_link_fixture(root: &Path) -> (PathBuf, &'static str) {
+    let target = root.join("timeline");
+    let link = root.join("linked");
+    junction::create(target, &link).unwrap();
+    assert!(junction::exists(&link).unwrap());
+    (link, "linked")
 }
