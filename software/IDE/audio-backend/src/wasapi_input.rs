@@ -148,6 +148,44 @@ pub struct WasapiInputStream {
     shutdown_timeout: Duration,
 }
 
+#[derive(Debug)]
+pub(crate) struct WasapiInputThreadRunner {
+    config: WasapiInputConfig,
+    stop_requested: Arc<AtomicBool>,
+    startup: SyncSender<Result<(), WasapiStartError>>,
+    counters: CaptureStreamCounters,
+    status: StreamStatus,
+    disconnect_reason: Arc<AtomicU8>,
+}
+
+impl WasapiInputThreadRunner {
+    fn run<P>(self, processor: P) -> Result<(), WasapiStartError>
+    where
+        P: InterleavedStereoCaptureProcessor,
+    {
+        let callback = CaptureCallback::try_new_with_counters(
+            processor,
+            self.config.maximum_block_frames,
+            self.counters.clone(),
+        )
+        .map_err(|source| WasapiStartError::Backend {
+            stage: WasapiStartupStage::Callback,
+            detail: source.to_string(),
+        })?;
+        run_wasapi_input(
+            &self.config,
+            callback,
+            WasapiInputSignals {
+                stop_requested: &self.stop_requested,
+                startup: &self.startup,
+                counters: &self.counters,
+                status: &self.status,
+                disconnect_reason: &self.disconnect_reason,
+            },
+        )
+    }
+}
+
 impl WasapiInputStream {
     /// Starts a strict event-driven shared-mode stereo capture stream.
     ///
@@ -159,17 +197,32 @@ impl WasapiInputStream {
     where
         P: InterleavedStereoCaptureProcessor + Send + 'static,
     {
-        Self::start_with_timeouts(config, processor, STARTUP_TIMEOUT, SHUTDOWN_TIMEOUT)
+        Self::start_with_thread_initializer(config, move |runner| runner.run(processor))
     }
 
-    fn start_with_timeouts<P>(
+    pub(crate) fn start_with_thread_initializer<F>(
         config: WasapiInputConfig,
-        processor: P,
+        initialize: F,
+    ) -> Result<Self, WasapiStartError>
+    where
+        F: FnOnce(WasapiInputThreadRunner) -> Result<(), WasapiStartError> + Send + 'static,
+    {
+        Self::start_with_thread_initializer_timeouts(
+            config,
+            initialize,
+            STARTUP_TIMEOUT,
+            SHUTDOWN_TIMEOUT,
+        )
+    }
+
+    fn start_with_thread_initializer_timeouts<F>(
+        config: WasapiInputConfig,
+        initialize: F,
         startup_timeout: Duration,
         shutdown_timeout: Duration,
     ) -> Result<Self, WasapiStartError>
     where
-        P: InterleavedStereoCaptureProcessor + Send + 'static,
+        F: FnOnce(WasapiInputThreadRunner) -> Result<(), WasapiStartError> + Send + 'static,
     {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let counters = CaptureStreamCounters::default();
@@ -191,29 +244,15 @@ impl WasapiInputStream {
                     sender: completion_sender,
                     status: completion_thread_status,
                 };
-                let callback = match CaptureCallback::try_new_with_counters(
-                    processor,
-                    config.maximum_block_frames,
-                    thread_counters.clone(),
-                ) {
-                    Ok(callback) => callback,
-                    Err(source) => {
-                        completion_status.mark_failed();
-                        let _ = failure_sender.try_send(Err(WasapiStartError::Backend {
-                            stage: WasapiStartupStage::Callback,
-                            detail: source.to_string(),
-                        }));
-                        return;
-                    }
+                let runner = WasapiInputThreadRunner {
+                    config,
+                    stop_requested: thread_stop,
+                    startup: startup_sender,
+                    counters: thread_counters,
+                    status: thread_status,
+                    disconnect_reason: thread_disconnect,
                 };
-                let signals = WasapiInputSignals {
-                    stop_requested: &thread_stop,
-                    startup: &startup_sender,
-                    counters: &thread_counters,
-                    status: &thread_status,
-                    disconnect_reason: &thread_disconnect,
-                };
-                if let Err(error) = run_wasapi_input(&config, callback, signals) {
+                if let Err(error) = initialize(runner) {
                     completion_status.mark_failed();
                     let _ = failure_sender.try_send(Err(error));
                 } else {
@@ -624,6 +663,9 @@ impl Drop for StartedStream<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PendingNativeShutdownWait;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
 
     #[test]
     fn config_rejects_invalid_domains() {
@@ -668,5 +710,198 @@ mod tests {
 
         assert_eq!(captured, input);
         assert_eq!(counters.snapshot().captured_callback_count, 2);
+    }
+
+    #[test]
+    fn thread_local_initializer_failure_is_reported_before_device_start() {
+        let config = WasapiInputConfig::try_new(48_000, 64).unwrap();
+        let result = WasapiInputStream::start_with_thread_initializer(config, |_| {
+            Err(WasapiStartError::Backend {
+                stage: WasapiStartupStage::Callback,
+                detail: "fixture rejected".to_owned(),
+            })
+        });
+
+        assert!(matches!(
+            result,
+            Err(WasapiStartError::Backend {
+                stage: WasapiStartupStage::Callback,
+                detail
+            }) if detail == "fixture rejected"
+        ));
+    }
+
+    #[test]
+    fn thread_local_initializer_must_run_its_context() {
+        let config = WasapiInputConfig::try_new(48_000, 64).unwrap();
+        let result = WasapiInputStream::start_with_thread_initializer(config, |_| Ok(()));
+
+        assert!(matches!(result, Err(WasapiStartError::ThreadTerminated)));
+    }
+
+    #[test]
+    fn thread_local_initializer_panic_is_distinct() {
+        let config = WasapiInputConfig::try_new(48_000, 64).unwrap();
+        let result = WasapiInputStream::start_with_thread_initializer(config, |_| {
+            panic!("initializer panic");
+        });
+
+        assert!(matches!(result, Err(WasapiStartError::ThreadPanicked)));
+    }
+
+    #[test]
+    fn uncooperative_initializer_retains_eventual_shutdown() {
+        let config = WasapiInputConfig::try_new(48_000, 64).unwrap();
+        let (release_sender, release_receiver) = sync_channel(1);
+        let started = Instant::now();
+
+        let result = WasapiInputStream::start_with_thread_initializer_timeouts(
+            config,
+            move |_| {
+                release_receiver.recv().unwrap();
+                Ok(())
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        );
+
+        let Err(WasapiStartError::CancellationPending { mut shutdown }) = result else {
+            panic!("startup cancellation must retain native thread ownership");
+        };
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            shutdown.wait(Duration::from_millis(1)),
+            PendingNativeShutdownWait::TimedOut
+        );
+        release_sender.send(()).unwrap();
+        assert_eq!(
+            shutdown.wait(Duration::from_secs(1)),
+            PendingNativeShutdownWait::Completed
+        );
+    }
+
+    #[test]
+    fn uncooperative_shutdown_returns_a_timeout() {
+        let config = WasapiInputConfig::try_new(48_000, 64).unwrap();
+        let (release_sender, release_receiver) = sync_channel(1);
+        let stream = WasapiInputStream::start_with_thread_initializer_timeouts(
+            config,
+            move |runner| {
+                runner.status.mark_running();
+                let _ = runner.startup.try_send(Ok(()));
+                release_receiver.recv().unwrap();
+                Ok(())
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let started = Instant::now();
+
+        assert_eq!(stream.stop(), Err(WasapiStopError::ShutdownTimeout));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_sender.send(()).unwrap();
+    }
+
+    #[test]
+    fn completed_runtime_failure_is_not_reported_as_clean_shutdown() {
+        let config = WasapiInputConfig::try_new(48_000, 64).unwrap();
+        let stream = WasapiInputStream::start_with_thread_initializer_timeouts(
+            config,
+            |runner| {
+                runner.status.mark_running();
+                let _ = runner.startup.try_send(Ok(()));
+                runner.status.mark_failed();
+                Ok(())
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        assert_eq!(stream.stop(), Err(WasapiStopError::RuntimeFailed));
+    }
+
+    #[test]
+    fn runtime_panic_is_reported_during_stop() {
+        let config = WasapiInputConfig::try_new(48_000, 64).unwrap();
+        let stream = WasapiInputStream::start_with_thread_initializer_timeouts(
+            config,
+            |runner| {
+                runner.status.mark_running();
+                let _ = runner.startup.try_send(Ok(()));
+                panic!("runtime panic");
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        assert_eq!(stream.stop(), Err(WasapiStopError::ThreadPanicked));
+    }
+
+    #[test]
+    fn uncooperative_lifecycle_is_bounded_in_a_subprocess() {
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .args([
+                "--ignored",
+                "--exact",
+                "wasapi_input::tests::uncooperative_lifecycle_subprocess_fixture",
+            ])
+            .env("HYPER_UNCOOPERATIVE_WASAPI_INPUT_FIXTURE", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("uncooperative input lifecycle subprocess exceeded its deadline");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn uncooperative_lifecycle_subprocess_fixture() {
+        if std::env::var_os("HYPER_UNCOOPERATIVE_WASAPI_INPUT_FIXTURE").is_none() {
+            return;
+        }
+        let config = WasapiInputConfig::try_new(48_000, 64).unwrap();
+        let startup = WasapiInputStream::start_with_thread_initializer_timeouts(
+            config.clone(),
+            |_| loop {
+                thread::park();
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        );
+        assert!(matches!(
+            startup,
+            Err(WasapiStartError::CancellationPending { .. })
+        ));
+
+        let stream = WasapiInputStream::start_with_thread_initializer_timeouts(
+            config,
+            |runner| {
+                runner.status.mark_running();
+                let _ = runner.startup.try_send(Ok(()));
+                loop {
+                    thread::park();
+                }
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        assert_eq!(stream.stop(), Err(WasapiStopError::ShutdownTimeout));
     }
 }

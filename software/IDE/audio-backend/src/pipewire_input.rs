@@ -150,6 +150,39 @@ pub struct PipeWireInputStream {
     shutdown_timeout: Duration,
 }
 
+#[derive(Debug)]
+pub(crate) struct PipeWireInputThreadRunner {
+    config: PipeWireInputConfig,
+    stop_requested: Arc<AtomicBool>,
+    startup: SyncSender<Result<(), PipeWireStartError>>,
+    counters: CaptureStreamCounters,
+    status: StreamStatus,
+}
+
+impl PipeWireInputThreadRunner {
+    fn run<P>(self, processor: P) -> Result<(), PipeWireStartError>
+    where
+        P: InterleavedStereoCaptureProcessor + 'static,
+    {
+        let callback = CaptureCallback::try_new_with_counters(
+            processor,
+            self.config.maximum_block_frames,
+            self.counters,
+        )
+        .map_err(|source| PipeWireStartError::Backend {
+            stage: PipeWireStartupStage::Callback,
+            detail: source.to_string(),
+        })?;
+        run_pipewire_input(
+            self.config,
+            callback,
+            self.stop_requested,
+            &self.startup,
+            &self.status,
+        )
+    }
+}
+
 impl PipeWireInputStream {
     /// Connects a stereo `f32` input node and owns its `PipeWire` loop thread.
     ///
@@ -161,17 +194,32 @@ impl PipeWireInputStream {
     where
         P: InterleavedStereoCaptureProcessor + Send + 'static,
     {
-        Self::start_with_timeouts(config, processor, STARTUP_TIMEOUT, SHUTDOWN_TIMEOUT)
+        Self::start_with_thread_initializer(config, move |runner| runner.run(processor))
     }
 
-    fn start_with_timeouts<P>(
+    pub(crate) fn start_with_thread_initializer<F>(
         config: PipeWireInputConfig,
-        processor: P,
+        initialize: F,
+    ) -> Result<Self, PipeWireStartError>
+    where
+        F: FnOnce(PipeWireInputThreadRunner) -> Result<(), PipeWireStartError> + Send + 'static,
+    {
+        Self::start_with_thread_initializer_timeouts(
+            config,
+            initialize,
+            STARTUP_TIMEOUT,
+            SHUTDOWN_TIMEOUT,
+        )
+    }
+
+    fn start_with_thread_initializer_timeouts<F>(
+        config: PipeWireInputConfig,
+        initialize: F,
         startup_timeout: Duration,
         shutdown_timeout: Duration,
     ) -> Result<Self, PipeWireStartError>
     where
-        P: InterleavedStereoCaptureProcessor + Send + 'static,
+        F: FnOnce(PipeWireInputThreadRunner) -> Result<(), PipeWireStartError> + Send + 'static,
     {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let counters = CaptureStreamCounters::default();
@@ -191,28 +239,14 @@ impl PipeWireInputStream {
                     sender: completion_sender,
                     status: completion_thread_status,
                 };
-                let callback = match CaptureCallback::try_new_with_counters(
-                    processor,
-                    config.maximum_block_frames,
-                    thread_counters,
-                ) {
-                    Ok(callback) => callback,
-                    Err(source) => {
-                        completion_status.mark_failed();
-                        let _ = failure_sender.try_send(Err(PipeWireStartError::Backend {
-                            stage: PipeWireStartupStage::Callback,
-                            detail: source.to_string(),
-                        }));
-                        return;
-                    }
-                };
-                if let Err(error) = run_pipewire_input(
+                let runner = PipeWireInputThreadRunner {
                     config,
-                    callback,
-                    thread_stop,
-                    &startup_sender,
-                    &thread_status,
-                ) {
+                    stop_requested: thread_stop,
+                    startup: startup_sender,
+                    counters: thread_counters,
+                    status: thread_status,
+                };
+                if let Err(error) = initialize(runner) {
                     completion_status.mark_failed();
                     let _ = failure_sender.try_send(Err(error));
                 } else {
@@ -504,7 +538,9 @@ fn backend_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PendingNativeShutdownWait;
     use core::sync::atomic::AtomicUsize;
+    use std::process::{Command, Stdio};
     use std::time::Instant;
 
     #[test]
@@ -535,6 +571,199 @@ mod tests {
     fn stereo_format_is_a_valid_spa_pod() {
         let format = build_format(48_000).unwrap();
         assert!(Pod::from_bytes(&format).is_some());
+    }
+
+    #[test]
+    fn thread_local_initializer_failure_is_reported_before_backend_start() {
+        let config = PipeWireInputConfig::try_new(48_000, 64).unwrap();
+        let result = PipeWireInputStream::start_with_thread_initializer(config, |_| {
+            Err(PipeWireStartError::Backend {
+                stage: PipeWireStartupStage::Callback,
+                detail: "fixture rejected".to_owned(),
+            })
+        });
+
+        assert!(matches!(
+            result,
+            Err(PipeWireStartError::Backend {
+                stage: PipeWireStartupStage::Callback,
+                detail
+            }) if detail == "fixture rejected"
+        ));
+    }
+
+    #[test]
+    fn thread_local_initializer_must_run_its_context() {
+        let config = PipeWireInputConfig::try_new(48_000, 64).unwrap();
+        let result = PipeWireInputStream::start_with_thread_initializer(config, |_| Ok(()));
+
+        assert!(matches!(result, Err(PipeWireStartError::ThreadTerminated)));
+    }
+
+    #[test]
+    fn thread_local_initializer_panic_is_distinct() {
+        let config = PipeWireInputConfig::try_new(48_000, 64).unwrap();
+        let result = PipeWireInputStream::start_with_thread_initializer(config, |_| {
+            panic!("initializer panic");
+        });
+
+        assert!(matches!(result, Err(PipeWireStartError::ThreadPanicked)));
+    }
+
+    #[test]
+    fn uncooperative_initializer_retains_eventual_shutdown() {
+        let config = PipeWireInputConfig::try_new(48_000, 64).unwrap();
+        let (release_sender, release_receiver) = sync_channel(1);
+        let started = Instant::now();
+
+        let result = PipeWireInputStream::start_with_thread_initializer_timeouts(
+            config,
+            move |_| {
+                release_receiver.recv().unwrap();
+                Ok(())
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        );
+
+        let Err(PipeWireStartError::CancellationPending { mut shutdown }) = result else {
+            panic!("startup cancellation must retain native thread ownership");
+        };
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            shutdown.wait(Duration::from_millis(1)),
+            PendingNativeShutdownWait::TimedOut
+        );
+        release_sender.send(()).unwrap();
+        assert_eq!(
+            shutdown.wait(Duration::from_secs(1)),
+            PendingNativeShutdownWait::Completed
+        );
+    }
+
+    #[test]
+    fn uncooperative_shutdown_returns_a_timeout() {
+        let config = PipeWireInputConfig::try_new(48_000, 64).unwrap();
+        let (release_sender, release_receiver) = sync_channel(1);
+        let stream = PipeWireInputStream::start_with_thread_initializer_timeouts(
+            config,
+            move |runner| {
+                runner.status.mark_running();
+                let _ = runner.startup.try_send(Ok(()));
+                release_receiver.recv().unwrap();
+                Ok(())
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let started = Instant::now();
+
+        assert_eq!(stream.stop(), Err(PipeWireStopError::ShutdownTimeout));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_sender.send(()).unwrap();
+    }
+
+    #[test]
+    fn completed_runtime_failure_is_not_reported_as_clean_shutdown() {
+        let config = PipeWireInputConfig::try_new(48_000, 64).unwrap();
+        let stream = PipeWireInputStream::start_with_thread_initializer_timeouts(
+            config,
+            |runner| {
+                runner.status.mark_running();
+                let _ = runner.startup.try_send(Ok(()));
+                runner.status.mark_failed();
+                Ok(())
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        assert_eq!(stream.stop(), Err(PipeWireStopError::RuntimeFailed));
+    }
+
+    #[test]
+    fn runtime_panic_is_reported_during_stop() {
+        let config = PipeWireInputConfig::try_new(48_000, 64).unwrap();
+        let stream = PipeWireInputStream::start_with_thread_initializer_timeouts(
+            config,
+            |runner| {
+                runner.status.mark_running();
+                let _ = runner.startup.try_send(Ok(()));
+                panic!("runtime panic");
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        assert_eq!(stream.stop(), Err(PipeWireStopError::ThreadPanicked));
+    }
+
+    #[test]
+    fn uncooperative_lifecycle_is_bounded_in_a_subprocess() {
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .args([
+                "--ignored",
+                "--exact",
+                "pipewire_input::tests::uncooperative_lifecycle_subprocess_fixture",
+            ])
+            .env("HYPER_UNCOOPERATIVE_PIPEWIRE_INPUT_FIXTURE", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("uncooperative input lifecycle subprocess exceeded its deadline");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn uncooperative_lifecycle_subprocess_fixture() {
+        if std::env::var_os("HYPER_UNCOOPERATIVE_PIPEWIRE_INPUT_FIXTURE").is_none() {
+            return;
+        }
+        let config = PipeWireInputConfig::try_new(48_000, 64).unwrap();
+        let startup = PipeWireInputStream::start_with_thread_initializer_timeouts(
+            config.clone(),
+            |_| loop {
+                thread::park();
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        );
+        assert!(matches!(
+            startup,
+            Err(PipeWireStartError::CancellationPending { .. })
+        ));
+
+        let stream = PipeWireInputStream::start_with_thread_initializer_timeouts(
+            config,
+            |runner| {
+                runner.status.mark_running();
+                let _ = runner.startup.try_send(Ok(()));
+                loop {
+                    thread::park();
+                }
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        assert_eq!(stream.stop(), Err(PipeWireStopError::ShutdownTimeout));
     }
 
     #[test]
