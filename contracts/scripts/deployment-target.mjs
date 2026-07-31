@@ -28,9 +28,10 @@ import {
   revokePairedClient,
   validateDeploymentAuthorizationState,
   validateInitialDeploymentAuthorizationState,
-  verifyDeploymentRequestBundle,
 } from "../lib/deployment-authorization.mjs";
 import {
+  assertRetainedDirectory,
+  openRetainedDirectory,
   readStableFile,
   syncDirectoryTree,
   syncPublishedDirectory,
@@ -110,7 +111,7 @@ async function createDeploymentValidators() {
 
 const deploymentValidators = createDeploymentValidators();
 
-async function withDeploymentLock(targetRoot, operation) {
+async function withRetainedDeploymentLock(targetRoot, targetHandle, operation) {
   const lockPath = join(targetRoot, "deployment.lock");
   const owner = {
     format: "hyper-deployment-lock",
@@ -133,11 +134,22 @@ async function withDeploymentLock(targetRoot, operation) {
   try {
     await lock.writeFile(ownerBytes);
     await lock.sync();
+    await assertRetainedDirectory(
+      targetHandle,
+      targetRoot,
+      "deployment target directory",
+    );
   } catch (error) {
     try {
       await lock.close();
     } finally {
-      await unlink(lockPath).catch(() => {});
+      await assertRetainedDirectory(
+        targetHandle,
+        targetRoot,
+        "deployment target directory",
+      )
+        .then(() => unlink(lockPath))
+        .catch(() => {});
     }
     throw error;
   }
@@ -145,7 +157,7 @@ async function withDeploymentLock(targetRoot, operation) {
   let result;
   let operationError;
   try {
-    result = await operation();
+    result = await operation(targetHandle);
   } catch (error) {
     operationError = error;
   }
@@ -153,6 +165,11 @@ async function withDeploymentLock(targetRoot, operation) {
   let releaseError;
   try {
     await lock.close();
+    await assertRetainedDirectory(
+      targetHandle,
+      targetRoot,
+      "deployment target directory",
+    );
     const publishedOwner = await readFile(lockPath);
     assert(
       publishedOwner.equals(ownerBytes),
@@ -174,8 +191,44 @@ async function withDeploymentLock(targetRoot, operation) {
   return result;
 }
 
-async function inspectBundle(bundlePath) {
-  const inspected = await inspectDeploymentBundle(bundlePath);
+async function withDeploymentLock(targetRoot, operation) {
+  const targetHandle = await openRetainedDirectory(targetRoot);
+  let result;
+  let operationError;
+  try {
+    await assertRetainedDirectory(
+      targetHandle,
+      targetRoot,
+      "deployment target directory",
+    );
+    result = await withRetainedDeploymentLock(
+      targetRoot,
+      targetHandle,
+      operation,
+    );
+  } catch (error) {
+    operationError = error;
+  }
+
+  let releaseError;
+  try {
+    await targetHandle.close();
+  } catch (error) {
+    releaseError = error;
+  }
+  if (operationError && releaseError) {
+    throw new AggregateError(
+      [operationError, releaseError],
+      "deployment transaction and target authority release both failed",
+    );
+  }
+  if (operationError) throw operationError;
+  if (releaseError) throw releaseError;
+  return result;
+}
+
+async function inspectBundle(bundlePath, options = {}) {
+  const inspected = await inspectDeploymentBundle(bundlePath, options);
   return {
     manifest: inspected.manifest,
     sha256: inspected.bundle_sha256,
@@ -351,6 +404,71 @@ async function requireBundlesRoot(targetRoot) {
     "deployment bundles directory escapes the target",
   );
   return bundlesRoot;
+}
+
+async function retainDeploymentDirectories(targetRoot, targetHandle) {
+  const bundlesRoot = await requireBundlesRoot(targetRoot);
+  await assertRetainedDirectory(
+    targetHandle,
+    targetRoot,
+    "deployment target directory",
+  );
+  const bundlesHandle = await openRetainedDirectory(bundlesRoot);
+  try {
+    await assertRetainedDirectory(
+      bundlesHandle,
+      bundlesRoot,
+      "deployment bundles directory",
+    );
+    return { bundlesHandle, bundlesRoot, targetHandle };
+  } catch (error) {
+    await bundlesHandle.close();
+    throw error;
+  }
+}
+
+async function assertDeploymentDirectoriesRetained(targetRoot, retained) {
+  await Promise.all([
+    assertRetainedDirectory(
+      retained.targetHandle,
+      targetRoot,
+      "deployment target directory",
+    ),
+    assertRetainedDirectory(
+      retained.bundlesHandle,
+      retained.bundlesRoot,
+      "deployment bundles directory",
+    ),
+  ]);
+}
+
+async function closeRetainedDeploymentDirectories(retained) {
+  await retained.bundlesHandle.close();
+}
+
+async function withRetainedDeploymentDirectories(retained, operation) {
+  let result;
+  let operationError;
+  try {
+    result = await operation();
+  } catch (error) {
+    operationError = error;
+  }
+  let releaseError;
+  try {
+    await closeRetainedDeploymentDirectories(retained);
+  } catch (error) {
+    releaseError = error;
+  }
+  if (operationError && releaseError) {
+    throw new AggregateError(
+      [operationError, releaseError],
+      "deployment installation and directory authority release both failed",
+    );
+  }
+  if (operationError) throw operationError;
+  if (releaseError) throw releaseError;
+  return result;
 }
 
 function protectedBundleIdentities(state) {
@@ -753,98 +871,125 @@ export async function recoverDeploymentTarget(
   });
 }
 
-async function installIdentity(sourceRoot, targetRoot, faultAt = undefined) {
-  const source = await inspectBundle(sourceRoot);
+async function installIdentity(
+  sourceRoot,
+  targetRoot,
+  targetHandle,
+  { faultAt = undefined, expectedIdentity = undefined } = {},
+) {
   const policy = await readStoragePolicy(targetRoot);
   assert(policy, "deployment storage policy is not configured");
-  const bundlesRoot = await requireBundlesRoot(targetRoot);
+  const maximumBundleBytes =
+    expectedIdentity?.byte_length ?? policy.max_installed_bytes;
+  const inspectionOptions = {
+    maximumBundleBytes,
+    ...(expectedIdentity
+      ? {
+          expectedBundleSha256: expectedIdentity.sha256,
+          expectedBundleByteLength: expectedIdentity.byte_length,
+        }
+      : {}),
+  };
+  const source = await inspectBundle(sourceRoot, inspectionOptions);
+  const retained = await retainDeploymentDirectories(targetRoot, targetHandle);
+  const { bundlesRoot } = retained;
   const installedPath = join(bundlesRoot, source.sha256);
-  try {
-    const status = await lstat(installedPath);
-    assert(status.isDirectory(), "installed bundle path is not a directory");
-    const installed = await inspectBundle(installedPath);
-    assert.equal(installed.sha256, source.sha256);
-    return source.sha256;
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
+  return withRetainedDeploymentDirectories(retained, async () => {
+    try {
+      const status = await lstat(installedPath);
+      assert(status.isDirectory(), "installed bundle path is not a directory");
+      const installed = await inspectBundle(installedPath, inspectionOptions);
+      assert.equal(installed.sha256, source.sha256);
+      return source.sha256;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
 
-  const state = await readState(targetRoot);
-  const bundles = await inspectInstalledBundles(
-    targetRoot,
-    policy.max_installed_bundles,
-  );
-  const usage = summarizeStorage(bundles, protectedBundleIdentities(state));
-  assertPolicyCapacity(
-    policy,
-    usage,
-    await availableBytes(targetRoot),
-    source.byte_length,
-  );
-
-  const stagingPath = join(targetRoot, `.install-${randomUUID()}`);
-  let installed = false;
-  try {
-    await cp(sourceRoot, stagingPath, {
-      recursive: true,
-      errorOnExist: true,
-      force: false,
-      verbatimSymlinks: true,
-    });
-    injectFault(faultAt, "after-staging-copy");
-    const staged = await inspectBundle(stagingPath);
-    assert.equal(
-      staged.sha256,
-      source.sha256,
-      "staged bundle identity changed during transfer",
+    const state = await readState(targetRoot);
+    const bundles = await inspectInstalledBundles(
+      targetRoot,
+      policy.max_installed_bundles,
     );
-    injectFault(faultAt, "after-staging-verification");
-    await syncDirectoryTree(stagingPath, [
-      "manifest.json",
-      ...staged.manifest.files.map((file) => file.path),
-    ]);
-    const durable = await inspectBundle(stagingPath);
-    assert.equal(
-      durable.sha256,
-      source.sha256,
-      "staged bundle identity changed before publication",
-    );
-    assert.equal(
-      await requireBundlesRoot(targetRoot),
-      bundlesRoot,
-      "deployment bundles directory changed during installation",
-    );
-    await rename(stagingPath, installedPath);
-    installed = true;
-    await syncPublishedDirectory(installedPath);
-    injectFault(faultAt, "after-bundle-publication");
+    const usage = summarizeStorage(bundles, protectedBundleIdentities(state));
     assertPolicyCapacity(
       policy,
-      {
-        ...usage,
-        installed_bundle_count: usage.installed_bundle_count + 1,
-        installed_bytes: usage.installed_bytes + source.byte_length,
-      },
+      usage,
       await availableBytes(targetRoot),
+      source.byte_length,
     );
-    installed = false;
-    injectFault(faultAt, "after-bundle-installation");
-  } finally {
-    await rm(stagingPath, { recursive: true, force: true });
-    if (installed) {
-      await rm(installedPath, { recursive: true, force: true });
+
+    const stagingPath = join(targetRoot, `.install-${randomUUID()}`);
+    let installed = false;
+    try {
+      await cp(sourceRoot, stagingPath, {
+        recursive: true,
+        errorOnExist: true,
+        force: false,
+        verbatimSymlinks: true,
+      });
+      injectFault(faultAt, "after-staging-copy");
+      const staged = await inspectBundle(stagingPath, inspectionOptions);
+      assert.equal(
+        staged.sha256,
+        source.sha256,
+        "staged bundle identity changed during transfer",
+      );
+      injectFault(faultAt, "after-staging-verification");
+      await syncDirectoryTree(stagingPath, [
+        "manifest.json",
+        ...staged.manifest.files.map((file) => file.path),
+      ]);
+      const durable = await inspectBundle(stagingPath, inspectionOptions);
+      assert.equal(
+        durable.sha256,
+        source.sha256,
+        "staged bundle identity changed before publication",
+      );
+      await assertDeploymentDirectoriesRetained(targetRoot, retained);
+      await rename(stagingPath, installedPath);
+      installed = true;
+      await assertDeploymentDirectoriesRetained(targetRoot, retained);
+      const published = await inspectBundle(installedPath, inspectionOptions);
+      assert.equal(
+        published.sha256,
+        source.sha256,
+        "published bundle identity changed during installation",
+      );
+      await syncPublishedDirectory(installedPath);
+      injectFault(faultAt, "after-bundle-publication");
+      assertPolicyCapacity(
+        policy,
+        {
+          ...usage,
+          installed_bundle_count: usage.installed_bundle_count + 1,
+          installed_bytes: usage.installed_bytes + source.byte_length,
+        },
+        await availableBytes(targetRoot),
+      );
+      installed = false;
+      injectFault(faultAt, "after-bundle-installation");
+    } finally {
+      await rm(stagingPath, { recursive: true, force: true });
+      if (installed) {
+        await rm(installedPath, { recursive: true, force: true });
+      }
     }
-  }
-  return source.sha256;
+    return source.sha256;
+  });
 }
 
 export async function installBundle(bundlePath, targetPath, options = {}) {
   const faultAt = validateFaultBoundary(options.faultAt);
   const sourceRoot = resolve(bundlePath);
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async () => {
+  return withDeploymentLock(targetRoot, async (targetHandle) => {
     await assertDirectDeploymentAllowed(targetRoot);
-    return installIdentity(sourceRoot, targetRoot, faultAt);
+    return installIdentity(
+      sourceRoot,
+      targetRoot,
+      targetHandle,
+      { faultAt },
+    );
   });
 }
 
@@ -926,9 +1071,14 @@ export async function deployBundle(
   const faultAt = validateFaultBoundary(options.faultAt);
   const sourceRoot = resolve(bundlePath);
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async () => {
+  return withDeploymentLock(targetRoot, async (targetHandle) => {
     await assertDirectDeploymentAllowed(targetRoot);
-    const identity = await installIdentity(sourceRoot, targetRoot, faultAt);
+    const identity = await installIdentity(
+      sourceRoot,
+      targetRoot,
+      targetHandle,
+      { faultAt },
+    );
     return activateIdentity(
       targetRoot,
       identity,
@@ -960,7 +1110,7 @@ export async function authenticatedDeployBundle(
   const faultAt = validateFaultBoundary(options.faultAt);
   const sourceRoot = resolve(bundlePath);
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async () => {
+  return withDeploymentLock(targetRoot, async (targetHandle) => {
     const authorizationState = await readAuthorizationState(targetRoot);
     assert(
       authorizationState,
@@ -1003,12 +1153,23 @@ export async function authenticatedDeployBundle(
     let deploymentState = null;
     let succeeded = false;
     try {
-      await verifyDeploymentRequestBundle(
-        request,
+      const identity = await installIdentity(
         sourceRoot,
-        request.runtime_version,
+        targetRoot,
+        targetHandle,
+        {
+          faultAt,
+          expectedIdentity: {
+            sha256: request.bundle_sha256,
+            byte_length: request.bundle_byte_length,
+          },
+        },
       );
-      const identity = await installIdentity(sourceRoot, targetRoot, faultAt);
+      assert.equal(
+        identity,
+        request.bundle_sha256,
+        "installed deployment identity does not match the authorized bundle",
+      );
       deploymentState = await activateIdentity(
         targetRoot,
         identity,

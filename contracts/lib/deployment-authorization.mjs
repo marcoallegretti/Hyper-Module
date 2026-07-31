@@ -143,7 +143,11 @@ export async function verifyDeploymentRequestBundle(
     request.runtime_version,
     "signed deployment request runtime version mismatch",
   );
-  const bundle = await inspectDeploymentBundle(bundlePath);
+  const bundle = await inspectDeploymentBundle(bundlePath, {
+    maximumBundleBytes: request.bundle_byte_length,
+    expectedBundleSha256: request.bundle_sha256,
+    expectedBundleByteLength: request.bundle_byte_length,
+  });
   assert.equal(
     bundle.bundle_sha256,
     request.bundle_sha256,

@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import Ajv2020 from "ajv/dist/2020.js";
 import canonicalize from "canonicalize";
-import { parseFile } from "music-metadata";
+import { parseStream } from "music-metadata";
 
 import { assertArrangementInvariants } from "../lib/arrangement.mjs";
 import {
@@ -123,15 +123,21 @@ function isLocalOnlyPath(path) {
   return path.startsWith("cache/") || path.startsWith("backups/");
 }
 
-async function readAudioAssetFormat(rootPath, asset) {
-  const assetPath = resolve(rootPath, ...asset.path.split("/"));
+async function readAudioAssetFormat(stream, asset, fileInfo) {
   let metadata;
   try {
-    metadata = await parseFile(assetPath, {
-      duration: true,
-      skipCovers: true,
-      skipPostHeaders: true,
-    });
+    metadata = await parseStream(
+      stream,
+      {
+        path: asset.path,
+        size: fileInfo.byteLength,
+      },
+      {
+        duration: true,
+        skipCovers: true,
+        skipPostHeaders: true,
+      },
+    );
   } catch (error) {
     throw new Error(`${asset.path}: audio metadata parsing failed`, {
       cause: error,
@@ -352,10 +358,6 @@ async function verifyProjectManifest(
     resources.set(resource.id, resource);
   }
 
-  for (const record of project.assets) {
-    await verifyDescribedFile(rootPath, rootRealPath, record);
-  }
-
   const tracks = project.resources
     .filter((record) => record.role === "track")
     .map((record) => resources.get(record.id));
@@ -380,7 +382,26 @@ async function verifyProjectManifest(
   const automationTakes = project.resources
     .filter((record) => record.role === "automation-take")
     .map((record) => resources.get(record.id));
+  const requiredAudioFormatIds = new Set([
+    ...clips.map((clip) => clip.source.asset_id),
+    ...recordingMetadata.map((metadata) => metadata.asset_id),
+  ]);
   const audioFormats = new Map();
+
+  for (const record of project.assets) {
+    if (
+      requiredAudioFormatIds.has(record.id) &&
+      (record.media_type === "audio/flac" || record.media_type === "audio/wav")
+    ) {
+      const verified = await verifyDescribedFile(rootPath, rootRealPath, record, {
+        inspect: (stream, fileInfo) =>
+          readAudioAssetFormat(stream, record, fileInfo),
+      });
+      audioFormats.set(record.id, verified.inspection);
+    } else {
+      await verifyDescribedFile(rootPath, rootRealPath, record);
+    }
+  }
   const trackOrders = tracks.map((track) => track.order);
   assert.equal(
     new Set(trackOrders).size,
@@ -451,11 +472,8 @@ async function verifyProjectManifest(
       asset.media_type === "audio/flac" || asset.media_type === "audio/wav",
       `${clip.name}: source asset must be audio`,
     );
-    let audioFormat = audioFormats.get(asset.id);
-    if (audioFormat === undefined) {
-      audioFormat = await readAudioAssetFormat(rootPath, asset);
-      audioFormats.set(asset.id, audioFormat);
-    }
+    const audioFormat = audioFormats.get(asset.id);
+    assert(audioFormat, `${asset.path}: verified audio format is unavailable`);
     assert(
       clip.source.start_frame <=
         audioFormat.frameCount - clip.source.frame_count,
@@ -497,11 +515,8 @@ async function verifyProjectManifest(
       );
     }
 
-    let audioFormat = audioFormats.get(asset.id);
-    if (audioFormat === undefined) {
-      audioFormat = await readAudioAssetFormat(rootPath, asset);
-      audioFormats.set(asset.id, audioFormat);
-    }
+    const audioFormat = audioFormats.get(asset.id);
+    assert(audioFormat, `${asset.path}: verified audio format is unavailable`);
     assert.equal(
       metadata.sample_rate_hz,
       project.sample_rate_hz,

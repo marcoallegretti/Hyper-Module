@@ -18,7 +18,7 @@ import canonicalize from "canonicalize";
 import { collectRegularFiles } from "../lib/filesystem-tree.mjs";
 import { buildProjectBundle } from "./build-project-bundle.mjs";
 import { createMinimalProject } from "./test-project-fixture.mjs";
-import { verifyBundle } from "./verify-bundle.mjs";
+import { verifyBundle, verifyBundleArtifact } from "./verify-bundle.mjs";
 
 async function createValidBundle(parent, name) {
   const fixture = await createMinimalProject(parent, `${name}-source`);
@@ -33,6 +33,32 @@ const temporaryRoot = await mkdtemp(
 try {
   const valid = await createValidBundle(temporaryRoot, "valid");
   await verifyBundle(valid);
+  const verifiedArtifact = await verifyBundleArtifact(valid);
+  assert(Object.isFrozen(verifiedArtifact));
+  assert(Object.isFrozen(verifiedArtifact.manifest));
+
+  const preflight = join(temporaryRoot, "preflight-limit");
+  await cp(valid, preflight, { recursive: true });
+  const preflightManifestBytes = await readFile(join(preflight, "manifest.json"));
+  const preflightManifest = JSON.parse(preflightManifestBytes);
+  const preflightPayload = join(
+    preflight,
+    ...preflightManifest.files[0].path.split("/"),
+  );
+  const preflightPayloadBytes = await readFile(preflightPayload);
+  await writeFile(preflightPayload, Buffer.alloc(preflightPayloadBytes.length, 0x78));
+  await assert.rejects(
+    verifyBundleArtifact(preflight, {
+      maximumBundleBytes: preflightManifestBytes.byteLength,
+    }),
+    /deployment bundle exceeds/,
+  );
+  await assert.rejects(
+    verifyBundleArtifact(preflight, {
+      expectedBundleSha256: "0".repeat(64),
+    }),
+    /bundle identity mismatch/,
+  );
 
   const noncanonical = join(temporaryRoot, "noncanonical");
   await cp(valid, noncanonical, { recursive: true });
@@ -153,7 +179,7 @@ try {
   );
   await assert.rejects(verifyBundle(oversized), /exceeds 1048576 bytes/);
 
-  console.log("Bundle verifier passed: 11 filesystem cases");
+  console.log("Bundle verifier passed: 13 filesystem cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

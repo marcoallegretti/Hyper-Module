@@ -860,6 +860,26 @@ try {
   await writeFile(capturedPath, replacementBytes);
   assert.deepEqual(captured, originalBytes);
 
+  await writeFile(capturedPath, originalBytes);
+  const inspected = await verifyDescribedFile(
+    capturedBytesRoot,
+    await realpath(capturedBytesRoot),
+    {
+      path: "resource.json",
+      byte_length: originalBytes.length,
+      sha256: createHash("sha256").update(originalBytes).digest("hex"),
+    },
+    {
+      inspect: async (stream) => {
+        const chunks = [];
+        for await (const chunk of stream) chunks.push(chunk);
+        return Buffer.concat(chunks);
+      },
+    },
+  );
+  assert.equal(inspected.bytes, null);
+  assert.deepEqual(inspected.inspection, originalBytes);
+
   const undeclared = join(temporaryRoot, "undeclared");
   await cp(valid, undeclared, { recursive: true });
   await writeFile(join(undeclared, "tracks", "undeclared.json"), "{}");
@@ -1805,7 +1825,7 @@ try {
     /project must contain at most one control-mapping resource/,
   );
 
-  console.log("Project verifier passed: 72 filesystem cases");
+  console.log("Project verifier passed: 73 filesystem cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

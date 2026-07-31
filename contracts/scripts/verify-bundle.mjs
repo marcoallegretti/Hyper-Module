@@ -8,6 +8,7 @@ import {
   realpath,
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { Readable } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import Ajv2020 from "ajv/dist/2020.js";
@@ -21,6 +22,36 @@ import { strictParse } from "../lib/strict-json.mjs";
 
 const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const manifestLimitBytes = 1024 * 1024;
+const inspectionChunkBytes = 64 * 1024;
+const sha256Pattern = /^[0-9a-f]{64}$/;
+
+function createRetainedReadStream(handle, byteLength, label) {
+  async function* readChunks() {
+    let position = 0;
+    while (position < byteLength) {
+      const chunk = Buffer.allocUnsafe(
+        Math.min(inspectionChunkBytes, byteLength - position),
+      );
+      const { bytesRead } = await handle.read(
+        chunk,
+        0,
+        chunk.byteLength,
+        position,
+      );
+      assert(bytesRead > 0, `${label}: payload became shorter during inspection`);
+      position += bytesRead;
+      yield bytesRead === chunk.byteLength ? chunk : chunk.subarray(0, bytesRead);
+    }
+    const overflow = Buffer.alloc(1);
+    const { bytesRead } = await handle.read(overflow, 0, 1, byteLength);
+    assert.equal(
+      bytesRead,
+      0,
+      `${label}: payload became longer during inspection`,
+    );
+  }
+  return Readable.from(readChunks(), { objectMode: false });
+}
 
 export async function readStableRegularFile(path, label, maximumBytes) {
   const noFollow = constants.O_NOFOLLOW ?? 0;
@@ -127,8 +158,12 @@ export async function verifyDescribedFile(
   rootPath,
   rootRealPath,
   descriptor,
-  { captureBytes = false } = {},
+  { captureBytes = false, inspect = undefined } = {},
 ) {
+  assert(
+    inspect === undefined || typeof inspect === "function",
+    "described-file inspector must be a function",
+  );
   const absolutePath = resolve(rootPath, ...descriptor.path.split("/"));
   const relativePath = relative(rootPath, absolutePath);
   assert(
@@ -167,13 +202,46 @@ export async function verifyDescribedFile(
   const handle = await open(absolutePath, constants.O_RDONLY | noFollow);
   let before;
   let after;
+  let inspection;
   const digest = createHash("sha256");
   const chunks = captureBytes ? [] : null;
   try {
     before = await handle.stat();
+    let observedBytes = 0;
     for await (const chunk of handle.createReadStream({ autoClose: false })) {
+      observedBytes += chunk.byteLength;
+      assert(
+        observedBytes <= descriptor.byte_length,
+        `${descriptor.path}: payload exceeded declared byte length while reading`,
+      );
       digest.update(chunk);
       chunks?.push(chunk);
+    }
+    assert.equal(
+      observedBytes,
+      descriptor.byte_length,
+      `${descriptor.path}: payload byte length changed during verification`,
+    );
+    assert.equal(
+      digest.digest("hex"),
+      descriptor.sha256,
+      `${descriptor.path}: SHA-256 mismatch`,
+    );
+    if (inspect) {
+      const stream = createRetainedReadStream(
+        handle,
+        descriptor.byte_length,
+        descriptor.path,
+      );
+      try {
+        inspection = await inspect(stream, {
+          byteLength: descriptor.byte_length,
+          mediaType: descriptor.media_type,
+          path: descriptor.path,
+        });
+      } finally {
+        stream.destroy();
+      }
     }
     after = await handle.stat();
   } finally {
@@ -198,12 +266,6 @@ export async function verifyDescribedFile(
     after.ctimeMs,
     `${descriptor.path}: payload metadata changed during verification`,
   );
-  assert.equal(
-    digest.digest("hex"),
-    descriptor.sha256,
-    `${descriptor.path}: SHA-256 mismatch`,
-  );
-
   const finalStatus = await lstat(absolutePath);
   assert(
     finalStatus.isFile() && !finalStatus.isSymbolicLink(),
@@ -230,10 +292,60 @@ export async function verifyDescribedFile(
     `${descriptor.path}: payload path changed during verification`,
   );
 
+  if (inspect) {
+    return {
+      bytes: captureBytes ? Buffer.concat(chunks, after.size) : null,
+      inspection,
+    };
+  }
   return captureBytes ? Buffer.concat(chunks, after.size) : null;
 }
 
-export async function verifyBundle(bundlePath) {
+function checkedBundleByteLength(manifestBytes, manifest) {
+  let byteLength = manifestBytes.byteLength;
+  for (const descriptor of manifest.files) {
+    byteLength += descriptor.byte_length;
+    assert(
+      Number.isSafeInteger(byteLength),
+      "deployment bundle byte accounting exceeds safe integer range",
+    );
+  }
+  return byteLength;
+}
+
+function freezeManifest(value) {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.values(value).forEach(freezeManifest);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+export async function verifyBundleArtifact(
+  bundlePath,
+  {
+    maximumBundleBytes = Number.MAX_SAFE_INTEGER,
+    expectedBundleSha256 = undefined,
+    expectedBundleByteLength = undefined,
+  } = {},
+) {
+  assert(
+    Number.isSafeInteger(maximumBundleBytes) && maximumBundleBytes >= 0,
+    "maximum bundle bytes must be a non-negative safe integer",
+  );
+  assert(
+    expectedBundleSha256 === undefined ||
+      (typeof expectedBundleSha256 === "string" &&
+        sha256Pattern.test(expectedBundleSha256)),
+    "expected bundle SHA-256 must be a lowercase hexadecimal digest",
+  );
+  assert(
+    expectedBundleByteLength === undefined ||
+      (Number.isSafeInteger(expectedBundleByteLength) &&
+        expectedBundleByteLength >= 0 &&
+        expectedBundleByteLength <= maximumBundleBytes),
+    "expected bundle byte length must fit the verification limit",
+  );
   const rootPath = resolve(bundlePath);
   const rootStatus = await lstat(rootPath);
   assert(
@@ -246,7 +358,7 @@ export async function verifyBundle(bundlePath) {
   const manifestBytes = await readStableRegularFile(
     manifestPath,
     "manifest.json",
-    manifestLimitBytes,
+    Math.min(manifestLimitBytes, maximumBundleBytes),
   );
   assert(
     !manifestBytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])),
@@ -274,6 +386,29 @@ export async function verifyBundle(bundlePath) {
     `manifest schema validation failed: ${JSON.stringify(validate.errors)}`,
   );
   assertRuntimeInvariants(manifest);
+
+  const bundleSha256 = createHash("sha256")
+    .update(manifestBytes)
+    .digest("hex");
+  const bundleByteLength = checkedBundleByteLength(manifestBytes, manifest);
+  assert(
+    bundleByteLength <= maximumBundleBytes,
+    `deployment bundle exceeds ${maximumBundleBytes} bytes`,
+  );
+  if (expectedBundleSha256 !== undefined) {
+    assert.equal(
+      bundleSha256,
+      expectedBundleSha256,
+      "signed deployment request bundle identity mismatch",
+    );
+  }
+  if (expectedBundleByteLength !== undefined) {
+    assert.equal(
+      bundleByteLength,
+      expectedBundleByteLength,
+      "signed deployment request bundle byte length mismatch",
+    );
+  }
 
   const declaredFiles = new Set([
     "manifest.json",
@@ -373,7 +508,15 @@ export async function verifyBundle(bundlePath) {
     "manifest.json changed during verification",
   );
 
-  return manifest;
+  return Object.freeze({
+    manifest: freezeManifest(manifest),
+    bundle_sha256: bundleSha256,
+    bundle_byte_length: bundleByteLength,
+  });
+}
+
+export async function verifyBundle(bundlePath) {
+  return (await verifyBundleArtifact(bundlePath)).manifest;
 }
 
 const invokedPath = process.argv[1]

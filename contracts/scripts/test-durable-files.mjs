@@ -12,6 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  assertRetainedDirectory,
+  openRetainedDirectory,
   readStableFile,
   syncDirectoryTree,
   syncPublishedDirectory,
@@ -31,6 +33,41 @@ try {
   assert.equal(await readFile(published, "utf8"), "durable");
   assert.equal((await readStableFile(published, 7)).toString("utf8"), "durable");
   await assert.rejects(readStableFile(published, 6), /exceeds 6 bytes/);
+
+  const retainedPath = join(root, "retained-directory");
+  const displacedPath = join(root, "displaced-directory");
+  await mkdir(retainedPath);
+  const retainedHandle = await openRetainedDirectory(retainedPath);
+  try {
+    let replacementPrevented = false;
+    try {
+      await rename(retainedPath, displacedPath);
+      await mkdir(retainedPath);
+    } catch (error) {
+      replacementPrevented =
+        process.platform === "win32" &&
+        (error.code === "EACCES" || error.code === "EPERM");
+      if (!replacementPrevented) throw error;
+    }
+    if (replacementPrevented) {
+      await assertRetainedDirectory(
+        retainedHandle,
+        retainedPath,
+        "retained test directory",
+      );
+    } else {
+      await assert.rejects(
+        assertRetainedDirectory(
+          retainedHandle,
+          retainedPath,
+          "retained test directory",
+        ),
+        /filesystem object changed/,
+      );
+    }
+  } finally {
+    await retainedHandle.close();
+  }
 
   const bounded = join(root, "bounded");
   await mkdir(bounded);

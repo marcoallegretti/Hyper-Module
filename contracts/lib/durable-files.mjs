@@ -108,7 +108,7 @@ export async function readStableFile(path, maximumBytes, label = "file") {
   }
 }
 
-async function openRetainedDirectory(path) {
+export async function openRetainedDirectory(path) {
   const before = await lstat(path, { bigint: true });
   assert(
     before.isDirectory() && !before.isSymbolicLink(),
@@ -131,6 +131,23 @@ async function openRetainedDirectory(path) {
     await handle.close();
     throw error;
   }
+}
+
+export async function assertRetainedDirectory(handle, path, label = "directory") {
+  const [opened, published] = await Promise.all([
+    handle.stat({ bigint: true }),
+    lstat(path, { bigint: true }),
+  ]);
+  assert(
+    opened.isDirectory() && published.isDirectory() && !published.isSymbolicLink(),
+    `${label} must remain a real directory: ${path}`,
+  );
+  assert(
+    opened.dev === published.dev &&
+      opened.ino === published.ino &&
+      opened.mode === published.mode,
+    `${label} filesystem object changed: ${path}`,
+  );
 }
 
 async function syncDirectory(path) {
