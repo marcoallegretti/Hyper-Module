@@ -3,7 +3,7 @@ mod realtime_allocator;
 
 use hyper_audio_engine::{
     ChannelParameters, ControlledInputBlock, InputBlock, InterleavedStereoCallback, LinearGain,
-    Pan, StereoMixer, StereoOutput,
+    Pan, StereoMixer, StereoOutput, StereoSineTestTone, StereoSineTestToneConfig,
 };
 
 use realtime_allocator::HeapMeasurement;
@@ -38,6 +38,9 @@ fn processing_performs_zero_heap_allocations() {
     let mut interleaved = [0.0_f32; 256];
     let mut failed_interleaved = [1.0_f32; 256];
     let mut invalid_interleaved = [1.0_f32; 3];
+    let tone_config = StereoSineTestToneConfig::try_new(48_000, 1_000.0, -18.0).unwrap();
+    let mut tone = StereoSineTestTone::new(tone_config);
+    let mut tone_output = [0.0_f32; 256];
 
     let measurement = HeapMeasurement::start_verified();
     let result = mixer.process(
@@ -68,6 +71,7 @@ fn processing_performs_zero_heap_allocations() {
         Err::<(), _>(7_u8)
     });
     let callback_validation = callback.process(&mut invalid_interleaved, |_| Ok::<_, u8>(()));
+    let tone_result = tone.render_interleaved_stereo(&mut tone_output);
     let heap_operations = measurement.finish();
 
     assert!(result.is_ok());
@@ -75,5 +79,6 @@ fn processing_performs_zero_heap_allocations() {
     assert!(callback_result.is_ok());
     assert!(callback_failure.is_err());
     assert!(callback_validation.is_err());
+    assert!(tone_result.is_ok());
     assert_eq!(heap_operations, 0);
 }

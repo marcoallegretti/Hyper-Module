@@ -1,6 +1,12 @@
 #![doc = "Real-time-safe audio processing primitives for Hyper Module."]
 #![forbid(unsafe_code)]
 
+mod test_tone;
+pub use test_tone::{
+    StereoSineTestTone, StereoSineTestToneConfig, StereoSineTestToneConfigError,
+    StereoSineTestToneRenderError,
+};
+
 use core::error::Error;
 use core::fmt;
 

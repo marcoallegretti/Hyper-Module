@@ -597,6 +597,16 @@ pub use playback_session::{
     DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
     DesktopPlaybackSessionStartError, DesktopProjectOpenError,
 };
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+mod test_tone_session;
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+pub use test_tone_session::{DesktopTestToneConfig, DesktopTestToneSession};
 #[cfg(target_os = "windows")]
 mod wasapi_devices;
 #[cfg(target_os = "windows")]
