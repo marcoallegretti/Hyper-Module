@@ -28,3 +28,21 @@ export function throwPreservingCleanupError(
   }
   throw cleanupError;
 }
+
+export async function finishOperationWithCleanup(
+  operationError,
+  cleanupSteps,
+  cleanupMessage,
+  combinedMessage,
+) {
+  try {
+    await runCleanupSteps(cleanupSteps, cleanupMessage);
+  } catch (cleanupError) {
+    throwPreservingCleanupError(
+      operationError,
+      cleanupError,
+      combinedMessage,
+    );
+  }
+  if (operationError) throw operationError;
+}

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 
 import {
+  finishOperationWithCleanup,
   runCleanupSteps,
   throwPreservingCleanupError,
 } from "../lib/operation-cleanup.mjs";
@@ -53,4 +54,32 @@ assert(cleanupCombined instanceof AggregateError);
 assert.deepEqual(cleanupCombined.errors, [firstCleanup, thirdCleanup]);
 assert.deepEqual(cleanupOrder, [1, 2, 3]);
 
-console.log("Operation cleanup passed: 3 failure-preservation cases");
+await assert.rejects(
+  finishOperationWithCleanup(
+    undefined,
+    [async () => {
+      throw cleanup;
+    }],
+    "release failure",
+    "combined release failure",
+  ),
+  (error) => error === cleanup,
+);
+
+let operationAndRelease;
+try {
+  await finishOperationWithCleanup(
+    primary,
+    [async () => {
+      throw cleanup;
+    }],
+    "release failure",
+    "combined release failure",
+  );
+} catch (error) {
+  operationAndRelease = error;
+}
+assert(operationAndRelease instanceof AggregateError);
+assert.deepEqual(operationAndRelease.errors, [primary, cleanup]);
+
+console.log("Operation cleanup passed: 5 failure-preservation cases");

@@ -6,6 +6,7 @@ import {
   collectRegularFiles,
   directoryPrefixes,
 } from "./filesystem-tree.mjs";
+import { finishOperationWithCleanup } from "./operation-cleanup.mjs";
 
 async function syncFile(path) {
   const handle = await openRetainedFile(path);
@@ -222,6 +223,7 @@ export async function syncDirectoryTree(rootPath, declaredFiles) {
   await assertDeclaredTree(rootPath, files, traversal);
   const retainedFiles = [];
   const retainedDirectories = [];
+  let operationError;
   try {
     for (const path of files) {
       retainedFiles.push({
@@ -271,12 +273,18 @@ export async function syncDirectoryTree(rootPath, declaredFiles) {
         path || ".",
       );
     }
-  } finally {
-    await Promise.allSettled([
-      ...retainedFiles.map(({ handle }) => handle.close()),
-      ...retainedDirectories.map(({ handle }) => handle.close()),
-    ]);
+  } catch (error) {
+    operationError = error;
   }
+  await finishOperationWithCleanup(
+    operationError,
+    [
+      ...retainedFiles.map(({ handle }) => async () => handle.close()),
+      ...retainedDirectories.map(({ handle }) => async () => handle.close()),
+    ],
+    "durable tree authority release failed",
+    "durable tree operation and authority release both failed",
+  );
 }
 
 export async function syncPublishedEntry(path) {
