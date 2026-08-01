@@ -24,6 +24,8 @@ const MAX_HANDOFF_BYTES: usize = 2 * 1_048_576;
 const MAX_HANDOFF_PATH_BYTES: usize = 4_096;
 const LOCK_NAME: &str = "project-storage.lock";
 const TRANSACTION_PREFIX: &str = ".recording-import-";
+const TRANSACTION_INTENT_NAME: &str = "intent.json";
+const TRANSACTION_INTENT_STAGING_NAME: &str = ".intent.json.tmp";
 
 #[derive(Clone, Copy, Debug)]
 pub struct RecordingImportRequest<'a> {
@@ -76,6 +78,15 @@ struct TransactionRecord {
     recording: TransactionFile,
     metadata: TransactionFile,
     created_directories: Vec<String>,
+    extensions: serde_json::Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TransactionIntent {
+    format: String,
+    format_version: u8,
+    id: String,
     extensions: serde_json::Map<String, Value>,
 }
 
@@ -248,15 +259,26 @@ pub fn recover_recording_imports(
         let transaction = backups
             .open_dir(&name)
             .map_err(|error| caused(format!("open recovery transaction {name}"), error))?;
-        let tx = read_transaction(&transaction, &name)?;
+        let tx = match read_transaction(&transaction, &name) {
+            Ok(tx) => tx,
+            Err(error)
+                if transaction
+                    .metadata("transaction.json")
+                    .is_err_and(|source| source.kind() == io::ErrorKind::NotFound) =>
+            {
+                let id = validate_prepublication_residue(&transaction, &name)?;
+                clear_and_remove_transaction(&backups, transaction, &name)?;
+                outcomes.push(RecordingImportRecovery {
+                    transaction_id: id,
+                    disposition: RecordingImportRecoveryDisposition::RolledBack,
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let disposition =
             recover_transaction(&root_path, &root_dir, &backups, &transaction, &tx, None)?;
-        clear_transaction(&transaction)?;
-        drop(transaction);
-        backups
-            .remove_dir(&name)
-            .map_err(|error| caused(format!("remove recovery transaction {name}"), error))?;
-        sync_dir(&backups)?;
+        clear_and_remove_transaction(&backups, transaction, &name)?;
         outcomes.push(RecordingImportRecovery {
             transaction_id: tx.id,
             disposition,
@@ -382,7 +404,9 @@ fn run_import(
     created_directories: &[String],
     after_transaction_sync: impl FnOnce(&Path) -> Result<(), RecordingImportError>,
 ) -> Result<RecordingImportOutcome, RecordingImportError> {
+    write_transaction_intent(transaction, transaction_name)?;
     copy_verified_recording(request, transaction, "recording.wav")?;
+    validate_staged_recording(transaction, "recording.wav", metadata)?;
     write_exclusive_synced(transaction, "metadata.json", request.metadata_bytes)?;
     let active_bytes = read_bounded(&verified.root_dir, MANIFEST_NAME, MAX_MANIFEST_BYTES)?;
     if Sha256::digest(&active_bytes).as_slice() != verified.manifest_sha256 {
@@ -597,6 +621,143 @@ fn transaction_document(
         .map_err(|error| caused("serialize recording import transaction", error))
 }
 
+fn write_transaction_intent(
+    transaction: &Dir,
+    directory_name: &str,
+) -> Result<(), RecordingImportError> {
+    let id = transaction_id(directory_name)?;
+    let intent = TransactionIntent {
+        format: "hyper-recording-import-intent".to_owned(),
+        format_version: 1,
+        id,
+        extensions: serde_json::Map::new(),
+    };
+    let bytes = serde_json_canonicalizer::to_vec(&intent)
+        .map_err(|error| caused("serialize recording import intent", error))?;
+    write_exclusive_synced(transaction, TRANSACTION_INTENT_STAGING_NAME, &bytes)?;
+    transaction
+        .rename(
+            TRANSACTION_INTENT_STAGING_NAME,
+            transaction,
+            TRANSACTION_INTENT_NAME,
+        )
+        .map_err(|error| caused("publish recording import intent", error))?;
+    sync_dir(transaction)
+}
+
+fn transaction_id(directory_name: &str) -> Result<String, RecordingImportError> {
+    let id = directory_name
+        .strip_prefix(TRANSACTION_PREFIX)
+        .ok_or_else(|| failure("recording import transaction name is invalid"))?;
+    Uuid::parse_str(id)
+        .map_err(|error| caused("recording import transaction id is invalid", error))?;
+    Ok(id.to_owned())
+}
+
+fn validate_prepublication_residue(
+    transaction: &Dir,
+    directory_name: &str,
+) -> Result<String, RecordingImportError> {
+    let id = transaction_id(directory_name)?;
+    let mut names = Vec::new();
+    for entry in transaction
+        .entries()
+        .map_err(|error| caused("read incomplete recording import transaction", error))?
+    {
+        let entry = entry.map_err(|error| caused("read incomplete transaction entry", error))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| failure("incomplete transaction entry name is not Unicode"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| caused("inspect incomplete transaction entry", error))?;
+        if !file_type.is_file()
+            || !matches!(
+                name.as_str(),
+                TRANSACTION_INTENT_STAGING_NAME
+                    | TRANSACTION_INTENT_NAME
+                    | "recording.wav"
+                    | "metadata.json"
+                    | "project.json"
+                    | "previous-project.json"
+            )
+        {
+            return Err(failure(
+                "incomplete recording import transaction has unknown content",
+            ));
+        }
+        names.push(name);
+    }
+    names.sort();
+    if names.is_empty() || names == [TRANSACTION_INTENT_STAGING_NAME] {
+        return Ok(id);
+    }
+    if names
+        .iter()
+        .any(|name| name == TRANSACTION_INTENT_STAGING_NAME)
+        || !names.iter().any(|name| name == TRANSACTION_INTENT_NAME)
+    {
+        return Err(failure(
+            "incomplete recording import transaction has no durable intent",
+        ));
+    }
+    let bytes = read_bounded(transaction, TRANSACTION_INTENT_NAME, MAX_MANIFEST_BYTES)?;
+    require_canonical_json(&bytes, "recording import intent")?;
+    let intent: TransactionIntent = serde_json::from_slice(&bytes)
+        .map_err(|error| caused("parse recording import intent", error))?;
+    if intent.format != "hyper-recording-import-intent"
+        || intent.format_version != 1
+        || intent.id != id
+        || !intent.extensions.is_empty()
+    {
+        return Err(failure("recording import intent is invalid"));
+    }
+    Ok(id)
+}
+
+fn validate_staged_recording(
+    transaction: &Dir,
+    path: &str,
+    metadata: &RecordingMetadataDocument,
+) -> Result<(), RecordingImportError> {
+    let file = transaction
+        .open(path)
+        .map_err(|error| caused("open staged recording for media validation", error))?
+        .into_std();
+    let mut reader =
+        hound::WavReader::new(file).map_err(|error| caused("parse staged recording WAV", error))?;
+    let spec = reader.spec();
+    if spec.sample_rate != metadata.sample_rate_hz()
+        || spec.channels != u16::from(metadata.channels())
+        || u64::from(reader.duration()) != metadata.frame_count()
+    {
+        return Err(failure(
+            "recording WAV facts do not match recording metadata",
+        ));
+    }
+    match spec.sample_format {
+        hound::SampleFormat::Float => {
+            if spec.bits_per_sample != 32 {
+                return Err(failure("recording WAV float width is unsupported"));
+            }
+            for sample in reader.samples::<f32>() {
+                let sample =
+                    sample.map_err(|error| caused("decode staged recording WAV", error))?;
+                if !sample.is_finite() {
+                    return Err(failure("recording WAV contains a non-finite sample"));
+                }
+            }
+        }
+        hound::SampleFormat::Int => {
+            for sample in reader.samples::<i32>() {
+                sample.map_err(|error| caused("decode staged recording WAV", error))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn copy_verified_recording(
     request: RecordingImportRequest<'_>,
     destination_dir: &Dir,
@@ -698,7 +859,16 @@ fn write_exclusive_synced(dir: &Dir, path: &str, bytes: &[u8]) -> Result<(), Rec
 }
 
 fn read_bounded(dir: &Dir, path: &str, maximum: usize) -> Result<Vec<u8>, RecordingImportError> {
-    let mut file = dir
+    read_bounded_observed(dir, path, maximum, || Ok(()))
+}
+
+fn read_bounded_observed(
+    dir: &Dir,
+    path: &str,
+    maximum: usize,
+    after_metadata: impl FnOnce() -> Result<(), RecordingImportError>,
+) -> Result<Vec<u8>, RecordingImportError> {
+    let file = dir
         .open(path)
         .map_err(|error| caused(format!("open {path}"), error))?;
     let length = file
@@ -708,14 +878,23 @@ fn read_bounded(dir: &Dir, path: &str, maximum: usize) -> Result<Vec<u8>, Record
     if length > maximum as u64 {
         return Err(failure(format!("{path} exceeds its size limit")));
     }
+    after_metadata()?;
     let mut bytes = Vec::new();
     let capacity = usize::try_from(length)
         .map_err(|_| failure(format!("{path} exceeds addressable memory")))?;
     bytes
         .try_reserve_exact(capacity)
         .map_err(|error| caused(format!("allocate {path}"), error))?;
-    file.read_to_end(&mut bytes)
+    let limit = u64::try_from(maximum)
+        .map_err(|_| failure(format!("{path} size limit is not addressable")))?
+        .checked_add(1)
+        .ok_or_else(|| failure(format!("{path} size limit overflows")))?;
+    file.take(limit)
+        .read_to_end(&mut bytes)
         .map_err(|error| caused(format!("read {path}"), error))?;
+    if bytes.len() > maximum {
+        return Err(failure(format!("{path} exceeds its size limit")));
+    }
     Ok(bytes)
 }
 
@@ -732,6 +911,8 @@ fn sync_dir(dir: &Dir) -> Result<(), RecordingImportError> {
 
 fn clear_transaction(transaction: &Dir) -> Result<(), RecordingImportError> {
     for file in [
+        TRANSACTION_INTENT_STAGING_NAME,
+        TRANSACTION_INTENT_NAME,
         "recording.wav",
         "metadata.json",
         "project.json",
@@ -749,6 +930,36 @@ fn clear_transaction(transaction: &Dir) -> Result<(), RecordingImportError> {
     sync_dir(transaction)
 }
 
+#[cfg(not(windows))]
+fn clear_and_remove_transaction(
+    backups: &Dir,
+    transaction: Dir,
+    name: &str,
+) -> Result<(), RecordingImportError> {
+    let quarantine = format!(".recording-import-cleanup-{}", Uuid::new_v4());
+    backups
+        .rename(name, backups, &quarantine)
+        .map_err(|error| caused("quarantine recording import transaction", error))?;
+    let moved = backups
+        .open_dir(&quarantine)
+        .map_err(|error| caused("open quarantined recording import transaction", error))?;
+    if !same_directory(&transaction, &moved)
+        .map_err(|error| caused("compare quarantined recording import transaction", error))?
+    {
+        return Err(failure(
+            "recording import transaction changed before cleanup",
+        ));
+    }
+    drop(moved);
+    clear_transaction(&transaction)?;
+    drop(transaction);
+    backups
+        .remove_dir(&quarantine)
+        .map_err(|error| caused("remove recording import transaction", error))?;
+    sync_dir(backups)
+}
+
+#[cfg(windows)]
 fn clear_and_remove_transaction(
     backups: &Dir,
     transaction: Dir,
@@ -819,6 +1030,15 @@ fn recover_transaction(
                     .is_some_and(|io| io.kind() == io::ErrorKind::NotFound)
             }) =>
         {
+            let previous = read_bounded(transaction, "previous-project.json", MAX_MANIFEST_BYTES)?;
+            require_canonical_json(&previous, "previous project manifest")?;
+            hyper_project_model::ProjectManifest::parse(&previous)
+                .map_err(|error| caused("previous project manifest is invalid", error))?;
+            if <[u8; 32]>::from(Sha256::digest(&previous)) != before {
+                return Err(failure(
+                    "previous project manifest does not match its recorded identity",
+                ));
+            }
             restore_previous_manifest(root, backups, transaction, &tx.id)?;
             before
         }
@@ -862,6 +1082,12 @@ fn recover_transaction(
         remove_matching_file(recordings, &tx.recording)?;
     }
     remove_created_directories(root, &tx.created_directories)?;
+    let restored_bytes = read_bounded(root, MANIFEST_NAME, MAX_MANIFEST_BYTES)?;
+    if <[u8; 32]>::from(Sha256::digest(&restored_bytes)) != before {
+        return Err(failure("rolled-back project identity changed"));
+    }
+    super::verify_retained_project_candidate(root, &restored_bytes)
+        .map_err(|error| caused("rolled-back recording import does not verify", error))?;
     Ok(RecordingImportRecoveryDisposition::RolledBack)
 }
 
@@ -882,13 +1108,16 @@ fn restore_previous_manifest(
     sync_dir(root)
 }
 
-fn remove_matching_file(dir: &Dir, record: &TransactionFile) -> Result<(), RecordingImportError> {
+fn verified_matching_file(
+    dir: &Dir,
+    record: &TransactionFile,
+) -> Result<Option<(cap_std::fs::File, std::ffi::OsString)>, RecordingImportError> {
     let name = Path::new(&record.path)
         .file_name()
         .ok_or_else(|| failure("transaction file path has no name"))?;
     let mut file = match dir.open(name) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(caused("open published recording import file", error)),
     };
     let mut hasher = Sha256::new();
@@ -899,8 +1128,52 @@ fn remove_matching_file(dir: &Dir, record: &TransactionFile) -> Result<(), Recor
     {
         return Err(failure("recording import rollback refuses changed content"));
     }
+    Ok(Some((file, name.to_owned())))
+}
+
+#[cfg(not(windows))]
+fn remove_matching_file(dir: &Dir, record: &TransactionFile) -> Result<(), RecordingImportError> {
+    let Some((file, name)) = verified_matching_file(dir, record)? else {
+        return Ok(());
+    };
+    let verified = Handle::from_file(
+        file.try_clone()
+            .map_err(|error| caused("retain published recording import file", error))?
+            .into_std(),
+    )
+    .map_err(|error| caused("identify published recording import file", error))?;
+    let quarantine = format!(".recording-import-rollback-{}", Uuid::new_v4());
+    dir.rename(name, dir, &quarantine)
+        .map_err(|error| caused("quarantine published recording import file", error))?;
+    let moved = dir
+        .open(&quarantine)
+        .map_err(|error| caused("open quarantined recording import file", error))?;
+    let moved_identity = Handle::from_file(
+        moved
+            .try_clone()
+            .map_err(|error| caused("retain quarantined recording import file", error))?
+            .into_std(),
+    )
+    .map_err(|error| caused("identify quarantined recording import file", error))?;
+    if moved_identity != verified {
+        return Err(failure(
+            "published recording import file changed before rollback",
+        ));
+    }
+    drop(moved);
     drop(file);
-    dir.remove_file(name)
+    dir.remove_file(&quarantine)
+        .map_err(|error| caused("remove quarantined recording import file", error))?;
+    sync_dir(dir)
+}
+
+#[cfg(windows)]
+fn remove_matching_file(dir: &Dir, record: &TransactionFile) -> Result<(), RecordingImportError> {
+    let Some((file, name)) = verified_matching_file(dir, record)? else {
+        return Ok(());
+    };
+    drop(file);
+    dir.remove_file(&name)
         .map_err(|error| caused("remove published recording import file", error))?;
     sync_dir(dir)
 }
@@ -1005,6 +1278,30 @@ mod tests {
     const METADATA_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334477";
     const ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334478";
 
+    fn pcm16_stereo_wav() -> Vec<u8> {
+        let samples = [0_i16, 0_i16];
+        let data_bytes = u32::try_from(samples.len() * size_of::<i16>()).unwrap();
+        let channels = 2_u16;
+        let block_align = channels * 2;
+        let mut bytes = Vec::with_capacity(44 + usize::try_from(data_bytes).unwrap());
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&48_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&(48_000 * u32::from(block_align)).to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
+    }
+
     struct Fixture {
         root: std::path::PathBuf,
         recording: std::path::PathBuf,
@@ -1070,7 +1367,7 @@ mod tests {
             )
             .unwrap();
             let recording = root.with_extension("source.wav");
-            let recording_bytes = b"RIFFnative-recording-import".to_vec();
+            let recording_bytes = pcm16_stereo_wav();
             fs::write(&recording, &recording_bytes).unwrap();
             let metadata = json!({
                 "format": "hyper-recording-metadata", "format_version": 1,
@@ -1157,6 +1454,83 @@ mod tests {
     }
 
     #[test]
+    fn rejects_digest_matching_non_wav_before_publication() {
+        let mut fixture = Fixture::new(false);
+        fixture.recording_bytes = b"RIFFnative-recording-import".to_vec();
+        fs::write(&fixture.recording, &fixture.recording_bytes).unwrap();
+
+        let result = import_recording(&fixture.root, fixture.request());
+
+        assert!(result.is_err());
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            1
+        );
+        assert!(recover_recording_imports(&fixture.root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovers_prepublication_transaction_residue() {
+        let fixture = Fixture::new(false);
+        let backups = fixture.root.join("backups");
+        fs::create_dir_all(&backups).unwrap();
+        let id = Uuid::new_v4();
+        let transaction_name = format!("{TRANSACTION_PREFIX}{id}");
+        let transaction_path = backups.join(&transaction_name);
+        fs::create_dir(&transaction_path).unwrap();
+        let intent = TransactionIntent {
+            format: "hyper-recording-import-intent".to_owned(),
+            format_version: 1,
+            id: id.to_string(),
+            extensions: serde_json::Map::new(),
+        };
+        fs::write(
+            transaction_path.join(TRANSACTION_INTENT_NAME),
+            serde_json_canonicalizer::to_vec(&intent).unwrap(),
+        )
+        .unwrap();
+        fs::write(transaction_path.join("recording.wav"), b"partial").unwrap();
+
+        let recovered = recover_recording_imports(&fixture.root).unwrap();
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].transaction_id(), id.to_string());
+        assert_eq!(
+            recovered[0].disposition(),
+            RecordingImportRecoveryDisposition::RolledBack
+        );
+        assert!(!transaction_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_read_rejects_growth_after_metadata_observation() {
+        let root = std::env::temp_dir().join(format!(
+            "hyper-recording-import-bounded-read-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("transaction.json"), b"small").unwrap();
+        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+
+        let result = read_bounded_observed(&dir, "transaction.json", 8, || {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(root.join("transaction.json"))
+                .map_err(|error| caused("open bounded read fixture for growth", error))?;
+            file.write_all(b" and now too large")
+                .map_err(|error| caused("grow bounded read fixture", error))
+        });
+
+        assert!(result.is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pretransaction_failure_leaves_no_import_residue() {
         let fixture = Fixture::new(false);
         let mut request = fixture.request();
@@ -1207,6 +1581,37 @@ mod tests {
                 .revision(),
             1
         );
+    }
+
+    #[test]
+    fn refuses_corrupt_previous_manifest_during_recovery() {
+        let fixture = Fixture::new(false);
+        let result = std::panic::catch_unwind(|| {
+            let _ = import_recording_observed(&fixture.root, fixture.request(), |_| {
+                panic!("simulated process crash")
+            });
+        });
+        assert!(result.is_err());
+        let backups = fixture.root.join("backups");
+        let transaction = fs::read_dir(&backups)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(TRANSACTION_PREFIX)
+            })
+            .unwrap()
+            .path();
+        fs::write(transaction.join("previous-project.json"), b"{}").unwrap();
+        fs::remove_file(fixture.root.join(MANIFEST_NAME)).unwrap();
+
+        let recovery = recover_recording_imports(&fixture.root);
+
+        assert!(recovery.is_err());
+        assert!(!fixture.root.join(MANIFEST_NAME).exists());
+        assert!(transaction.exists());
     }
 
     #[test]
@@ -1279,7 +1684,7 @@ mod tests {
         });
 
         let error = result.unwrap_err();
-        assert_ne!(
+        assert_eq!(
             error.to_string(),
             "recording import and recovery both failed",
             "{error:?}"
@@ -1290,6 +1695,12 @@ mod tests {
         fs::remove_file(&recordings).unwrap();
         fs::rename(&displaced, &recordings).unwrap();
         fs::remove_dir(&external).unwrap();
+        let recovered = recover_recording_imports(&fixture.root).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].disposition(),
+            RecordingImportRecoveryDisposition::RolledBack
+        );
         assert_eq!(
             verify_project_package(&fixture.root)
                 .unwrap()

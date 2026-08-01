@@ -409,6 +409,47 @@ pub(crate) fn verify_project_candidate(
     Ok(manifest)
 }
 
+pub(crate) fn verify_retained_project_candidate(
+    root_dir: &Dir,
+    manifest_bytes: &[u8],
+) -> Result<ProjectManifest, StorageError> {
+    assert_canonical_json(manifest_bytes, MANIFEST_NAME)?;
+    let manifest = ProjectManifest::parse(manifest_bytes).map_err(|error| StorageError {
+        kind: StorageErrorKind::ManifestInvalid,
+        path: MANIFEST_NAME.to_owned(),
+        message: "retained project manifest is invalid".to_owned(),
+        limit: None,
+        source: Some(Box::new(error)),
+    })?;
+    preflight_manifest(&manifest, None)?;
+    let policy = TreePolicy::new(&manifest);
+    let initial_files = collect_owned_tree_retained(root_dir, &policy)?;
+    require_managed_tree(&initial_files, &policy)?;
+    verify_records(root_dir, &manifest)?;
+    let final_files = collect_owned_tree_retained(root_dir, &policy)?;
+    if initial_files != final_files {
+        return Err(rejection(
+            StorageErrorKind::ChangedDuringVerification,
+            ".",
+            "retained project tree changed during verification",
+        ));
+    }
+    require_managed_tree(&final_files, &policy)?;
+    let final_manifest = read_open_stable(
+        open_declared_file(root_dir, MANIFEST_NAME)?,
+        MANIFEST_NAME,
+        MAX_JSON_FILE_BYTES,
+    )?;
+    if manifest_bytes != final_manifest {
+        return Err(rejection(
+            StorageErrorKind::ChangedDuringVerification,
+            MANIFEST_NAME,
+            "retained project manifest changed during verification",
+        ));
+    }
+    Ok(manifest)
+}
+
 fn preflight_manifest(
     manifest: &ProjectManifest,
     limits: Option<ProjectPackageVerificationLimits>,
@@ -715,6 +756,109 @@ fn collect_owned_tree(root: &Path, policy: &TreePolicy) -> Result<Vec<String>, S
                     depth,
                 });
             } else if metadata.is_file() {
+                if !policy.allows_file(&relative) {
+                    return Err(rejection(
+                        StorageErrorKind::UndeclaredEntry,
+                        &relative,
+                        "undeclared file is forbidden",
+                    ));
+                }
+                files.push(relative);
+                if files.len() > MAX_FILES {
+                    return Err(tree_limit());
+                }
+            } else {
+                return Err(rejection(
+                    StorageErrorKind::UnsupportedEntry,
+                    &relative,
+                    "unsupported filesystem entry is forbidden",
+                ));
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn collect_owned_tree_retained(
+    root: &Dir,
+    policy: &TreePolicy,
+) -> Result<Vec<String>, StorageError> {
+    struct Pending {
+        dir: Dir,
+        prefix: String,
+        depth: usize,
+    }
+    let mut files = Vec::new();
+    let mut pending = vec![Pending {
+        dir: root
+            .try_clone()
+            .map_err(|error| io_error(".", "clone retained project root", error))?,
+        prefix: String::new(),
+        depth: 0,
+    }];
+    let mut entries = 0_usize;
+    let mut directories = 1_usize;
+    let mut path_bytes = 0_usize;
+    while let Some(current) = pending.pop() {
+        let children = current
+            .dir
+            .entries()
+            .map_err(|error| io_error(".", "read retained project tree", error))?;
+        for child in children {
+            let child =
+                child.map_err(|error| io_error(".", "read retained project entry", error))?;
+            let name = child.file_name().into_string().map_err(|_| {
+                rejection(
+                    StorageErrorKind::UnsupportedEntry,
+                    ".",
+                    "retained project tree contains a non-Unicode entry name",
+                )
+            })?;
+            let relative = if current.prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", current.prefix, name)
+            };
+            entries = entries.checked_add(1).ok_or_else(tree_limit)?;
+            path_bytes = path_bytes
+                .checked_add(relative.len())
+                .ok_or_else(tree_limit)?;
+            if entries > MAX_ENTRIES || path_bytes > MAX_PATH_BYTES {
+                return Err(tree_limit());
+            }
+            let file_type = child
+                .file_type()
+                .map_err(|error| io_error(&relative, "inspect retained project entry", error))?;
+            if file_type.is_symlink() {
+                return Err(rejection(
+                    StorageErrorKind::LinkForbidden,
+                    &relative,
+                    "symbolic links and reparse points are forbidden",
+                ));
+            }
+            if file_type.is_dir() {
+                let depth = current.depth + 1;
+                directories = directories.checked_add(1).ok_or_else(tree_limit)?;
+                if depth > MAX_DEPTH || directories > MAX_DIRECTORIES {
+                    return Err(tree_limit());
+                }
+                if !policy.allows_directory(&relative) {
+                    return Err(rejection(
+                        StorageErrorKind::UndeclaredEntry,
+                        &relative,
+                        "undeclared directory is forbidden",
+                    ));
+                }
+                let dir = current.dir.open_dir_nofollow(&name).map_err(|error| {
+                    io_error(&relative, "open retained project directory", error)
+                })?;
+                pending.push(Pending {
+                    dir,
+                    prefix: relative,
+                    depth,
+                });
+            } else if file_type.is_file() {
                 if !policy.allows_file(&relative) {
                     return Err(rejection(
                         StorageErrorKind::UndeclaredEntry,

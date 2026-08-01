@@ -547,6 +547,7 @@ version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "hound",
  "hyper-project-model",
  "hyper-recording-metadata",
  "hyper-strict-json",
