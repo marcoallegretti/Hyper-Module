@@ -1,7 +1,14 @@
 #![doc = "Native project-package integrity and filesystem ownership verification."]
 #![forbid(unsafe_code)]
 
+mod recording_import;
 mod stable_file;
+
+pub use recording_import::{
+    RecordingImportError, RecordingImportOutcome, RecordingImportRecovery,
+    RecordingImportRecoveryDisposition, RecordingImportRequest, import_finalized_recording_handoff,
+    import_recording, recover_recording_imports,
+};
 
 use core::error::Error;
 use core::fmt;
@@ -284,38 +291,7 @@ fn verify_project_package_inner(
             "project verification limits must be positive",
         ));
     }
-    let root_metadata =
-        fs::symlink_metadata(root).map_err(|error| io_error(".", "inspect project root", error))?;
-    if is_link_like(&root_metadata) {
-        return Err(rejection(
-            StorageErrorKind::LinkForbidden,
-            ".",
-            "project root cannot be a link or reparse point",
-        ));
-    }
-    if !root_metadata.is_dir() {
-        return Err(rejection(
-            StorageErrorKind::RootNotDirectory,
-            ".",
-            "project root must be a real directory",
-        ));
-    }
-    let canonical_root =
-        fs::canonicalize(root).map_err(|error| io_error(".", "resolve project root", error))?;
-    let root_dir = Arc::new(
-        Dir::open_ambient_dir(root, ambient_authority())
-            .map_err(|error| io_error(".", "open project root", error))?,
-    );
-    let path_root_handle =
-        Handle::from_path(root).map_err(|error| io_error(".", "reopen project root", error))?;
-    let opened_root_handle = directory_handle(&root_dir)?;
-    if opened_root_handle != path_root_handle {
-        return Err(rejection(
-            StorageErrorKind::ChangedDuringVerification,
-            ".",
-            "project root changed while it was being opened",
-        ));
-    }
+    let (canonical_root, root_dir) = open_stable_project_root(root)?;
     let manifest_bytes = read_open_stable(
         open_declared_file(&root_dir, MANIFEST_NAME)?,
         MANIFEST_NAME,
@@ -366,6 +342,71 @@ fn verify_project_package_inner(
         manifest_sha256: Sha256::digest(&manifest_bytes).into(),
         verification_limits: limits,
     })
+}
+
+pub(crate) fn open_stable_project_root(root: &Path) -> Result<(PathBuf, Arc<Dir>), StorageError> {
+    let root_metadata =
+        fs::symlink_metadata(root).map_err(|error| io_error(".", "inspect project root", error))?;
+    if is_link_like(&root_metadata) {
+        return Err(rejection(
+            StorageErrorKind::LinkForbidden,
+            ".",
+            "project root cannot be a link or reparse point",
+        ));
+    }
+    if !root_metadata.is_dir() {
+        return Err(rejection(
+            StorageErrorKind::RootNotDirectory,
+            ".",
+            "project root must be a real directory",
+        ));
+    }
+    let canonical_root =
+        fs::canonicalize(root).map_err(|error| io_error(".", "resolve project root", error))?;
+    let root_dir = Arc::new(
+        Dir::open_ambient_dir(root, ambient_authority())
+            .map_err(|error| io_error(".", "open project root", error))?,
+    );
+    let path_root_handle =
+        Handle::from_path(root).map_err(|error| io_error(".", "reopen project root", error))?;
+    let opened_root_handle = directory_handle(&root_dir)?;
+    if opened_root_handle != path_root_handle {
+        return Err(rejection(
+            StorageErrorKind::ChangedDuringVerification,
+            ".",
+            "project root changed while it was being opened",
+        ));
+    }
+    Ok((canonical_root, root_dir))
+}
+
+pub(crate) fn verify_project_candidate(
+    root: &Path,
+    root_dir: &Dir,
+    manifest_bytes: &[u8],
+) -> Result<ProjectManifest, StorageError> {
+    assert_canonical_json(manifest_bytes, MANIFEST_NAME)?;
+    let manifest = ProjectManifest::parse(manifest_bytes).map_err(|error| StorageError {
+        kind: StorageErrorKind::ManifestInvalid,
+        path: MANIFEST_NAME.to_owned(),
+        message: "candidate project manifest is invalid".to_owned(),
+        limit: None,
+        source: Some(Box::new(error)),
+    })?;
+    preflight_manifest(&manifest, None)?;
+    let policy = TreePolicy::new(&manifest);
+    let initial_files = collect_owned_tree(root, &policy)?;
+    require_managed_tree(&initial_files, &policy)?;
+    verify_records(root_dir, &manifest)?;
+    let final_files = collect_owned_tree(root, &policy)?;
+    if initial_files != final_files {
+        return Err(rejection(
+            StorageErrorKind::ChangedDuringVerification,
+            ".",
+            "project filesystem tree changed during candidate verification",
+        ));
+    }
+    Ok(manifest)
 }
 
 fn preflight_manifest(
