@@ -487,17 +487,6 @@ where
     }
 }
 
-fn input_chunk_fields(chunk: *const spa_sys::spa_chunk) -> Option<(usize, usize, i32)> {
-    // PipeWire owns the SPA buffer and guarantees a valid chunk object when
-    // this pointer is non-null for the duration of the process callback.
-    let chunk = unsafe { chunk.as_ref()? };
-    Some((
-        usize::try_from(chunk.offset).unwrap_or(usize::MAX),
-        usize::try_from(chunk.size).unwrap_or(usize::MAX),
-        chunk.stride,
-    ))
-}
-
 fn prepare_pipewire_input<P>(
     datas: &mut [spa::buffer::Data],
     state: &mut PipeWireInputCallback<P>,
@@ -509,9 +498,13 @@ where
         state.input.counters().record_malformed_buffer(0);
         return PreparedPipeWireInput::Continue;
     };
-    let Some((offset, size, stride)) = input_chunk_fields(data.as_raw().chunk) else {
-        state.input.counters().record_malformed_buffer(0);
-        return PreparedPipeWireInput::Terminal;
+    let (offset, size, stride) = {
+        let chunk = data.chunk();
+        (
+            usize::try_from(chunk.offset()).unwrap_or(usize::MAX),
+            usize::try_from(chunk.size()).unwrap_or(usize::MAX),
+            chunk.stride(),
+        )
     };
     let Some(bytes) = data.data() else {
         state.input.counters().record_malformed_buffer(0);
@@ -547,7 +540,10 @@ where
     }
 }
 
-fn fail_pipewire_input<P>(state: &mut PipeWireInputCallback<P>, queue_rejected: bool) {
+fn fail_pipewire_input<P>(state: &mut PipeWireInputCallback<P>, queue_rejected: bool)
+where
+    P: InterleavedStereoCaptureProcessor,
+{
     if queue_rejected {
         state.input.counters().record_stream_error();
     }
@@ -642,22 +638,6 @@ mod tests {
     fn stereo_format_is_a_valid_spa_pod() {
         let format = build_format(48_000).unwrap();
         assert!(Pod::from_bytes(&format).is_some());
-    }
-
-    #[test]
-    fn null_input_chunk_is_rejected_without_dereferencing_it() {
-        assert_eq!(input_chunk_fields(std::ptr::null()), None);
-
-        let chunk = spa_sys::spa_chunk {
-            offset: 8,
-            size: 16,
-            stride: i32::try_from(FRAME_STRIDE).unwrap(),
-            flags: 0,
-        };
-        assert_eq!(
-            input_chunk_fields(std::ptr::from_ref(&chunk)),
-            Some((8, 16, i32::try_from(FRAME_STRIDE).unwrap()))
-        );
     }
 
     #[test]
