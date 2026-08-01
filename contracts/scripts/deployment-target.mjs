@@ -80,6 +80,14 @@ function validateFaultBoundary(faultAt) {
   return faultAt;
 }
 
+function validateDeploymentObserver(observer) {
+  assert(
+    observer === undefined || typeof observer === "function",
+    "deployment observer must be a function",
+  );
+  return observer ?? (async () => {});
+}
+
 function injectFault(faultAt, boundary) {
   if (faultAt === boundary) {
     throw new InjectedDeploymentFault(boundary);
@@ -488,6 +496,30 @@ async function closeRetainedDeploymentDirectories(retained) {
   await retained.bundlesHandle.close();
 }
 
+async function removeRetainedDirectory(path, parentRoot, handle, label) {
+  const quarantinePath = join(parentRoot, `.delete-${randomUUID()}`);
+  await rename(path, quarantinePath);
+  try {
+    await assertRetainedDirectory(handle, quarantinePath, label);
+    await rm(quarantinePath, { recursive: true, force: false });
+    await syncRemovedEntry(parentRoot);
+  } catch (error) {
+    let restoreError;
+    try {
+      await rename(quarantinePath, path);
+    } catch (source) {
+      restoreError = source;
+    }
+    if (restoreError) {
+      throw new AggregateError(
+        [error, restoreError],
+        `${label} cleanup and quarantine restoration both failed`,
+      );
+    }
+    throw error;
+  }
+}
+
 async function withRetainedDeploymentDirectories(retained, operation) {
   let result;
   let operationError;
@@ -629,16 +661,38 @@ async function collectUnprotectedBundles(targetRoot, policy) {
     }
     const bundlesRoot = await requireBundlesRoot(targetRoot);
     const bundlePath = join(bundlesRoot, bundle.sha256);
-    const bundleStatus = await lstat(bundlePath);
-    assert(
-      bundleStatus.isDirectory() && !bundleStatus.isSymbolicLink(),
-      `installed bundle entry is not a real directory: ${bundle.sha256}`,
-    );
-    await rm(bundlePath, {
-      recursive: true,
-      force: false,
-    });
-    await syncRemovedEntry(bundlesRoot);
+    const quarantinePath = join(bundlesRoot, `.garbage-${randomUUID()}`);
+    await rename(bundlePath, quarantinePath);
+    let quarantineHandle;
+    try {
+      quarantineHandle = await openRetainedDirectory(quarantinePath);
+      const inspected = await inspectBundle(quarantinePath, {
+        maximumBundleBytes: policy.max_installed_bytes,
+        expectedBundleSha256: bundle.sha256,
+        expectedBundleByteLength: bundle.byte_length,
+      });
+      assert.equal(inspected.sha256, bundle.sha256);
+      await removeRetainedDirectory(
+        quarantinePath,
+        bundlesRoot,
+        quarantineHandle,
+        `unprotected bundle ${bundle.sha256}`,
+      );
+    } catch (error) {
+      try {
+        await rename(quarantinePath, bundlePath);
+      } catch (restoreError) {
+        if (restoreError.code !== "ENOENT") {
+          throw new AggregateError(
+            [error, restoreError],
+            "bundle collection and restoration both failed",
+          );
+        }
+      }
+      throw error;
+    } finally {
+      await quarantineHandle?.close();
+    }
     removed.push({
       bundle_sha256: bundle.sha256,
       byte_length: bundle.byte_length,
@@ -929,7 +983,11 @@ async function installIdentity(
   sourceRoot,
   targetRoot,
   targetHandle,
-  { faultAt = undefined, expectedIdentity = undefined } = {},
+  {
+    faultAt = undefined,
+    expectedIdentity = undefined,
+    observer = async () => {},
+  } = {},
 ) {
   const policy = await readStoragePolicy(targetRoot);
   assert(policy, "deployment storage policy is not configured");
@@ -973,7 +1031,10 @@ async function installIdentity(
     );
 
     const stagingPath = join(targetRoot, `.install-${randomUUID()}`);
-    let installed = false;
+    await mkdir(stagingPath, { mode: 0o700 });
+    const stagingHandle = await openRetainedDirectory(stagingPath);
+    let published = false;
+    let accepted = false;
     try {
       await cp(sourceRoot, stagingPath, {
         recursive: true,
@@ -1001,11 +1062,20 @@ async function installIdentity(
       );
       await assertDeploymentDirectoriesRetained(targetRoot, retained);
       await rename(stagingPath, installedPath);
-      installed = true;
+      published = true;
+      await assertRetainedDirectory(
+        stagingHandle,
+        installedPath,
+        "published deployment bundle",
+      );
+      await observer("after-bundle-publication", { installedPath });
       await assertDeploymentDirectoriesRetained(targetRoot, retained);
-      const published = await inspectBundle(installedPath, inspectionOptions);
+      const publishedInspection = await inspectBundle(
+        installedPath,
+        inspectionOptions,
+      );
       assert.equal(
-        published.sha256,
+        publishedInspection.sha256,
         source.sha256,
         "published bundle identity changed during installation",
       );
@@ -1020,12 +1090,20 @@ async function installIdentity(
         },
         await availableBytes(targetRoot),
       );
-      installed = false;
+      accepted = true;
       injectFault(faultAt, "after-bundle-installation");
     } finally {
-      await rm(stagingPath, { recursive: true, force: true });
-      if (installed) {
-        await rm(installedPath, { recursive: true, force: true });
+      try {
+        if (!accepted) {
+          await removeRetainedDirectory(
+            published ? installedPath : stagingPath,
+            published ? bundlesRoot : targetRoot,
+            stagingHandle,
+            published ? "published deployment bundle" : "staged deployment bundle",
+          );
+        }
+      } finally {
+        await stagingHandle.close();
       }
     }
     return source.sha256;
@@ -1034,6 +1112,7 @@ async function installIdentity(
 
 export async function installBundle(bundlePath, targetPath, options = {}) {
   const faultAt = validateFaultBoundary(options.faultAt);
+  const observer = validateDeploymentObserver(options.observer);
   const sourceRoot = resolve(bundlePath);
   const targetRoot = await requireTarget(targetPath);
   return withDeploymentLock(targetRoot, async (authorityRoot, targetHandle) => {
@@ -1042,7 +1121,7 @@ export async function installBundle(bundlePath, targetPath, options = {}) {
       sourceRoot,
       authorityRoot,
       targetHandle,
-      { faultAt },
+      { faultAt, observer },
     );
   });
 }
@@ -1123,6 +1202,7 @@ export async function deployBundle(
   options = {},
 ) {
   const faultAt = validateFaultBoundary(options.faultAt);
+  const observer = validateDeploymentObserver(options.observer);
   const sourceRoot = resolve(bundlePath);
   const targetRoot = await requireTarget(targetPath);
   return withDeploymentLock(targetRoot, async (authorityRoot, targetHandle) => {
@@ -1131,7 +1211,7 @@ export async function deployBundle(
       sourceRoot,
       authorityRoot,
       targetHandle,
-      { faultAt },
+      { faultAt, observer },
     );
     return activateIdentity(
       authorityRoot,
@@ -1162,6 +1242,7 @@ export async function authenticatedDeployBundle(
   options = {},
 ) {
   const faultAt = validateFaultBoundary(options.faultAt);
+  const observer = validateDeploymentObserver(options.observer);
   const sourceRoot = resolve(bundlePath);
   const targetRoot = await requireTarget(targetPath);
   return withDeploymentLock(targetRoot, async (authorityRoot, targetHandle) => {
@@ -1217,6 +1298,7 @@ export async function authenticatedDeployBundle(
             sha256: request.bundle_sha256,
             byte_length: request.bundle_byte_length,
           },
+          observer,
         },
       );
       assert.equal(

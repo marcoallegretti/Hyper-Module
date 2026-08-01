@@ -7,6 +7,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  rename,
   rm,
   symlink,
   unlink,
@@ -360,6 +361,51 @@ try {
     await readFile(join(replacedBundlesOutside, "sentinel"), "utf8"),
     "preserve",
   );
+
+  const substitutedInstallTarget = await createTarget(
+    temporaryRoot,
+    "substituted-install-target",
+  );
+  const displacedInstallation = join(
+    substitutedInstallTarget,
+    "displaced-installation",
+  );
+  let replacementPrevented = false;
+  const substitutedInstall = installBundle(
+    bundle7,
+    substitutedInstallTarget,
+    {
+      observer: async (boundary, { installedPath }) => {
+        assert.equal(boundary, "after-bundle-publication");
+        try {
+          await rename(installedPath, displacedInstallation);
+          await mkdir(installedPath);
+          await writeFile(join(installedPath, "sentinel"), "preserve");
+        } catch (error) {
+          replacementPrevented =
+            process.platform === "win32" &&
+            (error.code === "EACCES" || error.code === "EPERM");
+          if (!replacementPrevented) throw error;
+        }
+      },
+    },
+  );
+  if (replacementPrevented) {
+    await substitutedInstall;
+  } else {
+    await assert.rejects(
+      substitutedInstall,
+      /filesystem object changed|bundle root must be a real directory/,
+    );
+    assert.equal(
+      await readFile(
+        join(substitutedInstallTarget, "bundles", identity7, "sentinel"),
+        "utf8",
+      ),
+      "preserve",
+    );
+    await inspectDeploymentBundle(displacedInstallation);
+  }
 
   const garbageTarget = await createTarget(temporaryRoot, "garbage-target");
   const garbageIdentity = await installBundle(bundle7, garbageTarget);
@@ -1161,7 +1207,7 @@ try {
     ),
   );
 
-  console.log("Deployment target passed: 158 transaction cases");
+console.log("Deployment target passed: 159 transaction cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }
