@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { runNativeProcess } from "./native-process.mjs";
 
 const workspaceRoot = resolve(import.meta.dirname, "..", "..");
+const protocolVersion = "1";
 
 function helperPath() {
   if (process.env.HYPER_FS_AUTHORITY) {
@@ -31,7 +32,7 @@ function retainedAuthority(handle, ambientPath, childDescriptor) {
 }
 
 function runHelper(arguments_, descriptors = []) {
-  return runNativeProcess(helperPath(), arguments_, {
+  return runNativeProcess(helperPath(), [protocolVersion, ...arguments_], {
     stdio: ["ignore", "ignore", "pipe", ...descriptors],
   });
 }

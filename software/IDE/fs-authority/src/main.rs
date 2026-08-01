@@ -194,6 +194,9 @@ fn rename_verified_entry_between_replace(
 
 fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
+    if arguments.next().as_deref() != Some("1") {
+        return Err(invalid_argument("unsupported filesystem authority protocol version").into());
+    }
     match arguments.next().as_deref() {
         Some("remove-directory") => remove_verified_directory(&mut arguments),
         Some("rename-directory-no-replace") => rename_verified_directory_no_replace(&mut arguments),

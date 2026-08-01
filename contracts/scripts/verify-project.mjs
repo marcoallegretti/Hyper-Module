@@ -32,6 +32,7 @@ import {
 } from "./verify-bundle.mjs";
 
 const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const audioValidatorProtocolVersion = "1";
 const workspaceRoot = resolve(contractRoot, "..");
 const manifestLimitBytes = 1024 * 1024;
 export const defaultMaximumProjectBytes = 1024 * 1024 * 1024;
@@ -234,6 +235,7 @@ async function validateNativeAudio(
     await runNativeProcess(
       audioValidatorPath(),
       [
+        audioValidatorProtocolVersion,
         "-",
         asset.media_type === "audio/wav" ? "wav" : "flac",
         String(format.sampleRate),

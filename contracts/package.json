@@ -7,12 +7,12 @@
   "scripts": {
     "build:native-tools": "cargo build --quiet --locked -p hyper-audio-source --bin hyper-audio-validate -p hyper-fs-authority --bin hyper-fs-authority --manifest-path ../Cargo.toml",
     "test": "npm run build:native-tools && node scripts/test-public-boundary.mjs && node scripts/test-durable-files.mjs && node scripts/test-native-fs-authority.mjs && node scripts/verify-contracts.mjs && node scripts/test-timeline.mjs && node scripts/test-audio-clip.mjs && node scripts/test-scene.mjs && node scripts/test-arrangement.mjs && node scripts/test-mixer.mjs && node scripts/test-control-mappings.mjs && node scripts/test-timing-simulator.mjs && node scripts/test-recording-metadata.mjs && node scripts/test-automation-take.mjs && node scripts/test-bundle-verifier.mjs && node scripts/test-bundle-builder.mjs && node scripts/test-project-bundle-builder.mjs && node scripts/test-project-roundtrip.mjs && node scripts/test-deployment-target.mjs && node scripts/test-deployment-authorization.mjs && node scripts/test-project-verifier.mjs",
-    "build:bundle": "node scripts/build-bundle.mjs",
+    "build:bundle": "npm run build:native-tools && node scripts/build-bundle.mjs",
     "build:project-bundle": "npm run build:native-tools && node scripts/build-project-bundle.mjs",
     "restore:project": "npm run build:native-tools && node scripts/restore-project.mjs",
     "deploy:local": "npm run build:native-tools && node scripts/deployment-target.mjs",
     "verify:project": "npm run build:native-tools && node scripts/verify-project.mjs",
-    "verify:bundle": "node scripts/verify-bundle.mjs"
+    "verify:bundle": "npm run build:native-tools && node scripts/verify-bundle.mjs"
   },
   "devDependencies": {
     "ajv": "8.20.0",

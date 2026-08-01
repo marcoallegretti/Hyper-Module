@@ -39,6 +39,9 @@ fn duplicate_standard_input() -> io::Result<File> {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
+    if arguments.next().as_deref() != Some("1") {
+        return Err(invalid_argument("unsupported audio validator protocol version").into());
+    }
     let path = arguments
         .next()
         .ok_or_else(|| invalid_argument("audio path is required"))?;

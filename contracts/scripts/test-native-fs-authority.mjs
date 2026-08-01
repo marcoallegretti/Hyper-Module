@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { openRetainedDirectory } from "../lib/durable-files.mjs";
+import { runNativeProcess } from "../lib/native-process.mjs";
 import {
   removeRetainedDirectory,
   renameDirectoryBetweenNoReplace,
@@ -13,6 +14,21 @@ import {
 
 const temporaryRoot = await mkdtemp(join(tmpdir(), "hyper-fs-authority-"));
 try {
+  const authorityExecutable = resolve(
+    import.meta.dirname,
+    "..",
+    "..",
+    "target",
+    "debug",
+    process.platform === "win32"
+      ? "hyper-fs-authority.exe"
+      : "hyper-fs-authority",
+  );
+  await assert.rejects(
+    runNativeProcess(authorityExecutable, ["0"]),
+    /unsupported filesystem authority protocol version/,
+  );
+
   const removable = join(temporaryRoot, "removable");
   await mkdir(join(removable, "nested"), { recursive: true });
   await writeFile(join(removable, "nested", "payload"), "owned");
@@ -173,7 +189,7 @@ try {
   } finally {
     await parentHandle.close();
   }
-  console.log("Native filesystem authority passed: 8 identity cases");
+  console.log("Native filesystem authority passed: 9 identity cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

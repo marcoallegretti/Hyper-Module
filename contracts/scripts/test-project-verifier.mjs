@@ -12,11 +12,12 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 import canonicalize from "canonicalize";
 
+import { runNativeProcess } from "../lib/native-process.mjs";
 import { verifyDescribedFile } from "./verify-bundle.mjs";
 import {
   verifyProject,
@@ -28,6 +29,21 @@ const playbackDomainCases = JSON.parse(
     new URL("../fixtures/playback-domain-cases.json", import.meta.url),
     "utf8",
   ),
+);
+
+const audioValidatorExecutable = resolve(
+  import.meta.dirname,
+  "..",
+  "..",
+  "target",
+  "debug",
+  process.platform === "win32"
+    ? "hyper-audio-validate.exe"
+    : "hyper-audio-validate",
+);
+await assert.rejects(
+  runNativeProcess(audioValidatorExecutable, ["0"]),
+  /unsupported audio validator protocol version/,
 );
 
 // MIT-licensed reference fixture from music-metadata 11.14.0:
@@ -2060,7 +2076,7 @@ try {
     /project must contain at most one control-mapping resource/,
   );
 
-  console.log("Project verifier passed: 77 filesystem cases");
+  console.log("Project verifier passed: 78 filesystem cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }
