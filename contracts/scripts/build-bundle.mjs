@@ -27,6 +27,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import canonicalize from "canonicalize";
 
 import {
+  readStableFile,
   syncDirectoryTree,
   syncPublishedDirectory,
 } from "../lib/durable-files.mjs";
@@ -65,16 +66,7 @@ async function createPlanValidator() {
 }
 
 async function readBuildPlan(planPath) {
-  const status = await lstat(planPath);
-  assert(
-    status.isFile() && !status.isSymbolicLink(),
-    "build plan must be a regular file",
-  );
-  assert(
-    status.size <= planLimitBytes,
-    `build plan exceeds ${planLimitBytes} bytes`,
-  );
-  const bytes = await readFile(planPath);
+  const bytes = await readStableFile(planPath, planLimitBytes, "build plan");
   assert(
     !bytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])),
     "build plan must not contain a byte-order mark",

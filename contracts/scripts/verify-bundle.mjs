@@ -18,6 +18,7 @@ import {
   collectRegularFiles,
   directoryPrefixes,
 } from "../lib/filesystem-tree.mjs";
+import { readStableFile } from "../lib/durable-files.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
 
 const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -54,60 +55,7 @@ function createRetainedReadStream(handle, byteLength, label) {
 }
 
 export async function readStableRegularFile(path, label, maximumBytes) {
-  const noFollow = constants.O_NOFOLLOW ?? 0;
-  const handle = await open(path, constants.O_RDONLY | noFollow);
-  let before;
-  let bytes;
-  let after;
-  try {
-    before = await handle.stat();
-    assert(before.isFile(), `${label} must be a regular file`);
-    assert(
-      before.size <= maximumBytes,
-      `${label} exceeds ${maximumBytes} bytes`,
-    );
-    bytes = await handle.readFile();
-    after = await handle.stat();
-  } finally {
-    await handle.close();
-  }
-  assert.equal(before.dev, after.dev, `${label} changed during reading`);
-  assert.equal(before.ino, after.ino, `${label} changed during reading`);
-  assert.equal(before.size, after.size, `${label} changed size during reading`);
-  assert.equal(
-    before.mtimeMs,
-    after.mtimeMs,
-    `${label} changed during reading`,
-  );
-  assert.equal(
-    before.ctimeMs,
-    after.ctimeMs,
-    `${label} metadata changed during reading`,
-  );
-  assert.equal(
-    bytes.byteLength,
-    after.size,
-    `${label} byte length changed during reading`,
-  );
-
-  const finalStatus = await lstat(path);
-  assert(
-    finalStatus.isFile() && !finalStatus.isSymbolicLink(),
-    `${label} path changed type during reading`,
-  );
-  assert.equal(finalStatus.dev, after.dev, `${label} path changed during reading`);
-  assert.equal(finalStatus.ino, after.ino, `${label} path changed during reading`);
-  assert.equal(
-    finalStatus.size,
-    after.size,
-    `${label} path changed size during reading`,
-  );
-  assert.equal(
-    finalStatus.mtimeMs,
-    after.mtimeMs,
-    `${label} path changed during reading`,
-  );
-  return bytes;
+  return readStableFile(path, maximumBytes, label);
 }
 
 async function createManifestValidator() {
