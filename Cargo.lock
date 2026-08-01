@@ -518,6 +518,8 @@ dependencies = [
 name = "hyper-recording-journal"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "crc32fast",
  "hound",
  "hyper-recording-transport",
@@ -526,6 +528,7 @@ dependencies = [
  "same-file",
  "sha2",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

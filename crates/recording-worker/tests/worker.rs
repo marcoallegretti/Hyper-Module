@@ -263,3 +263,99 @@ fn reused_wake_registration_fails_before_creating_a_journal() {
     assert!(RecordingWorker::start(config, consumer).is_err());
     assert!(!journal.exists());
 }
+
+#[cfg(windows)]
+#[test]
+fn worker_retains_both_recording_parent_directories_until_completion() {
+    let directory = TestDirectory::new();
+    let journal_parent = directory.0.join("journals");
+    let media_parent = directory.0.join("media");
+    fs::create_dir(&journal_parent).unwrap();
+    fs::create_dir(&media_parent).unwrap();
+    let config = RecordingWorkerConfig {
+        journal_path: journal_parent.join("take.journal"),
+        final_wav_path: media_parent.join("take.wav"),
+        journal: JournalConfig {
+            sample_rate: 48_000,
+            max_chunk_frames: 8,
+            max_total_frames: 64,
+        },
+        drain_frames: 1,
+    };
+    let (mut producer, consumer) = try_recording_transport(1).unwrap();
+    let mut worker = RecordingWorker::start(config, consumer).unwrap();
+
+    assert!(
+        fs::rename(&journal_parent, directory.0.join("moved-journals")).is_err(),
+        "the live journal parent must not be displaceable"
+    );
+    assert!(
+        fs::rename(&media_parent, directory.0.join("moved-media")).is_err(),
+        "the live media parent must not be displaceable"
+    );
+
+    producer.push(&[0.25, -0.25]).unwrap();
+    drop(producer);
+    worker.request_commit().unwrap();
+    assert!(matches!(
+        worker.wait(WAIT).unwrap(),
+        RecordingWorkerCompletion::Published(_)
+    ));
+    fs::rename(&journal_parent, directory.0.join("moved-journals")).unwrap();
+    fs::rename(&media_parent, directory.0.join("moved-media")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_never_redirects_recording_into_replacement_parent_directories() {
+    let directory = TestDirectory::new();
+    let journal_parent = directory.0.join("journals");
+    let media_parent = directory.0.join("media");
+    let moved_journal_parent = directory.0.join("moved-journals");
+    let moved_media_parent = directory.0.join("moved-media");
+    fs::create_dir(&journal_parent).unwrap();
+    fs::create_dir(&media_parent).unwrap();
+    let config = RecordingWorkerConfig {
+        journal_path: journal_parent.join("take.journal"),
+        final_wav_path: media_parent.join("take.wav"),
+        journal: JournalConfig {
+            sample_rate: 48_000,
+            max_chunk_frames: 8,
+            max_total_frames: 64,
+        },
+        drain_frames: 1,
+    };
+    let (mut producer, consumer) = try_recording_transport(1).unwrap();
+    let mut worker = RecordingWorker::start(config, consumer).unwrap();
+
+    fs::rename(&journal_parent, &moved_journal_parent).unwrap();
+    fs::rename(&media_parent, &moved_media_parent).unwrap();
+    fs::create_dir(&journal_parent).unwrap();
+    fs::create_dir(&media_parent).unwrap();
+    fs::write(
+        journal_parent.join("owner.txt"),
+        b"replacement journal parent",
+    )
+    .unwrap();
+    fs::write(media_parent.join("owner.txt"), b"replacement media parent").unwrap();
+
+    producer.push(&[0.25, -0.25]).unwrap();
+    drop(producer);
+    worker.request_commit().unwrap();
+    assert!(matches!(
+        worker.wait(WAIT).unwrap(),
+        RecordingWorkerCompletion::Published(_)
+    ));
+    assert!(moved_journal_parent.join("take.journal").is_file());
+    assert!(moved_media_parent.join("take.wav").is_file());
+    assert!(!journal_parent.join("take.journal").exists());
+    assert!(!media_parent.join("take.wav").exists());
+    assert_eq!(
+        fs::read(journal_parent.join("owner.txt")).unwrap(),
+        b"replacement journal parent"
+    );
+    assert_eq!(
+        fs::read(media_parent.join("owner.txt")).unwrap(),
+        b"replacement media parent"
+    );
+}

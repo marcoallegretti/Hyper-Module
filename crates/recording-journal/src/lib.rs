@@ -1,13 +1,18 @@
 #![doc = "Recoverable recording journals and verified WAV publication."]
 
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use crc32fast::Hasher;
 use same_file::Handle;
 use sha2::{Digest, Sha256};
 use std::error::Error;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, File, OpenOptions, TryLockError};
+#[cfg(windows)]
+use std::fs::OpenOptions;
+use std::fs::{self, File, TryLockError};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 const JOURNAL_MAGIC: &[u8; 8] = b"HYPRREC\0";
@@ -24,6 +29,81 @@ const BYTES_PER_FRAME_USIZE: usize = 8;
 const MIN_SAMPLE_RATE: u32 = 8_000;
 const MAX_SAMPLE_RATE: u32 = 384_000;
 const MAX_WAV_DATA_BYTES: u64 = u32::MAX as u64 - 64;
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_link {
+    use std::ffi::OsStr;
+    use std::io;
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::{addr_of_mut, copy_nonoverlapping};
+
+    use cap_std::fs::Dir;
+    use same_file::Handle;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_LINK_INFORMATION, FileLinkInformation, NtSetInformationFile,
+    };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    fn invalid_argument(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, message)
+    }
+
+    pub(super) fn hard_link(
+        source: &Handle,
+        destination_directory: &Dir,
+        destination: &OsStr,
+    ) -> io::Result<()> {
+        let mut destination_name: Vec<u16> = destination.encode_wide().collect();
+        let name_bytes = destination_name
+            .len()
+            .checked_mul(size_of::<u16>())
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or_else(|| invalid_argument("destination entry name is too long"))?;
+        destination_name.push(0);
+        let buffer_bytes = size_of::<FILE_LINK_INFORMATION>()
+            .checked_add(name_bytes as usize)
+            .ok_or_else(|| invalid_argument("link information size overflow"))?;
+        let storage_words = buffer_bytes.div_ceil(size_of::<usize>());
+        let mut storage = vec![0_usize; storage_words];
+        let information = storage.as_mut_ptr().cast::<FILE_LINK_INFORMATION>();
+        let mut io_status = IO_STATUS_BLOCK::default();
+
+        // SAFETY: `storage` is aligned and sized for the fixed information
+        // header plus the complete UTF-16 name. Both handles remain owned and
+        // valid for the system call, and the destination name is interpreted
+        // relative to the retained directory handle.
+        let status = unsafe {
+            (*information).Anonymous.ReplaceIfExists = false;
+            (*information).RootDirectory = destination_directory.as_raw_handle();
+            (*information).FileNameLength = name_bytes;
+            copy_nonoverlapping(
+                destination_name.as_ptr(),
+                addr_of_mut!((*information).FileName).cast::<u16>(),
+                destination_name.len(),
+            );
+            NtSetInformationFile(
+                source.as_raw_handle(),
+                &raw mut io_status,
+                information.cast(),
+                u32::try_from(buffer_bytes)
+                    .map_err(|_| invalid_argument("link information is too large"))?,
+                FileLinkInformation,
+            )
+        };
+        if status >= 0 {
+            return Ok(());
+        }
+        // SAFETY: `status` came directly from the NT system service.
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        Err(io::Error::from_raw_os_error(
+            i32::try_from(error).unwrap_or(i32::MAX),
+        ))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JournalConfig {
@@ -204,6 +284,72 @@ pub struct PublishedRecording {
     outcome: PublicationOutcome,
 }
 
+/// A move-only authority for one not-yet-created or existing recording file.
+pub struct RecordingPathAuthority {
+    path: PathBuf,
+    parent: Dir,
+    name: OsString,
+}
+
+impl fmt::Debug for RecordingPathAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecordingPathAuthority")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecordingPathAuthority {
+    /// Retains the canonical parent directory and one final path component.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path has no ordinary file name or its parent
+    /// cannot be canonicalized and retained.
+    pub fn retain(path: impl AsRef<Path>) -> Result<Self, JournalError> {
+        let path = path.as_ref();
+        let name = path
+            .file_name()
+            .ok_or(JournalError::InvalidConfig(
+                "recording path must have a file name",
+            ))?
+            .to_os_string();
+        let mut components = Path::new(&name).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            return Err(JournalError::InvalidConfig(
+                "recording file name must be one normal path component",
+            ));
+        }
+        let parent_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let display_path = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let canonical_parent = fs::canonicalize(parent_path)?;
+        let parent = open_directory_authority(&canonical_parent)?;
+        if !parent.dir_metadata()?.is_dir() {
+            return Err(JournalError::InvalidConfig(
+                "recording path parent must be a directory",
+            ));
+        }
+        Ok(Self {
+            path: display_path,
+            parent,
+            name,
+        })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 impl PublishedRecording {
     #[must_use]
     pub fn journal_path(&self) -> &Path {
@@ -252,7 +398,7 @@ impl PublishedRecording {
 }
 
 pub struct JournalWriter {
-    path: PathBuf,
+    authority: RecordingPathAuthority,
     file: BufWriter<File>,
     config: JournalConfig,
     next_sequence: u64,
@@ -269,24 +415,33 @@ impl JournalWriter {
     /// Returns an error for invalid configuration, allocation failure, an
     /// existing target, or any filesystem failure.
     pub fn create(path: impl AsRef<Path>, config: JournalConfig) -> Result<Self, JournalError> {
-        let path = path.as_ref();
+        Self::create_retained(RecordingPathAuthority::retain(path)?, config)
+    }
+
+    /// Creates a journal beneath a parent directory retained by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid configuration, allocation failure, an
+    /// existing target, or any filesystem failure.
+    pub fn create_retained(
+        authority: RecordingPathAuthority,
+        config: JournalConfig,
+    ) -> Result<Self, JournalError> {
         let config = config.validate()?;
         let encoded = allocate_payload_buffer(config)?;
-        let file = match OpenOptions::new()
-            .write(true)
-            .read(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(file) => file,
+        let mut options = CapOpenOptions::new();
+        options.write(true).read(true).create_new(true);
+        let file = match authority.parent.open_with(&authority.name, &options) {
+            Ok(file) => file.into_std(),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(JournalError::JournalExists(path.to_owned()));
+                return Err(JournalError::JournalExists(authority.path.clone()));
             }
             Err(error) => return Err(error.into()),
         };
-        if let Err(error) = lock_file(&file, path) {
+        if let Err(error) = lock_file(&file, &authority.path) {
             drop(file);
-            let _ = fs::remove_file(path);
+            let _ = authority.parent.remove_file(&authority.name);
             return Err(error);
         }
 
@@ -294,17 +449,17 @@ impl JournalWriter {
         let mut file = BufWriter::new(file);
         if let Err(error) = write_and_sync(&mut file, &header) {
             drop(file);
-            let _ = fs::remove_file(path);
+            let _ = authority.parent.remove_file(&authority.name);
             return Err(error.into());
         }
-        if let Err(error) = sync_parent(path) {
+        if let Err(error) = sync_directory(&authority.parent) {
             drop(file);
-            let _ = fs::remove_file(path);
+            let _ = authority.parent.remove_file(&authority.name);
             return Err(error);
         }
 
         Ok(Self {
-            path: path.to_owned(),
+            authority,
             file,
             config,
             next_sequence: 0,
@@ -321,14 +476,14 @@ impl JournalWriter {
     /// Returns an error when the header or a committed interior chunk is
     /// corrupt, configuration is invalid, allocation fails, or I/O fails.
     pub fn resume(path: impl AsRef<Path>) -> Result<(Self, RecoveryReport), JournalError> {
-        let path = path.as_ref();
-        let mut file = open_locked(path)?;
+        let authority = RecordingPathAuthority::retain(path)?;
+        let mut file = open_locked_at(&authority)?;
         let report = recover_file(&mut file)?;
         file.seek(SeekFrom::End(0))?;
         let encoded = allocate_payload_buffer(report.config)?;
         Ok((
             Self {
-                path: path.to_owned(),
+                authority,
                 file: BufWriter::new(file),
                 config: report.config,
                 next_sequence: report.chunks,
@@ -413,9 +568,24 @@ impl JournalWriter {
         self.committed_frames
     }
 
+    /// Consumes and durably removes this still-owned journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when buffered data, removal, or parent-directory
+    /// synchronization fails.
+    pub fn discard(mut self) -> Result<PathBuf, JournalError> {
+        self.file.flush()?;
+        let path = self.authority.path.clone();
+        drop(self.file);
+        self.authority.parent.remove_file(&self.authority.name)?;
+        sync_directory(&self.authority.parent)?;
+        Ok(path)
+    }
+
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.path
+        self.authority.path()
     }
 
     /// Consumes this writer and publishes WAV from the still-locked journal.
@@ -432,10 +602,30 @@ impl JournalWriter {
             return Err(JournalError::WriterPoisoned);
         }
         self.file.flush()?;
-        let journal_path = self.path.clone();
+        let journal_path = self.authority.path.clone();
         let journal = self.file.get_mut();
         let report = recover_file(journal)?;
         publish_locked_wav(&journal_path, journal, final_path.as_ref(), report)
+    }
+
+    /// Publishes WAV while retaining the destination parent authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, conflict, allocation, and I/O errors as
+    /// [`Self::publish_wav`].
+    pub fn publish_wav_retained(
+        mut self,
+        final_authority: &RecordingPathAuthority,
+    ) -> Result<PublishedRecording, JournalError> {
+        if self.poisoned {
+            return Err(JournalError::WriterPoisoned);
+        }
+        self.file.flush()?;
+        let journal_path = self.authority.path.clone();
+        let journal = self.file.get_mut();
+        let report = recover_file(journal)?;
+        publish_locked_wav_retained(&journal_path, journal, final_authority, report)
     }
 }
 
@@ -553,61 +743,97 @@ fn publish_locked_wav(
     final_path: &Path,
     report: RecoveryReport,
 ) -> Result<PublishedRecording, JournalError> {
-    publish_locked_wav_observed(journal_path, journal_lock, final_path, report, |_| {})
+    let final_authority = RecordingPathAuthority::retain(final_path)?;
+    publish_locked_wav_retained(journal_path, journal_lock, &final_authority, report)
 }
 
+#[cfg(test)]
 fn publish_locked_wav_observed(
     journal_path: &Path,
     journal_lock: &mut File,
     final_path: &Path,
     report: RecoveryReport,
     before_link: impl FnOnce(&Path),
+    after_link: impl FnOnce(&Path),
+) -> Result<PublishedRecording, JournalError> {
+    let final_authority = RecordingPathAuthority::retain(final_path)?;
+    publish_locked_wav_retained_observed(
+        journal_path,
+        journal_lock,
+        &final_authority,
+        report,
+        before_link,
+        after_link,
+    )
+}
+
+fn publish_locked_wav_retained(
+    journal_path: &Path,
+    journal_lock: &mut File,
+    final_authority: &RecordingPathAuthority,
+    report: RecoveryReport,
+) -> Result<PublishedRecording, JournalError> {
+    publish_locked_wav_retained_observed(
+        journal_path,
+        journal_lock,
+        final_authority,
+        report,
+        |_| {},
+        |_| {},
+    )
+}
+
+fn publish_locked_wav_retained_observed(
+    journal_path: &Path,
+    journal_lock: &mut File,
+    final_authority: &RecordingPathAuthority,
+    report: RecoveryReport,
+    before_link: impl FnOnce(&Path),
+    after_link: impl FnOnce(&Path),
 ) -> Result<PublishedRecording, JournalError> {
     if report.frames == 0 {
         return Err(JournalError::InvalidJournal(
             "an empty recording cannot be published",
         ));
     }
-    let staging_path = staging_path(final_path)?;
+    let final_path = final_authority.path();
+    let staging_name = staging_name(&final_authority.name);
+    let staging_path = final_path.with_file_name(&staging_name);
 
-    if final_path.exists() {
-        if let Some(verified) = verify_wav(final_path, report) {
-            if staging_path.exists() {
-                if verify_wav(&staging_path, report).is_none() {
-                    return Err(JournalError::StagingConflict(staging_path));
-                }
-                fs::remove_file(&staging_path)?;
-                sync_parent(final_path)?;
-            }
-            return Ok(published_recording(
-                journal_path,
-                final_path,
-                report,
-                verified,
-                PublicationOutcome::AlreadyPublished,
-            ));
-        }
-        return Err(JournalError::PublishedRecordingConflict(
-            final_path.to_owned(),
+    if let Some(verified) =
+        verify_existing_publication(final_authority, &staging_name, &staging_path, report)?
+    {
+        return Ok(published_recording(
+            journal_path,
+            final_path,
+            report,
+            verified,
+            PublicationOutcome::AlreadyPublished,
         ));
     }
 
-    let staging_authority = if staging_path.exists() {
-        verify_wav_authority(&staging_path, report)
+    let staging_authority = if entry_exists(&final_authority.parent, &staging_name)? {
+        verify_wav_authority_at(&final_authority.parent, &staging_name, report)
             .ok_or_else(|| JournalError::StagingConflict(staging_path.clone()))?
     } else {
-        write_staging_wav(journal_lock, &staging_path, report)?;
-        verify_wav_authority(&staging_path, report)
+        write_staging_wav_at(journal_lock, &final_authority.parent, &staging_name, report)?;
+        verify_wav_authority_at(&final_authority.parent, &staging_name, report)
             .ok_or_else(|| JournalError::StagingConflict(staging_path.clone()))?
     };
 
     before_link(&staging_path);
-    match hard_link_verified(&staging_authority.handle, &staging_path, final_path) {
+    match hard_link_verified(
+        &staging_authority.handle,
+        &final_authority.parent,
+        &final_authority.name,
+    ) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if let Some(verified) = verify_wav(final_path, report) {
-                remove_staging_if_owned(&staging_authority, &staging_path)?;
-                sync_published(final_path)?;
+            if let Some(verified) =
+                verify_wav_at(&final_authority.parent, &final_authority.name, report)
+            {
+                remove_path_if_owned_at(&staging_authority.handle, final_authority, &staging_name)?;
+                sync_published_at(final_authority)?;
                 return Ok(published_recording(
                     journal_path,
                     final_path,
@@ -622,18 +848,23 @@ fn publish_locked_wav_observed(
         }
         Err(error) => return Err(error.into()),
     }
-    let published = Handle::from_path(final_path)?;
+    after_link(final_path);
+    let published = open_verification_handle_at(&final_authority.parent, &final_authority.name)?;
     if published != staging_authority.handle {
-        remove_path_if_owned(&published, final_path)?;
+        remove_path_if_owned_at(
+            &staging_authority.handle,
+            final_authority,
+            &final_authority.name,
+        )?;
         return Err(JournalError::PublishedRecordingConflict(
             final_path.to_owned(),
         ));
     }
-    sync_parent(final_path)?;
-    let verified = verify_wav(final_path, report)
+    sync_published_at(final_authority)?;
+    let verified = verify_wav_at(&final_authority.parent, &final_authority.name, report)
         .ok_or_else(|| JournalError::PublishedRecordingConflict(final_path.to_owned()))?;
-    remove_staging_if_owned(&staging_authority, &staging_path)?;
-    sync_parent(final_path)?;
+    remove_path_if_owned_at(&staging_authority.handle, final_authority, &staging_name)?;
+    sync_directory(&final_authority.parent)?;
     Ok(published_recording(
         journal_path,
         final_path,
@@ -641,6 +872,29 @@ fn publish_locked_wav_observed(
         verified,
         PublicationOutcome::Published,
     ))
+}
+
+fn verify_existing_publication(
+    final_authority: &RecordingPathAuthority,
+    staging_name: &OsStr,
+    staging_path: &Path,
+    report: RecoveryReport,
+) -> Result<Option<VerifiedWav>, JournalError> {
+    if !entry_exists(&final_authority.parent, &final_authority.name)? {
+        return Ok(None);
+    }
+    let verified = verify_wav_at(&final_authority.parent, &final_authority.name, report)
+        .ok_or_else(|| {
+            JournalError::PublishedRecordingConflict(final_authority.path().to_owned())
+        })?;
+    if entry_exists(&final_authority.parent, staging_name)? {
+        if verify_wav_at(&final_authority.parent, staging_name, report).is_none() {
+            return Err(JournalError::StagingConflict(staging_path.to_owned()));
+        }
+        final_authority.parent.remove_file(staging_name)?;
+        sync_directory(&final_authority.parent)?;
+    }
+    Ok(Some(verified))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -840,15 +1094,15 @@ fn truncate_tail(
     })
 }
 
-fn write_staging_wav(
+fn write_staging_wav_at(
     journal: &mut File,
-    staging_path: &Path,
+    parent: &Dir,
+    staging_name: &OsStr,
     report: RecoveryReport,
 ) -> Result<(), JournalError> {
-    let staging = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(staging_path)?;
+    let mut options = CapOpenOptions::new();
+    options.write(true).read(true).create_new(true);
+    let staging = parent.open_with(staging_name, &options)?.into_std();
     let result = (|| {
         let spec = hound::WavSpec {
             channels: CHANNELS,
@@ -866,15 +1120,15 @@ fn write_staging_wav(
             Ok(())
         })?;
         writer.finalize()?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(staging_path)?;
+        let mut options = CapOpenOptions::new();
+        options.read(true).write(true).follow(FollowSymlinks::No);
+        let file = parent.open_with(staging_name, &options)?.into_std();
         file.sync_all()?;
+        sync_directory(parent)?;
         Ok::<(), JournalError>(())
     })();
     if result.is_err() {
-        let _ = fs::remove_file(staging_path);
+        let _ = parent.remove_file(staging_name);
     }
     result
 }
@@ -946,38 +1200,42 @@ fn visit_payloads(
     }
 }
 
-fn verify_wav(path: &Path, report: RecoveryReport) -> Option<VerifiedWav> {
-    verify_wav_authority(path, report).map(|authority| authority.verified)
-}
-
 #[cfg(test)]
 fn verify_wav_observed(
     path: &Path,
     report: RecoveryReport,
     after_samples: impl FnOnce(),
 ) -> Option<VerifiedWav> {
-    verify_wav_authority_observed(path, report, after_samples).map(|authority| authority.verified)
+    let authority = RecordingPathAuthority::retain(path).ok()?;
+    verify_wav_authority_at_observed(&authority.parent, &authority.name, report, after_samples)
+        .map(|verified| verified.verified)
 }
 
-fn verify_wav_authority(path: &Path, report: RecoveryReport) -> Option<VerifiedWavAuthority> {
-    verify_wav_authority_observed(path, report, || {})
+fn verify_wav_at(parent: &Dir, name: &OsStr, report: RecoveryReport) -> Option<VerifiedWav> {
+    verify_wav_authority_at(parent, name, report).map(|authority| authority.verified)
 }
 
-fn verify_wav_authority_observed(
-    path: &Path,
+fn verify_wav_authority_at(
+    parent: &Dir,
+    name: &OsStr,
+    report: RecoveryReport,
+) -> Option<VerifiedWavAuthority> {
+    verify_wav_authority_at_observed(parent, name, report, || {})
+}
+
+fn verify_wav_authority_at_observed(
+    parent: &Dir,
+    name: &OsStr,
     report: RecoveryReport,
     after_samples: impl FnOnce(),
 ) -> Option<VerifiedWavAuthority> {
-    let path_before = fs::symlink_metadata(path).ok()?;
-    if is_link_like(&path_before) || !path_before.is_file() {
+    let path_before = parent.symlink_metadata(name).ok()?;
+    if path_before.is_symlink() || !path_before.is_file() {
         return None;
     }
-    let mut handle = open_verification_handle(path).ok()?;
+    let mut handle = open_verification_handle_at(parent, name).ok()?;
     let file_before = handle.as_file().metadata().ok()?;
-    if !file_before.is_file()
-        || file_before.len() != path_before.len()
-        || metadata_stamp(&file_before) != metadata_stamp(&path_before)
-    {
+    if !file_before.is_file() || file_before.len() != path_before.len() {
         return None;
     }
     let before = hash_open_file(handle.as_file_mut())?;
@@ -992,14 +1250,13 @@ fn verify_wav_authority_observed(
         return None;
     }
     let file_after = handle.as_file().metadata().ok()?;
-    let path_after = fs::symlink_metadata(path).ok()?;
-    if is_link_like(&path_after)
+    let path_after = parent.symlink_metadata(name).ok()?;
+    if path_after.is_symlink()
         || !path_after.is_file()
         || file_after.len() != file_before.len()
         || metadata_stamp(&file_after) != metadata_stamp(&file_before)
         || path_after.len() != file_after.len()
-        || metadata_stamp(&path_after) != metadata_stamp(&file_after)
-        || Handle::from_path(path).ok()? != handle
+        || open_verification_handle_at(parent, name).ok()? != handle
     {
         return None;
     }
@@ -1009,73 +1266,70 @@ fn verify_wav_authority_observed(
     })
 }
 
-#[cfg(not(windows))]
-fn open_verification_handle(path: &Path) -> io::Result<Handle> {
-    Handle::from_path(path)
-}
+fn open_verification_handle_at(parent: &Dir, name: &OsStr) -> io::Result<Handle> {
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
 
-#[cfg(windows)]
-fn open_verification_handle(path: &Path) -> io::Result<Handle> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_SHARE_READ: u32 = 1;
-    const FILE_SHARE_WRITE: u32 = 2;
-    const FILE_SHARE_DELETE: u32 = 4;
-    let file = OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .open(path)?;
-    Handle::from_file(file)
+        const DELETE: u32 = 0x0001_0000;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
+        const FILE_SHARE_DELETE: u32 = 4;
+        options
+            .access_mode(GENERIC_READ | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    Handle::from_file(parent.open_with(name, &options)?.into_std())
 }
 
 #[cfg(target_os = "linux")]
-fn hard_link_verified(source: &Handle, _source_path: &Path, final_path: &Path) -> io::Result<()> {
+fn hard_link_verified(source: &Handle, destination: &Dir, name: &OsStr) -> io::Result<()> {
     use rustix::fs::{AtFlags, CWD, linkat};
     use std::os::fd::AsRawFd;
 
     let source_path = format!("/proc/self/fd/{}", source.as_raw_fd());
-    linkat(CWD, source_path, CWD, final_path, AtFlags::SYMLINK_FOLLOW)?;
+    linkat(
+        CWD,
+        source_path,
+        destination,
+        Path::new(name),
+        AtFlags::SYMLINK_FOLLOW,
+    )?;
     Ok(())
 }
 
 #[cfg(windows)]
-fn hard_link_verified(_source: &Handle, source_path: &Path, final_path: &Path) -> io::Result<()> {
-    fs::hard_link(source_path, final_path)
+fn hard_link_verified(source: &Handle, destination: &Dir, name: &OsStr) -> io::Result<()> {
+    windows_link::hard_link(source, destination, name)
 }
 
-fn remove_staging_if_owned(
-    authority: &VerifiedWavAuthority,
-    staging_path: &Path,
-) -> Result<(), JournalError> {
-    remove_path_if_owned(&authority.handle, staging_path)?;
-    Ok(())
-}
-
-fn remove_path_if_owned(authority: &Handle, path: &Path) -> Result<bool, JournalError> {
-    let parent = path
-        .parent()
-        .ok_or(JournalError::InvalidJournal("cleanup path has no parent"))?;
-    let name = path
-        .file_name()
-        .ok_or(JournalError::InvalidJournal("cleanup path has no name"))?
-        .to_string_lossy();
-    let quarantine = parent.join(format!(".{name}.hyper-cleanup-{}", Uuid::new_v4()));
-    match fs::rename(path, &quarantine) {
+fn remove_path_if_owned_at(
+    authority: &Handle,
+    target: &RecordingPathAuthority,
+    name: &OsStr,
+) -> Result<bool, JournalError> {
+    let mut quarantine = OsString::from(".");
+    quarantine.push(name);
+    quarantine.push(format!(".hyper-cleanup-{}", Uuid::new_v4()));
+    match target.parent.rename(name, &target.parent, &quarantine) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     }
-    let moved = Handle::from_path(&quarantine)?;
+    let moved = open_verification_handle_at(&target.parent, &quarantine)?;
     if &moved != authority {
         drop(moved);
-        if !path.exists() {
-            fs::rename(&quarantine, path)?;
+        if !entry_exists(&target.parent, name)? {
+            target.parent.rename(&quarantine, &target.parent, name)?;
         }
         return Ok(false);
     }
     drop(moved);
-    fs::remove_file(&quarantine)?;
-    sync_parent(path)?;
+    target.parent.remove_file(&quarantine)?;
+    sync_directory(&target.parent)?;
     Ok(true)
 }
 
@@ -1157,58 +1411,57 @@ fn metadata_stamp(metadata: &fs::Metadata) -> MetadataStamp {
     )
 }
 
+fn entry_exists(parent: &Dir, name: &OsStr) -> Result<bool, JournalError> {
+    match parent.symlink_metadata(name) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn staging_name(final_name: &OsStr) -> OsString {
+    let mut staging = OsString::from(".");
+    staging.push(final_name);
+    staging.push(".hyper-staging");
+    staging
+}
+
+fn sync_published_at(authority: &RecordingPathAuthority) -> Result<(), JournalError> {
+    let mut options = CapOpenOptions::new();
+    options.read(true).write(true).follow(FollowSymlinks::No);
+    authority
+        .parent
+        .open_with(&authority.name, &options)?
+        .into_std()
+        .sync_all()?;
+    sync_directory(&authority.parent)?;
+    Ok(())
+}
+
+fn sync_directory(directory: &Dir) -> Result<(), JournalError> {
+    directory.try_clone()?.into_std_file().sync_all()?;
+    Ok(())
+}
+
 #[cfg(unix)]
-fn is_link_like(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
+fn open_directory_authority(path: &Path) -> io::Result<Dir> {
+    Ok(Dir::from_std_file(File::open(path)?))
 }
 
 #[cfg(windows)]
-fn is_link_like(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
+fn open_directory_authority(path: &Path) -> io::Result<Dir> {
+    use std::os::windows::fs::OpenOptionsExt;
 
-fn staging_path(final_path: &Path) -> Result<PathBuf, JournalError> {
-    let name = final_path
-        .file_name()
-        .ok_or(JournalError::InvalidConfig(
-            "published WAV path must have a file name",
-        ))?
-        .to_string_lossy();
-    Ok(final_path.with_file_name(format!(".{name}.hyper-staging")))
-}
-
-fn sync_published(path: &Path) -> Result<(), JournalError> {
-    OpenOptions::new()
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(path)?
-        .sync_all()?;
-    sync_parent(path)
-}
-
-fn sync_parent(path: &Path) -> Result<(), JournalError> {
-    let parent = path.parent().ok_or(JournalError::InvalidConfig(
-        "published WAV path must have a parent directory",
-    ))?;
-    fs::metadata(parent)?;
-    #[cfg(unix)]
-    File::open(parent)?.sync_all()?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(parent)?
-            .sync_all()?;
-    }
-    Ok(())
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    Ok(Dir::from_std_file(file))
 }
 
 fn allocate_payload_buffer(config: JournalConfig) -> Result<Vec<u8>, JournalError> {
@@ -1234,8 +1487,18 @@ fn resize_zeroed(output: &mut Vec<u8>, length: usize) -> Result<(), JournalError
 }
 
 fn open_locked(path: &Path) -> Result<File, JournalError> {
-    let file = OpenOptions::new().read(true).write(true).open(path)?;
-    lock_file(&file, path)?;
+    let authority = RecordingPathAuthority::retain(path)?;
+    open_locked_at(&authority)
+}
+
+fn open_locked_at(authority: &RecordingPathAuthority) -> Result<File, JournalError> {
+    let mut options = CapOpenOptions::new();
+    options.read(true).write(true).follow(FollowSymlinks::No);
+    let file = authority
+        .parent
+        .open_with(&authority.name, &options)?
+        .into_std();
+    lock_file(&file, authority.path())?;
     Ok(file)
 }
 
@@ -1340,7 +1603,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn publication_links_the_verified_file_when_the_staging_path_is_replaced() {
         let root = test_root("staging-publication");
@@ -1363,12 +1626,18 @@ mod tests {
         let mut journal_lock = open_locked(&journal).unwrap();
         let report = recover_file(&mut journal_lock).unwrap();
 
-        let published =
-            publish_locked_wav_observed(&journal, &mut journal_lock, &final_path, report, |_| {
+        let published = publish_locked_wav_observed(
+            &journal,
+            &mut journal_lock,
+            &final_path,
+            report,
+            |_| {
                 fs::rename(&staging, &displaced).unwrap();
                 fs::rename(&replacement, &staging).unwrap();
-            })
-            .unwrap();
+            },
+            |_| {},
+        )
+        .unwrap();
 
         assert_eq!(published.outcome(), PublicationOutcome::Published);
         let decoded = hound::WavReader::open(&final_path)
@@ -1390,15 +1659,14 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
-    fn publication_removes_a_link_to_a_replaced_staging_file() {
-        let root = test_root("staging-publication");
+    fn publication_never_removes_a_foreign_final_path_replacement() {
+        let root = test_root("final-publication");
         fs::create_dir(&root).unwrap();
         let journal = root.join("take.journal");
         let final_path = root.join("take.wav");
-        let staging = root.join(".take.wav.hyper-staging");
-        let displaced = root.join("displaced.wav");
+        let linked_output = root.join("linked-output.wav");
         let replacement = root.join("replacement.wav");
         let config = JournalConfig {
             sample_rate: 48_000,
@@ -1408,22 +1676,28 @@ mod tests {
         let mut writer = JournalWriter::create(&journal, config).unwrap();
         writer.append(&[0.25, -0.25]).unwrap();
         drop(writer);
-        fs::write(&replacement, b"foreign staging data").unwrap();
+        fs::write(&replacement, b"foreign final data").unwrap();
         let mut journal_lock = open_locked(&journal).unwrap();
         let report = recover_file(&mut journal_lock).unwrap();
 
-        let result =
-            publish_locked_wav_observed(&journal, &mut journal_lock, &final_path, report, |_| {
-                fs::rename(&staging, &displaced).unwrap();
-                fs::rename(&replacement, &staging).unwrap();
-            });
+        let result = publish_locked_wav_observed(
+            &journal,
+            &mut journal_lock,
+            &final_path,
+            report,
+            |_| {},
+            |_| {
+                fs::rename(&final_path, &linked_output).unwrap();
+                fs::rename(&replacement, &final_path).unwrap();
+            },
+        );
 
         assert!(matches!(
             result,
             Err(JournalError::PublishedRecordingConflict(path)) if path == final_path
         ));
-        assert!(!final_path.exists());
-        assert_eq!(fs::read(&staging).unwrap(), b"foreign staging data");
+        assert_eq!(fs::read(&final_path).unwrap(), b"foreign final data");
+        assert!(verify_wav_observed(&linked_output, report, || {}).is_some());
         fs::remove_dir_all(root).unwrap();
     }
 }

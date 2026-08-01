@@ -1,6 +1,8 @@
 #![doc = "Owned non-real-time recording persistence workers."]
 
-use hyper_recording_journal::{JournalConfig, JournalError, JournalWriter, PublishedRecording};
+use hyper_recording_journal::{
+    JournalConfig, JournalError, JournalWriter, PublishedRecording, RecordingPathAuthority,
+};
 use hyper_recording_transport::{
     RECORDING_CHANNELS, RecordingConsumer, RecordingDrainError, RecordingTransportSnapshot,
     RecordingWakeRegistrationError,
@@ -267,7 +269,17 @@ impl RecordingWorker {
         consumer: RecordingConsumer,
     ) -> Result<Self, RecordingWorkerStartError> {
         validate_config(&config, &consumer)?;
-        let sample_count = config.drain_frames.checked_mul(RECORDING_CHANNELS).ok_or(
+        let RecordingWorkerConfig {
+            journal_path,
+            final_wav_path,
+            journal,
+            drain_frames,
+        } = config;
+        let journal_authority = RecordingPathAuthority::retain(&journal_path)
+            .map_err(RecordingWorkerStartError::Journal)?;
+        let final_authority = RecordingPathAuthority::retain(&final_wav_path)
+            .map_err(RecordingWorkerStartError::Journal)?;
+        let sample_count = drain_frames.checked_mul(RECORDING_CHANNELS).ok_or(
             RecordingWorkerStartError::InvalidConfig("drain sample count overflowed"),
         )?;
         let mut drain_buffer = Vec::new();
@@ -276,8 +288,7 @@ impl RecordingWorker {
             .map_err(RecordingWorkerStartError::Allocation)?;
         drain_buffer.resize(sample_count, 0.0);
 
-        let journal_path = config.journal_path;
-        let final_wav_path = config.final_wav_path;
+        let journal_path = journal_authority.path().to_owned();
         let thread_journal_path = journal_path.clone();
         let (consumer_sender, consumer_receiver) = sync_channel(1);
         let (disposition_sender, disposition_receiver) = sync_channel(1);
@@ -305,7 +316,7 @@ impl RecordingWorker {
                     drain_buffer,
                     &disposition_receiver,
                     thread_journal_path,
-                    &final_wav_path,
+                    &final_authority,
                     &thread_cancel,
                 )
             })
@@ -316,7 +327,7 @@ impl RecordingWorker {
             let _ = handle.join();
             return Err(RecordingWorkerStartError::WakeRegistration(source));
         }
-        let writer = match JournalWriter::create(&journal_path, config.journal) {
+        let writer = match JournalWriter::create_retained(journal_authority, journal) {
             Ok(writer) => writer,
             Err(source) => {
                 drop(consumer_sender);
@@ -326,9 +337,10 @@ impl RecordingWorker {
         };
         if let Err(error) = consumer_sender.send((consumer, writer)) {
             let (_, writer) = error.0;
-            drop(writer);
             let _ = handle.join();
-            fs::remove_file(&journal_path).map_err(RecordingWorkerStartError::PathValidation)?;
+            writer
+                .discard()
+                .map_err(RecordingWorkerStartError::Journal)?;
             return Err(RecordingWorkerStartError::ThreadTerminated);
         }
         Ok(Self {
@@ -515,7 +527,7 @@ fn run_worker(
     mut drain_buffer: Vec<f32>,
     disposition_receiver: &Receiver<RecordingDisposition>,
     journal_path: PathBuf,
-    final_wav_path: &Path,
+    final_wav_path: &RecordingPathAuthority,
     hard_cancel: &AtomicBool,
 ) -> RecordingWorkerCompletion {
     let counters = consumer.counters();
@@ -565,7 +577,7 @@ fn run_worker(
                     },
                 );
             }
-            return match writer.publish_wav(final_wav_path) {
+            return match writer.publish_wav_retained(final_wav_path) {
                 Ok(recording) => RecordingWorkerCompletion::Published(recording),
                 Err(error) => failed(frames, journal_path, error.into()),
             };
