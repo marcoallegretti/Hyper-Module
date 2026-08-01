@@ -1,10 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
-  chmod,
   constants,
   lstat,
-  mkdir,
   mkdtemp,
   open,
   readFile,
@@ -32,6 +30,7 @@ import {
   syncPublishedDirectory,
 } from "../lib/durable-files.mjs";
 import {
+  writeRetainedFile,
   removeRetainedDirectory,
   renameDirectoryNoReplace,
 } from "../lib/native-fs-authority.mjs";
@@ -41,13 +40,14 @@ import {
 } from "../lib/operation-cleanup.mjs";
 import { PublishedDirectoryDurabilityError } from "../lib/published-directory.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
+import { copyVerifiedBundleFile } from "../lib/verified-bundle-copy.mjs";
 import {
   verifyBundle,
   verifyBundleArtifact,
 } from "./verify-bundle.mjs";
 
 const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const planLimitBytes = 1024 * 1024;
+export const maximumBuildPlanBytes = 1024 * 1024;
 const defaultMaximumBundleBytes = 1024 * 1024 * 1024;
 const builderId = "hyper-bundle-builder";
 
@@ -74,7 +74,11 @@ async function createPlanValidator() {
 }
 
 async function readBuildPlan(planPath) {
-  const bytes = await readStableFile(planPath, planLimitBytes, "build plan");
+  const bytes = await readStableFile(
+    planPath,
+    maximumBuildPlanBytes,
+    "build plan",
+  );
   assert(
     !bytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])),
     "build plan must not contain a byte-order mark",
@@ -85,7 +89,10 @@ async function readBuildPlan(planPath) {
   } catch (error) {
     throw new Error("build plan is not valid UTF-8", { cause: error });
   }
-  const plan = strictParse(text);
+  return validateBuildPlan(strictParse(text));
+}
+
+async function validateBuildPlan(plan) {
   const validate = await createPlanValidator();
   assert(validate, "runtime build-plan schema was not registered");
   assert(
@@ -113,17 +120,14 @@ async function readBuildPlan(planPath) {
   return plan;
 }
 
-async function writeAll(handle, bytes) {
-  let offset = 0;
-  while (offset < bytes.length) {
-    const { bytesWritten } = await handle.write(
-      bytes,
-      offset,
-      bytes.length - offset,
-    );
-    assert(bytesWritten > 0, "write made no forward progress");
-    offset += bytesWritten;
-  }
+async function validatePreparedBuildPlan(plan) {
+  const text = canonicalize(plan);
+  assert.equal(typeof text, "string", "prepared build plan is not serializable");
+  assert(
+    Buffer.byteLength(text, "utf8") <= maximumBuildPlanBytes,
+    `build plan exceeds ${maximumBuildPlanBytes} bytes`,
+  );
+  return validateBuildPlan(strictParse(text));
 }
 
 function assertContained(rootPath, candidatePath, label) {
@@ -260,6 +264,7 @@ async function preflightBundle(
 async function copyPayload(
   sourceRoot,
   sourceRootReal,
+  stageHandle,
   stageRoot,
   payload,
   expectedSource,
@@ -284,64 +289,27 @@ async function copyPayload(
   const sourceReal = await realpath(sourcePath);
   assertContained(sourceRootReal, sourceReal, payload.source_path);
 
-  const destinationPath = resolve(stageRoot, ...payload.path.split("/"));
-  assertContained(stageRoot, destinationPath, payload.path);
-  await mkdir(dirname(destinationPath), { recursive: true, mode: 0o755 });
-
-  const noFollow = constants.O_NOFOLLOW ?? 0;
-  const sourceHandle = await open(sourcePath, constants.O_RDONLY | noFollow);
-  const destinationHandle = await open(
-    destinationPath,
-    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
-    0o644,
+  const copied = await copyVerifiedBundleFile(
+    sourceRoot,
+    sourceRootReal,
+    stageHandle,
+    stageRoot,
+    {
+      source_path: payload.source_path,
+      source_identity: expectedSource.identity,
+      path: payload.path,
+      byte_length: expectedSource.byteLength,
+      sha256: undefined,
+    },
+    maximumBundleBytes - currentBundleBytes,
   );
-  const digest = createHash("sha256");
-  let byteLength = 0;
-  let before;
-  let after;
-  try {
-    before = await sourceHandle.stat({ bigint: true });
-    assert(
-      sameFileIdentity(expectedSource.identity, before),
-      `${payload.source_path}: source changed after preflight`,
-    );
-    for await (const chunk of sourceHandle.createReadStream({
-      autoClose: false,
-    })) {
-      digest.update(chunk);
-      byteLength += chunk.length;
-      assert(
-        currentBundleBytes + byteLength <= maximumBundleBytes,
-        `runtime bundle exceeds ${maximumBundleBytes} bytes`,
-      );
-      await writeAll(destinationHandle, chunk);
-    }
-    await destinationHandle.sync();
-    after = await sourceHandle.stat({ bigint: true });
-  } finally {
-    await Promise.allSettled([sourceHandle.close(), destinationHandle.close()]);
-  }
-  assert(
-    sameFileIdentity(before, after),
-    `${payload.source_path}: source changed during build`,
-  );
-  const finalSourceStatus = await lstat(sourcePath, { bigint: true });
-  assert(
-    finalSourceStatus.isFile() && !finalSourceStatus.isSymbolicLink(),
-    `${payload.source_path}: source path changed type during build`,
-  );
-  assert(
-    sameFileIdentity(finalSourceStatus, after),
-    `${payload.source_path}: source path changed during build`,
-  );
-  await chmod(destinationPath, 0o644);
 
   return {
     path: payload.path,
     role: payload.role,
     media_type: payload.media_type,
-    byte_length: byteLength,
-    sha256: digest.digest("hex"),
+    byte_length: copied.byteLength,
+    sha256: copied.sha256,
   };
 }
 
@@ -352,6 +320,7 @@ export async function buildBundle(
   {
     faultAt,
     maximumBundleBytes = defaultMaximumBundleBytes,
+    preparedPlan = undefined,
   } = {},
 ) {
   assert(
@@ -362,7 +331,10 @@ export async function buildBundle(
     Number.isSafeInteger(maximumBundleBytes) && maximumBundleBytes > 0,
     "maximum bundle bytes must be a positive safe integer",
   );
-  const plan = await readBuildPlan(resolve(planPath));
+  const plan =
+    preparedPlan === undefined
+      ? await readBuildPlan(resolve(planPath))
+      : await validatePreparedBuildPlan(preparedPlan);
   const sourceRoot = resolve(sourcePath);
   const sourceStatus = await lstat(sourceRoot);
   assert(
@@ -407,6 +379,7 @@ export async function buildBundle(
       const descriptor = await copyPayload(
         sourceRoot,
         sourceRootReal,
+        stageHandle,
         stageRoot,
         payload,
         preflightSources.get(payload.source_path),
@@ -436,18 +409,14 @@ export async function buildBundle(
       bundleBytes <= maximumBundleBytes,
       `runtime bundle exceeds ${maximumBundleBytes} bytes`,
     );
-    const manifestHandle = await open(
-      join(stageRoot, "manifest.json"),
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
-      0o644,
+    await writeRetainedFile(
+      stageHandle,
+      stageRoot,
+      "manifest.json",
+      manifestBytes,
+      maximumBundleBytes - payloadBytes,
+      "runtime bundle manifest",
     );
-    try {
-      await writeAll(manifestHandle, manifestBytes);
-      await manifestHandle.sync();
-    } finally {
-      await manifestHandle.close();
-    }
-    await chmod(join(stageRoot, "manifest.json"), 0o644);
 
     await verifyBundle(stageRoot);
     const declaredFiles = [

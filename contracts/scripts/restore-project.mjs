@@ -129,13 +129,15 @@ export async function restoreProject(
     );
     let copiedBytes = 0;
     for (const descriptor of payloads) {
-      copiedBytes += await copyVerifiedBundleFile(
+      const copied = await copyVerifiedBundleFile(
         bundleRoot,
         bundleRootReal,
+        stageHandle,
         stageRoot,
         descriptor,
         maximumProjectBytes - copiedBytes,
       );
+      copiedBytes += copied.byteLength;
     }
     injectFault(faultAt, "after-payload-copy");
 

@@ -1,10 +1,11 @@
 use std::error::Error;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Component, Path};
 
-use cap_fs_ext::MetadataExt;
+use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, Metadata};
+use cap_std::fs::{Dir, DirBuilder, File, Metadata, OpenOptions};
+use sha2::{Digest, Sha256};
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
@@ -166,6 +167,45 @@ fn parse_identity(value: Option<String>, message: &'static str) -> Result<u64, B
         .parse::<u64>()?)
 }
 
+fn parse_sha256(
+    value: Option<String>,
+    message: &'static str,
+    optional: bool,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let value = value.ok_or_else(|| invalid_argument(message))?;
+    if optional && value == "-" {
+        return Ok(None);
+    }
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid_argument("SHA-256 must be 64 lowercase hexadecimal digits").into());
+    }
+    Ok(Some(value))
+}
+
+fn parse_relative_path(
+    value: Option<String>,
+    message: &'static str,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let value = value.ok_or_else(|| invalid_argument(message))?;
+    let components: Vec<_> = value.split('/').map(str::to_owned).collect();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| component.is_empty() || component == "." || component == "..")
+        || value.contains('\\')
+    {
+        return Err(invalid_argument(
+            "filesystem relative path must contain only normal POSIX components",
+        )
+        .into());
+    }
+    Ok(components)
+}
+
 fn parse_name(value: Option<String>, message: &'static str) -> Result<String, Box<dyn Error>> {
     let value = value.ok_or_else(|| invalid_argument(message))?;
     let mut components = Path::new(&value).components();
@@ -187,6 +227,193 @@ fn open_verified_directory(
         );
     }
     Ok(directory)
+}
+
+#[cfg(target_os = "linux")]
+fn open_copy_source(path: &str) -> io::Result<File> {
+    File::open_ambient(path, ambient_authority())
+}
+
+#[cfg(windows)]
+fn open_copy_source(path: &str) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    File::open_ambient_with(path, &options, ambient_authority())
+}
+
+fn create_destination_directory(parent: &Dir, name: &str) -> io::Result<()> {
+    #[cfg(unix)]
+    let builder = {
+        use cap_std::fs::DirBuilderExt;
+        let mut builder = DirBuilder::new();
+        builder.mode(0o755);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = DirBuilder::new();
+    match parent.create_dir_with(name, &builder) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_destination_parent(
+    destination_root: &Dir,
+    components: &[String],
+) -> io::Result<(Dir, String)> {
+    let (file_name, parents) = components
+        .split_last()
+        .ok_or_else(|| invalid_argument("destination path is empty"))?;
+    let mut current = destination_root.try_clone()?;
+    for component in parents {
+        create_destination_directory(&current, component)?;
+        current = current.open_dir_nofollow(component)?;
+    }
+    Ok((current, file_name.clone()))
+}
+
+fn copy_to_destination(
+    reader: &mut impl Read,
+    destination_root: &Dir,
+    destination_components: &[String],
+    expected_bytes: u64,
+    expected_sha256: Option<&str>,
+    maximum_bytes: u64,
+) -> Result<(u64, String), Box<dyn Error>> {
+    if expected_bytes > maximum_bytes {
+        return Err(invalid_argument("copy exceeds its remaining byte budget").into());
+    }
+    let (destination_parent, destination_name) =
+        open_destination_parent(destination_root, destination_components)?;
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.mode(0o644);
+    }
+    let mut destination = destination_parent.open_with(destination_name, &options)?;
+    let mut digest = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(read as u64)
+            .ok_or_else(|| invalid_argument("copy byte count overflow"))?;
+        if copied > expected_bytes || copied > maximum_bytes {
+            return Err(invalid_argument("copy source exceeded its byte budget").into());
+        }
+        digest.update(&buffer[..read]);
+        destination.write_all(&buffer[..read])?;
+    }
+    if copied != expected_bytes {
+        return Err(
+            invalid_argument("copy source byte length does not match its descriptor").into(),
+        );
+    }
+    let observed_sha256 = format!("{:x}", digest.finalize());
+    if expected_sha256.is_some_and(|expected| expected != observed_sha256) {
+        return Err(invalid_argument("copy source SHA-256 does not match its descriptor").into());
+    }
+    #[cfg(unix)]
+    {
+        use cap_std::fs::{Permissions, PermissionsExt};
+        destination.set_permissions(Permissions::from_mode(0o644))?;
+    }
+    destination.sync_all()?;
+    Ok((copied, observed_sha256))
+}
+
+fn copy_verified_file(arguments: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let source_path = arguments
+        .next()
+        .ok_or_else(|| invalid_argument("copy source path is required"))?;
+    let source_device = parse_identity(arguments.next(), "copy source device is required")?;
+    let source_file = parse_identity(arguments.next(), "copy source file is required")?;
+    let destination_root = arguments
+        .next()
+        .ok_or_else(|| invalid_argument("copy destination root is required"))?;
+    let destination_device =
+        parse_identity(arguments.next(), "copy destination device is required")?;
+    let destination_file = parse_identity(arguments.next(), "copy destination file is required")?;
+    let destination_path =
+        parse_relative_path(arguments.next(), "copy destination path is required")?;
+    let expected_bytes = parse_identity(arguments.next(), "copy byte length is required")?;
+    let expected_sha256 = parse_sha256(arguments.next(), "copy SHA-256 is required", true)?;
+    let maximum_bytes = parse_identity(arguments.next(), "copy byte budget is required")?;
+    if arguments.next().is_some() {
+        return Err(invalid_argument("unexpected filesystem authority argument").into());
+    }
+
+    let mut source = open_copy_source(&source_path)?;
+    let before = source.metadata()?;
+    if !before.is_file()
+        || identity(&before) != (source_device, source_file)
+        || before.len() != expected_bytes
+    {
+        return Err(
+            invalid_argument("copy source identity does not match retained authority").into(),
+        );
+    }
+    let before_modified = before.modified()?;
+    let destination =
+        open_verified_directory(&destination_root, (destination_device, destination_file))?;
+    let (copied, observed_sha256) = copy_to_destination(
+        &mut source,
+        &destination,
+        &destination_path,
+        expected_bytes,
+        expected_sha256.as_deref(),
+        maximum_bytes,
+    )?;
+    let after = source.metadata()?;
+    if identity(&after) != identity(&before)
+        || after.len() != before.len()
+        || after.modified()? != before_modified
+    {
+        return Err(invalid_argument("copy source changed during transfer").into());
+    }
+    println!("{copied} {observed_sha256}");
+    Ok(())
+}
+
+fn write_verified_file(arguments: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let destination_root = arguments
+        .next()
+        .ok_or_else(|| invalid_argument("write destination root is required"))?;
+    let destination_device =
+        parse_identity(arguments.next(), "write destination device is required")?;
+    let destination_file = parse_identity(arguments.next(), "write destination file is required")?;
+    let destination_path =
+        parse_relative_path(arguments.next(), "write destination path is required")?;
+    let expected_bytes = parse_identity(arguments.next(), "write byte length is required")?;
+    let expected_sha256 = parse_sha256(arguments.next(), "write SHA-256 is required", false)?
+        .expect("non-optional SHA-256 parser returned no value");
+    let maximum_bytes = parse_identity(arguments.next(), "write byte budget is required")?;
+    if arguments.next().is_some() {
+        return Err(invalid_argument("unexpected filesystem authority argument").into());
+    }
+
+    let destination =
+        open_verified_directory(&destination_root, (destination_device, destination_file))?;
+    let (copied, observed_sha256) = copy_to_destination(
+        &mut io::stdin().lock(),
+        &destination,
+        &destination_path,
+        expected_bytes,
+        Some(&expected_sha256),
+        maximum_bytes,
+    )?;
+    println!("{copied} {observed_sha256}");
+    Ok(())
 }
 
 fn remove_verified_directory(
@@ -414,6 +641,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("rename-entry-between-replace") => {
             rename_verified_entry_between_replace(&mut arguments)
         }
+        Some("copy-file") => copy_verified_file(&mut arguments),
+        Some("write-file") => write_verified_file(&mut arguments),
         _ => Err(invalid_argument("unsupported filesystem authority operation").into()),
     }
 }

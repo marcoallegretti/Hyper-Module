@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   lstat,
   mkdtemp,
@@ -16,10 +17,12 @@ import { join, resolve } from "node:path";
 import { openRetainedDirectory } from "../lib/durable-files.mjs";
 import { runNativeProcess } from "../lib/native-process.mjs";
 import {
+  copyRetainedFile,
   removeRetainedDirectory,
   renameDirectoryBetweenNoReplace,
   renameDirectoryNoReplace,
   renameEntryBetweenReplace,
+  writeRetainedFile,
 } from "../lib/native-fs-authority.mjs";
 
 const temporaryRoot = await mkdtemp(join(tmpdir(), "hyper-fs-authority-"));
@@ -164,6 +167,97 @@ try {
     await assert.rejects(open(join(temporaryRoot, "identity-published"), "r"), {
       code: "ENOENT",
     });
+
+    const transferRoot = join(temporaryRoot, "transfer-root");
+    const transferSource = join(temporaryRoot, "transfer-source");
+    const transferBytes = Buffer.from("capability-confined transfer", "utf8");
+    await mkdir(transferRoot);
+    await writeFile(transferSource, transferBytes);
+    const [transferRootHandle, transferSourceHandle] = await Promise.all([
+      openRetainedDirectory(transferRoot),
+      open(transferSource, "r"),
+    ]);
+    try {
+      const transferSha256 = createHash("sha256")
+        .update(transferBytes)
+        .digest("hex");
+      assert.deepEqual(
+        await copyRetainedFile(
+          transferSourceHandle,
+          transferSource,
+          transferRootHandle,
+          transferRoot,
+          "nested/payload.bin",
+          transferBytes.byteLength,
+          transferSha256,
+          transferBytes.byteLength,
+          "test retained copy",
+        ),
+        { byteLength: transferBytes.byteLength, sha256: transferSha256 },
+      );
+      assert.deepEqual(
+        await readFile(join(transferRoot, "nested", "payload.bin")),
+        transferBytes,
+      );
+
+      const generatedBytes = Buffer.from('{"retained":true}', "utf8");
+      await writeRetainedFile(
+        transferRootHandle,
+        transferRoot,
+        "generated/state.json",
+        generatedBytes,
+        generatedBytes.byteLength,
+        "test retained write",
+      );
+      assert.deepEqual(
+        await readFile(join(transferRoot, "generated", "state.json")),
+        generatedBytes,
+      );
+
+      const escapedRoot = join(temporaryRoot, "transfer-escape");
+      await mkdir(escapedRoot);
+      await symlink(
+        escapedRoot,
+        join(transferRoot, "linked"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+      await assert.rejects(
+        copyRetainedFile(
+          transferSourceHandle,
+          transferSource,
+          transferRootHandle,
+          transferRoot,
+          "linked/escape.bin",
+          transferBytes.byteLength,
+          transferSha256,
+          transferBytes.byteLength,
+          "linked retained copy",
+        ),
+        /native copy failed/,
+      );
+      await assert.rejects(
+        writeRetainedFile(
+          transferRootHandle,
+          transferRoot,
+          "linked/generated.bin",
+          generatedBytes,
+          generatedBytes.byteLength,
+          "linked retained write",
+        ),
+        /native write failed/,
+      );
+      await assert.rejects(open(join(escapedRoot, "escape.bin"), "r"), {
+        code: "ENOENT",
+      });
+      await assert.rejects(open(join(escapedRoot, "generated.bin"), "r"), {
+        code: "ENOENT",
+      });
+    } finally {
+      await Promise.all([
+        transferRootHandle.close(),
+        transferSourceHandle.close(),
+      ]);
+    }
 
     const sourceParent = join(temporaryRoot, "source-parent");
     const destinationParent = join(temporaryRoot, "destination-parent");
@@ -334,7 +428,7 @@ try {
   } finally {
     await parentHandle.close();
   }
-  console.log("Native filesystem authority passed: 13 identity cases");
+  console.log("Native filesystem authority passed: 16 identity cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

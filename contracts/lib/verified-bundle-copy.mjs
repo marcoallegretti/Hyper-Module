@@ -1,14 +1,8 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import {
-  chmod,
-  constants,
-  lstat,
-  mkdir,
-  open,
-  realpath,
-} from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { constants, lstat, open, realpath } from "node:fs/promises";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+
+import { copyRetainedFile } from "./native-fs-authority.mjs";
 
 function assertContained(rootPath, candidatePath, label) {
   const relativePath = relative(rootPath, candidatePath);
@@ -21,22 +15,22 @@ function assertContained(rootPath, candidatePath, label) {
   );
 }
 
-async function writeAll(handle, bytes) {
-  let offset = 0;
-  while (offset < bytes.length) {
-    const { bytesWritten } = await handle.write(
-      bytes,
-      offset,
-      bytes.length - offset,
-    );
-    assert(bytesWritten > 0, "write made no forward progress");
-    offset += bytesWritten;
-  }
+function sameFileIdentity(left, right) {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs &&
+    (process.platform !== "win32" || left.birthtimeNs === right.birthtimeNs)
+  );
 }
 
 export async function copyVerifiedBundleFile(
   bundleRoot,
   bundleRootReal,
+  stageHandle,
   stageRoot,
   descriptor,
   remainingBytes,
@@ -49,110 +43,79 @@ export async function copyVerifiedBundleFile(
     descriptor.byte_length <= remainingBytes,
     `${descriptor.path}: copy exceeds remaining byte budget`,
   );
-  const sourcePath = resolve(bundleRoot, ...descriptor.path.split("/"));
-  assertContained(bundleRoot, sourcePath, descriptor.path);
-  const sourceStatus = await lstat(sourcePath);
+  const sourceRelativePath = descriptor.source_path ?? descriptor.path;
+  const sourcePath = resolve(bundleRoot, ...sourceRelativePath.split("/"));
+  assertContained(bundleRoot, sourcePath, sourceRelativePath);
+  const sourceStatus = await lstat(sourcePath, { bigint: true });
   assert(
     sourceStatus.isFile() && !sourceStatus.isSymbolicLink(),
-    `${descriptor.path}: source must be a regular file`,
+    `${sourceRelativePath}: source must be a regular file`,
   );
+  if (descriptor.source_identity) {
+    assert(
+      sameFileIdentity(descriptor.source_identity, sourceStatus),
+      `${sourceRelativePath}: source changed after preflight`,
+    );
+  }
   const sourceReal = await realpath(sourcePath);
-  assertContained(bundleRootReal, sourceReal, descriptor.path);
+  assertContained(bundleRootReal, sourceReal, sourceRelativePath);
 
   const noFollow = constants.O_NOFOLLOW ?? 0;
   const sourceHandle = await open(sourcePath, constants.O_RDONLY | noFollow);
-  let destinationHandle;
-  let before;
-  let after;
-  let byteLength = 0;
-  const digest = createHash("sha256");
+  let result;
+  let operationError;
   try {
-    before = await sourceHandle.stat();
-    assert(before.isFile(), `${descriptor.path}: source changed type before copy`);
+    const before = await sourceHandle.stat({ bigint: true });
+    assert(
+      before.isFile() && sameFileIdentity(sourceStatus, before),
+      `${sourceRelativePath}: source changed before copy`,
+    );
     assert.equal(
       before.size,
-      descriptor.byte_length,
-      `${descriptor.path}: source size changed before copy`,
+      BigInt(descriptor.byte_length),
+      `${sourceRelativePath}: source size changed before copy`,
     );
 
-    const destinationPath = resolve(
+    result = await copyRetainedFile(
+      sourceHandle,
+      sourcePath,
+      stageHandle,
       stageRoot,
-      ...descriptor.path.split("/"),
+      descriptor.path,
+      descriptor.byte_length,
+      descriptor.sha256,
+      remainingBytes,
+      descriptor.path,
     );
-    assertContained(stageRoot, destinationPath, descriptor.path);
-    await mkdir(dirname(destinationPath), { recursive: true, mode: 0o755 });
-    destinationHandle = await open(
-      destinationPath,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
-      0o644,
+    const after = await sourceHandle.stat({ bigint: true });
+    assert(
+      sameFileIdentity(before, after),
+      `${sourceRelativePath}: source changed during copy`,
     );
-    for await (const chunk of sourceHandle.createReadStream({
-      autoClose: false,
-    })) {
-      const nextByteLength = byteLength + chunk.byteLength;
-      assert(
-        nextByteLength <= descriptor.byte_length &&
-          nextByteLength <= remainingBytes,
-        `${descriptor.path}: source exceeded its copy budget`,
-      );
-      digest.update(chunk);
-      await writeAll(destinationHandle, chunk);
-      byteLength = nextByteLength;
-    }
-    await destinationHandle.sync();
-    after = await sourceHandle.stat();
-    await chmod(destinationPath, 0o644);
-  } finally {
-    await Promise.allSettled([
-      sourceHandle.close(),
-      destinationHandle?.close(),
-    ]);
+    const published = await lstat(sourcePath, { bigint: true });
+    assert(
+      published.isFile() &&
+        !published.isSymbolicLink() &&
+        sameFileIdentity(after, published),
+      `${sourceRelativePath}: source path changed during copy`,
+    );
+  } catch (error) {
+    operationError = error;
   }
 
-  assert(
-    before.isFile() && after.isFile(),
-    `${descriptor.path}: source changed type during copy`,
-  );
-  assert.equal(
-    before.size,
-    after.size,
-    `${descriptor.path}: source size changed during copy`,
-  );
-  assert.equal(
-    before.mtimeMs,
-    after.mtimeMs,
-    `${descriptor.path}: source changed during copy`,
-  );
-  assert.equal(
-    before.ctimeMs,
-    after.ctimeMs,
-    `${descriptor.path}: source metadata changed during copy`,
-  );
-  assert.equal(
-    byteLength,
-    descriptor.byte_length,
-    `${descriptor.path}: copied byte length mismatch`,
-  );
-  assert.equal(
-    digest.digest("hex"),
-    descriptor.sha256,
-    `${descriptor.path}: copied SHA-256 mismatch`,
-  );
-
-  const finalSourceStatus = await lstat(sourcePath);
-  assert(
-    finalSourceStatus.isFile() && !finalSourceStatus.isSymbolicLink(),
-    `${descriptor.path}: source path changed type during copy`,
-  );
-  assert.equal(
-    finalSourceStatus.dev,
-    after.dev,
-    `${descriptor.path}: source path changed during copy`,
-  );
-  assert.equal(
-    finalSourceStatus.ino,
-    after.ino,
-    `${descriptor.path}: source path changed during copy`,
-  );
-  return byteLength;
+  let closeError;
+  try {
+    await sourceHandle.close();
+  } catch (error) {
+    closeError = error;
+  }
+  if (operationError && closeError) {
+    throw new AggregateError(
+      [operationError, closeError],
+      `${sourceRelativePath}: copy and source authority release both failed`,
+    );
+  }
+  if (operationError) throw operationError;
+  if (closeError) throw closeError;
+  return result;
 }

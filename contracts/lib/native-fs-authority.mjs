@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -31,9 +32,20 @@ function retainedAuthority(handle, ambientPath, childDescriptor) {
   };
 }
 
-function runHelper(arguments_, descriptors = []) {
+function runHelper(
+  arguments_,
+  descriptors = [],
+  { input = undefined, captureOutput = false } = {},
+) {
   return runNativeProcess(helperPath(), [protocolVersion, ...arguments_], {
-    stdio: ["ignore", "ignore", "pipe", ...descriptors],
+    stdio: [
+      input === undefined ? "ignore" : "pipe",
+      captureOutput ? "pipe" : "ignore",
+      "pipe",
+      ...descriptors,
+    ],
+    input,
+    maximumOutputBytes: 256,
   });
 }
 
@@ -49,6 +61,145 @@ function classifyNativeRenameError(wrapped, source) {
     wrapped.code = "ESTALE";
   }
   return wrapped;
+}
+
+function parseTransferResult(output, label) {
+  const match = /^([0-9]+) ([0-9a-f]{64})\r?\n$/.exec(output.toString("utf8"));
+  assert(match, `${label} native transfer returned an invalid result`);
+  const byteLength = Number(match[1]);
+  assert(Number.isSafeInteger(byteLength), `${label} byte length is not exact`);
+  return { byteLength, sha256: match[2] };
+}
+
+export async function copyRetainedFile(
+  sourceHandle,
+  sourcePath,
+  destinationRootHandle,
+  destinationRootPath,
+  destinationPath,
+  expectedByteLength,
+  expectedSha256,
+  maximumBytes,
+  label,
+) {
+  assert(
+    Number.isSafeInteger(expectedByteLength) && expectedByteLength >= 0,
+    `${label} expected byte length is invalid`,
+  );
+  assert(
+    expectedSha256 === undefined || /^[0-9a-f]{64}$/.test(expectedSha256),
+    `${label} expected SHA-256 is invalid`,
+  );
+  assert(
+    Number.isSafeInteger(maximumBytes) && maximumBytes >= 0,
+    `${label} byte budget is invalid`,
+  );
+  const [sourceStatus, destinationStatus] = await Promise.all([
+    sourceHandle.stat({ bigint: true }),
+    destinationRootHandle.stat({ bigint: true }),
+  ]);
+  assert(sourceStatus.isFile(), `${label} source authority is not a file`);
+  assert(
+    destinationStatus.isDirectory(),
+    `${label} destination authority is not a directory`,
+  );
+  const sourceAuthority = retainedAuthority(sourceHandle, sourcePath, 3);
+  const destinationAuthority = retainedAuthority(
+    destinationRootHandle,
+    destinationRootPath,
+    4,
+  );
+  const descriptors = [sourceAuthority.descriptor, destinationAuthority.descriptor]
+    .filter((descriptor) => descriptor !== undefined);
+  try {
+    const output = await runHelper(
+      [
+        "copy-file",
+        sourceAuthority.path,
+        String(sourceStatus.dev),
+        String(sourceStatus.ino),
+        destinationAuthority.path,
+        String(destinationStatus.dev),
+        String(destinationStatus.ino),
+        destinationPath,
+        String(expectedByteLength),
+        expectedSha256 ?? "-",
+        String(maximumBytes),
+      ],
+      descriptors,
+      { captureOutput: true },
+    );
+    const result = parseTransferResult(output, label);
+    assert.equal(
+      result.byteLength,
+      expectedByteLength,
+      `${label} native transfer byte length mismatch`,
+    );
+    if (expectedSha256 !== undefined) {
+      assert.equal(
+        result.sha256,
+        expectedSha256,
+        `${label} native transfer SHA-256 mismatch`,
+      );
+    }
+    return result;
+  } catch (error) {
+    throw new Error(`${label} native copy failed`, { cause: error });
+  }
+}
+
+export async function writeRetainedFile(
+  destinationRootHandle,
+  destinationRootPath,
+  destinationPath,
+  bytes,
+  maximumBytes,
+  label,
+) {
+  assert(Buffer.isBuffer(bytes), `${label} bytes must be a buffer`);
+  assert(
+    Number.isSafeInteger(maximumBytes) && maximumBytes >= 0,
+    `${label} byte budget is invalid`,
+  );
+  assert(bytes.byteLength <= maximumBytes, `${label} exceeds its byte budget`);
+  const destinationStatus = await destinationRootHandle.stat({ bigint: true });
+  assert(
+    destinationStatus.isDirectory(),
+    `${label} destination authority is not a directory`,
+  );
+  const destinationAuthority = retainedAuthority(
+    destinationRootHandle,
+    destinationRootPath,
+    3,
+  );
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  try {
+    const output = await runHelper(
+      [
+        "write-file",
+        destinationAuthority.path,
+        String(destinationStatus.dev),
+        String(destinationStatus.ino),
+        destinationPath,
+        String(bytes.byteLength),
+        sha256,
+        String(maximumBytes),
+      ],
+      destinationAuthority.descriptor === undefined
+        ? []
+        : [destinationAuthority.descriptor],
+      { input: bytes, captureOutput: true },
+    );
+    const result = parseTransferResult(output, label);
+    assert.deepEqual(
+      result,
+      { byteLength: bytes.byteLength, sha256 },
+      `${label} native write result mismatch`,
+    );
+    return result;
+  } catch (error) {
+    throw new Error(`${label} native write failed`, { cause: error });
+  }
 }
 
 export async function removeRetainedDirectory(handle, path, label) {

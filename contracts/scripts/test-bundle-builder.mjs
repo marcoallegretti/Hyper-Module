@@ -14,7 +14,10 @@ import { tmpdir } from "node:os";
 
 import canonicalize from "canonicalize";
 
-import { buildBundle } from "./build-bundle.mjs";
+import {
+  buildBundle,
+  maximumBuildPlanBytes,
+} from "./build-bundle.mjs";
 import { createMinimalProject } from "./test-project-fixture.mjs";
 import { verifyBundle } from "./verify-bundle.mjs";
 
@@ -96,6 +99,15 @@ const temporaryRoot = await mkdtemp(
 );
 try {
   const { plan, planPath, source } = await createInputs(temporaryRoot);
+  await assert.rejects(
+    buildBundle(undefined, source, join(temporaryRoot, "oversized-plan.runtime"), {
+      preparedPlan: {
+        ...plan,
+        extensions: { oversized: "x".repeat(maximumBuildPlanBytes) },
+      },
+    }),
+    /build plan exceeds 1048576 bytes/,
+  );
   const firstPath = join(temporaryRoot, "first.runtime");
   const secondPath = join(temporaryRoot, "second.runtime");
   const first = await buildBundle(planPath, source, firstPath);
@@ -252,7 +264,7 @@ try {
   );
   assert.deepEqual(stagingResidue, [], "failed builds left staging data");
 
-  console.log("Bundle builder passed: 13 construction cases");
+  console.log("Bundle builder passed: 14 construction cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

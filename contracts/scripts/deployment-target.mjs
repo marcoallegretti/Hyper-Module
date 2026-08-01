@@ -1342,13 +1342,15 @@ async function installIdentity(
       );
       let copiedBytes = 0;
       for (const descriptor of descriptors) {
-        copiedBytes += await copyVerifiedBundleFile(
+        const copied = await copyVerifiedBundleFile(
           sourceRoot,
           sourceRootReal,
+          stagingHandle,
           stagingPath,
           descriptor,
           source.byte_length - copiedBytes,
         );
+        copiedBytes += copied.byteLength;
       }
       assert.equal(
         copiedBytes,

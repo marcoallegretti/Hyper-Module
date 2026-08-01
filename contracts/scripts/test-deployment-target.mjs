@@ -628,6 +628,40 @@ try {
     [],
   );
 
+  const stagingEscapeTarget = await createTarget(
+    temporaryRoot,
+    "staging-escape-target",
+  );
+  const stagingEscapeDestination = join(
+    temporaryRoot,
+    "staging-escape-destination",
+  );
+  await mkdir(stagingEscapeDestination);
+  await assert.rejects(
+    installBundle(bundle7, stagingEscapeTarget, {
+      copyObserver: async (boundary, { stagingPath }) => {
+        assert.equal(boundary, "before-staging-copy");
+        await symlink(
+          stagingEscapeDestination,
+          join(stagingPath, "timeline"),
+          process.platform === "win32" ? "junction" : "dir",
+        );
+      },
+    }),
+    /native copy failed/,
+  );
+  await assert.rejects(
+    readFile(join(stagingEscapeDestination, "timeline.json")),
+    { code: "ENOENT" },
+  );
+  assert.equal(await readDeploymentLock(stagingEscapeTarget), null);
+  assert.deepEqual(
+    (await readdir(stagingEscapeTarget)).filter((name) =>
+      name.startsWith(".install-"),
+    ),
+    [],
+  );
+
   const garbageTarget = await createTarget(temporaryRoot, "garbage-target");
   const garbageIdentity = await installBundle(bundle7, garbageTarget);
   assert.equal((await readDeploymentStorage(garbageTarget)).installed_bundle_count, 1);
@@ -1538,7 +1572,7 @@ try {
     ),
   );
 
-  console.log("Deployment target passed: 160 transaction cases");
+  console.log("Deployment target passed: 161 transaction cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }
