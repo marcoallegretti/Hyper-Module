@@ -116,10 +116,33 @@ try {
     );
   }
 
-  await assert.rejects(
-    buildBundle(planPath, source, firstPath),
-    /output already exists/,
+  assert.deepEqual(await buildBundle(planPath, source, firstPath), first);
+
+  const uncertainPath = join(temporaryRoot, "uncertain.runtime");
+  let publicationError;
+  try {
+    await buildBundle(planPath, source, uncertainPath, {
+      faultAt: "after-publication-before-sync",
+    });
+  } catch (error) {
+    publicationError = error;
+  }
+  assert.equal(
+    publicationError?.code,
+    "HYPER_PUBLISHED_DIRECTORY_DURABILITY_UNCERTAIN",
   );
+  assert.equal(publicationError?.output_path, uncertainPath);
+  assert.equal(publicationError?.identity, first.identity);
+  assert.equal(publicationError?.published, true);
+  assert.equal(publicationError?.durability, "uncertain");
+  await verifyBundle(uncertainPath);
+  const recoveredPublication = await buildBundle(
+    planPath,
+    source,
+    uncertainPath,
+  );
+  assert.equal(recoveredPublication.output_path, uncertainPath);
+  assert.equal(recoveredPublication.identity, first.identity);
 
   const unsafeSource = join(temporaryRoot, "unsafe-source");
   await mkdir(unsafeSource);
@@ -180,7 +203,7 @@ try {
   );
   assert.deepEqual(stagingResidue, [], "failed builds left staging data");
 
-  console.log("Bundle builder passed: 6 construction cases");
+  console.log("Bundle builder passed: 8 construction cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

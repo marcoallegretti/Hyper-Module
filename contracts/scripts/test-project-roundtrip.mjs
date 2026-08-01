@@ -87,6 +87,7 @@ try {
   const restoredPath = join(temporaryRoot, "desktop-restored");
   const restored = await restoreProject(bundlePath, restoredPath);
   assert.equal(restored.identity, sourceVerification.identity);
+  assert.deepEqual(await restoreProject(bundlePath, restoredPath), restored);
   const restoredVerification = await verifyProject(restoredPath);
   assert.equal(restoredVerification.identity, sourceVerification.identity);
 
@@ -192,6 +193,35 @@ try {
     assert.deepEqual(residues, []);
   }
 
+  const uncertainOutputPath = join(temporaryRoot, "uncertain-output");
+  let publicationError;
+  try {
+    await restoreProject(bundlePath, uncertainOutputPath, {
+      faultAt: "after-publication-before-sync",
+    });
+  } catch (error) {
+    publicationError = error;
+  }
+  assert.equal(
+    publicationError?.code,
+    "HYPER_PUBLISHED_DIRECTORY_DURABILITY_UNCERTAIN",
+  );
+  assert.equal(publicationError?.output_path, uncertainOutputPath);
+  assert.equal(publicationError?.identity, sourceVerification.identity);
+  assert.equal(publicationError?.published, true);
+  assert.equal(publicationError?.durability, "uncertain");
+  assert.equal(
+    (await verifyProject(uncertainOutputPath)).identity,
+    sourceVerification.identity,
+  );
+  assert.deepEqual(
+    await restoreProject(bundlePath, uncertainOutputPath),
+    {
+      output_path: uncertainOutputPath,
+      identity: sourceVerification.identity,
+    },
+  );
+
   const cliOutputPath = join(temporaryRoot, "desktop-restored-cli");
   const { stdout } = await execFileAsync(process.execPath, [
     join(scriptRoot, "restore-project.mjs"),
@@ -204,7 +234,7 @@ try {
     sourceVerification.identity,
   );
 
-  console.log("Project round trip passed: 16 preservation and recovery cases");
+  console.log("Project round trip passed: 19 preservation and recovery cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

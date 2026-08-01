@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
-  access,
   chmod,
   constants,
   lstat,
@@ -31,8 +30,12 @@ import {
   syncDirectoryTree,
   syncPublishedDirectory,
 } from "../lib/durable-files.mjs";
+import { PublishedDirectoryDurabilityError } from "../lib/published-directory.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
-import { verifyBundle } from "./verify-bundle.mjs";
+import {
+  verifyBundle,
+  verifyBundleArtifact,
+} from "./verify-bundle.mjs";
 
 const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const planLimitBytes = 1024 * 1024;
@@ -218,19 +221,16 @@ async function copyPayload(sourceRoot, sourceRootReal, stageRoot, payload) {
   };
 }
 
-async function assertPathAbsent(path) {
-  try {
-    await access(path);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return;
-    }
-    throw error;
-  }
-  assert.fail(`output already exists: ${path}`);
-}
-
-export async function buildBundle(planPath, sourcePath, outputPath) {
+export async function buildBundle(
+  planPath,
+  sourcePath,
+  outputPath,
+  { faultAt } = {},
+) {
+  assert(
+    faultAt === undefined || faultAt === "after-publication-before-sync",
+    "unknown bundle build fault boundary",
+  );
   const plan = await readBuildPlan(resolve(planPath));
   const sourceRoot = resolve(sourcePath);
   const sourceStatus = await lstat(sourceRoot);
@@ -241,7 +241,6 @@ export async function buildBundle(planPath, sourcePath, outputPath) {
   const sourceRootReal = await realpath(sourceRoot);
 
   const outputRoot = resolve(outputPath);
-  await assertPathAbsent(outputRoot);
   const outputParent = dirname(outputRoot);
   const parentStatus = await lstat(outputParent);
   assert(
@@ -252,7 +251,6 @@ export async function buildBundle(planPath, sourcePath, outputPath) {
   const stageRoot = await mkdtemp(
     join(outputParent, `.${basename(outputRoot)}.staging-`),
   );
-  let published = false;
   try {
     const payloads = [...plan.payloads].sort((left, right) =>
       left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
@@ -308,20 +306,56 @@ export async function buildBundle(planPath, sourcePath, outputPath) {
     ];
     await syncDirectoryTree(stageRoot, declaredFiles);
     await verifyBundle(stageRoot);
-    await assertPathAbsent(outputRoot);
-    await rename(stageRoot, outputRoot);
-    await syncPublishedDirectory(outputRoot);
-    published = true;
-    return {
+    const result = {
       output_path: outputRoot,
       identity: `sha256:${createHash("sha256")
         .update(manifestBytes)
         .digest("hex")}`,
     };
-  } finally {
-    if (!published) {
-      await rm(stageRoot, { recursive: true, force: true });
+    try {
+      await rename(stageRoot, outputRoot);
+    } catch (error) {
+      if (!new Set(["EACCES", "EEXIST", "ENOTEMPTY", "EPERM"]).has(error.code)) {
+        throw error;
+      }
+      try {
+        await lstat(outputRoot);
+      } catch (statusError) {
+        if (statusError.code === "ENOENT") throw error;
+        throw statusError;
+      }
+      let existing;
+      try {
+        existing = await verifyBundleArtifact(outputRoot);
+      } catch (cause) {
+        throw new Error(
+          `output already exists and is not the requested bundle: ${outputRoot}`,
+          { cause },
+        );
+      }
+      assert.equal(
+        `sha256:${existing.bundle_sha256}`,
+        result.identity,
+        `output already exists with a different bundle identity: ${outputRoot}`,
+      );
+      await syncPublishedDirectory(outputRoot);
+      return result;
     }
+    try {
+      if (faultAt === "after-publication-before-sync") {
+        throw new Error("injected fault after bundle publication");
+      }
+      await syncPublishedDirectory(outputRoot);
+    } catch (error) {
+      throw new PublishedDirectoryDurabilityError(
+        outputRoot,
+        result.identity,
+        error,
+      );
+    }
+    return result;
+  } finally {
+    await rm(stageRoot, { recursive: true, force: true });
   }
 }
 

@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
-  access,
   chmod,
   constants,
   lstat,
@@ -26,6 +25,7 @@ import {
   syncDirectoryTree,
   syncPublishedDirectory,
 } from "../lib/durable-files.mjs";
+import { PublishedDirectoryDurabilityError } from "../lib/published-directory.mjs";
 import { verifyBundle } from "./verify-bundle.mjs";
 import { verifyProject } from "./verify-project.mjs";
 
@@ -33,6 +33,7 @@ const faultBoundaries = new Set([
   "after-payload-copy",
   "after-project-verification",
   "before-publication",
+  "after-publication-before-sync",
 ]);
 
 function injectFault(faultAt, boundary) {
@@ -60,18 +61,6 @@ function isContainedOrEqual(rootPath, candidatePath) {
       relativePath !== ".." &&
       !isAbsolute(relativePath))
   );
-}
-
-async function assertPathAbsent(path) {
-  try {
-    await access(path);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return;
-    }
-    throw error;
-  }
-  assert.fail(`output already exists: ${path}`);
 }
 
 async function writeAll(handle, bytes) {
@@ -197,7 +186,6 @@ export async function restoreProject(bundlePath, outputPath, { faultAt } = {}) {
   const manifest = await verifyBundle(bundleRoot);
 
   const outputRoot = resolve(outputPath);
-  await assertPathAbsent(outputRoot);
   const outputParent = dirname(outputRoot);
   const parentStatus = await lstat(outputParent);
   assert(
@@ -217,7 +205,6 @@ export async function restoreProject(bundlePath, outputPath, { faultAt } = {}) {
   const stageRoot = await mkdtemp(
     resolve(outputParent, `.${basename(outputRoot)}.restore-`),
   );
-  let published = false;
   try {
     const payloads = [...manifest.files].sort((left, right) =>
       left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
@@ -240,7 +227,6 @@ export async function restoreProject(bundlePath, outputPath, { faultAt } = {}) {
     );
     injectFault(faultAt, "after-project-verification");
 
-    await assertPathAbsent(outputRoot);
     injectFault(faultAt, "before-publication");
     await syncDirectoryTree(
       stageRoot,
@@ -252,18 +238,52 @@ export async function restoreProject(bundlePath, outputPath, { faultAt } = {}) {
       restored.identity,
       "restored project identity changed before publication",
     );
-    await rename(stageRoot, outputRoot);
-    await syncPublishedDirectory(outputRoot);
-    published = true;
-
-    return {
+    const result = {
       output_path: outputRoot,
       identity: restored.identity,
     };
-  } finally {
-    if (!published) {
-      await rm(stageRoot, { recursive: true, force: true });
+    try {
+      await rename(stageRoot, outputRoot);
+    } catch (error) {
+      if (!new Set(["EACCES", "EEXIST", "ENOTEMPTY", "EPERM"]).has(error.code)) {
+        throw error;
+      }
+      try {
+        await lstat(outputRoot);
+      } catch (statusError) {
+        if (statusError.code === "ENOENT") throw error;
+        throw statusError;
+      }
+      let existing;
+      try {
+        existing = await verifyProject(outputRoot);
+      } catch (cause) {
+        throw new Error(
+          `output already exists and is not the requested project: ${outputRoot}`,
+          { cause },
+        );
+      }
+      assert.equal(
+        existing.identity,
+        result.identity,
+        `output already exists with a different project identity: ${outputRoot}`,
+      );
+      await syncPublishedDirectory(outputRoot);
+      return result;
     }
+    try {
+      injectFault(faultAt, "after-publication-before-sync");
+      await syncPublishedDirectory(outputRoot);
+    } catch (error) {
+      throw new PublishedDirectoryDurabilityError(
+        outputRoot,
+        result.identity,
+        error,
+      );
+    }
+    return result;
+  } finally {
+    await rm(stageRoot, { recursive: true, force: true });
   }
 }
 
