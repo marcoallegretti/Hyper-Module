@@ -83,6 +83,15 @@ async function writeDeploymentStateFixture(target, state) {
   );
 }
 
+async function writeDeploymentLockFixture(target, owner) {
+  const lockPath = join(target, "deployment.lock");
+  await mkdir(lockPath);
+  await writeFile(
+    join(lockPath, "owner.json"),
+    typeof owner === "string" ? owner : canonicalize(owner),
+  );
+}
+
 async function assertGenerationExhaustionIsAtomic(target, operation) {
   const statePath = join(target, "state.json");
   const before = await readFile(statePath);
@@ -187,12 +196,12 @@ try {
     /manifest.json is not canonical|Unexpected end|JSON/,
   );
 
-  await writeFile(join(target, "deployment.lock"), "held");
+  await mkdir(join(target, "deployment.lock"));
   await assert.rejects(
     activateBundle(target, identity7, "1.0.0"),
     /another deployment transaction is active/,
   );
-  await unlink(join(target, "deployment.lock"));
+  await rm(join(target, "deployment.lock"), { recursive: true });
 
   const residue = (await readdir(target)).filter((name) =>
     name.startsWith(".install-"),
@@ -472,6 +481,49 @@ try {
     await inspectDeploymentBundle(displacedInstallation);
   }
 
+  const substitutedLockTarget = await createTarget(
+    temporaryRoot,
+    "substituted-lock-target",
+  );
+  const displacedLock = join(substitutedLockTarget, "displaced-lock");
+  let lockReplacementPrevented = false;
+  let substitutedLockError;
+  try {
+    await installBundle(bundle7, substitutedLockTarget, {
+      observer: async () => {
+        const lockPath = join(substitutedLockTarget, "deployment.lock");
+        try {
+          await rename(lockPath, displacedLock);
+          await mkdir(lockPath);
+          await writeFile(join(lockPath, "owner.json"), "preserve");
+        } catch (error) {
+          lockReplacementPrevented =
+            process.platform === "win32" &&
+            (error.code === "EACCES" || error.code === "EPERM");
+          if (!lockReplacementPrevented) throw error;
+        }
+      },
+    });
+  } catch (error) {
+    substitutedLockError = error;
+  }
+  if (lockReplacementPrevented) {
+    assert.equal(substitutedLockError, undefined);
+  } else {
+    assert.match(
+      substitutedLockError?.message ?? "",
+      /lock ownership was compromised|filesystem object changed/,
+    );
+    assert.equal(
+      await readFile(
+        join(substitutedLockTarget, "deployment.lock", "owner.json"),
+        "utf8",
+      ),
+      "preserve",
+    );
+    await readFile(join(displacedLock, "owner.json"));
+  }
+
   const substitutedBundlesTarget = await createTarget(
     temporaryRoot,
     "substituted-bundles-target",
@@ -646,10 +698,7 @@ try {
     owner_token: randomUUID(),
     extensions: {},
   };
-  await writeFile(
-    join(recoveryTarget, "deployment.lock"),
-    canonicalize(staleOwner),
-  );
+  await writeDeploymentLockFixture(recoveryTarget, staleOwner);
   const installResidue = `.install-${randomUUID()}`;
   const stateResidue = `.state-${randomUUID()}.json`;
   const policyResidue = `.policy-${randomUUID()}.json`;
@@ -688,10 +737,7 @@ try {
     temporaryRoot,
     "active-lock-target",
   );
-  await writeFile(
-    join(activeLockTarget, "deployment.lock"),
-    canonicalize(staleOwner),
-  );
+  await writeDeploymentLockFixture(activeLockTarget, staleOwner);
   await assert.rejects(
     recoverDeploymentTarget(activeLockTarget, {
       processIsAlive: async () => true,
@@ -699,13 +745,61 @@ try {
     /owner process 424242 is still active/,
   );
   assert.deepEqual(await readDeploymentLock(activeLockTarget), staleOwner);
-  await unlink(join(activeLockTarget, "deployment.lock"));
+  await rm(join(activeLockTarget, "deployment.lock"), { recursive: true });
+
+  const substitutedRecoveryTarget = await createTarget(
+    temporaryRoot,
+    "substituted-recovery-lock-target",
+  );
+  await writeDeploymentLockFixture(substitutedRecoveryTarget, staleOwner);
+  const displacedRecoveryLock = join(
+    substitutedRecoveryTarget,
+    "displaced-lock",
+  );
+  let recoveryReplacementPrevented = false;
+  let substitutedRecoveryError;
+  try {
+    await recoverDeploymentTarget(substitutedRecoveryTarget, {
+      processIsAlive: async () => {
+        const lockPath = join(substitutedRecoveryTarget, "deployment.lock");
+        try {
+          await rename(lockPath, displacedRecoveryLock);
+          await mkdir(lockPath);
+          await writeFile(join(lockPath, "owner.json"), "preserve");
+        } catch (error) {
+          recoveryReplacementPrevented =
+            process.platform === "win32" &&
+            (error.code === "EACCES" || error.code === "EPERM");
+          if (!recoveryReplacementPrevented) throw error;
+        }
+        return false;
+      },
+    });
+  } catch (error) {
+    substitutedRecoveryError = error;
+  }
+  if (recoveryReplacementPrevented) {
+    assert.equal(substitutedRecoveryError, undefined);
+  } else {
+    assert.match(
+      substitutedRecoveryError?.message ?? "",
+      /filesystem object changed/,
+    );
+    assert.equal(
+      await readFile(
+        join(substitutedRecoveryTarget, "deployment.lock", "owner.json"),
+        "utf8",
+      ),
+      "preserve",
+    );
+    await readFile(join(displacedRecoveryLock, "owner.json"));
+  }
 
   const malformedLockTarget = await createTarget(
     temporaryRoot,
     "malformed-lock-target",
   );
-  await writeFile(join(malformedLockTarget, "deployment.lock"), "invalid");
+  await writeDeploymentLockFixture(malformedLockTarget, "invalid");
   await assert.rejects(
     recoverDeploymentTarget(malformedLockTarget),
     /explicit force is required/,
@@ -716,6 +810,41 @@ try {
   assert.equal(forcedRecovery.forced, true);
   assert.equal(forcedRecovery.recovered_lock_owner, null);
   assert.equal(await readDeploymentLock(malformedLockTarget), null);
+
+  const legacyLockTarget = await createTarget(
+    temporaryRoot,
+    "legacy-file-lock-target",
+  );
+  await writeFile(join(legacyLockTarget, "deployment.lock"), "preserve");
+  await assert.rejects(
+    recoverDeploymentTarget(legacyLockTarget, { force: true }),
+    /not a recoverable directory/,
+  );
+  assert.equal(
+    await readFile(join(legacyLockTarget, "deployment.lock"), "utf8"),
+    "preserve",
+  );
+
+  const linkedLockTarget = await createTarget(
+    temporaryRoot,
+    "linked-lock-target",
+  );
+  const linkedLockOutside = join(temporaryRoot, "linked-lock-outside");
+  await mkdir(linkedLockOutside);
+  await writeFile(join(linkedLockOutside, "sentinel"), "preserve");
+  await symlink(
+    linkedLockOutside,
+    join(linkedLockTarget, "deployment.lock"),
+    "junction",
+  );
+  await assert.rejects(
+    recoverDeploymentTarget(linkedLockTarget, { force: true }),
+    /not a recoverable directory/,
+  );
+  assert.equal(
+    await readFile(join(linkedLockOutside, "sentinel"), "utf8"),
+    "preserve",
+  );
 
   const faultBoundaries = [
     "after-staging-copy",

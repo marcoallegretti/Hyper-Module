@@ -138,6 +138,7 @@ async function withRetainedDeploymentLock(
   operation,
 ) {
   const lockPath = join(authorityRoot, "deployment.lock");
+  const ownerPath = join(lockPath, "owner.json");
   const owner = {
     format: "hyper-deployment-lock",
     format_version: 1,
@@ -146,9 +147,8 @@ async function withRetainedDeploymentLock(
     extensions: {},
   };
   const ownerBytes = Buffer.from(canonicalize(owner), "utf8");
-  let lock;
   try {
-    lock = await open(lockPath, "wx", 0o600);
+    await mkdir(lockPath, { mode: 0o700 });
   } catch (error) {
     if (error.code === "EEXIST") {
       throw new Error("another deployment transaction is active");
@@ -156,27 +156,57 @@ async function withRetainedDeploymentLock(
     throw error;
   }
 
+  let lockHandle;
+  let ownerHandle;
   try {
-    await lock.writeFile(ownerBytes);
-    await lock.sync();
+    lockHandle = await openRetainedDirectory(lockPath);
+    ownerHandle = await open(ownerPath, "wx", 0o600);
+    await ownerHandle.writeFile(ownerBytes);
+    await ownerHandle.sync();
+    await lockHandle.sync();
     await assertRetainedDirectory(
       targetHandle,
       targetRoot,
       "deployment target directory",
     );
+    await assertRetainedDirectory(
+      lockHandle,
+      lockPath,
+      "deployment lock directory",
+    );
+    await targetHandle.sync();
+    await ownerHandle.close();
+    ownerHandle = undefined;
   } catch (error) {
+    let cleanupError;
     try {
-      await lock.close();
+      await ownerHandle?.close();
+      if (lockHandle) {
+        await assertRetainedDirectory(
+          lockHandle,
+          lockPath,
+          "deployment lock directory",
+        );
+        await removeRetainedDirectoryNative(
+          lockHandle,
+          lockPath,
+          "deployment lock directory",
+        );
+        await targetHandle.sync();
+      }
+    } catch (source) {
+      cleanupError = source;
     } finally {
-      await readFile(lockPath)
-        .then((publishedOwner) =>
-          publishedOwner.equals(ownerBytes) ? unlink(lockPath) : undefined,
-        )
-        .catch(() => {});
+      await Promise.allSettled([ownerHandle?.close(), lockHandle?.close()]);
+    }
+    if (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "deployment lock initialization and cleanup both failed",
+      );
     }
     throw error;
   }
-
   let result;
   let operationError;
   try {
@@ -187,13 +217,26 @@ async function withRetainedDeploymentLock(
 
   let releaseError;
   try {
-    await lock.close();
-    const publishedOwner = await readFile(lockPath);
+    const publishedOwner = await readStableFile(
+      ownerPath,
+      MAX_DEPLOYMENT_METADATA_BYTES,
+      "deployment lock",
+    );
     assert(
       publishedOwner.equals(ownerBytes),
       "deployment lock ownership was compromised",
     );
-    await unlink(lockPath);
+    await assertRetainedDirectory(
+      lockHandle,
+      lockPath,
+      "deployment lock directory",
+    );
+    await removeRetainedDirectoryNative(
+      lockHandle,
+      lockPath,
+      "deployment lock directory",
+    );
+    await targetHandle.sync();
     await assertRetainedDirectory(
       targetHandle,
       targetRoot,
@@ -201,6 +244,8 @@ async function withRetainedDeploymentLock(
     );
   } catch (error) {
     releaseError = error;
+  } finally {
+    await lockHandle.close();
   }
 
   if (operationError && releaseError) {
@@ -368,13 +413,32 @@ async function readStoragePolicy(targetRoot) {
 }
 
 async function readLockOwner(targetRoot) {
+  const lockPath = join(targetRoot, "deployment.lock");
+  let lockHandle;
+  try {
+    lockHandle = await openRetainedDirectory(lockPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
   const { lock: validate } = await deploymentValidators;
-  return readCanonicalValidatedFile(
-    join(targetRoot, "deployment.lock"),
-    validate,
-    "deployment lock",
-    null,
-  );
+  try {
+    const owner = await readCanonicalValidatedFile(
+      join(lockPath, "owner.json"),
+      validate,
+      "deployment lock",
+      null,
+    );
+    assert(owner, "deployment lock owner is missing");
+    await assertRetainedDirectory(
+      lockHandle,
+      lockPath,
+      "deployment lock directory",
+    );
+    return owner;
+  } finally {
+    await lockHandle.close();
+  }
 }
 
 async function readAuthorizationState(targetRoot) {
@@ -930,30 +994,57 @@ export async function recoverDeploymentTarget(
     const lockPath = join(authorityRoot, "deployment.lock");
     let owner = null;
     let forced = false;
+    let lockHandle;
     try {
-      owner = await readLockOwner(authorityRoot);
+      try {
+        lockHandle = await openRetainedDirectory(lockPath);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      if (lockHandle) owner = await readLockOwner(authorityRoot);
     } catch (error) {
-      assert(
-        force,
-        `deployment lock ownership is invalid; explicit force is required: ${error.message}`,
-      );
-      const status = await lstat(lockPath);
-      assert(
-        status.isFile() || status.isSymbolicLink(),
-        "deployment lock is not a removable file",
-      );
-      forced = true;
+      if (!force) {
+        await lockHandle?.close();
+        assert.fail(
+          `deployment lock ownership is invalid; explicit force is required: ${error.message}`,
+        );
+      }
+      try {
+        const status = await lstat(lockPath);
+        assert(
+          status.isDirectory() && !status.isSymbolicLink() && lockHandle,
+          "deployment lock is not a recoverable directory",
+        );
+        forced = true;
+      } catch (validationError) {
+        await lockHandle?.close();
+        throw validationError;
+      }
     }
 
-    if (owner) {
-      assert.equal(
-        await processIsAlive(owner.owner_pid),
-        false,
-        `deployment lock owner process ${owner.owner_pid} is still active`,
-      );
-    }
-    if (owner || forced) {
-      await unlink(lockPath);
+    try {
+      if (owner) {
+        assert.equal(
+          await processIsAlive(owner.owner_pid),
+          false,
+          `deployment lock owner process ${owner.owner_pid} is still active`,
+        );
+      }
+      if (owner || forced) {
+        await assertRetainedDirectory(
+          lockHandle,
+          lockPath,
+          "deployment lock directory",
+        );
+        await removeRetainedDirectoryNative(
+          lockHandle,
+          lockPath,
+          "deployment lock directory",
+        );
+        await targetHandle.sync();
+      }
+    } finally {
+      await lockHandle?.close();
     }
 
     return withRetainedDeploymentLock(
