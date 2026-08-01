@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -71,7 +79,42 @@ try {
     /project exceeds .* bytes/,
   );
 
-  console.log("Project bundle builder passed: 8 compilation cases");
+  const cleanupOutput = join(temporaryRoot, "retained-cleanup.runtime");
+  let replacementPlanDirectory;
+  let displacedPlanDirectory;
+  let cleanupResult;
+  let cleanupError;
+  try {
+    cleanupResult = await buildProjectBundle(
+      fixture.root,
+      cleanupOutput,
+      "1.0.0",
+      {
+        planObserver: async (boundary, { planDirectory }) => {
+          assert.equal(boundary, "before-plan-cleanup");
+          replacementPlanDirectory = planDirectory;
+          displacedPlanDirectory = `${planDirectory}-displaced`;
+          await rename(planDirectory, displacedPlanDirectory);
+          await mkdir(planDirectory);
+          await writeFile(join(planDirectory, "sentinel"), "preserve");
+        },
+      },
+    );
+  } catch (error) {
+    cleanupError = error;
+  }
+  if (process.platform === "linux") {
+    assert(cleanupResult);
+    assert.equal(cleanupError, undefined);
+  } else {
+    assert.match(cleanupError?.message ?? "", /native cleanup failed/);
+  }
+  assert.equal(
+    await readFile(join(replacementPlanDirectory, "sentinel"), "utf8"),
+    "preserve",
+  );
+
+  console.log("Project bundle builder passed: 9 compilation cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }
