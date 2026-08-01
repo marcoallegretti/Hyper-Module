@@ -10,7 +10,6 @@ import {
   rm,
   stat,
   statfs,
-  unlink,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -926,6 +925,97 @@ function defaultProcessIsAlive(ownerPid) {
   }
 }
 
+function sameResidueIdentity(expected, observed) {
+  return (
+    expected.dev === observed.dev &&
+    expected.ino === observed.ino &&
+    expected.mode === observed.mode &&
+    expected.size === observed.size &&
+    expected.mtimeNs === observed.mtimeNs &&
+    (process.platform !== "win32" ||
+      expected.birthtimeNs === observed.birthtimeNs)
+  );
+}
+
+async function removeRetainedFileResidue(
+  targetRoot,
+  targetHandle,
+  entryName,
+  expectedStatus,
+) {
+  const quarantineName = `.recovery-${randomUUID()}`;
+  const quarantinePath = join(targetRoot, quarantineName);
+  await mkdir(quarantinePath, { mode: 0o700 });
+  const quarantineHandle = await openRetainedDirectory(quarantinePath);
+  let moved = false;
+  try {
+    try {
+      await renameDirectoryBetweenNoReplace(
+        targetHandle,
+        targetRoot,
+        entryName,
+        quarantineHandle,
+        quarantinePath,
+        entryName,
+        `metadata residue ${entryName}`,
+      );
+      moved = true;
+      const quarantinedStatus = await lstat(join(quarantinePath, entryName), {
+        bigint: true,
+      });
+      assert(
+        sameResidueIdentity(expectedStatus, quarantinedStatus),
+        `metadata residue identity changed: ${entryName}`,
+      );
+    } catch (error) {
+      let restoreError;
+      if (moved) {
+        try {
+          await renameDirectoryBetweenNoReplace(
+            quarantineHandle,
+            quarantinePath,
+            entryName,
+            targetHandle,
+            targetRoot,
+            entryName,
+            `metadata residue ${entryName}`,
+          );
+          moved = false;
+        } catch (source) {
+          restoreError = source;
+        }
+      }
+      let cleanupError;
+      if (!moved) {
+        try {
+          await removeRetainedDirectoryNative(
+            quarantineHandle,
+            quarantinePath,
+            `metadata residue quarantine ${entryName}`,
+          );
+        } catch (source) {
+          cleanupError = source;
+        }
+      }
+      if (restoreError || cleanupError) {
+        throw new AggregateError(
+          [error, restoreError, cleanupError].filter(Boolean),
+          `metadata residue ${entryName} quarantine failed`,
+        );
+      }
+      throw error;
+    }
+
+    await removeRetainedDirectoryNative(
+      quarantineHandle,
+      quarantinePath,
+      `metadata residue quarantine ${entryName}`,
+    );
+  } finally {
+    await quarantineHandle.close();
+  }
+}
+
 const UUID_FRAGMENT =
   "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const INSTALL_RESIDUE_PATTERN = new RegExp(`^\\.install-${UUID_FRAGMENT}$`);
@@ -933,7 +1023,11 @@ const FILE_RESIDUE_PATTERN = new RegExp(
   `^\\.(?:state|policy|authorization)-${UUID_FRAGMENT}\\.json$`,
 );
 
-async function removeTransactionResidue(targetRoot) {
+async function removeTransactionResidue(
+  targetRoot,
+  targetHandle,
+  observer = async () => {},
+) {
   const removed = [];
   const entries = await readBoundedDirectory(targetRoot, {
     maximumEntries: MAX_TARGET_ROOT_ENTRIES,
@@ -947,14 +1041,20 @@ async function removeTransactionResidue(targetRoot) {
     const fileResidue = FILE_RESIDUE_PATTERN.test(entry.name);
     if (!installResidue && !fileResidue) continue;
     const residuePath = join(targetRoot, entry.name);
-    const status = await lstat(residuePath);
+    const status = await lstat(residuePath, { bigint: true });
     if (installResidue) {
       assert(
         status.isDirectory() || status.isSymbolicLink(),
         `install residue has an unsupported file type: ${entry.name}`,
       );
       if (status.isSymbolicLink()) {
-        await unlink(residuePath);
+        await observer("before-file-residue-quarantine", { residuePath });
+        await removeRetainedFileResidue(
+          targetRoot,
+          targetHandle,
+          entry.name,
+          status,
+        );
       } else {
         const residueHandle = await openRetainedDirectory(residuePath);
         try {
@@ -973,7 +1073,13 @@ async function removeTransactionResidue(targetRoot) {
         status.isFile() || status.isSymbolicLink(),
         `metadata residue has an unsupported file type: ${entry.name}`,
       );
-      await unlink(residuePath);
+      await observer("before-file-residue-quarantine", { residuePath });
+      await removeRetainedFileResidue(
+        targetRoot,
+        targetHandle,
+        entry.name,
+        status,
+      );
     }
     removed.push(entry.name);
   }
@@ -982,7 +1088,11 @@ async function removeTransactionResidue(targetRoot) {
 
 export async function recoverDeploymentTarget(
   targetPath,
-  { force = false, processIsAlive = defaultProcessIsAlive } = {},
+  {
+    force = false,
+    processIsAlive = defaultProcessIsAlive,
+    observer = async () => {},
+  } = {},
 ) {
   assert.equal(typeof force, "boolean", "force must be Boolean");
   assert.equal(
@@ -990,6 +1100,7 @@ export async function recoverDeploymentTarget(
     "function",
     "process liveness inspector must be a function",
   );
+  observer = validateDeploymentObserver(observer);
   const targetRoot = await requireTarget(targetPath);
   return withTargetAuthority(targetRoot, async (authorityRoot, targetHandle) => {
     const lockPath = join(authorityRoot, "deployment.lock");
@@ -1054,7 +1165,7 @@ export async function recoverDeploymentTarget(
       targetHandle,
       async () => {
         const removedTemporaryPaths =
-          await removeTransactionResidue(authorityRoot);
+          await removeTransactionResidue(authorityRoot, targetHandle, observer);
         const policy = await readStoragePolicy(authorityRoot);
         let storage = null;
         if (policy) {

@@ -781,6 +781,44 @@ try {
     "recovery removed an unrecognized path",
   );
 
+  const substitutedResidueTarget = await createTarget(
+    temporaryRoot,
+    "substituted-recovery-residue-target",
+  );
+  const substitutedResidueName = `.state-${randomUUID()}.json`;
+  const substitutedResiduePath = join(
+    substitutedResidueTarget,
+    substitutedResidueName,
+  );
+  const displacedResiduePath = join(
+    substitutedResidueTarget,
+    "displaced-residue",
+  );
+  await writeFile(substitutedResiduePath, "original");
+  let residueSubstituted = false;
+  await assert.rejects(
+    recoverDeploymentTarget(substitutedResidueTarget, {
+      observer: async (boundary, detail) => {
+        if (boundary !== "before-file-residue-quarantine") return;
+        assert.equal(detail.residuePath, substitutedResiduePath);
+        await rename(substitutedResiduePath, displacedResiduePath);
+        await writeFile(substitutedResiduePath, "replacement");
+        residueSubstituted = true;
+      },
+    }),
+    /metadata residue identity changed/,
+  );
+  assert.equal(residueSubstituted, true);
+  assert.equal(await readFile(substitutedResiduePath, "utf8"), "replacement");
+  assert.equal(await readFile(displacedResiduePath, "utf8"), "original");
+  assert.equal(
+    (await readdir(substitutedResidueTarget)).some((entry) =>
+      entry.startsWith(".recovery-")
+    ),
+    false,
+  );
+  assert.equal(await readDeploymentLock(substitutedResidueTarget), null);
+
   const activeLockTarget = await createTarget(
     temporaryRoot,
     "active-lock-target",
