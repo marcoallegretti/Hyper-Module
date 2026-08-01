@@ -9,8 +9,6 @@ import {
   open,
   readFile,
   realpath,
-  rename,
-  rm,
 } from "node:fs/promises";
 import {
   basename,
@@ -27,10 +25,16 @@ import Ajv2020 from "ajv/dist/2020.js";
 import canonicalize from "canonicalize";
 
 import {
+  assertRetainedDirectory,
+  openRetainedDirectory,
   readStableFile,
   syncDirectoryTree,
   syncPublishedDirectory,
 } from "../lib/durable-files.mjs";
+import {
+  removeRetainedDirectory,
+  renameDirectoryNoReplace,
+} from "../lib/native-fs-authority.mjs";
 import { PublishedDirectoryDurabilityError } from "../lib/published-directory.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
 import {
@@ -266,6 +270,9 @@ export async function buildBundle(
   const stageRoot = await mkdtemp(
     join(outputParent, `.${basename(outputRoot)}.staging-`),
   );
+  const stageHandle = await openRetainedDirectory(stageRoot);
+  const outputParentHandle = await openRetainedDirectory(outputParent);
+  let published = false;
   try {
     const payloads = [...plan.payloads].sort((left, right) =>
       left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
@@ -349,34 +356,52 @@ export async function buildBundle(
         .digest("hex")}`,
     };
     try {
-      await rename(stageRoot, outputRoot);
+      await renameDirectoryNoReplace(
+        outputParentHandle,
+        outputParent,
+        basename(stageRoot),
+        basename(outputRoot),
+        "bundle",
+      );
+      published = true;
     } catch (error) {
       if (!new Set(["EACCES", "EEXIST", "ENOTEMPTY", "EPERM"]).has(error.code)) {
-        throw error;
-      }
-      try {
-        await lstat(outputRoot);
-      } catch (statusError) {
-        if (statusError.code === "ENOENT") throw error;
-        throw statusError;
-      }
-      let existing;
-      try {
-        existing = await verifyBundleArtifact(outputRoot);
-      } catch (cause) {
-        throw new Error(
-          `output already exists and is not the requested bundle: ${outputRoot}`,
-          { cause },
+        try {
+          await assertRetainedDirectory(
+            stageHandle,
+            outputRoot,
+            "published bundle",
+          );
+          published = true;
+        } catch {
+          throw error;
+        }
+      } else {
+        try {
+          await lstat(outputRoot);
+        } catch (statusError) {
+          if (statusError.code === "ENOENT") throw error;
+          throw statusError;
+        }
+        let existing;
+        try {
+          existing = await verifyBundleArtifact(outputRoot);
+        } catch (cause) {
+          throw new Error(
+            `output already exists and is not the requested bundle: ${outputRoot}`,
+            { cause },
+          );
+        }
+        assert.equal(
+          `sha256:${existing.bundle_sha256}`,
+          result.identity,
+          `output already exists with a different bundle identity: ${outputRoot}`,
         );
+        await syncPublishedDirectory(outputRoot);
+        return result;
       }
-      assert.equal(
-        `sha256:${existing.bundle_sha256}`,
-        result.identity,
-        `output already exists with a different bundle identity: ${outputRoot}`,
-      );
-      await syncPublishedDirectory(outputRoot);
-      return result;
     }
+    await assertRetainedDirectory(stageHandle, outputRoot, "published bundle");
     try {
       if (faultAt === "after-publication-before-sync") {
         throw new Error("injected fault after bundle publication");
@@ -391,7 +416,33 @@ export async function buildBundle(
     }
     return result;
   } finally {
-    await rm(stageRoot, { recursive: true, force: true });
+    try {
+      if (!published) {
+        let stagePresent = true;
+        try {
+          await lstat(stageRoot);
+        } catch (error) {
+          if (error.code === "ENOENT") {
+            stagePresent = false;
+          } else {
+            throw error;
+          }
+        }
+        if (stagePresent) {
+          await removeRetainedDirectory(
+            stageHandle,
+            stageRoot,
+            "bundle staging directory",
+          );
+        }
+      }
+    } finally {
+      try {
+        await stageHandle.close();
+      } finally {
+        await outputParentHandle.close();
+      }
+    }
   }
 }
 

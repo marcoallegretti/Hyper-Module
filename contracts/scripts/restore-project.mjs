@@ -8,8 +8,6 @@ import {
   mkdtemp,
   open,
   realpath,
-  rename,
-  rm,
 } from "node:fs/promises";
 import {
   basename,
@@ -22,9 +20,15 @@ import {
 import { pathToFileURL } from "node:url";
 
 import {
+  assertRetainedDirectory,
+  openRetainedDirectory,
   syncDirectoryTree,
   syncPublishedDirectory,
 } from "../lib/durable-files.mjs";
+import {
+  removeRetainedDirectory,
+  renameDirectoryNoReplace,
+} from "../lib/native-fs-authority.mjs";
 import { PublishedDirectoryDurabilityError } from "../lib/published-directory.mjs";
 import { verifyBundle } from "./verify-bundle.mjs";
 import { verifyProject } from "./verify-project.mjs";
@@ -205,6 +209,9 @@ export async function restoreProject(bundlePath, outputPath, { faultAt } = {}) {
   const stageRoot = await mkdtemp(
     resolve(outputParent, `.${basename(outputRoot)}.restore-`),
   );
+  const stageHandle = await openRetainedDirectory(stageRoot);
+  const outputParentHandle = await openRetainedDirectory(outputParent);
+  let published = false;
   try {
     const payloads = [...manifest.files].sort((left, right) =>
       left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
@@ -243,34 +250,52 @@ export async function restoreProject(bundlePath, outputPath, { faultAt } = {}) {
       identity: restored.identity,
     };
     try {
-      await rename(stageRoot, outputRoot);
+      await renameDirectoryNoReplace(
+        outputParentHandle,
+        outputParent,
+        basename(stageRoot),
+        basename(outputRoot),
+        "project",
+      );
+      published = true;
     } catch (error) {
       if (!new Set(["EACCES", "EEXIST", "ENOTEMPTY", "EPERM"]).has(error.code)) {
-        throw error;
-      }
-      try {
-        await lstat(outputRoot);
-      } catch (statusError) {
-        if (statusError.code === "ENOENT") throw error;
-        throw statusError;
-      }
-      let existing;
-      try {
-        existing = await verifyProject(outputRoot);
-      } catch (cause) {
-        throw new Error(
-          `output already exists and is not the requested project: ${outputRoot}`,
-          { cause },
+        try {
+          await assertRetainedDirectory(
+            stageHandle,
+            outputRoot,
+            "published project",
+          );
+          published = true;
+        } catch {
+          throw error;
+        }
+      } else {
+        try {
+          await lstat(outputRoot);
+        } catch (statusError) {
+          if (statusError.code === "ENOENT") throw error;
+          throw statusError;
+        }
+        let existing;
+        try {
+          existing = await verifyProject(outputRoot);
+        } catch (cause) {
+          throw new Error(
+            `output already exists and is not the requested project: ${outputRoot}`,
+            { cause },
+          );
+        }
+        assert.equal(
+          existing.identity,
+          result.identity,
+          `output already exists with a different project identity: ${outputRoot}`,
         );
+        await syncPublishedDirectory(outputRoot);
+        return result;
       }
-      assert.equal(
-        existing.identity,
-        result.identity,
-        `output already exists with a different project identity: ${outputRoot}`,
-      );
-      await syncPublishedDirectory(outputRoot);
-      return result;
     }
+    await assertRetainedDirectory(stageHandle, outputRoot, "published project");
     try {
       injectFault(faultAt, "after-publication-before-sync");
       await syncPublishedDirectory(outputRoot);
@@ -283,7 +308,33 @@ export async function restoreProject(bundlePath, outputPath, { faultAt } = {}) {
     }
     return result;
   } finally {
-    await rm(stageRoot, { recursive: true, force: true });
+    try {
+      if (!published) {
+        let stagePresent = true;
+        try {
+          await lstat(stageRoot);
+        } catch (error) {
+          if (error.code === "ENOENT") {
+            stagePresent = false;
+          } else {
+            throw error;
+          }
+        }
+        if (stagePresent) {
+          await removeRetainedDirectory(
+            stageHandle,
+            stageRoot,
+            "project staging directory",
+          );
+        }
+      }
+    } finally {
+      try {
+        await stageHandle.close();
+      } finally {
+        await outputParentHandle.close();
+      }
+    }
   }
 }
 

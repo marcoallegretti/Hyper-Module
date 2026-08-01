@@ -19,6 +19,7 @@ members = [
     "crates/storage-engine",
     "crates/strict-json",
     "software/IDE/audio-backend",
+    "software/IDE/fs-authority",
 ]
 exclude = ["third_party/pipewire"]
 resolver = "3"

@@ -42,6 +42,9 @@ import {
 import { strictParse } from "../lib/strict-json.mjs";
 import { inspectDeploymentBundle } from "../lib/deployment-bundle.mjs";
 import { readBoundedDirectory } from "../lib/filesystem-tree.mjs";
+import {
+  removeRetainedDirectory as removeRetainedDirectoryNative,
+} from "../lib/native-fs-authority.mjs";
 
 const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -502,7 +505,7 @@ async function removeRetainedDirectory(path, parentRoot, handle, label) {
   await rename(path, quarantinePath);
   try {
     await assertRetainedDirectory(handle, quarantinePath, label);
-    await rm(quarantinePath, { recursive: true, force: false });
+    await removeRetainedDirectoryNative(handle, quarantinePath, label);
     await syncRemovedEntry(parentRoot);
   } catch (error) {
     let restoreError;
@@ -888,7 +891,17 @@ async function removeTransactionResidue(targetRoot) {
       if (status.isSymbolicLink()) {
         await unlink(residuePath);
       } else {
-        await rm(residuePath, { recursive: true, force: false });
+        const residueHandle = await openRetainedDirectory(residuePath);
+        try {
+          await removeRetainedDirectory(
+            residuePath,
+            targetRoot,
+            residueHandle,
+            `install residue ${entry.name}`,
+          );
+        } finally {
+          await residueHandle.close();
+        }
       }
     } else {
       assert(

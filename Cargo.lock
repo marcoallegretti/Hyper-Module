@@ -414,6 +414,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-fs-authority"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "rustix",
+]
+
+[[package]]
 name = "hyper-media-cache"
 version = "0.1.0"
 dependencies = [

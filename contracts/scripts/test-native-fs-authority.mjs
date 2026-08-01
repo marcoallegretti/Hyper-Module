@@ -1,0 +1,101 @@
+import assert from "node:assert/strict";
+import { mkdtemp, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { openRetainedDirectory } from "../lib/durable-files.mjs";
+import {
+  removeRetainedDirectory,
+  renameDirectoryNoReplace,
+} from "../lib/native-fs-authority.mjs";
+
+const temporaryRoot = await mkdtemp(join(tmpdir(), "hyper-fs-authority-"));
+try {
+  const removable = join(temporaryRoot, "removable");
+  await mkdir(join(removable, "nested"), { recursive: true });
+  await writeFile(join(removable, "nested", "payload"), "owned");
+  const removableHandle = await openRetainedDirectory(removable);
+  try {
+    await removeRetainedDirectory(
+      removableHandle,
+      removable,
+      "test directory",
+    );
+  } finally {
+    await removableHandle.close();
+  }
+  await assert.rejects(open(removable, "r"), { code: "ENOENT" });
+
+  const retainedPath = join(temporaryRoot, "retained");
+  const movedPath = join(temporaryRoot, "moved");
+  await mkdir(retainedPath);
+  const retainedHandle = await openRetainedDirectory(retainedPath);
+  try {
+    await rename(retainedPath, movedPath);
+    await mkdir(retainedPath);
+    await writeFile(join(retainedPath, "replacement"), "preserve");
+
+    await assert.rejects(
+      removeRetainedDirectory(
+        retainedHandle,
+        retainedPath,
+        "replaced test directory",
+      ),
+      /native cleanup failed/,
+    );
+    assert.equal(
+      await readFile(join(retainedPath, "replacement"), "utf8"),
+      "preserve",
+    );
+
+    await removeRetainedDirectory(
+      retainedHandle,
+      movedPath,
+      "moved test directory",
+    );
+  } finally {
+    await retainedHandle.close();
+  }
+  await assert.rejects(open(movedPath, "r"), { code: "ENOENT" });
+
+  const parentHandle = await openRetainedDirectory(temporaryRoot);
+  try {
+    await mkdir(join(temporaryRoot, "publish-source"));
+    await renameDirectoryNoReplace(
+      parentHandle,
+      temporaryRoot,
+      "publish-source",
+      "published",
+      "test publication",
+    );
+    await assert.rejects(open(join(temporaryRoot, "publish-source"), "r"), {
+      code: "ENOENT",
+    });
+
+    await mkdir(join(temporaryRoot, "blocked-source"));
+    await mkdir(join(temporaryRoot, "occupied"));
+    await writeFile(join(temporaryRoot, "occupied", "marker"), "preserve");
+    await assert.rejects(
+      renameDirectoryNoReplace(
+        parentHandle,
+        temporaryRoot,
+        "blocked-source",
+        "occupied",
+        "blocked test publication",
+      ),
+      { code: "EEXIST" },
+    );
+    assert.equal(
+      await readFile(join(temporaryRoot, "occupied", "marker"), "utf8"),
+      "preserve",
+    );
+    await open(join(temporaryRoot, "blocked-source"), "r").then((handle) =>
+      handle.close(),
+    );
+  } finally {
+    await parentHandle.close();
+  }
+  console.log("Native filesystem authority passed: 5 identity cases");
+} finally {
+  await rm(temporaryRoot, { recursive: true, force: true });
+}

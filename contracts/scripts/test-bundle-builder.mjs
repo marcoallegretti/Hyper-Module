@@ -118,6 +118,18 @@ try {
 
   assert.deepEqual(await buildBundle(planPath, source, firstPath), first);
 
+  const occupiedPath = join(temporaryRoot, "occupied.runtime");
+  await mkdir(occupiedPath);
+  await writeFile(join(occupiedPath, "sentinel.txt"), "preserve");
+  await assert.rejects(
+    buildBundle(planPath, source, occupiedPath),
+    /output already exists/,
+  );
+  assert.equal(
+    await readFile(join(occupiedPath, "sentinel.txt"), "utf8"),
+    "preserve",
+  );
+
   const uncertainPath = join(temporaryRoot, "uncertain.runtime");
   let publicationError;
   try {
@@ -213,7 +225,7 @@ try {
   );
   assert.deepEqual(stagingResidue, [], "failed builds left staging data");
 
-  console.log("Bundle builder passed: 10 construction cases");
+  console.log("Bundle builder passed: 11 construction cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }
