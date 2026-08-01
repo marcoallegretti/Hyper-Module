@@ -62,26 +62,36 @@ fn remove_verified_directory(
 }
 
 #[cfg(target_os = "linux")]
-fn rename_no_replace(directory: &Dir, source: &str, destination: &str) -> io::Result<()> {
+fn rename_no_replace(
+    source_directory: &Dir,
+    source: &str,
+    destination_directory: &Dir,
+    destination: &str,
+) -> io::Result<()> {
     Ok(rustix::fs::renameat_with(
-        directory,
+        source_directory,
         source,
-        directory,
+        destination_directory,
         destination,
         rustix::fs::RenameFlags::NOREPLACE,
     )?)
 }
 
 #[cfg(windows)]
-fn rename_no_replace(directory: &Dir, source: &str, destination: &str) -> io::Result<()> {
-    match directory.symlink_metadata(destination) {
+fn rename_no_replace(
+    source_directory: &Dir,
+    source: &str,
+    destination_directory: &Dir,
+    destination: &str,
+) -> io::Result<()> {
+    match destination_directory.symlink_metadata(destination) {
         Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    match directory.rename(source, directory, destination) {
+    match source_directory.rename(source, destination_directory, destination) {
         Ok(()) => Ok(()),
-        Err(error) if directory.symlink_metadata(destination).is_ok() => {
+        Err(error) if destination_directory.symlink_metadata(destination).is_ok() => {
             Err(io::ErrorKind::AlreadyExists.into())
         }
         Err(error) => Err(error),
@@ -103,7 +113,47 @@ fn rename_verified_directory_no_replace(
     }
 
     let directory = open_verified_directory(&parent, (expected_device, expected_file))?;
-    rename_no_replace(&directory, &source, &destination)?;
+    rename_no_replace(&directory, &source, &directory, &destination)?;
+    Ok(())
+}
+
+fn rename_verified_directory_between_no_replace(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let source_parent = arguments
+        .next()
+        .ok_or_else(|| invalid_argument("source parent directory path is required"))?;
+    let source_device = parse_identity(
+        arguments.next(),
+        "source parent device identity is required",
+    )?;
+    let source_file = parse_identity(arguments.next(), "source parent file identity is required")?;
+    let source = parse_name(arguments.next(), "source directory name is required")?;
+    let destination_parent = arguments
+        .next()
+        .ok_or_else(|| invalid_argument("destination parent directory path is required"))?;
+    let destination_device = parse_identity(
+        arguments.next(),
+        "destination parent device identity is required",
+    )?;
+    let destination_file = parse_identity(
+        arguments.next(),
+        "destination parent file identity is required",
+    )?;
+    let destination = parse_name(arguments.next(), "destination directory name is required")?;
+    if arguments.next().is_some() {
+        return Err(invalid_argument("unexpected filesystem authority argument").into());
+    }
+
+    let source_directory = open_verified_directory(&source_parent, (source_device, source_file))?;
+    let destination_directory =
+        open_verified_directory(&destination_parent, (destination_device, destination_file))?;
+    rename_no_replace(
+        &source_directory,
+        &source,
+        &destination_directory,
+        &destination,
+    )?;
     Ok(())
 }
 
@@ -112,6 +162,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     match arguments.next().as_deref() {
         Some("remove-directory") => remove_verified_directory(&mut arguments),
         Some("rename-directory-no-replace") => rename_verified_directory_no_replace(&mut arguments),
+        Some("rename-directory-between-no-replace") => {
+            rename_verified_directory_between_no_replace(&mut arguments)
+        }
         _ => Err(invalid_argument("unsupported filesystem authority operation").into()),
     }
 }

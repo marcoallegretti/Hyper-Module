@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { openRetainedDirectory } from "../lib/durable-files.mjs";
 import {
   removeRetainedDirectory,
+  renameDirectoryBetweenNoReplace,
   renameDirectoryNoReplace,
 } from "../lib/native-fs-authority.mjs";
 
@@ -100,10 +101,59 @@ try {
     await open(join(temporaryRoot, "blocked-source"), "r").then((handle) =>
       handle.close(),
     );
+
+    const sourceParent = join(temporaryRoot, "source-parent");
+    const destinationParent = join(temporaryRoot, "destination-parent");
+    await Promise.all([mkdir(sourceParent), mkdir(destinationParent)]);
+    const [sourceParentHandle, destinationParentHandle] = await Promise.all([
+      openRetainedDirectory(sourceParent),
+      openRetainedDirectory(destinationParent),
+    ]);
+    try {
+      await mkdir(join(sourceParent, "transfer"));
+      await renameDirectoryBetweenNoReplace(
+        sourceParentHandle,
+        sourceParent,
+        "transfer",
+        destinationParentHandle,
+        destinationParent,
+        "transferred",
+        "cross-parent test publication",
+      );
+      await assert.rejects(open(join(sourceParent, "transfer"), "r"), {
+        code: "ENOENT",
+      });
+      await open(join(destinationParent, "transferred"), "r").then((handle) =>
+        handle.close(),
+      );
+
+      await mkdir(join(sourceParent, "blocked-transfer"));
+      await mkdir(join(destinationParent, "occupied-transfer"));
+      await assert.rejects(
+        renameDirectoryBetweenNoReplace(
+          sourceParentHandle,
+          sourceParent,
+          "blocked-transfer",
+          destinationParentHandle,
+          destinationParent,
+          "occupied-transfer",
+          "blocked cross-parent test publication",
+        ),
+        { code: "EEXIST" },
+      );
+      await open(join(sourceParent, "blocked-transfer"), "r").then((handle) =>
+        handle.close(),
+      );
+    } finally {
+      await Promise.all([
+        sourceParentHandle.close(),
+        destinationParentHandle.close(),
+      ]);
+    }
   } finally {
     await parentHandle.close();
   }
-  console.log("Native filesystem authority passed: 5 identity cases");
+  console.log("Native filesystem authority passed: 7 identity cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

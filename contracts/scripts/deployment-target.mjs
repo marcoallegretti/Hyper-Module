@@ -13,7 +13,7 @@ import {
   statfs,
   unlink,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import Ajv2020 from "ajv/dist/2020.js";
@@ -44,6 +44,7 @@ import { inspectDeploymentBundle } from "../lib/deployment-bundle.mjs";
 import { readBoundedDirectory } from "../lib/filesystem-tree.mjs";
 import {
   removeRetainedDirectory as removeRetainedDirectoryNative,
+  renameDirectoryBetweenNoReplace,
 } from "../lib/native-fs-authority.mjs";
 
 const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -1167,8 +1168,29 @@ async function installIdentity(
         "staged bundle identity changed before publication",
       );
       await assertDeploymentDirectoriesRetained(targetRoot, retained);
-      await rename(stagingPath, installedPath);
-      published = true;
+      await observer("before-bundle-publication", { installedPath });
+      try {
+        await renameDirectoryBetweenNoReplace(
+          targetHandle,
+          targetRoot,
+          basename(stagingPath),
+          retained.bundlesHandle,
+          bundlesRoot,
+          source.sha256,
+          "deployment bundle",
+        );
+        published = true;
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+        const existing = await inspectBundle(installedPath, inspectionOptions);
+        assert.equal(
+          existing.sha256,
+          source.sha256,
+          "deployment bundle destination has a different identity",
+        );
+        await assertDeploymentDirectoriesRetained(targetRoot, retained);
+        return source.sha256;
+      }
       await assertRetainedDirectory(
         stagingHandle,
         installedPath,

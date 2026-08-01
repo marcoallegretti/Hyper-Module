@@ -444,6 +444,7 @@ try {
     substitutedInstallTarget,
     {
       observer: async (boundary, { installedPath }) => {
+        if (boundary === "before-bundle-publication") return;
         assert.equal(boundary, "after-bundle-publication");
         try {
           await rename(installedPath, displacedInstallation);
@@ -478,7 +479,11 @@ try {
       ),
       "preserve",
     );
-    await inspectDeploymentBundle(displacedInstallation);
+    if (process.platform === "linux") {
+      await assert.rejects(inspectDeploymentBundle(displacedInstallation), /ENOENT/);
+    } else {
+      await inspectDeploymentBundle(displacedInstallation);
+    }
   }
 
   const substitutedLockTarget = await createTarget(
@@ -490,7 +495,8 @@ try {
   let substitutedLockError;
   try {
     await installBundle(bundle7, substitutedLockTarget, {
-      observer: async () => {
+      observer: async (boundary) => {
+        if (boundary !== "before-bundle-publication") return;
         const lockPath = join(substitutedLockTarget, "deployment.lock");
         try {
           await rename(lockPath, displacedLock);
@@ -537,7 +543,8 @@ try {
     bundle7,
     substitutedBundlesTarget,
     {
-      observer: async () => {
+      observer: async (boundary) => {
+        if (boundary !== "before-bundle-publication") return;
         try {
           await rename(
             join(substitutedBundlesTarget, "bundles"),
@@ -568,7 +575,7 @@ try {
   } else {
     assert.match(
       substitutedBundlesError?.message ?? "",
-      /deployment bundles directory filesystem object changed/,
+      /deployment bundles directory filesystem object changed|deployment bundle native publication failed/,
     );
     assert.equal(
       await readFile(
@@ -577,8 +584,27 @@ try {
       ),
       "preserve",
     );
-    await inspectDeploymentBundle(join(displacedBundles, identity7));
+    assert.deepEqual(await readdir(displacedBundles), []);
   }
+
+  const publicationCollisionTarget = await createTarget(
+    temporaryRoot,
+    "publication-collision-target",
+  );
+  let collisionPath;
+  await assert.rejects(
+    installBundle(bundle7, publicationCollisionTarget, {
+      observer: async (boundary, { installedPath }) => {
+        if (boundary !== "before-bundle-publication") return;
+        collisionPath = installedPath;
+        await mkdir(installedPath);
+      },
+    }),
+    /manifest\.json|runtime bundle root|ENOENT/,
+  );
+  assert(collisionPath);
+  assert.deepEqual(await readdir(collisionPath), []);
+  assert.equal(await readDeploymentLock(publicationCollisionTarget), null);
 
   const garbageTarget = await createTarget(temporaryRoot, "garbage-target");
   const garbageIdentity = await installBundle(bundle7, garbageTarget);
