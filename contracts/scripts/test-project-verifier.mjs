@@ -687,6 +687,50 @@ try {
   const second = await verifyProject(valid);
   assert.equal(first.identity, second.identity);
 
+  const compressedWave = pcm16Wave(128);
+  compressedWave.writeUInt16LE(2, 20);
+  const unsupportedWave = await createValidProject(
+    temporaryRoot,
+    "unsupported-wave-codec",
+    {
+      bytes: compressedWave,
+      frameCount: 128,
+      mediaType: "audio/wav",
+      path: "assets/samples/compressed.wav",
+    },
+  );
+  await assert.rejects(
+    verifyProject(unsupportedWave),
+    /WAV codec is unsupported/,
+  );
+
+  const unusedMalformedAudio = join(temporaryRoot, "unused-malformed-audio");
+  await cp(valid, unusedMalformedAudio, { recursive: true });
+  const unusedProjectPath = join(unusedMalformedAudio, "project.json");
+  const unusedProject = JSON.parse(
+    await readFile(unusedProjectPath, "utf8"),
+  );
+  const malformedBytes = Buffer.from("not audio", "utf8");
+  const malformedPath = "assets/samples/unused.wav";
+  await writeFile(
+    join(unusedMalformedAudio, ...malformedPath.split("/")),
+    malformedBytes,
+  );
+  unusedProject.assets.push(
+    record(
+      "018f47a2-6b2d-7c11-8a44-001122334498",
+      "sample",
+      malformedPath,
+      "audio/wav",
+      malformedBytes,
+    ),
+  );
+  await writeFile(unusedProjectPath, canonicalize(unusedProject));
+  await assert.rejects(
+    verifyProject(unusedMalformedAudio),
+    /audio metadata parsing failed|audio container does not match/,
+  );
+
   for (const testCase of playbackDomainCases) {
     const caseRoot = join(temporaryRoot, `playback-domain-${testCase.name}`);
     await cp(valid, caseRoot, { recursive: true });
@@ -1936,7 +1980,7 @@ try {
     /project must contain at most one control-mapping resource/,
   );
 
-  console.log("Project verifier passed: 73 filesystem cases");
+  console.log("Project verifier passed: 75 filesystem cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

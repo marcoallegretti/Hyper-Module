@@ -153,6 +153,19 @@ async function readAudioAssetFormat(stream, asset, fileInfo) {
     expectedContainers[asset.media_type]?.has(container),
     `${asset.path}: audio container does not match declared media type`,
   );
+  if (asset.media_type === "audio/wav") {
+    const codec = metadata.format.codec;
+    assert(
+      codec === "PCM" || codec === "IEEE_FLOAT",
+      `${asset.path}: WAV codec is unsupported`,
+    );
+    const bitsPerSample = metadata.format.bitsPerSample;
+    const supportedWidth =
+      codec === "PCM"
+        ? new Set([8, 16, 24, 32]).has(bitsPerSample)
+        : bitsPerSample === 32;
+    assert(supportedWidth, `${asset.path}: WAV sample width is unsupported`);
+  }
   const sampleRate = metadata.format.sampleRate;
   assert(
     Number.isSafeInteger(sampleRate) && sampleRate > 0,
@@ -382,15 +395,10 @@ async function verifyProjectManifest(
   const automationTakes = project.resources
     .filter((record) => record.role === "automation-take")
     .map((record) => resources.get(record.id));
-  const requiredAudioFormatIds = new Set([
-    ...clips.map((clip) => clip.source.asset_id),
-    ...recordingMetadata.map((metadata) => metadata.asset_id),
-  ]);
   const audioFormats = new Map();
 
   for (const record of project.assets) {
     if (
-      requiredAudioFormatIds.has(record.id) &&
       (record.media_type === "audio/flac" || record.media_type === "audio/wav")
     ) {
       const verified = await verifyDescribedFile(rootPath, rootRealPath, record, {

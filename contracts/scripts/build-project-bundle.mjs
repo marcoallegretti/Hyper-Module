@@ -12,6 +12,7 @@ export async function buildProjectBundle(
   projectPath,
   outputPath,
   minimumRuntimeVersion,
+  options = {},
 ) {
   assert(
     typeof minimumRuntimeVersion === "string" &&
@@ -63,7 +64,7 @@ export async function buildProjectBundle(
   try {
     const planPath = join(planDirectory, "build-plan.json");
     await writeFile(planPath, canonicalize(plan), { flag: "wx" });
-    return await buildBundle(planPath, sourceRoot, outputRoot);
+    return await buildBundle(planPath, sourceRoot, outputRoot, options);
   } finally {
     await rm(planDirectory, { recursive: true, force: true });
   }

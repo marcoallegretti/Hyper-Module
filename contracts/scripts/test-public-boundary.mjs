@@ -21,6 +21,10 @@ const rejected = [
   ".GitHub/Copilot-Instructions.md",
   "nested\\AI_WORKSPACE\\state.json",
   "I\u0307NT_DOCS/normalized-variant.md",
+  "docs/architecture/overview.md",
+  "DOCS/ARCHITECTURE/overview.md",
+  "contracts/README.md",
+  "Contracts/ReadMe.MD",
 ];
 
 const accepted = [
@@ -52,4 +56,3 @@ assert.throws(() => privatePathReason("safe\0unsafe"), /without NUL/);
 console.log(
   `Public boundary policy passed: ${rejected.length} rejected and ${accepted.length} accepted cases`,
 );
-

@@ -144,6 +144,16 @@ try {
   assert.equal(recoveredPublication.output_path, uncertainPath);
   assert.equal(recoveredPublication.identity, first.identity);
 
+  const boundedPath = join(temporaryRoot, "bounded.runtime");
+  await assert.rejects(
+    buildBundle(planPath, source, boundedPath, { maximumBundleBytes: 1 }),
+    /runtime bundle exceeds 1 bytes/,
+  );
+  await assert.rejects(
+    buildBundle(planPath, source, boundedPath, { maximumBundleBytes: 0 }),
+    /maximum bundle bytes must be a positive safe integer/,
+  );
+
   const unsafeSource = join(temporaryRoot, "unsafe-source");
   await mkdir(unsafeSource);
   await symlink(source, join(unsafeSource, "linked"), "junction");
@@ -203,7 +213,7 @@ try {
   );
   assert.deepEqual(stagingResidue, [], "failed builds left staging data");
 
-  console.log("Bundle builder passed: 8 construction cases");
+  console.log("Bundle builder passed: 10 construction cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

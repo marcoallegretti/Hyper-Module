@@ -39,6 +39,7 @@ import {
 
 const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const planLimitBytes = 1024 * 1024;
+const defaultMaximumBundleBytes = 1024 * 1024 * 1024;
 const builderId = "hyper-bundle-builder";
 
 async function createPlanValidator() {
@@ -136,7 +137,14 @@ function assertContained(rootPath, candidatePath, label) {
   );
 }
 
-async function copyPayload(sourceRoot, sourceRootReal, stageRoot, payload) {
+async function copyPayload(
+  sourceRoot,
+  sourceRootReal,
+  stageRoot,
+  payload,
+  currentBundleBytes,
+  maximumBundleBytes,
+) {
   const sourcePath = resolve(sourceRoot, ...payload.source_path.split("/"));
   assertContained(sourceRoot, sourcePath, payload.source_path);
   const sourceStatus = await lstat(sourcePath);
@@ -147,6 +155,10 @@ async function copyPayload(sourceRoot, sourceRootReal, stageRoot, payload) {
   assert(
     Number.isSafeInteger(sourceStatus.size),
     `${payload.source_path}: source is too large for an exact byte count`,
+  );
+  assert(
+    sourceStatus.size <= maximumBundleBytes - currentBundleBytes,
+    `runtime bundle exceeds ${maximumBundleBytes} bytes`,
   );
   const sourceReal = await realpath(sourcePath);
   assertContained(sourceRootReal, sourceReal, payload.source_path);
@@ -173,6 +185,10 @@ async function copyPayload(sourceRoot, sourceRootReal, stageRoot, payload) {
     })) {
       digest.update(chunk);
       byteLength += chunk.length;
+      assert(
+        currentBundleBytes + byteLength <= maximumBundleBytes,
+        `runtime bundle exceeds ${maximumBundleBytes} bytes`,
+      );
       await writeAll(destinationHandle, chunk);
     }
     await destinationHandle.sync();
@@ -225,11 +241,18 @@ export async function buildBundle(
   planPath,
   sourcePath,
   outputPath,
-  { faultAt } = {},
+  {
+    faultAt,
+    maximumBundleBytes = defaultMaximumBundleBytes,
+  } = {},
 ) {
   assert(
     faultAt === undefined || faultAt === "after-publication-before-sync",
     "unknown bundle build fault boundary",
+  );
+  assert(
+    Number.isSafeInteger(maximumBundleBytes) && maximumBundleBytes > 0,
+    "maximum bundle bytes must be a positive safe integer",
   );
   const plan = await readBuildPlan(resolve(planPath));
   const sourceRoot = resolve(sourcePath);
@@ -256,9 +279,21 @@ export async function buildBundle(
       left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
     );
     const files = [];
+    let payloadBytes = 0;
     for (const payload of payloads) {
-      files.push(
-        await copyPayload(sourceRoot, sourceRootReal, stageRoot, payload),
+      const descriptor = await copyPayload(
+        sourceRoot,
+        sourceRootReal,
+        stageRoot,
+        payload,
+        payloadBytes,
+        maximumBundleBytes,
+      );
+      files.push(descriptor);
+      payloadBytes += descriptor.byte_length;
+      assert(
+        Number.isSafeInteger(payloadBytes),
+        "runtime bundle byte accounting exceeds safe integer range",
       );
     }
 
@@ -285,6 +320,15 @@ export async function buildBundle(
     assert(
       manifestBytes.length <= 1024 * 1024,
       "generated manifest exceeds one mebibyte",
+    );
+    const bundleBytes = payloadBytes + manifestBytes.length;
+    assert(
+      Number.isSafeInteger(bundleBytes),
+      "runtime bundle byte accounting exceeds safe integer range",
+    );
+    assert(
+      bundleBytes <= maximumBundleBytes,
+      `runtime bundle exceeds ${maximumBundleBytes} bytes`,
     );
     const manifestHandle = await open(
       join(stageRoot, "manifest.json"),

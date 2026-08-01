@@ -67,6 +67,18 @@ export function privatePathReason(path) {
     }
   }
 
+  if (names[0] === "docs" && names[1] === "architecture") {
+    return "private project architecture documentation";
+  }
+
+  if (
+    names.length === 2 &&
+    names[0] === "contracts" &&
+    names[1] === "readme.md"
+  ) {
+    return "private contract design documentation";
+  }
+
   return null;
 }
 
@@ -80,4 +92,3 @@ export function findPrivateTrackedPaths(paths) {
   }
   return violations;
 }
-
