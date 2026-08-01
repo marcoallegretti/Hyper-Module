@@ -1131,7 +1131,6 @@ fn verified_matching_file(
     Ok(Some((file, name.to_owned())))
 }
 
-#[cfg(not(windows))]
 fn remove_matching_file(dir: &Dir, record: &TransactionFile) -> Result<(), RecordingImportError> {
     let Some((file, name)) = verified_matching_file(dir, record)? else {
         return Ok(());
@@ -1164,17 +1163,6 @@ fn remove_matching_file(dir: &Dir, record: &TransactionFile) -> Result<(), Recor
     drop(file);
     dir.remove_file(&quarantine)
         .map_err(|error| caused("remove quarantined recording import file", error))?;
-    sync_dir(dir)
-}
-
-#[cfg(windows)]
-fn remove_matching_file(dir: &Dir, record: &TransactionFile) -> Result<(), RecordingImportError> {
-    let Some((file, name)) = verified_matching_file(dir, record)? else {
-        return Ok(());
-    };
-    drop(file);
-    dir.remove_file(&name)
-        .map_err(|error| caused("remove published recording import file", error))?;
     sync_dir(dir)
 }
 
