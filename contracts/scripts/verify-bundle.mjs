@@ -106,11 +106,15 @@ export async function verifyDescribedFile(
   rootPath,
   rootRealPath,
   descriptor,
-  { captureBytes = false, inspect = undefined } = {},
+  { captureBytes = false, inspect = undefined, validate = undefined } = {},
 ) {
   assert(
     inspect === undefined || typeof inspect === "function",
     "described-file inspector must be a function",
+  );
+  assert(
+    validate === undefined || typeof validate === "function",
+    "described-file validator must be a function",
   );
   const absolutePath = resolve(rootPath, ...descriptor.path.split("/"));
   const relativePath = relative(rootPath, absolutePath);
@@ -190,6 +194,14 @@ export async function verifyDescribedFile(
       } finally {
         stream.destroy();
       }
+    }
+    if (validate) {
+      await validate({
+        absolutePath,
+        byteLength: descriptor.byte_length,
+        mediaType: descriptor.media_type,
+        path: descriptor.path,
+      });
     }
     after = await handle.stat();
   } finally {

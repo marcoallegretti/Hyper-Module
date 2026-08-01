@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 
 import Ajv2020 from "ajv/dist/2020.js";
 import canonicalize from "canonicalize";
@@ -30,8 +33,10 @@ import {
 } from "./verify-bundle.mjs";
 
 const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const workspaceRoot = resolve(contractRoot, "..");
 const manifestLimitBytes = 1024 * 1024;
 export const defaultMaximumProjectBytes = 1024 * 1024 * 1024;
+const execFileAsync = promisify(execFile);
 
 async function createProjectValidator() {
   const schemaNames = [
@@ -197,6 +202,45 @@ async function readAudioAssetFormat(stream, asset, fileInfo) {
     `${asset.path}: audio frame count is missing or invalid`,
   );
   return { channels, frameCount, sampleRate };
+}
+
+function audioValidatorPath() {
+  if (process.env.HYPER_AUDIO_VALIDATOR) {
+    return resolve(process.env.HYPER_AUDIO_VALIDATOR);
+  }
+  const executable = process.platform === "win32"
+    ? "hyper-audio-validate.exe"
+    : "hyper-audio-validate";
+  const debugPath = resolve(workspaceRoot, "target", "debug", executable);
+  return existsSync(debugPath)
+    ? debugPath
+    : resolve(workspaceRoot, "target", "release", executable);
+}
+
+async function validateNativeAudio(asset, format, fileInfo) {
+  const decodedSampleBytes = format.frameCount * format.channels * 4;
+  assert(
+    Number.isSafeInteger(decodedSampleBytes) && decodedSampleBytes > 0,
+    `${asset.path}: decoded audio byte length is invalid`,
+  );
+  try {
+    await execFileAsync(
+      audioValidatorPath(),
+      [
+        fileInfo.absolutePath,
+        asset.media_type === "audio/wav" ? "wav" : "flac",
+        String(format.sampleRate),
+        String(fileInfo.byteLength),
+        String(format.frameCount),
+        String(decodedSampleBytes),
+      ],
+      { maxBuffer: 64 * 1024, windowsHide: true },
+    );
+  } catch (error) {
+    throw new Error(`${asset.path}: native audio validation failed`, {
+      cause: error,
+    });
+  }
 }
 
 export async function verifyProject(
@@ -427,9 +471,16 @@ async function verifyProjectManifest(
     if (
       (record.media_type === "audio/flac" || record.media_type === "audio/wav")
     ) {
+      let decodedFormat;
       const verified = await verifyDescribedFile(rootPath, rootRealPath, record, {
-        inspect: (stream, fileInfo) =>
-          readAudioAssetFormat(stream, record, fileInfo),
+        inspect: async (stream, fileInfo) => {
+          decodedFormat = await readAudioAssetFormat(stream, record, fileInfo);
+          return decodedFormat;
+        },
+        validate: (fileInfo) => {
+          assert(decodedFormat, `${record.path}: audio metadata is unavailable`);
+          return validateNativeAudio(record, decodedFormat, fileInfo);
+        },
       });
       audioFormats.set(record.id, verified.inspection);
     } else {

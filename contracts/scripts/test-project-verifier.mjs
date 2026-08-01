@@ -67,6 +67,28 @@ function pcm16Wave(frameCount, channels = 1, sampleRate = 48000) {
   return buffer;
 }
 
+function float32Wave(samples, channels = 1, sampleRate = 48000) {
+  assert.equal(samples.length % channels, 0);
+  const blockAlign = channels * 4;
+  const dataBytes = samples.length * 4;
+  const buffer = Buffer.alloc(44 + dataBytes);
+  buffer.write("RIFF", 0, "ascii");
+  buffer.writeUInt32LE(36 + dataBytes, 4);
+  buffer.write("WAVE", 8, "ascii");
+  buffer.write("fmt ", 12, "ascii");
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(3, 20);
+  buffer.writeUInt16LE(channels, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(sampleRate * blockAlign, 28);
+  buffer.writeUInt16LE(blockAlign, 32);
+  buffer.writeUInt16LE(32, 34);
+  buffer.write("data", 36, "ascii");
+  buffer.writeUInt32LE(dataBytes, 40);
+  samples.forEach((sample, index) => buffer.writeFloatLE(sample, 44 + index * 4));
+  return buffer;
+}
+
 async function createValidProject(parent, name, audioFixture) {
   const fixture = audioFixture ?? {
     bytes: pcm16Wave(128),
@@ -702,6 +724,21 @@ try {
   await assert.rejects(
     verifyProject(unsupportedWave),
     /WAV codec is unsupported/,
+  );
+
+  const nonFiniteWave = await createValidProject(
+    temporaryRoot,
+    "non-finite-wave",
+    {
+      bytes: float32Wave([Number.NaN]),
+      frameCount: 1,
+      mediaType: "audio/wav",
+      path: "assets/samples/non-finite.wav",
+    },
+  );
+  await assert.rejects(
+    verifyProject(nonFiniteWave),
+    /native audio validation failed/,
   );
 
   const unusedMalformedAudio = join(temporaryRoot, "unused-malformed-audio");
@@ -1980,7 +2017,7 @@ try {
     /project must contain at most one control-mapping resource/,
   );
 
-  console.log("Project verifier passed: 75 filesystem cases");
+  console.log("Project verifier passed: 76 filesystem cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }
