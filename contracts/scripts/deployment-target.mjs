@@ -682,7 +682,15 @@ function protectedBundleIdentities(state) {
   );
 }
 
-async function inspectInstalledBundles(targetRoot, maximumBundles) {
+async function inspectInstalledBundles(
+  targetRoot,
+  maximumBundles,
+  maximumBytes,
+) {
+  assert(
+    Number.isSafeInteger(maximumBytes) && maximumBytes >= 0,
+    "installed bundle byte budget must be a non-negative safe integer",
+  );
   const bundlesRoot = await requireBundlesRoot(targetRoot);
   const entries = await readBoundedDirectory(bundlesRoot, {
     maximumEntries: maximumBundles,
@@ -690,6 +698,7 @@ async function inspectInstalledBundles(targetRoot, maximumBundles) {
     label: "installed bundle directory",
   });
   const bundles = [];
+  let remainingBytes = maximumBytes;
   for (const entry of entries.sort((left, right) =>
     left.name.localeCompare(right.name),
   )) {
@@ -716,7 +725,9 @@ async function inspectInstalledBundles(targetRoot, maximumBundles) {
         sameResidueIdentity(selectedStatus, openedStatus),
         `installed bundle filesystem object changed: ${entry.name}`,
       );
-      bundle = await inspectBundle(bundlePath);
+      bundle = await inspectBundle(bundlePath, {
+        maximumBundleBytes: remainingBytes,
+      });
       const [retainedStatus, publishedStatus] = await Promise.all([
         bundleHandle.stat({ bigint: true }),
         lstat(bundlePath, { bigint: true }),
@@ -747,6 +758,11 @@ async function inspectInstalledBundles(targetRoot, maximumBundles) {
       bundle.sha256,
       entry.name,
       `installed bundle identity mismatch: ${entry.name}`,
+    );
+    remainingBytes -= bundle.byte_length;
+    assert(
+      Number.isSafeInteger(remainingBytes) && remainingBytes >= 0,
+      "installed bundle byte budget accounting is invalid",
     );
     bundles.push({ ...bundle, filesystem_identity: selectedStatus });
   }
@@ -802,6 +818,7 @@ async function assertStorageWithinPolicy(targetRoot) {
   const bundles = await inspectInstalledBundles(
     targetRoot,
     policy.max_installed_bundles,
+    policy.max_installed_bytes,
   );
   assertPolicyCapacity(
     policy,
@@ -820,6 +837,7 @@ async function collectUnprotectedBundles(
   const bundles = await inspectInstalledBundles(
     targetRoot,
     policy.max_installed_bundles,
+    policy.max_installed_bytes,
   );
   const removed = [];
   const retained = [];
@@ -983,6 +1001,7 @@ export async function configureDeploymentStorage(targetPath, policy) {
     const bundles = await inspectInstalledBundles(
       authorityRoot,
       policy.max_installed_bundles,
+      policy.max_installed_bytes,
     );
     const usage = summarizeStorage(bundles, protectedIdentities);
     assertPolicyCapacity(policy, usage, await availableBytes(authorityRoot));
@@ -1000,6 +1019,7 @@ export async function readDeploymentStorage(targetPath) {
     const bundles = await inspectInstalledBundles(
       authorityRoot,
       policy.max_installed_bundles,
+      policy.max_installed_bytes,
     );
     return {
       policy,
@@ -1470,6 +1490,7 @@ export async function recoverDeploymentTarget(
           const bundles = await inspectInstalledBundles(
             authorityRoot,
             policy.max_installed_bundles,
+            policy.max_installed_bytes,
           );
           const usage = summarizeStorage(
             bundles,
@@ -1539,6 +1560,7 @@ async function installIdentity(
     const bundles = await inspectInstalledBundles(
       targetRoot,
       policy.max_installed_bundles,
+      policy.max_installed_bytes,
     );
     const usage = summarizeStorage(bundles, protectedBundleIdentities(state));
     assertPolicyCapacity(

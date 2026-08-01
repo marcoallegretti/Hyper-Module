@@ -110,9 +110,38 @@ try {
   const restoredPath = join(temporaryRoot, "desktop-restored");
   const restored = await restoreProject(bundlePath, restoredPath);
   assert.equal(restored.identity, sourceVerification.identity);
-  assert.deepEqual(await restoreProject(bundlePath, restoredPath), restored);
+  assert.deepEqual(
+    await restoreProject(bundlePath, restoredPath, {
+      maximumProjectBytes: bundleByteLength,
+    }),
+    restored,
+  );
   const restoredVerification = await verifyProject(restoredPath);
   assert.equal(restoredVerification.identity, sourceVerification.identity);
+
+  const oversizedCollisionPath = join(
+    temporaryRoot,
+    "oversized-project-collision",
+  );
+  await cp(restoredPath, oversizedCollisionPath, { recursive: true });
+  const oversizedProjectPath = join(oversizedCollisionPath, "project.json");
+  const oversizedProject = JSON.parse(
+    await readFile(oversizedProjectPath, "utf8"),
+  );
+  oversizedProject.resources[0].byte_length = bundleByteLength;
+  await writeFile(oversizedProjectPath, canonicalBytes(oversizedProject));
+  let oversizedCollisionError;
+  try {
+    await restoreProject(bundlePath, oversizedCollisionPath, {
+      maximumProjectBytes: bundleByteLength,
+    });
+  } catch (error) {
+    oversizedCollisionError = error;
+  }
+  assert.match(
+    oversizedCollisionError?.cause?.message ?? "",
+    new RegExp(`project exceeds ${bundleByteLength} bytes`),
+  );
 
   for (const descriptor of manifest.files) {
     const relativeParts = descriptor.path.split("/");
@@ -257,7 +286,7 @@ try {
     sourceVerification.identity,
   );
 
-  console.log("Project round trip passed: 21 preservation and recovery cases");
+  console.log("Project round trip passed: 22 preservation and recovery cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

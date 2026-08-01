@@ -772,6 +772,49 @@ try {
   );
   assert.equal((await readDeploymentStorage(byteTarget)).installed_bundle_count, 1);
 
+  const inventoryBudgetTarget = await createTarget(
+    temporaryRoot,
+    "inventory-budget-target",
+  );
+  await installBundle(bundle7, inventoryBudgetTarget);
+  await installBundle(bundle8, inventoryBudgetTarget);
+  const inventoryBundleNames = (
+    await readdir(join(inventoryBudgetTarget, "bundles"))
+  ).sort();
+  const inventoryBundles = await Promise.all(
+    inventoryBundleNames.map((name) =>
+      inspectDeploymentBundle(
+        join(inventoryBudgetTarget, "bundles", name),
+      ),
+    ),
+  );
+  const inventoryByteLimit = inventoryBundles.reduce(
+    (total, bundle) => total + bundle.bundle_byte_length,
+    0,
+  );
+  await configureDeploymentStorage(
+    inventoryBudgetTarget,
+    storagePolicy({ max_installed_bytes: inventoryByteLimit }),
+  );
+  assert.equal(
+    (await readDeploymentStorage(inventoryBudgetTarget)).installed_bytes,
+    inventoryByteLimit,
+  );
+  const secondInventoryBudget = inventoryBundles[1].bundle_byte_length - 1;
+  await writeFile(
+    join(inventoryBudgetTarget, "policy.json"),
+    canonicalize(
+      storagePolicy({ max_installed_bytes: inventoryByteLimit - 1 }),
+    ),
+  );
+  await rm(
+    join(inventoryBudgetTarget, "bundles", inventoryBundleNames[1], "project.json"),
+  );
+  await assert.rejects(
+    readDeploymentStorage(inventoryBudgetTarget),
+    new RegExp(`deployment bundle exceeds ${secondInventoryBudget} bytes`),
+  );
+
   const reserveTarget = join(temporaryRoot, "reserve-target");
   await mkdir(reserveTarget);
   await assert.rejects(
@@ -1683,7 +1726,7 @@ try {
     ),
   );
 
-  console.log("Deployment target passed: 164 transaction cases");
+  console.log("Deployment target passed: 166 transaction cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

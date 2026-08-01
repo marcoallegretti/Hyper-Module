@@ -197,7 +197,9 @@ export async function restoreProject(
         }
         let existing;
         try {
-          existing = await verifyProject(outputRoot);
+          existing = await verifyProject(outputRoot, {
+            maximumProjectBytes,
+          });
         } catch (cause) {
           throw new Error(
             `output already exists and is not the requested project: ${outputRoot}`,

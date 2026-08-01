@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  cp,
   mkdir,
   mkdtemp,
   readFile,
@@ -155,7 +156,42 @@ try {
     "aggregate preflight created staging data",
   );
 
-  assert.deepEqual(await buildBundle(planPath, source, firstPath), first);
+  assert.deepEqual(
+    await buildBundle(planPath, source, firstPath, {
+      maximumBundleBytes: exactBundleBytes,
+    }),
+    first,
+  );
+
+  const oversizedCollisionPath = join(
+    temporaryRoot,
+    "oversized-collision.runtime",
+  );
+  await cp(firstPath, oversizedCollisionPath, { recursive: true });
+  const oversizedCollisionManifestPath = join(
+    oversizedCollisionPath,
+    "manifest.json",
+  );
+  const oversizedCollisionManifest = JSON.parse(
+    await readFile(oversizedCollisionManifestPath, "utf8"),
+  );
+  oversizedCollisionManifest.files[0].byte_length = exactBundleBytes;
+  await writeFile(
+    oversizedCollisionManifestPath,
+    canonicalize(oversizedCollisionManifest),
+  );
+  let oversizedCollisionError;
+  try {
+    await buildBundle(planPath, source, oversizedCollisionPath, {
+      maximumBundleBytes: exactBundleBytes,
+    });
+  } catch (error) {
+    oversizedCollisionError = error;
+  }
+  assert.match(
+    oversizedCollisionError?.cause?.message ?? "",
+    new RegExp(`deployment bundle exceeds ${exactBundleBytes} bytes`),
+  );
 
   const occupiedPath = join(temporaryRoot, "occupied.runtime");
   await mkdir(occupiedPath);
@@ -264,7 +300,7 @@ try {
   );
   assert.deepEqual(stagingResidue, [], "failed builds left staging data");
 
-  console.log("Bundle builder passed: 14 construction cases");
+  console.log("Bundle builder passed: 15 construction cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

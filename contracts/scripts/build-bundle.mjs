@@ -462,7 +462,9 @@ export async function buildBundle(
         }
         let existing;
         try {
-          existing = await verifyBundleArtifact(outputRoot);
+          existing = await verifyBundleArtifact(outputRoot, {
+            maximumBundleBytes,
+          });
         } catch (cause) {
           throw new Error(
             `output already exists and is not the requested bundle: ${outputRoot}`,
