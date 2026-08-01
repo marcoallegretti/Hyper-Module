@@ -7,6 +7,8 @@ import { runNativeProcess } from "./native-process.mjs";
 
 const workspaceRoot = resolve(import.meta.dirname, "..", "..");
 const protocolVersion = "2";
+const authorityOperationTimeoutMs = 30_000;
+const transferOperationTimeoutMs = 10 * 60_000;
 
 function helperPath() {
   if (process.env.HYPER_FS_AUTHORITY) {
@@ -35,7 +37,11 @@ function retainedAuthority(handle, ambientPath, childDescriptor) {
 function runHelper(
   arguments_,
   descriptors = [],
-  { input = undefined, captureOutput = false } = {},
+  {
+    input = undefined,
+    captureOutput = false,
+    timeoutMs = authorityOperationTimeoutMs,
+  } = {},
 ) {
   return runNativeProcess(helperPath(), [protocolVersion, ...arguments_], {
     stdio: [
@@ -46,6 +52,7 @@ function runHelper(
     ],
     input,
     maximumOutputBytes: 256,
+    timeoutMs,
   });
 }
 
@@ -211,7 +218,10 @@ export async function copyRetainedFile(
         String(maximumBytes),
       ],
       descriptors,
-      { captureOutput: true },
+      {
+        captureOutput: true,
+        timeoutMs: transferOperationTimeoutMs,
+      },
     );
     const result = parseTransferResult(output, label);
     assert.equal(
@@ -272,7 +282,11 @@ export async function writeRetainedFile(
       destinationAuthority.descriptor === undefined
         ? []
         : [destinationAuthority.descriptor],
-      { input: bytes, captureOutput: true },
+      {
+        input: bytes,
+        captureOutput: true,
+        timeoutMs: transferOperationTimeoutMs,
+      },
     );
     const result = parseTransferResult(output, label);
     assert.deepEqual(
