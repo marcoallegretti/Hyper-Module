@@ -293,10 +293,32 @@ pub fn decode_file(
     expected_sample_rate_hz: u32,
     limits: DecodeLimits,
 ) -> Result<DecodedAudio, DecodeError> {
+    decode_open_file(
+        File::open(path)?,
+        container,
+        expected_sample_rate_hz,
+        limits,
+    )
+}
+
+/// Decodes one complete WAV or native FLAC file from an already-open file.
+///
+/// This entry point preserves the caller's filesystem object identity across
+/// package hashing and production decoding.
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] under the same rules as [`decode_file`].
+pub fn decode_open_file(
+    mut file: File,
+    container: AudioContainer,
+    expected_sample_rate_hz: u32,
+    limits: DecodeLimits,
+) -> Result<DecodedAudio, DecodeError> {
     require_expected_sample_rate(expected_sample_rate_hz)?;
-    let mut file = File::open(path)?;
     let file_length = file.metadata()?.len();
     require_file_limit(file_length, limits)?;
+    file.seek(SeekFrom::Start(0))?;
     verify_container_signature(&mut file, container)?;
     file.seek(SeekFrom::Start(0))?;
     decode_source(Box::new(file), container, expected_sample_rate_hz, limits)

@@ -1,11 +1,9 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { promisify } from "node:util";
 
 import Ajv2020 from "ajv/dist/2020.js";
 import canonicalize from "canonicalize";
@@ -23,6 +21,7 @@ import {
   directoryPrefixes,
 } from "../lib/filesystem-tree.mjs";
 import { assertMixerInvariants } from "../lib/mixer.mjs";
+import { runNativeProcess } from "../lib/native-process.mjs";
 import { assertRecordingMetadataInvariants } from "../lib/recording-metadata.mjs";
 import { assertSceneInvariants } from "../lib/scene.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
@@ -36,7 +35,6 @@ const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workspaceRoot = resolve(contractRoot, "..");
 const manifestLimitBytes = 1024 * 1024;
 export const defaultMaximumProjectBytes = 1024 * 1024 * 1024;
-const execFileAsync = promisify(execFile);
 
 async function createProjectValidator() {
   const schemaNames = [
@@ -217,28 +215,42 @@ function audioValidatorPath() {
     : resolve(workspaceRoot, "target", "release", executable);
 }
 
-async function validateNativeAudio(asset, format, fileInfo) {
+async function validateNativeAudio(
+  asset,
+  format,
+  fileInfo,
+  nativeAudioObserver,
+) {
   const decodedSampleBytes = format.frameCount * format.channels * 4;
   assert(
     Number.isSafeInteger(decodedSampleBytes) && decodedSampleBytes > 0,
     `${asset.path}: decoded audio byte length is invalid`,
   );
+  await nativeAudioObserver("before-native-audio-validation", {
+    absolutePath: fileInfo.absolutePath,
+    path: asset.path,
+  });
   try {
-    await execFileAsync(
+    await runNativeProcess(
       audioValidatorPath(),
       [
-        fileInfo.absolutePath,
+        "-",
         asset.media_type === "audio/wav" ? "wav" : "flac",
         String(format.sampleRate),
         String(fileInfo.byteLength),
         String(format.frameCount),
         String(decodedSampleBytes),
       ],
-      { maxBuffer: 64 * 1024, windowsHide: true },
+      { stdio: [fileInfo.handle.fd, "ignore", "pipe"] },
     );
   } catch (error) {
     throw new Error(`${asset.path}: native audio validation failed`, {
       cause: error,
+    });
+  } finally {
+    await nativeAudioObserver("after-native-audio-validation", {
+      absolutePath: fileInfo.absolutePath,
+      path: asset.path,
     });
   }
 }
@@ -248,13 +260,20 @@ export async function verifyProject(
   {
     ignoredManagedPaths = [],
     maximumProjectBytes = defaultMaximumProjectBytes,
+    nativeAudioObserver = async () => {},
   } = {},
 ) {
+  assert.equal(
+    typeof nativeAudioObserver,
+    "function",
+    "native audio observer must be a function",
+  );
   return verifyProjectManifest(
     projectPath,
     ignoredManagedPaths,
     undefined,
     maximumProjectBytes,
+    nativeAudioObserver,
   );
 }
 
@@ -264,6 +283,7 @@ export async function verifyProjectCandidate(
   {
     ignoredManagedPaths = [],
     maximumProjectBytes = defaultMaximumProjectBytes,
+    nativeAudioObserver = async () => {},
   } = {},
 ) {
   assert(
@@ -274,11 +294,17 @@ export async function verifyProjectCandidate(
     candidateManifestBytes.length <= manifestLimitBytes,
     `candidate project manifest exceeds ${manifestLimitBytes} bytes`,
   );
+  assert.equal(
+    typeof nativeAudioObserver,
+    "function",
+    "native audio observer must be a function",
+  );
   return verifyProjectManifest(
     projectPath,
     ignoredManagedPaths,
     Buffer.from(candidateManifestBytes),
     maximumProjectBytes,
+    nativeAudioObserver,
   );
 }
 
@@ -287,6 +313,7 @@ async function verifyProjectManifest(
   ignoredManagedPaths,
   candidateManifestBytes = undefined,
   maximumProjectBytes = defaultMaximumProjectBytes,
+  nativeAudioObserver = async () => {},
 ) {
   assert(
     Number.isSafeInteger(maximumProjectBytes) && maximumProjectBytes > 0,
@@ -479,7 +506,12 @@ async function verifyProjectManifest(
         },
         validate: (fileInfo) => {
           assert(decodedFormat, `${record.path}: audio metadata is unavailable`);
-          return validateNativeAudio(record, decodedFormat, fileInfo);
+          return validateNativeAudio(
+            record,
+            decodedFormat,
+            fileInfo,
+            nativeAudioObserver,
+          );
         },
       });
       audioFormats.set(record.id, verified.inspection);

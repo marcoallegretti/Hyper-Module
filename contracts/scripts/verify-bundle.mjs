@@ -199,6 +199,7 @@ export async function verifyDescribedFile(
       await validate({
         absolutePath,
         byteLength: descriptor.byte_length,
+        handle,
         mediaType: descriptor.media_type,
         path: descriptor.path,
       });

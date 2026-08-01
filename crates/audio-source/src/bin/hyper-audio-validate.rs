@@ -1,8 +1,14 @@
 use std::error::Error;
+use std::fs::File;
 use std::io;
 use std::path::Path;
 
-use hyper_audio_source::{AudioContainer, DecodeLimits, decode_file};
+use hyper_audio_source::{AudioContainer, DecodeLimits, decode_file, decode_open_file};
+
+#[cfg(unix)]
+use std::os::fd::AsFd;
+#[cfg(windows)]
+use std::os::windows::io::AsHandle;
 
 fn invalid_argument(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
@@ -19,6 +25,16 @@ where
         .ok_or_else(|| invalid_argument(message))?
         .parse::<T>()
         .map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn duplicate_standard_input() -> io::Result<File> {
+    Ok(File::from(io::stdin().as_fd().try_clone_to_owned()?))
+}
+
+#[cfg(windows)]
+fn duplicate_standard_input() -> io::Result<File> {
+    Ok(File::from(io::stdin().as_handle().try_clone_to_owned()?))
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
@@ -45,7 +61,16 @@ fn run() -> Result<(), Box<dyn Error>> {
         expected_frames,
         maximum_decoded_sample_bytes,
     )?;
-    let decoded = decode_file(Path::new(&path), container, sample_rate_hz, limits)?;
+    let decoded = if path == "-" {
+        decode_open_file(
+            duplicate_standard_input()?,
+            container,
+            sample_rate_hz,
+            limits,
+        )?
+    } else {
+        decode_file(Path::new(&path), container, sample_rate_hz, limits)?
+    };
     if u64::try_from(decoded.frame_count())? != expected_frames {
         return Err(invalid_argument("decoded audio frame count does not match metadata").into());
     }

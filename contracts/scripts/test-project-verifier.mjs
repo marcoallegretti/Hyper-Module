@@ -6,6 +6,7 @@ import {
   mkdtemp,
   readFile,
   realpath,
+  rename,
   rm,
   symlink,
   unlink,
@@ -740,6 +741,48 @@ try {
     verifyProject(nonFiniteWave),
     /native audio validation failed/,
   );
+
+  const substitutedNonFiniteWave = await createValidProject(
+    temporaryRoot,
+    "substituted-non-finite-wave",
+    {
+      bytes: float32Wave([Number.NaN]),
+      frameCount: 1,
+      mediaType: "audio/wav",
+      path: "assets/samples/substituted-non-finite.wav",
+    },
+  );
+  let displacedAudioPath;
+  let audioSubstituted = false;
+  await assert.rejects(
+    verifyProject(substitutedNonFiniteWave, {
+      nativeAudioObserver: async (boundary, { absolutePath }) => {
+        if (boundary === "before-native-audio-validation") {
+          displacedAudioPath = `${absolutePath}.displaced`;
+          try {
+            await rename(absolutePath, displacedAudioPath);
+            await writeFile(absolutePath, float32Wave([0]));
+            audioSubstituted = true;
+          } catch (error) {
+            if (
+              process.platform !== "win32" ||
+              (error.code !== "EACCES" && error.code !== "EPERM")
+            ) {
+              throw error;
+            }
+          }
+          return;
+        }
+        assert.equal(boundary, "after-native-audio-validation");
+        if (audioSubstituted) {
+          await rm(absolutePath);
+          await rename(displacedAudioPath, absolutePath);
+        }
+      },
+    }),
+    /native audio validation failed/,
+  );
+  assert(audioSubstituted, "audio path substitution was not exercised");
 
   const unusedMalformedAudio = join(temporaryRoot, "unused-malformed-audio");
   await cp(valid, unusedMalformedAudio, { recursive: true });
@@ -2017,7 +2060,7 @@ try {
     /project must contain at most one control-mapping resource/,
   );
 
-  console.log("Project verifier passed: 76 filesystem cases");
+  console.log("Project verifier passed: 77 filesystem cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }
