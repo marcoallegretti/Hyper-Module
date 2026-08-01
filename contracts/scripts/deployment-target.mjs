@@ -82,6 +82,17 @@ class InjectedDeploymentFault extends Error {
   }
 }
 
+async function readCliJson(path, maximumBytes, label) {
+  const bytes = await readStableFile(path, maximumBytes, label);
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (error) {
+    throw new Error(`${label} is not valid UTF-8`, { cause: error });
+  }
+  return strictParse(text);
+}
+
 function validateFaultBoundary(faultAt) {
   assert(
     faultAt === undefined || DEPLOYMENT_FAULT_BOUNDARIES.has(faultAt),
@@ -2301,7 +2312,11 @@ if (invokedPath === import.meta.url) {
     );
     result = await configureDeploymentStorage(
       args[0],
-      strictParse(await readFile(args[1], "utf8")),
+      await readCliJson(
+        args[1],
+        MAX_DEPLOYMENT_METADATA_BYTES,
+        "deployment storage policy input",
+      ),
     );
   } else if (command === "storage") {
     assert.equal(
@@ -2340,7 +2355,11 @@ if (invokedPath === import.meta.url) {
     );
     result = await configureDeploymentAuthorization(
       args[0],
-      strictParse(await readFile(args[1], "utf8")),
+      await readCliJson(
+        args[1],
+        MAX_AUTHORIZATION_STATE_BYTES,
+        "deployment authorization input",
+      ),
     );
   } else if (command === "authorization") {
     assert.equal(
@@ -2365,7 +2384,11 @@ if (invokedPath === import.meta.url) {
       4,
       "usage: deployment-target.mjs pairing-approve <target> <request-json> <now-epoch-ms> <approved-thumbprint>",
     );
-    const pairingRequest = strictParse(await readFile(args[1], "utf8"));
+    const pairingRequest = await readCliJson(
+      args[1],
+      MAX_DEPLOYMENT_METADATA_BYTES,
+      "pairing approval input",
+    );
     result = await approveDeploymentPairing(
       args[0],
       pairingRequest,
@@ -2393,7 +2416,11 @@ if (invokedPath === import.meta.url) {
     result = await authenticatedDeployBundle(
       args[0],
       args[1],
-      strictParse(await readFile(args[2], "utf8")),
+      await readCliJson(
+        args[2],
+        MAX_DEPLOYMENT_METADATA_BYTES,
+        "authenticated deployment request input",
+      ),
       Number(args[3]),
     );
   } else {
