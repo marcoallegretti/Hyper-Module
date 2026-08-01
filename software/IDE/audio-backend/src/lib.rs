@@ -6,17 +6,17 @@ use std::sync::Arc;
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
-use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel};
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+use std::sync::{Mutex, OnceLock};
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
@@ -204,6 +204,42 @@ struct BoundedBackendThread {
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
+fn backend_thread_supervisor() -> Option<&'static Sender<JoinHandle<()>>> {
+    static SUPERVISOR: OnceLock<Option<Sender<JoinHandle<()>>>> = OnceLock::new();
+    SUPERVISOR
+        .get_or_init(|| {
+            let (sender, receiver) = channel::<JoinHandle<()>>();
+            thread::Builder::new()
+                .name("hyper-audio-shutdown".to_owned())
+                .spawn(move || {
+                    for handle in receiver {
+                        let _ = handle.join();
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+fn retain_backend_join(handle: JoinHandle<()>) {
+    if let Some(supervisor) = backend_thread_supervisor() {
+        if let Err(error) = supervisor.send(handle) {
+            let _ = error.0.join();
+        }
+    } else {
+        let _ = handle.join();
+    }
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
 impl BoundedBackendThread {
     fn new(handle: JoinHandle<()>, completed: Receiver<()>) -> Self {
         Self {
@@ -234,9 +270,17 @@ impl BoundedBackendThread {
             BackendThreadJoin::Panicked
         }
     }
+}
 
-    fn detach(&mut self) {
-        let _ = self.handle.take();
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+impl Drop for BoundedBackendThread {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            retain_backend_join(handle);
+        }
     }
 }
 
@@ -244,7 +288,7 @@ impl BoundedBackendThread {
 /// within the bounded startup-cancellation deadline.
 ///
 /// Call [`Self::wait`] again to observe eventual termination. Dropping this
-/// value relinquishes monitoring but does not terminate the native thread.
+/// value transfers join ownership to the process shutdown supervisor.
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"

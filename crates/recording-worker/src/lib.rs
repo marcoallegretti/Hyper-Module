@@ -11,15 +11,45 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{
-    Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
+    Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError, channel,
+    sync_channel,
 };
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::Duration;
 
 const IDLE_RECHECK_INTERVAL: Duration = Duration::from_millis(10);
+
+fn worker_shutdown_supervisor() -> Option<&'static Sender<JoinHandle<RecordingWorkerCompletion>>> {
+    static SUPERVISOR: OnceLock<Option<Sender<JoinHandle<RecordingWorkerCompletion>>>> =
+        OnceLock::new();
+    SUPERVISOR
+        .get_or_init(|| {
+            let (sender, receiver) = channel::<JoinHandle<RecordingWorkerCompletion>>();
+            thread::Builder::new()
+                .name("hyper-recording-shutdown".to_owned())
+                .spawn(move || {
+                    for handle in receiver {
+                        let _ = handle.join();
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+}
+
+fn retain_worker_join(handle: JoinHandle<RecordingWorkerCompletion>) {
+    if let Some(supervisor) = worker_shutdown_supervisor() {
+        if let Err(error) = supervisor.send(handle) {
+            let _ = error.0.join();
+        }
+    } else {
+        let _ = handle.join();
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordingWorkerConfig {
@@ -380,9 +410,10 @@ impl RecordingWorker {
 
 impl Drop for RecordingWorker {
     fn drop(&mut self) {
-        if self.handle.take().is_some() {
+        if let Some(handle) = self.handle.take() {
             self.hard_cancel.store(true, Ordering::Release);
             self.wake_thread.unpark();
+            retain_worker_join(handle);
         }
     }
 }

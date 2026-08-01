@@ -339,9 +339,6 @@ impl Drop for WasapiInputStream {
     fn drop(&mut self) {
         self.status.request_stop();
         self.stop_requested.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.as_mut() {
-            thread.detach();
-        }
     }
 }
 
