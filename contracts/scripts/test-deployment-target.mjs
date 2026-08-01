@@ -748,9 +748,11 @@ try {
   };
   await writeDeploymentLockFixture(recoveryTarget, staleOwner);
   const installResidue = `.install-${randomUUID()}`;
+  const metadataResidue = `.metadata-${randomUUID()}`;
   const stateResidue = `.state-${randomUUID()}.json`;
   const policyResidue = `.policy-${randomUUID()}.json`;
   await mkdir(join(recoveryTarget, installResidue));
+  await mkdir(join(recoveryTarget, metadataResidue));
   await writeFile(join(recoveryTarget, stateResidue), "{}");
   await writeFile(join(recoveryTarget, policyResidue), "{}");
   await writeFile(join(recoveryTarget, ".install-not-a-transaction"), "keep");
@@ -765,6 +767,7 @@ try {
   assert.equal(recoveredTarget.forced, false);
   assert.deepEqual(recoveredTarget.removed_temporary_paths, [
     installResidue,
+    metadataResidue,
     policyResidue,
     stateResidue,
   ].sort());
@@ -954,18 +957,12 @@ try {
     const publishedState = boundary === "after-state-publication";
     assert.equal(stateAfterFault !== null, publishedState);
     const rootResidue = (await readdir(faultTarget)).filter(
-      (name) => name.startsWith(".install-") || name.startsWith(".state-"),
+      (name) =>
+        name.startsWith(".install-") ||
+        name.startsWith(".metadata-") ||
+        name.startsWith(".state-"),
     );
-    assert.equal(
-      rootResidue.length,
-      boundary === "after-state-sync" ? 1 : 0,
-    );
-    if (boundary === "after-state-sync") {
-      assert.match(
-        rootResidue[0],
-        /^\.state-[0-9a-f-]{36}\.json$/,
-      );
-    }
+    assert.equal(rootResidue.length, 0);
     const recovery = await recoverDeploymentTarget(faultTarget);
     assert.equal(recovery.removed_temporary_paths.length, rootResidue.length);
     const installedAfterRecovery = await readdir(
@@ -1383,10 +1380,12 @@ try {
     ),
     /after-authorization-sync/,
   );
-  const authorizationSyncResidue = (
-    await readdir(authorizationTarget)
-  ).find((entry) => /^\.authorization-[0-9a-f-]+\.json$/.test(entry));
-  assert(authorizationSyncResidue);
+  assert.equal(
+    (await readdir(authorizationTarget)).some((entry) =>
+      entry.startsWith(".metadata-")
+    ),
+    false,
+  );
   assert.equal(
     (
       await readDeploymentAuthorization(authorizationTarget)
@@ -1398,11 +1397,7 @@ try {
   const recoveredAuthorizationSync = await recoverDeploymentTarget(
     authorizationTarget,
   );
-  assert(
-    recoveredAuthorizationSync.removed_temporary_paths.includes(
-      authorizationSyncResidue,
-    ),
-  );
+  assert.deepEqual(recoveredAuthorizationSync.removed_temporary_paths, []);
   await assert.rejects(
     authenticatedDeployBundle(
       bundle9,

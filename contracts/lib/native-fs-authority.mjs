@@ -139,3 +139,53 @@ export async function renameDirectoryBetweenNoReplace(
     throw wrapped;
   }
 }
+
+export async function renameEntryBetweenReplace(
+  sourceParentHandle,
+  sourceParentPath,
+  sourceName,
+  destinationParentHandle,
+  destinationParentPath,
+  destinationName,
+  label,
+) {
+  const [sourceStatus, destinationStatus] = await Promise.all([
+    sourceParentHandle.stat({ bigint: true }),
+    destinationParentHandle.stat({ bigint: true }),
+  ]);
+  assert(sourceStatus.isDirectory(), `${label} source parent is not a directory`);
+  assert(
+    destinationStatus.isDirectory(),
+    `${label} destination parent is not a directory`,
+  );
+  const sourceAuthority = retainedAuthority(
+    sourceParentHandle,
+    sourceParentPath,
+    3,
+  );
+  const destinationAuthority = retainedAuthority(
+    destinationParentHandle,
+    destinationParentPath,
+    4,
+  );
+  const descriptors = [sourceAuthority.descriptor, destinationAuthority.descriptor]
+    .filter((descriptor) => descriptor !== undefined);
+  try {
+    await runHelper(
+      [
+        "rename-entry-between-replace",
+        sourceAuthority.path,
+        String(sourceStatus.dev),
+        String(sourceStatus.ino),
+        sourceName,
+        destinationAuthority.path,
+        String(destinationStatus.dev),
+        String(destinationStatus.ino),
+        destinationName,
+      ],
+      descriptors,
+    );
+  } catch (error) {
+    throw new Error(`${label} native replacement failed`, { cause: error });
+  }
+}

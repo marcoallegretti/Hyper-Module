@@ -8,6 +8,7 @@ import {
   removeRetainedDirectory,
   renameDirectoryBetweenNoReplace,
   renameDirectoryNoReplace,
+  renameEntryBetweenReplace,
 } from "../lib/native-fs-authority.mjs";
 
 const temporaryRoot = await mkdtemp(join(tmpdir(), "hyper-fs-authority-"));
@@ -144,6 +145,25 @@ try {
       await open(join(sourceParent, "blocked-transfer"), "r").then((handle) =>
         handle.close(),
       );
+
+      await writeFile(join(sourceParent, "replacement-source"), "new");
+      await writeFile(join(destinationParent, "replacement-target"), "old");
+      await renameEntryBetweenReplace(
+        sourceParentHandle,
+        sourceParent,
+        "replacement-source",
+        destinationParentHandle,
+        destinationParent,
+        "replacement-target",
+        "cross-parent test replacement",
+      );
+      await assert.rejects(open(join(sourceParent, "replacement-source"), "r"), {
+        code: "ENOENT",
+      });
+      assert.equal(
+        await readFile(join(destinationParent, "replacement-target"), "utf8"),
+        "new",
+      );
     } finally {
       await Promise.all([
         sourceParentHandle.close(),
@@ -153,7 +173,7 @@ try {
   } finally {
     await parentHandle.close();
   }
-  console.log("Native filesystem authority passed: 7 identity cases");
+  console.log("Native filesystem authority passed: 8 identity cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

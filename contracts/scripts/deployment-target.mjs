@@ -7,7 +7,6 @@ import {
   readFile,
   realpath,
   rename,
-  rm,
   stat,
   statfs,
 } from "node:fs/promises";
@@ -34,7 +33,6 @@ import {
   readStableFile,
   syncDirectoryTree,
   syncPublishedDirectory,
-  syncPublishedEntry,
   syncRemovedEntry,
 } from "../lib/durable-files.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
@@ -43,6 +41,7 @@ import { readBoundedDirectory } from "../lib/filesystem-tree.mjs";
 import {
   removeRetainedDirectory as removeRetainedDirectoryNative,
   renameDirectoryBetweenNoReplace,
+  renameEntryBetweenReplace,
 } from "../lib/native-fs-authority.mjs";
 import { copyVerifiedBundleFile } from "../lib/verified-bundle-copy.mjs";
 
@@ -347,31 +346,83 @@ async function writeCanonicalFile(
   faultAt = undefined,
   maxBytes = MAX_DEPLOYMENT_METADATA_BYTES,
 ) {
-  const temporaryPath = join(targetRoot, `.${name}-${randomUUID()}.json`);
   const bytes = Buffer.from(canonicalize(value), "utf8");
   assert(bytes.byteLength <= maxBytes, `${name} exceeds ${maxBytes} bytes`);
-  const handle = await open(temporaryPath, "wx");
+
+  const transactionName = `.metadata-${randomUUID()}`;
+  let targetHandle;
+  let transactionHandle;
+  let transactionPath;
+  let operationError;
   try {
-    await handle.writeFile(bytes);
-    await handle.sync();
+    targetHandle = await openRetainedDirectory(targetRoot);
+    const authorityRoot = retainedDirectoryPath(targetHandle, targetRoot);
+    transactionPath = join(authorityRoot, transactionName);
+    await mkdir(transactionPath, { mode: 0o700 });
+    transactionHandle = await openRetainedDirectory(transactionPath);
+    const authorityTransaction = retainedDirectoryPath(
+      transactionHandle,
+      transactionPath,
+    );
+    const temporaryName = `${name}.json`;
+    const temporaryPath = join(authorityTransaction, temporaryName);
+    const handle = await open(temporaryPath, "wx");
+    try {
+      await handle.writeFile(bytes);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     if (name === "state") injectFault(faultAt, "after-state-sync");
     if (name === "authorization") {
       injectFault(faultAt, "after-authorization-sync");
     }
-  } finally {
-    await handle.close();
-  }
-  try {
-    const publishedPath = join(targetRoot, `${name}.json`);
-    await rename(temporaryPath, publishedPath);
-    await syncPublishedEntry(publishedPath);
+
+    await renameEntryBetweenReplace(
+      transactionHandle,
+      transactionPath,
+      temporaryName,
+      targetHandle,
+      authorityRoot,
+      `${name}.json`,
+      `${name} publication`,
+    );
+    await targetHandle.sync();
     if (name === "state") injectFault(faultAt, "after-state-publication");
     if (name === "authorization") {
       injectFault(faultAt, "after-authorization-state-publication");
     }
-  } finally {
-    await rm(temporaryPath, { force: true });
+  } catch (error) {
+    operationError = error;
   }
+
+  let cleanupError;
+  if (transactionHandle) {
+    try {
+      await removeRetainedDirectoryNative(
+        transactionHandle,
+        transactionPath,
+        `${name} transaction directory`,
+      );
+      await targetHandle.sync();
+    } catch (error) {
+      cleanupError = error;
+    }
+  }
+
+  const releaseErrors = [];
+  for (const handle of [transactionHandle, targetHandle]) {
+    try {
+      await handle?.close();
+    } catch (error) {
+      releaseErrors.push(error);
+    }
+  }
+  const errors = [operationError, cleanupError, ...releaseErrors].filter(Boolean);
+  if (errors.length > 1) {
+    throw new AggregateError(errors, `${name} publication failed`);
+  }
+  if (errors.length === 1) throw errors[0];
 }
 
 async function readState(targetRoot) {
@@ -1018,7 +1069,9 @@ async function removeRetainedFileResidue(
 
 const UUID_FRAGMENT =
   "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
-const INSTALL_RESIDUE_PATTERN = new RegExp(`^\\.install-${UUID_FRAGMENT}$`);
+const DIRECTORY_RESIDUE_PATTERN = new RegExp(
+  `^\\.(?:install|metadata)-${UUID_FRAGMENT}$`,
+);
 const FILE_RESIDUE_PATTERN = new RegExp(
   `^\\.(?:state|policy|authorization)-${UUID_FRAGMENT}\\.json$`,
 );
@@ -1037,15 +1090,15 @@ async function removeTransactionResidue(
   for (const entry of entries.sort((left, right) =>
     left.name.localeCompare(right.name),
   )) {
-    const installResidue = INSTALL_RESIDUE_PATTERN.test(entry.name);
+    const directoryResidue = DIRECTORY_RESIDUE_PATTERN.test(entry.name);
     const fileResidue = FILE_RESIDUE_PATTERN.test(entry.name);
-    if (!installResidue && !fileResidue) continue;
+    if (!directoryResidue && !fileResidue) continue;
     const residuePath = join(targetRoot, entry.name);
     const status = await lstat(residuePath, { bigint: true });
-    if (installResidue) {
+    if (directoryResidue) {
       assert(
         status.isDirectory() || status.isSymbolicLink(),
-        `install residue has an unsupported file type: ${entry.name}`,
+        `directory residue has an unsupported file type: ${entry.name}`,
       );
       if (status.isSymbolicLink()) {
         await observer("before-file-residue-quarantine", { residuePath });
@@ -1062,7 +1115,7 @@ async function removeTransactionResidue(
             residuePath,
             targetRoot,
             residueHandle,
-            `install residue ${entry.name}`,
+            `directory residue ${entry.name}`,
           );
         } finally {
           await residueHandle.close();

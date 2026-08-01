@@ -157,6 +157,41 @@ fn rename_verified_directory_between_no_replace(
     Ok(())
 }
 
+fn rename_verified_entry_between_replace(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let source_parent = arguments
+        .next()
+        .ok_or_else(|| invalid_argument("source parent directory path is required"))?;
+    let source_device = parse_identity(
+        arguments.next(),
+        "source parent device identity is required",
+    )?;
+    let source_file = parse_identity(arguments.next(), "source parent file identity is required")?;
+    let source = parse_name(arguments.next(), "source entry name is required")?;
+    let destination_parent = arguments
+        .next()
+        .ok_or_else(|| invalid_argument("destination parent directory path is required"))?;
+    let destination_device = parse_identity(
+        arguments.next(),
+        "destination parent device identity is required",
+    )?;
+    let destination_file = parse_identity(
+        arguments.next(),
+        "destination parent file identity is required",
+    )?;
+    let destination = parse_name(arguments.next(), "destination entry name is required")?;
+    if arguments.next().is_some() {
+        return Err(invalid_argument("unexpected filesystem authority argument").into());
+    }
+
+    let source_directory = open_verified_directory(&source_parent, (source_device, source_file))?;
+    let destination_directory =
+        open_verified_directory(&destination_parent, (destination_device, destination_file))?;
+    source_directory.rename(source, &destination_directory, destination)?;
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
     match arguments.next().as_deref() {
@@ -164,6 +199,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("rename-directory-no-replace") => rename_verified_directory_no_replace(&mut arguments),
         Some("rename-directory-between-no-replace") => {
             rename_verified_directory_between_no_replace(&mut arguments)
+        }
+        Some("rename-entry-between-replace") => {
+            rename_verified_entry_between_replace(&mut arguments)
         }
         _ => Err(invalid_argument("unsupported filesystem authority operation").into()),
     }
