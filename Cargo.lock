@@ -408,6 +408,7 @@ dependencies = [
  "hyper-recording-metadata",
  "hyper-recording-transport",
  "hyper-recording-worker",
+ "hyper-thread-supervisor",
  "libspa-sys",
  "pipewire",
  "wasapi",
@@ -549,6 +550,7 @@ dependencies = [
  "hound",
  "hyper-recording-journal",
  "hyper-recording-transport",
+ "hyper-thread-supervisor",
 ]
 
 [[package]]
@@ -577,6 +579,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "hyper-thread-supervisor"
+version = "0.1.0"
 
 [[package]]
 name = "indexmap"

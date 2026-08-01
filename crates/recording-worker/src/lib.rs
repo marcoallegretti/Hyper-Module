@@ -5,6 +5,7 @@ use hyper_recording_transport::{
     RECORDING_CHANNELS, RecordingConsumer, RecordingDrainError, RecordingTransportSnapshot,
     RecordingWakeRegistrationError,
 };
+use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSnapshot};
 use std::collections::TryReserveError;
 use std::error::Error;
 use std::fmt;
@@ -13,8 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{
-    Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError, channel,
-    sync_channel,
+    Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
@@ -22,33 +22,31 @@ use std::time::Duration;
 
 const IDLE_RECHECK_INTERVAL: Duration = Duration::from_millis(10);
 
-fn worker_shutdown_supervisor() -> Option<&'static Sender<JoinHandle<RecordingWorkerCompletion>>> {
-    static SUPERVISOR: OnceLock<Option<Sender<JoinHandle<RecordingWorkerCompletion>>>> =
+fn worker_shutdown_supervisor() -> io::Result<&'static ThreadSupervisor<RecordingWorkerCompletion>>
+{
+    const CAPACITY: usize = 64;
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+    static SUPERVISOR: OnceLock<Result<ThreadSupervisor<RecordingWorkerCompletion>, io::Error>> =
         OnceLock::new();
     SUPERVISOR
-        .get_or_init(|| {
-            let (sender, receiver) = channel::<JoinHandle<RecordingWorkerCompletion>>();
-            thread::Builder::new()
-                .name("hyper-recording-shutdown".to_owned())
-                .spawn(move || {
-                    for handle in receiver {
-                        let _ = handle.join();
-                    }
-                })
-                .ok()
-                .map(|_| sender)
-        })
+        .get_or_init(|| ThreadSupervisor::new("hyper-recording-shutdown", CAPACITY, POLL_INTERVAL))
         .as_ref()
+        .map_err(|error| io::Error::new(error.kind(), error.to_string()))
 }
 
-fn retain_worker_join(handle: JoinHandle<RecordingWorkerCompletion>) {
-    if let Some(supervisor) = worker_shutdown_supervisor() {
-        if let Err(error) = supervisor.send(handle) {
-            let _ = error.0.join();
-        }
-    } else {
-        let _ = handle.join();
-    }
+fn acquire_worker_thread_permit() -> io::Result<ThreadPermit<RecordingWorkerCompletion>> {
+    worker_shutdown_supervisor()?
+        .acquire()
+        .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error))
+}
+
+/// Returns bounded recording-thread ownership telemetry when the supervisor
+/// has been initialized successfully.
+#[must_use]
+pub fn recording_thread_supervisor_snapshot() -> Option<ThreadSupervisorSnapshot> {
+    worker_shutdown_supervisor()
+        .ok()
+        .map(ThreadSupervisor::snapshot)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -238,6 +236,7 @@ pub struct RecordingWorker {
     wake_thread: Thread,
     completion_receiver: Receiver<()>,
     handle: Option<JoinHandle<RecordingWorkerCompletion>>,
+    shutdown_permit: Option<ThreadPermit<RecordingWorkerCompletion>>,
     requested: Option<RecordingDisposition>,
     hard_cancel: Arc<AtomicBool>,
 }
@@ -285,6 +284,8 @@ impl RecordingWorker {
         let (completion_sender, completion_receiver) = sync_channel(1);
         let hard_cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = Arc::clone(&hard_cancel);
+        let shutdown_permit =
+            acquire_worker_thread_permit().map_err(RecordingWorkerStartError::ThreadSpawn)?;
         let handle = thread::Builder::new()
             .name("hyper-recording-writer".to_owned())
             .spawn(move || {
@@ -326,8 +327,8 @@ impl RecordingWorker {
         if let Err(error) = consumer_sender.send((consumer, writer)) {
             let (_, writer) = error.0;
             drop(writer);
-            fs::remove_file(&journal_path).map_err(RecordingWorkerStartError::PathValidation)?;
             let _ = handle.join();
+            fs::remove_file(&journal_path).map_err(RecordingWorkerStartError::PathValidation)?;
             return Err(RecordingWorkerStartError::ThreadTerminated);
         }
         Ok(Self {
@@ -335,6 +336,7 @@ impl RecordingWorker {
             wake_thread,
             completion_receiver,
             handle: Some(handle),
+            shutdown_permit: Some(shutdown_permit),
             requested: None,
             hard_cancel,
         })
@@ -379,9 +381,11 @@ impl RecordingWorker {
                     .handle
                     .take()
                     .ok_or(RecordingWorkerWaitError::CompletionAlreadyTaken)?;
-                handle
+                let completion = handle
                     .join()
-                    .map_err(|_| RecordingWorkerWaitError::ThreadPanicked)
+                    .map_err(|_| RecordingWorkerWaitError::ThreadPanicked);
+                self.shutdown_permit.take();
+                completion
             }
             Err(RecvTimeoutError::Timeout) => Err(RecordingWorkerWaitError::TimedOut),
         }
@@ -413,7 +417,10 @@ impl Drop for RecordingWorker {
         if let Some(handle) = self.handle.take() {
             self.hard_cancel.store(true, Ordering::Release);
             self.wake_thread.unpark();
-            retain_worker_join(handle);
+            let Some(permit) = self.shutdown_permit.take() else {
+                std::process::abort();
+            };
+            permit.retain(handle);
         }
     }
 }

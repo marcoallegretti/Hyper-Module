@@ -21,6 +21,7 @@ hyper-recording-journal = { path = "../../../crates/recording-journal" }
 hyper-recording-metadata = { path = "../../../crates/recording-metadata" }
 hyper-recording-transport = { path = "../../../crates/recording-transport" }
 hyper-recording-worker = { path = "../../../crates/recording-worker" }
+hyper-thread-supervisor = { path = "../../../crates/thread-supervisor" }
 
 [target.'cfg(all(target_os = "linux", target_endian = "little"))'.dependencies]
 bytemuck = "=1.24.0"

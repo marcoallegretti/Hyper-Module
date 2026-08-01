@@ -2,6 +2,7 @@ use super::{
     BackendThreadCompletion, BackendThreadJoin, BoundedBackendThread, InterleavedStereoProcessor,
     OutputCallback, OutputCallbackStatus, OutputStreamCounters, OutputStreamState,
     OutputStreamStatus, PendingNativeShutdown, PipeWireOutputTarget, STEREO_CHANNELS,
+    acquire_backend_thread_permit,
 };
 use core::cell::Cell;
 use core::error::Error;
@@ -419,6 +420,8 @@ impl PipeWireOutputStream {
         let failure_sender = startup_sender.clone();
         let (completion_sender, completion_receiver) = sync_channel(1);
         let completion_thread_status = status.clone();
+        let shutdown_permit =
+            acquire_backend_thread_permit().map_err(PipeWireStartError::ThreadSpawn)?;
         let handle = thread::Builder::new()
             .name("hyper-pipewire-output".to_owned())
             .spawn(move || {
@@ -441,7 +444,7 @@ impl PipeWireOutputStream {
                 }
             })
             .map_err(PipeWireStartError::ThreadSpawn)?;
-        let mut thread = BoundedBackendThread::new(handle, completion_receiver);
+        let mut thread = BoundedBackendThread::new(handle, completion_receiver, shutdown_permit);
 
         match wait_for_startup(&startup_receiver, startup_timeout) {
             Ok(()) => Ok(Self {

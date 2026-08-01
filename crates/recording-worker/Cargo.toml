@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 hyper-recording-journal = { path = "../recording-journal" }
 hyper-recording-transport = { path = "../recording-transport" }
+hyper-thread-supervisor = { path = "../thread-supervisor" }
 
 [dev-dependencies]
 hound = "=3.5.1"

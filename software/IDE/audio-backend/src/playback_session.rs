@@ -1045,7 +1045,7 @@ fn callback_error(detail: String) -> NativeDesktopOutputStartError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BoundedBackendThread;
+    use crate::{BoundedBackendThread, acquire_backend_thread_permit};
     use hyper_audio_source::DecodeLimits;
     #[cfg(all(target_os = "linux", target_endian = "little"))]
     use hyper_audio_source::DecodedAudio;
@@ -1127,7 +1127,11 @@ mod tests {
             release_receiver.recv().unwrap();
             completed_sender.send(()).unwrap();
         });
-        let thread = BoundedBackendThread::new(handle, completed_receiver);
+        let thread = BoundedBackendThread::new(
+            handle,
+            completed_receiver,
+            acquire_backend_thread_permit().unwrap(),
+        );
         (
             PendingNativeShutdown::new(thread, OutputStreamStatus::default()),
             release_sender,

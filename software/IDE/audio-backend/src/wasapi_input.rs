@@ -4,6 +4,7 @@ use super::{
     CaptureCallbackStatus, CaptureStreamCounters, InterleavedStereoCaptureProcessor,
     PendingNativeShutdown, STEREO_CHANNELS, StreamState, StreamStatus, WasapiDisconnectReason,
     WasapiInputEndpoint, WasapiStartError, WasapiStartupStage, WasapiStopError,
+    acquire_backend_thread_permit,
 };
 use core::error::Error;
 use core::fmt;
@@ -237,6 +238,8 @@ impl WasapiInputStream {
         let failure_sender = startup_sender.clone();
         let (completion_sender, completion_receiver) = sync_channel(1);
         let completion_thread_status = status.clone();
+        let shutdown_permit =
+            acquire_backend_thread_permit().map_err(WasapiStartError::ThreadSpawn)?;
         let handle = thread::Builder::new()
             .name("hyper-wasapi-input".to_owned())
             .spawn(move || {
@@ -260,7 +263,7 @@ impl WasapiInputStream {
                 }
             })
             .map_err(WasapiStartError::ThreadSpawn)?;
-        let mut thread = BoundedBackendThread::new(handle, completion_receiver);
+        let mut thread = BoundedBackendThread::new(handle, completion_receiver, shutdown_permit);
 
         match wait_for_startup(&startup_receiver, startup_timeout) {
             Ok(()) => Ok(Self {

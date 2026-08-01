@@ -1,12 +1,17 @@
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+use std::io;
 use std::sync::Arc;
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
@@ -16,12 +21,18 @@ use std::sync::{Mutex, OnceLock};
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
 use std::time::Duration;
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSnapshot};
 
 pub const STEREO_CHANNELS: usize = 2;
 pub const MAXIMUM_BLOCK_FRAMES: usize = 4_096;
@@ -198,42 +209,40 @@ pub enum PendingNativeShutdownWait {
 struct BoundedBackendThread {
     handle: Option<JoinHandle<()>>,
     completed: Mutex<Receiver<()>>,
+    shutdown_permit: Option<ThreadPermit<()>>,
 }
 
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
-fn backend_thread_supervisor() -> Option<&'static Sender<JoinHandle<()>>> {
-    static SUPERVISOR: OnceLock<Option<Sender<JoinHandle<()>>>> = OnceLock::new();
+fn backend_thread_supervisor() -> io::Result<&'static ThreadSupervisor<()>> {
+    const CAPACITY: usize = 64;
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+    static SUPERVISOR: OnceLock<Result<ThreadSupervisor<()>, io::Error>> = OnceLock::new();
     SUPERVISOR
-        .get_or_init(|| {
-            let (sender, receiver) = channel::<JoinHandle<()>>();
-            thread::Builder::new()
-                .name("hyper-audio-shutdown".to_owned())
-                .spawn(move || {
-                    for handle in receiver {
-                        let _ = handle.join();
-                    }
-                })
-                .ok()
-                .map(|_| sender)
-        })
+        .get_or_init(|| ThreadSupervisor::new("hyper-audio-shutdown", CAPACITY, POLL_INTERVAL))
         .as_ref()
+        .map_err(|error| io::Error::new(error.kind(), error.to_string()))
 }
 
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
-fn retain_backend_join(handle: JoinHandle<()>) {
-    if let Some(supervisor) = backend_thread_supervisor() {
-        if let Err(error) = supervisor.send(handle) {
-            let _ = error.0.join();
-        }
-    } else {
-        let _ = handle.join();
-    }
+fn acquire_backend_thread_permit() -> io::Result<ThreadPermit<()>> {
+    backend_thread_supervisor()?
+        .acquire()
+        .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error))
+}
+
+/// Returns bounded native-thread ownership telemetry when the supervisor has
+/// been initialized successfully.
+#[must_use]
+pub fn native_thread_supervisor_snapshot() -> Option<ThreadSupervisorSnapshot> {
+    backend_thread_supervisor()
+        .ok()
+        .map(ThreadSupervisor::snapshot)
 }
 
 #[cfg(any(
@@ -241,10 +250,15 @@ fn retain_backend_join(handle: JoinHandle<()>) {
     target_os = "windows"
 ))]
 impl BoundedBackendThread {
-    fn new(handle: JoinHandle<()>, completed: Receiver<()>) -> Self {
+    fn new(
+        handle: JoinHandle<()>,
+        completed: Receiver<()>,
+        shutdown_permit: ThreadPermit<()>,
+    ) -> Self {
         Self {
             handle: Some(handle),
             completed: Mutex::new(completed),
+            shutdown_permit: Some(shutdown_permit),
         }
     }
 
@@ -264,7 +278,9 @@ impl BoundedBackendThread {
         let Some(handle) = self.handle.take() else {
             return BackendThreadJoin::Completed;
         };
-        if handle.join().is_ok() {
+        let joined = handle.join();
+        self.shutdown_permit.take();
+        if joined.is_ok() {
             BackendThreadJoin::Completed
         } else {
             BackendThreadJoin::Panicked
@@ -279,7 +295,10 @@ impl BoundedBackendThread {
 impl Drop for BoundedBackendThread {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            retain_backend_join(handle);
+            let Some(permit) = self.shutdown_permit.take() else {
+                std::process::abort();
+            };
+            permit.retain(handle);
         }
     }
 }
