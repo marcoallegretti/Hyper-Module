@@ -674,6 +674,45 @@ try {
   ]);
   assert.equal(garbageResult.installed_bundle_count, 0);
 
+  const substitutedGarbageTarget = await createTarget(
+    temporaryRoot,
+    "substituted-garbage-target",
+  );
+  const substitutedGarbageIdentity = await installBundle(
+    bundle7,
+    substitutedGarbageTarget,
+  );
+  const substitutedGarbagePath = join(
+    substitutedGarbageTarget,
+    "bundles",
+    substitutedGarbageIdentity,
+  );
+  const displacedGarbagePath = join(
+    substitutedGarbageTarget,
+    "displaced-garbage-candidate",
+  );
+  await assert.rejects(
+    collectDeploymentGarbage(substitutedGarbageTarget, {
+      observer: async (boundary, { bundlePath }) => {
+        if (boundary !== "before-garbage-candidate-open") return;
+        assert.equal(bundlePath, substitutedGarbagePath);
+        await rename(substitutedGarbagePath, displacedGarbagePath);
+        await cp(displacedGarbagePath, substitutedGarbagePath, {
+          recursive: true,
+        });
+      },
+    }),
+    /garbage collection candidate identity changed/,
+  );
+  await readFile(join(substitutedGarbagePath, "manifest.json"));
+  await readFile(join(displacedGarbagePath, "manifest.json"));
+  assert.equal(
+    (await readdir(join(substitutedGarbageTarget, "bundles"))).some((entry) =>
+      entry.startsWith(".garbage-"),
+    ),
+    false,
+  );
+
   const source9 = await createMinimalProject(temporaryRoot, "source-9", {
     revision: 9,
   });
@@ -785,10 +824,25 @@ try {
   const metadataResidue = `.metadata-${randomUUID()}`;
   const stateResidue = `.state-${randomUUID()}.json`;
   const policyResidue = `.policy-${randomUUID()}.json`;
+  const deleteResidue = `.delete-${randomUUID()}`;
+  const recoveryResidue = `.recovery-${randomUUID()}`;
+  const garbageBundleResidue = `.garbage-${randomUUID()}`;
   await mkdir(join(recoveryTarget, installResidue));
   await mkdir(join(recoveryTarget, metadataResidue));
   await writeFile(join(recoveryTarget, stateResidue), "{}");
   await writeFile(join(recoveryTarget, policyResidue), "{}");
+  await mkdir(join(recoveryTarget, deleteResidue));
+  await writeFile(join(recoveryTarget, deleteResidue, "sentinel"), "delete");
+  await mkdir(join(recoveryTarget, recoveryResidue));
+  await writeFile(
+    join(recoveryTarget, recoveryResidue, stateResidue),
+    "quarantined",
+  );
+  await cp(
+    bundle9,
+    join(recoveryTarget, "bundles", garbageBundleResidue),
+    { recursive: true },
+  );
   await writeFile(join(recoveryTarget, ".install-not-a-transaction"), "keep");
   assert.deepEqual(await readDeploymentLock(recoveryTarget), staleOwner);
   const recoveredTarget = await recoverDeploymentTarget(recoveryTarget, {
@@ -800,11 +854,16 @@ try {
   assert.deepEqual(recoveredTarget.recovered_lock_owner, staleOwner);
   assert.equal(recoveredTarget.forced, false);
   assert.deepEqual(recoveredTarget.removed_temporary_paths, [
+    deleteResidue,
     installResidue,
     metadataResidue,
     policyResidue,
+    recoveryResidue,
     stateResidue,
   ].sort());
+  assert.deepEqual(recoveredTarget.removed_bundle_quarantine_paths, [
+    garbageBundleResidue,
+  ]);
   assert.equal(recoveredTarget.storage.installed_bundle_count, 1);
   assert(
     (await readdir(join(recoveryTarget, "bundles"))).includes(
@@ -855,6 +914,58 @@ try {
     false,
   );
   assert.equal(await readDeploymentLock(substitutedResidueTarget), null);
+
+  const substitutedDirectoryResidueTarget = await createTarget(
+    temporaryRoot,
+    "substituted-directory-recovery-residue-target",
+  );
+  const substitutedDirectoryResidueName = `.install-${randomUUID()}`;
+  const substitutedDirectoryResiduePath = join(
+    substitutedDirectoryResidueTarget,
+    substitutedDirectoryResidueName,
+  );
+  const displacedDirectoryResiduePath = join(
+    substitutedDirectoryResidueTarget,
+    "displaced-directory-residue",
+  );
+  await mkdir(substitutedDirectoryResiduePath);
+  await writeFile(
+    join(substitutedDirectoryResiduePath, "sentinel"),
+    "original",
+  );
+  await assert.rejects(
+    recoverDeploymentTarget(substitutedDirectoryResidueTarget, {
+      observer: async (boundary, { residuePath }) => {
+        if (boundary !== "before-directory-residue-open") return;
+        assert.equal(residuePath, substitutedDirectoryResiduePath);
+        await rename(
+          substitutedDirectoryResiduePath,
+          displacedDirectoryResiduePath,
+        );
+        await mkdir(substitutedDirectoryResiduePath);
+        await writeFile(
+          join(substitutedDirectoryResiduePath, "sentinel"),
+          "replacement",
+        );
+      },
+    }),
+    /directory residue identity changed/,
+  );
+  assert.equal(
+    await readFile(join(substitutedDirectoryResiduePath, "sentinel"), "utf8"),
+    "replacement",
+  );
+  assert.equal(
+    await readFile(join(displacedDirectoryResiduePath, "sentinel"), "utf8"),
+    "original",
+  );
+  assert.equal(
+    (await readdir(substitutedDirectoryResidueTarget)).some((entry) =>
+      entry.startsWith(".delete-") || entry.startsWith(".recovery-"),
+    ),
+    false,
+  );
+  assert.equal(await readDeploymentLock(substitutedDirectoryResidueTarget), null);
 
   const activeLockTarget = await createTarget(
     temporaryRoot,
@@ -1572,7 +1683,7 @@ try {
     ),
   );
 
-  console.log("Deployment target passed: 161 transaction cases");
+  console.log("Deployment target passed: 164 transaction cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

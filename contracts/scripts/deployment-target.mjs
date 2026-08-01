@@ -41,6 +41,7 @@ import { readBoundedDirectory } from "../lib/filesystem-tree.mjs";
 import {
   removeRetainedDirectory as removeRetainedDirectoryNative,
   renameDirectoryBetweenNoReplace,
+  renameDirectoryNoReplace,
   renameEntryBetweenReplace,
 } from "../lib/native-fs-authority.mjs";
 import { copyVerifiedBundleFile } from "../lib/verified-bundle-copy.mjs";
@@ -51,6 +52,7 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const MAX_DEPLOYMENT_METADATA_BYTES = 64 * 1024;
 const MAX_AUTHORIZATION_STATE_BYTES = 1024 * 1024;
 const MAX_TRANSACTION_RESIDUES = 4096;
+const MAX_INSTALLED_BUNDLES = 4096;
 const MAX_TARGET_ROOT_ENTRIES = MAX_TRANSACTION_RESIDUES + 8;
 const MAX_TARGET_ROOT_NAME_BYTES = MAX_TARGET_ROOT_ENTRIES * 1024;
 const DEPLOYMENT_FAULT_BOUNDARIES = new Set([
@@ -699,13 +701,54 @@ async function inspectInstalledBundles(targetRoot, maximumBundles) {
       entry.isDirectory() && !entry.isSymbolicLink(),
       `installed bundle entry is not a real directory: ${entry.name}`,
     );
-    const bundle = await inspectBundle(join(bundlesRoot, entry.name));
+    const bundlePath = join(bundlesRoot, entry.name);
+    const selectedStatus = await lstat(bundlePath, { bigint: true });
+    assert(
+      selectedStatus.isDirectory() && !selectedStatus.isSymbolicLink(),
+      `installed bundle entry is not a real directory: ${entry.name}`,
+    );
+    const bundleHandle = await openRetainedDirectory(bundlePath);
+    let bundle;
+    let operationError;
+    try {
+      const openedStatus = await bundleHandle.stat({ bigint: true });
+      assert(
+        sameResidueIdentity(selectedStatus, openedStatus),
+        `installed bundle filesystem object changed: ${entry.name}`,
+      );
+      bundle = await inspectBundle(bundlePath);
+      const [retainedStatus, publishedStatus] = await Promise.all([
+        bundleHandle.stat({ bigint: true }),
+        lstat(bundlePath, { bigint: true }),
+      ]);
+      assert(
+        sameResidueIdentity(selectedStatus, retainedStatus) &&
+          sameResidueIdentity(retainedStatus, publishedStatus),
+        `installed bundle filesystem object changed: ${entry.name}`,
+      );
+    } catch (error) {
+      operationError = error;
+    }
+    let closeError;
+    try {
+      await bundleHandle.close();
+    } catch (error) {
+      closeError = error;
+    }
+    if (operationError && closeError) {
+      throw new AggregateError(
+        [operationError, closeError],
+        `installed bundle inspection and authority release both failed: ${entry.name}`,
+      );
+    }
+    if (operationError) throw operationError;
+    if (closeError) throw closeError;
     assert.equal(
       bundle.sha256,
       entry.name,
       `installed bundle identity mismatch: ${entry.name}`,
     );
-    bundles.push(bundle);
+    bundles.push({ ...bundle, filesystem_identity: selectedStatus });
   }
   return bundles;
 }
@@ -767,7 +810,11 @@ async function assertStorageWithinPolicy(targetRoot) {
   );
 }
 
-async function collectUnprotectedBundles(targetRoot, policy) {
+async function collectUnprotectedBundles(
+  targetRoot,
+  policy,
+  observer = async () => {},
+) {
   const state = await readState(targetRoot);
   const protectedIdentities = protectedBundleIdentities(state);
   const bundles = await inspectInstalledBundles(
@@ -776,50 +823,138 @@ async function collectUnprotectedBundles(targetRoot, policy) {
   );
   const removed = [];
   const retained = [];
-  for (const bundle of bundles) {
-    if (protectedIdentities.has(bundle.sha256)) {
-      retained.push(bundle);
-      continue;
-    }
-    const bundlesRoot = await requireBundlesRoot(targetRoot);
-    const bundlePath = join(bundlesRoot, bundle.sha256);
-    const quarantinePath = join(bundlesRoot, `.garbage-${randomUUID()}`);
-    await rename(bundlePath, quarantinePath);
-    let quarantineHandle;
-    try {
-      quarantineHandle = await openRetainedDirectory(quarantinePath);
-      const inspected = await inspectBundle(quarantinePath, {
-        maximumBundleBytes: policy.max_installed_bytes,
-        expectedBundleSha256: bundle.sha256,
-        expectedBundleByteLength: bundle.byte_length,
-      });
-      assert.equal(inspected.sha256, bundle.sha256);
-      await removeRetainedDirectory(
-        quarantinePath,
-        bundlesRoot,
-        quarantineHandle,
-        `unprotected bundle ${bundle.sha256}`,
-      );
-    } catch (error) {
+  const bundlesRoot = await requireBundlesRoot(targetRoot);
+  const bundlesHandle = await openRetainedDirectory(bundlesRoot);
+  let operationError;
+  try {
+    for (const bundle of bundles) {
+      if (protectedIdentities.has(bundle.sha256)) {
+        retained.push(bundle);
+        continue;
+      }
+      const bundlePath = join(bundlesRoot, bundle.sha256);
+      const quarantineName = `.garbage-${randomUUID()}`;
+      const quarantinePath = join(bundlesRoot, quarantineName);
+      let bundleHandle;
+      let moved = false;
+      let deletionStarted = false;
+      let collectionError;
       try {
-        await rename(quarantinePath, bundlePath);
-      } catch (restoreError) {
-        if (restoreError.code !== "ENOENT") {
-          throw new AggregateError(
-            [error, restoreError],
-            "bundle collection and restoration both failed",
-          );
+        await observer("before-garbage-candidate-open", {
+          bundlePath,
+          bundleSha256: bundle.sha256,
+        });
+        bundleHandle = await openRetainedDirectory(bundlePath);
+        const selectedStatus = await bundleHandle.stat({ bigint: true });
+        assert(
+          sameResidueIdentity(bundle.filesystem_identity, selectedStatus),
+          `garbage collection candidate identity changed: ${bundle.sha256}`,
+        );
+        await observer("before-garbage-quarantine", {
+          bundlePath,
+          bundleSha256: bundle.sha256,
+        });
+        await renameDirectoryNoReplace(
+          bundlesHandle,
+          bundlesRoot,
+          bundle.sha256,
+          selectedStatus,
+          quarantineName,
+          `unprotected bundle ${bundle.sha256}`,
+        );
+        moved = true;
+        await observer("after-garbage-quarantine", {
+          bundlePath,
+          bundleSha256: bundle.sha256,
+          quarantinePath,
+        });
+        await assertRetainedDirectory(
+          bundleHandle,
+          quarantinePath,
+          `unprotected bundle ${bundle.sha256}`,
+        );
+        const inspected = await inspectBundle(quarantinePath, {
+          maximumBundleBytes: policy.max_installed_bytes,
+          expectedBundleSha256: bundle.sha256,
+          expectedBundleByteLength: bundle.byte_length,
+        });
+        assert.equal(inspected.sha256, bundle.sha256);
+        await observer("before-garbage-delete", {
+          bundlePath,
+          bundleSha256: bundle.sha256,
+          quarantinePath,
+        });
+        await assertRetainedDirectory(
+          bundleHandle,
+          quarantinePath,
+          `unprotected bundle ${bundle.sha256}`,
+        );
+        deletionStarted = true;
+        await removeRetainedDirectoryNative(
+          bundleHandle,
+          quarantinePath,
+          `unprotected bundle ${bundle.sha256}`,
+        );
+        moved = false;
+        await syncRemovedEntry(bundlesRoot);
+      } catch (error) {
+        collectionError = error;
+        if (moved && !deletionStarted) {
+          try {
+            const quarantineStatus = await bundleHandle.stat({ bigint: true });
+            await renameDirectoryNoReplace(
+              bundlesHandle,
+              bundlesRoot,
+              quarantineName,
+              quarantineStatus,
+              bundle.sha256,
+              `unprotected bundle ${bundle.sha256} restoration`,
+            );
+            moved = false;
+          } catch (restoreError) {
+            collectionError = new AggregateError(
+              [error, restoreError],
+              "bundle collection and restoration both failed",
+            );
+          }
         }
       }
-      throw error;
-    } finally {
-      await quarantineHandle?.close();
+      let closeError;
+      try {
+        await bundleHandle?.close();
+      } catch (error) {
+        closeError = error;
+      }
+      if (collectionError && closeError) {
+        throw new AggregateError(
+          [collectionError, closeError],
+          "bundle collection and authority release both failed",
+        );
+      }
+      if (collectionError) throw collectionError;
+      if (closeError) throw closeError;
+      removed.push({
+        bundle_sha256: bundle.sha256,
+        byte_length: bundle.byte_length,
+      });
     }
-    removed.push({
-      bundle_sha256: bundle.sha256,
-      byte_length: bundle.byte_length,
-    });
+  } catch (error) {
+    operationError = error;
   }
+  let releaseError;
+  try {
+    await bundlesHandle.close();
+  } catch (error) {
+    releaseError = error;
+  }
+  if (operationError && releaseError) {
+    throw new AggregateError(
+      [operationError, releaseError],
+      "bundle collection and bundles authority release both failed",
+    );
+  }
+  if (operationError) throw operationError;
+  if (releaseError) throw releaseError;
   return {
     removed,
     bundles: retained,
@@ -874,12 +1009,20 @@ export async function readDeploymentStorage(targetPath) {
   });
 }
 
-export async function collectDeploymentGarbage(targetPath) {
+export async function collectDeploymentGarbage(
+  targetPath,
+  { observer = async () => {} } = {},
+) {
+  observer = validateDeploymentObserver(observer);
   const targetRoot = await requireTarget(targetPath);
   return withDeploymentLock(targetRoot, async (authorityRoot) => {
     const policy = await readStoragePolicy(authorityRoot);
     assert(policy, "deployment storage policy is not configured");
-    const collected = await collectUnprotectedBundles(authorityRoot, policy);
+    const collected = await collectUnprotectedBundles(
+      authorityRoot,
+      policy,
+      observer,
+    );
     const usage = summarizeStorage(
       collected.bundles,
       collected.protectedIdentities,
@@ -1080,10 +1223,13 @@ async function removeRetainedFileResidue(
 const UUID_FRAGMENT =
   "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const DIRECTORY_RESIDUE_PATTERN = new RegExp(
-  `^\\.(?:install|metadata)-${UUID_FRAGMENT}$`,
+  `^\\.(?:delete|install|metadata|recovery)-${UUID_FRAGMENT}$`,
 );
 const FILE_RESIDUE_PATTERN = new RegExp(
   `^\\.(?:state|policy|authorization)-${UUID_FRAGMENT}\\.json$`,
+);
+const BUNDLE_QUARANTINE_PATTERN = new RegExp(
+  `^\\.(?:delete|garbage|recovery)-${UUID_FRAGMENT}$`,
 );
 
 async function removeTransactionResidue(
@@ -1119,8 +1265,17 @@ async function removeTransactionResidue(
           status,
         );
       } else {
+        await observer("before-directory-residue-open", { residuePath });
         const residueHandle = await openRetainedDirectory(residuePath);
         try {
+          const openedStatus = await residueHandle.stat({ bigint: true });
+          assert(
+            sameResidueIdentity(status, openedStatus),
+            `directory residue identity changed: ${entry.name}`,
+          );
+          await observer("before-directory-residue-quarantine", {
+            residuePath,
+          });
           await removeRetainedDirectory(
             residuePath,
             targetRoot,
@@ -1146,6 +1301,83 @@ async function removeTransactionResidue(
     }
     removed.push(entry.name);
   }
+  return removed;
+}
+
+async function removeBundleQuarantineResidue(
+  targetRoot,
+  observer = async () => {},
+) {
+  const bundlesRoot = await requireBundlesRoot(targetRoot);
+  const bundlesHandle = await openRetainedDirectory(bundlesRoot);
+  const removed = [];
+  let operationError;
+  try {
+    const maximumEntries = MAX_INSTALLED_BUNDLES + MAX_TRANSACTION_RESIDUES;
+    const entries = await readBoundedDirectory(bundlesRoot, {
+      maximumEntries,
+      maximumNameBytes: maximumEntries * 1024,
+      label: "deployment bundle recovery directory",
+    });
+    for (const entry of entries.sort((left, right) =>
+      left.name.localeCompare(right.name),
+    )) {
+      if (!BUNDLE_QUARANTINE_PATTERN.test(entry.name)) continue;
+      const residuePath = join(bundlesRoot, entry.name);
+      const status = await lstat(residuePath, { bigint: true });
+      assert(
+        status.isDirectory() || status.isSymbolicLink(),
+        `bundle quarantine has an unsupported file type: ${entry.name}`,
+      );
+      if (status.isSymbolicLink()) {
+        await observer("before-file-residue-quarantine", { residuePath });
+        await removeRetainedFileResidue(
+          bundlesRoot,
+          bundlesHandle,
+          entry.name,
+          status,
+        );
+      } else {
+        await observer("before-directory-residue-open", { residuePath });
+        const residueHandle = await openRetainedDirectory(residuePath);
+        try {
+          const openedStatus = await residueHandle.stat({ bigint: true });
+          assert(
+            sameResidueIdentity(status, openedStatus),
+            `bundle quarantine identity changed: ${entry.name}`,
+          );
+          await observer("before-directory-residue-quarantine", {
+            residuePath,
+          });
+          await removeRetainedDirectory(
+            residuePath,
+            bundlesRoot,
+            residueHandle,
+            `bundle quarantine ${entry.name}`,
+          );
+        } finally {
+          await residueHandle.close();
+        }
+      }
+      removed.push(entry.name);
+    }
+  } catch (error) {
+    operationError = error;
+  }
+  let closeError;
+  try {
+    await bundlesHandle.close();
+  } catch (error) {
+    closeError = error;
+  }
+  if (operationError && closeError) {
+    throw new AggregateError(
+      [operationError, closeError],
+      "bundle quarantine recovery and authority release both failed",
+    );
+  }
+  if (operationError) throw operationError;
+  if (closeError) throw closeError;
   return removed;
 }
 
@@ -1229,6 +1461,8 @@ export async function recoverDeploymentTarget(
       async () => {
         const removedTemporaryPaths =
           await removeTransactionResidue(authorityRoot, targetHandle, observer);
+        const removedBundleQuarantinePaths =
+          await removeBundleQuarantineResidue(authorityRoot, observer);
         const policy = await readStoragePolicy(authorityRoot);
         let storage = null;
         if (policy) {
@@ -1252,6 +1486,7 @@ export async function recoverDeploymentTarget(
           recovered_lock_owner: owner,
           forced,
           removed_temporary_paths: removedTemporaryPaths,
+          removed_bundle_quarantine_paths: removedBundleQuarantinePaths,
           storage,
         };
       },
