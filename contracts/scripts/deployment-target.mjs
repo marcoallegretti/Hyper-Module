@@ -2,15 +2,13 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import {
   lstat,
-  mkdir,
   open,
   readFile,
   realpath,
-  rename,
   stat,
   statfs,
 } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import Ajv2020 from "ajv/dist/2020.js";
@@ -36,6 +34,7 @@ import {
   syncRemovedEntry,
 } from "../lib/durable-files.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
+import { createStagingDirectoryUnder } from "../lib/staging-directory.mjs";
 import {
   runCleanupSteps,
   throwPreservingCleanupError,
@@ -43,8 +42,10 @@ import {
 import { inspectDeploymentBundle } from "../lib/deployment-bundle.mjs";
 import { readBoundedDirectory } from "../lib/filesystem-tree.mjs";
 import {
+  createRetainedDirectory,
   preflightFilesystemAuthority,
   removeRetainedDirectory as removeRetainedDirectoryNative,
+  removeRetainedDirectoryEntry,
   renameDirectoryBetweenNoReplace,
   renameDirectoryNoReplace,
   renameEntryBetweenReplace,
@@ -143,8 +144,8 @@ async function withRetainedDeploymentLock(
   targetHandle,
   operation,
 ) {
-  const lockPath = join(authorityRoot, "deployment.lock");
-  const ownerPath = join(lockPath, "owner.json");
+  let lockPath = join(authorityRoot, "deployment.lock");
+  let ownerPath = join(lockPath, "owner.json");
   const owner = {
     format: "hyper-deployment-lock",
     format_version: 1,
@@ -153,8 +154,16 @@ async function withRetainedDeploymentLock(
     extensions: {},
   };
   const ownerBytes = Buffer.from(canonicalize(owner), "utf8");
+  let createdLock;
   try {
-    await mkdir(lockPath, { mode: 0o700 });
+    createdLock = await createRetainedDirectory(
+      targetHandle,
+      authorityRoot,
+      "deployment.lock",
+      "deployment lock directory",
+    );
+    lockPath = createdLock.path;
+    ownerPath = join(lockPath, "owner.json");
   } catch (error) {
     if (error.code === "EEXIST") {
       throw new Error("another deployment transaction is active");
@@ -166,6 +175,13 @@ async function withRetainedDeploymentLock(
   let ownerHandle;
   try {
     lockHandle = await openRetainedDirectory(lockPath);
+    const lockStatus = await lockHandle.stat({ bigint: true });
+    assert(
+      lockStatus.isDirectory() &&
+        lockStatus.dev === createdLock.identity.dev &&
+        lockStatus.ino === createdLock.identity.ino,
+      "deployment lock identity changed while being retained",
+    );
     ownerHandle = await open(ownerPath, "wx", 0o600);
     await ownerHandle.writeFile(ownerBytes);
     await ownerHandle.sync();
@@ -196,6 +212,15 @@ async function withRetainedDeploymentLock(
         await removeRetainedDirectoryNative(
           lockHandle,
           lockPath,
+          "deployment lock directory",
+        );
+        await targetHandle.sync();
+      } else if (createdLock) {
+        await removeRetainedDirectoryEntry(
+          targetHandle,
+          authorityRoot,
+          "deployment.lock",
+          createdLock.identity,
           "deployment lock directory",
         );
         await targetHandle.sync();
@@ -357,7 +382,7 @@ async function writeCanonicalFile(
   const bytes = Buffer.from(canonicalize(value), "utf8");
   assert(bytes.byteLength <= maxBytes, `${name} exceeds ${maxBytes} bytes`);
 
-  const transactionName = `.metadata-${randomUUID()}`;
+  const transactionPrefix = ".metadata-";
   let targetHandle;
   let transactionHandle;
   let transactionPath;
@@ -365,9 +390,14 @@ async function writeCanonicalFile(
   try {
     targetHandle = await openRetainedDirectory(targetRoot);
     const authorityRoot = retainedDirectoryPath(targetHandle, targetRoot);
-    transactionPath = join(authorityRoot, transactionName);
-    await mkdir(transactionPath, { mode: 0o700 });
-    transactionHandle = await openRetainedDirectory(transactionPath);
+    const transaction = await createStagingDirectoryUnder(
+      targetHandle,
+      authorityRoot,
+      transactionPrefix,
+      `${name} transaction directory`,
+    );
+    transactionPath = transaction.path;
+    transactionHandle = transaction.handle;
     const authorityTransaction = retainedDirectoryPath(
       transactionHandle,
       transactionPath,
@@ -545,9 +575,66 @@ async function requireTarget(targetPath) {
     status.isDirectory() && !status.isSymbolicLink(),
     "deployment target must be a real directory",
   );
-  await mkdir(join(targetRoot, "bundles"), { recursive: true });
-  await requireBundlesRoot(targetRoot);
   return targetRoot;
+}
+
+async function initializeBundlesRoot(targetRoot, targetHandle) {
+  let created;
+  let bundlesHandle;
+  let operationError;
+  try {
+    try {
+      created = await createRetainedDirectory(
+        targetHandle,
+        targetRoot,
+        "bundles",
+        "deployment bundles directory",
+      );
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      return requireBundlesRoot(targetRoot);
+    }
+    bundlesHandle = await openRetainedDirectory(created.path);
+    const status = await bundlesHandle.stat({ bigint: true });
+    assert(
+      status.isDirectory() &&
+        status.dev === created.identity.dev &&
+        status.ino === created.identity.ino,
+      "deployment bundles directory identity changed while being retained",
+    );
+    await bundlesHandle.sync();
+    await targetHandle.sync();
+    return created.path;
+  } catch (error) {
+    operationError = error;
+    throw error;
+  } finally {
+    try {
+      await runCleanupSteps(
+        [
+          async () => {
+            if (!operationError || !created) return;
+            await removeRetainedDirectoryEntry(
+              targetHandle,
+              targetRoot,
+              "bundles",
+              created.identity,
+              "deployment bundles directory",
+            );
+            await targetHandle.sync();
+          },
+          async () => bundlesHandle?.close(),
+        ],
+        "deployment bundles initialization cleanup failed",
+      );
+    } catch (cleanupError) {
+      throwPreservingCleanupError(
+        operationError,
+        cleanupError,
+        "deployment bundles initialization and cleanup both failed",
+      );
+    }
+  }
 }
 
 async function requireBundlesRoot(targetRoot) {
@@ -626,19 +713,47 @@ async function closeRetainedDeploymentDirectories(retained) {
   await retained.bundlesHandle.close();
 }
 
-async function removeRetainedDirectory(path, parentRoot, handle, label) {
-  const quarantinePath = join(parentRoot, `.delete-${randomUUID()}`);
-  await rename(path, quarantinePath);
+async function removeRetainedDirectory(
+  parentRoot,
+  parentHandle,
+  sourceName,
+  handle,
+  label,
+) {
+  const quarantineName = `.delete-${randomUUID()}`;
+  const quarantinePath = join(parentRoot, quarantineName);
+  const sourceStatus = await handle.stat({ bigint: true });
+  let moved = false;
   try {
+    await renameDirectoryNoReplace(
+      parentHandle,
+      parentRoot,
+      sourceName,
+      sourceStatus,
+      quarantineName,
+      `${label} quarantine`,
+    );
+    moved = true;
     await assertRetainedDirectory(handle, quarantinePath, label);
     await removeRetainedDirectoryNative(handle, quarantinePath, label);
-    await syncRemovedEntry(parentRoot);
+    moved = false;
+    await parentHandle.sync();
   } catch (error) {
     let restoreError;
-    try {
-      await rename(quarantinePath, path);
-    } catch (source) {
-      restoreError = source;
+    if (moved) {
+      try {
+        await renameDirectoryNoReplace(
+          parentHandle,
+          parentRoot,
+          quarantineName,
+          await handle.stat({ bigint: true }),
+          sourceName,
+          `${label} quarantine restoration`,
+        );
+        moved = false;
+      } catch (source) {
+        restoreError = source;
+      }
     }
     if (restoreError) {
       throw new AggregateError(
@@ -987,13 +1102,13 @@ async function collectUnprotectedBundles(
 }
 
 export async function configureDeploymentStorage(targetPath, policy) {
+  const { policy: validate } = await deploymentValidators;
+  assert(
+    validate(policy),
+    `deployment storage policy schema validation failed: ${JSON.stringify(validate.errors)}`,
+  );
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async (authorityRoot) => {
-    const { policy: validate } = await deploymentValidators;
-    assert(
-      validate(policy),
-      `deployment storage policy schema validation failed: ${JSON.stringify(validate.errors)}`,
-    );
+  return withDeploymentLock(targetRoot, async (authorityRoot, targetHandle) => {
     const authorizationState = await readAuthorizationState(authorityRoot);
     if (authorizationState) {
       assert(
@@ -1002,6 +1117,7 @@ export async function configureDeploymentStorage(targetPath, policy) {
         "deployment storage byte quota is below authorization bundle limit",
       );
     }
+    await initializeBundlesRoot(authorityRoot, targetHandle);
     const state = await readState(authorityRoot);
     const protectedIdentities = protectedBundleIdentities(state);
     const bundles = await inspectInstalledBundles(
@@ -1166,10 +1282,15 @@ async function removeRetainedFileResidue(
   entryName,
   expectedStatus,
 ) {
-  const quarantineName = `.recovery-${randomUUID()}`;
-  const quarantinePath = join(targetRoot, quarantineName);
-  await mkdir(quarantinePath, { mode: 0o700 });
-  const quarantineHandle = await openRetainedDirectory(quarantinePath);
+  const quarantine = await createStagingDirectoryUnder(
+    targetHandle,
+    targetRoot,
+    ".recovery-",
+    `metadata residue ${entryName} quarantine`,
+  );
+  const quarantineName = quarantine.name;
+  const quarantinePath = quarantine.path;
+  const quarantineHandle = quarantine.handle;
   let moved = false;
   try {
     try {
@@ -1303,8 +1424,9 @@ async function removeTransactionResidue(
             residuePath,
           });
           await removeRetainedDirectory(
-            residuePath,
             targetRoot,
+            targetHandle,
+            entry.name,
             residueHandle,
             `directory residue ${entry.name}`,
           );
@@ -1376,8 +1498,9 @@ async function removeBundleQuarantineResidue(
             residuePath,
           });
           await removeRetainedDirectory(
-            residuePath,
             bundlesRoot,
+            bundlesHandle,
+            entry.name,
             residueHandle,
             `bundle quarantine ${entry.name}`,
           );
@@ -1577,9 +1700,14 @@ async function installIdentity(
       source.byte_length,
     );
 
-    const stagingPath = join(targetRoot, `.install-${randomUUID()}`);
-    await mkdir(stagingPath, { mode: 0o700 });
-    const stagingHandle = await openRetainedDirectory(stagingPath);
+    const staging = await createStagingDirectoryUnder(
+      targetHandle,
+      targetRoot,
+      ".install-",
+      "deployment staging directory",
+    );
+    const stagingPath = staging.path;
+    const stagingHandle = staging.handle;
     let published = false;
     let accepted = false;
     let stagingOperationError;
@@ -1646,7 +1774,7 @@ async function installIdentity(
         await renameDirectoryBetweenNoReplace(
           targetHandle,
           targetRoot,
-          basename(stagingPath),
+          staging.name,
           await stagingHandle.stat({ bigint: true }),
           retained.bundlesHandle,
           bundlesRoot,
@@ -1710,8 +1838,9 @@ async function installIdentity(
             async () => {
               if (accepted) return;
               await removeRetainedDirectory(
-                published ? installedPath : stagingPath,
                 published ? bundlesRoot : targetRoot,
+                published ? retained.bundlesHandle : targetHandle,
+                published ? source.sha256 : staging.name,
                 stagingHandle,
                 published
                   ? "published deployment bundle"

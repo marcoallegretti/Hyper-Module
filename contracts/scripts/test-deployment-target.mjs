@@ -124,6 +124,17 @@ try {
   const bundle8 = join(temporaryRoot, "revision-8.runtime");
   await buildProjectBundle(source7.root, bundle7, "1.0.0");
   await buildProjectBundle(source8.root, bundle8, "1.0.0");
+
+  const emptyReadTarget = join(temporaryRoot, "empty-read-target");
+  await mkdir(emptyReadTarget);
+  const emptyReadEntries = await readdir(emptyReadTarget);
+  assert.equal(await readDeploymentState(emptyReadTarget), null);
+  assert.deepEqual(
+    await readdir(emptyReadTarget),
+    emptyReadEntries,
+    "deployment state read mutated an uninitialized target",
+  );
+
   const target = await createTarget(temporaryRoot, "target");
 
   const incompatibleHelperTarget = await createTarget(
@@ -131,11 +142,26 @@ try {
     "incompatible-helper-target",
   );
   const incompatibleHelperEntries = await readdir(incompatibleHelperTarget);
+  const incompatibleInitializationTarget = join(
+    temporaryRoot,
+    "incompatible-initialization-target",
+  );
+  await mkdir(incompatibleInitializationTarget);
+  const incompatibleInitializationEntries = await readdir(
+    incompatibleInitializationTarget,
+  );
   const previousFilesystemAuthority = process.env.HYPER_FS_AUTHORITY;
   try {
     process.env.HYPER_FS_AUTHORITY = process.execPath;
     await assert.rejects(
       installBundle(bundle7, incompatibleHelperTarget),
+      /deployment transaction native helper compatibility check failed/,
+    );
+    await assert.rejects(
+      configureDeploymentStorage(
+        incompatibleInitializationTarget,
+        storagePolicy(),
+      ),
       /deployment transaction native helper compatibility check failed/,
     );
   } finally {
@@ -148,6 +174,11 @@ try {
   assert.deepEqual(
     await readdir(incompatibleHelperTarget),
     incompatibleHelperEntries,
+  );
+  assert.deepEqual(
+    await readdir(incompatibleInitializationTarget),
+    incompatibleInitializationEntries,
+    "incompatible helper mutated an uninitialized deployment target",
   );
   assert.equal(await readDeploymentLock(incompatibleHelperTarget), null);
 
@@ -505,7 +536,7 @@ try {
   } else {
     assert.match(
       collectErrorMessages(substitutedInstallError).join("\n"),
-      /filesystem object changed|bundle root must be a real directory/,
+      /filesystem object changed|bundle root must be a real directory|source entry identity does not match retained authority/,
     );
     assert.equal(
       await readFile(
@@ -514,11 +545,7 @@ try {
       ),
       "preserve",
     );
-    if (process.platform === "linux") {
-      await assert.rejects(inspectDeploymentBundle(displacedInstallation), /ENOENT/);
-    } else {
-      await inspectDeploymentBundle(displacedInstallation);
-    }
+    await inspectDeploymentBundle(displacedInstallation);
   }
 
   const substitutedLockTarget = await createTarget(
@@ -1044,6 +1071,58 @@ try {
     false,
   );
   assert.equal(await readDeploymentLock(substitutedDirectoryResidueTarget), null);
+
+  const quarantineSubstitutionTarget = await createTarget(
+    temporaryRoot,
+    "quarantine-substitution-target",
+  );
+  const quarantineSubstitutionName = `.install-${randomUUID()}`;
+  const quarantineSubstitutionPath = join(
+    quarantineSubstitutionTarget,
+    quarantineSubstitutionName,
+  );
+  const quarantineDisplacedPath = join(
+    quarantineSubstitutionTarget,
+    "quarantine-displaced",
+  );
+  await mkdir(quarantineSubstitutionPath);
+  await writeFile(join(quarantineSubstitutionPath, "sentinel"), "original");
+  let quarantineSubstitutionError;
+  try {
+    await recoverDeploymentTarget(quarantineSubstitutionTarget, {
+      observer: async (boundary, { residuePath }) => {
+        if (boundary !== "before-directory-residue-quarantine") return;
+        assert.equal(residuePath, quarantineSubstitutionPath);
+        await rename(quarantineSubstitutionPath, quarantineDisplacedPath);
+        await mkdir(quarantineSubstitutionPath);
+        await writeFile(
+          join(quarantineSubstitutionPath, "sentinel"),
+          "replacement",
+        );
+      },
+    });
+  } catch (error) {
+    quarantineSubstitutionError = error;
+  }
+  assert.match(
+    quarantineSubstitutionError?.message ?? "",
+    /native publication failed/,
+  );
+  assert.equal(
+    await readFile(join(quarantineSubstitutionPath, "sentinel"), "utf8"),
+    "replacement",
+  );
+  assert.equal(
+    await readFile(join(quarantineDisplacedPath, "sentinel"), "utf8"),
+    "original",
+  );
+  assert.equal(
+    (await readdir(quarantineSubstitutionTarget)).some((entry) =>
+      entry.startsWith(".delete-")
+    ),
+    false,
+  );
+  assert.equal(await readDeploymentLock(quarantineSubstitutionTarget), null);
 
   const activeLockTarget = await createTarget(
     temporaryRoot,

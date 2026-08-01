@@ -13,8 +13,13 @@ import {
 
 const maximumNameAttempts = 4;
 
-export async function createStagingDirectory(parentPath, prefix, label) {
-  const parentHandle = await openRetainedDirectory(parentPath);
+async function createUnderAuthority(
+  parentHandle,
+  parentPath,
+  prefix,
+  label,
+  closeParentOnFailure,
+) {
   let created;
   let stageHandle;
   let operationError;
@@ -66,7 +71,9 @@ export async function createStagingDirectory(parentPath, prefix, label) {
             );
           },
           async () => stageHandle?.close(),
-          async () => parentHandle.close(),
+          async () => {
+            if (closeParentOnFailure) await parentHandle.close();
+          },
         ],
         `${label} initialization cleanup failed`,
       );
@@ -79,4 +86,18 @@ export async function createStagingDirectory(parentPath, prefix, label) {
     }
     throw error;
   }
+}
+
+export async function createStagingDirectory(parentPath, prefix, label) {
+  const parentHandle = await openRetainedDirectory(parentPath);
+  return createUnderAuthority(parentHandle, parentPath, prefix, label, true);
+}
+
+export async function createStagingDirectoryUnder(
+  parentHandle,
+  parentPath,
+  prefix,
+  label,
+) {
+  return createUnderAuthority(parentHandle, parentPath, prefix, label, false);
 }
