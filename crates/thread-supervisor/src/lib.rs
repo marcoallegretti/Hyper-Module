@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -44,12 +44,14 @@ struct SupervisorState<T> {
     pending_count: AtomicUsize,
     reaped: AtomicUsize,
     panicked: AtomicUsize,
+    shutdown_requested: AtomicBool,
     pending: Mutex<Vec<PendingThread<T>>>,
     wake: Condvar,
 }
 
 pub struct ThreadSupervisor<T> {
     state: Arc<SupervisorState<T>>,
+    reaper: Option<JoinHandle<()>>,
 }
 
 impl<T: Send + 'static> fmt::Debug for ThreadSupervisor<T> {
@@ -91,14 +93,18 @@ impl<T: Send + 'static> ThreadSupervisor<T> {
             pending_count: AtomicUsize::new(0),
             reaped: AtomicUsize::new(0),
             panicked: AtomicUsize::new(0),
+            shutdown_requested: AtomicBool::new(false),
             pending: Mutex::new(Vec::with_capacity(capacity)),
             wake: Condvar::new(),
         });
         let supervisor_state = Arc::clone(&state);
-        thread::Builder::new()
+        let reaper = thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || supervise(&supervisor_state, poll_interval))?;
-        Ok(Self { state })
+        Ok(Self {
+            state,
+            reaper: Some(reaper),
+        })
     }
 
     /// Reserves one slot before a native thread is created.
@@ -129,6 +135,34 @@ impl<T: Send + 'static> ThreadSupervisor<T> {
             reaped: self.state.reaped.load(Ordering::Acquire),
             panicked: self.state.panicked.load(Ordering::Acquire),
         }
+    }
+
+    /// Stops admission, drains every issued permit and retained thread, and
+    /// joins the supervisor thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns the supervisor thread's panic payload if the reaper panicked.
+    pub fn shutdown(mut self) -> thread::Result<ThreadSupervisorSnapshot> {
+        self.shutdown_and_join()?;
+        Ok(self.snapshot())
+    }
+}
+
+impl<T> ThreadSupervisor<T> {
+    fn shutdown_and_join(&mut self) -> thread::Result<()> {
+        self.state.shutdown_requested.store(true, Ordering::Release);
+        self.state.wake.notify_all();
+        match self.reaper.take() {
+            Some(reaper) => reaper.join(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<T> Drop for ThreadSupervisor<T> {
+    fn drop(&mut self) {
+        let _ = self.shutdown_and_join();
     }
 }
 
@@ -168,6 +202,7 @@ impl<T> ThreadPermit<T> {
 impl<T> Drop for ThreadPermit<T> {
     fn drop(&mut self) {
         self.state.active.fetch_sub(1, Ordering::AcqRel);
+        self.state.wake.notify_all();
     }
 }
 
@@ -177,18 +212,22 @@ fn supervise<T: Send + 'static>(state: &SupervisorState<T>, poll_interval: Durat
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pending.is_empty() {
+        while pending.is_empty() {
+            if state.shutdown_requested.load(Ordering::Acquire)
+                && state.active.load(Ordering::Acquire) == 0
+            {
+                return;
+            }
             pending = state
                 .wake
                 .wait(pending)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-        } else {
-            let (locked, _) = state
-                .wake
-                .wait_timeout(pending, poll_interval)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending = locked;
         }
+        let (locked, _) = state
+            .wake
+            .wait_timeout(pending, poll_interval)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending = locked;
 
         let mut completed = Vec::new();
         let mut index = 0;
@@ -280,5 +319,47 @@ mod tests {
         wait_for(&supervisor, |snapshot| {
             snapshot.reaped == 2 && snapshot.active == 0 && snapshot.pending == 0
         });
+    }
+
+    #[test]
+    fn explicit_shutdown_drains_and_joins_the_reaper() {
+        let supervisor = ThreadSupervisor::<()>::new(
+            "hyper-supervisor-shutdown-test",
+            1,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let permit = supervisor.acquire().unwrap();
+        permit.retain(thread::spawn(|| {}));
+
+        let snapshot = supervisor.shutdown().unwrap();
+        assert_eq!(snapshot.active, 0);
+        assert_eq!(snapshot.pending, 0);
+        assert_eq!(snapshot.reaped, 1);
+        assert_eq!(snapshot.panicked, 0);
+    }
+
+    #[test]
+    fn drop_waits_for_an_issued_permit_to_be_released() {
+        let supervisor =
+            ThreadSupervisor::<()>::new("hyper-supervisor-drop-test", 1, Duration::from_millis(1))
+                .unwrap();
+        let permit = supervisor.acquire().unwrap();
+        let (release_sender, release_receiver) = sync_channel(0);
+        let (dropped_sender, dropped_receiver) = sync_channel(1);
+        let permit_owner = thread::spawn(move || {
+            release_receiver.recv().unwrap();
+            drop(permit);
+            dropped_sender.send(()).unwrap();
+        });
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            release_sender.send(()).unwrap();
+        });
+
+        drop(supervisor);
+        dropped_receiver.recv().unwrap();
+        release.join().unwrap();
+        permit_owner.join().unwrap();
     }
 }
