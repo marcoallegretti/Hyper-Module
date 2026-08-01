@@ -6,7 +6,10 @@ import { pathToFileURL } from "node:url";
 import canonicalize from "canonicalize";
 
 import { buildBundle } from "./build-bundle.mjs";
-import { verifyProject } from "./verify-project.mjs";
+import {
+  defaultMaximumProjectBytes,
+  verifyProject,
+} from "./verify-project.mjs";
 
 export async function buildProjectBundle(
   projectPath,
@@ -21,7 +24,15 @@ export async function buildProjectBundle(
   );
   const sourceRoot = resolve(projectPath);
   const outputRoot = resolve(outputPath);
-  const verified = await verifyProject(sourceRoot);
+  const maximumBundleBytes =
+    options.maximumBundleBytes ?? defaultMaximumProjectBytes;
+  assert(
+    Number.isSafeInteger(maximumBundleBytes) && maximumBundleBytes > 0,
+    "maximum bundle bytes must be a positive safe integer",
+  );
+  const verified = await verifyProject(sourceRoot, {
+    maximumProjectBytes: maximumBundleBytes,
+  });
   const project = verified.project;
   const sourceProjectSha256 = verified.identity.slice("sha256:".length);
 

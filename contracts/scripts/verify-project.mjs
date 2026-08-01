@@ -31,6 +31,7 @@ import {
 
 const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const manifestLimitBytes = 1024 * 1024;
+export const defaultMaximumProjectBytes = 1024 * 1024 * 1024;
 
 async function createProjectValidator() {
   const schemaNames = [
@@ -200,15 +201,26 @@ async function readAudioAssetFormat(stream, asset, fileInfo) {
 
 export async function verifyProject(
   projectPath,
-  { ignoredManagedPaths = [] } = {},
+  {
+    ignoredManagedPaths = [],
+    maximumProjectBytes = defaultMaximumProjectBytes,
+  } = {},
 ) {
-  return verifyProjectManifest(projectPath, ignoredManagedPaths);
+  return verifyProjectManifest(
+    projectPath,
+    ignoredManagedPaths,
+    undefined,
+    maximumProjectBytes,
+  );
 }
 
 export async function verifyProjectCandidate(
   projectPath,
   candidateManifestBytes,
-  { ignoredManagedPaths = [] } = {},
+  {
+    ignoredManagedPaths = [],
+    maximumProjectBytes = defaultMaximumProjectBytes,
+  } = {},
 ) {
   assert(
     Buffer.isBuffer(candidateManifestBytes),
@@ -222,6 +234,7 @@ export async function verifyProjectCandidate(
     projectPath,
     ignoredManagedPaths,
     Buffer.from(candidateManifestBytes),
+    maximumProjectBytes,
   );
 }
 
@@ -229,7 +242,12 @@ async function verifyProjectManifest(
   projectPath,
   ignoredManagedPaths,
   candidateManifestBytes = undefined,
+  maximumProjectBytes = defaultMaximumProjectBytes,
 ) {
+  assert(
+    Number.isSafeInteger(maximumProjectBytes) && maximumProjectBytes > 0,
+    "project byte limit must be a positive safe integer",
+  );
   const ignoredManagedPathSet = new Set(ignoredManagedPaths);
   const rootPath = resolve(projectPath);
   const rootStatus = await lstat(rootPath);
@@ -275,6 +293,14 @@ async function verifyProjectManifest(
   assertProjectInvariants(project);
 
   const records = [...project.resources, ...project.assets];
+  let declaredProjectBytes = manifestBytes.byteLength;
+  for (const record of records) {
+    assert(
+      record.byte_length <= maximumProjectBytes - declaredProjectBytes,
+      `project exceeds ${maximumProjectBytes} bytes`,
+    );
+    declaredProjectBytes += record.byte_length;
+  }
   const declaredPaths = records.map((record) => record.path).sort();
   const acceptedManagedPaths = new Set([
     "project.json",

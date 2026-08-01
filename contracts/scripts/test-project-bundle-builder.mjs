@@ -61,7 +61,17 @@ try {
     /build-plan schema validation failed/,
   );
 
-  console.log("Project bundle builder passed: 7 compilation cases");
+  await assert.rejects(
+    buildProjectBundle(
+      fixture.root,
+      join(temporaryRoot, "bounded.runtime"),
+      "1.0.0",
+      { maximumBundleBytes: originalProjectBytes.byteLength },
+    ),
+    /project exceeds .* bytes/,
+  );
+
+  console.log("Project bundle builder passed: 8 compilation cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }
