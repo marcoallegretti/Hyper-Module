@@ -367,9 +367,11 @@ async function writeCanonicalFile(
     const temporaryName = `${name}.json`;
     const temporaryPath = join(authorityTransaction, temporaryName);
     const handle = await open(temporaryPath, "wx");
+    let temporaryStatus;
     try {
       await handle.writeFile(bytes);
       await handle.sync();
+      temporaryStatus = await handle.stat({ bigint: true });
     } finally {
       await handle.close();
     }
@@ -382,6 +384,7 @@ async function writeCanonicalFile(
       transactionHandle,
       transactionPath,
       temporaryName,
+      temporaryStatus,
       targetHandle,
       authorityRoot,
       `${name}.json`,
@@ -1005,6 +1008,7 @@ async function removeRetainedFileResidue(
         targetHandle,
         targetRoot,
         entryName,
+        expectedStatus,
         quarantineHandle,
         quarantinePath,
         entryName,
@@ -1026,6 +1030,7 @@ async function removeRetainedFileResidue(
             quarantineHandle,
             quarantinePath,
             entryName,
+            expectedStatus,
             targetHandle,
             targetRoot,
             entryName,
@@ -1053,6 +1058,11 @@ async function removeRetainedFileResidue(
           [error, restoreError, cleanupError].filter(Boolean),
           `metadata residue ${entryName} quarantine failed`,
         );
+      }
+      if (error.code === "ESTALE") {
+        throw new Error(`metadata residue identity changed: ${entryName}`, {
+          cause: error,
+        });
       }
       throw error;
     }
@@ -1370,6 +1380,7 @@ async function installIdentity(
           targetHandle,
           targetRoot,
           basename(stagingPath),
+          await stagingHandle.stat({ bigint: true }),
           retained.bundlesHandle,
           bundlesRoot,
           source.sha256,

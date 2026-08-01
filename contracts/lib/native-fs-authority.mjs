@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { runNativeProcess } from "./native-process.mjs";
 
 const workspaceRoot = resolve(import.meta.dirname, "..", "..");
-const protocolVersion = "1";
+const protocolVersion = "2";
 
 function helperPath() {
   if (process.env.HYPER_FS_AUTHORITY) {
@@ -37,6 +37,20 @@ function runHelper(arguments_, descriptors = []) {
   });
 }
 
+function retainedEntryIdentity(status, label) {
+  assert.equal(typeof status?.dev, "bigint", `${label} device identity is missing`);
+  assert.equal(typeof status?.ino, "bigint", `${label} file identity is missing`);
+  return [String(status.dev), String(status.ino)];
+}
+
+function classifyNativeRenameError(wrapped, source) {
+  if (source.code === 2) wrapped.code = "EEXIST";
+  if (source.message.includes("source entry identity does not match")) {
+    wrapped.code = "ESTALE";
+  }
+  return wrapped;
+}
+
 export async function removeRetainedDirectory(handle, path, label) {
   const status = await handle.stat({ bigint: true });
   assert(status.isDirectory(), `${label} authority is not a directory`);
@@ -60,12 +74,14 @@ export async function renameDirectoryNoReplace(
   parentHandle,
   parentPath,
   sourceName,
+  sourceStatus,
   destinationName,
   label,
 ) {
   const status = await parentHandle.stat({ bigint: true });
   assert(status.isDirectory(), `${label} parent authority is not a directory`);
   const authority = retainedAuthority(parentHandle, parentPath, 3);
+  const sourceIdentity = retainedEntryIdentity(sourceStatus, `${label} source`);
   try {
     await runHelper(
       [
@@ -74,16 +90,16 @@ export async function renameDirectoryNoReplace(
         String(status.dev),
         String(status.ino),
         sourceName,
+        ...sourceIdentity,
         destinationName,
       ],
       authority.descriptor === undefined ? [] : [authority.descriptor],
     );
   } catch (error) {
-    const wrapped = new Error(`${label} native publication failed`, {
-      cause: error,
-    });
-    if (error.code === 2) wrapped.code = "EEXIST";
-    throw wrapped;
+    throw classifyNativeRenameError(
+      new Error(`${label} native publication failed`, { cause: error }),
+      error,
+    );
   }
 }
 
@@ -91,16 +107,20 @@ export async function renameDirectoryBetweenNoReplace(
   sourceParentHandle,
   sourceParentPath,
   sourceName,
+  sourceEntryStatus,
   destinationParentHandle,
   destinationParentPath,
   destinationName,
   label,
 ) {
-  const [sourceStatus, destinationStatus] = await Promise.all([
+  const [sourceParentStatus, destinationStatus] = await Promise.all([
     sourceParentHandle.stat({ bigint: true }),
     destinationParentHandle.stat({ bigint: true }),
   ]);
-  assert(sourceStatus.isDirectory(), `${label} source parent is not a directory`);
+  assert(
+    sourceParentStatus.isDirectory(),
+    `${label} source parent is not a directory`,
+  );
   assert(
     destinationStatus.isDirectory(),
     `${label} destination parent is not a directory`,
@@ -117,14 +137,19 @@ export async function renameDirectoryBetweenNoReplace(
   );
   const descriptors = [sourceAuthority.descriptor, destinationAuthority.descriptor]
     .filter((descriptor) => descriptor !== undefined);
+  const sourceIdentity = retainedEntryIdentity(
+    sourceEntryStatus,
+    `${label} source`,
+  );
   try {
     await runHelper(
       [
         "rename-directory-between-no-replace",
         sourceAuthority.path,
-        String(sourceStatus.dev),
-        String(sourceStatus.ino),
+        String(sourceParentStatus.dev),
+        String(sourceParentStatus.ino),
         sourceName,
+        ...sourceIdentity,
         destinationAuthority.path,
         String(destinationStatus.dev),
         String(destinationStatus.ino),
@@ -133,11 +158,10 @@ export async function renameDirectoryBetweenNoReplace(
       descriptors,
     );
   } catch (error) {
-    const wrapped = new Error(`${label} native publication failed`, {
-      cause: error,
-    });
-    if (error.code === 2) wrapped.code = "EEXIST";
-    throw wrapped;
+    throw classifyNativeRenameError(
+      new Error(`${label} native publication failed`, { cause: error }),
+      error,
+    );
   }
 }
 
@@ -145,16 +169,20 @@ export async function renameEntryBetweenReplace(
   sourceParentHandle,
   sourceParentPath,
   sourceName,
+  sourceEntryStatus,
   destinationParentHandle,
   destinationParentPath,
   destinationName,
   label,
 ) {
-  const [sourceStatus, destinationStatus] = await Promise.all([
+  const [sourceParentStatus, destinationStatus] = await Promise.all([
     sourceParentHandle.stat({ bigint: true }),
     destinationParentHandle.stat({ bigint: true }),
   ]);
-  assert(sourceStatus.isDirectory(), `${label} source parent is not a directory`);
+  assert(
+    sourceParentStatus.isDirectory(),
+    `${label} source parent is not a directory`,
+  );
   assert(
     destinationStatus.isDirectory(),
     `${label} destination parent is not a directory`,
@@ -171,14 +199,19 @@ export async function renameEntryBetweenReplace(
   );
   const descriptors = [sourceAuthority.descriptor, destinationAuthority.descriptor]
     .filter((descriptor) => descriptor !== undefined);
+  const sourceIdentity = retainedEntryIdentity(
+    sourceEntryStatus,
+    `${label} source`,
+  );
   try {
     await runHelper(
       [
         "rename-entry-between-replace",
         sourceAuthority.path,
-        String(sourceStatus.dev),
-        String(sourceStatus.ino),
+        String(sourceParentStatus.dev),
+        String(sourceParentStatus.ino),
         sourceName,
+        ...sourceIdentity,
         destinationAuthority.path,
         String(destinationStatus.dev),
         String(destinationStatus.ino),
@@ -187,6 +220,9 @@ export async function renameEntryBetweenReplace(
       descriptors,
     );
   } catch (error) {
-    throw new Error(`${label} native replacement failed`, { cause: error });
+    throw classifyNativeRenameError(
+      new Error(`${label} native replacement failed`, { cause: error }),
+      error,
+    );
   }
 }

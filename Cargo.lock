@@ -421,6 +421,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

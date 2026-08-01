@@ -467,6 +467,7 @@ export async function buildBundle(
         outputParentHandle,
         outputParent,
         basename(stageRoot),
+        await stageHandle.stat({ bigint: true }),
         basename(outputRoot),
         "bundle",
       );

@@ -1,5 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdtemp,
+  mkdir,
+  open,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -91,6 +101,7 @@ try {
       parentHandle,
       temporaryRoot,
       "publish-source",
+      await lstat(join(temporaryRoot, "publish-source"), { bigint: true }),
       "published",
       "test publication",
     );
@@ -106,6 +117,7 @@ try {
         parentHandle,
         temporaryRoot,
         "blocked-source",
+        await lstat(join(temporaryRoot, "blocked-source"), { bigint: true }),
         "occupied",
         "blocked test publication",
       ),
@@ -119,6 +131,40 @@ try {
       handle.close(),
     );
 
+    const identitySource = join(temporaryRoot, "identity-source");
+    const identityDisplaced = join(temporaryRoot, "identity-displaced");
+    await mkdir(identitySource);
+    await writeFile(join(identitySource, "marker"), "retained");
+    const identitySourceStatus = await lstat(identitySource, { bigint: true });
+    await rename(identitySource, identityDisplaced);
+    await mkdir(identitySource);
+    await writeFile(join(identitySource, "marker"), "replacement");
+    await assert.rejects(
+      renameDirectoryNoReplace(
+        parentHandle,
+        temporaryRoot,
+        "identity-source",
+        identitySourceStatus,
+        "identity-published",
+        "identity-bound test publication",
+      ),
+      (error) => {
+        assert.match(error.cause?.message ?? "", /source entry identity/);
+        return true;
+      },
+    );
+    assert.equal(
+      await readFile(join(identitySource, "marker"), "utf8"),
+      "replacement",
+    );
+    assert.equal(
+      await readFile(join(identityDisplaced, "marker"), "utf8"),
+      "retained",
+    );
+    await assert.rejects(open(join(temporaryRoot, "identity-published"), "r"), {
+      code: "ENOENT",
+    });
+
     const sourceParent = join(temporaryRoot, "source-parent");
     const destinationParent = join(temporaryRoot, "destination-parent");
     await Promise.all([mkdir(sourceParent), mkdir(destinationParent)]);
@@ -128,10 +174,14 @@ try {
     ]);
     try {
       await mkdir(join(sourceParent, "transfer"));
+      const transferStatus = await lstat(join(sourceParent, "transfer"), {
+        bigint: true,
+      });
       await renameDirectoryBetweenNoReplace(
         sourceParentHandle,
         sourceParent,
         "transfer",
+        transferStatus,
         destinationParentHandle,
         destinationParent,
         "transferred",
@@ -146,11 +196,16 @@ try {
 
       await mkdir(join(sourceParent, "blocked-transfer"));
       await mkdir(join(destinationParent, "occupied-transfer"));
+      const blockedTransferStatus = await lstat(
+        join(sourceParent, "blocked-transfer"),
+        { bigint: true },
+      );
       await assert.rejects(
         renameDirectoryBetweenNoReplace(
           sourceParentHandle,
           sourceParent,
           "blocked-transfer",
+          blockedTransferStatus,
           destinationParentHandle,
           destinationParent,
           "occupied-transfer",
@@ -162,12 +217,72 @@ try {
         handle.close(),
       );
 
+      await mkdir(join(sourceParent, "file-collision-source"));
+      const fileCollisionStatus = await lstat(
+        join(sourceParent, "file-collision-source"),
+        { bigint: true },
+      );
+      await writeFile(join(destinationParent, "occupied-file"), "preserve");
+      await assert.rejects(
+        renameDirectoryBetweenNoReplace(
+          sourceParentHandle,
+          sourceParent,
+          "file-collision-source",
+          fileCollisionStatus,
+          destinationParentHandle,
+          destinationParent,
+          "occupied-file",
+          "file collision publication",
+        ),
+        { code: "EEXIST" },
+      );
+      assert.equal(
+        await readFile(join(destinationParent, "occupied-file"), "utf8"),
+        "preserve",
+      );
+
+      const linkTarget = join(temporaryRoot, "collision-link-target");
+      await mkdir(linkTarget);
+      await writeFile(join(linkTarget, "marker"), "preserve");
+      await symlink(
+        linkTarget,
+        join(destinationParent, "occupied-link"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+      await mkdir(join(sourceParent, "link-collision-source"));
+      const linkCollisionStatus = await lstat(
+        join(sourceParent, "link-collision-source"),
+        { bigint: true },
+      );
+      await assert.rejects(
+        renameDirectoryBetweenNoReplace(
+          sourceParentHandle,
+          sourceParent,
+          "link-collision-source",
+          linkCollisionStatus,
+          destinationParentHandle,
+          destinationParent,
+          "occupied-link",
+          "link collision publication",
+        ),
+        { code: "EEXIST" },
+      );
+      assert.equal(
+        await readFile(join(linkTarget, "marker"), "utf8"),
+        "preserve",
+      );
+
       await writeFile(join(sourceParent, "replacement-source"), "new");
       await writeFile(join(destinationParent, "replacement-target"), "old");
+      const replacementSourceStatus = await lstat(
+        join(sourceParent, "replacement-source"),
+        { bigint: true },
+      );
       await renameEntryBetweenReplace(
         sourceParentHandle,
         sourceParent,
         "replacement-source",
+        replacementSourceStatus,
         destinationParentHandle,
         destinationParent,
         "replacement-target",
@@ -180,6 +295,36 @@ try {
         await readFile(join(destinationParent, "replacement-target"), "utf8"),
         "new",
       );
+
+      const boundSource = join(sourceParent, "bound-source");
+      const displacedSource = join(sourceParent, "bound-source-displaced");
+      await writeFile(boundSource, "retained");
+      const boundSourceStatus = await lstat(boundSource, { bigint: true });
+      await rename(boundSource, displacedSource);
+      await writeFile(boundSource, "replacement");
+      await writeFile(join(destinationParent, "bound-target"), "preserve");
+      await assert.rejects(
+        renameEntryBetweenReplace(
+          sourceParentHandle,
+          sourceParent,
+          "bound-source",
+          boundSourceStatus,
+          destinationParentHandle,
+          destinationParent,
+          "bound-target",
+          "identity-bound test replacement",
+        ),
+        (error) => {
+          assert.match(error.cause?.message ?? "", /source entry identity/);
+          return true;
+        },
+      );
+      assert.equal(await readFile(boundSource, "utf8"), "replacement");
+      assert.equal(await readFile(displacedSource, "utf8"), "retained");
+      assert.equal(
+        await readFile(join(destinationParent, "bound-target"), "utf8"),
+        "preserve",
+      );
     } finally {
       await Promise.all([
         sourceParentHandle.close(),
@@ -189,7 +334,7 @@ try {
   } finally {
     await parentHandle.close();
   }
-  console.log("Native filesystem authority passed: 9 identity cases");
+  console.log("Native filesystem authority passed: 13 identity cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }
