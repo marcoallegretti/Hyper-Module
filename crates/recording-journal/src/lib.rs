@@ -8,6 +8,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 const JOURNAL_MAGIC: &[u8; 8] = b"HYPRREC\0";
 const JOURNAL_VERSION: u16 = 1;
@@ -605,7 +606,7 @@ fn publish_locked_wav_observed(
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             if let Some(verified) = verify_wav(final_path, report) {
-                remove_staging_if_owned(staging_authority, &staging_path)?;
+                remove_staging_if_owned(&staging_authority, &staging_path)?;
                 sync_published(final_path)?;
                 return Ok(published_recording(
                     journal_path,
@@ -621,9 +622,9 @@ fn publish_locked_wav_observed(
         }
         Err(error) => return Err(error.into()),
     }
-    if !matches!(Handle::from_path(final_path), Ok(published) if published == staging_authority.handle)
-    {
-        remove_created_link(final_path)?;
+    let published = Handle::from_path(final_path)?;
+    if published != staging_authority.handle {
+        remove_path_if_owned(&published, final_path)?;
         return Err(JournalError::PublishedRecordingConflict(
             final_path.to_owned(),
         ));
@@ -631,7 +632,7 @@ fn publish_locked_wav_observed(
     sync_parent(final_path)?;
     let verified = verify_wav(final_path, report)
         .ok_or_else(|| JournalError::PublishedRecordingConflict(final_path.to_owned()))?;
-    remove_staging_if_owned(staging_authority, &staging_path)?;
+    remove_staging_if_owned(&staging_authority, &staging_path)?;
     sync_parent(final_path)?;
     Ok(published_recording(
         journal_path,
@@ -1027,14 +1028,6 @@ fn open_verification_handle(path: &Path) -> io::Result<Handle> {
     Handle::from_file(file)
 }
 
-fn remove_created_link(path: &Path) -> Result<(), JournalError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn hard_link_verified(source: &Handle, _source_path: &Path, final_path: &Path) -> io::Result<()> {
     use rustix::fs::{AtFlags, CWD, linkat};
@@ -1051,15 +1044,39 @@ fn hard_link_verified(_source: &Handle, source_path: &Path, final_path: &Path) -
 }
 
 fn remove_staging_if_owned(
-    authority: VerifiedWavAuthority,
+    authority: &VerifiedWavAuthority,
     staging_path: &Path,
 ) -> Result<(), JournalError> {
-    let owned = Handle::from_path(staging_path).is_ok_and(|current| current == authority.handle);
-    drop(authority);
-    if owned {
-        fs::remove_file(staging_path)?;
-    }
+    remove_path_if_owned(&authority.handle, staging_path)?;
     Ok(())
+}
+
+fn remove_path_if_owned(authority: &Handle, path: &Path) -> Result<bool, JournalError> {
+    let parent = path
+        .parent()
+        .ok_or(JournalError::InvalidJournal("cleanup path has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or(JournalError::InvalidJournal("cleanup path has no name"))?
+        .to_string_lossy();
+    let quarantine = parent.join(format!(".{name}.hyper-cleanup-{}", Uuid::new_v4()));
+    match fs::rename(path, &quarantine) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    let moved = Handle::from_path(&quarantine)?;
+    if &moved != authority {
+        drop(moved);
+        if !path.exists() {
+            fs::rename(&quarantine, path)?;
+        }
+        return Ok(false);
+    }
+    drop(moved);
+    fs::remove_file(&quarantine)?;
+    sync_parent(path)?;
+    Ok(true)
 }
 
 fn verify_wav_samples(file: &mut File, report: RecoveryReport) -> bool {

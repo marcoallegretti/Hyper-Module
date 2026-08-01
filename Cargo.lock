@@ -513,6 +513,7 @@ dependencies = [
  "rustix",
  "same-file",
  "sha2",
+ "uuid",
 ]
 
 [[package]]
