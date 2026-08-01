@@ -115,6 +115,33 @@ try {
       `${path}: repeated builds differ`,
     );
   }
+  const exactBundleBytes = [...firstFiles.values()].reduce(
+    (total, bytes) => total + bytes.length,
+    0,
+  );
+  const exactLimitPath = join(temporaryRoot, "exact-limit.runtime");
+  await buildBundle(planPath, source, exactLimitPath, {
+    maximumBundleBytes: exactBundleBytes,
+  });
+  await verifyBundle(exactLimitPath);
+
+  const preflightRejectedPath = join(
+    temporaryRoot,
+    "preflight-rejected.runtime",
+  );
+  await assert.rejects(
+    buildBundle(planPath, source, preflightRejectedPath, {
+      maximumBundleBytes: exactBundleBytes - 1,
+    }),
+    new RegExp(`runtime bundle exceeds ${exactBundleBytes - 1} bytes`),
+  );
+  assert.equal(
+    (await readdir(temporaryRoot)).some((name) =>
+      name.startsWith(".preflight-rejected.runtime.staging-"),
+    ),
+    false,
+    "aggregate preflight created staging data",
+  );
 
   assert.deepEqual(await buildBundle(planPath, source, firstPath), first);
 
@@ -225,7 +252,7 @@ try {
   );
   assert.deepEqual(stagingResidue, [], "failed builds left staging data");
 
-  console.log("Bundle builder passed: 11 construction cases");
+  console.log("Bundle builder passed: 13 construction cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

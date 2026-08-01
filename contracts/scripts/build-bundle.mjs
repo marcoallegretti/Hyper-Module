@@ -133,27 +133,148 @@ function assertContained(rootPath, candidatePath, label) {
   );
 }
 
+function sameFileIdentity(left, right) {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs &&
+    (process.platform !== "win32" || left.birthtimeNs === right.birthtimeNs)
+  );
+}
+
+function createManifest(plan, files, builderVersion) {
+  return {
+    format: "hyper-runtime-bundle",
+    format_version: 1,
+    project_id: plan.project_id,
+    project_revision: plan.project_revision,
+    source_project_sha256: plan.source_project_sha256,
+    minimum_runtime_version: plan.minimum_runtime_version,
+    builder: {
+      id: builderId,
+      version: builderVersion,
+    },
+    entrypoint: plan.entrypoint,
+    required_capabilities: plan.required_capabilities,
+    files,
+    extensions: plan.extensions,
+  };
+}
+
+async function preflightPayload(sourceRoot, sourceRootReal, payload) {
+  const sourcePath = resolve(sourceRoot, ...payload.source_path.split("/"));
+  assertContained(sourceRoot, sourcePath, payload.source_path);
+  const before = await lstat(sourcePath, { bigint: true });
+  assert(
+    before.isFile() && !before.isSymbolicLink(),
+    `${payload.source_path}: source must be a regular file`,
+  );
+  const noFollow = constants.O_NOFOLLOW ?? 0;
+  const sourceHandle = await open(sourcePath, constants.O_RDONLY | noFollow);
+  let opened;
+  try {
+    opened = await sourceHandle.stat({ bigint: true });
+    const published = await lstat(sourcePath, { bigint: true });
+    assert(
+      opened.isFile() && sameFileIdentity(before, opened),
+      `${payload.source_path}: source changed during preflight`,
+    );
+    assert(
+      published.isFile() &&
+        !published.isSymbolicLink() &&
+        sameFileIdentity(opened, published),
+      `${payload.source_path}: source path changed during preflight`,
+    );
+  } finally {
+    await sourceHandle.close();
+  }
+  assert(
+    opened.size <= BigInt(Number.MAX_SAFE_INTEGER),
+    `${payload.source_path}: source is too large for an exact byte count`,
+  );
+  const sourceReal = await realpath(sourcePath);
+  assertContained(sourceRootReal, sourceReal, payload.source_path);
+  return {
+    identity: opened,
+    byteLength: Number(opened.size),
+  };
+}
+
+async function preflightBundle(
+  sourceRoot,
+  sourceRootReal,
+  plan,
+  payloads,
+  builderVersion,
+  maximumBundleBytes,
+) {
+  const sources = new Map();
+  const files = [];
+  let payloadBytes = 0;
+  for (const payload of payloads) {
+    let source = sources.get(payload.source_path);
+    if (!source) {
+      source = await preflightPayload(sourceRoot, sourceRootReal, payload);
+      sources.set(payload.source_path, source);
+    }
+    payloadBytes += source.byteLength;
+    assert(
+      Number.isSafeInteger(payloadBytes),
+      "runtime bundle byte accounting exceeds safe integer range",
+    );
+    files.push({
+      path: payload.path,
+      role: payload.role,
+      media_type: payload.media_type,
+      byte_length: source.byteLength,
+      sha256: "0".repeat(64),
+    });
+  }
+  const manifestBytes = Buffer.byteLength(
+    canonicalize(createManifest(plan, files, builderVersion)),
+    "utf8",
+  );
+  assert(
+    manifestBytes <= 1024 * 1024,
+    "generated manifest exceeds one mebibyte",
+  );
+  const bundleBytes = payloadBytes + manifestBytes;
+  assert(
+    Number.isSafeInteger(bundleBytes),
+    "runtime bundle byte accounting exceeds safe integer range",
+  );
+  assert(
+    bundleBytes <= maximumBundleBytes,
+    `runtime bundle exceeds ${maximumBundleBytes} bytes`,
+  );
+  return sources;
+}
+
 async function copyPayload(
   sourceRoot,
   sourceRootReal,
   stageRoot,
   payload,
+  expectedSource,
   currentBundleBytes,
   maximumBundleBytes,
 ) {
   const sourcePath = resolve(sourceRoot, ...payload.source_path.split("/"));
   assertContained(sourceRoot, sourcePath, payload.source_path);
-  const sourceStatus = await lstat(sourcePath);
+  const sourceStatus = await lstat(sourcePath, { bigint: true });
   assert(
     sourceStatus.isFile() && !sourceStatus.isSymbolicLink(),
     `${payload.source_path}: source must be a regular file`,
   );
   assert(
-    Number.isSafeInteger(sourceStatus.size),
-    `${payload.source_path}: source is too large for an exact byte count`,
+    sameFileIdentity(expectedSource.identity, sourceStatus),
+    `${payload.source_path}: source changed after preflight`,
   );
   assert(
-    sourceStatus.size <= maximumBundleBytes - currentBundleBytes,
+    expectedSource.byteLength <= maximumBundleBytes - currentBundleBytes,
     `runtime bundle exceeds ${maximumBundleBytes} bytes`,
   );
   const sourceReal = await realpath(sourcePath);
@@ -175,7 +296,11 @@ async function copyPayload(
   let before;
   let after;
   try {
-    before = await sourceHandle.stat();
+    before = await sourceHandle.stat({ bigint: true });
+    assert(
+      sameFileIdentity(expectedSource.identity, before),
+      `${payload.source_path}: source changed after preflight`,
+    );
     for await (const chunk of sourceHandle.createReadStream({
       autoClose: false,
     })) {
@@ -188,38 +313,21 @@ async function copyPayload(
       await writeAll(destinationHandle, chunk);
     }
     await destinationHandle.sync();
-    after = await sourceHandle.stat();
+    after = await sourceHandle.stat({ bigint: true });
   } finally {
     await Promise.allSettled([sourceHandle.close(), destinationHandle.close()]);
   }
-  assert.equal(
-    before.size,
-    after.size,
-    `${payload.source_path}: source size changed during build`,
-  );
-  assert.equal(
-    before.mtimeMs,
-    after.mtimeMs,
+  assert(
+    sameFileIdentity(before, after),
     `${payload.source_path}: source changed during build`,
   );
-  assert.equal(
-    before.ctimeMs,
-    after.ctimeMs,
-    `${payload.source_path}: source metadata changed during build`,
-  );
-  const finalSourceStatus = await lstat(sourcePath);
+  const finalSourceStatus = await lstat(sourcePath, { bigint: true });
   assert(
     finalSourceStatus.isFile() && !finalSourceStatus.isSymbolicLink(),
     `${payload.source_path}: source path changed type during build`,
   );
-  assert.equal(
-    finalSourceStatus.dev,
-    after.dev,
-    `${payload.source_path}: source path changed during build`,
-  );
-  assert.equal(
-    finalSourceStatus.ino,
-    after.ino,
+  assert(
+    sameFileIdentity(finalSourceStatus, after),
     `${payload.source_path}: source path changed during build`,
   );
   await chmod(destinationPath, 0o644);
@@ -258,6 +366,20 @@ export async function buildBundle(
     "payload source root must be a real directory",
   );
   const sourceRootReal = await realpath(sourceRoot);
+  const payloads = [...plan.payloads].sort((left, right) =>
+    left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
+  );
+  const packageMetadata = strictParse(
+    await readFile(resolve(contractRoot, "package.json"), "utf8"),
+  );
+  const preflightSources = await preflightBundle(
+    sourceRoot,
+    sourceRootReal,
+    plan,
+    payloads,
+    packageMetadata.version,
+    maximumBundleBytes,
+  );
 
   const outputRoot = resolve(outputPath);
   const outputParent = dirname(outputRoot);
@@ -274,9 +396,6 @@ export async function buildBundle(
   const outputParentHandle = await openRetainedDirectory(outputParent);
   let published = false;
   try {
-    const payloads = [...plan.payloads].sort((left, right) =>
-      left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
-    );
     const files = [];
     let payloadBytes = 0;
     for (const payload of payloads) {
@@ -285,6 +404,7 @@ export async function buildBundle(
         sourceRootReal,
         stageRoot,
         payload,
+        preflightSources.get(payload.source_path),
         payloadBytes,
         maximumBundleBytes,
       );
@@ -296,25 +416,7 @@ export async function buildBundle(
       );
     }
 
-    const packageMetadata = strictParse(
-      await readFile(resolve(contractRoot, "package.json"), "utf8"),
-    );
-    const manifest = {
-      format: "hyper-runtime-bundle",
-      format_version: 1,
-      project_id: plan.project_id,
-      project_revision: plan.project_revision,
-      source_project_sha256: plan.source_project_sha256,
-      minimum_runtime_version: plan.minimum_runtime_version,
-      builder: {
-        id: builderId,
-        version: packageMetadata.version,
-      },
-      entrypoint: plan.entrypoint,
-      required_capabilities: plan.required_capabilities,
-      files,
-      extensions: plan.extensions,
-    };
+    const manifest = createManifest(plan, files, packageMetadata.version);
     const manifestBytes = Buffer.from(canonicalize(manifest), "utf8");
     assert(
       manifestBytes.length <= 1024 * 1024,
