@@ -64,6 +64,18 @@ try {
         ),
         /filesystem object changed/,
       );
+      if (process.platform === "linux") {
+        const authorityRoot = `/proc/self/fd/${retainedHandle.fd}`;
+        await writeFile(join(authorityRoot, "owned"), "retained");
+        await syncPublishedEntry(join(authorityRoot, "owned"));
+        assert.equal(
+          await readFile(join(displacedPath, "owned"), "utf8"),
+          "retained",
+        );
+        await assert.rejects(readFile(join(retainedPath, "owned")), {
+          code: "ENOENT",
+        });
+      }
     }
   } finally {
     await retainedHandle.close();

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { constants, lstat, open } from "node:fs/promises";
+import { constants, lstat, open, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import {
@@ -38,6 +38,19 @@ function assertSameIdentity(expected, actual, path) {
     sameIdentity(expected, actual),
     `filesystem object changed while being retained: ${path}`,
   );
+}
+
+function isProcessDescriptorPath(path) {
+  return (
+    process.platform === "linux" &&
+    /^\/proc\/self\/fd\/[0-9]+$/.test(path)
+  );
+}
+
+async function retainedDirectoryStatus(path) {
+  return isProcessDescriptorPath(path)
+    ? stat(path, { bigint: true })
+    : lstat(path, { bigint: true });
 }
 
 async function openRetainedFile(path) {
@@ -109,7 +122,8 @@ export async function readStableFile(path, maximumBytes, label = "file") {
 }
 
 export async function openRetainedDirectory(path) {
-  const before = await lstat(path, { bigint: true });
+  const descriptorPath = isProcessDescriptorPath(path);
+  const before = await retainedDirectoryStatus(path);
   assert(
     before.isDirectory() && !before.isSymbolicLink(),
     `directory path is not a real directory: ${path}`,
@@ -119,11 +133,11 @@ export async function openRetainedDirectory(path) {
       ? constants.O_RDWR
       : constants.O_RDONLY |
         (constants.O_DIRECTORY ?? 0) |
-        (constants.O_NOFOLLOW ?? 0);
+        (descriptorPath ? 0 : (constants.O_NOFOLLOW ?? 0));
   const handle = await open(path, flags);
   try {
     const opened = await handle.stat({ bigint: true });
-    const after = await lstat(path, { bigint: true });
+    const after = await retainedDirectoryStatus(path);
     assertSameIdentity(before, opened, path);
     assertSameIdentity(opened, after, path);
     return handle;
@@ -136,7 +150,7 @@ export async function openRetainedDirectory(path) {
 export async function assertRetainedDirectory(handle, path, label = "directory") {
   const [opened, published] = await Promise.all([
     handle.stat({ bigint: true }),
-    lstat(path, { bigint: true }),
+    retainedDirectoryStatus(path),
   ]);
   assert(
     opened.isDirectory() && published.isDirectory() && !published.isSymbolicLink(),

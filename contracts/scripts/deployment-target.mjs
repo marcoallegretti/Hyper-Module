@@ -9,6 +9,7 @@ import {
   realpath,
   rename,
   rm,
+  stat,
   statfs,
   unlink,
 } from "node:fs/promises";
@@ -111,8 +112,21 @@ async function createDeploymentValidators() {
 
 const deploymentValidators = createDeploymentValidators();
 
-async function withRetainedDeploymentLock(targetRoot, targetHandle, operation) {
-  const lockPath = join(targetRoot, "deployment.lock");
+function retainedDirectoryPath(handle, ambientPath) {
+  if (process.platform === "linux") {
+    assert(Number.isInteger(handle.fd), "retained directory handle is closed");
+    return `/proc/self/fd/${handle.fd}`;
+  }
+  return ambientPath;
+}
+
+async function withRetainedDeploymentLock(
+  targetRoot,
+  authorityRoot,
+  targetHandle,
+  operation,
+) {
+  const lockPath = join(authorityRoot, "deployment.lock");
   const owner = {
     format: "hyper-deployment-lock",
     format_version: 1,
@@ -143,12 +157,10 @@ async function withRetainedDeploymentLock(targetRoot, targetHandle, operation) {
     try {
       await lock.close();
     } finally {
-      await assertRetainedDirectory(
-        targetHandle,
-        targetRoot,
-        "deployment target directory",
-      )
-        .then(() => unlink(lockPath))
+      await readFile(lockPath)
+        .then((publishedOwner) =>
+          publishedOwner.equals(ownerBytes) ? unlink(lockPath) : undefined,
+        )
         .catch(() => {});
     }
     throw error;
@@ -157,7 +169,7 @@ async function withRetainedDeploymentLock(targetRoot, targetHandle, operation) {
   let result;
   let operationError;
   try {
-    result = await operation(targetHandle);
+    result = await operation(authorityRoot, targetHandle);
   } catch (error) {
     operationError = error;
   }
@@ -165,17 +177,17 @@ async function withRetainedDeploymentLock(targetRoot, targetHandle, operation) {
   let releaseError;
   try {
     await lock.close();
-    await assertRetainedDirectory(
-      targetHandle,
-      targetRoot,
-      "deployment target directory",
-    );
     const publishedOwner = await readFile(lockPath);
     assert(
       publishedOwner.equals(ownerBytes),
       "deployment lock ownership was compromised",
     );
     await unlink(lockPath);
+    await assertRetainedDirectory(
+      targetHandle,
+      targetRoot,
+      "deployment target directory",
+    );
   } catch (error) {
     releaseError = error;
   }
@@ -191,8 +203,9 @@ async function withRetainedDeploymentLock(targetRoot, targetHandle, operation) {
   return result;
 }
 
-async function withDeploymentLock(targetRoot, operation) {
+async function withTargetAuthority(targetRoot, operation) {
   const targetHandle = await openRetainedDirectory(targetRoot);
+  const authorityRoot = retainedDirectoryPath(targetHandle, targetRoot);
   let result;
   let operationError;
   try {
@@ -201,11 +214,7 @@ async function withDeploymentLock(targetRoot, operation) {
       targetRoot,
       "deployment target directory",
     );
-    result = await withRetainedDeploymentLock(
-      targetRoot,
-      targetHandle,
-      operation,
-    );
+    result = await operation(authorityRoot, targetHandle);
   } catch (error) {
     operationError = error;
   }
@@ -225,6 +234,17 @@ async function withDeploymentLock(targetRoot, operation) {
   if (operationError) throw operationError;
   if (releaseError) throw releaseError;
   return result;
+}
+
+async function withDeploymentLock(targetRoot, operation) {
+  return withTargetAuthority(targetRoot, (authorityRoot, targetHandle) =>
+    withRetainedDeploymentLock(
+      targetRoot,
+      authorityRoot,
+      targetHandle,
+      operation,
+    ),
+  );
 }
 
 async function inspectBundle(bundlePath, options = {}) {
@@ -394,7 +414,11 @@ async function requireTarget(targetPath) {
 }
 
 async function requireBundlesRoot(targetRoot) {
-  const targetStatus = await lstat(targetRoot);
+  const targetStatus =
+    process.platform === "linux" &&
+    /^\/proc\/self\/fd\/[0-9]+$/.test(targetRoot)
+      ? await stat(targetRoot)
+      : await lstat(targetRoot);
   assert(
     targetStatus.isDirectory() && !targetStatus.isSymbolicLink(),
     "deployment target must remain a real directory",
@@ -421,20 +445,24 @@ async function requireBundlesRoot(targetRoot) {
 }
 
 async function retainDeploymentDirectories(targetRoot, targetHandle) {
-  const bundlesRoot = await requireBundlesRoot(targetRoot);
+  const bundlesPath = await requireBundlesRoot(targetRoot);
   await assertRetainedDirectory(
     targetHandle,
     targetRoot,
     "deployment target directory",
   );
-  const bundlesHandle = await openRetainedDirectory(bundlesRoot);
+  const bundlesHandle = await openRetainedDirectory(bundlesPath);
   try {
     await assertRetainedDirectory(
       bundlesHandle,
-      bundlesRoot,
+      bundlesPath,
       "deployment bundles directory",
     );
-    return { bundlesHandle, bundlesRoot, targetHandle };
+    return {
+      bundlesHandle,
+      bundlesRoot: retainedDirectoryPath(bundlesHandle, bundlesPath),
+      targetHandle,
+    };
   } catch (error) {
     await bundlesHandle.close();
     throw error;
@@ -625,13 +653,13 @@ async function collectUnprotectedBundles(targetRoot, policy) {
 
 export async function configureDeploymentStorage(targetPath, policy) {
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async () => {
+  return withDeploymentLock(targetRoot, async (authorityRoot) => {
     const { policy: validate } = await deploymentValidators;
     assert(
       validate(policy),
       `deployment storage policy schema validation failed: ${JSON.stringify(validate.errors)}`,
     );
-    const authorizationState = await readAuthorizationState(targetRoot);
+    const authorizationState = await readAuthorizationState(authorityRoot);
     if (authorizationState) {
       assert(
         authorizationState.policy.max_bundle_bytes <=
@@ -639,48 +667,48 @@ export async function configureDeploymentStorage(targetPath, policy) {
         "deployment storage byte quota is below authorization bundle limit",
       );
     }
-    const state = await readState(targetRoot);
+    const state = await readState(authorityRoot);
     const protectedIdentities = protectedBundleIdentities(state);
     const bundles = await inspectInstalledBundles(
-      targetRoot,
+      authorityRoot,
       policy.max_installed_bundles,
     );
     const usage = summarizeStorage(bundles, protectedIdentities);
-    assertPolicyCapacity(policy, usage, await availableBytes(targetRoot));
-    await writeCanonicalFile(targetRoot, "policy", policy);
+    assertPolicyCapacity(policy, usage, await availableBytes(authorityRoot));
+    await writeCanonicalFile(authorityRoot, "policy", policy);
     return policy;
   });
 }
 
 export async function readDeploymentStorage(targetPath) {
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async () => {
-    const policy = await readStoragePolicy(targetRoot);
+  return withDeploymentLock(targetRoot, async (authorityRoot) => {
+    const policy = await readStoragePolicy(authorityRoot);
     assert(policy, "deployment storage policy is not configured");
-    const state = await readState(targetRoot);
+    const state = await readState(authorityRoot);
     const bundles = await inspectInstalledBundles(
-      targetRoot,
+      authorityRoot,
       policy.max_installed_bundles,
     );
     return {
       policy,
       ...summarizeStorage(bundles, protectedBundleIdentities(state)),
-      available_bytes: await availableBytes(targetRoot),
+      available_bytes: await availableBytes(authorityRoot),
     };
   });
 }
 
 export async function collectDeploymentGarbage(targetPath) {
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async () => {
-    const policy = await readStoragePolicy(targetRoot);
+  return withDeploymentLock(targetRoot, async (authorityRoot) => {
+    const policy = await readStoragePolicy(authorityRoot);
     assert(policy, "deployment storage policy is not configured");
-    const collected = await collectUnprotectedBundles(targetRoot, policy);
+    const collected = await collectUnprotectedBundles(authorityRoot, policy);
     const usage = summarizeStorage(
       collected.bundles,
       collected.protectedIdentities,
     );
-    assertPolicyCapacity(policy, usage, await availableBytes(targetRoot));
+    assertPolicyCapacity(policy, usage, await availableBytes(authorityRoot));
     return {
       removed: collected.removed,
       ...usage,
@@ -690,39 +718,39 @@ export async function collectDeploymentGarbage(targetPath) {
 
 export async function configureDeploymentAuthorization(targetPath, state) {
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async () => {
+  return withDeploymentLock(targetRoot, async (authorityRoot) => {
     await validateInitialDeploymentAuthorizationState(state);
-    const storagePolicy = await readStoragePolicy(targetRoot);
+    const storagePolicy = await readStoragePolicy(authorityRoot);
     assert(storagePolicy, "deployment storage policy is not configured");
     assert(
       state.policy.max_bundle_bytes <= storagePolicy.max_installed_bytes,
       "authorization bundle limit exceeds deployment storage byte quota",
     );
     try {
-      await lstat(join(targetRoot, "authorization.json"));
+      await lstat(join(authorityRoot, "authorization.json"));
       assert.fail("deployment authorization is already configured");
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
-    await writeAuthorizationState(targetRoot, state);
+    await writeAuthorizationState(authorityRoot, state);
     return state;
   });
 }
 
 export async function readDeploymentAuthorization(targetPath) {
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, () =>
-    readAuthorizationState(targetRoot),
+  return withDeploymentLock(targetRoot, (authorityRoot) =>
+    readAuthorizationState(authorityRoot),
   );
 }
 
 export async function openDeploymentPairing(targetPath, options) {
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async () => {
-    const state = await readAuthorizationState(targetRoot);
+  return withDeploymentLock(targetRoot, async (authorityRoot) => {
+    const state = await readAuthorizationState(authorityRoot);
     assert(state, "deployment authorization is not configured");
     const result = await issuePairingChallenge(state, options);
-    await writeAuthorizationState(targetRoot, result.state);
+    await writeAuthorizationState(authorityRoot, result.state);
     return result;
   });
 }
@@ -733,12 +761,12 @@ export async function approveDeploymentPairing(
   options,
 ) {
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async () => {
-    const state = await readAuthorizationState(targetRoot);
+  return withDeploymentLock(targetRoot, async (authorityRoot) => {
+    const state = await readAuthorizationState(authorityRoot);
     assert(state, "deployment authorization is not configured");
     const result = await approvePairingRequest(state, request, options);
     if (!result.idempotent) {
-      await writeAuthorizationState(targetRoot, result.state);
+      await writeAuthorizationState(authorityRoot, result.state);
     }
     return result;
   });
@@ -750,11 +778,11 @@ export async function revokeDeploymentClient(
   options,
 ) {
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async () => {
-    const state = await readAuthorizationState(targetRoot);
+  return withDeploymentLock(targetRoot, async (authorityRoot) => {
+    const state = await readAuthorizationState(authorityRoot);
     assert(state, "deployment authorization is not configured");
     const result = await revokePairedClient(state, clientId, options);
-    await writeAuthorizationState(targetRoot, result.state);
+    await writeAuthorizationState(authorityRoot, result.state);
     return result;
   });
 }
@@ -830,58 +858,70 @@ export async function recoverDeploymentTarget(
     "process liveness inspector must be a function",
   );
   const targetRoot = await requireTarget(targetPath);
-  const lockPath = join(targetRoot, "deployment.lock");
-  let owner = null;
-  let forced = false;
-  try {
-    owner = await readLockOwner(targetRoot);
-  } catch (error) {
-    assert(
-      force,
-      `deployment lock ownership is invalid; explicit force is required: ${error.message}`,
-    );
-    const status = await lstat(lockPath);
-    assert(
-      status.isFile() || status.isSymbolicLink(),
-      "deployment lock is not a removable file",
-    );
-    forced = true;
-  }
-
-  if (owner) {
-    assert.equal(
-      await processIsAlive(owner.owner_pid),
-      false,
-      `deployment lock owner process ${owner.owner_pid} is still active`,
-    );
-  }
-  if (owner || forced) {
-    await unlink(lockPath);
-  }
-
-  return withDeploymentLock(targetRoot, async () => {
-    const removedTemporaryPaths = await removeTransactionResidue(targetRoot);
-    const policy = await readStoragePolicy(targetRoot);
-    let storage = null;
-    if (policy) {
-      const state = await readState(targetRoot);
-      const bundles = await inspectInstalledBundles(
-        targetRoot,
-        policy.max_installed_bundles,
+  return withTargetAuthority(targetRoot, async (authorityRoot, targetHandle) => {
+    const lockPath = join(authorityRoot, "deployment.lock");
+    let owner = null;
+    let forced = false;
+    try {
+      owner = await readLockOwner(authorityRoot);
+    } catch (error) {
+      assert(
+        force,
+        `deployment lock ownership is invalid; explicit force is required: ${error.message}`,
       );
-      const usage = summarizeStorage(
-        bundles,
-        protectedBundleIdentities(state),
+      const status = await lstat(lockPath);
+      assert(
+        status.isFile() || status.isSymbolicLink(),
+        "deployment lock is not a removable file",
       );
-      assertPolicyCapacity(policy, usage, await availableBytes(targetRoot));
-      storage = usage;
+      forced = true;
     }
-    return {
-      recovered_lock_owner: owner,
-      forced,
-      removed_temporary_paths: removedTemporaryPaths,
-      storage,
-    };
+
+    if (owner) {
+      assert.equal(
+        await processIsAlive(owner.owner_pid),
+        false,
+        `deployment lock owner process ${owner.owner_pid} is still active`,
+      );
+    }
+    if (owner || forced) {
+      await unlink(lockPath);
+    }
+
+    return withRetainedDeploymentLock(
+      targetRoot,
+      authorityRoot,
+      targetHandle,
+      async () => {
+        const removedTemporaryPaths =
+          await removeTransactionResidue(authorityRoot);
+        const policy = await readStoragePolicy(authorityRoot);
+        let storage = null;
+        if (policy) {
+          const state = await readState(authorityRoot);
+          const bundles = await inspectInstalledBundles(
+            authorityRoot,
+            policy.max_installed_bundles,
+          );
+          const usage = summarizeStorage(
+            bundles,
+            protectedBundleIdentities(state),
+          );
+          assertPolicyCapacity(
+            policy,
+            usage,
+            await availableBytes(authorityRoot),
+          );
+          storage = usage;
+        }
+        return {
+          recovered_lock_owner: owner,
+          forced,
+          removed_temporary_paths: removedTemporaryPaths,
+          storage,
+        };
+      },
+    );
   });
 }
 
@@ -996,11 +1036,11 @@ export async function installBundle(bundlePath, targetPath, options = {}) {
   const faultAt = validateFaultBoundary(options.faultAt);
   const sourceRoot = resolve(bundlePath);
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async (targetHandle) => {
-    await assertDirectDeploymentAllowed(targetRoot);
+  return withDeploymentLock(targetRoot, async (authorityRoot, targetHandle) => {
+    await assertDirectDeploymentAllowed(authorityRoot);
     return installIdentity(
       sourceRoot,
-      targetRoot,
+      authorityRoot,
       targetHandle,
       { faultAt },
     );
@@ -1064,10 +1104,10 @@ export async function activateBundle(
 ) {
   const faultAt = validateFaultBoundary(options.faultAt);
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async () => {
-    await assertDirectDeploymentAllowed(targetRoot);
+  return withDeploymentLock(targetRoot, async (authorityRoot) => {
+    await assertDirectDeploymentAllowed(authorityRoot);
     return activateIdentity(
-      targetRoot,
+      authorityRoot,
       bundleSha256,
       runtimeVersion,
       false,
@@ -1085,16 +1125,16 @@ export async function deployBundle(
   const faultAt = validateFaultBoundary(options.faultAt);
   const sourceRoot = resolve(bundlePath);
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async (targetHandle) => {
-    await assertDirectDeploymentAllowed(targetRoot);
+  return withDeploymentLock(targetRoot, async (authorityRoot, targetHandle) => {
+    await assertDirectDeploymentAllowed(authorityRoot);
     const identity = await installIdentity(
       sourceRoot,
-      targetRoot,
+      authorityRoot,
       targetHandle,
       { faultAt },
     );
     return activateIdentity(
-      targetRoot,
+      authorityRoot,
       identity,
       runtimeVersion,
       false,
@@ -1124,8 +1164,8 @@ export async function authenticatedDeployBundle(
   const faultAt = validateFaultBoundary(options.faultAt);
   const sourceRoot = resolve(bundlePath);
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async (targetHandle) => {
-    const authorizationState = await readAuthorizationState(targetRoot);
+  return withDeploymentLock(targetRoot, async (authorityRoot, targetHandle) => {
+    const authorizationState = await readAuthorizationState(authorityRoot);
     assert(
       authorizationState,
       "deployment authorization is not configured",
@@ -1137,7 +1177,7 @@ export async function authenticatedDeployBundle(
     );
     if (!authorization.accepted) {
       await writeAuthorizationState(
-        targetRoot,
+        authorityRoot,
         authorization.state,
         faultAt,
       );
@@ -1157,7 +1197,7 @@ export async function authenticatedDeployBundle(
     }
     if (!authorization.idempotent) {
       await writeAuthorizationState(
-        targetRoot,
+        authorityRoot,
         authorization.state,
         faultAt,
       );
@@ -1169,7 +1209,7 @@ export async function authenticatedDeployBundle(
     try {
       const identity = await installIdentity(
         sourceRoot,
-        targetRoot,
+        authorityRoot,
         targetHandle,
         {
           faultAt,
@@ -1185,7 +1225,7 @@ export async function authenticatedDeployBundle(
         "installed deployment identity does not match the authorized bundle",
       );
       deploymentState = await activateIdentity(
-        targetRoot,
+        authorityRoot,
         identity,
         request.runtime_version,
         false,
@@ -1195,7 +1235,7 @@ export async function authenticatedDeployBundle(
     } catch (error) {
       if (error.code === "HYPER_INJECTED_DEPLOYMENT_FAULT") {
         if (error.boundary !== "after-state-publication") throw error;
-        const current = await readState(targetRoot);
+        const current = await readState(authorityRoot);
         assert.equal(
           current?.active.bundle_sha256,
           request.bundle_sha256,
@@ -1216,7 +1256,7 @@ export async function authenticatedDeployBundle(
         nowEpochMs,
       },
     );
-    await writeAuthorizationState(targetRoot, terminal.state, faultAt);
+    await writeAuthorizationState(authorityRoot, terminal.state, faultAt);
     return authenticatedDeploymentResult(
       request,
       terminal.request,
@@ -1227,16 +1267,16 @@ export async function authenticatedDeployBundle(
 
 export async function rollbackDeployment(targetPath, runtimeVersion) {
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async () => {
-    await assertDirectDeploymentAllowed(targetRoot);
-    const current = await readState(targetRoot);
+  return withDeploymentLock(targetRoot, async (authorityRoot) => {
+    await assertDirectDeploymentAllowed(authorityRoot);
+    const current = await readState(authorityRoot);
     assert(current, "deployment target has no active bundle");
     assert(
       current.previous_bundle_sha256,
       "deployment target has no previous bundle",
     );
     return activateIdentity(
-      targetRoot,
+      authorityRoot,
       current.previous_bundle_sha256,
       runtimeVersion,
       true,
@@ -1282,8 +1322,8 @@ export async function resolveStartupDeployment(
   assert(semver.valid(runtimeVersion), "runtime version must be valid SemVer");
   assert.equal(typeof probe, "function", "runtime health probe is required");
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async () => {
-    const current = await readState(targetRoot);
+  return withDeploymentLock(targetRoot, async (authorityRoot) => {
+    const current = await readState(authorityRoot);
     assert(current, "deployment target has no active bundle");
     const promotionGeneration =
       current.active.status === "healthy"
@@ -1293,7 +1333,7 @@ export async function resolveStartupDeployment(
     let activeError;
     try {
       await probeInstalledBundle(
-        targetRoot,
+        authorityRoot,
         current.active.bundle_sha256,
         runtimeVersion,
         probe,
@@ -1311,7 +1351,7 @@ export async function resolveStartupDeployment(
         generation: promotionGeneration,
         active: { ...current.active, status: "healthy" },
       };
-      await writeState(targetRoot, healthy);
+      await writeState(authorityRoot, healthy);
       return { state: healthy, recovered_from_bundle_sha256: null };
     }
     assert(
@@ -1322,7 +1362,7 @@ export async function resolveStartupDeployment(
     let previous;
     try {
       previous = await probeInstalledBundle(
-        targetRoot,
+        authorityRoot,
         current.previous_bundle_sha256,
         runtimeVersion,
         probe,
@@ -1347,7 +1387,7 @@ export async function resolveStartupDeployment(
       previous_bundle_sha256: current.active.bundle_sha256,
       extensions: {},
     };
-    await writeState(targetRoot, recovered);
+    await writeState(authorityRoot, recovered);
     return {
       state: recovered,
       recovered_from_bundle_sha256: current.active.bundle_sha256,
