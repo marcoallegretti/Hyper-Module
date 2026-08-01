@@ -24,6 +24,10 @@ import {
   removeRetainedDirectory,
   renameDirectoryNoReplace,
 } from "../lib/native-fs-authority.mjs";
+import {
+  runCleanupSteps,
+  throwPreservingCleanupError,
+} from "../lib/operation-cleanup.mjs";
 import { PublishedDirectoryDurabilityError } from "../lib/published-directory.mjs";
 import { copyVerifiedBundleFile } from "../lib/verified-bundle-copy.mjs";
 import { verifyBundleArtifact } from "./verify-bundle.mjs";
@@ -118,6 +122,7 @@ export async function restoreProject(
   const stageHandle = await openRetainedDirectory(stageRoot);
   const outputParentHandle = await openRetainedDirectory(outputParent);
   let published = false;
+  let operationError;
   try {
     const payloads = [...manifest.files].sort((left, right) =>
       left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
@@ -217,33 +222,44 @@ export async function restoreProject(
       );
     }
     return result;
+  } catch (error) {
+    operationError = error;
+    throw error;
   } finally {
     try {
-      if (!published) {
-        let stagePresent = true;
-        try {
-          await lstat(stageRoot);
-        } catch (error) {
-          if (error.code === "ENOENT") {
-            stagePresent = false;
-          } else {
-            throw error;
-          }
-        }
-        if (stagePresent) {
-          await removeRetainedDirectory(
-            stageHandle,
-            stageRoot,
-            "project staging directory",
-          );
-        }
-      }
-    } finally {
-      try {
-        await stageHandle.close();
-      } finally {
-        await outputParentHandle.close();
-      }
+      await runCleanupSteps(
+        [
+          async () => {
+            if (published) return;
+            let stagePresent = true;
+            try {
+              await lstat(stageRoot);
+            } catch (error) {
+              if (error.code === "ENOENT") {
+                stagePresent = false;
+              } else {
+                throw error;
+              }
+            }
+            if (stagePresent) {
+              await removeRetainedDirectory(
+                stageHandle,
+                stageRoot,
+                "project staging directory",
+              );
+            }
+          },
+          async () => stageHandle.close(),
+          async () => outputParentHandle.close(),
+        ],
+        "project staging cleanup failed",
+      );
+    } catch (cleanupError) {
+      throwPreservingCleanupError(
+        operationError,
+        cleanupError,
+        "project restoration and cleanup both failed",
+      );
     }
   }
 }

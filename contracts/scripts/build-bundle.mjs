@@ -35,6 +35,10 @@ import {
   removeRetainedDirectory,
   renameDirectoryNoReplace,
 } from "../lib/native-fs-authority.mjs";
+import {
+  runCleanupSteps,
+  throwPreservingCleanupError,
+} from "../lib/operation-cleanup.mjs";
 import { PublishedDirectoryDurabilityError } from "../lib/published-directory.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
 import {
@@ -395,6 +399,7 @@ export async function buildBundle(
   const stageHandle = await openRetainedDirectory(stageRoot);
   const outputParentHandle = await openRetainedDirectory(outputParent);
   let published = false;
+  let operationError;
   try {
     const files = [];
     let payloadBytes = 0;
@@ -517,33 +522,44 @@ export async function buildBundle(
       );
     }
     return result;
+  } catch (error) {
+    operationError = error;
+    throw error;
   } finally {
     try {
-      if (!published) {
-        let stagePresent = true;
-        try {
-          await lstat(stageRoot);
-        } catch (error) {
-          if (error.code === "ENOENT") {
-            stagePresent = false;
-          } else {
-            throw error;
-          }
-        }
-        if (stagePresent) {
-          await removeRetainedDirectory(
-            stageHandle,
-            stageRoot,
-            "bundle staging directory",
-          );
-        }
-      }
-    } finally {
-      try {
-        await stageHandle.close();
-      } finally {
-        await outputParentHandle.close();
-      }
+      await runCleanupSteps(
+        [
+          async () => {
+            if (published) return;
+            let stagePresent = true;
+            try {
+              await lstat(stageRoot);
+            } catch (error) {
+              if (error.code === "ENOENT") {
+                stagePresent = false;
+              } else {
+                throw error;
+              }
+            }
+            if (stagePresent) {
+              await removeRetainedDirectory(
+                stageHandle,
+                stageRoot,
+                "bundle staging directory",
+              );
+            }
+          },
+          async () => stageHandle.close(),
+          async () => outputParentHandle.close(),
+        ],
+        "bundle staging cleanup failed",
+      );
+    } catch (cleanupError) {
+      throwPreservingCleanupError(
+        operationError,
+        cleanupError,
+        "bundle build and cleanup both failed",
+      );
     }
   }
 }
