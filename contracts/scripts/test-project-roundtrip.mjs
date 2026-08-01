@@ -90,6 +90,26 @@ try {
       0,
     );
 
+  const incompatibleRestorePath = join(
+    temporaryRoot,
+    "incompatible-helper-restore",
+  );
+  const previousFilesystemAuthority = process.env.HYPER_FS_AUTHORITY;
+  try {
+    process.env.HYPER_FS_AUTHORITY = process.execPath;
+    await assert.rejects(
+      restoreProject(bundlePath, incompatibleRestorePath),
+      /project restoration native helper compatibility check failed/,
+    );
+  } finally {
+    if (previousFilesystemAuthority === undefined) {
+      delete process.env.HYPER_FS_AUTHORITY;
+    } else {
+      process.env.HYPER_FS_AUTHORITY = previousFilesystemAuthority;
+    }
+  }
+  assert.equal(await pathExists(incompatibleRestorePath), false);
+
   const boundedOutputPath = join(temporaryRoot, "bounded-restore");
   await assert.rejects(
     restoreProject(bundlePath, boundedOutputPath, {
@@ -286,7 +306,7 @@ try {
     sourceVerification.identity,
   );
 
-  console.log("Project round trip passed: 22 preservation and recovery cases");
+  console.log("Project round trip passed: 23 preservation and recovery cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

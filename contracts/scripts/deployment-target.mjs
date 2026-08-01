@@ -36,9 +36,14 @@ import {
   syncRemovedEntry,
 } from "../lib/durable-files.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
+import {
+  runCleanupSteps,
+  throwPreservingCleanupError,
+} from "../lib/operation-cleanup.mjs";
 import { inspectDeploymentBundle } from "../lib/deployment-bundle.mjs";
 import { readBoundedDirectory } from "../lib/filesystem-tree.mjs";
 import {
+  preflightFilesystemAuthority,
   removeRetainedDirectory as removeRetainedDirectoryNative,
   renameDirectoryBetweenNoReplace,
   renameDirectoryNoReplace,
@@ -294,6 +299,7 @@ async function withTargetAuthority(targetRoot, operation) {
 }
 
 async function withDeploymentLock(targetRoot, operation) {
+  await preflightFilesystemAuthority("deployment transaction");
   return withTargetAuthority(targetRoot, (authorityRoot, targetHandle) =>
     withRetainedDeploymentLock(
       targetRoot,
@@ -1416,6 +1422,7 @@ export async function recoverDeploymentTarget(
     "process liveness inspector must be a function",
   );
   observer = validateDeploymentObserver(observer);
+  await preflightFilesystemAuthority("deployment recovery");
   const targetRoot = await requireTarget(targetPath);
   return withTargetAuthority(targetRoot, async (authorityRoot, targetHandle) => {
     const lockPath = join(authorityRoot, "deployment.lock");
@@ -1575,6 +1582,7 @@ async function installIdentity(
     const stagingHandle = await openRetainedDirectory(stagingPath);
     let published = false;
     let accepted = false;
+    let stagingOperationError;
     try {
       await copyObserver("before-staging-copy", { sourceRoot, stagingPath });
       const sourceRootReal = await realpath(sourceRoot);
@@ -1692,18 +1700,34 @@ async function installIdentity(
       );
       accepted = true;
       injectFault(faultAt, "after-bundle-installation");
+    } catch (error) {
+      stagingOperationError = error;
+      throw error;
     } finally {
       try {
-        if (!accepted) {
-          await removeRetainedDirectory(
-            published ? installedPath : stagingPath,
-            published ? bundlesRoot : targetRoot,
-            stagingHandle,
-            published ? "published deployment bundle" : "staged deployment bundle",
-          );
-        }
-      } finally {
-        await stagingHandle.close();
+        await runCleanupSteps(
+          [
+            async () => {
+              if (accepted) return;
+              await removeRetainedDirectory(
+                published ? installedPath : stagingPath,
+                published ? bundlesRoot : targetRoot,
+                stagingHandle,
+                published
+                  ? "published deployment bundle"
+                  : "staged deployment bundle",
+              );
+            },
+            async () => stagingHandle.close(),
+          ],
+          "deployment staging cleanup failed",
+        );
+      } catch (cleanupError) {
+        throwPreservingCleanupError(
+          stagingOperationError,
+          cleanupError,
+          "deployment installation and staging cleanup both failed",
+        );
       }
     }
     return source.sha256;

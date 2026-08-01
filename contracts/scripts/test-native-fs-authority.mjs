@@ -18,6 +18,7 @@ import { openRetainedDirectory } from "../lib/durable-files.mjs";
 import { runNativeProcess } from "../lib/native-process.mjs";
 import {
   copyRetainedFile,
+  preflightFilesystemAuthority,
   removeRetainedDirectory,
   renameDirectoryBetweenNoReplace,
   renameDirectoryNoReplace,
@@ -27,6 +28,7 @@ import {
 
 const temporaryRoot = await mkdtemp(join(tmpdir(), "hyper-fs-authority-"));
 try {
+  await preflightFilesystemAuthority("native authority test");
   const authorityExecutable = resolve(
     import.meta.dirname,
     "..",

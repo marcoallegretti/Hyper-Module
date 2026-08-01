@@ -21,6 +21,7 @@ import {
   syncPublishedDirectory,
 } from "../lib/durable-files.mjs";
 import {
+  preflightFilesystemAuthority,
   removeRetainedDirectory,
   renameDirectoryNoReplace,
 } from "../lib/native-fs-authority.mjs";
@@ -86,6 +87,7 @@ export async function restoreProject(
     Number.isSafeInteger(maximumProjectBytes) && maximumProjectBytes > 0,
     "maximum project bytes must be a positive safe integer",
   );
+  await preflightFilesystemAuthority("project restoration");
 
   const bundleRoot = resolve(bundlePath);
   const bundleStatus = await lstat(bundleRoot);

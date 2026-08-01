@@ -633,6 +633,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err(invalid_argument("unsupported filesystem authority protocol version").into());
     }
     match arguments.next().as_deref() {
+        Some("preflight") => {
+            if arguments.next().is_some() {
+                return Err(invalid_argument("unexpected filesystem authority argument").into());
+            }
+            Ok(())
+        }
         Some("remove-directory") => remove_verified_directory(&mut arguments),
         Some("rename-directory-no-replace") => rename_verified_directory_no_replace(&mut arguments),
         Some("rename-directory-between-no-replace") => {

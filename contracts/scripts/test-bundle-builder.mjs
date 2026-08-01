@@ -100,6 +100,30 @@ const temporaryRoot = await mkdtemp(
 );
 try {
   const { plan, planPath, source } = await createInputs(temporaryRoot);
+  const incompatibleHelperPath = join(
+    temporaryRoot,
+    "incompatible-helper.runtime",
+  );
+  const previousFilesystemAuthority = process.env.HYPER_FS_AUTHORITY;
+  try {
+    process.env.HYPER_FS_AUTHORITY = process.execPath;
+    await assert.rejects(
+      buildBundle(planPath, source, incompatibleHelperPath),
+      /bundle build native helper compatibility check failed/,
+    );
+  } finally {
+    if (previousFilesystemAuthority === undefined) {
+      delete process.env.HYPER_FS_AUTHORITY;
+    } else {
+      process.env.HYPER_FS_AUTHORITY = previousFilesystemAuthority;
+    }
+  }
+  assert.equal(
+    (await readdir(temporaryRoot)).some((name) =>
+      name.startsWith(".incompatible-helper.runtime.staging-"),
+    ),
+    false,
+  );
   await assert.rejects(
     buildBundle(undefined, source, join(temporaryRoot, "oversized-plan.runtime"), {
       preparedPlan: {
@@ -300,7 +324,7 @@ try {
   );
   assert.deepEqual(stagingResidue, [], "failed builds left staging data");
 
-  console.log("Bundle builder passed: 15 construction cases");
+  console.log("Bundle builder passed: 16 construction cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

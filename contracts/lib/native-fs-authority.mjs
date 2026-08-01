@@ -71,6 +71,18 @@ function parseTransferResult(output, label) {
   return { byteLength, sha256: match[2] };
 }
 
+export async function preflightFilesystemAuthority(
+  label = "filesystem authority",
+) {
+  try {
+    await runHelper(["preflight"]);
+  } catch (error) {
+    throw new Error(`${label} native helper compatibility check failed`, {
+      cause: error,
+    });
+  }
+}
+
 export async function copyRetainedFile(
   sourceHandle,
   sourcePath,

@@ -103,6 +103,16 @@ async function assertGenerationExhaustionIsAtomic(target, operation) {
   );
 }
 
+function collectErrorMessages(error, messages = []) {
+  if (!(error instanceof Error)) return messages;
+  messages.push(error.message);
+  if (error instanceof AggregateError) {
+    for (const nested of error.errors) collectErrorMessages(nested, messages);
+  }
+  collectErrorMessages(error.cause, messages);
+  return messages;
+}
+
 try {
   const source7 = await createMinimalProject(temporaryRoot, "source-7", {
     revision: 7,
@@ -115,6 +125,31 @@ try {
   await buildProjectBundle(source7.root, bundle7, "1.0.0");
   await buildProjectBundle(source8.root, bundle8, "1.0.0");
   const target = await createTarget(temporaryRoot, "target");
+
+  const incompatibleHelperTarget = await createTarget(
+    temporaryRoot,
+    "incompatible-helper-target",
+  );
+  const incompatibleHelperEntries = await readdir(incompatibleHelperTarget);
+  const previousFilesystemAuthority = process.env.HYPER_FS_AUTHORITY;
+  try {
+    process.env.HYPER_FS_AUTHORITY = process.execPath;
+    await assert.rejects(
+      installBundle(bundle7, incompatibleHelperTarget),
+      /deployment transaction native helper compatibility check failed/,
+    );
+  } finally {
+    if (previousFilesystemAuthority === undefined) {
+      delete process.env.HYPER_FS_AUTHORITY;
+    } else {
+      process.env.HYPER_FS_AUTHORITY = previousFilesystemAuthority;
+    }
+  }
+  assert.deepEqual(
+    await readdir(incompatibleHelperTarget),
+    incompatibleHelperEntries,
+  );
+  assert.equal(await readDeploymentLock(incompatibleHelperTarget), null);
 
   const identity7 = await installBundle(bundle7, target);
   assert.equal(await readDeploymentState(target), null);
@@ -469,7 +504,7 @@ try {
     assert.equal(substitutedInstallError, undefined);
   } else {
     assert.match(
-      substitutedInstallError?.message ?? "",
+      collectErrorMessages(substitutedInstallError).join("\n"),
       /filesystem object changed|bundle root must be a real directory/,
     );
     assert.equal(
@@ -1726,7 +1761,7 @@ try {
     ),
   );
 
-  console.log("Deployment target passed: 166 transaction cases");
+  console.log("Deployment target passed: 167 transaction cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

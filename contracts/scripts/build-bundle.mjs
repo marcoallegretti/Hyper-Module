@@ -30,6 +30,7 @@ import {
   syncPublishedDirectory,
 } from "../lib/durable-files.mjs";
 import {
+  preflightFilesystemAuthority,
   writeRetainedFile,
   removeRetainedDirectory,
   renameDirectoryNoReplace,
@@ -331,6 +332,7 @@ export async function buildBundle(
     Number.isSafeInteger(maximumBundleBytes) && maximumBundleBytes > 0,
     "maximum bundle bytes must be a positive safe integer",
   );
+  await preflightFilesystemAuthority("bundle build");
   const plan =
     preparedPlan === undefined
       ? await readBuildPlan(resolve(planPath))
