@@ -159,7 +159,9 @@ export async function assertRetainedDirectory(handle, path, label = "directory")
   assert(
     opened.dev === published.dev &&
       opened.ino === published.ino &&
-      opened.mode === published.mode,
+      opened.mode === published.mode &&
+      (process.platform !== "win32" ||
+        opened.birthtimeNs === published.birthtimeNs),
     `${label} filesystem object changed: ${path}`,
   );
 }

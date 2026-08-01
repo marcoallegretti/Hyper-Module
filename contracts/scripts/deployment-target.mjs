@@ -468,6 +468,7 @@ async function retainDeploymentDirectories(targetRoot, targetHandle) {
     );
     return {
       bundlesHandle,
+      bundlesPublishedRoot: bundlesPath,
       bundlesRoot: retainedDirectoryPath(bundlesHandle, bundlesPath),
       targetHandle,
     };
@@ -486,7 +487,7 @@ async function assertDeploymentDirectoriesRetained(targetRoot, retained) {
     ),
     assertRetainedDirectory(
       retained.bundlesHandle,
-      retained.bundlesRoot,
+      retained.bundlesPublishedRoot,
       "deployment bundles directory",
     ),
   ]);
@@ -1012,6 +1013,7 @@ async function installIdentity(
       assert(status.isDirectory(), "installed bundle path is not a directory");
       const installed = await inspectBundle(installedPath, inspectionOptions);
       assert.equal(installed.sha256, source.sha256);
+      await assertDeploymentDirectoriesRetained(targetRoot, retained);
       return source.sha256;
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
@@ -1078,6 +1080,12 @@ async function installIdentity(
         publishedInspection.sha256,
         source.sha256,
         "published bundle identity changed during installation",
+      );
+      await assertDeploymentDirectoriesRetained(targetRoot, retained);
+      await assertRetainedDirectory(
+        stagingHandle,
+        join(retained.bundlesPublishedRoot, source.sha256),
+        "published deployment bundle",
       );
       await syncPublishedDirectory(installedPath);
       injectFault(faultAt, "after-bundle-publication");
@@ -1373,27 +1381,46 @@ export async function readDeploymentState(targetPath) {
 
 async function probeInstalledBundle(
   targetRoot,
+  targetHandle,
   bundleSha256,
   runtimeVersion,
   probe,
 ) {
-  const bundlePath = join(targetRoot, "bundles", bundleSha256);
-  const installed = await inspectBundle(bundlePath);
-  assert.equal(
-    installed.sha256,
+  const retained = await retainDeploymentDirectories(targetRoot, targetHandle);
+  const bundlePath = join(retained.bundlesRoot, bundleSha256);
+  const publishedBundlePath = join(
+    retained.bundlesPublishedRoot,
     bundleSha256,
-    "installed bundle identity mismatch",
   );
-  assert(
-    semver.gte(runtimeVersion, installed.manifest.minimum_runtime_version),
-    "bundle requires a newer runtime version",
-  );
-  assert.equal(
-    await probe({ manifest: installed.manifest }),
-    true,
-    "runtime health probe rejected the bundle",
-  );
-  return installed;
+  let bundleHandle;
+  try {
+    bundleHandle = await openRetainedDirectory(bundlePath);
+    const installed = await inspectBundle(bundlePath);
+    assert.equal(
+      installed.sha256,
+      bundleSha256,
+      "installed bundle identity mismatch",
+    );
+    assert(
+      semver.gte(runtimeVersion, installed.manifest.minimum_runtime_version),
+      "bundle requires a newer runtime version",
+    );
+    assert.equal(
+      await probe({ manifest: installed.manifest }),
+      true,
+      "runtime health probe rejected the bundle",
+    );
+    await assertDeploymentDirectoriesRetained(targetRoot, retained);
+    await assertRetainedDirectory(
+      bundleHandle,
+      publishedBundlePath,
+      "probed deployment bundle",
+    );
+    return installed;
+  } finally {
+    if (bundleHandle) await bundleHandle.close();
+    await closeRetainedDeploymentDirectories(retained);
+  }
 }
 
 export async function resolveStartupDeployment(
@@ -1404,7 +1431,7 @@ export async function resolveStartupDeployment(
   assert(semver.valid(runtimeVersion), "runtime version must be valid SemVer");
   assert.equal(typeof probe, "function", "runtime health probe is required");
   const targetRoot = await requireTarget(targetPath);
-  return withDeploymentLock(targetRoot, async (authorityRoot) => {
+  return withDeploymentLock(targetRoot, async (authorityRoot, targetHandle) => {
     const current = await readState(authorityRoot);
     assert(current, "deployment target has no active bundle");
     const promotionGeneration =
@@ -1416,6 +1443,7 @@ export async function resolveStartupDeployment(
     try {
       await probeInstalledBundle(
         authorityRoot,
+        targetHandle,
         current.active.bundle_sha256,
         runtimeVersion,
         probe,
@@ -1445,6 +1473,7 @@ export async function resolveStartupDeployment(
     try {
       previous = await probeInstalledBundle(
         authorityRoot,
+        targetHandle,
         current.previous_bundle_sha256,
         runtimeVersion,
         probe,

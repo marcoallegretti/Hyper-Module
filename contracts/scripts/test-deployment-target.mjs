@@ -221,6 +221,65 @@ try {
   );
   assert.deepEqual(healthRepeated, healthConfirmed7);
 
+  const substitutedHealthTarget = await createTarget(
+    temporaryRoot,
+    "substituted-health-target",
+  );
+  await deployBundle(bundle7, substitutedHealthTarget, "1.0.0");
+  const displacedHealthBundles = join(
+    substitutedHealthTarget,
+    "bundles-displaced",
+  );
+  let healthReplacementPrevented = false;
+  const substitutedHealth = resolveStartupDeployment(
+    substitutedHealthTarget,
+    "1.0.0",
+    async () => {
+      try {
+        await rename(
+          join(substitutedHealthTarget, "bundles"),
+          displacedHealthBundles,
+        );
+        await mkdir(join(substitutedHealthTarget, "bundles"));
+        await writeFile(
+          join(substitutedHealthTarget, "bundles", "sentinel"),
+          "preserve",
+        );
+      } catch (error) {
+        healthReplacementPrevented =
+          process.platform === "win32" &&
+          (error.code === "EACCES" || error.code === "EPERM");
+        if (!healthReplacementPrevented) throw error;
+      }
+      return true;
+    },
+  );
+  let substitutedHealthError;
+  try {
+    await substitutedHealth;
+  } catch (error) {
+    substitutedHealthError = error;
+  }
+  if (healthReplacementPrevented) {
+    assert.equal(substitutedHealthError, undefined);
+  } else {
+    assert.match(
+      substitutedHealthError?.message ?? "",
+      /deployment bundles directory filesystem object changed|probed deployment bundle filesystem object changed|no previous bundle is available/,
+    );
+    assert.equal(
+      await readFile(
+        join(substitutedHealthTarget, "bundles", "sentinel"),
+        "utf8",
+      ),
+      "preserve",
+    );
+    assert.equal(
+      (await readDeploymentState(substitutedHealthTarget)).active.status,
+      "pending",
+    );
+  }
+
   const healthPending8 = await deployBundle(bundle8, healthTarget, "1.0.0");
   assert.equal(healthPending8.generation, 3);
   const recovered = await resolveStartupDeployment(
@@ -390,11 +449,17 @@ try {
       },
     },
   );
-  if (replacementPrevented) {
+  let substitutedInstallError;
+  try {
     await substitutedInstall;
+  } catch (error) {
+    substitutedInstallError = error;
+  }
+  if (replacementPrevented) {
+    assert.equal(substitutedInstallError, undefined);
   } else {
-    await assert.rejects(
-      substitutedInstall,
+    assert.match(
+      substitutedInstallError?.message ?? "",
       /filesystem object changed|bundle root must be a real directory/,
     );
     assert.equal(
@@ -405,6 +470,62 @@ try {
       "preserve",
     );
     await inspectDeploymentBundle(displacedInstallation);
+  }
+
+  const substitutedBundlesTarget = await createTarget(
+    temporaryRoot,
+    "substituted-bundles-target",
+  );
+  const displacedBundles = join(
+    substitutedBundlesTarget,
+    "bundles-displaced",
+  );
+  let bundlesReplacementPrevented = false;
+  const substitutedBundlesInstall = installBundle(
+    bundle7,
+    substitutedBundlesTarget,
+    {
+      observer: async () => {
+        try {
+          await rename(
+            join(substitutedBundlesTarget, "bundles"),
+            displacedBundles,
+          );
+          await mkdir(join(substitutedBundlesTarget, "bundles"));
+          await writeFile(
+            join(substitutedBundlesTarget, "bundles", "sentinel"),
+            "preserve",
+          );
+        } catch (error) {
+          bundlesReplacementPrevented =
+            process.platform === "win32" &&
+            (error.code === "EACCES" || error.code === "EPERM");
+          if (!bundlesReplacementPrevented) throw error;
+        }
+      },
+    },
+  );
+  let substitutedBundlesError;
+  try {
+    await substitutedBundlesInstall;
+  } catch (error) {
+    substitutedBundlesError = error;
+  }
+  if (bundlesReplacementPrevented) {
+    assert.equal(substitutedBundlesError, undefined);
+  } else {
+    assert.match(
+      substitutedBundlesError?.message ?? "",
+      /deployment bundles directory filesystem object changed/,
+    );
+    assert.equal(
+      await readFile(
+        join(substitutedBundlesTarget, "bundles", "sentinel"),
+        "utf8",
+      ),
+      "preserve",
+    );
+    await inspectDeploymentBundle(join(displacedBundles, identity7));
   }
 
   const garbageTarget = await createTarget(temporaryRoot, "garbage-target");
