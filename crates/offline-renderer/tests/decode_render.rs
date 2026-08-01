@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use hyper_audio_engine::{ChannelParameters, LinearGain, Pan};
 use hyper_audio_source::{AudioContainer, DecodeLimits, decode_file};
-use hyper_offline_renderer::{AlignedInput, RenderSpec, render_aligned};
+use hyper_offline_renderer::{AlignedInput, RenderLimits, RenderSpec, render_aligned};
 
 const EPSILON: f32 = 1.0e-6;
 
@@ -68,6 +68,12 @@ fn decoded_wave_reaches_the_shared_offline_mixer() {
             block_frames: 2,
         },
         LinearGain::UNITY,
+        RenderLimits {
+            max_inputs: 1,
+            max_frames: 4,
+            max_output_bytes: 32,
+            max_working_sample_frames: 8,
+        },
     )
     .unwrap();
 

@@ -23,6 +23,14 @@ pub struct RenderSpec {
     pub block_frames: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderLimits {
+    pub max_inputs: usize,
+    pub max_frames: usize,
+    pub max_output_bytes: usize,
+    pub max_working_sample_frames: usize,
+}
+
 #[derive(Debug)]
 pub enum RenderError {
     InvalidSpec(&'static str),
@@ -40,6 +48,11 @@ pub enum RenderError {
     MixerCreation(MixerCreationError),
     Output(DecodeError),
     CapacityUnavailable,
+    LimitExceeded {
+        resource: &'static str,
+        actual: usize,
+        maximum: usize,
+    },
 }
 
 impl fmt::Display for RenderError {
@@ -70,6 +83,14 @@ impl fmt::Display for RenderError {
             Self::CapacityUnavailable => {
                 formatter.write_str("offline render capacity cannot be reserved")
             }
+            Self::LimitExceeded {
+                resource,
+                actual,
+                maximum,
+            } => write!(
+                formatter,
+                "offline render {resource} is {actual}; maximum is {maximum}"
+            ),
         }
     }
 }
@@ -110,8 +131,9 @@ pub fn render_aligned(
     inputs: &[AlignedInput<'_>],
     spec: RenderSpec,
     master_gain: LinearGain,
+    limits: RenderLimits,
 ) -> Result<DecodedAudio, RenderError> {
-    validate_spec(spec)?;
+    validate_spec(spec, inputs.len(), limits)?;
     for (index, input) in inputs.iter().enumerate() {
         if input.source.sample_rate_hz() != spec.sample_rate_hz {
             return Err(RenderError::SourceRateMismatch {
@@ -179,7 +201,11 @@ pub fn render_aligned(
     DecodedAudio::from_stereo(spec.sample_rate_hz, left, right).map_err(RenderError::Output)
 }
 
-fn validate_spec(spec: RenderSpec) -> Result<(), RenderError> {
+fn validate_spec(
+    spec: RenderSpec,
+    input_count: usize,
+    limits: RenderLimits,
+) -> Result<(), RenderError> {
     if spec.sample_rate_hz == 0 {
         return Err(RenderError::InvalidSpec("sample rate must be positive"));
     }
@@ -189,7 +215,49 @@ fn validate_spec(spec: RenderSpec) -> Result<(), RenderError> {
     if spec.block_frames == 0 || spec.block_frames > MAX_PROCESS_FRAMES {
         return Err(RenderError::InvalidSpec("block size must be in 1..=65536"));
     }
+    if limits.max_inputs == 0
+        || limits.max_frames == 0
+        || limits.max_output_bytes == 0
+        || limits.max_working_sample_frames == 0
+    {
+        return Err(RenderError::InvalidSpec(
+            "render limits must all be positive",
+        ));
+    }
+    require_limit("input count", input_count, limits.max_inputs)?;
+    require_limit("frame count", spec.frame_count, limits.max_frames)?;
+    let output_bytes = spec
+        .frame_count
+        .checked_mul(2)
+        .and_then(|samples| samples.checked_mul(size_of::<f32>()))
+        .ok_or(RenderError::InvalidSpec("output byte count overflowed"))?;
+    require_limit("output byte count", output_bytes, limits.max_output_bytes)?;
+    let working_sample_frames = spec
+        .frame_count
+        .checked_mul(
+            input_count
+                .checked_add(1)
+                .ok_or(RenderError::InvalidSpec("render work count overflowed"))?,
+        )
+        .ok_or(RenderError::InvalidSpec("render work count overflowed"))?;
+    require_limit(
+        "working sample-frame count",
+        working_sample_frames,
+        limits.max_working_sample_frames,
+    )?;
     Ok(())
+}
+
+fn require_limit(resource: &'static str, actual: usize, maximum: usize) -> Result<(), RenderError> {
+    if actual > maximum {
+        Err(RenderError::LimitExceeded {
+            resource,
+            actual,
+            maximum,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn allocate_silence(frame_count: usize) -> Result<Vec<f32>, RenderError> {
@@ -210,6 +278,15 @@ mod tests {
 
     fn parameters(gain: LinearGain, pan: Pan, audible: bool) -> ChannelParameters {
         ChannelParameters::new(gain, pan, audible)
+    }
+
+    const fn limits() -> RenderLimits {
+        RenderLimits {
+            max_inputs: 8,
+            max_frames: 100,
+            max_output_bytes: 800,
+            max_working_sample_frames: 900,
+        }
     }
 
     fn assert_samples(actual: &[f32], expected: &[f32]) {
@@ -249,6 +326,7 @@ mod tests {
                 block_frames: 3,
             },
             LinearGain::new(0.5).unwrap(),
+            limits(),
         )
         .unwrap();
 
@@ -272,6 +350,7 @@ mod tests {
                     block_frames,
                 },
                 LinearGain::UNITY,
+                limits(),
             )
             .unwrap()
         };
@@ -289,6 +368,7 @@ mod tests {
                 block_frames: 2,
             },
             LinearGain::UNITY,
+            limits(),
         )
         .unwrap();
         assert_samples(output.plane(0).unwrap(), &[0.0; 4]);
@@ -310,7 +390,8 @@ mod tests {
                     frame_count: 3,
                     block_frames: 2,
                 },
-                LinearGain::UNITY
+                LinearGain::UNITY,
+                limits(),
             ),
             Err(RenderError::SourceRateMismatch { input: 0, .. })
         ));
@@ -328,7 +409,8 @@ mod tests {
                     frame_count: 4,
                     block_frames: 2,
                 },
-                LinearGain::UNITY
+                LinearGain::UNITY,
+                limits(),
             ),
             Err(RenderError::SourceFrameMismatch { input: 0, .. })
         ));
@@ -355,9 +437,76 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                render_aligned(&[], invalid_spec, LinearGain::UNITY),
+                render_aligned(&[], invalid_spec, LinearGain::UNITY, limits()),
                 Err(RenderError::InvalidSpec(_))
             ));
         }
+    }
+
+    #[test]
+    fn rejects_work_and_output_beyond_explicit_limits() {
+        let source = DecodedAudio::from_mono(48_000, vec![0.0; 3]).unwrap();
+        let input = [AlignedInput {
+            source: &source,
+            parameters: parameters(LinearGain::UNITY, Pan::CENTER, true),
+        }];
+        for (limits, resource) in [
+            (
+                RenderLimits {
+                    max_frames: 2,
+                    ..limits()
+                },
+                "frame count",
+            ),
+            (
+                RenderLimits {
+                    max_output_bytes: 23,
+                    ..limits()
+                },
+                "output byte count",
+            ),
+            (
+                RenderLimits {
+                    max_working_sample_frames: 5,
+                    ..limits()
+                },
+                "working sample-frame count",
+            ),
+        ] {
+            assert!(matches!(
+                render_aligned(
+                    &input,
+                    RenderSpec {
+                        sample_rate_hz: 48_000,
+                        frame_count: 3,
+                        block_frames: 2,
+                    },
+                    LinearGain::UNITY,
+                    limits,
+                ),
+                Err(RenderError::LimitExceeded {
+                    resource: actual,
+                    ..
+                }) if actual == resource
+            ));
+        }
+        assert!(matches!(
+            render_aligned(
+                &input,
+                RenderSpec {
+                    sample_rate_hz: 48_000,
+                    frame_count: 3,
+                    block_frames: 2,
+                },
+                LinearGain::UNITY,
+                RenderLimits {
+                    max_inputs: 0,
+                    ..limits()
+                },
+            ),
+            Err(RenderError::InvalidSpec(
+                "render limits must all be positive"
+            ))
+        ));
     }
 }

@@ -1,7 +1,7 @@
 use hyper_audio_engine::{ChannelParameters, LinearGain, Pan};
 use hyper_audio_source::DecodedAudio;
 use hyper_clip_engine::{ClipRenderPlan, FrameRange, NativeClipSpec, PlacementSpec, TimeMapping};
-use hyper_offline_renderer::{AlignedInput, RenderSpec, render_aligned};
+use hyper_offline_renderer::{AlignedInput, RenderLimits, RenderSpec, render_aligned};
 
 const EPSILON: f32 = 1.0e-6;
 
@@ -41,6 +41,12 @@ fn rendered_looping_clip_reaches_the_shared_mixer() {
             block_frames: 3,
         },
         LinearGain::UNITY,
+        RenderLimits {
+            max_inputs: 1,
+            max_frames: 7,
+            max_output_bytes: 56,
+            max_working_sample_frames: 14,
+        },
     )
     .unwrap();
 
