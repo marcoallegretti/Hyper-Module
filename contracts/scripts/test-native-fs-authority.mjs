@@ -35,23 +35,31 @@ try {
     await mkdir(retainedPath);
     await writeFile(join(retainedPath, "replacement"), "preserve");
 
-    await assert.rejects(
-      removeRetainedDirectory(
+    if (process.platform === "linux") {
+      await removeRetainedDirectory(
         retainedHandle,
         retainedPath,
         "replaced test directory",
-      ),
-      /native cleanup failed/,
-    );
+      );
+      await assert.rejects(open(movedPath, "r"), { code: "ENOENT" });
+    } else {
+      await assert.rejects(
+        removeRetainedDirectory(
+          retainedHandle,
+          retainedPath,
+          "replaced test directory",
+        ),
+        /native cleanup failed/,
+      );
+      await removeRetainedDirectory(
+        retainedHandle,
+        movedPath,
+        "moved test directory",
+      );
+    }
     assert.equal(
       await readFile(join(retainedPath, "replacement"), "utf8"),
       "preserve",
-    );
-
-    await removeRetainedDirectory(
-      retainedHandle,
-      movedPath,
-      "moved test directory",
     );
   } finally {
     await retainedHandle.close();
