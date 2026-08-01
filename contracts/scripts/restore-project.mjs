@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import {
   lstat,
-  mkdtemp,
   realpath,
 } from "node:fs/promises";
 import {
@@ -16,7 +15,6 @@ import { pathToFileURL } from "node:url";
 
 import {
   assertRetainedDirectory,
-  openRetainedDirectory,
   syncDirectoryTree,
   syncPublishedDirectory,
 } from "../lib/durable-files.mjs";
@@ -30,6 +28,7 @@ import {
   throwPreservingCleanupError,
 } from "../lib/operation-cleanup.mjs";
 import { PublishedDirectoryDurabilityError } from "../lib/published-directory.mjs";
+import { createStagingDirectory } from "../lib/staging-directory.mjs";
 import { copyVerifiedBundleFile } from "../lib/verified-bundle-copy.mjs";
 import { verifyBundleArtifact } from "./verify-bundle.mjs";
 import {
@@ -118,11 +117,14 @@ export async function restoreProject(
     "output project must be outside the runtime bundle",
   );
 
-  const stageRoot = await mkdtemp(
-    resolve(outputParent, `.${basename(outputRoot)}.restore-`),
+  const stage = await createStagingDirectory(
+    outputParent,
+    `.${basename(outputRoot)}.restore-`,
+    "project staging directory",
   );
-  const stageHandle = await openRetainedDirectory(stageRoot);
-  const outputParentHandle = await openRetainedDirectory(outputParent);
+  const stageRoot = stage.path;
+  const stageHandle = stage.handle;
+  const outputParentHandle = stage.parentHandle;
   let published = false;
   let operationError;
   try {
@@ -172,7 +174,7 @@ export async function restoreProject(
       await renameDirectoryNoReplace(
         outputParentHandle,
         outputParent,
-        basename(stageRoot),
+        stage.name,
         await stageHandle.stat({ bigint: true }),
         basename(outputRoot),
         "project",
@@ -238,23 +240,11 @@ export async function restoreProject(
         [
           async () => {
             if (published) return;
-            let stagePresent = true;
-            try {
-              await lstat(stageRoot);
-            } catch (error) {
-              if (error.code === "ENOENT") {
-                stagePresent = false;
-              } else {
-                throw error;
-              }
-            }
-            if (stagePresent) {
-              await removeRetainedDirectory(
-                stageHandle,
-                stageRoot,
-                "project staging directory",
-              );
-            }
+            await removeRetainedDirectory(
+              stageHandle,
+              stageRoot,
+              "project staging directory",
+            );
           },
           async () => stageHandle.close(),
           async () => outputParentHandle.close(),

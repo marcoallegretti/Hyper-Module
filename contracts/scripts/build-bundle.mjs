@@ -3,7 +3,6 @@ import { createHash } from "node:crypto";
 import {
   constants,
   lstat,
-  mkdtemp,
   open,
   readFile,
   realpath,
@@ -12,7 +11,6 @@ import {
   basename,
   dirname,
   isAbsolute,
-  join,
   relative,
   resolve,
   sep,
@@ -24,7 +22,6 @@ import canonicalize from "canonicalize";
 
 import {
   assertRetainedDirectory,
-  openRetainedDirectory,
   readStableFile,
   syncDirectoryTree,
   syncPublishedDirectory,
@@ -41,6 +38,7 @@ import {
 } from "../lib/operation-cleanup.mjs";
 import { PublishedDirectoryDurabilityError } from "../lib/published-directory.mjs";
 import { strictParse } from "../lib/strict-json.mjs";
+import { createStagingDirectory } from "../lib/staging-directory.mjs";
 import { copyVerifiedBundleFile } from "../lib/verified-bundle-copy.mjs";
 import {
   verifyBundle,
@@ -367,11 +365,14 @@ export async function buildBundle(
     "output parent must be a real directory",
   );
 
-  const stageRoot = await mkdtemp(
-    join(outputParent, `.${basename(outputRoot)}.staging-`),
+  const stage = await createStagingDirectory(
+    outputParent,
+    `.${basename(outputRoot)}.staging-`,
+    "bundle staging directory",
   );
-  const stageHandle = await openRetainedDirectory(stageRoot);
-  const outputParentHandle = await openRetainedDirectory(outputParent);
+  const stageRoot = stage.path;
+  const stageHandle = stage.handle;
+  const outputParentHandle = stage.parentHandle;
   let published = false;
   let operationError;
   try {
@@ -437,7 +438,7 @@ export async function buildBundle(
       await renameDirectoryNoReplace(
         outputParentHandle,
         outputParent,
-        basename(stageRoot),
+        stage.name,
         await stageHandle.stat({ bigint: true }),
         basename(outputRoot),
         "bundle",
@@ -505,23 +506,11 @@ export async function buildBundle(
         [
           async () => {
             if (published) return;
-            let stagePresent = true;
-            try {
-              await lstat(stageRoot);
-            } catch (error) {
-              if (error.code === "ENOENT") {
-                stagePresent = false;
-              } else {
-                throw error;
-              }
-            }
-            if (stagePresent) {
-              await removeRetainedDirectory(
-                stageHandle,
-                stageRoot,
-                "bundle staging directory",
-              );
-            }
+            await removeRetainedDirectory(
+              stageHandle,
+              stageRoot,
+              "bundle staging directory",
+            );
           },
           async () => stageHandle.close(),
           async () => outputParentHandle.close(),

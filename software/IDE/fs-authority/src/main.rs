@@ -15,16 +15,19 @@ mod windows_rename {
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
-    use std::ptr::{addr_of_mut, copy_nonoverlapping, null_mut};
+    use std::ptr::{addr_of_mut, copy_nonoverlapping};
 
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
     use cap_std::fs::{Dir, File, OpenOptions, OpenOptionsExt};
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+    };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo,
-        GetFinalPathNameByHandleW, SetFileInformationByHandle,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     use super::{identity, invalid_argument};
 
@@ -55,89 +58,53 @@ mod windows_rename {
         destination: &str,
         replace: bool,
     ) -> io::Result<()> {
-        let mut destination_name = final_directory_path(destination_directory)?;
-        if !destination_name.ends_with(&['\\' as u16]) {
-            destination_name.push('\\' as u16);
-        }
-        destination_name.extend(OsStr::new(destination).encode_wide());
+        let mut destination_name: Vec<u16> = OsStr::new(destination).encode_wide().collect();
         let name_bytes = destination_name
             .len()
             .checked_mul(size_of::<u16>())
             .and_then(|length| u32::try_from(length).ok())
             .ok_or_else(|| invalid_argument("destination entry name is too long"))?;
         destination_name.push(0);
-        let buffer_bytes = size_of::<FILE_RENAME_INFO>()
+        let buffer_bytes = size_of::<FILE_RENAME_INFORMATION>()
             .checked_add(name_bytes as usize)
             .ok_or_else(|| invalid_argument("rename information size overflow"))?;
         let storage_words = buffer_bytes.div_ceil(size_of::<usize>());
         let mut storage = vec![0_usize; storage_words];
-        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let mut io_status = IO_STATUS_BLOCK::default();
 
         // SAFETY: `storage` is aligned to `usize`, sized for the fixed header and
         // complete UTF-16 name, and remains alive for the duration of the call.
         // Both handles are owned Rust values. The source was opened with DELETE
-        // access, and the destination name is one validated path component.
-        let result = unsafe {
+        // access, and the destination name is resolved relative to the retained
+        // destination directory handle.
+        let status = unsafe {
             (*information).Anonymous.ReplaceIfExists = replace;
-            (*information).RootDirectory = null_mut();
+            (*information).RootDirectory = destination_directory.as_raw_handle();
             (*information).FileNameLength = name_bytes;
             copy_nonoverlapping(
                 destination_name.as_ptr(),
                 addr_of_mut!((*information).FileName).cast::<u16>(),
                 destination_name.len(),
             );
-            SetFileInformationByHandle(
+            NtSetInformationFile(
                 source_handle.as_raw_handle(),
-                FileRenameInfo,
+                &raw mut io_status,
                 information.cast(),
                 u32::try_from(buffer_bytes)
                     .map_err(|_| invalid_argument("rename information is too large"))?,
+                FileRenameInformation,
             )
         };
-        if result != 0 {
+        if status >= 0 {
             return Ok(());
         }
-        let error = io::Error::last_os_error();
-        if matches!(
-            error.raw_os_error().map(i32::cast_unsigned),
-            Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS)
-        ) {
-            return Err(io::ErrorKind::AlreadyExists.into());
-        }
-        Err(error)
-    }
-
-    fn final_directory_path(directory: &Dir) -> io::Result<Vec<u16>> {
-        // SAFETY: The first call supplies no buffer and requests the required
-        // length. The second call owns a buffer of that reported size and the
-        // directory handle remains valid throughout both calls.
-        let required =
-            unsafe { GetFinalPathNameByHandleW(directory.as_raw_handle(), null_mut(), 0, 0) };
-        if required == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut path = vec![0_u16; required as usize];
-        // SAFETY: `path` is writable for its full reported capacity and the
-        // directory handle remains valid for the duration of the call.
-        let written = unsafe {
-            GetFinalPathNameByHandleW(
-                directory.as_raw_handle(),
-                path.as_mut_ptr(),
-                u32::try_from(path.len())
-                    .map_err(|_| invalid_argument("directory path is too long"))?,
-                0,
-            )
-        };
-        if written == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if written as usize >= path.len() {
-            return Err(invalid_argument(
-                "directory path changed while being resolved",
-            ));
-        }
-        path.truncate(written as usize);
-        Ok(path)
+        // SAFETY: `status` was returned by an NT system service and is passed
+        // directly to the documented status-to-Win32 conversion routine.
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        Err(io::Error::from_raw_os_error(
+            i32::try_from(error).unwrap_or(i32::MAX),
+        ))
     }
 
     pub(super) fn rename(
@@ -150,6 +117,77 @@ mod windows_rename {
     ) -> io::Result<()> {
         let source_handle = open_verified_source(source_directory, source, expected_identity)?;
         rename_open_source(&source_handle, destination_directory, destination, replace)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::fs;
+        use std::path::{Path, PathBuf};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use cap_std::ambient_authority;
+        use cap_std::fs::Dir;
+
+        use super::{open_verified_source, rename_open_source};
+        use crate::identity;
+
+        struct TemporaryDirectory(PathBuf);
+
+        impl TemporaryDirectory {
+            fn new() -> Self {
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock must follow the Unix epoch")
+                    .as_nanos();
+                let path = std::env::temp_dir().join(format!(
+                    "hyper-fs-authority-rename-{}-{nonce}",
+                    std::process::id()
+                ));
+                fs::create_dir(&path).expect("temporary authority root must be unique");
+                Self(path)
+            }
+
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for TemporaryDirectory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        #[test]
+        fn retained_destination_is_immutable_and_resolved_by_handle() {
+            let temporary = TemporaryDirectory::new();
+            let source_parent_path = temporary.path().join("source");
+            let destination_path = temporary.path().join("destination");
+            let retained_destination_path = temporary.path().join("retained-destination");
+            fs::create_dir(&source_parent_path).unwrap();
+            fs::create_dir(&destination_path).unwrap();
+            fs::create_dir(source_parent_path.join("entry")).unwrap();
+            fs::write(source_parent_path.join("entry/marker"), b"retained").unwrap();
+
+            let source_parent =
+                Dir::open_ambient_dir(&source_parent_path, ambient_authority()).unwrap();
+            let destination =
+                Dir::open_ambient_dir(&destination_path, ambient_authority()).unwrap();
+            let source_identity = identity(&source_parent.symlink_metadata("entry").unwrap());
+            let source = open_verified_source(&source_parent, "entry", source_identity).unwrap();
+
+            let displacement = fs::rename(&destination_path, &retained_destination_path)
+                .expect_err("retained Windows directories must reject ambient displacement");
+            assert_eq!(displacement.raw_os_error(), Some(32));
+
+            rename_open_source(&source, &destination, "published", false).unwrap();
+
+            assert_eq!(
+                fs::read(destination_path.join("published/marker")).unwrap(),
+                b"retained"
+            );
+            assert!(!retained_destination_path.exists());
+        }
     }
 }
 
@@ -256,6 +294,67 @@ fn create_destination_directory(parent: &Dir, name: &str) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn create_verified_directory(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let parent = arguments
+        .next()
+        .ok_or_else(|| invalid_argument("parent directory path is required"))?;
+    let expected_device = parse_identity(arguments.next(), "parent device identity is required")?;
+    let expected_file = parse_identity(arguments.next(), "parent file identity is required")?;
+    let name = parse_name(arguments.next(), "directory name is required")?;
+    if arguments.next().is_some() {
+        return Err(invalid_argument("unexpected filesystem authority argument").into());
+    }
+
+    let parent = open_verified_directory(&parent, (expected_device, expected_file))?;
+    #[cfg(unix)]
+    let builder = {
+        use cap_std::fs::DirBuilderExt;
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = DirBuilder::new();
+    parent.create_dir_with(&name, &builder)?;
+    let directory = parent.open_dir_nofollow(&name)?;
+    let metadata = directory.dir_metadata()?;
+    if !metadata.is_dir() {
+        return Err(invalid_argument("created entry is not a directory").into());
+    }
+    let (device, file) = identity(&metadata);
+    println!("{device} {file}");
+    Ok(())
+}
+
+fn remove_verified_directory_entry(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let parent = arguments
+        .next()
+        .ok_or_else(|| invalid_argument("parent directory path is required"))?;
+    let expected_device = parse_identity(arguments.next(), "parent device identity is required")?;
+    let expected_file = parse_identity(arguments.next(), "parent file identity is required")?;
+    let name = parse_name(arguments.next(), "directory name is required")?;
+    let entry_device = parse_identity(arguments.next(), "directory device identity is required")?;
+    let entry_file = parse_identity(arguments.next(), "directory file identity is required")?;
+    if arguments.next().is_some() {
+        return Err(invalid_argument("unexpected filesystem authority argument").into());
+    }
+
+    let parent = open_verified_directory(&parent, (expected_device, expected_file))?;
+    let directory = parent.open_dir_nofollow(&name)?;
+    let metadata = directory.dir_metadata()?;
+    if !metadata.is_dir() || identity(&metadata) != (entry_device, entry_file) {
+        return Err(
+            invalid_argument("directory entry identity does not match retained authority").into(),
+        );
+    }
+    directory.remove_open_dir_all()?;
+    Ok(())
 }
 
 fn open_destination_parent(
@@ -640,6 +739,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Some("remove-directory") => remove_verified_directory(&mut arguments),
+        Some("create-directory") => create_verified_directory(&mut arguments),
+        Some("remove-directory-entry") => remove_verified_directory_entry(&mut arguments),
         Some("rename-directory-no-replace") => rename_verified_directory_no_replace(&mut arguments),
         Some("rename-directory-between-no-replace") => {
             rename_verified_directory_between_no_replace(&mut arguments)

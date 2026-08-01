@@ -18,8 +18,10 @@ import { openRetainedDirectory } from "../lib/durable-files.mjs";
 import { runNativeProcess } from "../lib/native-process.mjs";
 import {
   copyRetainedFile,
+  createRetainedDirectory,
   preflightFilesystemAuthority,
   removeRetainedDirectory,
+  removeRetainedDirectoryEntry,
   renameDirectoryBetweenNoReplace,
   renameDirectoryNoReplace,
   renameEntryBetweenReplace,
@@ -101,6 +103,64 @@ try {
 
   const parentHandle = await openRetainedDirectory(temporaryRoot);
   try {
+    const created = await createRetainedDirectory(
+      parentHandle,
+      temporaryRoot,
+      "created-under-authority",
+      "test retained directory",
+    );
+    const createdStatus = await lstat(
+      join(temporaryRoot, "created-under-authority"),
+      { bigint: true },
+    );
+    assert.equal(createdStatus.dev, created.identity.dev);
+    assert.equal(createdStatus.ino, created.identity.ino);
+    await assert.rejects(
+      createRetainedDirectory(
+        parentHandle,
+        temporaryRoot,
+        "created-under-authority",
+        "colliding retained directory",
+      ),
+      { code: "EEXIST" },
+    );
+    await removeRetainedDirectoryEntry(
+      parentHandle,
+      temporaryRoot,
+      "created-under-authority",
+      created.identity,
+      "test retained directory entry",
+    );
+    await assert.rejects(
+      open(join(temporaryRoot, "created-under-authority"), "r"),
+      { code: "ENOENT" },
+    );
+
+    const boundCreated = await createRetainedDirectory(
+      parentHandle,
+      temporaryRoot,
+      "created-bound",
+      "identity-bound created directory",
+    );
+    await rename(
+      join(temporaryRoot, "created-bound"),
+      join(temporaryRoot, "created-bound-displaced"),
+    );
+    await mkdir(join(temporaryRoot, "created-bound"));
+    await assert.rejects(
+      removeRetainedDirectoryEntry(
+        parentHandle,
+        temporaryRoot,
+        "created-bound",
+        boundCreated.identity,
+        "identity-bound directory cleanup",
+      ),
+      /native cleanup failed/,
+    );
+    await open(join(temporaryRoot, "created-bound"), "r").then((handle) =>
+      handle.close(),
+    );
+
     await mkdir(join(temporaryRoot, "publish-source"));
     await renameDirectoryNoReplace(
       parentHandle,
@@ -430,7 +490,7 @@ try {
   } finally {
     await parentHandle.close();
   }
-  console.log("Native filesystem authority passed: 16 identity cases");
+  console.log("Native filesystem authority passed: 20 identity cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

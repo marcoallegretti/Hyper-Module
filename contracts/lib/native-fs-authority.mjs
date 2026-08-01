@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import { runNativeProcess } from "./native-process.mjs";
 
@@ -71,6 +71,18 @@ function parseTransferResult(output, label) {
   return { byteLength, sha256: match[2] };
 }
 
+function parseIdentityResult(output, label) {
+  const match = /^([0-9]+) ([0-9]+)\r?\n$/.exec(output.toString("utf8"));
+  assert(match, `${label} native operation returned an invalid identity`);
+  return { dev: BigInt(match[1]), ino: BigInt(match[2]) };
+}
+
+function retainedChildPath(handle, ambientPath, childName) {
+  return process.platform === "linux"
+    ? join(`/proc/self/fd/${handle.fd}`, childName)
+    : join(ambientPath, childName);
+}
+
 export async function preflightFilesystemAuthority(
   label = "filesystem authority",
 ) {
@@ -80,6 +92,66 @@ export async function preflightFilesystemAuthority(
     throw new Error(`${label} native helper compatibility check failed`, {
       cause: error,
     });
+  }
+}
+
+export async function createRetainedDirectory(
+  parentHandle,
+  parentPath,
+  childName,
+  label,
+) {
+  const status = await parentHandle.stat({ bigint: true });
+  assert(status.isDirectory(), `${label} parent authority is not a directory`);
+  const authority = retainedAuthority(parentHandle, parentPath, 3);
+  try {
+    const output = await runHelper(
+      [
+        "create-directory",
+        authority.path,
+        String(status.dev),
+        String(status.ino),
+        childName,
+      ],
+      authority.descriptor === undefined ? [] : [authority.descriptor],
+      { captureOutput: true },
+    );
+    return {
+      path: retainedChildPath(parentHandle, parentPath, childName),
+      identity: parseIdentityResult(output, label),
+    };
+  } catch (error) {
+    const wrapped = new Error(`${label} native creation failed`, { cause: error });
+    if (error.code === 2) wrapped.code = "EEXIST";
+    throw wrapped;
+  }
+}
+
+export async function removeRetainedDirectoryEntry(
+  parentHandle,
+  parentPath,
+  childName,
+  childIdentity,
+  label,
+) {
+  const status = await parentHandle.stat({ bigint: true });
+  assert(status.isDirectory(), `${label} parent authority is not a directory`);
+  const authority = retainedAuthority(parentHandle, parentPath, 3);
+  const identity = retainedEntryIdentity(childIdentity, label);
+  try {
+    await runHelper(
+      [
+        "remove-directory-entry",
+        authority.path,
+        String(status.dev),
+        String(status.ino),
+        childName,
+        ...identity,
+      ],
+      authority.descriptor === undefined ? [] : [authority.descriptor],
+    );
+  } catch (error) {
+    throw new Error(`${label} native cleanup failed`, { cause: error });
   }
 }
 
