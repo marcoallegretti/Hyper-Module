@@ -606,6 +606,28 @@ try {
   assert.deepEqual(await readdir(collisionPath), []);
   assert.equal(await readDeploymentLock(publicationCollisionTarget), null);
 
+  const growingSource = join(temporaryRoot, "growing-source.runtime");
+  await cp(bundle7, growingSource, { recursive: true });
+  const growingTarget = await createTarget(temporaryRoot, "growing-source-target");
+  await assert.rejects(
+    installBundle(growingSource, growingTarget, {
+      copyObserver: async (boundary) => {
+        assert.equal(boundary, "before-staging-copy");
+        const projectPath = join(growingSource, "project.json");
+        await writeFile(
+          projectPath,
+          Buffer.concat([await readFile(projectPath), Buffer.from("x")]),
+        );
+      },
+    }),
+    /project\.json: source size changed before copy/,
+  );
+  assert.equal(await readDeploymentLock(growingTarget), null);
+  assert.deepEqual(
+    (await readdir(growingTarget)).filter((name) => name.startsWith(".install-")),
+    [],
+  );
+
   const garbageTarget = await createTarget(temporaryRoot, "garbage-target");
   const garbageIdentity = await installBundle(bundle7, garbageTarget);
   assert.equal((await readDeploymentStorage(garbageTarget)).installed_bundle_count, 1);
@@ -1483,7 +1505,7 @@ try {
     ),
   );
 
-console.log("Deployment target passed: 159 transaction cases");
+  console.log("Deployment target passed: 160 transaction cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

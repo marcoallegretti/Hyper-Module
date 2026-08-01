@@ -83,6 +83,29 @@ try {
   const bundlePath = join(temporaryRoot, "project.runtime");
   await buildProjectBundle(fixture.root, bundlePath, "1.0.0");
   const manifest = await verifyBundle(bundlePath);
+  const bundleByteLength =
+    (await readFile(join(bundlePath, "manifest.json"))).byteLength +
+    manifest.files.reduce(
+      (total, descriptor) => total + descriptor.byte_length,
+      0,
+    );
+
+  const boundedOutputPath = join(temporaryRoot, "bounded-restore");
+  await assert.rejects(
+    restoreProject(bundlePath, boundedOutputPath, {
+      maximumProjectBytes: bundleByteLength - 1,
+    }),
+    /deployment bundle exceeds/,
+  );
+  assert.equal(await pathExists(boundedOutputPath), false);
+  const exactLimitOutputPath = join(temporaryRoot, "exact-limit-restore");
+  await restoreProject(bundlePath, exactLimitOutputPath, {
+    maximumProjectBytes: bundleByteLength,
+  });
+  assert.equal(
+    (await verifyProject(exactLimitOutputPath)).identity,
+    sourceVerification.identity,
+  );
 
   const restoredPath = join(temporaryRoot, "desktop-restored");
   const restored = await restoreProject(bundlePath, restoredPath);
@@ -234,7 +257,7 @@ try {
     sourceVerification.identity,
   );
 
-  console.log("Project round trip passed: 19 preservation and recovery cases");
+  console.log("Project round trip passed: 21 preservation and recovery cases");
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }

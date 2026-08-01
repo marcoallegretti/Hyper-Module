@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import {
-  cp,
   lstat,
   mkdir,
   open,
@@ -46,6 +45,7 @@ import {
   removeRetainedDirectory as removeRetainedDirectoryNative,
   renameDirectoryBetweenNoReplace,
 } from "../lib/native-fs-authority.mjs";
+import { copyVerifiedBundleFile } from "../lib/verified-bundle-copy.mjs";
 
 const contractRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -1093,8 +1093,10 @@ async function installIdentity(
     faultAt = undefined,
     expectedIdentity = undefined,
     observer = async () => {},
+    copyObserver = async () => {},
   } = {},
 ) {
+  assert.equal(typeof copyObserver, "function", "copy observer must be a function");
   const policy = await readStoragePolicy(targetRoot);
   assert(policy, "deployment storage policy is not configured");
   const maximumBundleBytes =
@@ -1143,12 +1145,42 @@ async function installIdentity(
     let published = false;
     let accepted = false;
     try {
-      await cp(sourceRoot, stagingPath, {
-        recursive: true,
-        errorOnExist: true,
-        force: false,
-        verbatimSymlinks: true,
-      });
+      await copyObserver("before-staging-copy", { sourceRoot, stagingPath });
+      const sourceRootReal = await realpath(sourceRoot);
+      const payloadBytes = source.manifest.files.reduce(
+        (total, descriptor) => total + descriptor.byte_length,
+        0,
+      );
+      const manifestByteLength = source.byte_length - payloadBytes;
+      assert(
+        Number.isSafeInteger(manifestByteLength) && manifestByteLength > 0,
+        "runtime bundle manifest byte length is invalid",
+      );
+      const descriptors = [
+        {
+          path: "manifest.json",
+          byte_length: manifestByteLength,
+          sha256: source.sha256,
+        },
+        ...source.manifest.files,
+      ].sort((left, right) =>
+        left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
+      );
+      let copiedBytes = 0;
+      for (const descriptor of descriptors) {
+        copiedBytes += await copyVerifiedBundleFile(
+          sourceRoot,
+          sourceRootReal,
+          stagingPath,
+          descriptor,
+          source.byte_length - copiedBytes,
+        );
+      }
+      assert.equal(
+        copiedBytes,
+        source.byte_length,
+        "staged deployment bundle byte length mismatch",
+      );
       injectFault(faultAt, "after-staging-copy");
       const staged = await inspectBundle(stagingPath, inspectionOptions);
       assert.equal(
@@ -1247,6 +1279,7 @@ async function installIdentity(
 export async function installBundle(bundlePath, targetPath, options = {}) {
   const faultAt = validateFaultBoundary(options.faultAt);
   const observer = validateDeploymentObserver(options.observer);
+  const copyObserver = validateDeploymentObserver(options.copyObserver);
   const sourceRoot = resolve(bundlePath);
   const targetRoot = await requireTarget(targetPath);
   return withDeploymentLock(targetRoot, async (authorityRoot, targetHandle) => {
@@ -1255,7 +1288,7 @@ export async function installBundle(bundlePath, targetPath, options = {}) {
       sourceRoot,
       authorityRoot,
       targetHandle,
-      { faultAt, observer },
+      { faultAt, observer, copyObserver },
     );
   });
 }

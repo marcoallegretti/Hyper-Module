@@ -1,12 +1,7 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import {
-  chmod,
-  constants,
   lstat,
-  mkdir,
   mkdtemp,
-  open,
   realpath,
 } from "node:fs/promises";
 import {
@@ -30,8 +25,12 @@ import {
   renameDirectoryNoReplace,
 } from "../lib/native-fs-authority.mjs";
 import { PublishedDirectoryDurabilityError } from "../lib/published-directory.mjs";
-import { verifyBundle } from "./verify-bundle.mjs";
-import { verifyProject } from "./verify-project.mjs";
+import { copyVerifiedBundleFile } from "../lib/verified-bundle-copy.mjs";
+import { verifyBundleArtifact } from "./verify-bundle.mjs";
+import {
+  defaultMaximumProjectBytes,
+  verifyProject,
+} from "./verify-project.mjs";
 
 const faultBoundaries = new Set([
   "after-payload-copy",
@@ -67,117 +66,21 @@ function isContainedOrEqual(rootPath, candidatePath) {
   );
 }
 
-async function writeAll(handle, bytes) {
-  let offset = 0;
-  while (offset < bytes.length) {
-    const { bytesWritten } = await handle.write(
-      bytes,
-      offset,
-      bytes.length - offset,
-    );
-    assert(bytesWritten > 0, "write made no forward progress");
-    offset += bytesWritten;
-  }
-}
-
-async function copyVerifiedPayload(
-  bundleRoot,
-  bundleRootReal,
-  stageRoot,
-  descriptor,
+export async function restoreProject(
+  bundlePath,
+  outputPath,
+  {
+    faultAt,
+    maximumProjectBytes = defaultMaximumProjectBytes,
+  } = {},
 ) {
-  const sourcePath = resolve(bundleRoot, ...descriptor.path.split("/"));
-  assertContained(bundleRoot, sourcePath, descriptor.path);
-  const sourceStatus = await lstat(sourcePath);
-  assert(
-    sourceStatus.isFile() && !sourceStatus.isSymbolicLink(),
-    `${descriptor.path}: source must be a regular file`,
-  );
-  const sourceReal = await realpath(sourcePath);
-  assertContained(bundleRootReal, sourceReal, descriptor.path);
-
-  const destinationPath = resolve(stageRoot, ...descriptor.path.split("/"));
-  assertContained(stageRoot, destinationPath, descriptor.path);
-  await mkdir(dirname(destinationPath), { recursive: true, mode: 0o755 });
-
-  const noFollow = constants.O_NOFOLLOW ?? 0;
-  const sourceHandle = await open(sourcePath, constants.O_RDONLY | noFollow);
-  const destinationHandle = await open(
-    destinationPath,
-    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
-    0o644,
-  );
-  const digest = createHash("sha256");
-  let byteLength = 0;
-  let before;
-  let after;
-  try {
-    before = await sourceHandle.stat();
-    for await (const chunk of sourceHandle.createReadStream({
-      autoClose: false,
-    })) {
-      digest.update(chunk);
-      byteLength += chunk.length;
-      await writeAll(destinationHandle, chunk);
-    }
-    await destinationHandle.sync();
-    after = await sourceHandle.stat();
-  } finally {
-    await Promise.allSettled([sourceHandle.close(), destinationHandle.close()]);
-  }
-
-  assert(
-    before.isFile() && after.isFile(),
-    `${descriptor.path}: source changed type during restoration`,
-  );
-  assert.equal(
-    before.size,
-    after.size,
-    `${descriptor.path}: source size changed during restoration`,
-  );
-  assert.equal(
-    before.mtimeMs,
-    after.mtimeMs,
-    `${descriptor.path}: source changed during restoration`,
-  );
-  assert.equal(
-    before.ctimeMs,
-    after.ctimeMs,
-    `${descriptor.path}: source metadata changed during restoration`,
-  );
-  assert.equal(
-    byteLength,
-    descriptor.byte_length,
-    `${descriptor.path}: restored byte length mismatch`,
-  );
-  assert.equal(
-    digest.digest("hex"),
-    descriptor.sha256,
-    `${descriptor.path}: restored SHA-256 mismatch`,
-  );
-
-  const finalSourceStatus = await lstat(sourcePath);
-  assert(
-    finalSourceStatus.isFile() && !finalSourceStatus.isSymbolicLink(),
-    `${descriptor.path}: source path changed type during restoration`,
-  );
-  assert.equal(
-    finalSourceStatus.dev,
-    after.dev,
-    `${descriptor.path}: source path changed during restoration`,
-  );
-  assert.equal(
-    finalSourceStatus.ino,
-    after.ino,
-    `${descriptor.path}: source path changed during restoration`,
-  );
-  await chmod(destinationPath, 0o644);
-}
-
-export async function restoreProject(bundlePath, outputPath, { faultAt } = {}) {
   assert(
     faultAt === undefined || faultBoundaries.has(faultAt),
     "unknown restoration fault boundary",
+  );
+  assert(
+    Number.isSafeInteger(maximumProjectBytes) && maximumProjectBytes > 0,
+    "maximum project bytes must be a positive safe integer",
   );
 
   const bundleRoot = resolve(bundlePath);
@@ -187,7 +90,10 @@ export async function restoreProject(bundlePath, outputPath, { faultAt } = {}) {
     "bundle root must be a real directory",
   );
   const bundleRootReal = await realpath(bundleRoot);
-  const manifest = await verifyBundle(bundleRoot);
+  const verifiedBundle = await verifyBundleArtifact(bundleRoot, {
+    maximumBundleBytes: maximumProjectBytes,
+  });
+  const manifest = verifiedBundle.manifest;
 
   const outputRoot = resolve(outputPath);
   const outputParent = dirname(outputRoot);
@@ -216,17 +122,19 @@ export async function restoreProject(bundlePath, outputPath, { faultAt } = {}) {
     const payloads = [...manifest.files].sort((left, right) =>
       left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
     );
+    let copiedBytes = 0;
     for (const descriptor of payloads) {
-      await copyVerifiedPayload(
+      copiedBytes += await copyVerifiedBundleFile(
         bundleRoot,
         bundleRootReal,
         stageRoot,
         descriptor,
+        maximumProjectBytes - copiedBytes,
       );
     }
     injectFault(faultAt, "after-payload-copy");
 
-    const restored = await verifyProject(stageRoot);
+    const restored = await verifyProject(stageRoot, { maximumProjectBytes });
     assert.equal(
       restored.identity,
       `sha256:${manifest.source_project_sha256}`,
@@ -239,7 +147,9 @@ export async function restoreProject(bundlePath, outputPath, { faultAt } = {}) {
       stageRoot,
       payloads.map((descriptor) => descriptor.path),
     );
-    const finalRestored = await verifyProject(stageRoot);
+    const finalRestored = await verifyProject(stageRoot, {
+      maximumProjectBytes,
+    });
     assert.equal(
       finalRestored.identity,
       restored.identity,
