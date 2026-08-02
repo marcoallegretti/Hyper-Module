@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hyper_audio_source::{DecodeError, DecodeLimits};
+use hyper_control_mappings::ControlMappingBindingErrorKind;
 use hyper_media_cache::CacheLimits;
 use hyper_playback_json::LoaderLimits;
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
@@ -10,7 +11,6 @@ use hyper_project_loader::{
     ProjectPlaybackError, ProjectPlaybackLimits, RecordingBindingErrorKind,
     prepare_project_playback,
 };
-use hyper_project_model::ResourceRole;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -28,6 +28,8 @@ const SECOND_MIXER_ID: &str = "018f47a2-6b2d-7c11-8a44-00112233445f";
 const SECOND_ARRANGEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334460";
 const RECORDING_METADATA_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334461";
 const FOREIGN_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334462";
+const SECOND_MAPPING_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334463";
+const BINDING_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334464";
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -316,6 +318,12 @@ impl Fixture {
         self.write_manifest(&manifest);
     }
 
+    fn set_cv_inputs(&self, inputs: u8) {
+        let mut manifest = self.manifest();
+        manifest["required_capabilities"]["cv_inputs"] = inputs.into();
+        self.write_manifest(&manifest);
+    }
+
     fn manifest(&self) -> Value {
         serde_json::from_slice(&fs::read(self.root.join("project.json")).unwrap()).unwrap()
     }
@@ -491,21 +499,7 @@ fn recording_metadata_id_cannot_collide_with_a_nested_playback_identity() {
 }
 
 #[test]
-fn rejects_every_role_that_the_playback_runtime_does_not_own() {
-    let mapping = Fixture::new();
-    mapping.add_resource(
-        MAPPING_ID,
-        "mapping",
-        "mappings/controller.json",
-        &json!({}),
-    );
-    assert!(matches!(
-        prepare_project_playback(&mapping.root, limits()),
-        Err(ProjectPlaybackError::UnsupportedResourceRole(
-            ResourceRole::Mapping
-        ))
-    ));
-
+fn requires_complete_playback_resource_ownership() {
     let missing_mixer = Fixture::new();
     missing_mixer.remove_mixer();
     assert!(matches!(
@@ -541,6 +535,126 @@ fn rejects_every_role_that_the_playback_runtime_does_not_own() {
         prepare_project_playback(&duplicate_arrangement.root, limits()),
         Err(ProjectPlaybackError::MultipleArrangements)
     ));
+}
+
+#[test]
+fn loads_and_binds_one_verified_control_mapping() {
+    let fixture = Fixture::new();
+    fixture.set_cv_inputs(1);
+    fixture.add_resource(
+        MAPPING_ID,
+        "mapping",
+        "mappings/controller.json",
+        &control_mapping(MAPPING_ID, BINDING_ID, TRACK_ID, Value::Null),
+    );
+
+    let prepared = prepare_project_playback(&fixture.root, limits()).unwrap();
+    let mapping = prepared.control_mapping().unwrap();
+    assert_eq!(mapping.id(), MAPPING_ID);
+    assert_eq!(mapping.project_id(), PROJECT_ID);
+    assert_eq!(mapping.bindings().len(), 1);
+}
+
+#[test]
+fn rejects_invalid_or_ambiguous_control_mapping_resources() {
+    let malformed = Fixture::new();
+    malformed.add_resource(
+        MAPPING_ID,
+        "mapping",
+        "mappings/controller.json",
+        &json!({}),
+    );
+    assert!(matches!(
+        prepare_project_playback(&malformed.root, limits()),
+        Err(ProjectPlaybackError::ControlMapping { resource_id, .. })
+            if resource_id == MAPPING_ID
+    ));
+
+    let duplicate = Fixture::new();
+    duplicate.set_cv_inputs(1);
+    duplicate.add_resource(
+        MAPPING_ID,
+        "mapping",
+        "mappings/controller.json",
+        &control_mapping(MAPPING_ID, BINDING_ID, TRACK_ID, Value::Null),
+    );
+    let mut second = control_mapping(SECOND_MAPPING_ID, BINDING_ID, TRACK_ID, Value::Null);
+    second["bindings"] = json!([]);
+    duplicate.add_resource(
+        SECOND_MAPPING_ID,
+        "mapping",
+        "mappings/second.json",
+        &second,
+    );
+    assert!(matches!(
+        prepare_project_playback(&duplicate.root, limits()),
+        Err(ProjectPlaybackError::MultipleControlMappings)
+    ));
+}
+
+#[test]
+fn rejects_unavailable_mapping_sources_and_unresolved_graph_references() {
+    let unavailable = Fixture::new();
+    unavailable.add_resource(
+        MAPPING_ID,
+        "mapping",
+        "mappings/controller.json",
+        &control_mapping(MAPPING_ID, BINDING_ID, TRACK_ID, Value::Null),
+    );
+    assert_mapping_binding_kind(
+        prepare_project_playback(&unavailable.root, limits()),
+        ControlMappingBindingErrorKind::CvInputUnavailable {
+            index: 0,
+            available: 0,
+        },
+    );
+
+    let target = Fixture::new();
+    target.set_cv_inputs(1);
+    target.add_resource(
+        MAPPING_ID,
+        "mapping",
+        "mappings/controller.json",
+        &control_mapping(MAPPING_ID, BINDING_ID, FOREIGN_ID, Value::Null),
+    );
+    assert_mapping_binding_kind(
+        prepare_project_playback(&target.root, limits()),
+        ControlMappingBindingErrorKind::MixerChannelMissing,
+    );
+
+    let scope = Fixture::new();
+    scope.set_cv_inputs(1);
+    scope.add_resource(
+        MAPPING_ID,
+        "mapping",
+        "mappings/controller.json",
+        &control_mapping(
+            MAPPING_ID,
+            BINDING_ID,
+            TRACK_ID,
+            json!({"kind": "track", "track_id": FOREIGN_ID}),
+        ),
+    );
+    assert_mapping_binding_kind(
+        prepare_project_playback(&scope.root, limits()),
+        ControlMappingBindingErrorKind::TrackScopeMissing,
+    );
+}
+
+#[test]
+fn rejects_mapping_binding_identity_collisions() {
+    let fixture = Fixture::new();
+    fixture.set_cv_inputs(1);
+    fixture.add_resource(
+        MAPPING_ID,
+        "mapping",
+        "mappings/controller.json",
+        &control_mapping(MAPPING_ID, PLACEMENT_ID, TRACK_ID, Value::Null),
+    );
+    assert_mapping_binding_kind(
+        prepare_project_playback(&fixture.root, limits()),
+        ControlMappingBindingErrorKind::IdentityCollision,
+    );
 }
 
 #[test]
@@ -735,6 +849,39 @@ fn recording_metadata(
     })
 }
 
+fn control_mapping(
+    mapping_id: &str,
+    binding_id: &str,
+    target_track_id: &str,
+    scope: Value,
+) -> Value {
+    json!({
+        "format": "hyper-control-mappings",
+        "format_version": 1,
+        "id": mapping_id,
+        "project_id": PROJECT_ID,
+        "bindings": [{
+            "id": binding_id,
+            "enabled": true,
+            "source": {"kind": "cv-input", "input_index": 0},
+            "scope": if scope.is_null() { json!({"kind": "global"}) } else { scope },
+            "transform": {
+                "kind": "linear",
+                "input_min": -1_000_000,
+                "input_max": 1_000_000,
+                "output_min": 0,
+                "output_max": 1_000_000
+            },
+            "target": {
+                "kind": "mixer-channel",
+                "track_id": target_track_id,
+                "parameter": "gain"
+            }
+        }],
+        "extensions": {}
+    })
+}
+
 fn assert_binding_kind(
     result: Result<hyper_project_loader::PreparedProjectPlayback, ProjectPlaybackError>,
     expected: RecordingBindingErrorKind,
@@ -744,6 +891,18 @@ fn assert_binding_kind(
             assert_eq!(error.kind(), expected);
         }
         other => panic!("expected recording binding error, got {other:?}"),
+    }
+}
+
+fn assert_mapping_binding_kind(
+    result: Result<hyper_project_loader::PreparedProjectPlayback, ProjectPlaybackError>,
+    expected: ControlMappingBindingErrorKind,
+) {
+    match result {
+        Err(ProjectPlaybackError::ControlMappingBinding(error)) => {
+            assert_eq!(error.kind(), expected);
+        }
+        other => panic!("expected control mapping binding error, got {other:?}"),
     }
 }
 

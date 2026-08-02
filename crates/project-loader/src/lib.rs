@@ -7,6 +7,10 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use hyper_audio_source::{AudioContainer, DecodeError, DecodeLimits, decode_bytes};
+use hyper_control_mappings::{
+    ControlMappingBindingError, ControlMappingDocument, ControlMappingParseError,
+    ControlMappingProject,
+};
 use hyper_playback_session::{
     DecodedPlaybackAsset, PlaybackDocumentBytes, PlaybackSessionAssemblyError,
     PlaybackSessionAssemblyInput, PlaybackSessionAssemblyLimits, PreparedPlaybackSession,
@@ -32,6 +36,7 @@ pub struct ProjectPlaybackLimits {
 pub struct PreparedProjectPlayback {
     package: StructurallyVerifiedProject,
     session: PreparedPlaybackSession,
+    control_mapping: Option<ControlMappingDocument>,
     recording_metadata: Vec<RecordingMetadataDocument>,
 }
 
@@ -47,6 +52,11 @@ impl PreparedProjectPlayback {
     }
 
     #[must_use]
+    pub const fn control_mapping(&self) -> Option<&ControlMappingDocument> {
+        self.control_mapping.as_ref()
+    }
+
+    #[must_use]
     pub fn recording_metadata(&self) -> &[RecordingMetadataDocument] {
         &self.recording_metadata
     }
@@ -57,9 +67,15 @@ impl PreparedProjectPlayback {
     ) -> (
         StructurallyVerifiedProject,
         PreparedPlaybackSession,
+        Option<ControlMappingDocument>,
         Vec<RecordingMetadataDocument>,
     ) {
-        (self.package, self.session, self.recording_metadata)
+        (
+            self.package,
+            self.session,
+            self.control_mapping,
+            self.recording_metadata,
+        )
     }
 }
 
@@ -170,8 +186,13 @@ pub enum ProjectPlaybackError {
     MissingMixer,
     MultipleArrangements,
     MultipleMixers,
-    UnsupportedResourceRole(ResourceRole),
+    MultipleControlMappings,
     Storage(StorageError),
+    ControlMapping {
+        resource_id: String,
+        source: ControlMappingParseError,
+    },
+    ControlMappingBinding(ControlMappingBindingError),
     RecordingMetadata {
         resource_id: String,
         source: RecordingMetadataParseError,
@@ -228,10 +249,18 @@ impl fmt::Display for ProjectPlaybackError {
             Self::MultipleMixers => {
                 formatter.write_str("playback package has multiple mixer resources")
             }
-            Self::UnsupportedResourceRole(role) => {
-                write!(formatter, "resource role {role:?} is not a playback input")
+            Self::MultipleControlMappings => {
+                formatter.write_str("playback package has multiple control-mapping resources")
             }
             Self::Storage(source) => write!(formatter, "package verification failed: {source}"),
+            Self::ControlMapping {
+                resource_id,
+                source,
+            } => write!(
+                formatter,
+                "control-mapping resource {resource_id} is invalid: {source}"
+            ),
+            Self::ControlMappingBinding(source) => source.fmt(formatter),
             Self::RecordingMetadata {
                 resource_id,
                 source,
@@ -272,6 +301,8 @@ impl Error for ProjectPlaybackError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Storage(source) => Some(source),
+            Self::ControlMapping { source, .. } => Some(source),
+            Self::ControlMappingBinding(source) => Some(source),
             Self::RecordingMetadata { source, .. } => Some(source),
             Self::ResourceJson { source, .. } => Some(source),
             Self::RecordingBinding(source) => Some(source),
@@ -286,8 +317,8 @@ impl Error for ProjectPlaybackError {
             | Self::MissingMixer
             | Self::MultipleArrangements
             | Self::MultipleMixers
-            | Self::ResourceIdMismatch { .. }
-            | Self::UnsupportedResourceRole(_) => None,
+            | Self::MultipleControlMappings
+            | Self::ResourceIdMismatch { .. } => None,
         }
     }
 }
@@ -303,8 +334,9 @@ impl From<StorageError> for ProjectPlaybackError {
 ///
 /// Recording metadata is bound to verified recording assets, decoded media
 /// facts, project input capabilities, and loaded audio tracks. Control
-/// mappings remain explicitly rejected because they are not playback inputs.
-/// No resource role is silently ignored.
+/// mappings are parsed and bound to verified capabilities, identities, scopes,
+/// mixer targets, scenes, and exact integer transforms. No resource role is
+/// silently ignored.
 ///
 /// # Errors
 ///
@@ -347,10 +379,24 @@ pub fn prepare_project_playback(
     })
     .map_err(ProjectPlaybackError::Assembly)?;
     validate_recording_media(&session, &captured.recording_metadata, &decoded.facts)?;
+    if let Some(mapping) = &captured.control_mapping {
+        mapping
+            .document
+            .validate_for_project(
+                &mapping.descriptor_id,
+                &LoadedMappingProject {
+                    package: &package,
+                    session: &session,
+                    nested_playback_ids: &captured.nested_playback_ids,
+                },
+            )
+            .map_err(ProjectPlaybackError::ControlMappingBinding)?;
+    }
     package.confirm_unchanged()?;
     Ok(PreparedProjectPlayback {
         package,
         session,
+        control_mapping: captured.control_mapping.map(|mapping| mapping.document),
         recording_metadata: captured
             .recording_metadata
             .into_iter()
@@ -525,6 +571,7 @@ struct ResourceInventory<'manifest> {
     scenes: Vec<&'manifest ResourceDescriptor>,
     arrangement: Option<&'manifest ResourceDescriptor>,
     mixer: &'manifest ResourceDescriptor,
+    control_mapping: Option<&'manifest ResourceDescriptor>,
     automation_takes: Vec<&'manifest ResourceDescriptor>,
     recording_metadata: Vec<&'manifest ResourceDescriptor>,
 }
@@ -558,6 +605,7 @@ impl<'manifest> ResourceInventory<'manifest> {
         let mut scenes = Vec::new();
         let mut arrangement = None;
         let mut mixer = None;
+        let mut control_mapping = None;
         let mut automation_takes = Vec::new();
         let mut recording_metadata = Vec::new();
         for descriptor in resources {
@@ -580,9 +628,9 @@ impl<'manifest> ResourceInventory<'manifest> {
                     push_descriptor(&mut automation_takes, descriptor)?;
                 }
                 ResourceRole::Mapping => {
-                    return Err(ProjectPlaybackError::UnsupportedResourceRole(
-                        descriptor.role(),
-                    ));
+                    if control_mapping.replace(descriptor).is_some() {
+                        return Err(ProjectPlaybackError::MultipleControlMappings);
+                    }
                 }
                 ResourceRole::RecordingMetadata => {
                     push_descriptor(&mut recording_metadata, descriptor)?;
@@ -597,6 +645,7 @@ impl<'manifest> ResourceInventory<'manifest> {
             scenes,
             arrangement,
             mixer,
+            control_mapping,
             automation_takes,
             recording_metadata,
         })
@@ -628,6 +677,10 @@ impl<'manifest> ResourceInventory<'manifest> {
                     &mut nested_playback_ids,
                 )?,
             },
+            control_mapping: self
+                .control_mapping
+                .map(|descriptor| read_control_mapping(package, descriptor))
+                .transpose()?,
             recording_metadata: read_recording_metadata(package, &self.recording_metadata)?,
             nested_playback_ids,
         })
@@ -636,13 +689,102 @@ impl<'manifest> ResourceInventory<'manifest> {
 
 struct CapturedPackage {
     playback: PlaybackDocumentBytes,
+    control_mapping: Option<CapturedControlMapping>,
     recording_metadata: Vec<CapturedRecordingMetadata>,
     nested_playback_ids: BTreeSet<String>,
+}
+
+struct CapturedControlMapping {
+    descriptor_id: String,
+    document: ControlMappingDocument,
 }
 
 struct CapturedRecordingMetadata {
     descriptor_id: String,
     document: RecordingMetadataDocument,
+}
+
+struct LoadedMappingProject<'project> {
+    package: &'project StructurallyVerifiedProject,
+    session: &'project PreparedPlaybackSession,
+    nested_playback_ids: &'project BTreeSet<String>,
+}
+
+impl ControlMappingProject for LoadedMappingProject<'_> {
+    fn project_id(&self) -> &str {
+        self.package.manifest().project_id()
+    }
+
+    fn cv_inputs(&self) -> u8 {
+        self.package.manifest().required_capabilities().cv_inputs()
+    }
+
+    fn has_clock_input(&self) -> bool {
+        self.package
+            .manifest()
+            .required_capabilities()
+            .has_clock_input()
+    }
+
+    fn has_reset_input(&self) -> bool {
+        self.package
+            .manifest()
+            .required_capabilities()
+            .has_reset_input()
+    }
+
+    fn contains_entity(&self, id: &str) -> bool {
+        self.package
+            .manifest()
+            .resources()
+            .iter()
+            .any(|descriptor| descriptor.id() == id)
+            || self
+                .package
+                .manifest()
+                .assets()
+                .iter()
+                .any(|descriptor| descriptor.id() == id)
+            || self.nested_playback_ids.contains(id)
+    }
+
+    fn contains_track(&self, id: &str) -> bool {
+        self.package
+            .manifest()
+            .resources()
+            .iter()
+            .any(|descriptor| descriptor.role() == ResourceRole::Track && descriptor.id() == id)
+    }
+
+    fn contains_scene(&self, id: &str) -> bool {
+        self.package
+            .manifest()
+            .resources()
+            .iter()
+            .any(|descriptor| descriptor.role() == ResourceRole::Scene && descriptor.id() == id)
+    }
+
+    fn contains_mixer_channel(&self, track_id: &str) -> bool {
+        self.session
+            .parts()
+            .1
+            .slots()
+            .iter()
+            .any(|slot| slot.track_id() == track_id)
+    }
+
+    fn contains_mixer_send(&self, send_id: &str) -> bool {
+        self.session
+            .parts()
+            .1
+            .slots()
+            .iter()
+            .any(|slot| slot.sends().iter().any(|send| send.id() == send_id))
+    }
+
+    fn is_solo_source_track(&self, track_id: &str) -> bool {
+        self.session.parts().0.is_audio_track(track_id)
+    }
 }
 
 struct DecodedAssetFact<'asset> {
@@ -675,6 +817,23 @@ fn read_documents(
         documents.push(read_playback_document(package, descriptor, nested_ids)?);
     }
     Ok(documents)
+}
+
+fn read_control_mapping(
+    package: &StructurallyVerifiedProject,
+    descriptor: &ResourceDescriptor,
+) -> Result<CapturedControlMapping, ProjectPlaybackError> {
+    let bytes = package.read_resource(descriptor.id())?;
+    let document = ControlMappingDocument::parse(&bytes).map_err(|source| {
+        ProjectPlaybackError::ControlMapping {
+            resource_id: descriptor.id().to_owned(),
+            source,
+        }
+    })?;
+    Ok(CapturedControlMapping {
+        descriptor_id: descriptor.id().to_owned(),
+        document,
+    })
 }
 
 fn read_playback_document(

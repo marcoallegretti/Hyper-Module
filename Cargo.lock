@@ -607,6 +607,7 @@ name = "hyper-project-loader"
 version = "0.1.0"
 dependencies = [
  "hyper-audio-source",
+ "hyper-control-mappings",
  "hyper-media-cache",
  "hyper-playback-json",
  "hyper-playback-session",
