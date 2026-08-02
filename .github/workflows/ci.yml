@@ -60,6 +60,14 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --all-targets --locked
 
+      - name: Lint and test vendored PipeWire bindings
+        if: runner.os == 'Linux'
+        env:
+          CARGO_TARGET_DIR: target
+        run: |
+          cargo clippy --manifest-path third_party/pipewire/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path third_party/pipewire/Cargo.toml
+
       - name: Build optimized workspace
         run: cargo build --workspace --all-targets --locked --release
 
