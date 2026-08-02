@@ -224,8 +224,10 @@ fn publishes_exact_float_wav_and_is_idempotent() {
         &<[u8; 32]>::from(Sha256::digest(fs::read(&wav).unwrap()))
     );
     assert_eq!(published.outcome(), PublicationOutcome::Published);
+    assert!(!directory.join(".take.wav.hyper-staging").exists());
     let republished = publish_wav(&journal, &wav).unwrap();
     assert_eq!(republished.outcome(), PublicationOutcome::AlreadyPublished);
+    assert!(!directory.join(".take.wav.hyper-staging").exists());
     assert_eq!(republished.byte_length(), published.byte_length());
     assert_eq!(republished.wav_sha256(), published.wav_sha256());
     let mut reader = hound::WavReader::open(&wav).unwrap();
@@ -281,6 +283,7 @@ fn owned_writer_publication_uses_the_locked_journal_after_path_replacement() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn resumes_a_verified_staging_file_after_interruption() {
     let directory = TestDirectory::new();
@@ -293,10 +296,8 @@ fn resumes_a_verified_staging_file_after_interruption() {
     publish_wav(&journal, &wav).unwrap();
     fs::rename(&wav, &staging).unwrap();
 
-    assert_eq!(
-        publish_wav(&journal, &wav).unwrap().outcome(),
-        PublicationOutcome::Published
-    );
+    let resumed = publish_wav(&journal, &wav).unwrap();
+    assert_eq!(resumed.outcome(), PublicationOutcome::Published);
     assert!(wav.exists());
     assert!(!staging.exists());
 }
@@ -318,6 +319,34 @@ fn preserves_a_conflicting_staging_file_for_explicit_resolution() {
     ));
     assert_eq!(fs::read(staging).unwrap(), b"unrelated data");
     assert!(!wav.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn preserves_named_staging_for_explicit_resolution_then_retries_from_the_journal() {
+    let directory = TestDirectory::new();
+    let journal = directory.join("take.journal");
+    let wav = directory.join("take.wav");
+    let staging = directory.join(".take.wav.hyper-staging");
+    let mut writer = JournalWriter::create(&journal, config()).unwrap();
+    writer.append(&[0.25, -0.25]).unwrap();
+    drop(writer);
+    publish_wav(&journal, &wav).unwrap();
+    fs::copy(&wav, &staging).unwrap();
+    fs::remove_file(&wav).unwrap();
+    let staged_bytes = fs::read(&staging).unwrap();
+
+    assert!(matches!(
+        publish_wav(&journal, &wav),
+        Err(JournalError::StagingConflict(path)) if path == staging
+    ));
+    assert_eq!(fs::read(&staging).unwrap(), staged_bytes);
+    assert!(!wav.exists());
+
+    fs::remove_file(&staging).unwrap();
+    let published = publish_wav(&journal, &wav).unwrap();
+    assert_eq!(published.outcome(), PublicationOutcome::Published);
+    assert_eq!(fs::read(&wav).unwrap(), staged_bytes);
 }
 
 #[test]

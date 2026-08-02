@@ -527,7 +527,6 @@ dependencies = [
  "rustix",
  "same-file",
  "sha2",
- "uuid",
  "windows-sys 0.61.2",
 ]
 

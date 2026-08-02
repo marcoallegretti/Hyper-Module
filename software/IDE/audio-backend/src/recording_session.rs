@@ -111,7 +111,7 @@ impl fmt::Display for DesktopRecordingSessionStartError {
                 source,
             } => write!(
                 formatter,
-                "desktop input startup failed; recoverable journal remains at {}: {source}",
+                "desktop input startup failed; last configured journal path was {}: {source}",
                 journal_path.display()
             ),
         }
@@ -162,7 +162,7 @@ impl fmt::Display for DesktopRecordingSessionStopError {
                 ..
             } => write!(
                 formatter,
-                "desktop input shutdown failed; recording was not published and its journal remains at {}: {source}",
+                "desktop input shutdown failed; recording was not published and the last configured journal path was {}: {source}",
                 journal_path.display()
             ),
             Self::CaptureIntegrity {
@@ -171,7 +171,7 @@ impl fmt::Display for DesktopRecordingSessionStopError {
                 ..
             } => write!(
                 formatter,
-                "capture integrity failed; recording was not published and its journal remains at {}: callbacks={}, captured={}, dropped_frames={}, discontinuities={}, timestamp_errors={}, unavailable_buffers={}, malformed_buffers={}",
+                "capture integrity failed; recording was not published and the last configured journal path was {}: callbacks={}, captured={}, dropped_frames={}, discontinuities={}, timestamp_errors={}, unavailable_buffers={}, malformed_buffers={}",
                 journal_path.display(),
                 capture.callback_count,
                 capture.captured_callback_count,
@@ -187,7 +187,7 @@ impl fmt::Display for DesktopRecordingSessionStopError {
                 ..
             } => write!(
                 formatter,
-                "recording disposition failed; journal remains at {}: {source}",
+                "recording disposition failed; last configured journal path was {}: {source}",
                 journal_path.display()
             ),
             Self::Writer {
@@ -196,7 +196,7 @@ impl fmt::Display for DesktopRecordingSessionStopError {
                 ..
             } => write!(
                 formatter,
-                "recording writer shutdown failed; journal remains at {}: {source}",
+                "recording writer shutdown failed; last configured journal path was {}: {source}",
                 journal_path.display()
             ),
         }
@@ -325,6 +325,8 @@ pub struct DesktopRecordingPendingCompletion {
 }
 
 impl DesktopRecordingPendingCompletion {
+    /// Returns the last configured path for presentation while the worker is
+    /// still pending. Only a terminal completion can prove recoverability.
     #[must_use]
     pub fn journal_path(&self) -> &Path {
         &self.journal_path
@@ -356,7 +358,7 @@ pub enum DesktopRecordingSessionCommitError {
     },
     Failed {
         frames: u64,
-        journal_path: PathBuf,
+        journal_path: Option<PathBuf>,
         source: RecordingWorkerFailure,
     },
 }
@@ -377,11 +379,17 @@ impl fmt::Display for DesktopRecordingSessionCommitError {
                 frames,
                 journal_path,
                 source,
-            } => write!(
-                formatter,
-                "recording commit failed after {frames} frames; journal remains at {}: {source}",
-                journal_path.display()
-            ),
+            } => match journal_path {
+                Some(journal_path) => write!(
+                    formatter,
+                    "recording commit failed after {frames} frames; journal remains at {}: {source}",
+                    journal_path.display()
+                ),
+                None => write!(
+                    formatter,
+                    "recording commit failed after {frames} frames and no recovery journal path can be proven: {source}"
+                ),
+            },
         }
     }
 }

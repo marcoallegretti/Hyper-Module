@@ -124,13 +124,14 @@ fn commit_refuses_to_publish_after_any_transport_rejection() {
     drop(producer);
     worker.request_commit().unwrap();
 
+    let completion = worker.wait(WAIT).unwrap();
     assert!(matches!(
-        worker.wait(WAIT).unwrap(),
+        &completion,
         RecordingWorkerCompletion::Failed {
             frames: 1,
+            journal_path: Some(path),
             error: RecordingWorkerFailure::TransportIntegrity { .. },
-            ..
-        }
+        } if path == &journal
     ));
     assert_eq!(recover(journal).unwrap().frames, 1);
     assert!(!wav.exists());
@@ -307,7 +308,7 @@ fn worker_retains_both_recording_parent_directories_until_completion() {
 
 #[cfg(unix)]
 #[test]
-fn worker_never_redirects_recording_into_replacement_parent_directories() {
+fn worker_refuses_publication_after_recording_parent_displacement() {
     let directory = TestDirectory::new();
     let journal_parent = directory.0.join("journals");
     let media_parent = directory.0.join("media");
@@ -344,10 +345,14 @@ fn worker_never_redirects_recording_into_replacement_parent_directories() {
     worker.request_commit().unwrap();
     assert!(matches!(
         worker.wait(WAIT).unwrap(),
-        RecordingWorkerCompletion::Published(_)
+        RecordingWorkerCompletion::Failed {
+            frames: 1,
+            journal_path: None,
+            error: RecordingWorkerFailure::JournalLocationLost { .. },
+        }
     ));
     assert!(moved_journal_parent.join("take.journal").is_file());
-    assert!(moved_media_parent.join("take.wav").is_file());
+    assert!(!moved_media_parent.join("take.wav").exists());
     assert!(!journal_parent.join("take.journal").exists());
     assert!(!media_parent.join("take.wav").exists());
     assert_eq!(
@@ -358,4 +363,43 @@ fn worker_never_redirects_recording_into_replacement_parent_directories() {
         fs::read(media_parent.join("owner.txt")).unwrap(),
         b"replacement media parent"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_never_reports_a_stale_recovery_path_after_parent_displacement() {
+    let directory = TestDirectory::new();
+    let journal_parent = directory.0.join("journals");
+    let moved_journal_parent = directory.0.join("moved-journals");
+    fs::create_dir(&journal_parent).unwrap();
+    let config = RecordingWorkerConfig {
+        journal_path: journal_parent.join("take.journal"),
+        final_wav_path: directory.0.join("take.wav"),
+        journal: JournalConfig {
+            sample_rate: 48_000,
+            max_chunk_frames: 8,
+            max_total_frames: 64,
+        },
+        drain_frames: 1,
+    };
+    let (producer, consumer) = try_recording_transport(1).unwrap();
+    let mut worker = RecordingWorker::start(config, consumer).unwrap();
+
+    fs::rename(&journal_parent, &moved_journal_parent).unwrap();
+    fs::create_dir(&journal_parent).unwrap();
+    drop(producer);
+    worker.request_abort().unwrap();
+
+    assert!(matches!(
+        worker.wait(WAIT).unwrap(),
+        RecordingWorkerCompletion::Failed {
+            frames: 0,
+            journal_path: None,
+            error: RecordingWorkerFailure::Journal(
+                hyper_recording_journal::JournalError::PathAuthorityLost(_)
+            ),
+        }
+    ));
+    assert!(moved_journal_parent.join("take.journal").is_file());
+    assert!(!journal_parent.join("take.journal").exists());
 }

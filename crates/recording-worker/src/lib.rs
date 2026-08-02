@@ -10,8 +10,8 @@ use hyper_recording_transport::{
 use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSnapshot};
 use std::collections::TryReserveError;
 use std::error::Error;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,7 +65,6 @@ pub enum RecordingWorkerStartError {
     Allocation(TryReserveError),
     Journal(JournalError),
     WakeRegistration(RecordingWakeRegistrationError),
-    PathValidation(io::Error),
     ThreadSpawn(io::Error),
     ThreadTerminated,
 }
@@ -88,12 +87,6 @@ impl fmt::Display for RecordingWorkerStartError {
                     "recording worker wake registration failed: {source}"
                 )
             }
-            Self::PathValidation(source) => {
-                write!(
-                    formatter,
-                    "recording worker path validation failed: {source}"
-                )
-            }
             Self::ThreadSpawn(source) => {
                 write!(
                     formatter,
@@ -113,7 +106,7 @@ impl Error for RecordingWorkerStartError {
             Self::Allocation(source) => Some(source),
             Self::Journal(source) => Some(source),
             Self::WakeRegistration(source) => Some(source),
-            Self::PathValidation(source) | Self::ThreadSpawn(source) => Some(source),
+            Self::ThreadSpawn(source) => Some(source),
             Self::InvalidConfig(_) | Self::ThreadTerminated => None,
         }
     }
@@ -151,6 +144,10 @@ impl Error for RecordingDispositionError {}
 pub enum RecordingWorkerFailure {
     Journal(JournalError),
     Drain(RecordingDrainError),
+    JournalLocationLost {
+        failure: Box<RecordingWorkerFailure>,
+        location: JournalError,
+    },
     TransportIntegrity {
         transport: RecordingTransportSnapshot,
         journal_frames: u64,
@@ -162,6 +159,10 @@ impl fmt::Display for RecordingWorkerFailure {
         match self {
             Self::Journal(source) => write!(formatter, "recording journal failed: {source}"),
             Self::Drain(source) => write!(formatter, "recording transport drain failed: {source}"),
+            Self::JournalLocationLost { failure, location } => write!(
+                formatter,
+                "{failure}; the recovery journal locator was also lost: {location}"
+            ),
             Self::TransportIntegrity {
                 transport,
                 journal_frames,
@@ -181,6 +182,7 @@ impl Error for RecordingWorkerFailure {
         match self {
             Self::Journal(source) => Some(source),
             Self::Drain(source) => Some(source),
+            Self::JournalLocationLost { failure, .. } => Some(failure.as_ref()),
             Self::TransportIntegrity { .. } => None,
         }
     }
@@ -207,7 +209,7 @@ pub enum RecordingWorkerCompletion {
     },
     Failed {
         frames: u64,
-        journal_path: PathBuf,
+        journal_path: Option<PathBuf>,
         error: RecordingWorkerFailure,
     },
 }
@@ -279,6 +281,7 @@ impl RecordingWorker {
             .map_err(RecordingWorkerStartError::Journal)?;
         let final_authority = RecordingPathAuthority::retain(&final_wav_path)
             .map_err(RecordingWorkerStartError::Journal)?;
+        validate_authority_relationship(&journal_authority, &final_authority)?;
         let sample_count = drain_frames.checked_mul(RECORDING_CHANNELS).ok_or(
             RecordingWorkerStartError::InvalidConfig("drain sample count overflowed"),
         )?;
@@ -288,8 +291,6 @@ impl RecordingWorker {
             .map_err(RecordingWorkerStartError::Allocation)?;
         drain_buffer.resize(sample_count, 0.0);
 
-        let journal_path = journal_authority.path().to_owned();
-        let thread_journal_path = journal_path.clone();
         let (consumer_sender, consumer_receiver) = sync_channel(1);
         let (disposition_sender, disposition_receiver) = sync_channel(1);
         let (completion_sender, completion_receiver) = sync_channel(1);
@@ -304,7 +305,7 @@ impl RecordingWorker {
                 let Ok((consumer, writer)) = consumer_receiver.recv() else {
                     return RecordingWorkerCompletion::Failed {
                         frames: 0,
-                        journal_path: thread_journal_path,
+                        journal_path: None,
                         error: RecordingWorkerFailure::Journal(JournalError::InvalidJournal(
                             "recording startup ownership was unavailable",
                         )),
@@ -315,7 +316,6 @@ impl RecordingWorker {
                     writer,
                     drain_buffer,
                     &disposition_receiver,
-                    thread_journal_path,
                     &final_authority,
                     &thread_cancel,
                 )
@@ -338,9 +338,7 @@ impl RecordingWorker {
         if let Err(error) = consumer_sender.send((consumer, writer)) {
             let (_, writer) = error.0;
             let _ = handle.join();
-            writer
-                .discard()
-                .map_err(RecordingWorkerStartError::Journal)?;
+            drop(writer);
             return Err(RecordingWorkerStartError::ThreadTerminated);
         }
         Ok(Self {
@@ -481,9 +479,40 @@ fn validate_config(
             "final media path must have a WAV extension",
         ));
     }
-    let journal_path = resolve_destination(&config.journal_path)?;
-    let final_path = resolve_destination(&config.final_wav_path)?;
-    if journal_path == final_path || journal_path == staging_path(&final_path)? {
+    validate_destination_syntax(&config.journal_path)?;
+    validate_destination_syntax(&config.final_wav_path)?;
+    Ok(())
+}
+
+fn validate_destination_syntax(path: &Path) -> Result<(), RecordingWorkerStartError> {
+    if !path.is_absolute() {
+        return Err(RecordingWorkerStartError::InvalidConfig(
+            "recording paths must be absolute",
+        ));
+    }
+    path.file_name()
+        .ok_or(RecordingWorkerStartError::InvalidConfig(
+            "recording path must have a file name",
+        ))?;
+    path.parent()
+        .ok_or(RecordingWorkerStartError::InvalidConfig(
+            "recording path must have a parent directory",
+        ))?;
+    Ok(())
+}
+
+fn validate_authority_relationship(
+    journal: &RecordingPathAuthority,
+    final_wav: &RecordingPathAuthority,
+) -> Result<(), RecordingWorkerStartError> {
+    if !journal
+        .has_same_parent(final_wav)
+        .map_err(RecordingWorkerStartError::Journal)?
+    {
+        return Ok(());
+    }
+    let staging = staging_file_name(final_wav.file_name());
+    if journal.file_name() == final_wav.file_name() || journal.file_name() == staging {
         return Err(RecordingWorkerStartError::InvalidConfig(
             "journal path overlaps final or staging media",
         ));
@@ -491,34 +520,11 @@ fn validate_config(
     Ok(())
 }
 
-fn resolve_destination(path: &Path) -> Result<PathBuf, RecordingWorkerStartError> {
-    if !path.is_absolute() {
-        return Err(RecordingWorkerStartError::InvalidConfig(
-            "recording paths must be absolute",
-        ));
-    }
-    let name = path
-        .file_name()
-        .ok_or(RecordingWorkerStartError::InvalidConfig(
-            "recording path must have a file name",
-        ))?;
-    let parent = path
-        .parent()
-        .ok_or(RecordingWorkerStartError::InvalidConfig(
-            "recording path must have a parent directory",
-        ))?;
-    let parent = fs::canonicalize(parent).map_err(RecordingWorkerStartError::PathValidation)?;
-    Ok(parent.join(name))
-}
-
-fn staging_path(final_path: &Path) -> Result<PathBuf, RecordingWorkerStartError> {
-    let name = final_path
-        .file_name()
-        .ok_or(RecordingWorkerStartError::InvalidConfig(
-            "final WAV path must have a file name",
-        ))?
-        .to_string_lossy();
-    Ok(final_path.with_file_name(format!(".{name}.hyper-staging")))
+fn staging_file_name(final_name: &OsStr) -> OsString {
+    let mut staging = OsString::from(".");
+    staging.push(final_name);
+    staging.push(".hyper-staging");
+    staging
 }
 
 fn run_worker(
@@ -526,7 +532,6 @@ fn run_worker(
     mut writer: JournalWriter,
     mut drain_buffer: Vec<f32>,
     disposition_receiver: &Receiver<RecordingDisposition>,
-    journal_path: PathBuf,
     final_wav_path: &RecordingPathAuthority,
     hard_cancel: &AtomicBool,
 ) -> RecordingWorkerCompletion {
@@ -534,22 +539,19 @@ fn run_worker(
     let mut disposition = None;
     loop {
         if hard_cancel.load(Ordering::Acquire) {
-            return RecordingWorkerCompletion::Aborted {
-                frames: writer.committed_frames(),
-                journal_path,
-            };
+            return aborted(&writer, writer.committed_frames());
         }
         receive_disposition(disposition_receiver, &mut disposition);
         let drained = match consumer.drain(&mut drain_buffer) {
             Ok(drained) => drained,
             Err(error) => {
-                return failed(writer.committed_frames(), journal_path, error.into());
+                return failed(&writer, writer.committed_frames(), error.into());
             }
         };
         if drained.frames > 0
             && let Err(error) = writer.append(&drain_buffer[..drained.frames * RECORDING_CHANNELS])
         {
-            return failed(writer.committed_frames(), journal_path, error.into());
+            return failed(&writer, writer.committed_frames(), error.into());
         }
         if drained.producer_closed && drained.frames == 0 {
             let Some(disposition) = disposition else {
@@ -558,10 +560,7 @@ fn run_worker(
             };
             let frames = writer.committed_frames();
             if disposition == RecordingDisposition::Abort {
-                return RecordingWorkerCompletion::Aborted {
-                    frames,
-                    journal_path,
-                };
+                return aborted(&writer, frames);
             }
             let snapshot = counters.snapshot();
             if snapshot.rejected_block_count != 0
@@ -569,8 +568,8 @@ fn run_worker(
                 || snapshot.drained_frame_count != frames
             {
                 return failed(
+                    &writer,
                     frames,
-                    journal_path,
                     RecordingWorkerFailure::TransportIntegrity {
                         transport: snapshot,
                         journal_frames: frames,
@@ -579,7 +578,7 @@ fn run_worker(
             }
             return match writer.publish_wav_retained(final_wav_path) {
                 Ok(recording) => RecordingWorkerCompletion::Published(recording),
-                Err(error) => failed(frames, journal_path, error.into()),
+                Err(error) => failed(&writer, frames, error.into()),
             };
         }
         if drained.frames == 0 {
@@ -603,13 +602,37 @@ fn receive_disposition(
 }
 
 fn failed(
+    writer: &JournalWriter,
     frames: u64,
-    journal_path: PathBuf,
-    error: RecordingWorkerFailure,
+    mut error: RecordingWorkerFailure,
 ) -> RecordingWorkerCompletion {
+    let journal_path = match writer.proven_path() {
+        Ok(path) => Some(path),
+        Err(location) => {
+            error = RecordingWorkerFailure::JournalLocationLost {
+                failure: Box::new(error),
+                location,
+            };
+            None
+        }
+    };
     RecordingWorkerCompletion::Failed {
         frames,
         journal_path,
         error,
+    }
+}
+
+fn aborted(writer: &JournalWriter, frames: u64) -> RecordingWorkerCompletion {
+    match writer.proven_path() {
+        Ok(journal_path) => RecordingWorkerCompletion::Aborted {
+            frames,
+            journal_path,
+        },
+        Err(error) => RecordingWorkerCompletion::Failed {
+            frames,
+            journal_path: None,
+            error: error.into(),
+        },
     }
 }
