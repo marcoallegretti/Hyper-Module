@@ -213,3 +213,25 @@ Licenses:
 
 - <https://github.com/microsoft/windows-rs/blob/master/license-mit>
 - <https://github.com/microsoft/windows-rs/blob/master/license-apache>
+
+## COBS 0.5.1 and CRC 3.4.0
+
+The `hyper-panel-protocol` crate uses COBS 0.5.1 for bounded serial framing and
+CRC 3.4.0 with CRC Catalog 2.5.0 for CRC-32C integrity checks. These packages
+are licensed under either the MIT License or Apache License 2.0.
+
+COBS brings the locked `heapless` 0.9.3, `hash32` 0.3.1,
+`stable_deref_trait` 1.2.1, and `thiserror` 2.0.19 dependency chain. These
+packages are licensed under either the MIT License or Apache License 2.0.
+`byteorder` 1.5.0 is licensed under either the Unlicense or MIT License.
+
+Sources:
+
+- <https://github.com/jamesmunns/cobs.rs/tree/v0.5.1>
+- <https://github.com/mrhooray/crc-rs/tree/2c8fd9615d620b5a5f8c9556b79a4ca173d6d401>
+- <https://github.com/akhilles/crc-catalog>
+- <https://github.com/rust-embedded/heapless>
+- <https://github.com/japaric/hash32>
+- <https://github.com/storyyeller/stable_deref_trait>
+- <https://github.com/dtolnay/thiserror>
+- <https://github.com/BurntSushi/byteorder>
