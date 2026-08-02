@@ -1,5 +1,6 @@
 [package]
 name = "pipewire"
+build = "build.rs"
 version.workspace = true
 authors.workspace = true
 rust-version.workspace = true
@@ -23,6 +24,13 @@ bitflags.workspace = true
 
 [dev-dependencies]
 clap = { workspace = true, features = ["derive"] }
+
+[build-dependencies]
+system-deps.workspace = true
+version-compare = "0.2"
+
+[package.metadata.system-deps]
+libpipewire = { name = "libpipewire-0.3", version = "1.0" }
 
 [features]
 v0_3_32 = []

@@ -426,14 +426,15 @@ type ProcessWithClockCB<D> = dyn FnMut(&Stream, &mut D, Option<ProcessClock>);
 /// [`ListenerLocalBuilder::process_with_clock`] receives `None`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessClock {
-    graph_cycle: u32,
+    graph_cycle: Option<u32>,
     accumulated_xrun: u64,
-    recovering_xrun: bool,
+    recovering_xrun: Option<bool>,
 }
 
 impl ProcessClock {
-    /// Counter incremented whenever the graph is started.
-    pub fn graph_cycle(self) -> u32 {
+    /// Counter incremented whenever the graph is started, when published by
+    /// the installed PipeWire headers.
+    pub fn graph_cycle(self) -> Option<u32> {
         self.graph_cycle
     }
 
@@ -442,8 +443,9 @@ impl ProcessClock {
         self.accumulated_xrun
     }
 
-    /// Whether this node is recovering from an XRUN in the preceding cycle.
-    pub fn recovering_xrun(self) -> bool {
+    /// Whether this node is recovering from an XRUN in the preceding cycle,
+    /// when the installed PipeWire headers define that evidence.
+    pub fn recovering_xrun(self) -> Option<bool> {
         self.recovering_xrun
     }
 }
@@ -498,10 +500,22 @@ unsafe fn process_clock_snapshot(clock: ptr::NonNull<spa_sys::spa_io_clock>) -> 
     // PipeWire publishes its read-only clock before entering process().
     let clock = unsafe { clock.as_ptr().read_volatile() };
     ProcessClock {
-        graph_cycle: clock.cycle,
+        #[cfg(pipewire_1_2)]
+        graph_cycle: Some(clock.cycle),
+        #[cfg(not(pipewire_1_2))]
+        graph_cycle: None,
         accumulated_xrun: clock.xrun,
-        recovering_xrun: clock.flags & spa_sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER != 0,
+        #[cfg(pipewire_1_4)]
+        recovering_xrun: Some(clock.flags & spa_sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER != 0),
+        #[cfg(not(pipewire_1_4))]
+        recovering_xrun: None,
     }
+}
+
+unsafe fn process_clock_for_callback(
+    clock: Option<ptr::NonNull<spa_sys::spa_io_clock>>,
+) -> Option<ProcessClock> {
+    clock.map(|clock| unsafe { process_clock_snapshot(clock) })
 }
 
 impl<D> ListenerLocalCallbacks<D> {
@@ -625,9 +639,7 @@ impl<D> ListenerLocalCallbacks<D> {
             if let Some(state) = (data as *mut ListenerLocalCallbacks<D>).as_mut() {
                 let stream = unwrap_stream_ptr(state.stream);
                 if let Some(cb) = &mut state.process_with_clock {
-                    let clock = state
-                        .position_clock
-                        .map(|clock| unsafe { process_clock_snapshot(clock) });
+                    let clock = unsafe { process_clock_for_callback(state.position_clock) };
                     cb(stream, &mut state.user_data, clock);
                 } else if let Some(cb) = &mut state.process {
                     cb(stream, &mut state.user_data);
@@ -1064,29 +1076,48 @@ mod tests {
 
     #[test]
     fn position_clock_binding_tracks_only_compatible_position_io() {
-        let existing = ptr::NonNull::dangling();
-        let unrelated = update_position_clock(
-            Some(existing),
-            spa_sys::SPA_IO_Position + 1,
-            ptr::null_mut(),
-            0,
+        // SAFETY: all-zero is a valid test value for this C data structure.
+        let mut first_clock = unsafe { mem::zeroed::<spa_sys::spa_io_clock>() };
+        // SAFETY: all-zero is a valid test value for this C data structure.
+        let mut replacement_clock = unsafe { mem::zeroed::<spa_sys::spa_io_clock>() };
+        let first = ptr::NonNull::from(&mut first_clock);
+        let replacement = ptr::NonNull::from(&mut replacement_clock);
+        let compatible_size = u32::try_from(mem::size_of::<spa_sys::spa_io_clock>()).unwrap();
+
+        let unrelated =
+            update_position_clock(None, spa_sys::SPA_IO_Position + 1, ptr::null_mut(), 0);
+        assert_eq!(unrelated, None);
+
+        let bound = update_position_clock(
+            unrelated,
+            spa_sys::SPA_IO_Position,
+            first.as_ptr().cast(),
+            compatible_size,
         );
-        assert_eq!(unrelated, Some(existing));
+        assert_eq!(bound, Some(first));
+
+        let replaced = update_position_clock(
+            bound,
+            spa_sys::SPA_IO_Position,
+            replacement.as_ptr().cast(),
+            compatible_size,
+        );
+        assert_eq!(replaced, Some(replacement));
 
         assert_eq!(
             update_position_clock(
-                Some(existing),
+                replaced,
                 spa_sys::SPA_IO_Position,
                 ptr::null_mut(),
-                u32::try_from(mem::size_of::<spa_sys::spa_io_clock>()).unwrap(),
+                compatible_size,
             ),
             None
         );
         assert_eq!(
             update_position_clock(
-                Some(existing),
+                Some(first),
                 spa_sys::SPA_IO_Position,
-                existing.as_ptr().cast(),
+                first.as_ptr().cast(),
                 u32::try_from(mem::size_of::<spa_sys::spa_io_clock>() - 1).unwrap(),
             ),
             None
@@ -1097,16 +1128,46 @@ mod tests {
     fn process_clock_snapshot_preserves_xrun_evidence() {
         // SAFETY: all-zero is a valid test value for this C data structure.
         let mut clock = unsafe { mem::zeroed::<spa_sys::spa_io_clock>() };
-        clock.flags = spa_sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER;
-        clock.cycle = 17;
+        #[cfg(pipewire_1_4)]
+        {
+            clock.flags = spa_sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER;
+        }
+        #[cfg(pipewire_1_2)]
+        {
+            clock.cycle = 17;
+        }
         clock.xrun = 23;
         let pointer = ptr::NonNull::from(&mut clock);
 
         // SAFETY: `pointer` refers to `clock` for this entire read.
-        let snapshot = unsafe { process_clock_snapshot(pointer) };
+        let snapshot = unsafe { process_clock_for_callback(Some(pointer)) }.unwrap();
 
-        assert_eq!(snapshot.graph_cycle(), 17);
         assert_eq!(snapshot.accumulated_xrun(), 23);
-        assert!(snapshot.recovering_xrun());
+        #[cfg(pipewire_1_2)]
+        assert_eq!(snapshot.graph_cycle(), Some(17));
+        #[cfg(not(pipewire_1_2))]
+        assert_eq!(snapshot.graph_cycle(), None);
+        #[cfg(pipewire_1_4)]
+        assert_eq!(snapshot.recovering_xrun(), Some(true));
+        #[cfg(not(pipewire_1_4))]
+        assert_eq!(snapshot.recovering_xrun(), None);
+    }
+
+    #[test]
+    fn process_clock_callback_value_tracks_binding_availability() {
+        // SAFETY: no native clock is bound.
+        assert_eq!(unsafe { process_clock_for_callback(None) }, None);
+
+        // SAFETY: all-zero is a valid test value for this C data structure.
+        let mut clock = unsafe { mem::zeroed::<spa_sys::spa_io_clock>() };
+        clock.xrun = 31;
+        let pointer = ptr::NonNull::from(&mut clock);
+
+        // SAFETY: `pointer` refers to `clock` for this entire read.
+        let bound = unsafe { process_clock_for_callback(Some(pointer)) }.unwrap();
+        assert_eq!(bound.accumulated_xrun(), 31);
+
+        // SAFETY: removal clears the native clock binding.
+        assert_eq!(unsafe { process_clock_for_callback(None) }, None);
     }
 }

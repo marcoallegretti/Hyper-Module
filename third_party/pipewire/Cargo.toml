@@ -18,7 +18,7 @@ authors = [
     "Tom Wagner <tom.a.wagner@protonmail.com>",
     "Guillaume Desmottes <guillaume.desmottes@collabora.com>",
 ]
-build = false
+build = "build.rs"
 autolib = false
 autobins = false
 autoexamples = false
@@ -132,3 +132,12 @@ package = "libspa-sys"
 [dev-dependencies.clap]
 version = "4.3.2"
 features = ["derive"]
+
+[build-dependencies.system-deps]
+version = "7"
+
+[build-dependencies.version-compare]
+version = "0.2"
+
+[package.metadata.system-deps]
+libpipewire = { name = "libpipewire-0.3", version = "1.0" }

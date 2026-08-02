@@ -839,6 +839,8 @@ dependencies = [
  "libspa-sys",
  "pipewire-sys",
  "rustix",
+ "system-deps",
+ "version-compare",
 ]
 
 [[package]]
