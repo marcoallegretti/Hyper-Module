@@ -417,6 +417,36 @@ impl Stream {
 
 type ParamChangedCB<D> = dyn FnMut(&Stream, &mut D, u32, Option<&spa::pod::Pod>);
 type ProcessCB<D> = dyn FnMut(&Stream, &mut D);
+type ProcessWithClockCB<D> = dyn FnMut(&Stream, &mut D, Option<ProcessClock>);
+
+/// Clock information published for one graph process cycle.
+///
+/// PipeWire updates the position IO block before invoking a node's process
+/// callback. A stream may omit that block, in which case
+/// [`ListenerLocalBuilder::process_with_clock`] receives `None`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessClock {
+    graph_cycle: u32,
+    accumulated_xrun: u64,
+    recovering_xrun: bool,
+}
+
+impl ProcessClock {
+    /// Counter incremented whenever the graph is started.
+    pub fn graph_cycle(self) -> u32 {
+        self.graph_cycle
+    }
+
+    /// Estimated accumulated XRUN duration in units of the graph clock rate.
+    pub fn accumulated_xrun(self) -> u64 {
+        self.accumulated_xrun
+    }
+
+    /// Whether this node is recovering from an XRUN in the preceding cycle.
+    pub fn recovering_xrun(self) -> bool {
+        self.recovering_xrun
+    }
+}
 
 #[allow(clippy::type_complexity)]
 pub struct ListenerLocalCallbacks<D> {
@@ -428,6 +458,7 @@ pub struct ListenerLocalCallbacks<D> {
     pub add_buffer: Option<Box<dyn FnMut(&Stream, &mut D, *mut pw_sys::pw_buffer)>>,
     pub remove_buffer: Option<Box<dyn FnMut(&Stream, &mut D, *mut pw_sys::pw_buffer)>>,
     pub process: Option<Box<ProcessCB<D>>>,
+    pub process_with_clock: Option<Box<ProcessWithClockCB<D>>>,
     pub drained: Option<Box<dyn FnMut(&Stream, &mut D)>>,
     #[cfg(feature = "v0_3_39")]
     pub command: Option<Box<dyn FnMut(&Stream, &mut D, *const spa_sys::spa_command)>>,
@@ -435,6 +466,7 @@ pub struct ListenerLocalCallbacks<D> {
     pub trigger_done: Option<Box<dyn FnMut(&Stream, &mut D)>>,
     pub user_data: D,
     stream: Option<ptr::NonNull<pw_sys::pw_stream>>,
+    position_clock: Option<ptr::NonNull<spa_sys::spa_io_clock>>,
 }
 
 unsafe fn unwrap_stream_ptr<'a>(stream: Option<ptr::NonNull<pw_sys::pw_stream>>) -> &'a Stream {
@@ -443,11 +475,42 @@ unsafe fn unwrap_stream_ptr<'a>(stream: Option<ptr::NonNull<pw_sys::pw_stream>>)
         .expect("stream cannot be null")
 }
 
+fn update_position_clock(
+    current: Option<ptr::NonNull<spa_sys::spa_io_clock>>,
+    id: u32,
+    area: *mut os::raw::c_void,
+    size: u32,
+) -> Option<ptr::NonNull<spa_sys::spa_io_clock>> {
+    if id != spa_sys::SPA_IO_Position {
+        return current;
+    }
+    if usize::try_from(size)
+        .ok()
+        .map_or(true, |size| size < mem::size_of::<spa_sys::spa_io_clock>())
+    {
+        return None;
+    }
+    ptr::NonNull::new(area.cast())
+}
+
+unsafe fn process_clock_snapshot(clock: ptr::NonNull<spa_sys::spa_io_clock>) -> ProcessClock {
+    // SAFETY: the stream owns the compatible SPA_IO_Position area and
+    // PipeWire publishes its read-only clock before entering process().
+    let clock = unsafe { clock.as_ptr().read_volatile() };
+    ProcessClock {
+        graph_cycle: clock.cycle,
+        accumulated_xrun: clock.xrun,
+        recovering_xrun: clock.flags & spa_sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER != 0,
+    }
+}
+
 impl<D> ListenerLocalCallbacks<D> {
     fn with_user_data(user_data: D) -> Self {
         ListenerLocalCallbacks {
             process: Default::default(),
+            process_with_clock: Default::default(),
             stream: Default::default(),
+            position_clock: Default::default(),
             drained: Default::default(),
             add_buffer: Default::default(),
             control_info: Default::default(),
@@ -507,6 +570,7 @@ impl<D> ListenerLocalCallbacks<D> {
             size: u32,
         ) {
             if let Some(state) = (data as *mut ListenerLocalCallbacks<D>).as_mut() {
+                state.position_clock = update_position_clock(state.position_clock, id, area, size);
                 if let Some(cb) = &mut state.io_changed {
                     let stream = unwrap_stream_ptr(state.stream);
                     cb(stream, &mut state.user_data, id, area, size);
@@ -559,8 +623,13 @@ impl<D> ListenerLocalCallbacks<D> {
 
         unsafe extern "C" fn on_process<D>(data: *mut ::std::os::raw::c_void) {
             if let Some(state) = (data as *mut ListenerLocalCallbacks<D>).as_mut() {
-                if let Some(cb) = &mut state.process {
-                    let stream = unwrap_stream_ptr(state.stream);
+                let stream = unwrap_stream_ptr(state.stream);
+                if let Some(cb) = &mut state.process_with_clock {
+                    let clock = state
+                        .position_clock
+                        .map(|clock| unsafe { process_clock_snapshot(clock) });
+                    cb(stream, &mut state.user_data, clock);
+                } else if let Some(cb) = &mut state.process {
                     cb(stream, &mut state.user_data);
                 }
             }
@@ -608,7 +677,7 @@ impl<D> ListenerLocalCallbacks<D> {
             if callbacks.control_info.is_some() {
                 events.control_info = Some(on_control_info::<D>);
             }
-            if callbacks.io_changed.is_some() {
+            if callbacks.io_changed.is_some() || callbacks.process_with_clock.is_some() {
                 events.io_changed = Some(on_io_changed::<D>);
             }
             if callbacks.param_changed.is_some() {
@@ -620,7 +689,7 @@ impl<D> ListenerLocalCallbacks<D> {
             if callbacks.remove_buffer.is_some() {
                 events.remove_buffer = Some(on_remove_buffer::<D>);
             }
-            if callbacks.process.is_some() {
+            if callbacks.process.is_some() || callbacks.process_with_clock.is_some() {
                 events.process = Some(on_process::<D>);
             }
             if callbacks.drained.is_some() {
@@ -875,6 +944,23 @@ impl<'a, D> ListenerLocalBuilder<'a, D> {
         F: FnMut(&Stream, &mut D) + 'static,
     {
         self.callbacks.process = Some(Box::new(callback));
+        self.callbacks.process_with_clock = None;
+        self
+    }
+
+    /// Set a process callback that also receives the current graph clock.
+    ///
+    /// The clock snapshot is copied from `SPA_IO_Position` at the process
+    /// boundary. `None` means that PipeWire did not publish a compatible
+    /// position IO area for this stream. Setting this callback replaces a
+    /// callback previously set with [`Self::process`].
+    #[must_use = "Call `.register()` to start receiving events"]
+    pub fn process_with_clock<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(&Stream, &mut D, Option<ProcessClock>) + 'static,
+    {
+        self.callbacks.process_with_clock = Some(Box::new(callback));
+        self.callbacks.process = None;
         self
     }
 
@@ -969,5 +1055,58 @@ bitflags! {
         const ALLOC_BUFFERS = pw_sys::pw_stream_flags_PW_STREAM_FLAG_ALLOC_BUFFERS;
         #[cfg(feature = "v0_3_41")]
         const TRIGGER = pw_sys::pw_stream_flags_PW_STREAM_FLAG_TRIGGER;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn position_clock_binding_tracks_only_compatible_position_io() {
+        let existing = ptr::NonNull::dangling();
+        let unrelated = update_position_clock(
+            Some(existing),
+            spa_sys::SPA_IO_Position + 1,
+            ptr::null_mut(),
+            0,
+        );
+        assert_eq!(unrelated, Some(existing));
+
+        assert_eq!(
+            update_position_clock(
+                Some(existing),
+                spa_sys::SPA_IO_Position,
+                ptr::null_mut(),
+                u32::try_from(mem::size_of::<spa_sys::spa_io_clock>()).unwrap(),
+            ),
+            None
+        );
+        assert_eq!(
+            update_position_clock(
+                Some(existing),
+                spa_sys::SPA_IO_Position,
+                existing.as_ptr().cast(),
+                u32::try_from(mem::size_of::<spa_sys::spa_io_clock>() - 1).unwrap(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn process_clock_snapshot_preserves_xrun_evidence() {
+        // SAFETY: all-zero is a valid test value for this C data structure.
+        let mut clock = unsafe { mem::zeroed::<spa_sys::spa_io_clock>() };
+        clock.flags = spa_sys::SPA_IO_CLOCK_FLAG_XRUN_RECOVER;
+        clock.cycle = 17;
+        clock.xrun = 23;
+        let pointer = ptr::NonNull::from(&mut clock);
+
+        // SAFETY: `pointer` refers to `clock` for this entire read.
+        let snapshot = unsafe { process_clock_snapshot(pointer) };
+
+        assert_eq!(snapshot.graph_cycle(), 17);
+        assert_eq!(snapshot.accumulated_xrun(), 23);
+        assert!(snapshot.recovering_xrun());
     }
 }

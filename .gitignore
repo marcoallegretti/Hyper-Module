@@ -40,3 +40,5 @@ GEMINI.md
 /contracts/node_modules/
 /contracts/coverage/
 /target/
+/third_party/pipewire/Cargo.lock
+/third_party/pipewire/target/
