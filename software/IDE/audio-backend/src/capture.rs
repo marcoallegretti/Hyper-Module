@@ -3,6 +3,8 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+use super::NativeXrunPublisher;
 use super::{MAXIMUM_BLOCK_FRAMES, NativeXrunCounterState, NativeXrunSnapshot, STEREO_CHANNELS};
 
 /// Consumes one borrowed interleaved stereo input block.
@@ -79,7 +81,7 @@ struct CaptureStreamCounterState {
     discontinuities: AtomicU64,
     timestamp_errors: AtomicU64,
     stream_errors: AtomicU64,
-    native_xruns: NativeXrunCounterState,
+    native_xruns: Arc<NativeXrunCounterState>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -147,11 +149,6 @@ impl CaptureStreamCounters {
     pub(crate) fn record_stream_error(&self) {
         Self::add(&self.state.stream_errors, 1);
     }
-
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
-    pub(crate) fn observe_pipewire_clock(&self, clock: Option<pipewire::stream::ProcessClock>) {
-        self.state.native_xruns.observe_pipewire(clock);
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,6 +174,8 @@ pub struct CaptureCallback<P> {
     processor: P,
     maximum_block_frames: usize,
     counters: CaptureStreamCounters,
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    native_xruns: NativeXrunPublisher,
 }
 
 impl<P: InterleavedStereoCaptureProcessor> CaptureCallback<P> {
@@ -208,10 +207,14 @@ impl<P: InterleavedStereoCaptureProcessor> CaptureCallback<P> {
                 maximum: MAXIMUM_BLOCK_FRAMES,
             });
         }
+        #[cfg(all(target_os = "linux", target_endian = "little"))]
+        let native_xruns = NativeXrunPublisher::new(Arc::clone(&counters.state.native_xruns));
         Ok(Self {
             processor,
             maximum_block_frames,
             counters,
+            #[cfg(all(target_os = "linux", target_endian = "little"))]
+            native_xruns,
         })
     }
 
@@ -223,6 +226,11 @@ impl<P: InterleavedStereoCaptureProcessor> CaptureCallback<P> {
     #[must_use]
     pub const fn maximum_block_frames(&self) -> usize {
         self.maximum_block_frames
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    pub(crate) fn observe_pipewire_clock(&mut self, clock: Option<pipewire::stream::ProcessClock>) {
+        self.native_xruns.observe_pipewire(clock);
     }
 
     pub fn process(&mut self, input: &[f32]) -> CaptureCallbackStatus {

@@ -255,29 +255,34 @@ pub type OutputStreamStatus = StreamStatus;
 /// not publish native XRUN timing, so absence is never misreported as zero.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeXrunSnapshot {
-    /// Process cycles the backend flagged as recovering from an XRUN.
-    pub recovery_count: u64,
+    /// Process cycles the backend flagged as recovering from an XRUN, when
+    /// that evidence is supported. The count is cumulative for the stream
+    /// lifetime and saturates at `u64::MAX`.
+    pub recovery_count: Option<u64>,
     /// Latest accumulated XRUN duration in backend graph-clock units.
     pub accumulated_duration: u64,
-    /// Graph-start cycle associated with the latest backend observation.
-    pub graph_cycle: u32,
+    /// Graph-start cycle associated with the latest backend observation, when
+    /// that evidence is supported.
+    pub graph_cycle: Option<u32>,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct NativeXrunCounterState {
     sequence: AtomicU64,
     available: AtomicBool,
+    recovery_available: AtomicBool,
     recovery_count: AtomicU64,
     accumulated_duration: AtomicU64,
+    graph_cycle_available: AtomicBool,
     graph_cycle: AtomicU32,
 }
 
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeXrunObservation {
-    recovering: bool,
+    recovering: Option<bool>,
     accumulated_duration: u64,
-    graph_cycle: u32,
+    graph_cycle: Option<u32>,
 }
 
 impl NativeXrunCounterState {
@@ -290,10 +295,14 @@ impl NativeXrunCounterState {
             }
 
             let available = self.available.load(Ordering::Relaxed);
+            let recovery_available = self.recovery_available.load(Ordering::Relaxed);
+            let recovery_count = self.recovery_count.load(Ordering::Relaxed);
+            let graph_cycle_available = self.graph_cycle_available.load(Ordering::Relaxed);
+            let graph_cycle = self.graph_cycle.load(Ordering::Relaxed);
             let snapshot = NativeXrunSnapshot {
-                recovery_count: self.recovery_count.load(Ordering::Relaxed),
+                recovery_count: recovery_available.then_some(recovery_count),
                 accumulated_duration: self.accumulated_duration.load(Ordering::Relaxed),
-                graph_cycle: self.graph_cycle.load(Ordering::Relaxed),
+                graph_cycle: graph_cycle_available.then_some(graph_cycle),
             };
             fence(Ordering::Acquire);
 
@@ -304,16 +313,7 @@ impl NativeXrunCounterState {
     }
 
     #[cfg(all(target_os = "linux", target_endian = "little"))]
-    pub(crate) fn observe_pipewire(&self, clock: Option<pipewire::stream::ProcessClock>) {
-        self.observe(clock.map(|clock| NativeXrunObservation {
-            recovering: clock.recovering_xrun(),
-            accumulated_duration: clock.accumulated_xrun(),
-            graph_cycle: clock.graph_cycle(),
-        }));
-    }
-
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
-    fn observe(&self, observation: Option<NativeXrunObservation>) {
+    fn publish(&self, observation: Option<NativeXrunObservation>) {
         let odd_sequence = self.sequence.fetch_add(1, Ordering::Acquire) | 1;
         fence(Ordering::Release);
 
@@ -323,18 +323,48 @@ impl NativeXrunCounterState {
                 .store(odd_sequence.wrapping_add(1), Ordering::Release);
             return;
         };
-        if observation.recovering {
+        if observation.recovering == Some(true) {
             let recovery_count = self.recovery_count.load(Ordering::Relaxed);
             self.recovery_count
                 .store(recovery_count.saturating_add(1), Ordering::Relaxed);
         }
+        self.recovery_available
+            .store(observation.recovering.is_some(), Ordering::Relaxed);
         self.accumulated_duration
             .store(observation.accumulated_duration, Ordering::Relaxed);
-        self.graph_cycle
-            .store(observation.graph_cycle, Ordering::Relaxed);
+        if let Some(graph_cycle) = observation.graph_cycle {
+            self.graph_cycle.store(graph_cycle, Ordering::Relaxed);
+        }
+        self.graph_cycle_available
+            .store(observation.graph_cycle.is_some(), Ordering::Relaxed);
         self.available.store(true, Ordering::Relaxed);
         self.sequence
             .store(odd_sequence.wrapping_add(1), Ordering::Release);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+#[derive(Debug)]
+struct NativeXrunPublisher {
+    state: Arc<NativeXrunCounterState>,
+}
+
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+impl NativeXrunPublisher {
+    fn new(state: Arc<NativeXrunCounterState>) -> Self {
+        Self { state }
+    }
+
+    fn observe_pipewire(&mut self, clock: Option<pipewire::stream::ProcessClock>) {
+        self.observe(clock.map(|clock| NativeXrunObservation {
+            recovering: clock.recovering_xrun(),
+            accumulated_duration: clock.accumulated_xrun(),
+            graph_cycle: clock.graph_cycle(),
+        }));
+    }
+
+    fn observe(&mut self, observation: Option<NativeXrunObservation>) {
+        self.state.publish(observation);
     }
 }
 
@@ -600,7 +630,7 @@ struct OutputStreamCounterState {
     unavailable_buffers: AtomicU64,
     malformed_buffers: AtomicU64,
     stream_errors: AtomicU64,
-    native_xruns: NativeXrunCounterState,
+    native_xruns: Arc<NativeXrunCounterState>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -653,11 +683,6 @@ impl OutputStreamCounters {
     fn record_stream_error(&self) {
         Self::add(&self.state.stream_errors, 1);
     }
-
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
-    fn observe_pipewire_clock(&self, clock: Option<pipewire::stream::ProcessClock>) {
-        self.state.native_xruns.observe_pipewire(clock);
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -683,6 +708,8 @@ pub struct OutputCallback<P> {
     processor: P,
     maximum_block_frames: usize,
     counters: OutputStreamCounters,
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    native_xruns: NativeXrunPublisher,
 }
 
 impl<P: InterleavedStereoProcessor> OutputCallback<P> {
@@ -714,10 +741,14 @@ impl<P: InterleavedStereoProcessor> OutputCallback<P> {
                 maximum: MAXIMUM_BLOCK_FRAMES,
             });
         }
+        #[cfg(all(target_os = "linux", target_endian = "little"))]
+        let native_xruns = NativeXrunPublisher::new(Arc::clone(&counters.state.native_xruns));
         Ok(Self {
             processor,
             maximum_block_frames,
             counters,
+            #[cfg(all(target_os = "linux", target_endian = "little"))]
+            native_xruns,
         })
     }
 
@@ -729,6 +760,11 @@ impl<P: InterleavedStereoProcessor> OutputCallback<P> {
     #[must_use]
     pub const fn maximum_block_frames(&self) -> usize {
         self.maximum_block_frames
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    fn observe_pipewire_clock(&mut self, clock: Option<pipewire::stream::ProcessClock>) {
+        self.native_xruns.observe_pipewire(clock);
     }
 
     pub fn process(&mut self, output: &mut [f32]) -> OutputCallbackStatus {
@@ -1020,80 +1056,180 @@ mod tests {
     #[cfg(all(target_os = "linux", target_endian = "little"))]
     #[test]
     fn native_xrun_evidence_preserves_availability_and_recovery_count() {
-        let counters = NativeXrunCounterState::default();
+        let counters = Arc::new(NativeXrunCounterState::default());
+        let mut publisher = NativeXrunPublisher::new(Arc::clone(&counters));
         assert_eq!(counters.snapshot(), None);
 
-        counters.observe(Some(NativeXrunObservation {
-            recovering: false,
+        publisher.observe(Some(NativeXrunObservation {
+            recovering: None,
             accumulated_duration: 11,
-            graph_cycle: 3,
+            graph_cycle: None,
         }));
         assert_eq!(
             counters.snapshot(),
             Some(NativeXrunSnapshot {
-                recovery_count: 0,
+                recovery_count: None,
                 accumulated_duration: 11,
-                graph_cycle: 3,
+                graph_cycle: None,
             })
         );
 
-        counters.observe(Some(NativeXrunObservation {
-            recovering: true,
+        publisher.observe(Some(NativeXrunObservation {
+            recovering: Some(false),
             accumulated_duration: 19,
-            graph_cycle: 3,
+            graph_cycle: Some(3),
         }));
         assert_eq!(
             counters.snapshot(),
             Some(NativeXrunSnapshot {
-                recovery_count: 1,
+                recovery_count: Some(0),
                 accumulated_duration: 19,
-                graph_cycle: 3,
+                graph_cycle: Some(3),
             })
         );
 
-        counters.observe(None);
+        publisher.observe(None);
         assert_eq!(counters.snapshot(), None);
+
+        publisher.observe(Some(NativeXrunObservation {
+            recovering: Some(true),
+            accumulated_duration: 23,
+            graph_cycle: Some(4),
+        }));
+        assert_eq!(
+            counters.snapshot(),
+            Some(NativeXrunSnapshot {
+                recovery_count: Some(1),
+                accumulated_duration: 23,
+                graph_cycle: Some(4),
+            })
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[test]
+    fn native_xrun_evidence_saturates_and_preserves_boundaries() {
+        let counters = Arc::new(NativeXrunCounterState::default());
+        counters
+            .recovery_count
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        let mut publisher = NativeXrunPublisher::new(Arc::clone(&counters));
+        let maximum = NativeXrunObservation {
+            recovering: Some(true),
+            accumulated_duration: u64::MAX,
+            graph_cycle: Some(u32::MAX),
+        };
+
+        publisher.observe(Some(maximum));
+        publisher.observe(Some(maximum));
+
+        assert_eq!(
+            counters.snapshot(),
+            Some(NativeXrunSnapshot {
+                recovery_count: Some(u64::MAX),
+                accumulated_duration: u64::MAX,
+                graph_cycle: Some(u32::MAX),
+            })
+        );
     }
 
     #[cfg(all(target_os = "linux", target_endian = "little"))]
     #[test]
     fn native_xrun_snapshot_is_coherent_during_concurrent_observation() {
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
         use std::thread;
 
         let counters = Arc::new(NativeXrunCounterState::default());
+        let mut publisher = NativeXrunPublisher::new(Arc::clone(&counters));
+        let started = Arc::new(AtomicBool::new(false));
+        let ready_readers = Arc::new(AtomicUsize::new(0));
         let finished = Arc::new(AtomicBool::new(false));
-        let writer_counters = Arc::clone(&counters);
+        let writer_started = Arc::clone(&started);
+        let writer_ready_readers = Arc::clone(&ready_readers);
         let writer_finished = Arc::clone(&finished);
         let writer = thread::spawn(move || {
-            for graph_cycle in 1..=10_000_u32 {
-                writer_counters.observe(Some(NativeXrunObservation {
-                    recovering: false,
-                    accumulated_duration: u64::from(graph_cycle) * 2,
-                    graph_cycle,
+            publisher.observe(Some(NativeXrunObservation {
+                recovering: Some(true),
+                accumulated_duration: 1,
+                graph_cycle: Some(1),
+            }));
+            writer_started.store(true, Ordering::Release);
+            while writer_ready_readers.load(Ordering::Acquire) != 2 {
+                thread::yield_now();
+            }
+            for graph_cycle in 2..=10_000_u32 {
+                publisher.observe(None);
+                publisher.observe(Some(NativeXrunObservation {
+                    recovering: Some(true),
+                    accumulated_duration: u64::from(graph_cycle),
+                    graph_cycle: Some(graph_cycle),
                 }));
             }
             writer_finished.store(true, Ordering::Release);
         });
 
-        while !finished.load(Ordering::Acquire) {
-            if let Some(snapshot) = counters.snapshot() {
-                assert_eq!(
-                    snapshot.accumulated_duration,
-                    u64::from(snapshot.graph_cycle) * 2
-                );
-            }
+        let mut readers = Vec::new();
+        for _ in 0..2 {
+            let reader_counters = Arc::clone(&counters);
+            let reader_started = Arc::clone(&started);
+            let reader_ready = Arc::clone(&ready_readers);
+            let reader_finished = Arc::clone(&finished);
+            readers.push(thread::spawn(move || {
+                while !reader_started.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                let mut reads = 0_u64;
+                loop {
+                    if let Some(snapshot) = reader_counters.snapshot() {
+                        assert_eq!(snapshot.recovery_count, Some(snapshot.accumulated_duration));
+                        assert_eq!(
+                            snapshot.graph_cycle,
+                            Some(u32::try_from(snapshot.accumulated_duration).unwrap())
+                        );
+                    }
+                    reads = reads.saturating_add(1);
+                    if reads == 1 {
+                        reader_ready.fetch_add(1, Ordering::Release);
+                    }
+                    if reader_finished.load(Ordering::Acquire) {
+                        return reads;
+                    }
+                }
+            }));
         }
         writer.join().unwrap();
+        for reader in readers {
+            assert!(reader.join().unwrap() > 0);
+        }
 
         assert_eq!(
             counters.snapshot(),
             Some(NativeXrunSnapshot {
-                recovery_count: 0,
-                accumulated_duration: 20_000,
-                graph_cycle: 10_000,
+                recovery_count: Some(10_000),
+                accumulated_duration: 10_000,
+                graph_cycle: Some(10_000),
             })
         );
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[test]
+    fn native_xrun_publication_performs_zero_heap_allocations() {
+        use crate::monitoring_session::realtime_allocator::HeapMeasurement;
+
+        let counters = Arc::new(NativeXrunCounterState::default());
+        let mut publisher = NativeXrunPublisher::new(counters);
+        let observation = NativeXrunObservation {
+            recovering: Some(true),
+            accumulated_duration: 47,
+            graph_cycle: Some(5),
+        };
+
+        let measurement = HeapMeasurement::start_verified();
+        publisher.observe(Some(observation));
+        publisher.observe(None);
+        let heap_operations = measurement.finish();
+
+        assert_eq!(heap_operations, 0);
     }
 }

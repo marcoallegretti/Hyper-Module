@@ -721,7 +721,7 @@ fn process_pipewire_buffer(
     state: &mut PipeWireCallback<'_>,
     clock: Option<pw::stream::ProcessClock>,
 ) {
-    state.output.counters().observe_pipewire_clock(clock);
+    state.output.observe_pipewire_clock(clock);
     let Some(mut buffer) = stream.dequeue_buffer() else {
         state.output.counters().record_unavailable_buffer();
         return;

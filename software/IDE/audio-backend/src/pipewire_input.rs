@@ -560,7 +560,7 @@ fn process_pipewire_input<P>(
 ) where
     P: InterleavedStereoCaptureProcessor,
 {
-    state.input.counters().observe_pipewire_clock(clock);
+    state.input.observe_pipewire_clock(clock);
     let Some(mut buffer) = stream.dequeue_buffer() else {
         state.input.counters().record_unavailable_buffer();
         return;
