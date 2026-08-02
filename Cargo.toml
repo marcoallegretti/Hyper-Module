@@ -4,6 +4,7 @@ members = [
     "crates/audio-source",
     "crates/arrangement-renderer",
     "crates/clip-engine",
+    "crates/control-mappings",
     "crates/media-cache",
     "crates/mixer-runtime",
     "crates/offline-renderer",
