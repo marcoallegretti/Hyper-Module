@@ -218,7 +218,11 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
             .snapshot()
             .present_loudness(EbuLoudnessPresentationConfig::default())
     });
-    let second_result = processor.process(&mut second);
+    let second_result = processor.process_with_post_mix(&mut second, |post| {
+        for sample in post.left.iter_mut().chain(post.right.iter_mut()) {
+            *sample += 0.125;
+        }
+    });
     let heap_operations = measurement.finish();
 
     assert!(start_result.is_ok());

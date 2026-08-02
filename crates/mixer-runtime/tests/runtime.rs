@@ -533,6 +533,52 @@ fn transport_output_processor_reuses_maximum_scratch_for_variable_quanta() {
 }
 
 #[test]
+fn final_post_mix_is_included_in_output_metering() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 64)
+            .unwrap();
+    let (_command_sender, mut transport) =
+        PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+    let mut arrangement_left = [0.0_f32; 64];
+    let mut arrangement_right = [0.0_f32; 64];
+    let mut scene_left = [0.0_f32; 64];
+    let mut scene_right = [0.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let (mut meter_sender, mut meter_receiver) = output_meter_channel();
+    let (_loudness_sender, loudness_receiver) = loudness_command_channel();
+    let mut processor = TransportOutputProcessor::try_new(
+        &mut transport,
+        &mut scratch,
+        &mut meter_sender,
+        loudness_receiver,
+        48_000,
+    )
+    .unwrap();
+    let mut output = [9.0_f32; 32];
+
+    let cycle = processor
+        .process_with_post_mix(&mut output, |post| {
+            post.left.fill(0.25);
+            post.right.fill(-0.5);
+        })
+        .unwrap();
+
+    assert!(output.chunks_exact(2).all(|frame| frame == [0.25, -0.5]));
+    assert_eq!(cycle.snapshot().meter().left().sample_peak(), Some(0.25));
+    assert_eq!(cycle.snapshot().meter().right().sample_peak(), Some(0.5));
+    assert_eq!(
+        meter_receiver.read_latest().snapshot(),
+        Some(cycle.snapshot())
+    );
+}
+
+#[test]
 fn transport_output_processor_rejects_incomplete_scratch_before_processing() {
     let fixture = playback_fixture();
     let graph = fixture.compile_playback();

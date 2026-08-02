@@ -37,6 +37,43 @@ use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSn
 pub const STEREO_CHANNELS: usize = 2;
 pub const MAXIMUM_BLOCK_FRAMES: usize = 4_096;
 
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+pub(crate) trait CheckpointedOutputProcessor {
+    type Error;
+
+    fn maximum_block_frames(&self) -> usize;
+
+    fn process_checkpointed(
+        &mut self,
+        output: &mut [f32],
+    ) -> Result<hyper_mixer_runtime::InterleavedTransportCycle, Self::Error>;
+}
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+impl<R> CheckpointedOutputProcessor for hyper_mixer_runtime::TransportOutputProcessor<'_, '_, R>
+where
+    R: hyper_mixer_runtime::TrackWindowRenderer,
+{
+    type Error = hyper_audio_engine::StereoCallbackError<hyper_mixer_runtime::RuntimeProcessError>;
+
+    fn maximum_block_frames(&self) -> usize {
+        self.maximum_block_frames()
+    }
+
+    fn process_checkpointed(
+        &mut self,
+        output: &mut [f32],
+    ) -> Result<hyper_mixer_runtime::InterleavedTransportCycle, Self::Error> {
+        self.process(output)
+    }
+}
+
 mod capture;
 pub use capture::{
     CaptureCallback, CaptureCallbackConfigError, CaptureCallbackStatus, CaptureStreamCounters,
@@ -695,7 +732,7 @@ pub use playback_session::{
     DesktopPlaybackRecoveryPendingStopWait, DesktopPlaybackRecoveryPendingWait,
     DesktopPlaybackRecoveryStartError, DesktopPlaybackRecoveryStopError, DesktopPlaybackSession,
     DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
-    DesktopPlaybackSessionStartError, DesktopProjectOpenError,
+    DesktopPlaybackSessionStartError, DesktopPlaybackSessionStopError, DesktopProjectOpenError,
 };
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),

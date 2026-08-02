@@ -2405,6 +2405,12 @@ pub struct RoutedTransportRuntime<R> {
     mixer_parameter_command_consumer: Option<Consumer<MixerParameterCommand>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LoudnessCycleControl {
+    applied_command_count: usize,
+    sender_disconnected: bool,
+}
+
 pub type GraphTransportRuntime<'prepared, 'cache, 'schedule> =
     RoutedTransportRuntime<ArrangementRenderer<'prepared, 'cache, 'schedule>>;
 
@@ -2653,22 +2659,65 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             scratch,
             interleaved_output,
             meter_sender,
-            0,
-            false,
+            LoudnessCycleControl::default(),
+            |_| {},
         )
     }
 
-    fn process_interleaved_cycle_with_loudness_control(
+    /// Processes one transport callback and applies an infallible final stereo
+    /// mix before validation, metering, loudness, true-peak, and interleaving.
+    ///
+    /// The final mix is intended for already-bounded realtime sources such as
+    /// a cue-monitor bridge. It runs only after the project cycle succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StereoCallbackError`] under the same conditions as
+    /// [`Self::process_interleaved_cycle`]. Non-finite samples introduced by
+    /// the final mix are rejected by the callback adapter.
+    pub fn process_interleaved_cycle_with_post_mix<F>(
         &mut self,
         callback: &mut InterleavedStereoCallback,
         scratch: &mut [RenderScratchSlot<'_>],
         interleaved_output: &mut [f32],
         meter_sender: &mut OutputMeterSender,
-        applied_loudness_command_count: usize,
-        loudness_command_sender_disconnected: bool,
-    ) -> Result<InterleavedTransportCycle, StereoCallbackError<RuntimeProcessError>> {
+        post_mix: F,
+    ) -> Result<InterleavedTransportCycle, StereoCallbackError<RuntimeProcessError>>
+    where
+        F: FnOnce(StereoOutput<'_>),
+    {
+        self.process_interleaved_cycle_with_loudness_control(
+            callback,
+            scratch,
+            interleaved_output,
+            meter_sender,
+            LoudnessCycleControl::default(),
+            post_mix,
+        )
+    }
+
+    fn process_interleaved_cycle_with_loudness_control<F>(
+        &mut self,
+        callback: &mut InterleavedStereoCallback,
+        scratch: &mut [RenderScratchSlot<'_>],
+        interleaved_output: &mut [f32],
+        meter_sender: &mut OutputMeterSender,
+        loudness: LoudnessCycleControl,
+        post_mix: F,
+    ) -> Result<InterleavedTransportCycle, StereoCallbackError<RuntimeProcessError>>
+    where
+        F: FnOnce(StereoOutput<'_>),
+    {
         let processed = callback.process(interleaved_output, |output| {
-            self.process_cycle(scratch, output)
+            let cycle = self.process_cycle(
+                scratch,
+                StereoOutput {
+                    left: &mut *output.left,
+                    right: &mut *output.right,
+                },
+            )?;
+            post_mix(output);
+            Ok(cycle)
         })?;
         let (cycle, meter) = processed.into_parts();
         let mixer_parameter_state = (cycle.applied_mixer_parameter_command_count() > 0)
@@ -2678,8 +2727,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             meter,
             processed_frame_end: 0,
             dropped_before: 0,
-            applied_loudness_command_count,
-            loudness_command_sender_disconnected,
+            applied_loudness_command_count: loudness.applied_command_count,
+            loudness_command_sender_disconnected: loudness.sender_disconnected,
         };
         let (snapshot, publication) = match meter_sender.try_publish(snapshot) {
             Ok(snapshot) => (snapshot, OutputMeterPublication::Published),
@@ -2874,14 +2923,33 @@ impl<'state, 'buffers, R: TrackWindowRenderer> TransportOutputProcessor<'state, 
         &mut self,
         interleaved_output: &mut [f32],
     ) -> Result<InterleavedTransportCycle, StereoCallbackError<RuntimeProcessError>> {
+        self.process_with_post_mix(interleaved_output, |_| {})
+    }
+
+    /// Renders one callback and applies a final planar stereo mix before all
+    /// output validation and metering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StereoCallbackError`] for invalid device-buffer shape,
+    /// excessive quantum, transport failure, or non-finite final output.
+    pub fn process_with_post_mix<F>(
+        &mut self,
+        interleaved_output: &mut [f32],
+        post_mix: F,
+    ) -> Result<InterleavedTransportCycle, StereoCallbackError<RuntimeProcessError>>
+    where
+        F: FnOnce(StereoOutput<'_>),
+    {
         if !interleaved_output.len().is_multiple_of(2)
             || interleaved_output.len() / 2 > self.callback.maximum_frames()
         {
-            return self.transport.process_interleaved_cycle(
+            return self.transport.process_interleaved_cycle_with_post_mix(
                 &mut self.callback,
                 self.scratch,
                 interleaved_output,
                 self.meter_sender,
+                post_mix,
             );
         }
         let applied_loudness_command_count = self.drain_loudness_commands();
@@ -2892,8 +2960,11 @@ impl<'state, 'buffers, R: TrackWindowRenderer> TransportOutputProcessor<'state, 
                 self.scratch,
                 interleaved_output,
                 self.meter_sender,
-                applied_loudness_command_count,
-                loudness_command_sender_disconnected,
+                LoudnessCycleControl {
+                    applied_command_count: applied_loudness_command_count,
+                    sender_disconnected: loudness_command_sender_disconnected,
+                },
+                post_mix,
             )
     }
 

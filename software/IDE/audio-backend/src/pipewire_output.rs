@@ -1,16 +1,14 @@
 use super::{
-    BackendThreadCompletion, BackendThreadJoin, BoundedBackendThread, InterleavedStereoProcessor,
-    OutputCallback, OutputCallbackStatus, OutputStreamCounters, OutputStreamState,
-    OutputStreamStatus, PendingNativeShutdown, PipeWireOutputTarget, STEREO_CHANNELS,
-    acquire_backend_thread_permit,
+    BackendThreadCompletion, BackendThreadJoin, BoundedBackendThread, CheckpointedOutputProcessor,
+    InterleavedStereoProcessor, OutputCallback, OutputCallbackStatus, OutputStreamCounters,
+    OutputStreamState, OutputStreamStatus, PendingNativeShutdown, PipeWireOutputTarget,
+    STEREO_CHANNELS, acquire_backend_thread_permit,
 };
 use core::cell::Cell;
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
-use hyper_mixer_runtime::{
-    PlaybackRecoveryPublisher, TrackWindowRenderer, TransportOutputProcessor,
-};
+use hyper_mixer_runtime::PlaybackRecoveryPublisher;
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
@@ -322,13 +320,13 @@ impl PipeWireThreadRunner {
         )
     }
 
-    pub(crate) fn run_transport_output_with_checkpoint<R>(
+    pub(crate) fn run_transport_output_with_checkpoint<P>(
         self,
-        mut processor: TransportOutputProcessor<'_, '_, R>,
+        mut processor: P,
         mut publisher: PlaybackRecoveryPublisher,
     ) -> Result<(), PipeWireStartError>
     where
-        R: TrackWindowRenderer,
+        P: CheckpointedOutputProcessor,
     {
         validate_transport_capacity(
             self.config.maximum_block_frames,
@@ -338,7 +336,7 @@ impl PipeWireThreadRunner {
         self.run_with_commit(
             |output: &mut [f32]| {
                 pending_cycle.set(None);
-                processor.process(output).map(|rendered| {
+                processor.process_checkpointed(output).map(|rendered| {
                     pending_cycle.set(Some((
                         rendered.snapshot().cycle(),
                         rendered.mixer_parameter_state().copied(),

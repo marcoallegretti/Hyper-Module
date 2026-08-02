@@ -179,6 +179,22 @@ impl DesktopMonitoringConfig {
         Ok(self)
     }
 
+    /// Rebinds monitoring to a replacement output while preserving its input,
+    /// latency, capacity, chunk, and drift contracts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the replacement output is incompatible with the
+    /// existing monitoring contract.
+    pub fn with_output(
+        mut self,
+        output: DesktopOutputConfig,
+    ) -> Result<Self, DesktopMonitoringConfigError> {
+        self.output = output;
+        self.validate()?;
+        Ok(self)
+    }
+
     #[must_use]
     pub const fn input(&self) -> &DesktopInputConfig {
         &self.input
@@ -359,6 +375,7 @@ pub struct MonitoringSnapshot {
     pub discarded_stale_frame_count: u64,
     pub buffered_frames: u64,
     pub correction_ppm: i32,
+    pub processor_failure_count: u64,
 }
 
 #[derive(Debug, Default)]
@@ -374,6 +391,7 @@ struct MonitoringCounterState {
     buffered_frames: AtomicU64,
     queued_output_frames: AtomicU64,
     correction_ppm: AtomicI32,
+    processor_failures: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -401,6 +419,7 @@ impl MonitoringCounters {
             discarded_stale_frame_count: self.state.discarded_stale_frames.load(Ordering::Relaxed),
             buffered_frames: self.state.buffered_frames.load(Ordering::Relaxed),
             correction_ppm: self.state.correction_ppm.load(Ordering::Relaxed),
+            processor_failure_count: self.state.processor_failures.load(Ordering::Relaxed),
         }
     }
 
@@ -471,6 +490,14 @@ pub(crate) struct MonitoringConsumer {
 
 impl MonitoringConsumer {
     pub(crate) fn process(&mut self, output: &mut [f32]) -> Result<(), MonitoringRenderError> {
+        let result = self.process_inner(output);
+        if result.is_err() {
+            MonitoringCounters::add(&self.counters.state.processor_failures, 1);
+        }
+        result
+    }
+
+    fn process_inner(&mut self, output: &mut [f32]) -> Result<(), MonitoringRenderError> {
         output.fill(0.0);
         let mut output_offset = 0;
         while output_offset < output.len() {
@@ -1045,6 +1072,41 @@ mod tests {
             ),
             Err(DesktopMonitoringConfigError::ProcessingChunkExceedsTransport { .. })
         ));
+    }
+
+    #[test]
+    fn replacement_output_preserves_the_monitoring_contract() {
+        let original = config().with_maximum_clock_drift_ppm(750).unwrap();
+        let replacement = DesktopOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_routing_id("replacement-output")
+            .unwrap();
+        let rebound = original.clone().with_output(replacement.clone()).unwrap();
+
+        assert_eq!(rebound.input(), original.input());
+        assert_eq!(rebound.output(), &replacement);
+        assert_eq!(
+            rebound.transport_capacity_frames(),
+            original.transport_capacity_frames()
+        );
+        assert_eq!(
+            rebound.target_latency_frames(),
+            original.target_latency_frames()
+        );
+        assert_eq!(
+            rebound.processing_chunk_frames(),
+            original.processing_chunk_frames()
+        );
+        assert_eq!(rebound.maximum_clock_drift_ppm(), 750);
+
+        let incompatible = DesktopOutputConfig::try_new(44_100, 128).unwrap();
+        assert_eq!(
+            original.with_output(incompatible),
+            Err(DesktopMonitoringConfigError::SampleRateMismatch {
+                input_hz: 48_000,
+                output_hz: 44_100,
+            })
+        );
     }
 
     #[test]

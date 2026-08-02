@@ -1,16 +1,14 @@
 use super::{
-    BackendThreadCompletion, BackendThreadJoin, BoundedBackendThread, InterleavedStereoProcessor,
-    OutputCallback, OutputCallbackStatus, OutputStreamCounters, OutputStreamState,
-    OutputStreamStatus, PendingNativeShutdown, STEREO_CHANNELS, WasapiOutputEndpoint,
-    acquire_backend_thread_permit,
+    BackendThreadCompletion, BackendThreadJoin, BoundedBackendThread, CheckpointedOutputProcessor,
+    InterleavedStereoProcessor, OutputCallback, OutputCallbackStatus, OutputStreamCounters,
+    OutputStreamState, OutputStreamStatus, PendingNativeShutdown, STEREO_CHANNELS,
+    WasapiOutputEndpoint, acquire_backend_thread_permit,
 };
 use core::cell::Cell;
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use hyper_mixer_runtime::{
-    PlaybackRecoveryPublisher, TrackWindowRenderer, TransportOutputProcessor,
-};
+use hyper_mixer_runtime::PlaybackRecoveryPublisher;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
@@ -341,13 +339,13 @@ impl WasapiThreadRunner {
         )
     }
 
-    pub(crate) fn run_transport_output_with_checkpoint<R>(
+    pub(crate) fn run_transport_output_with_checkpoint<P>(
         self,
-        mut processor: TransportOutputProcessor<'_, '_, R>,
+        mut processor: P,
         mut publisher: PlaybackRecoveryPublisher,
     ) -> Result<(), WasapiStartError>
     where
-        R: TrackWindowRenderer,
+        P: CheckpointedOutputProcessor,
     {
         validate_transport_capacity(
             self.config.maximum_block_frames,
@@ -357,7 +355,7 @@ impl WasapiThreadRunner {
         self.run_with_commit(
             |output: &mut [f32]| {
                 pending_cycle.set(None);
-                processor.process(output).map(|rendered| {
+                processor.process_checkpointed(output).map(|rendered| {
                     pending_cycle.set(Some((
                         rendered.snapshot().cycle(),
                         rendered.mixer_parameter_state().copied(),

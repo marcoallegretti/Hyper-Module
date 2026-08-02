@@ -1,11 +1,16 @@
+use super::monitoring_session::{MonitoringConsumer, MonitoringCounters, try_monitoring_transport};
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::pipewire_output::PipeWireThreadRunner;
 #[cfg(target_os = "windows")]
 use super::wasapi_output::WasapiThreadRunner;
 use super::{
-    DesktopOutputConfig, OutputStreamCounters, OutputStreamStatus, PendingNativeShutdown,
-    PendingNativeShutdownWait, PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
+    CheckpointedOutputProcessor, DesktopInputStartError, DesktopInputStopError,
+    DesktopMonitoringConfig, DesktopMonitoringControl, DesktopOutputConfig, MonitoringSnapshot,
+    OutputStreamCounters, OutputStreamStatus, PendingNativeShutdown, PendingNativeShutdownWait,
+    PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
 };
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+use super::{PipeWireInputConfig as NativeInputConfig, PipeWireInputStream as NativeInputStream};
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::{PipeWireOutputStream, PipeWireStartError, PipeWireStartupStage, PipeWireStopError};
 #[cfg(target_os = "windows")]
@@ -13,9 +18,12 @@ use super::{
     WasapiDisconnectReason, WasapiOutputStream, WasapiStartError, WasapiStartupStage,
     WasapiStopError,
 };
+#[cfg(target_os = "windows")]
+use super::{WasapiInputConfig as NativeInputConfig, WasapiInputStream as NativeInputStream};
 use core::error::Error;
 use core::fmt;
 use hyper_arrangement_renderer::RenderScratchSlot;
+use hyper_audio_engine::StereoOutput;
 use hyper_media_cache::PreparePlaybackError;
 use hyper_mixer_runtime::{
     LoudnessCommandSender, MixerParameterCommandSender, MixerParameterStateRestoreError,
@@ -198,6 +206,7 @@ pub enum DesktopPlaybackSessionBuildError {
     MixerRecovery(MixerParameterStateRestoreError),
     ScratchCapacityUnavailable,
     Output(TransportOutputCreationError),
+    MonitoringScratchCapacityUnavailable,
 }
 
 impl fmt::Display for DesktopPlaybackSessionBuildError {
@@ -222,6 +231,9 @@ impl fmt::Display for DesktopPlaybackSessionBuildError {
             Self::Output(source) => {
                 write!(formatter, "transport output construction failed: {source}")
             }
+            Self::MonitoringScratchCapacityUnavailable => {
+                formatter.write_str("playback monitoring scratch capacity is unavailable")
+            }
         }
     }
 }
@@ -236,7 +248,8 @@ impl Error for DesktopPlaybackSessionBuildError {
             Self::Output(source) => Some(source),
             Self::SampleRateMismatch { .. }
             | Self::AssetFactCapacityUnavailable
-            | Self::ScratchCapacityUnavailable => None,
+            | Self::ScratchCapacityUnavailable
+            | Self::MonitoringScratchCapacityUnavailable => None,
         }
     }
 }
@@ -246,6 +259,12 @@ pub enum DesktopPlaybackSessionStartError {
     Build(DesktopPlaybackSessionBuildError),
     Output(DesktopOutputStartError),
     PublicationUnavailable,
+    MonitoringCapacityUnavailable,
+    Input(DesktopInputStartError),
+    Monitored {
+        source: Box<DesktopPlaybackSessionStartError>,
+        input_cleanup: Option<DesktopInputStopError>,
+    },
 }
 
 impl fmt::Display for DesktopPlaybackSessionStartError {
@@ -256,6 +275,18 @@ impl fmt::Display for DesktopPlaybackSessionStartError {
             Self::PublicationUnavailable => {
                 formatter.write_str("playback controls were unavailable after output startup")
             }
+            Self::MonitoringCapacityUnavailable => {
+                formatter.write_str("playback monitoring capacity is unavailable")
+            }
+            Self::Input(source) => write!(formatter, "playback monitoring input failed: {source}"),
+            Self::Monitored {
+                source,
+                input_cleanup: None,
+            } => source.fmt(formatter),
+            Self::Monitored {
+                source,
+                input_cleanup: Some(cleanup),
+            } => write!(formatter, "{source}; input cleanup also failed: {cleanup}"),
         }
     }
 }
@@ -265,8 +296,46 @@ impl Error for DesktopPlaybackSessionStartError {
         match self {
             Self::Build(source) => Some(source),
             Self::Output(source) => Some(source),
-            Self::PublicationUnavailable => None,
+            Self::Input(source) => Some(source),
+            Self::Monitored { source, .. } => Some(source.as_ref()),
+            Self::PublicationUnavailable | Self::MonitoringCapacityUnavailable => None,
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct DesktopPlaybackSessionStopError {
+    pub input: Option<DesktopInputStopError>,
+    pub output: Option<DesktopOutputStopError>,
+}
+
+impl fmt::Display for DesktopPlaybackSessionStopError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.input, &self.output) {
+            (Some(input), Some(output)) => write!(
+                formatter,
+                "playback monitoring input shutdown failed: {input}; output shutdown failed: {output}"
+            ),
+            (Some(input), None) => write!(
+                formatter,
+                "playback monitoring input shutdown failed: {input}"
+            ),
+            (None, Some(output)) => output.fmt(formatter),
+            (None, None) => formatter.write_str("playback native shutdown failed"),
+        }
+    }
+}
+
+impl Error for DesktopPlaybackSessionStopError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.input
+            .as_ref()
+            .map(|source| source as &(dyn Error + 'static))
+            .or_else(|| {
+                self.output
+                    .as_ref()
+                    .map(|source| source as &(dyn Error + 'static))
+            })
     }
 }
 
@@ -321,6 +390,89 @@ pub struct DesktopPlaybackSession {
     recovery: PlaybackRecoveryCheckpoint,
     config: DesktopOutputConfig,
     source: Arc<dyn DesktopPlaybackSource>,
+    monitoring: Option<PlaybackMonitoringSession>,
+}
+
+#[derive(Debug)]
+struct PlaybackMonitoringSession {
+    input: NativeInputStream,
+    config: DesktopMonitoringConfig,
+    counters: MonitoringCounters,
+    control: DesktopMonitoringControl,
+}
+
+struct PlaybackMonitoringMixer {
+    consumer: MonitoringConsumer,
+    interleaved: Vec<f32>,
+    enabled: bool,
+}
+
+impl PlaybackMonitoringMixer {
+    fn try_new(
+        consumer: MonitoringConsumer,
+        maximum_block_frames: usize,
+    ) -> Result<Self, DesktopPlaybackSessionBuildError> {
+        let sample_capacity = maximum_block_frames
+            .checked_mul(2)
+            .ok_or(DesktopPlaybackSessionBuildError::MonitoringScratchCapacityUnavailable)?;
+        let mut interleaved = Vec::new();
+        interleaved
+            .try_reserve_exact(sample_capacity)
+            .map_err(|_| DesktopPlaybackSessionBuildError::MonitoringScratchCapacityUnavailable)?;
+        interleaved.resize(sample_capacity, 0.0);
+        Ok(Self {
+            consumer,
+            interleaved,
+            enabled: true,
+        })
+    }
+
+    fn mix(&mut self, output: StereoOutput<'_>) {
+        let StereoOutput { left, right } = output;
+        if !self.enabled {
+            return;
+        }
+        let frames = left.len();
+        let samples = frames * 2;
+        if self
+            .consumer
+            .process(&mut self.interleaved[..samples])
+            .is_err()
+        {
+            self.enabled = false;
+            return;
+        }
+        for (frame, monitor) in self.interleaved[..samples].chunks_exact(2).enumerate() {
+            left[frame] += monitor[0];
+            right[frame] += monitor[1];
+        }
+    }
+}
+
+struct MonitoredTransportOutputProcessor<'state, 'buffers, R> {
+    playback: TransportOutputProcessor<'state, 'buffers, R>,
+    monitoring: PlaybackMonitoringMixer,
+}
+
+impl<R: hyper_mixer_runtime::TrackWindowRenderer> CheckpointedOutputProcessor
+    for MonitoredTransportOutputProcessor<'_, '_, R>
+{
+    type Error = hyper_audio_engine::StereoCallbackError<hyper_mixer_runtime::RuntimeProcessError>;
+
+    fn maximum_block_frames(&self) -> usize {
+        self.playback.maximum_block_frames()
+    }
+
+    fn process_checkpointed(
+        &mut self,
+        output: &mut [f32],
+    ) -> Result<hyper_mixer_runtime::InterleavedTransportCycle, Self::Error> {
+        let Self {
+            playback,
+            monitoring,
+        } = self;
+        playback.process_with_post_mix(output, |output| monitoring.mix(output))
+    }
 }
 
 /// Restart authority retained after a desktop output has been fully torn down.
@@ -331,46 +483,56 @@ pub struct DesktopPlaybackSession {
 #[derive(Debug)]
 pub struct DesktopPlaybackRecovery {
     config: DesktopOutputConfig,
+    monitoring: Option<DesktopMonitoringConfig>,
     source: Option<Arc<dyn DesktopPlaybackSource>>,
     checkpoint: Box<PlaybackRecoverySnapshot>,
 }
 
 #[derive(Debug)]
-pub enum DesktopPlaybackRecoveryStopError {
-    RuntimeFailed {
-        source: DesktopOutputStopError,
-        recovery: DesktopPlaybackRecovery,
-    },
-    ThreadPanicked {
-        source: DesktopOutputStopError,
-        recovery: DesktopPlaybackRecovery,
-    },
-    ShutdownPending {
-        source: DesktopOutputStopError,
-        recovery: DesktopPlaybackRecovery,
-    },
+pub struct DesktopPlaybackRecoveryStopError {
+    pub input: Option<DesktopInputStopError>,
+    pub output: Option<DesktopOutputStopError>,
+    recovery: Box<DesktopPlaybackRecovery>,
 }
 
 impl DesktopPlaybackRecoveryStopError {
+    #[cfg(test)]
     fn from_stop(source: DesktopOutputStopError, recovery: DesktopPlaybackRecovery) -> Self {
-        match source {
-            DesktopOutputStopError::RuntimeFailed => Self::RuntimeFailed { source, recovery },
-            DesktopOutputStopError::ThreadPanicked => Self::ThreadPanicked { source, recovery },
-            DesktopOutputStopError::ShutdownPending { .. } => {
-                Self::ShutdownPending { source, recovery }
-            }
+        Self {
+            input: None,
+            output: Some(source),
+            recovery: Box::new(recovery),
+        }
+    }
+
+    fn has_pending_shutdown(&self) -> bool {
+        matches!(
+            self.input,
+            Some(DesktopInputStopError::ShutdownPending { .. })
+        ) || matches!(
+            self.output,
+            Some(DesktopOutputStopError::ShutdownPending { .. })
+        )
+    }
+
+    fn primary_error(&self) -> &(dyn Error + 'static) {
+        if let Some(source) = &self.input {
+            source
+        } else if let Some(source) = &self.output {
+            source
+        } else {
+            unreachable!("playback recovery stop error requires a native failure")
         }
     }
 
     /// Returns restart authority only when the backend thread is known to have
     /// terminated.
     #[must_use]
-    pub const fn recovery(&self) -> Option<&DesktopPlaybackRecovery> {
-        match self {
-            Self::RuntimeFailed { recovery, .. } | Self::ThreadPanicked { recovery, .. } => {
-                Some(recovery)
-            }
-            Self::ShutdownPending { .. } => None,
+    pub fn recovery(&self) -> Option<&DesktopPlaybackRecovery> {
+        if self.has_pending_shutdown() {
+            None
+        } else {
+            Some(&self.recovery)
         }
     }
 
@@ -382,25 +544,16 @@ impl DesktopPlaybackRecoveryStopError {
     ///
     /// Returns the unchanged error while native shutdown remains pending.
     pub fn into_recovery(self) -> Result<DesktopPlaybackRecovery, Self> {
-        match self {
-            Self::RuntimeFailed { recovery, .. } | Self::ThreadPanicked { recovery, .. } => {
-                Ok(recovery)
-            }
-            pending @ Self::ShutdownPending { .. } => Err(pending),
+        if self.has_pending_shutdown() {
+            Err(self)
+        } else {
+            Ok(*self.recovery)
         }
     }
 
     #[must_use]
-    pub const fn is_shutdown_pending(&self) -> bool {
-        matches!(self, Self::ShutdownPending { .. })
-    }
-
-    fn source_error(&self) -> &DesktopOutputStopError {
-        match self {
-            Self::RuntimeFailed { source, .. }
-            | Self::ThreadPanicked { source, .. }
-            | Self::ShutdownPending { source, .. } => source,
-        }
+    pub fn is_shutdown_pending(&self) -> bool {
+        self.has_pending_shutdown()
     }
 
     /// Returns the sole pending native owner together with restart authority.
@@ -409,35 +562,65 @@ impl DesktopPlaybackRecoveryStopError {
     ///
     /// Returns the unchanged error when native teardown already completed.
     pub fn into_pending(self) -> Result<DesktopPlaybackRecoveryPendingStop, Self> {
-        match self {
-            Self::ShutdownPending {
-                source: DesktopOutputStopError::ShutdownPending { shutdown },
-                recovery,
-            } => Ok(DesktopPlaybackRecoveryPendingStop {
-                shutdown: *shutdown,
-                recovery,
-            }),
-            other => Err(other),
+        if !self.has_pending_shutdown() {
+            return Err(self);
         }
+        let failed = matches!(self.input, Some(DesktopInputStopError::RuntimeFailed))
+            || matches!(self.output, Some(DesktopOutputStopError::RuntimeFailed));
+        let panicked = matches!(self.input, Some(DesktopInputStopError::ThreadPanicked))
+            || matches!(self.output, Some(DesktopOutputStopError::ThreadPanicked));
+        let input = match self.input {
+            Some(DesktopInputStopError::ShutdownPending { shutdown }) => Some(*shutdown),
+            Some(DesktopInputStopError::RuntimeFailed | DesktopInputStopError::ThreadPanicked)
+            | None => None,
+        };
+        let output = match self.output {
+            Some(DesktopOutputStopError::ShutdownPending { shutdown }) => Some(*shutdown),
+            Some(
+                DesktopOutputStopError::RuntimeFailed | DesktopOutputStopError::ThreadPanicked,
+            )
+            | None => None,
+        };
+        Ok(DesktopPlaybackRecoveryPendingStop {
+            input,
+            output,
+            failed,
+            panicked,
+            recovery: *self.recovery,
+        })
     }
 }
 
 impl fmt::Display for DesktopPlaybackRecoveryStopError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.source_error().fmt(formatter)
+        match (&self.input, &self.output) {
+            (Some(input), Some(output)) => write!(
+                formatter,
+                "playback monitoring input shutdown failed: {input}; output shutdown failed: {output}"
+            ),
+            (Some(input), None) => write!(
+                formatter,
+                "playback monitoring input shutdown failed: {input}"
+            ),
+            (None, Some(output)) => output.fmt(formatter),
+            (None, None) => formatter.write_str("playback native shutdown failed"),
+        }
     }
 }
 
 impl Error for DesktopPlaybackRecoveryStopError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(self.source_error())
+        Some(self.primary_error())
     }
 }
 
-/// Sole restart authority while ordinary output shutdown remains pending.
+/// Sole restart authority while one or both native streams remain pending.
 #[derive(Debug)]
 pub struct DesktopPlaybackRecoveryPendingStop {
-    shutdown: PendingNativeShutdown,
+    input: Option<PendingNativeShutdown>,
+    output: Option<PendingNativeShutdown>,
+    failed: bool,
+    panicked: bool,
     recovery: DesktopPlaybackRecovery,
 }
 
@@ -451,28 +634,62 @@ pub enum DesktopPlaybackRecoveryPendingStopWait {
 
 impl DesktopPlaybackRecoveryPendingStop {
     #[must_use]
-    pub fn status(&self) -> OutputStreamStatus {
-        self.shutdown.status()
+    pub fn input_status(&self) -> Option<super::StreamStatus> {
+        self.input.as_ref().map(PendingNativeShutdown::status)
+    }
+
+    #[must_use]
+    pub fn output_status(&self) -> Option<super::StreamStatus> {
+        self.output.as_ref().map(PendingNativeShutdown::status)
     }
 
     /// Waits for teardown while retaining exactly one restart authority.
     #[must_use]
     pub fn wait(mut self, timeout: std::time::Duration) -> DesktopPlaybackRecoveryPendingStopWait {
-        match self.shutdown.wait(timeout) {
-            PendingNativeShutdownWait::Completed => {
-                DesktopPlaybackRecoveryPendingStopWait::Completed(self.recovery)
-            }
-            PendingNativeShutdownWait::Failed => {
-                DesktopPlaybackRecoveryPendingStopWait::Failed(self.recovery)
-            }
-            PendingNativeShutdownWait::Panicked => {
-                DesktopPlaybackRecoveryPendingStopWait::Panicked(self.recovery)
-            }
-            PendingNativeShutdownWait::TimedOut => {
-                DesktopPlaybackRecoveryPendingStopWait::TimedOut(self)
+        let deadline = std::time::Instant::now() + timeout;
+        let mut failed = self.failed;
+        let mut panicked = self.panicked;
+        for input in [true, false] {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let result = if input {
+                wait_pending_shutdown(&mut self.input, remaining)
+            } else {
+                wait_pending_shutdown(&mut self.output, remaining)
+            };
+            match result {
+                None | Some(PendingNativeShutdownWait::Completed) => {}
+                Some(PendingNativeShutdownWait::Failed) => {
+                    failed = true;
+                }
+                Some(PendingNativeShutdownWait::Panicked) => {
+                    panicked = true;
+                }
+                Some(PendingNativeShutdownWait::TimedOut) => {
+                    self.failed = failed;
+                    self.panicked = panicked;
+                    return DesktopPlaybackRecoveryPendingStopWait::TimedOut(self);
+                }
             }
         }
+        if panicked {
+            DesktopPlaybackRecoveryPendingStopWait::Panicked(self.recovery)
+        } else if failed {
+            DesktopPlaybackRecoveryPendingStopWait::Failed(self.recovery)
+        } else {
+            DesktopPlaybackRecoveryPendingStopWait::Completed(self.recovery)
+        }
     }
+}
+
+fn wait_pending_shutdown(
+    shutdown: &mut Option<PendingNativeShutdown>,
+    timeout: std::time::Duration,
+) -> Option<PendingNativeShutdownWait> {
+    let result = shutdown.as_mut()?.wait(timeout);
+    if result != PendingNativeShutdownWait::TimedOut {
+        *shutdown = None;
+    }
+    Some(result)
 }
 
 #[derive(Debug)]
@@ -483,6 +700,7 @@ pub enum DesktopPlaybackRecoveryStartError {
         pending: Box<DesktopPlaybackRecoveryPendingStart>,
     },
     Start(DesktopPlaybackSessionStartError),
+    MonitoringConfig(super::DesktopMonitoringConfigError),
 }
 
 impl fmt::Display for DesktopPlaybackRecoveryStartError {
@@ -498,6 +716,7 @@ impl fmt::Display for DesktopPlaybackRecoveryStartError {
                 formatter.write_str("desktop playback restart cancellation is still pending")
             }
             Self::Start(source) => source.fmt(formatter),
+            Self::MonitoringConfig(source) => source.fmt(formatter),
         }
     }
 }
@@ -509,6 +728,7 @@ impl Error for DesktopPlaybackRecoveryStartError {
                 None
             }
             Self::Start(source) => Some(source),
+            Self::MonitoringConfig(source) => Some(source),
         }
     }
 }
@@ -520,19 +740,25 @@ impl DesktopPlaybackRecoveryStartError {
     pub fn into_pending(self) -> Option<DesktopPlaybackRecoveryPendingStart> {
         match self {
             Self::CancellationPending { pending } => Some(*pending),
-            Self::OutputNotPinned | Self::AlreadyRestarted | Self::Start(_) => None,
+            Self::OutputNotPinned
+            | Self::AlreadyRestarted
+            | Self::Start(_)
+            | Self::MonitoringConfig(_) => None,
         }
     }
 }
 
-/// Sole restart authority while a cancelled native startup still owns its
-/// output thread.
+/// Sole restart authority while cancelled monitored playback startup still
+/// owns one or both native threads.
 ///
 /// This value is intentionally not cloneable. A retry becomes available only
 /// after [`Self::wait`] observes terminal native-thread teardown.
 #[derive(Debug)]
 pub struct DesktopPlaybackRecoveryPendingStart {
-    shutdown: PendingNativeShutdown,
+    input: Option<PendingNativeShutdown>,
+    output: Option<PendingNativeShutdown>,
+    failed: bool,
+    panicked: bool,
     recovery: DesktopPlaybackRecovery,
 }
 
@@ -546,10 +772,13 @@ pub enum DesktopPlaybackRecoveryPendingWait {
 }
 
 impl DesktopPlaybackRecoveryPendingStart {
-    /// Returns the latest state reported by the native output thread.
+    /// Returns the latest state reported by a pending native thread.
     #[must_use]
-    pub fn status(&self) -> OutputStreamStatus {
-        self.shutdown.status()
+    pub fn status(&self) -> Option<super::StreamStatus> {
+        self.output
+            .as_ref()
+            .or(self.input.as_ref())
+            .map(PendingNativeShutdown::status)
     }
 
     /// Waits for native teardown while retaining exactly one retry authority.
@@ -558,19 +787,33 @@ impl DesktopPlaybackRecoveryPendingStart {
     /// recovery value that may create the next output.
     #[must_use]
     pub fn wait(mut self, timeout: std::time::Duration) -> DesktopPlaybackRecoveryPendingWait {
-        match self.shutdown.wait(timeout) {
-            PendingNativeShutdownWait::Completed => {
-                DesktopPlaybackRecoveryPendingWait::Completed(self.recovery)
+        let deadline = std::time::Instant::now() + timeout;
+        let mut failed = self.failed;
+        let mut panicked = self.panicked;
+        for input in [true, false] {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let result = if input {
+                wait_pending_shutdown(&mut self.input, remaining)
+            } else {
+                wait_pending_shutdown(&mut self.output, remaining)
+            };
+            match result {
+                None | Some(PendingNativeShutdownWait::Completed) => {}
+                Some(PendingNativeShutdownWait::Failed) => failed = true,
+                Some(PendingNativeShutdownWait::Panicked) => panicked = true,
+                Some(PendingNativeShutdownWait::TimedOut) => {
+                    self.failed = failed;
+                    self.panicked = panicked;
+                    return DesktopPlaybackRecoveryPendingWait::TimedOut(self);
+                }
             }
-            PendingNativeShutdownWait::Failed => {
-                DesktopPlaybackRecoveryPendingWait::Failed(self.recovery)
-            }
-            PendingNativeShutdownWait::Panicked => {
-                DesktopPlaybackRecoveryPendingWait::Panicked(self.recovery)
-            }
-            PendingNativeShutdownWait::TimedOut => {
-                DesktopPlaybackRecoveryPendingWait::TimedOut(self)
-            }
+        }
+        if panicked {
+            DesktopPlaybackRecoveryPendingWait::Panicked(self.recovery)
+        } else if failed {
+            DesktopPlaybackRecoveryPendingWait::Failed(self.recovery)
+        } else {
+            DesktopPlaybackRecoveryPendingWait::Completed(self.recovery)
         }
     }
 }
@@ -589,6 +832,11 @@ impl DesktopPlaybackRecovery {
         self.source
             .as_deref()
             .and_then(DesktopPlaybackSource::project)
+    }
+
+    #[must_use]
+    pub const fn monitoring_config(&self) -> Option<&DesktopMonitoringConfig> {
+        self.monitoring.as_ref()
     }
 
     /// Rebuilds playback against the same explicitly selected output.
@@ -622,6 +870,15 @@ impl DesktopPlaybackRecovery {
         if !output_is_pinned(&config) {
             return Err(DesktopPlaybackRecoveryStartError::OutputNotPinned);
         }
+        if self.source.is_none() {
+            return Err(DesktopPlaybackRecoveryStartError::AlreadyRestarted);
+        }
+        let monitoring = self
+            .monitoring
+            .clone()
+            .map(|monitoring| monitoring.with_output(config.clone()))
+            .transpose()
+            .map_err(DesktopPlaybackRecoveryStartError::MonitoringConfig)?;
         let source = self
             .source
             .take()
@@ -630,16 +887,18 @@ impl DesktopPlaybackRecovery {
             config.clone(),
             source.clone(),
             Some(Box::new(*self.checkpoint)),
+            monitoring.clone(),
         );
         match session {
             Ok(session) => Ok(session),
-            Err(error) => Err(self.failed_restart(config, source, error)),
+            Err(error) => Err(self.failed_restart(config, monitoring, source, error)),
         }
     }
 
     fn failed_restart(
         &mut self,
         config: DesktopOutputConfig,
+        monitoring: Option<DesktopMonitoringConfig>,
         source: Arc<dyn DesktopPlaybackSource>,
         error: DesktopPlaybackSessionStartError,
     ) -> DesktopPlaybackRecoveryStartError {
@@ -648,14 +907,70 @@ impl DesktopPlaybackRecovery {
                 DesktopOutputStartError::CancellationPending { shutdown },
             ) => DesktopPlaybackRecoveryStartError::CancellationPending {
                 pending: Box::new(DesktopPlaybackRecoveryPendingStart {
-                    shutdown: *shutdown,
+                    input: None,
+                    output: Some(*shutdown),
+                    failed: false,
+                    panicked: false,
                     recovery: DesktopPlaybackRecovery {
                         config,
+                        monitoring,
                         source: Some(source),
                         checkpoint: self.checkpoint.clone(),
                     },
                 }),
             },
+            DesktopPlaybackSessionStartError::Monitored {
+                source: nested,
+                input_cleanup,
+            } => {
+                let (input, terminal_input_cleanup) = match input_cleanup {
+                    Some(DesktopInputStopError::ShutdownPending { shutdown }) => {
+                        (Some(*shutdown), None)
+                    }
+                    Some(
+                        source @ (DesktopInputStopError::RuntimeFailed
+                        | DesktopInputStopError::ThreadPanicked),
+                    ) => (None, Some(source)),
+                    None => (None, None),
+                };
+                let output = match *nested {
+                    DesktopPlaybackSessionStartError::Output(
+                        DesktopOutputStartError::CancellationPending { shutdown },
+                    ) => Some(*shutdown),
+                    nested => {
+                        if input.is_none() {
+                            self.source = Some(source);
+                            return DesktopPlaybackRecoveryStartError::Start(
+                                DesktopPlaybackSessionStartError::Monitored {
+                                    source: Box::new(nested),
+                                    input_cleanup: terminal_input_cleanup,
+                                },
+                            );
+                        }
+                        None
+                    }
+                };
+                DesktopPlaybackRecoveryStartError::CancellationPending {
+                    pending: Box::new(DesktopPlaybackRecoveryPendingStart {
+                        input,
+                        output,
+                        failed: matches!(
+                            terminal_input_cleanup,
+                            Some(DesktopInputStopError::RuntimeFailed)
+                        ),
+                        panicked: matches!(
+                            terminal_input_cleanup,
+                            Some(DesktopInputStopError::ThreadPanicked)
+                        ),
+                        recovery: DesktopPlaybackRecovery {
+                            config,
+                            monitoring,
+                            source: Some(source),
+                            checkpoint: self.checkpoint.clone(),
+                        },
+                    }),
+                }
+            }
             error => {
                 self.source = Some(source);
                 DesktopPlaybackRecoveryStartError::Start(error)
@@ -689,6 +1004,22 @@ impl DesktopPlaybackSession {
         Self::start_project(config, project).map_err(DesktopProjectOpenError::Start)
     }
 
+    /// Verifies and starts one project with bounded live input monitoring.
+    ///
+    /// # Errors
+    ///
+    /// Returns project loading or monitored playback startup errors without
+    /// publishing a partial session.
+    pub fn open_project_monitored(
+        monitoring: DesktopMonitoringConfig,
+        root: impl AsRef<Path>,
+        limits: ProjectPlaybackLimits,
+    ) -> Result<Self, DesktopProjectOpenError> {
+        let project =
+            prepare_project_playback(root, limits).map_err(DesktopProjectOpenError::Load)?;
+        Self::start_project_monitored(monitoring, project).map_err(DesktopProjectOpenError::Start)
+    }
+
     /// Starts an already verified project while retaining its package and
     /// recording metadata for the complete native-output and recovery lifetime.
     ///
@@ -700,7 +1031,26 @@ impl DesktopPlaybackSession {
         config: DesktopOutputConfig,
         project: PreparedProjectPlayback,
     ) -> Result<Self, DesktopPlaybackSessionStartError> {
-        Self::start_source(config, Arc::new(project), None)
+        Self::start_source(config, Arc::new(project), None, None)
+    }
+
+    /// Starts an already verified project with one bounded input-monitor path
+    /// mixed before final output metering.
+    ///
+    /// # Errors
+    ///
+    /// Returns a playback, monitoring-capacity, input, or output startup error.
+    /// Any failure after input startup attempts bounded input cleanup.
+    pub fn start_project_monitored(
+        monitoring: DesktopMonitoringConfig,
+        project: PreparedProjectPlayback,
+    ) -> Result<Self, DesktopPlaybackSessionStartError> {
+        Self::start_source(
+            monitoring.output().clone(),
+            Arc::new(project),
+            None,
+            Some(monitoring),
+        )
     }
 
     /// Compiles and binds one prepared session entirely on the output thread.
@@ -716,13 +1066,72 @@ impl DesktopPlaybackSession {
         config: DesktopOutputConfig,
         input: DesktopPlaybackSessionInput,
     ) -> Result<Self, DesktopPlaybackSessionStartError> {
-        Self::start_source(config, Arc::new(input), None)
+        Self::start_source(config, Arc::new(input), None, None)
+    }
+
+    /// Starts prepared playback with one bounded input-monitor path mixed
+    /// before final output metering.
+    ///
+    /// # Errors
+    ///
+    /// Returns a playback, monitoring-capacity, input, or output startup error.
+    pub fn start_monitored(
+        monitoring: DesktopMonitoringConfig,
+        input: DesktopPlaybackSessionInput,
+    ) -> Result<Self, DesktopPlaybackSessionStartError> {
+        Self::start_source(
+            monitoring.output().clone(),
+            Arc::new(input),
+            None,
+            Some(monitoring),
+        )
     }
 
     fn start_source(
         config: DesktopOutputConfig,
         source: Arc<dyn DesktopPlaybackSource>,
         initial_checkpoint: Option<Box<PlaybackRecoverySnapshot>>,
+        monitoring: Option<DesktopMonitoringConfig>,
+    ) -> Result<Self, DesktopPlaybackSessionStartError> {
+        let Some(monitoring_config) = monitoring else {
+            return Self::start_output_source(config, source, initial_checkpoint, None);
+        };
+        let (mut producer, consumer, counters, control) =
+            try_monitoring_transport(&monitoring_config)
+                .map_err(|_| DesktopPlaybackSessionStartError::MonitoringCapacityUnavailable)?;
+        let input = NativeInputStream::start(
+            NativeInputConfig::from(monitoring_config.input()),
+            move |samples: &[f32]| {
+                producer.push(samples);
+                Ok::<(), core::convert::Infallible>(())
+            },
+        )
+        .map_err(|source| DesktopPlaybackSessionStartError::Input(source.into()))?;
+        match Self::start_output_source(config, source, initial_checkpoint, Some(consumer)) {
+            Ok(mut session) => {
+                session.monitoring = Some(PlaybackMonitoringSession {
+                    input,
+                    config: monitoring_config,
+                    counters,
+                    control,
+                });
+                Ok(session)
+            }
+            Err(source) => {
+                let input_cleanup = input.stop().err().map(DesktopInputStopError::from);
+                Err(DesktopPlaybackSessionStartError::Monitored {
+                    source: Box::new(source),
+                    input_cleanup,
+                })
+            }
+        }
+    }
+
+    fn start_output_source(
+        config: DesktopOutputConfig,
+        source: Arc<dyn DesktopPlaybackSource>,
+        initial_checkpoint: Option<Box<PlaybackRecoverySnapshot>>,
+        monitoring: Option<MonitoringConsumer>,
     ) -> Result<Self, DesktopPlaybackSessionStartError> {
         let sample_rate_hz = config.sample_rate_hz();
         let maximum_block_frames = config.maximum_block_frames();
@@ -737,6 +1146,7 @@ impl DesktopPlaybackSession {
                     maximum_block_frames,
                     initial_checkpoint.as_deref(),
                     &publication_sender,
+                    monitoring,
                 )
             });
 
@@ -751,6 +1161,7 @@ impl DesktopPlaybackSession {
                     recovery: handles.recovery,
                     config,
                     source,
+                    monitoring: None,
                 }),
                 Ok(SessionPublication::Failed(source)) => {
                     Err(DesktopPlaybackSessionStartError::Build(source))
@@ -801,6 +1212,34 @@ impl DesktopPlaybackSession {
         self.output.status()
     }
 
+    #[must_use]
+    pub fn monitoring_control(&self) -> Option<DesktopMonitoringControl> {
+        self.monitoring
+            .as_ref()
+            .map(|monitoring| monitoring.control.clone())
+    }
+
+    #[must_use]
+    pub fn monitoring_snapshot(&self) -> Option<MonitoringSnapshot> {
+        self.monitoring
+            .as_ref()
+            .map(|monitoring| monitoring.counters.snapshot())
+    }
+
+    #[must_use]
+    pub fn monitoring_input_status(&self) -> Option<super::StreamStatus> {
+        self.monitoring
+            .as_ref()
+            .map(|monitoring| monitoring.input.status())
+    }
+
+    #[must_use]
+    pub fn monitoring_input_counters(&self) -> Option<super::CaptureStreamCounters> {
+        self.monitoring
+            .as_ref()
+            .map(|monitoring| monitoring.input.counters())
+    }
+
     /// Returns an observer for the last successfully committed transport cycle.
     #[must_use]
     pub fn recovery_checkpoint(&self) -> PlaybackRecoveryCheckpoint {
@@ -828,18 +1267,30 @@ impl DesktopPlaybackSession {
             recovery,
             config,
             source,
+            monitoring,
         } = self;
-        let stop_result = output.stop().map_err(DesktopOutputStopError::from);
+        let monitoring_config = monitoring
+            .as_ref()
+            .map(|monitoring| monitoring.config.clone());
+        let input = monitoring
+            .map(|monitoring| monitoring.input.stop().map_err(DesktopInputStopError::from))
+            .transpose()
+            .err();
+        let output = output.stop().err().map(DesktopOutputStopError::from);
         let recovery = DesktopPlaybackRecovery {
             config,
+            monitoring: monitoring_config,
             source: Some(source),
             checkpoint: Box::new(recovery.snapshot()),
         };
-        match stop_result {
-            Ok(()) => Ok(recovery),
-            Err(source) => Err(DesktopPlaybackRecoveryStopError::from_stop(
-                source, recovery,
-            )),
+        if input.is_none() && output.is_none() {
+            Ok(recovery)
+        } else {
+            Err(DesktopPlaybackRecoveryStopError {
+                input,
+                output,
+                recovery: Box::new(recovery),
+            })
         }
     }
 
@@ -851,13 +1302,21 @@ impl DesktopPlaybackSession {
         self.output.disconnect_reason()
     }
 
-    /// Stops the output thread and waits for its complete teardown.
+    #[cfg(target_os = "windows")]
+    #[must_use]
+    pub fn monitoring_input_disconnect_reason(&self) -> Option<WasapiDisconnectReason> {
+        self.monitoring
+            .as_ref()
+            .and_then(|monitoring| monitoring.input.disconnect_reason())
+    }
+
+    /// Stops monitoring input before output and attempts both bounded joins.
     ///
     /// # Errors
     ///
-    /// Returns [`DesktopOutputStopError`] if the output thread panicked or did
-    /// not terminate before the bounded shutdown deadline.
-    pub fn stop(self) -> Result<(), DesktopOutputStopError> {
+    /// Returns every input or output shutdown failure, including any pending
+    /// native ownership needed to observe eventual teardown.
+    pub fn stop(self) -> Result<(), DesktopPlaybackSessionStopError> {
         let Self {
             output,
             commands: _,
@@ -867,8 +1326,18 @@ impl DesktopPlaybackSession {
             recovery: _,
             config: _,
             source: _,
+            monitoring,
         } = self;
-        output.stop().map_err(DesktopOutputStopError::from)
+        let input = monitoring
+            .map(|monitoring| monitoring.input.stop().map_err(DesktopInputStopError::from))
+            .transpose()
+            .err();
+        let output = output.stop().err().map(DesktopOutputStopError::from);
+        if input.is_none() && output.is_none() {
+            Ok(())
+        } else {
+            Err(DesktopPlaybackSessionStopError { input, output })
+        }
     }
 }
 
@@ -902,6 +1371,7 @@ fn initialize_session(
     maximum_block_frames: usize,
     initial_checkpoint: Option<&PlaybackRecoverySnapshot>,
     publication: &SyncSender<SessionPublication>,
+    monitoring: Option<MonitoringConsumer>,
 ) -> Result<(), NativeDesktopOutputStartError> {
     let (project, mixer, automation, media) = input.parts();
     if project.sample_rate_hz() != sample_rate_hz {
@@ -981,6 +1451,10 @@ fn initialize_session(
     )
     .map_err(DesktopPlaybackSessionBuildError::Output)
     .or_else(|source| fail_build(publication, source))?;
+    let monitoring = monitoring
+        .map(|monitoring| PlaybackMonitoringMixer::try_new(monitoring, maximum_block_frames))
+        .transpose()
+        .or_else(|source| fail_build(publication, source))?;
     let (publisher, recovery) = playback_recovery_channel(initial_checkpoint);
     publication
         .try_send(SessionPublication::Prepared(SessionHandles {
@@ -991,7 +1465,17 @@ fn initialize_session(
             recovery: recovery.clone(),
         }))
         .map_err(|_| callback_error("playback control publication failed".to_owned()))?;
-    runner.run_transport_output_with_checkpoint(processor, publisher)
+    if let Some(monitoring) = monitoring {
+        runner.run_transport_output_with_checkpoint(
+            MonitoredTransportOutputProcessor {
+                playback: processor,
+                monitoring,
+            },
+            publisher,
+        )
+    } else {
+        runner.run_transport_output_with_checkpoint(processor, publisher)
+    }
 }
 
 fn output_is_pinned(config: &DesktopOutputConfig) -> bool {
@@ -1045,6 +1529,8 @@ fn callback_error(detail: String) -> NativeDesktopOutputStartError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DesktopMonitoringConfigError;
+    use crate::monitoring_session::realtime_allocator::HeapMeasurement;
     use crate::{BoundedBackendThread, acquire_backend_thread_permit};
     use hyper_audio_source::DecodeLimits;
     #[cfg(all(target_os = "linux", target_endian = "little"))]
@@ -1121,6 +1607,12 @@ mod tests {
     }
 
     fn pending_shutdown_fixture() -> (PendingNativeShutdown, SyncSender<()>) {
+        pending_shutdown_fixture_with_status(OutputStreamStatus::default())
+    }
+
+    fn pending_shutdown_fixture_with_status(
+        status: OutputStreamStatus,
+    ) -> (PendingNativeShutdown, SyncSender<()>) {
         let (release_sender, release_receiver) = sync_channel(1);
         let (completed_sender, completed_receiver) = sync_channel(1);
         let handle = thread::spawn(move || {
@@ -1132,10 +1624,7 @@ mod tests {
             completed_receiver,
             acquire_backend_thread_permit().unwrap(),
         );
-        (
-            PendingNativeShutdown::new(thread, OutputStreamStatus::default()),
-            release_sender,
-        )
+        (PendingNativeShutdown::new(thread, status), release_sender)
     }
 
     fn project_limits() -> ProjectPlaybackLimits {
@@ -1151,6 +1640,49 @@ mod tests {
                 },
             },
         }
+    }
+
+    fn monitoring_transport() -> (
+        super::super::monitoring_session::MonitoringProducer,
+        MonitoringConsumer,
+    ) {
+        let config = DesktopMonitoringConfig::try_new(
+            super::super::DesktopInputConfig::try_new(48_000, 128).unwrap(),
+            DesktopOutputConfig::try_new(48_000, 128).unwrap(),
+            1_024,
+            256,
+            64,
+        )
+        .unwrap();
+        let (producer, consumer, _, _) = try_monitoring_transport(&config).unwrap();
+        (producer, consumer)
+    }
+
+    #[test]
+    fn playback_monitoring_mixes_into_the_final_stereo_output_without_allocating() {
+        let (mut producer, consumer) = monitoring_transport();
+        producer.push(&vec![0.25; 320 * 2]);
+        let mut monitoring = PlaybackMonitoringMixer::try_new(consumer, 128).unwrap();
+        let mut left = [0.5; 64];
+        let mut right = [-0.5; 64];
+
+        let measurement = HeapMeasurement::start_verified();
+        monitoring.mix(StereoOutput {
+            left: &mut left,
+            right: &mut right,
+        });
+        let heap_operations = measurement.finish();
+
+        assert_eq!(heap_operations, 0);
+        assert!(
+            left.iter()
+                .all(|sample| (*sample - 0.75).abs() <= f32::EPSILON)
+        );
+        assert!(
+            right
+                .iter()
+                .all(|sample| (*sample + 0.25).abs() <= f32::EPSILON)
+        );
     }
 
     #[cfg(all(target_os = "linux", target_endian = "little"))]
@@ -1375,6 +1907,7 @@ mod tests {
         let source: Arc<dyn DesktopPlaybackSource> = Arc::new(UnusedPlaybackSource);
         let mut original = DesktopPlaybackRecovery {
             config: pinned.clone(),
+            monitoring: None,
             source: None,
             checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
         };
@@ -1382,6 +1915,7 @@ mod tests {
 
         let error = original.failed_restart(
             pinned,
+            None,
             source,
             DesktopPlaybackSessionStartError::Output(
                 DesktopOutputStartError::CancellationPending {
@@ -1414,6 +1948,109 @@ mod tests {
     }
 
     #[test]
+    fn pending_monitored_restart_retains_a_joined_input_failure() {
+        let pinned = DesktopOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_routing_id("opaque-route")
+            .unwrap();
+        let source: Arc<dyn DesktopPlaybackSource> = Arc::new(UnusedPlaybackSource);
+        let monitoring = DesktopMonitoringConfig::try_new(
+            super::super::DesktopInputConfig::try_new(48_000, 128).unwrap(),
+            pinned.clone(),
+            1_024,
+            256,
+            64,
+        )
+        .unwrap();
+        let mut original = DesktopPlaybackRecovery {
+            config: pinned.clone(),
+            monitoring: Some(monitoring),
+            source: None,
+            checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
+        };
+        let (shutdown, release) = pending_shutdown_fixture();
+
+        let error = original.failed_restart(
+            pinned,
+            original.monitoring.clone(),
+            source,
+            DesktopPlaybackSessionStartError::Monitored {
+                source: Box::new(DesktopPlaybackSessionStartError::Output(
+                    DesktopOutputStartError::CancellationPending {
+                        shutdown: Box::new(shutdown),
+                    },
+                )),
+                input_cleanup: Some(DesktopInputStopError::RuntimeFailed),
+            },
+        );
+        let pending = error
+            .into_pending()
+            .expect("output cancellation must retain retry authority");
+        assert!(pending.status().is_some());
+        release.send(()).unwrap();
+        assert!(matches!(
+            pending.wait(Duration::from_secs(1)),
+            DesktopPlaybackRecoveryPendingWait::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn pending_restart_carries_observed_failure_across_a_later_timeout() {
+        let pinned = DesktopOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_routing_id("opaque-route")
+            .unwrap();
+        let source: Arc<dyn DesktopPlaybackSource> = Arc::new(UnusedPlaybackSource);
+        let monitoring = DesktopMonitoringConfig::try_new(
+            super::super::DesktopInputConfig::try_new(48_000, 128).unwrap(),
+            pinned.clone(),
+            1_024,
+            256,
+            64,
+        )
+        .unwrap();
+        let mut original = DesktopPlaybackRecovery {
+            config: pinned.clone(),
+            monitoring: Some(monitoring.clone()),
+            source: None,
+            checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
+        };
+        let input_status = OutputStreamStatus::default();
+        input_status.mark_failed();
+        let (input_shutdown, release_input) = pending_shutdown_fixture_with_status(input_status);
+        let (output_shutdown, release_output) = pending_shutdown_fixture();
+
+        let error = original.failed_restart(
+            pinned,
+            Some(monitoring),
+            source,
+            DesktopPlaybackSessionStartError::Monitored {
+                source: Box::new(DesktopPlaybackSessionStartError::Output(
+                    DesktopOutputStartError::CancellationPending {
+                        shutdown: Box::new(output_shutdown),
+                    },
+                )),
+                input_cleanup: Some(DesktopInputStopError::ShutdownPending {
+                    shutdown: Box::new(input_shutdown),
+                }),
+            },
+        );
+        let pending = error.into_pending().unwrap();
+        release_input.send(()).unwrap();
+        let DesktopPlaybackRecoveryPendingWait::TimedOut(pending) =
+            pending.wait(Duration::from_millis(50))
+        else {
+            panic!("the unreleased output must keep restart pending");
+        };
+
+        release_output.send(()).unwrap();
+        assert!(matches!(
+            pending.wait(Duration::from_secs(1)),
+            DesktopPlaybackRecoveryPendingWait::Failed(_)
+        ));
+    }
+
+    #[test]
     fn joined_restart_failure_restores_retry_authority_in_place() {
         let pinned = DesktopOutputConfig::try_new(48_000, 256)
             .unwrap()
@@ -1422,12 +2059,14 @@ mod tests {
         let source: Arc<dyn DesktopPlaybackSource> = Arc::new(UnusedPlaybackSource);
         let mut recovery = DesktopPlaybackRecovery {
             config: pinned.clone(),
+            monitoring: None,
             source: None,
             checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
         };
 
         let error = recovery.failed_restart(
             pinned,
+            None,
             source,
             DesktopPlaybackSessionStartError::PublicationUnavailable,
         );
@@ -1439,6 +2078,46 @@ mod tests {
             )
         ));
         assert!(recovery.source.is_some());
+    }
+
+    #[test]
+    fn incompatible_monitoring_rebind_preserves_retry_authority() {
+        let original_output = DesktopOutputConfig::try_new(48_000, 256)
+            .unwrap()
+            .with_routing_id("original-output")
+            .unwrap();
+        let monitoring = DesktopMonitoringConfig::try_new(
+            super::super::DesktopInputConfig::try_new(48_000, 128).unwrap(),
+            original_output.clone(),
+            1_024,
+            256,
+            64,
+        )
+        .unwrap();
+        let source: Arc<dyn DesktopPlaybackSource> = Arc::new(UnusedPlaybackSource);
+        let mut recovery = DesktopPlaybackRecovery {
+            config: original_output.clone(),
+            monitoring: Some(monitoring.clone()),
+            source: Some(source),
+            checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
+        };
+        let incompatible = DesktopOutputConfig::try_new(44_100, 256)
+            .unwrap()
+            .with_routing_id("incompatible-output")
+            .unwrap();
+
+        assert!(matches!(
+            recovery.restart_with_output(incompatible),
+            Err(DesktopPlaybackRecoveryStartError::MonitoringConfig(
+                DesktopMonitoringConfigError::SampleRateMismatch {
+                    input_hz: 48_000,
+                    output_hz: 44_100,
+                }
+            ))
+        ));
+        assert!(recovery.source.is_some());
+        assert_eq!(recovery.config, original_output);
+        assert_eq!(recovery.monitoring_config(), Some(&monitoring));
     }
 
     #[test]
@@ -1469,6 +2148,7 @@ mod tests {
 
         let mut spent = DesktopPlaybackRecovery {
             config: pinned,
+            monitoring: None,
             source: None,
             checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
         };
@@ -1482,6 +2162,7 @@ mod tests {
     fn shutdown_timeout_retains_restart_authority_until_join() {
         let recovery = DesktopPlaybackRecovery {
             config: DesktopOutputConfig::try_new(48_000, 256).unwrap(),
+            monitoring: None,
             source: None,
             checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
         };
@@ -1509,9 +2190,36 @@ mod tests {
     }
 
     #[test]
+    fn pending_recovery_stop_retains_a_joined_input_failure() {
+        let recovery = DesktopPlaybackRecovery {
+            config: DesktopOutputConfig::try_new(48_000, 256).unwrap(),
+            monitoring: None,
+            source: None,
+            checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
+        };
+        let (shutdown, release) = pending_shutdown_fixture();
+        let error = DesktopPlaybackRecoveryStopError {
+            input: Some(DesktopInputStopError::RuntimeFailed),
+            output: Some(DesktopOutputStopError::ShutdownPending {
+                shutdown: Box::new(shutdown),
+            }),
+            recovery: Box::new(recovery),
+        };
+
+        let pending = error.into_pending().unwrap();
+        assert!(pending.output_status().is_some());
+        release.send(()).unwrap();
+        assert!(matches!(
+            pending.wait(Duration::from_secs(1)),
+            DesktopPlaybackRecoveryPendingStopWait::Failed(_)
+        ));
+    }
+
+    #[test]
     fn joined_panic_retains_restart_authority() {
         let recovery = DesktopPlaybackRecovery {
             config: DesktopOutputConfig::try_new(48_000, 256).unwrap(),
+            monitoring: None,
             source: None,
             checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
         };
@@ -1529,6 +2237,7 @@ mod tests {
     fn joined_runtime_failure_retains_restart_authority() {
         let recovery = DesktopPlaybackRecovery {
             config: DesktopOutputConfig::try_new(48_000, 256).unwrap(),
+            monitoring: None,
             source: None,
             checkpoint: Box::new(PlaybackRecoveryCheckpoint::default().snapshot()),
         };
