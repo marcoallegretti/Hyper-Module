@@ -377,7 +377,7 @@ struct MonitoringCounterState {
 }
 
 #[derive(Clone, Debug, Default)]
-struct MonitoringCounters {
+pub(crate) struct MonitoringCounters {
     state: Arc<MonitoringCounterState>,
 }
 
@@ -389,7 +389,7 @@ impl MonitoringCounters {
         });
     }
 
-    fn snapshot(&self) -> MonitoringSnapshot {
+    pub(crate) fn snapshot(&self) -> MonitoringSnapshot {
         MonitoringSnapshot {
             accepted_frame_count: self.state.accepted_frames.load(Ordering::Relaxed),
             overflow_frame_count: self.state.overflow_frames.load(Ordering::Relaxed),
@@ -420,13 +420,13 @@ impl MonitoringCounters {
     }
 }
 
-struct MonitoringProducer {
+pub(crate) struct MonitoringProducer {
     inner: HeapProd<f32>,
     counters: MonitoringCounters,
 }
 
 impl MonitoringProducer {
-    fn push(&mut self, samples: &[f32]) {
+    pub(crate) fn push(&mut self, samples: &[f32]) {
         let frames = samples.len() / STEREO_CHANNELS;
         if !self.inner.read_is_held() {
             MonitoringCounters::add(&self.counters.state.consumer_closed_frames, frames);
@@ -446,12 +446,12 @@ impl MonitoringProducer {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MonitoringRenderError {
+pub(crate) enum MonitoringRenderError {
     AdapterInvariant,
     ResamplerInvariant,
 }
 
-struct MonitoringConsumer {
+pub(crate) struct MonitoringConsumer {
     inner: HeapCons<f32>,
     counters: MonitoringCounters,
     control: DesktopMonitoringControl,
@@ -470,7 +470,7 @@ struct MonitoringConsumer {
 }
 
 impl MonitoringConsumer {
-    fn process(&mut self, output: &mut [f32]) -> Result<(), MonitoringRenderError> {
+    pub(crate) fn process(&mut self, output: &mut [f32]) -> Result<(), MonitoringRenderError> {
         output.fill(0.0);
         let mut output_offset = 0;
         while output_offset < output.len() {
@@ -619,13 +619,13 @@ impl MonitoringConsumer {
 }
 
 #[derive(Debug)]
-enum MonitoringTransportBuildError {
+pub(crate) enum MonitoringTransportBuildError {
     Allocation,
     RingAllocation,
     Resampler,
 }
 
-fn try_monitoring_transport(
+pub(crate) fn try_monitoring_transport(
     config: &DesktopMonitoringConfig,
 ) -> Result<
     (
@@ -997,7 +997,7 @@ impl DesktopMonitoringSession {
 
 #[cfg(test)]
 #[path = "../../../../test-support/realtime_allocator.rs"]
-mod realtime_allocator;
+pub(crate) mod realtime_allocator;
 
 #[cfg(test)]
 mod tests {

@@ -11,7 +11,9 @@ use hyper_recording_journal::PublishedRecording;
 use hyper_recording_metadata::{
     FinalizedRecordingMetadata, RecordingMetadataBuildError, RecordingMetadataContext,
 };
-use hyper_recording_transport::{RecordingTransportBuildError, try_recording_transport};
+use hyper_recording_transport::{
+    RecordingProducer, RecordingTransportBuildError, try_recording_transport,
+};
 use hyper_recording_worker::{
     RecordingDispositionError, RecordingWorker, RecordingWorkerCompletion, RecordingWorkerConfig,
     RecordingWorkerFailure, RecordingWorkerStartError, RecordingWorkerWaitError,
@@ -433,9 +435,114 @@ impl Error for DesktopRecordingSessionFinalizeError {
 #[derive(Debug)]
 pub struct DesktopRecordingSession {
     input: NativeInputStream,
+    recording: RecordingSessionCore,
+}
+
+#[derive(Debug)]
+pub(crate) struct RecordingSessionCore {
     writer: RecordingWorker,
     journal_path: PathBuf,
     completion_timeout: Duration,
+}
+
+pub(crate) enum RecordingCoreStartError {
+    Config(DesktopRecordingSessionConfigError),
+    Transport(RecordingTransportBuildError),
+    Writer(RecordingWorkerStartError),
+}
+
+impl From<RecordingCoreStartError> for DesktopRecordingSessionStartError {
+    fn from(source: RecordingCoreStartError) -> Self {
+        match source {
+            RecordingCoreStartError::Config(source) => Self::Config(source),
+            RecordingCoreStartError::Transport(source) => Self::Transport(source),
+            RecordingCoreStartError::Writer(source) => Self::Writer(source),
+        }
+    }
+}
+
+pub(crate) fn start_recording_core(
+    config: DesktopRecordingSessionConfig,
+) -> Result<(RecordingProducer, RecordingSessionCore), RecordingCoreStartError> {
+    validate_config(&config).map_err(RecordingCoreStartError::Config)?;
+    let (producer, consumer) = try_recording_transport(config.transport_capacity_frames)
+        .map_err(RecordingCoreStartError::Transport)?;
+    let journal_path = config.writer.journal_path.clone();
+    let writer =
+        RecordingWorker::start(config.writer, consumer).map_err(RecordingCoreStartError::Writer)?;
+    Ok((
+        producer,
+        RecordingSessionCore {
+            writer,
+            journal_path,
+            completion_timeout: config.completion_timeout,
+        },
+    ))
+}
+
+impl RecordingSessionCore {
+    #[must_use]
+    pub(crate) fn journal_path(&self) -> &Path {
+        &self.journal_path
+    }
+
+    pub(crate) fn abort_and_settle(mut self) -> DesktopRecordingWriterSettlement {
+        let _ = self.writer.request_abort();
+        settle_writer(self.writer, &self.journal_path, self.completion_timeout)
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        capture: CaptureStreamSnapshot,
+        commit: bool,
+    ) -> Result<RecordingWorkerCompletion, DesktopRecordingSessionStopError> {
+        if commit && !capture_is_publishable(capture) {
+            let _ = self.writer.request_abort();
+            let writer = Box::new(settle_writer(
+                self.writer,
+                &self.journal_path,
+                self.completion_timeout,
+            ));
+            return Err(DesktopRecordingSessionStopError::CaptureIntegrity {
+                journal_path: self.journal_path,
+                capture: Box::new(capture),
+                writer,
+            });
+        }
+        let disposition = if commit {
+            self.writer.request_commit()
+        } else {
+            self.writer.request_abort()
+        };
+        if let Err(source) = disposition {
+            let writer = Box::new(settle_writer(
+                self.writer,
+                &self.journal_path,
+                self.completion_timeout,
+            ));
+            return Err(DesktopRecordingSessionStopError::Disposition {
+                journal_path: self.journal_path,
+                source,
+                writer,
+            });
+        }
+        match self.writer.wait(self.completion_timeout) {
+            Ok(completion) => Ok(completion),
+            Err(source) => {
+                let pending = (source == RecordingWorkerWaitError::TimedOut).then(|| {
+                    Box::new(DesktopRecordingPendingCompletion {
+                        writer: self.writer,
+                        journal_path: self.journal_path.clone(),
+                    })
+                });
+                Err(DesktopRecordingSessionStopError::Writer {
+                    journal_path: self.journal_path,
+                    source,
+                    pending,
+                })
+            }
+        }
+    }
 }
 
 impl DesktopRecordingSession {
@@ -450,30 +557,22 @@ impl DesktopRecordingSession {
     pub fn start(
         config: DesktopRecordingSessionConfig,
     ) -> Result<Self, DesktopRecordingSessionStartError> {
-        validate_config(&config).map_err(DesktopRecordingSessionStartError::Config)?;
-        let (mut producer, consumer) = try_recording_transport(config.transport_capacity_frames)
-            .map_err(DesktopRecordingSessionStartError::Transport)?;
-        let journal_path = config.writer.journal_path.clone();
-        let writer = RecordingWorker::start(config.writer, consumer)
-            .map_err(DesktopRecordingSessionStartError::Writer)?;
         let native = NativeInputConfig::from(&config.input);
+        let (mut producer, recording) =
+            start_recording_core(config).map_err(DesktopRecordingSessionStartError::from)?;
+        let journal_path = recording.journal_path.clone();
         let input =
             match NativeInputStream::start(native, move |samples: &[f32]| producer.push(samples)) {
                 Ok(input) => input,
                 Err(source) => {
-                    drop(writer);
+                    drop(recording);
                     return Err(DesktopRecordingSessionStartError::Input {
                         journal_path: journal_path.clone(),
                         source: Box::new(source),
                     });
                 }
             };
-        Ok(Self {
-            input,
-            writer,
-            journal_path,
-            completion_timeout: config.completion_timeout,
-        })
+        Ok(Self { input, recording })
     }
 
     #[must_use]
@@ -488,7 +587,7 @@ impl DesktopRecordingSession {
 
     #[must_use]
     pub fn journal_path(&self) -> &Path {
-        &self.journal_path
+        self.recording.journal_path()
     }
 
     #[cfg(target_os = "windows")]
@@ -548,16 +647,11 @@ impl DesktopRecordingSession {
         self,
         commit: bool,
     ) -> Result<RecordingWorkerCompletion, DesktopRecordingSessionStopError> {
-        let Self {
-            input,
-            mut writer,
-            journal_path,
-            completion_timeout,
-        } = self;
+        let Self { input, recording } = self;
         let capture = input.counters();
         if let Err(source) = input.stop() {
-            let _ = writer.request_abort();
-            let writer = Box::new(settle_writer(writer, &journal_path, completion_timeout));
+            let journal_path = recording.journal_path.clone();
+            let writer = Box::new(recording.abort_and_settle());
             return Err(DesktopRecordingSessionStopError::Input {
                 journal_path,
                 source: Box::new(source),
@@ -565,44 +659,7 @@ impl DesktopRecordingSession {
             });
         }
         let capture = capture.snapshot();
-        if commit && !capture_is_publishable(capture) {
-            let _ = writer.request_abort();
-            let writer = Box::new(settle_writer(writer, &journal_path, completion_timeout));
-            return Err(DesktopRecordingSessionStopError::CaptureIntegrity {
-                journal_path,
-                capture: Box::new(capture),
-                writer,
-            });
-        }
-        let disposition = if commit {
-            writer.request_commit()
-        } else {
-            writer.request_abort()
-        };
-        if let Err(source) = disposition {
-            let writer = Box::new(settle_writer(writer, &journal_path, completion_timeout));
-            return Err(DesktopRecordingSessionStopError::Disposition {
-                journal_path,
-                source,
-                writer,
-            });
-        }
-        match writer.wait(completion_timeout) {
-            Ok(completion) => Ok(completion),
-            Err(source) => {
-                let pending = (source == RecordingWorkerWaitError::TimedOut).then(|| {
-                    Box::new(DesktopRecordingPendingCompletion {
-                        writer,
-                        journal_path: journal_path.clone(),
-                    })
-                });
-                Err(DesktopRecordingSessionStopError::Writer {
-                    journal_path,
-                    source,
-                    pending,
-                })
-            }
-        }
+        recording.finish(capture, commit)
     }
 }
 
@@ -663,7 +720,7 @@ fn validate_config(
     Ok(())
 }
 
-fn published_recording(
+pub(crate) fn published_recording(
     completion: RecordingWorkerCompletion,
 ) -> Result<DesktopPublishedRecording, DesktopRecordingSessionCommitError> {
     match completion {

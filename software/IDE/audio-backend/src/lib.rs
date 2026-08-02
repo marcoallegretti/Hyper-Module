@@ -77,6 +77,24 @@ pub use monitoring_session::{
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
+mod monitored_recording_session;
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+pub use monitored_recording_session::{
+    DesktopMonitoredFinalizedRecording, DesktopMonitoredPublishedRecording,
+    DesktopMonitoredRecordingAbort, DesktopMonitoredRecordingCommitError,
+    DesktopMonitoredRecordingConfig, DesktopMonitoredRecordingFinalizeError,
+    DesktopMonitoredRecordingOutcome, DesktopMonitoredRecordingSession,
+    DesktopMonitoredRecordingStartError, DesktopMonitoredRecordingStopError,
+    DesktopMonitoringShutdown,
+};
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
 mod recording_session;
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
