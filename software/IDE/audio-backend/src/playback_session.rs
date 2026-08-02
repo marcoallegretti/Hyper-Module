@@ -428,11 +428,18 @@ impl PlaybackMonitoringMixer {
     }
 
     fn mix(&mut self, output: StereoOutput<'_>) {
-        let StereoOutput { left, right } = output;
         if !self.enabled {
             return;
         }
-        let frames = left.len();
+        if output
+            .left
+            .iter()
+            .chain(output.right.iter())
+            .any(|sample| !sample.is_finite())
+        {
+            return;
+        }
+        let frames = output.left.len();
         let samples = frames * 2;
         if self
             .consumer
@@ -442,11 +449,32 @@ impl PlaybackMonitoringMixer {
             self.enabled = false;
             return;
         }
-        for (frame, monitor) in self.interleaved[..samples].chunks_exact(2).enumerate() {
-            left[frame] += monitor[0];
-            right[frame] += monitor[1];
+        if !mix_monitoring_interleaved(output, &self.interleaved[..samples]) {
+            self.consumer.record_processor_failure();
+            self.enabled = false;
         }
     }
+}
+
+fn mix_monitoring_interleaved(output: StereoOutput<'_>, monitoring: &[f32]) -> bool {
+    let StereoOutput { left, right } = output;
+    debug_assert_eq!(left.len(), right.len());
+    debug_assert_eq!(monitoring.len(), left.len() * 2);
+    let valid = left
+        .iter()
+        .zip(right.iter())
+        .zip(monitoring.chunks_exact(2))
+        .all(|((left, right), monitor)| {
+            (*left + monitor[0]).is_finite() && (*right + monitor[1]).is_finite()
+        });
+    if !valid {
+        return false;
+    }
+    for (frame, monitor) in monitoring.chunks_exact(2).enumerate() {
+        left[frame] += monitor[0];
+        right[frame] += monitor[1];
+    }
+    true
 }
 
 struct MonitoredTransportOutputProcessor<'state, 'buffers, R> {
@@ -772,13 +800,29 @@ pub enum DesktopPlaybackRecoveryPendingWait {
 }
 
 impl DesktopPlaybackRecoveryPendingStart {
-    /// Returns the latest state reported by a pending native thread.
+    /// Returns the latest output state, or the input state when only input
+    /// teardown remains pending.
+    ///
+    /// Use [`Self::input_status`] and [`Self::output_status`] when both native
+    /// owners must be supervised independently.
     #[must_use]
     pub fn status(&self) -> Option<super::StreamStatus> {
         self.output
             .as_ref()
             .or(self.input.as_ref())
             .map(PendingNativeShutdown::status)
+    }
+
+    /// Returns the latest state reported by the pending monitor-input thread.
+    #[must_use]
+    pub fn input_status(&self) -> Option<super::StreamStatus> {
+        self.input.as_ref().map(PendingNativeShutdown::status)
+    }
+
+    /// Returns the latest state reported by the pending playback-output thread.
+    #[must_use]
+    pub fn output_status(&self) -> Option<super::StreamStatus> {
+        self.output.as_ref().map(PendingNativeShutdown::status)
     }
 
     /// Waits for native teardown while retaining exactly one retry authority.
@@ -1645,6 +1689,7 @@ mod tests {
     fn monitoring_transport() -> (
         super::super::monitoring_session::MonitoringProducer,
         MonitoringConsumer,
+        MonitoringCounters,
     ) {
         let config = DesktopMonitoringConfig::try_new(
             super::super::DesktopInputConfig::try_new(48_000, 128).unwrap(),
@@ -1654,16 +1699,16 @@ mod tests {
             64,
         )
         .unwrap();
-        let (producer, consumer, _, _) = try_monitoring_transport(&config).unwrap();
-        (producer, consumer)
+        let (producer, consumer, counters, _) = try_monitoring_transport(&config).unwrap();
+        (producer, consumer, counters)
     }
 
     #[test]
     fn playback_monitoring_mixes_into_the_final_stereo_output_without_allocating() {
-        let (mut producer, consumer) = monitoring_transport();
-        producer.push(&vec![0.25; 320 * 2]);
+        let (mut producer, consumer, _) = monitoring_transport();
+        producer.push(&vec![0.5; 320 * 2]);
         let mut monitoring = PlaybackMonitoringMixer::try_new(consumer, 128).unwrap();
-        let mut left = [0.5; 64];
+        let mut left = [0.75; 64];
         let mut right = [-0.5; 64];
 
         let measurement = HeapMeasurement::start_verified();
@@ -1676,13 +1721,110 @@ mod tests {
         assert_eq!(heap_operations, 0);
         assert!(
             left.iter()
-                .all(|sample| (*sample - 0.75).abs() <= f32::EPSILON)
+                .all(|sample| (*sample - 1.25).abs() <= f32::EPSILON)
+        );
+        assert!(right.iter().all(|sample| sample.abs() <= f32::EPSILON));
+    }
+
+    #[test]
+    fn invalid_monitor_sum_leaves_the_complete_project_block_unchanged() {
+        let mut left = [f32::MAX, 0.25];
+        let mut right = [-0.5, 0.75];
+        let original_left = left;
+        let original_right = right;
+
+        assert!(!mix_monitoring_interleaved(
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+            &[f32::MAX, f32::MAX, 0.5, 0.5],
+        ));
+
+        assert!(
+            left.iter()
+                .zip(original_left)
+                .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
         );
         assert!(
             right
                 .iter()
-                .all(|sample| (*sample + 0.25).abs() <= f32::EPSILON)
+                .zip(original_right)
+                .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
         );
+    }
+
+    #[test]
+    fn invalid_monitor_sum_disables_only_monitoring_without_allocating() {
+        let (mut producer, consumer, counters) = monitoring_transport();
+        producer.push(&vec![3.0e38; 320 * 2]);
+        let mut monitoring = PlaybackMonitoringMixer::try_new(consumer, 128).unwrap();
+        let mut callback =
+            hyper_audio_engine::InterleavedStereoCallback::try_new(64, 48_000).unwrap();
+        let mut output = [9.0; 128];
+
+        let measurement = HeapMeasurement::start_verified();
+        let processed = callback.process(&mut output, |project| {
+            project.left.fill(1.0e38);
+            project.right.fill(-0.5);
+            monitoring.mix(project);
+            Ok::<(), core::convert::Infallible>(())
+        });
+        let heap_operations = measurement.finish();
+
+        assert_eq!(heap_operations, 0);
+        assert!(processed.is_ok());
+        assert!(output.chunks_exact(2).all(|frame| frame == [1.0e38, -0.5]));
+        assert!(!monitoring.enabled);
+        assert_eq!(counters.snapshot().processor_failure_count, 1);
+
+        callback
+            .process(&mut output, |project| {
+                project.left.fill(0.25);
+                project.right.fill(-0.25);
+                monitoring.mix(project);
+                Ok::<(), core::convert::Infallible>(())
+            })
+            .unwrap();
+        assert!(output.chunks_exact(2).all(|frame| frame == [0.25, -0.25]));
+        assert_eq!(counters.snapshot().processor_failure_count, 1);
+    }
+
+    #[test]
+    fn invalid_project_output_does_not_consume_or_disable_monitoring() {
+        let (mut producer, consumer, counters) = monitoring_transport();
+        producer.push(&vec![0.5; 320 * 2]);
+        let mut monitoring = PlaybackMonitoringMixer::try_new(consumer, 128).unwrap();
+        let mut invalid_left = [f32::NAN; 64];
+        let mut invalid_right = [0.25; 64];
+
+        monitoring.mix(StereoOutput {
+            left: &mut invalid_left,
+            right: &mut invalid_right,
+        });
+
+        assert!(monitoring.enabled);
+        assert_eq!(counters.snapshot().rendered_frame_count, 0);
+        assert_eq!(counters.snapshot().processor_failure_count, 0);
+
+        let mut valid_left = [0.5; 64];
+        let mut valid_right = [-0.5; 64];
+        monitoring.mix(StereoOutput {
+            left: &mut valid_left,
+            right: &mut valid_right,
+        });
+        assert!(
+            valid_left
+                .iter()
+                .all(|sample| (*sample - 1.0).abs() <= f32::EPSILON)
+        );
+        assert!(
+            valid_right
+                .iter()
+                .all(|sample| sample.abs() <= f32::EPSILON)
+        );
+        assert_eq!(counters.snapshot().rendered_frame_count, 64);
+        assert_eq!(counters.snapshot().processor_failure_count, 0);
     }
 
     #[cfg(all(target_os = "linux", target_endian = "little"))]
@@ -1987,6 +2129,8 @@ mod tests {
             .into_pending()
             .expect("output cancellation must retain retry authority");
         assert!(pending.status().is_some());
+        assert!(pending.input_status().is_none());
+        assert!(pending.output_status().is_some());
         release.send(()).unwrap();
         assert!(matches!(
             pending.wait(Duration::from_secs(1)),
@@ -2036,6 +2180,14 @@ mod tests {
             },
         );
         let pending = error.into_pending().unwrap();
+        assert_eq!(
+            pending.input_status().unwrap().state(),
+            crate::StreamState::Failed
+        );
+        assert_eq!(
+            pending.output_status().unwrap().state(),
+            crate::StreamState::Starting
+        );
         release_input.send(()).unwrap();
         let DesktopPlaybackRecoveryPendingWait::TimedOut(pending) =
             pending.wait(Duration::from_millis(50))

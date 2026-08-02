@@ -560,21 +560,41 @@ fn final_post_mix_is_included_in_output_metering() {
         48_000,
     )
     .unwrap();
-    let mut output = [9.0_f32; 32];
-
-    let cycle = processor
-        .process_with_post_mix(&mut output, |post| {
-            post.left.fill(0.25);
-            post.right.fill(-0.5);
-        })
-        .unwrap();
+    let mut output = [9.0_f32; 128];
+    let mut cycle = None;
+    for _ in 0..300 {
+        let processed = processor
+            .process_with_post_mix(&mut output, |post| {
+                post.left.fill(0.25);
+                post.right.fill(-0.5);
+            })
+            .unwrap();
+        assert_eq!(
+            meter_receiver.read_latest().snapshot(),
+            Some(processed.snapshot())
+        );
+        cycle = Some(processed);
+    }
+    let cycle = cycle.unwrap();
 
     assert!(output.chunks_exact(2).all(|frame| frame == [0.25, -0.5]));
-    assert_eq!(cycle.snapshot().meter().left().sample_peak(), Some(0.25));
-    assert_eq!(cycle.snapshot().meter().right().sample_peak(), Some(0.5));
-    assert_eq!(
-        meter_receiver.read_latest().snapshot(),
-        Some(cycle.snapshot())
+    let meter = cycle.snapshot().meter();
+    assert_eq!(meter.left().sample_peak(), Some(0.25));
+    assert_eq!(meter.right().sample_peak(), Some(0.5));
+    assert!(meter.left().true_peak().is_some_and(|peak| peak >= 0.25));
+    assert!(meter.right().true_peak().is_some_and(|peak| peak >= 0.5));
+    assert_eq!(meter.loudness().programme_frame_count(), 300_u64 * 64);
+    assert!(
+        meter
+            .loudness()
+            .momentary_lufs()
+            .is_some_and(f32::is_finite)
+    );
+    assert!(
+        meter
+            .loudness()
+            .maximum_true_peak_linear()
+            .is_some_and(|peak| peak >= 0.5)
     );
 }
 

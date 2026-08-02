@@ -492,9 +492,13 @@ impl MonitoringConsumer {
     pub(crate) fn process(&mut self, output: &mut [f32]) -> Result<(), MonitoringRenderError> {
         let result = self.process_inner(output);
         if result.is_err() {
-            MonitoringCounters::add(&self.counters.state.processor_failures, 1);
+            self.record_processor_failure();
         }
         result
+    }
+
+    pub(crate) fn record_processor_failure(&self) {
+        MonitoringCounters::add(&self.counters.state.processor_failures, 1);
     }
 
     fn process_inner(&mut self, output: &mut [f32]) -> Result<(), MonitoringRenderError> {
