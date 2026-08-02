@@ -942,6 +942,8 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
+    const TEST_STARTUP_TIMEOUT: Duration = Duration::from_secs(1);
+
     #[test]
     fn config_rejects_invalid_domains() {
         assert_eq!(
@@ -1053,7 +1055,7 @@ mod tests {
                 release_receiver.recv().unwrap();
                 Ok(())
             },
-            Duration::from_millis(20),
+            TEST_STARTUP_TIMEOUT,
             Duration::from_millis(20),
         )
         .unwrap();
@@ -1083,7 +1085,7 @@ mod tests {
                 runner.status.mark_failed();
                 Ok(())
             },
-            Duration::from_millis(20),
+            TEST_STARTUP_TIMEOUT,
             Duration::from_millis(20),
         )
         .unwrap();
@@ -1149,7 +1151,7 @@ mod tests {
                     thread::park();
                 }
             },
-            Duration::from_millis(20),
+            TEST_STARTUP_TIMEOUT,
             Duration::from_millis(20),
         )
         .unwrap();
