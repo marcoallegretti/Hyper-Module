@@ -61,6 +61,22 @@ pub use desktop_input::{
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
+mod monitoring_session;
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+pub use monitoring_session::{
+    DesktopInputStartError, DesktopInputStopError, DesktopMonitoringConfig,
+    DesktopMonitoringConfigError, DesktopMonitoringControl, DesktopMonitoringControlError,
+    DesktopMonitoringSession, DesktopMonitoringSessionStartError,
+    DesktopMonitoringSessionStopError, MonitoringSnapshot,
+};
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
 mod recording_session;
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
