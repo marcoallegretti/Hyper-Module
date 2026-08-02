@@ -613,7 +613,7 @@ fn run_pipewire_inner(
             }
             pw::stream::StreamState::Connecting => {}
         })
-        .process(process_pipewire_buffer)
+        .process_with_clock(process_pipewire_buffer)
         .register()
         .map_err(|source| backend_error(PipeWireStartupStage::Listener, source))?;
 
@@ -716,7 +716,12 @@ fn set_pipewire_chunk(data: &mut spa::buffer::Data, size: usize) {
     *chunk.stride_mut() = i32::try_from(FRAME_STRIDE).expect("stereo f32 stride fits i32");
 }
 
-fn process_pipewire_buffer(stream: &pw::stream::Stream, state: &mut PipeWireCallback<'_>) {
+fn process_pipewire_buffer(
+    stream: &pw::stream::Stream,
+    state: &mut PipeWireCallback<'_>,
+    clock: Option<pw::stream::ProcessClock>,
+) {
+    state.output.counters().observe_pipewire_clock(clock);
     let Some(mut buffer) = stream.dequeue_buffer() else {
         state.output.counters().record_unavailable_buffer();
         return;
@@ -965,6 +970,7 @@ mod tests {
             )
         })
         .unwrap();
+        let counters = stream.counters();
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while committed.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
@@ -974,6 +980,7 @@ mod tests {
 
         assert!(processed.load(Ordering::Relaxed) > 0);
         assert!(committed.load(Ordering::Relaxed) > 0);
+        assert!(counters.snapshot().native_xruns.is_some());
     }
 
     #[test]

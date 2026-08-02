@@ -427,7 +427,7 @@ where
             }
             pw::stream::StreamState::Connecting => {}
         })
-        .process(process_pipewire_input)
+        .process_with_clock(process_pipewire_input)
         .register()
         .map_err(|source| backend_error(PipeWireStartupStage::Listener, source))?;
 
@@ -553,10 +553,14 @@ where
     state.main_loop.quit();
 }
 
-fn process_pipewire_input<P>(stream: &pw::stream::Stream, state: &mut PipeWireInputCallback<P>)
-where
+fn process_pipewire_input<P>(
+    stream: &pw::stream::Stream,
+    state: &mut PipeWireInputCallback<P>,
+    clock: Option<pw::stream::ProcessClock>,
+) where
     P: InterleavedStereoCaptureProcessor,
 {
+    state.input.counters().observe_pipewire_clock(clock);
     let Some(mut buffer) = stream.dequeue_buffer() else {
         state.input.counters().record_unavailable_buffer();
         return;
@@ -886,6 +890,7 @@ mod tests {
             Ok::<_, u8>(())
         })
         .unwrap();
+        let counters = stream.counters();
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while captured.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
@@ -894,5 +899,6 @@ mod tests {
         stream.stop().unwrap();
 
         assert!(captured.load(Ordering::Relaxed) > 0);
+        assert!(counters.snapshot().native_xruns.is_some());
     }
 }

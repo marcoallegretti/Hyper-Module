@@ -3,7 +3,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::{MAXIMUM_BLOCK_FRAMES, STEREO_CHANNELS};
+use super::{MAXIMUM_BLOCK_FRAMES, NativeXrunCounterState, NativeXrunSnapshot, STEREO_CHANNELS};
 
 /// Consumes one borrowed interleaved stereo input block.
 ///
@@ -61,6 +61,7 @@ pub struct CaptureStreamSnapshot {
     pub discontinuity_count: u64,
     pub timestamp_error_count: u64,
     pub stream_error_count: u64,
+    pub native_xruns: Option<NativeXrunSnapshot>,
 }
 
 #[derive(Debug, Default)]
@@ -78,6 +79,7 @@ struct CaptureStreamCounterState {
     discontinuities: AtomicU64,
     timestamp_errors: AtomicU64,
     stream_errors: AtomicU64,
+    native_xruns: NativeXrunCounterState,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -102,6 +104,7 @@ impl CaptureStreamCounters {
             discontinuity_count: self.state.discontinuities.load(Ordering::Relaxed),
             timestamp_error_count: self.state.timestamp_errors.load(Ordering::Relaxed),
             stream_error_count: self.state.stream_errors.load(Ordering::Relaxed),
+            native_xruns: self.state.native_xruns.snapshot(),
         }
     }
 
@@ -143,6 +146,11 @@ impl CaptureStreamCounters {
     ))]
     pub(crate) fn record_stream_error(&self) {
         Self::add(&self.state.stream_errors, 1);
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    pub(crate) fn observe_pipewire_clock(&self, clock: Option<pipewire::stream::ProcessClock>) {
+        self.state.native_xruns.observe_pipewire(clock);
     }
 }
 

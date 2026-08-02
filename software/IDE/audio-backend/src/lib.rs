@@ -1,6 +1,7 @@
 use core::error::Error;
 use core::fmt;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::hint::spin_loop;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
@@ -246,6 +247,96 @@ impl StreamStatus {
 
 pub type OutputStreamState = StreamState;
 pub type OutputStreamStatus = StreamStatus;
+
+/// Backend-reported XRUN evidence for one native stream.
+///
+/// This is distinct from callback validation failures and WASAPI capture
+/// discontinuities. A containing snapshot uses `None` when its backend did
+/// not publish native XRUN timing, so absence is never misreported as zero.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeXrunSnapshot {
+    /// Process cycles the backend flagged as recovering from an XRUN.
+    pub recovery_count: u64,
+    /// Latest accumulated XRUN duration in backend graph-clock units.
+    pub accumulated_duration: u64,
+    /// Graph-start cycle associated with the latest backend observation.
+    pub graph_cycle: u32,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct NativeXrunCounterState {
+    sequence: AtomicU64,
+    available: AtomicBool,
+    recovery_count: AtomicU64,
+    accumulated_duration: AtomicU64,
+    graph_cycle: AtomicU32,
+}
+
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeXrunObservation {
+    recovering: bool,
+    accumulated_duration: u64,
+    graph_cycle: u32,
+}
+
+impl NativeXrunCounterState {
+    fn snapshot(&self) -> Option<NativeXrunSnapshot> {
+        loop {
+            let sequence_before = self.sequence.load(Ordering::Acquire);
+            if sequence_before & 1 != 0 {
+                spin_loop();
+                continue;
+            }
+
+            let available = self.available.load(Ordering::Relaxed);
+            let snapshot = NativeXrunSnapshot {
+                recovery_count: self.recovery_count.load(Ordering::Relaxed),
+                accumulated_duration: self.accumulated_duration.load(Ordering::Relaxed),
+                graph_cycle: self.graph_cycle.load(Ordering::Relaxed),
+            };
+            fence(Ordering::Acquire);
+
+            if self.sequence.load(Ordering::Relaxed) == sequence_before {
+                return available.then_some(snapshot);
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    pub(crate) fn observe_pipewire(&self, clock: Option<pipewire::stream::ProcessClock>) {
+        self.observe(clock.map(|clock| NativeXrunObservation {
+            recovering: clock.recovering_xrun(),
+            accumulated_duration: clock.accumulated_xrun(),
+            graph_cycle: clock.graph_cycle(),
+        }));
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    fn observe(&self, observation: Option<NativeXrunObservation>) {
+        let odd_sequence = self.sequence.fetch_add(1, Ordering::Acquire) | 1;
+        fence(Ordering::Release);
+
+        let Some(observation) = observation else {
+            self.available.store(false, Ordering::Relaxed);
+            self.sequence
+                .store(odd_sequence.wrapping_add(1), Ordering::Release);
+            return;
+        };
+        if observation.recovering {
+            let recovery_count = self.recovery_count.load(Ordering::Relaxed);
+            self.recovery_count
+                .store(recovery_count.saturating_add(1), Ordering::Relaxed);
+        }
+        self.accumulated_duration
+            .store(observation.accumulated_duration, Ordering::Relaxed);
+        self.graph_cycle
+            .store(observation.graph_cycle, Ordering::Relaxed);
+        self.available.store(true, Ordering::Relaxed);
+        self.sequence
+            .store(odd_sequence.wrapping_add(1), Ordering::Release);
+    }
+}
 
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
@@ -493,6 +584,7 @@ pub struct OutputStreamSnapshot {
     pub unavailable_buffer_count: u64,
     pub malformed_buffer_count: u64,
     pub stream_error_count: u64,
+    pub native_xruns: Option<NativeXrunSnapshot>,
 }
 
 #[derive(Debug, Default)]
@@ -508,6 +600,7 @@ struct OutputStreamCounterState {
     unavailable_buffers: AtomicU64,
     malformed_buffers: AtomicU64,
     stream_errors: AtomicU64,
+    native_xruns: NativeXrunCounterState,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -530,6 +623,7 @@ impl OutputStreamCounters {
             unavailable_buffer_count: self.state.unavailable_buffers.load(Ordering::Relaxed),
             malformed_buffer_count: self.state.malformed_buffers.load(Ordering::Relaxed),
             stream_error_count: self.state.stream_errors.load(Ordering::Relaxed),
+            native_xruns: self.state.native_xruns.snapshot(),
         }
     }
 
@@ -558,6 +652,11 @@ impl OutputStreamCounters {
     ))]
     fn record_stream_error(&self) {
         Self::add(&self.state.stream_errors, 1);
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    fn observe_pipewire_clock(&self, clock: Option<pipewire::stream::ProcessClock>) {
+        self.state.native_xruns.observe_pipewire(clock);
     }
 }
 
@@ -916,5 +1015,85 @@ mod tests {
             assert_samples(&output, 1.0);
         }
         assert_eq!(invocation_count, 1);
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[test]
+    fn native_xrun_evidence_preserves_availability_and_recovery_count() {
+        let counters = NativeXrunCounterState::default();
+        assert_eq!(counters.snapshot(), None);
+
+        counters.observe(Some(NativeXrunObservation {
+            recovering: false,
+            accumulated_duration: 11,
+            graph_cycle: 3,
+        }));
+        assert_eq!(
+            counters.snapshot(),
+            Some(NativeXrunSnapshot {
+                recovery_count: 0,
+                accumulated_duration: 11,
+                graph_cycle: 3,
+            })
+        );
+
+        counters.observe(Some(NativeXrunObservation {
+            recovering: true,
+            accumulated_duration: 19,
+            graph_cycle: 3,
+        }));
+        assert_eq!(
+            counters.snapshot(),
+            Some(NativeXrunSnapshot {
+                recovery_count: 1,
+                accumulated_duration: 19,
+                graph_cycle: 3,
+            })
+        );
+
+        counters.observe(None);
+        assert_eq!(counters.snapshot(), None);
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[test]
+    fn native_xrun_snapshot_is_coherent_during_concurrent_observation() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::thread;
+
+        let counters = Arc::new(NativeXrunCounterState::default());
+        let finished = Arc::new(AtomicBool::new(false));
+        let writer_counters = Arc::clone(&counters);
+        let writer_finished = Arc::clone(&finished);
+        let writer = thread::spawn(move || {
+            for graph_cycle in 1..=10_000_u32 {
+                writer_counters.observe(Some(NativeXrunObservation {
+                    recovering: false,
+                    accumulated_duration: u64::from(graph_cycle) * 2,
+                    graph_cycle,
+                }));
+            }
+            writer_finished.store(true, Ordering::Release);
+        });
+
+        while !finished.load(Ordering::Acquire) {
+            if let Some(snapshot) = counters.snapshot() {
+                assert_eq!(
+                    snapshot.accumulated_duration,
+                    u64::from(snapshot.graph_cycle) * 2
+                );
+            }
+        }
+        writer.join().unwrap();
+
+        assert_eq!(
+            counters.snapshot(),
+            Some(NativeXrunSnapshot {
+                recovery_count: 0,
+                accumulated_duration: 20_000,
+                graph_cycle: 10_000,
+            })
+        );
     }
 }
