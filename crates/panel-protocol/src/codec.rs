@@ -768,6 +768,13 @@ mod tests {
         assert_eq!(decoder.push(FRAME_DELIMITER), DecoderEvent::Frame(frame));
     }
 
+    fn assert_message_layout(message: Message, expected_kind: u8, expected_payload: &[u8]) {
+        let mut payload = [0_u8; MAX_PAYLOAD_LEN];
+        let length = encode_message(message, &mut payload).unwrap();
+        assert_eq!(message.kind(), expected_kind);
+        assert_eq!(&payload[..length], expected_payload);
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn every_message_round_trips_through_the_wire_codec() {
@@ -879,6 +886,215 @@ mod tests {
             }
             .direction(),
             Direction::Bidirectional
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn every_message_has_a_fixed_payload_layout() {
+        assert_message_layout(
+            Message::RuntimeHello {
+                versions: SupportedVersions::CURRENT,
+                heartbeat_interval_ms: 100,
+                heartbeat_timeout_ms: 350,
+            },
+            0x01,
+            &[0x01, 0x01, 0x64, 0x00, 0x00, 0x00, 0x5E, 0x01, 0x00, 0x00],
+        );
+        assert_message_layout(
+            Message::PanelHello {
+                selected_version: 1,
+                heartbeat_interval_ms: 100,
+                heartbeat_timeout_ms: 350,
+                descriptor: descriptor(),
+            },
+            0x02,
+            &[
+                0x01, 0x64, 0x00, 0x00, 0x00, 0x5E, 0x01, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03,
+                0x00, 0xDD, 0xCC, 0xBB, 0xAA, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x04,
+                0x08, 0x0C, 0x01, 0x20,
+            ],
+        );
+        assert_message_layout(
+            Message::VersionRejected {
+                supported: SupportedVersions::CURRENT,
+            },
+            0x03,
+            &[0x01, 0x01],
+        );
+        assert_message_layout(
+            Message::Heartbeat {
+                uptime_ms: u64::MAX,
+                last_received_sequence: u32::MAX,
+            },
+            0x04,
+            &[
+                0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            ],
+        );
+        assert_message_layout(
+            Message::InputSnapshot(InputState {
+                timestamp_us: 9,
+                encoder_pressed: 3,
+                button_pressed: 5,
+                modifiers: 7,
+            }),
+            0x10,
+            &[
+                0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x05, 0x00, 0x00, 0x00,
+                0x07, 0x00,
+            ],
+        );
+        assert_message_layout(
+            Message::EncoderDelta {
+                control_id: 2,
+                delta: -7,
+                timestamp_us: 11,
+                modifiers: 3,
+            },
+            0x11,
+            &[
+                0x02, 0x00, 0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0xF9, 0xFF,
+            ],
+        );
+        assert_message_layout(
+            Message::EncoderPress {
+                control_id: 2,
+                timestamp_us: 12,
+                modifiers: 3,
+            },
+            0x12,
+            &[
+                0x02, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
+            ],
+        );
+        assert_message_layout(
+            Message::EncoderRelease {
+                control_id: 2,
+                timestamp_us: 13,
+                modifiers: 3,
+            },
+            0x13,
+            &[
+                0x02, 0x00, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
+            ],
+        );
+        assert_message_layout(
+            Message::ButtonPress {
+                control_id: 4,
+                timestamp_us: 14,
+                modifiers: 1,
+            },
+            0x14,
+            &[
+                0x04, 0x00, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+            ],
+        );
+        assert_message_layout(
+            Message::ButtonRelease {
+                control_id: 4,
+                timestamp_us: 15,
+                modifiers: 1,
+            },
+            0x15,
+            &[
+                0x04, 0x00, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+            ],
+        );
+        assert_message_layout(
+            Message::ButtonLongPress {
+                control_id: 4,
+                held_ms: 750,
+                timestamp_us: 16,
+                modifiers: 1,
+            },
+            0x16,
+            &[
+                0x04, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0xEE, 0x02,
+                0x00, 0x00,
+            ],
+        );
+        assert_message_layout(
+            Message::ButtonDoublePress {
+                control_id: 4,
+                timestamp_us: 17,
+                modifiers: 1,
+            },
+            0x17,
+            &[
+                0x04, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+            ],
+        );
+        assert_message_layout(
+            Message::PanelError {
+                code: PanelErrorCode::UnsupportedControl,
+                detail: 6,
+            },
+            0x18,
+            &[0x01, 0x00, 0x06, 0x00, 0x00, 0x00],
+        );
+        assert_message_layout(
+            Message::SetLed {
+                control_id: 1,
+                enabled: true,
+            },
+            0x20,
+            &[0x01, 0x00, 0x01],
+        );
+        assert_message_layout(
+            Message::SetLedBrightness {
+                control_id: 1,
+                brightness: 127,
+            },
+            0x21,
+            &[0x01, 0x00, 0x7F],
+        );
+        assert_message_layout(
+            Message::SetLedBlink(LedBlink {
+                control_id: 1,
+                on_ms: 100,
+                off_ms: 200,
+            }),
+            0x22,
+            &[0x01, 0x00, 0x64, 0x00, 0xC8, 0x00],
+        );
+        assert_message_layout(
+            Message::SetRingSegment(RingSegment {
+                ring_id: 0,
+                segment: 31,
+                brightness: 200,
+            }),
+            0x23,
+            &[0x00, 0x1F, 0xC8],
+        );
+        assert_message_layout(
+            Message::SetRingValue {
+                ring_id: 0,
+                value: 32_768,
+            },
+            0x24,
+            &[0x00, 0x00, 0x80],
+        );
+        assert_message_layout(
+            Message::SetRingAnimation {
+                ring_id: 0,
+                animation: Animation::Pulse,
+                period_ms: 500,
+            },
+            0x25,
+            &[0x00, 0x03, 0xF4, 0x01],
+        );
+        assert_message_layout(
+            Message::SetGlobalBrightness { brightness: 64 },
+            0x26,
+            &[0x40],
+        );
+        assert_message_layout(
+            Message::EnterBootloader {
+                confirmation: Message::BOOTLOADER_CONFIRMATION,
+            },
+            0x27,
+            &[0xAD, 0x10, 0x07, 0xB0],
         );
     }
 
