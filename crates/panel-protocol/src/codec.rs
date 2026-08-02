@@ -544,7 +544,7 @@ fn encode_message(message: Message, output: &mut [u8]) -> Result<usize, EncodeEr
             animation,
             period_ms,
         } => {
-            if animation != Animation::Off && period_ms == 0 {
+            if (animation == Animation::Off) != (period_ms == 0) {
                 return Err(EncodeError::InvalidMessage);
             }
             writer.u8(ring_id)?;
@@ -703,7 +703,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<Message, DecodeError> {
             let animation =
                 Animation::from_wire(reader.u8()?).ok_or(DecodeError::InvalidPayload)?;
             let period_ms = reader.u16()?;
-            if animation != Animation::Off && period_ms == 0 {
+            if (animation == Animation::Off) != (period_ms == 0) {
                 return Err(DecodeError::InvalidPayload);
             }
             Message::SetRingAnimation {

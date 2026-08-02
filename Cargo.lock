@@ -555,6 +555,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-panel-simulator"
+version = "0.1.0"
+dependencies = [
+ "hyper-panel-protocol",
+]
+
+[[package]]
 name = "hyper-playback-compiler"
 version = "0.1.0"
 dependencies = [

@@ -91,6 +91,58 @@ impl PanelDescriptor {
                     && self.ring_segments > 0
                     && self.ring_segments <= MAX_RING_SEGMENTS))
     }
+
+    pub(crate) const fn accepts_panel_message(self, message: Message) -> bool {
+        match message {
+            Message::Heartbeat { .. } | Message::PanelError { .. } => true,
+            Message::InputSnapshot(state) => {
+                state.encoder_pressed & !low_u16_mask(self.encoders) == 0
+                    && state.button_pressed & !low_u32_mask(self.buttons) == 0
+            }
+            Message::EncoderDelta { control_id, .. }
+            | Message::EncoderPress { control_id, .. }
+            | Message::EncoderRelease { control_id, .. } => control_id < self.encoders as u16,
+            Message::ButtonPress { control_id, .. }
+            | Message::ButtonRelease { control_id, .. }
+            | Message::ButtonLongPress { control_id, .. }
+            | Message::ButtonDoublePress { control_id, .. } => control_id < self.buttons as u16,
+            _ => false,
+        }
+    }
+
+    pub(crate) const fn accepts_runtime_message(self, message: Message) -> bool {
+        match message {
+            Message::Heartbeat { .. }
+            | Message::SetGlobalBrightness { .. }
+            | Message::EnterBootloader { .. } => true,
+            Message::SetLed { control_id, .. }
+            | Message::SetLedBrightness { control_id, .. }
+            | Message::SetLedBlink(LedBlink { control_id, .. }) => control_id < self.leds as u16,
+            Message::SetRingSegment(RingSegment {
+                ring_id, segment, ..
+            }) => ring_id < self.rings && segment < self.ring_segments,
+            Message::SetRingValue { ring_id, .. } | Message::SetRingAnimation { ring_id, .. } => {
+                ring_id < self.rings
+            }
+            _ => false,
+        }
+    }
+}
+
+const fn low_u16_mask(bits: u8) -> u16 {
+    if bits == 16 {
+        u16::MAX
+    } else {
+        (1_u16 << bits) - 1
+    }
+}
+
+const fn low_u32_mask(bits: u8) -> u32 {
+    if bits == 32 {
+        u32::MAX
+    } else {
+        (1_u32 << bits) - 1
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -433,6 +485,47 @@ mod tests {
                 ..valid
             }
             .is_valid()
+        );
+    }
+
+    #[test]
+    fn descriptors_bound_messages_and_snapshot_bits() {
+        let descriptor = PanelDescriptor {
+            firmware: FirmwareVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+                build: 0,
+            },
+            boot_id: 1,
+            encoders: 4,
+            buttons: 8,
+            leds: 12,
+            rings: 1,
+            ring_segments: 32,
+        };
+        assert!(
+            descriptor.accepts_panel_message(Message::InputSnapshot(InputState {
+                timestamp_us: 0,
+                encoder_pressed: 0b1111,
+                button_pressed: 0xff,
+                modifiers: 0,
+            }))
+        );
+        assert!(
+            !descriptor.accepts_panel_message(Message::InputSnapshot(InputState {
+                timestamp_us: 0,
+                encoder_pressed: 1 << 4,
+                button_pressed: 0,
+                modifiers: 0,
+            }))
+        );
+        assert!(
+            !descriptor.accepts_runtime_message(Message::SetRingSegment(RingSegment {
+                ring_id: 0,
+                segment: 32,
+                brightness: 1,
+            }))
         );
     }
 }

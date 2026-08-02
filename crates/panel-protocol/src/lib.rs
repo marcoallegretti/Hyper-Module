@@ -11,8 +11,9 @@ pub use link::{
     RuntimeReceive,
 };
 pub use message::{
-    Animation, Direction, FirmwareVersion, Frame, InputState, LedBlink, Message, PanelDescriptor,
-    PanelErrorCode, RingSegment, SupportedVersions,
+    Animation, Direction, FirmwareVersion, Frame, InputState, LedBlink, MAX_BUTTONS, MAX_ENCODERS,
+    MAX_LEDS, MAX_RING_SEGMENTS, MAX_RINGS, Message, PanelDescriptor, PanelErrorCode, RingSegment,
+    SupportedVersions,
 };
 
 pub const WIRE_VERSION: u8 = 1;

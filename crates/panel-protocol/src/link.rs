@@ -82,6 +82,7 @@ pub enum LinkFault {
     ProtocolMismatch { expected: u8, received: u8 },
     SequenceMismatch { expected: u32, received: u32 },
     InvalidNegotiation,
+    UnsupportedControl,
     HeartbeatTimedOut,
 }
 
@@ -116,6 +117,9 @@ impl fmt::Display for LinkFault {
             ),
             Self::InvalidNegotiation => {
                 formatter.write_str("panel version or heartbeat negotiation is invalid")
+            }
+            Self::UnsupportedControl => {
+                formatter.write_str("panel message exceeds negotiated control capabilities")
             }
             Self::HeartbeatTimedOut => formatter.write_str("panel heartbeat deadline expired"),
         }
@@ -232,6 +236,12 @@ impl RuntimeLink {
             RuntimeState::Negotiating => self.receive_negotiation(frame, now_ms),
             RuntimeState::Connected => {
                 self.validate_application(frame, Direction::PanelToRuntime)?;
+                let descriptor = self
+                    .descriptor
+                    .ok_or_else(|| self.fail(LinkFault::UnexpectedState))?;
+                if !descriptor.accepts_panel_message(frame.message) {
+                    return Err(self.fail(LinkFault::UnsupportedControl));
+                }
                 self.expected_rx_sequence = next_sequence(self.expected_rx_sequence);
                 self.last_rx_ms = now_ms;
                 Ok(RuntimeReceive::Message(frame.message))
@@ -253,6 +263,12 @@ impl RuntimeLink {
         self.ensure_connected_and_alive(now_ms)?;
         if message.is_handshake() || message.direction() == Direction::PanelToRuntime {
             return Err(self.fail(LinkFault::WrongDirection));
+        }
+        let descriptor = self
+            .descriptor
+            .ok_or_else(|| self.fail(LinkFault::UnexpectedState))?;
+        if !descriptor.accepts_runtime_message(message) {
+            return Err(self.fail(LinkFault::UnsupportedControl));
         }
         let frame = Frame::application(
             self.protocol_version,
@@ -520,6 +536,9 @@ impl PanelLink {
         self.ensure_connected_and_alive(now_ms)?;
         if message.is_handshake() || message.direction() == Direction::RuntimeToPanel {
             return Err(self.fail(LinkFault::WrongDirection));
+        }
+        if !self.descriptor.accepts_panel_message(message) {
+            return Err(self.fail(LinkFault::UnsupportedControl));
         }
         let frame = Frame::application(
             self.protocol_version,
@@ -823,6 +842,44 @@ mod tests {
             })
         );
         assert!(!runtime.is_connected());
+    }
+
+    #[test]
+    fn wrong_direction_and_protocol_are_rejected_before_delivery() {
+        let mut runtime = RuntimeLink::new(config());
+        let mut panel = PanelLink::new(descriptor()).unwrap();
+        connect(&mut runtime, &mut panel, 42, 0);
+        let wrong_direction = Frame::application(
+            PROTOCOL_VERSION,
+            42,
+            1,
+            Message::SetGlobalBrightness { brightness: 1 },
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.receive(wrong_direction, 1),
+            Err(LinkFault::WrongDirection)
+        );
+
+        connect(&mut runtime, &mut panel, 43, 2);
+        let wrong_protocol = Frame::application(
+            PROTOCOL_VERSION + 1,
+            43,
+            1,
+            Message::ButtonPress {
+                control_id: 0,
+                timestamp_us: 2_000,
+                modifiers: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.receive(wrong_protocol, 2),
+            Err(LinkFault::ProtocolMismatch {
+                expected: PROTOCOL_VERSION,
+                received: PROTOCOL_VERSION + 1,
+            })
+        );
     }
 
     #[test]
