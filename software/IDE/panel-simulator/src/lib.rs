@@ -570,7 +570,9 @@ impl PanelSimulator {
                     self.contain_transmit_error(error);
                     return;
                 }
-                let _ = self.enqueue_snapshot(now_ms);
+                if let Err(error) = self.enqueue_snapshot(now_ms) {
+                    self.contain_transmit_error(error);
+                }
             }
             Ok(PanelReceive::VersionRejected(reply)) => {
                 self.telemetry.version_rejections += 1;
@@ -582,6 +584,10 @@ impl PanelSimulator {
             }
             Ok(PanelReceive::Command(Message::Heartbeat { .. })) => {
                 self.telemetry.received_heartbeats += 1;
+            }
+            Ok(PanelReceive::UnsupportedControl { detail }) => {
+                self.telemetry.unsupported_commands += 1;
+                self.send_command_error(PanelErrorCode::UnsupportedControl, detail, now_ms);
             }
             Ok(PanelReceive::Command(message)) => self.apply_command(message, now_ms),
             Err(error) => self.record_protocol_fault(error),
@@ -648,12 +654,7 @@ impl PanelSimulator {
         if result.is_ok() {
             self.telemetry.commands_applied += 1;
         } else {
-            self.telemetry.unsupported_commands += 1;
-            self.send_command_error(
-                PanelErrorCode::UnsupportedControl,
-                command_detail(message),
-                now_ms,
-            );
+            self.record_protocol_fault(LinkFault::UnexpectedState);
         }
     }
 
@@ -777,21 +778,6 @@ fn timestamp_us(now_ms: u64) -> Result<u64, PanelSimulatorError> {
     now_ms
         .checked_mul(1_000)
         .ok_or(PanelSimulatorError::TimestampOverflow)
-}
-
-const fn command_detail(message: Message) -> u32 {
-    match message {
-        Message::SetLed { control_id, .. }
-        | Message::SetLedBrightness { control_id, .. }
-        | Message::SetLedBlink(LedBlink { control_id, .. }) => control_id as u32,
-        Message::SetRingSegment(RingSegment {
-            ring_id, segment, ..
-        }) => ((ring_id as u32) << 8) | segment as u32,
-        Message::SetRingValue { ring_id, .. } | Message::SetRingAnimation { ring_id, .. } => {
-            ring_id as u32
-        }
-        _ => 0,
-    }
 }
 
 #[cfg(test)]
@@ -1106,5 +1092,23 @@ mod tests {
         assert!(matches!(frames[0].message, Message::VersionRejected { .. }));
         assert_eq!(simulator.telemetry().version_rejections, 1);
         assert_ne!(PROTOCOL_VERSION, 2);
+    }
+
+    #[test]
+    fn snapshot_timestamp_overflow_fails_session_establishment_closed() {
+        let mut simulator = simulator(false);
+        let mut runtime = RuntimeLink::new(LinkConfig::new(100, 300).unwrap());
+        let now_ms = u64::MAX / 1_000 + 1;
+        let hello = runtime.start(90, now_ms).unwrap();
+        let (bytes, length) = encode(hello);
+
+        let report = simulator.receive_runtime_bytes(&bytes[..length], now_ms);
+
+        assert_eq!(report.decoded_frames, 1);
+        assert_eq!(report.protocol_faults, 1);
+        assert!(!report.connected);
+        assert!(!simulator.is_connected());
+        assert_eq!(simulator.pending_panel_bytes(), 0);
+        assert_eq!(simulator.output_state().global_brightness(), 0);
     }
 }

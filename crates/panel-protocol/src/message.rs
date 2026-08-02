@@ -328,6 +328,21 @@ impl Message {
         }
     }
 
+    pub(crate) const fn runtime_control_detail(self) -> u32 {
+        match self {
+            Self::SetLed { control_id, .. }
+            | Self::SetLedBrightness { control_id, .. }
+            | Self::SetLedBlink(LedBlink { control_id, .. }) => control_id as u32,
+            Self::SetRingSegment(RingSegment {
+                ring_id, segment, ..
+            }) => ((ring_id as u32) << 8) | segment as u32,
+            Self::SetRingValue { ring_id, .. } | Self::SetRingAnimation { ring_id, .. } => {
+                ring_id as u32
+            }
+            _ => 0,
+        }
+    }
+
     #[must_use]
     pub const fn is_handshake(self) -> bool {
         matches!(

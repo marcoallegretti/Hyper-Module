@@ -144,6 +144,7 @@ pub enum RuntimeReceive {
 pub enum PanelReceive {
     SessionEstablished(Frame),
     VersionRejected(Frame),
+    UnsupportedControl { detail: u32 },
     Command(Message),
 }
 
@@ -163,6 +164,7 @@ pub struct RuntimeLink {
     protocol_version: u8,
     next_tx_sequence: u32,
     expected_rx_sequence: u32,
+    last_received_sequence: u32,
     started_ms: u64,
     last_rx_ms: u64,
     next_heartbeat_ms: u64,
@@ -182,6 +184,7 @@ impl RuntimeLink {
             protocol_version: 0,
             next_tx_sequence: 1,
             expected_rx_sequence: 1,
+            last_received_sequence: 0,
             started_ms: 0,
             last_rx_ms: 0,
             next_heartbeat_ms: 0,
@@ -207,6 +210,7 @@ impl RuntimeLink {
         self.protocol_version = 0;
         self.next_tx_sequence = 1;
         self.expected_rx_sequence = 1;
+        self.last_received_sequence = 0;
         self.started_ms = now_ms;
         self.last_rx_ms = now_ms;
         self.next_heartbeat_ms = deadline(now_ms, self.config.heartbeat_interval_ms)
@@ -233,8 +237,14 @@ impl RuntimeLink {
     pub fn receive(&mut self, frame: Frame, now_ms: u64) -> Result<RuntimeReceive, LinkFault> {
         self.observe(now_ms)?;
         match self.state {
-            RuntimeState::Negotiating => self.receive_negotiation(frame, now_ms),
+            RuntimeState::Negotiating => {
+                if expired(self.last_rx_ms, self.config.heartbeat_timeout_ms, now_ms) {
+                    return Err(self.fail(LinkFault::HeartbeatTimedOut));
+                }
+                self.receive_negotiation(frame, now_ms)
+            }
             RuntimeState::Connected => {
+                self.ensure_connected_and_alive(now_ms)?;
                 self.validate_application(frame, Direction::PanelToRuntime)?;
                 let descriptor = self
                     .descriptor
@@ -242,7 +252,8 @@ impl RuntimeLink {
                 if !descriptor.accepts_panel_message(frame.message) {
                     return Err(self.fail(LinkFault::UnsupportedControl));
                 }
-                self.expected_rx_sequence = next_sequence(self.expected_rx_sequence);
+                self.last_received_sequence = frame.sequence;
+                self.expected_rx_sequence = next_sequence(frame.sequence);
                 self.last_rx_ms = now_ms;
                 Ok(RuntimeReceive::Message(frame.message))
             }
@@ -370,6 +381,9 @@ impl RuntimeLink {
                 Ok(RuntimeReceive::Connected(descriptor))
             }
             Message::VersionRejected { supported } => {
+                if self.supported.negotiate(supported).is_some() {
+                    return Err(self.fail(LinkFault::InvalidNegotiation));
+                }
                 self.state = RuntimeState::Incompatible;
                 self.descriptor = None;
                 Ok(RuntimeReceive::VersionRejected(supported))
@@ -420,7 +434,7 @@ impl RuntimeLink {
     fn heartbeat(&mut self, now_ms: u64) -> Result<Frame, LinkFault> {
         let message = Message::Heartbeat {
             uptime_ms: now_ms - self.started_ms,
-            last_received_sequence: previous_sequence(self.expected_rx_sequence),
+            last_received_sequence: self.last_received_sequence,
         };
         let frame = Frame::application(
             self.protocol_version,
@@ -464,6 +478,7 @@ pub struct PanelLink {
     protocol_version: u8,
     next_tx_sequence: u32,
     expected_rx_sequence: u32,
+    last_received_sequence: u32,
     started_ms: u64,
     last_rx_ms: u64,
     next_heartbeat_ms: u64,
@@ -486,6 +501,7 @@ impl PanelLink {
             protocol_version: 0,
             next_tx_sequence: 1,
             expected_rx_sequence: 1,
+            last_received_sequence: 0,
             started_ms: 0,
             last_rx_ms: 0,
             next_heartbeat_ms: 0,
@@ -519,9 +535,16 @@ impl PanelLink {
         if self.state != PanelState::Connected {
             return Err(self.fail(LinkFault::UnexpectedState));
         }
+        self.ensure_connected_and_alive(now_ms)?;
         self.validate_application(frame, Direction::RuntimeToPanel)?;
-        self.expected_rx_sequence = next_sequence(self.expected_rx_sequence);
+        self.last_received_sequence = frame.sequence;
+        self.expected_rx_sequence = next_sequence(frame.sequence);
         self.last_rx_ms = now_ms;
+        if !self.descriptor.accepts_runtime_message(frame.message) {
+            return Ok(PanelReceive::UnsupportedControl {
+                detail: frame.message.runtime_control_detail(),
+            });
+        }
         Ok(PanelReceive::Command(frame.message))
     }
 
@@ -632,6 +655,7 @@ impl PanelLink {
         self.protocol_version = selected_version;
         self.next_tx_sequence = 1;
         self.expected_rx_sequence = 1;
+        self.last_received_sequence = 0;
         self.started_ms = now_ms;
         self.last_rx_ms = now_ms;
         self.next_heartbeat_ms =
@@ -695,7 +719,7 @@ impl PanelLink {
     fn heartbeat(&mut self, now_ms: u64) -> Result<Frame, LinkFault> {
         let message = Message::Heartbeat {
             uptime_ms: now_ms - self.started_ms,
-            last_received_sequence: previous_sequence(self.expected_rx_sequence),
+            last_received_sequence: self.last_received_sequence,
         };
         let frame = Frame::application(
             self.protocol_version,
@@ -732,10 +756,6 @@ impl Direction {
             Self::Bidirectional => Self::Bidirectional,
         }
     }
-}
-
-const fn previous_sequence(next: u32) -> u32 {
-    if next == 1 { 0 } else { next - 1 }
 }
 
 fn deadline(now_ms: u64, delta_ms: u32) -> Result<u64, LinkFault> {
@@ -939,6 +959,153 @@ mod tests {
     }
 
     #[test]
+    fn contradictory_version_rejection_is_a_negotiation_fault() {
+        let mut runtime = RuntimeLink::new(config());
+        runtime.start(7, 0).unwrap();
+        let rejection = Frame::handshake(
+            7,
+            Message::VersionRejected {
+                supported: SupportedVersions::CURRENT,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime.receive(rejection, 0),
+            Err(LinkFault::InvalidNegotiation)
+        );
+        assert!(!runtime.is_connected());
+    }
+
+    #[test]
+    fn receive_timeout_precedes_late_application_delivery() {
+        let mut runtime = RuntimeLink::new(config());
+        let mut panel = PanelLink::new(descriptor()).unwrap();
+        connect(&mut runtime, &mut panel, 42, 0);
+        let late_panel_event = Frame::application(
+            PROTOCOL_VERSION,
+            42,
+            1,
+            Message::ButtonPress {
+                control_id: 0,
+                timestamp_us: 300_000,
+                modifiers: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.receive(late_panel_event, 300),
+            Err(LinkFault::HeartbeatTimedOut)
+        );
+        assert!(!runtime.is_connected());
+
+        let mut runtime = RuntimeLink::new(config());
+        let mut panel = PanelLink::new(descriptor()).unwrap();
+        connect(&mut runtime, &mut panel, 43, 0);
+        let late_runtime_command = Frame::application(
+            PROTOCOL_VERSION,
+            43,
+            1,
+            Message::SetGlobalBrightness { brightness: 1 },
+        )
+        .unwrap();
+        assert_eq!(
+            panel.receive(late_runtime_command, 300),
+            Err(LinkFault::HeartbeatTimedOut)
+        );
+        assert!(!panel.is_connected());
+    }
+
+    #[test]
+    fn panel_classifies_unsupported_controls_before_command_delivery() {
+        let mut runtime = RuntimeLink::new(config());
+        let mut panel = PanelLink::new(descriptor()).unwrap();
+        connect(&mut runtime, &mut panel, 42, 0);
+        let unsupported = [
+            (
+                Message::SetLed {
+                    control_id: 8,
+                    enabled: true,
+                },
+                8,
+            ),
+            (
+                Message::SetLedBrightness {
+                    control_id: 8,
+                    brightness: 1,
+                },
+                8,
+            ),
+            (
+                Message::SetLedBlink(crate::LedBlink {
+                    control_id: 8,
+                    on_ms: 1,
+                    off_ms: 1,
+                }),
+                8,
+            ),
+            (
+                Message::SetRingSegment(crate::RingSegment {
+                    ring_id: 1,
+                    segment: 0,
+                    brightness: 1,
+                }),
+                0x100,
+            ),
+            (
+                Message::SetRingSegment(crate::RingSegment {
+                    ring_id: 0,
+                    segment: 32,
+                    brightness: 1,
+                }),
+                32,
+            ),
+            (
+                Message::SetRingValue {
+                    ring_id: 1,
+                    value: 1,
+                },
+                1,
+            ),
+            (
+                Message::SetRingAnimation {
+                    ring_id: 1,
+                    animation: crate::Animation::Pulse,
+                    period_ms: 1,
+                },
+                1,
+            ),
+        ];
+        for (index, (message, detail)) in unsupported.into_iter().enumerate() {
+            let sequence = u32::try_from(index + 1).unwrap();
+            let frame = Frame::application(PROTOCOL_VERSION, 42, sequence, message).unwrap();
+            assert_eq!(
+                panel.receive(frame, u64::from(sequence)),
+                Ok(PanelReceive::UnsupportedControl { detail })
+            );
+        }
+        assert!(panel.is_connected());
+
+        let valid = Frame::application(
+            PROTOCOL_VERSION,
+            42,
+            8,
+            Message::SetLed {
+                control_id: 0,
+                enabled: true,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            panel.receive(valid, 8),
+            Ok(PanelReceive::Command(Message::SetLed {
+                control_id: 0,
+                enabled: true,
+            }))
+        ));
+    }
+
+    #[test]
     fn heartbeat_deadline_is_fail_safe_and_precedes_transmission() {
         let mut runtime = RuntimeLink::new(config());
         let mut panel = PanelLink::new(descriptor()).unwrap();
@@ -963,8 +1130,62 @@ mod tests {
     }
 
     #[test]
-    fn sequence_wrap_skips_the_reserved_zero_value() {
-        assert_eq!(next_sequence(u32::MAX), 1);
-        assert_eq!(previous_sequence(1), 0);
+    fn sequence_wrap_preserves_acknowledgement_and_skips_reserved_zero() {
+        let mut runtime = RuntimeLink::new(config());
+        let mut panel = PanelLink::new(descriptor()).unwrap();
+        connect(&mut runtime, &mut panel, 42, 0);
+
+        runtime.expected_rx_sequence = u32::MAX;
+        runtime.next_tx_sequence = u32::MAX;
+        let panel_event = Frame::application(
+            PROTOCOL_VERSION,
+            42,
+            u32::MAX,
+            Message::ButtonPress {
+                control_id: 0,
+                timestamp_us: 1_000,
+                modifiers: 0,
+            },
+        )
+        .unwrap();
+        runtime.receive(panel_event, 1).unwrap();
+        let LinkPoll::Send(runtime_heartbeat) = runtime.poll(100).unwrap() else {
+            panic!("runtime heartbeat was not due");
+        };
+        assert_eq!(runtime_heartbeat.sequence, u32::MAX);
+        assert!(matches!(
+            runtime_heartbeat.message,
+            Message::Heartbeat {
+                last_received_sequence: u32::MAX,
+                ..
+            }
+        ));
+        assert_eq!(
+            runtime
+                .send(Message::SetGlobalBrightness { brightness: 1 }, 101)
+                .unwrap()
+                .sequence,
+            1
+        );
+
+        panel.expected_rx_sequence = u32::MAX;
+        let runtime_command = Frame::application(
+            PROTOCOL_VERSION,
+            42,
+            u32::MAX,
+            Message::SetGlobalBrightness { brightness: 1 },
+        )
+        .unwrap();
+        panel.receive(runtime_command, 1).unwrap();
+        let LinkPoll::Send(panel_heartbeat) = panel.poll(100).unwrap() else {
+            panic!("panel heartbeat was not due");
+        };
+        assert!(matches!(
+            panel_heartbeat.message,
+            Message::Heartbeat {
+                last_received_sequence: u32::MAX,
+                ..
+            }
+        ));
     }
 }
