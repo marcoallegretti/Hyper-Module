@@ -1,0 +1,62 @@
+{
+  "format": "hyper-control-mapping-transform-vectors",
+  "format_version": 1,
+  "cases": [
+    {
+      "name": "forward-below",
+      "transform": {"kind": "linear", "input_min": -1000000, "input_max": 1000000, "output_min": 0, "output_max": 1000000},
+      "input": -2000000,
+      "normalized": 0,
+      "gain_millionths": 0,
+      "pan_millionths": -1000000
+    },
+    {
+      "name": "forward-midpoint",
+      "transform": {"kind": "linear", "input_min": -1000000, "input_max": 1000000, "output_min": 0, "output_max": 1000000},
+      "input": 0,
+      "normalized": 500000,
+      "gain_millionths": 1000000,
+      "pan_millionths": 0
+    },
+    {
+      "name": "forward-above",
+      "transform": {"kind": "linear", "input_min": -1000000, "input_max": 1000000, "output_min": 0, "output_max": 1000000},
+      "input": 2000000,
+      "normalized": 1000000,
+      "gain_millionths": 2000000,
+      "pan_millionths": 1000000
+    },
+    {
+      "name": "reversed-below",
+      "transform": {"kind": "linear", "input_min": -3, "input_max": 3, "output_min": 1000000, "output_max": 0},
+      "input": -4,
+      "normalized": 1000000,
+      "gain_millionths": 2000000,
+      "pan_millionths": 1000000
+    },
+    {
+      "name": "reversed-negative-quotient",
+      "transform": {"kind": "linear", "input_min": -3, "input_max": 3, "output_min": 1000000, "output_max": 0},
+      "input": -2,
+      "normalized": 833334,
+      "gain_millionths": 1666668,
+      "pan_millionths": 666668
+    },
+    {
+      "name": "reversed-positive-input",
+      "transform": {"kind": "linear", "input_min": -3, "input_max": 3, "output_min": 1000000, "output_max": 0},
+      "input": 2,
+      "normalized": 166667,
+      "gain_millionths": 333334,
+      "pan_millionths": -666666
+    },
+    {
+      "name": "reversed-above",
+      "transform": {"kind": "linear", "input_min": -3, "input_max": 3, "output_min": 1000000, "output_max": 0},
+      "input": 4,
+      "normalized": 0,
+      "gain_millionths": 0,
+      "pan_millionths": -1000000
+    }
+  ]
+}

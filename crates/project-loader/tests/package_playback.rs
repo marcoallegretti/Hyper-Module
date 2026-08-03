@@ -30,6 +30,7 @@ const RECORDING_METADATA_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334461";
 const FOREIGN_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334462";
 const SECOND_MAPPING_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334463";
 const BINDING_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334464";
+const AUTOMATION_TAKE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334465";
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -324,6 +325,18 @@ impl Fixture {
         self.write_manifest(&manifest);
     }
 
+    fn set_clock_input(&self, available: bool) {
+        let mut manifest = self.manifest();
+        manifest["required_capabilities"]["has_clock_input"] = available.into();
+        self.write_manifest(&manifest);
+    }
+
+    fn set_reset_input(&self, available: bool) {
+        let mut manifest = self.manifest();
+        manifest["required_capabilities"]["has_reset_input"] = available.into();
+        self.write_manifest(&manifest);
+    }
+
     fn manifest(&self) -> Value {
         serde_json::from_slice(&fs::read(self.root.join("project.json")).unwrap()).unwrap()
     }
@@ -553,6 +566,11 @@ fn loads_and_binds_one_verified_control_mapping() {
     assert_eq!(mapping.id(), MAPPING_ID);
     assert_eq!(mapping.project_id(), PROJECT_ID);
     assert_eq!(mapping.bindings().len(), 1);
+    let (package, session, mapping, recording_metadata) = prepared.into_parts();
+    assert_eq!(package.manifest().project_id(), PROJECT_ID);
+    assert_eq!(session.parts().0.project_id(), PROJECT_ID);
+    assert_eq!(mapping.unwrap().id(), MAPPING_ID);
+    assert!(recording_metadata.is_empty());
 }
 
 #[test]
@@ -593,6 +611,111 @@ fn rejects_invalid_or_ambiguous_control_mapping_resources() {
 }
 
 #[test]
+fn rejects_mapping_document_ownership_mismatches() {
+    let descriptor = Fixture::new();
+    descriptor.set_cv_inputs(1);
+    descriptor.add_resource(
+        MAPPING_ID,
+        "mapping",
+        "mappings/controller.json",
+        &control_mapping(FOREIGN_ID, BINDING_ID, TRACK_ID, Value::Null),
+    );
+    assert_mapping_binding_kind(
+        prepare_project_playback(&descriptor.root, limits()),
+        ControlMappingBindingErrorKind::DescriptorIdMismatch,
+        None,
+    );
+
+    let project = Fixture::new();
+    project.set_cv_inputs(1);
+    let mut mapping = control_mapping(MAPPING_ID, BINDING_ID, TRACK_ID, Value::Null);
+    mapping["project_id"] = FOREIGN_ID.into();
+    project.add_resource(MAPPING_ID, "mapping", "mappings/controller.json", &mapping);
+    assert_mapping_binding_kind(
+        prepare_project_playback(&project.root, limits()),
+        ControlMappingBindingErrorKind::ProjectIdMismatch,
+        None,
+    );
+}
+
+#[test]
+fn rejects_unavailable_edge_sources_and_graph_target_kinds() {
+    let clock = Fixture::new();
+    clock.add_resource(
+        MAPPING_ID,
+        "mapping",
+        "mappings/controller.json",
+        &trigger_control_mapping(
+            "clock-input",
+            json!({"kind": "transport", "action": "play"}),
+        ),
+    );
+    assert_mapping_binding_kind(
+        prepare_project_playback(&clock.root, limits()),
+        ControlMappingBindingErrorKind::ClockInputUnavailable,
+        Some(BINDING_ID),
+    );
+
+    let reset = Fixture::new();
+    reset.add_resource(
+        MAPPING_ID,
+        "mapping",
+        "mappings/controller.json",
+        &trigger_control_mapping(
+            "reset-input",
+            json!({"kind": "transport", "action": "reset"}),
+        ),
+    );
+    assert_mapping_binding_kind(
+        prepare_project_playback(&reset.root, limits()),
+        ControlMappingBindingErrorKind::ResetInputUnavailable,
+        Some(BINDING_ID),
+    );
+
+    let send = Fixture::new();
+    send.set_cv_inputs(1);
+    let mut mapping = control_mapping(MAPPING_ID, BINDING_ID, TRACK_ID, Value::Null);
+    mapping["bindings"][0]["target"] =
+        json!({"kind": "mixer-send", "send_id": FOREIGN_ID, "parameter": "gain"});
+    send.add_resource(MAPPING_ID, "mapping", "mappings/controller.json", &mapping);
+    assert_mapping_binding_kind(
+        prepare_project_playback(&send.root, limits()),
+        ControlMappingBindingErrorKind::MixerSendMissing,
+        Some(BINDING_ID),
+    );
+
+    let scene = Fixture::new();
+    scene.set_clock_input(true);
+    scene.add_resource(
+        MAPPING_ID,
+        "mapping",
+        "mappings/controller.json",
+        &trigger_control_mapping(
+            "clock-input",
+            json!({"kind": "scene", "scene_id": FOREIGN_ID, "action": "launch"}),
+        ),
+    );
+    assert_mapping_binding_kind(
+        prepare_project_playback(&scene.root, limits()),
+        ControlMappingBindingErrorKind::SceneTargetMissing,
+        Some(BINDING_ID),
+    );
+
+    let available_reset = Fixture::new();
+    available_reset.set_reset_input(true);
+    available_reset.add_resource(
+        MAPPING_ID,
+        "mapping",
+        "mappings/controller.json",
+        &trigger_control_mapping(
+            "reset-input",
+            json!({"kind": "transport", "action": "reset"}),
+        ),
+    );
+    assert!(prepare_project_playback(&available_reset.root, limits()).is_ok());
+}
+
+#[test]
 fn rejects_unavailable_mapping_sources_and_unresolved_graph_references() {
     let unavailable = Fixture::new();
     unavailable.add_resource(
@@ -607,6 +730,7 @@ fn rejects_unavailable_mapping_sources_and_unresolved_graph_references() {
             index: 0,
             available: 0,
         },
+        Some(BINDING_ID),
     );
 
     let target = Fixture::new();
@@ -620,6 +744,7 @@ fn rejects_unavailable_mapping_sources_and_unresolved_graph_references() {
     assert_mapping_binding_kind(
         prepare_project_playback(&target.root, limits()),
         ControlMappingBindingErrorKind::MixerChannelMissing,
+        Some(BINDING_ID),
     );
 
     let scope = Fixture::new();
@@ -638,6 +763,7 @@ fn rejects_unavailable_mapping_sources_and_unresolved_graph_references() {
     assert_mapping_binding_kind(
         prepare_project_playback(&scope.root, limits()),
         ControlMappingBindingErrorKind::TrackScopeMissing,
+        Some(BINDING_ID),
     );
 }
 
@@ -654,6 +780,68 @@ fn rejects_mapping_binding_identity_collisions() {
     assert_mapping_binding_kind(
         prepare_project_playback(&fixture.root, limits()),
         ControlMappingBindingErrorKind::IdentityCollision,
+        Some(PLACEMENT_ID),
+    );
+}
+
+#[test]
+fn rejects_mapping_resource_identity_collisions() {
+    let arrangement = Fixture::new();
+    arrangement.set_cv_inputs(1);
+    arrangement.add_resource(
+        PLACEMENT_ID,
+        "mapping",
+        "mappings/controller.json",
+        &control_mapping(PLACEMENT_ID, BINDING_ID, TRACK_ID, Value::Null),
+    );
+    assert_mapping_binding_kind(
+        prepare_project_playback(&arrangement.root, limits()),
+        ControlMappingBindingErrorKind::DocumentIdentityCollision,
+        None,
+    );
+
+    let automation = Fixture::new();
+    automation.set_cv_inputs(1);
+    automation.add_resource(
+        AUTOMATION_TAKE_ID,
+        "automation-take",
+        "takes/take.json",
+        &json!({
+            "format": "hyper-automation-take",
+            "format_version": 1,
+            "id": AUTOMATION_TAKE_ID,
+            "project_id": PROJECT_ID,
+            "name": "Collision",
+            "enabled": true,
+            "captured_at_utc": "2026-08-03T00:00:00.000Z",
+            "start_tick": 0,
+            "end_tick": 4,
+            "lanes": [{
+                "id": MAPPING_ID,
+                "target": {
+                    "kind": "mixer-channel",
+                    "track_id": TRACK_ID,
+                    "parameter": "gain"
+                },
+                "interpolation": "linear",
+                "points": [
+                    {"tick": 0, "value": 0},
+                    {"tick": 3, "value": 1_000_000}
+                ]
+            }],
+            "extensions": {}
+        }),
+    );
+    automation.add_resource(
+        MAPPING_ID,
+        "mapping",
+        "mappings/controller.json",
+        &control_mapping(MAPPING_ID, BINDING_ID, TRACK_ID, Value::Null),
+    );
+    assert_mapping_binding_kind(
+        prepare_project_playback(&automation.root, limits()),
+        ControlMappingBindingErrorKind::DocumentIdentityCollision,
+        None,
     );
 }
 
@@ -882,6 +1070,14 @@ fn control_mapping(
     })
 }
 
+fn trigger_control_mapping(source_kind: &str, target: Value) -> Value {
+    let mut mapping = control_mapping(MAPPING_ID, BINDING_ID, TRACK_ID, Value::Null);
+    mapping["bindings"][0]["source"] = json!({"kind": source_kind, "edge": "rising"});
+    mapping["bindings"][0]["transform"] = json!({"kind": "trigger", "behavior": "invoke"});
+    mapping["bindings"][0]["target"] = target;
+    mapping
+}
+
 fn assert_binding_kind(
     result: Result<hyper_project_loader::PreparedProjectPlayback, ProjectPlaybackError>,
     expected: RecordingBindingErrorKind,
@@ -897,10 +1093,12 @@ fn assert_binding_kind(
 fn assert_mapping_binding_kind(
     result: Result<hyper_project_loader::PreparedProjectPlayback, ProjectPlaybackError>,
     expected: ControlMappingBindingErrorKind,
+    expected_binding_id: Option<&str>,
 ) {
     match result {
         Err(ProjectPlaybackError::ControlMappingBinding(error)) => {
             assert_eq!(error.kind(), expected);
+            assert_eq!(error.binding_id(), expected_binding_id);
         }
         other => panic!("expected control mapping binding error, got {other:?}"),
     }

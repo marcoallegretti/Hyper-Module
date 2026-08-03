@@ -314,6 +314,12 @@ impl ControlMappingDocument {
                 ControlMappingBindingErrorKind::ProjectIdMismatch,
             ));
         }
+        if project.contains_nested_entity(&self.id) {
+            return Err(binding_error(
+                None,
+                ControlMappingBindingErrorKind::DocumentIdentityCollision,
+            ));
+        }
         for binding in &self.bindings {
             validate_project_binding(binding, project)?;
         }
@@ -326,6 +332,8 @@ pub trait ControlMappingProject {
     fn cv_inputs(&self) -> u8;
     fn has_clock_input(&self) -> bool;
     fn has_reset_input(&self) -> bool;
+    fn has_mixer(&self) -> bool;
+    fn contains_nested_entity(&self, id: &str) -> bool;
     fn contains_entity(&self, id: &str) -> bool;
     fn contains_track(&self, id: &str) -> bool;
     fn contains_scene(&self, id: &str) -> bool;
@@ -381,14 +389,17 @@ impl From<StrictJsonError> for ControlMappingParseError {
 pub enum ControlMappingBindingErrorKind {
     DescriptorIdMismatch,
     ProjectIdMismatch,
+    DocumentIdentityCollision,
     IdentityCollision,
     CvInputUnavailable { index: u8, available: u8 },
     ClockInputUnavailable,
     ResetInputUnavailable,
     TrackScopeMissing,
     SceneScopeMissing,
+    MixerScopeMissing,
     MixerChannelMissing,
     MixerSendMissing,
+    MixerTargetMissing,
     SceneTargetMissing,
     SoloTargetNotSource,
 }
@@ -423,6 +434,9 @@ impl fmt::Display for ControlMappingBindingError {
             ControlMappingBindingErrorKind::ProjectIdMismatch => {
                 formatter.write_str("document belongs to another project")
             }
+            ControlMappingBindingErrorKind::DocumentIdentityCollision => {
+                formatter.write_str("document ID collides with a nested project entity")
+            }
             ControlMappingBindingErrorKind::IdentityCollision => {
                 formatter.write_str("identifier collides with another project entity")
             }
@@ -442,11 +456,17 @@ impl fmt::Display for ControlMappingBindingError {
             ControlMappingBindingErrorKind::SceneScopeMissing => {
                 formatter.write_str("scene scope does not exist")
             }
+            ControlMappingBindingErrorKind::MixerScopeMissing => {
+                formatter.write_str("mixer-page scope requires a mixer")
+            }
             ControlMappingBindingErrorKind::MixerChannelMissing => {
                 formatter.write_str("target mixer channel does not exist")
             }
             ControlMappingBindingErrorKind::MixerSendMissing => {
                 formatter.write_str("target mixer send does not exist")
+            }
+            ControlMappingBindingErrorKind::MixerTargetMissing => {
+                formatter.write_str("target requires a mixer")
             }
             ControlMappingBindingErrorKind::SceneTargetMissing => {
                 formatter.write_str("target scene does not exist")
@@ -670,6 +690,15 @@ fn validate_project_binding(
             ControlMappingBindingErrorKind::IdentityCollision,
         ));
     }
+    validate_project_source(binding, project)?;
+    validate_project_scope(binding, project)?;
+    validate_project_target(binding, project)
+}
+
+fn validate_project_source(
+    binding: &ControlBinding,
+    project: &impl ControlMappingProject,
+) -> Result<(), ControlMappingBindingError> {
     match binding.source {
         ControlSource::CvInput { input_index } if input_index >= project.cv_inputs() => {
             return Err(binding_error(
@@ -696,6 +725,13 @@ fn validate_project_binding(
         | ControlSource::ClockInput { .. }
         | ControlSource::ResetInput { .. } => {}
     }
+    Ok(())
+}
+
+fn validate_project_scope(
+    binding: &ControlBinding,
+    project: &impl ControlMappingProject,
+) -> Result<(), ControlMappingBindingError> {
     match &binding.scope {
         ControlScope::Track { track_id } if !project.contains_track(track_id) => {
             return Err(binding_error(
@@ -709,11 +745,24 @@ fn validate_project_binding(
                 ControlMappingBindingErrorKind::SceneScopeMissing,
             ));
         }
+        ControlScope::MixerPage if !project.has_mixer() => {
+            return Err(binding_error(
+                Some(&binding.id),
+                ControlMappingBindingErrorKind::MixerScopeMissing,
+            ));
+        }
         ControlScope::Global
         | ControlScope::MixerPage
         | ControlScope::Track { .. }
         | ControlScope::Scene { .. } => {}
     }
+    Ok(())
+}
+
+fn validate_project_target(
+    binding: &ControlBinding,
+    project: &impl ControlMappingProject,
+) -> Result<(), ControlMappingBindingError> {
     match &binding.target {
         ControlTarget::MixerChannel {
             track_id,
@@ -742,6 +791,14 @@ fn validate_project_binding(
             return Err(binding_error(
                 Some(&binding.id),
                 ControlMappingBindingErrorKind::SceneTargetMissing,
+            ));
+        }
+        ControlTarget::MixerMain { .. } | ControlTarget::MixerCue { .. }
+            if !project.has_mixer() =>
+        {
+            return Err(binding_error(
+                Some(&binding.id),
+                ControlMappingBindingErrorKind::MixerTargetMissing,
             ));
         }
         ControlTarget::MixerSend { .. }
@@ -786,10 +843,158 @@ fn binding_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::collections::BTreeSet;
 
     const VALID: &[u8] = include_bytes!("../../../contracts/fixtures/valid/control-mappings.json");
     const INVALID_ACTION_LINEAR: &[u8] =
         include_bytes!("../../../contracts/fixtures/invalid/control-mappings-action-linear.json");
+    const TRANSFORM_VECTORS: &[u8] =
+        include_bytes!("../../../contracts/fixtures/vectors/control-mapping-transforms.json");
+    const MAPPING_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334474";
+    const PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334455";
+    const BINDING_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334475";
+    const SECOND_BINDING_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334476";
+    const TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334456";
+    const SCENE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334477";
+    const SEND_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334478";
+    const FOREIGN_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334479";
+
+    #[derive(Deserialize)]
+    struct TransformVectorDocument {
+        format: String,
+        format_version: u8,
+        cases: Vec<TransformVector>,
+    }
+
+    #[derive(Deserialize)]
+    struct TransformVector {
+        name: String,
+        transform: ControlTransform,
+        input: i32,
+        normalized: i32,
+        gain_millionths: u32,
+        pan_millionths: i32,
+    }
+
+    #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+    enum ProjectFact {
+        Clock,
+        Reset,
+        Mixer,
+        Track,
+        Scene,
+        MixerChannel,
+        MixerSend,
+        SoloSource,
+    }
+
+    #[derive(Clone)]
+    struct TestProject {
+        project_id: &'static str,
+        cv_inputs: u8,
+        nested_entity: Option<&'static str>,
+        entity: Option<&'static str>,
+        facts: BTreeSet<ProjectFact>,
+    }
+
+    impl Default for TestProject {
+        fn default() -> Self {
+            Self {
+                project_id: PROJECT_ID,
+                cv_inputs: 4,
+                nested_entity: None,
+                entity: None,
+                facts: BTreeSet::from([
+                    ProjectFact::Clock,
+                    ProjectFact::Reset,
+                    ProjectFact::Mixer,
+                    ProjectFact::Track,
+                    ProjectFact::Scene,
+                    ProjectFact::MixerChannel,
+                    ProjectFact::MixerSend,
+                    ProjectFact::SoloSource,
+                ]),
+            }
+        }
+    }
+
+    impl TestProject {
+        fn without(mut self, fact: ProjectFact) -> Self {
+            self.facts.remove(&fact);
+            self
+        }
+
+        fn with_project_id(mut self, project_id: &'static str) -> Self {
+            self.project_id = project_id;
+            self
+        }
+
+        fn with_cv_inputs(mut self, cv_inputs: u8) -> Self {
+            self.cv_inputs = cv_inputs;
+            self
+        }
+
+        fn with_nested_entity(mut self, id: &'static str) -> Self {
+            self.nested_entity = Some(id);
+            self
+        }
+
+        fn with_entity(mut self, id: &'static str) -> Self {
+            self.entity = Some(id);
+            self
+        }
+    }
+
+    impl ControlMappingProject for TestProject {
+        fn project_id(&self) -> &str {
+            self.project_id
+        }
+
+        fn cv_inputs(&self) -> u8 {
+            self.cv_inputs
+        }
+
+        fn has_clock_input(&self) -> bool {
+            self.facts.contains(&ProjectFact::Clock)
+        }
+
+        fn has_reset_input(&self) -> bool {
+            self.facts.contains(&ProjectFact::Reset)
+        }
+
+        fn has_mixer(&self) -> bool {
+            self.facts.contains(&ProjectFact::Mixer)
+        }
+
+        fn contains_nested_entity(&self, id: &str) -> bool {
+            self.nested_entity == Some(id)
+        }
+
+        fn contains_entity(&self, id: &str) -> bool {
+            self.entity == Some(id)
+        }
+
+        fn contains_track(&self, id: &str) -> bool {
+            self.facts.contains(&ProjectFact::Track) && id == TRACK_ID
+        }
+
+        fn contains_scene(&self, id: &str) -> bool {
+            self.facts.contains(&ProjectFact::Scene) && id == SCENE_ID
+        }
+
+        fn contains_mixer_channel(&self, track_id: &str) -> bool {
+            self.facts.contains(&ProjectFact::MixerChannel) && track_id == TRACK_ID
+        }
+
+        fn contains_mixer_send(&self, send_id: &str) -> bool {
+            self.facts.contains(&ProjectFact::MixerSend) && send_id == SEND_ID
+        }
+
+        fn is_solo_source_track(&self, track_id: &str) -> bool {
+            self.facts.contains(&ProjectFact::SoloSource) && track_id == TRACK_ID
+        }
+    }
 
     #[test]
     fn parses_the_published_fixture_and_matches_integer_vectors() {
@@ -837,5 +1042,561 @@ mod tests {
             binding.map_continuous(2),
             Some(ContinuousControlValue::PanMillionths(-666_666))
         );
+    }
+
+    #[test]
+    fn shared_transform_vectors_match_every_continuous_target_domain() {
+        let vectors: TransformVectorDocument = serde_json::from_slice(TRANSFORM_VECTORS).unwrap();
+        assert_eq!(vectors.format, "hyper-control-mapping-transform-vectors");
+        assert_eq!(vectors.format_version, 1);
+        let mut names = BTreeSet::new();
+        for vector in vectors.cases {
+            assert!(names.insert(vector.name.clone()));
+            assert_eq!(
+                vector.normalized.checked_mul(2),
+                Some(i32::try_from(vector.gain_millionths).unwrap())
+            );
+            let gain = continuous_binding(
+                vector.transform,
+                ControlTarget::MixerMain {
+                    parameter: MainParameter::Gain,
+                },
+            );
+            assert_eq!(
+                gain.map_continuous(vector.input),
+                Some(ContinuousControlValue::GainMillionths(
+                    vector.gain_millionths
+                )),
+                "{}",
+                vector.name
+            );
+            let pan = continuous_binding(
+                vector.transform,
+                ControlTarget::MixerChannel {
+                    track_id: TRACK_ID.to_owned(),
+                    parameter: ChannelParameter::Pan,
+                },
+            );
+            assert_eq!(
+                pan.map_continuous(vector.input),
+                Some(ContinuousControlValue::PanMillionths(vector.pan_millionths)),
+                "{}",
+                vector.name
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive table keeps every published tagged variant visible together"
+    )]
+    fn parses_every_published_source_scope_transform_and_target_variant() {
+        let linear = json!({
+            "kind": "linear",
+            "input_min": -1_000_000,
+            "input_max": 1_000_000,
+            "output_min": 0,
+            "output_max": 1_000_000
+        });
+        let cases = [
+            (
+                json!({"kind": "cv-input", "input_index": 0}),
+                json!({"kind": "global"}),
+                linear.clone(),
+                json!({"kind": "mixer-channel", "track_id": TRACK_ID, "parameter": "gain"}),
+            ),
+            (
+                json!({"kind": "cv-input", "input_index": 3}),
+                json!({"kind": "track", "track_id": TRACK_ID}),
+                linear.clone(),
+                json!({"kind": "mixer-channel", "track_id": TRACK_ID, "parameter": "pan"}),
+            ),
+            (
+                json!({"kind": "cv-input", "input_index": 1}),
+                json!({"kind": "scene", "scene_id": SCENE_ID}),
+                linear.clone(),
+                json!({"kind": "mixer-send", "send_id": SEND_ID, "parameter": "gain"}),
+            ),
+            (
+                json!({"kind": "cv-input", "input_index": 2}),
+                json!({"kind": "mixer-page"}),
+                linear.clone(),
+                json!({"kind": "mixer-send", "send_id": SEND_ID, "parameter": "pan"}),
+            ),
+            (
+                json!({"kind": "cv-input", "input_index": 0}),
+                json!({"kind": "global"}),
+                linear.clone(),
+                json!({"kind": "mixer-main", "parameter": "gain"}),
+            ),
+            (
+                json!({"kind": "cv-input", "input_index": 0}),
+                json!({"kind": "mixer-page"}),
+                linear,
+                json!({"kind": "mixer-cue", "parameter": "gain"}),
+            ),
+            trigger_case(
+                "clock-input",
+                "rising",
+                "global",
+                "toggle",
+                json!({"kind": "mixer-channel", "track_id": TRACK_ID, "parameter": "mute"}),
+            ),
+            trigger_case(
+                "clock-input",
+                "falling",
+                "track",
+                "momentary",
+                json!({"kind": "mixer-channel", "track_id": TRACK_ID, "parameter": "solo"}),
+            ),
+            trigger_case(
+                "reset-input",
+                "rising",
+                "scene",
+                "toggle",
+                json!({"kind": "mixer-send", "send_id": SEND_ID, "parameter": "enabled"}),
+            ),
+            trigger_case(
+                "reset-input",
+                "falling",
+                "mixer-page",
+                "momentary",
+                json!({"kind": "mixer-main", "parameter": "mute"}),
+            ),
+            trigger_case(
+                "clock-input",
+                "rising",
+                "global",
+                "toggle",
+                json!({"kind": "mixer-cue", "parameter": "mute"}),
+            ),
+            trigger_case(
+                "clock-input",
+                "falling",
+                "track",
+                "invoke",
+                json!({"kind": "scene", "scene_id": SCENE_ID, "action": "launch"}),
+            ),
+            trigger_case(
+                "reset-input",
+                "rising",
+                "scene",
+                "invoke",
+                json!({"kind": "transport", "action": "play"}),
+            ),
+            trigger_case(
+                "reset-input",
+                "falling",
+                "global",
+                "invoke",
+                json!({"kind": "transport", "action": "stop"}),
+            ),
+            trigger_case(
+                "clock-input",
+                "rising",
+                "mixer-page",
+                "invoke",
+                json!({"kind": "transport", "action": "toggle"}),
+            ),
+            trigger_case(
+                "reset-input",
+                "falling",
+                "track",
+                "invoke",
+                json!({"kind": "transport", "action": "reset"}),
+            ),
+        ];
+
+        for (source, scope, transform, target) in cases {
+            let document = parse_mapping(&mapping_value(&source, &scope, &transform, &target));
+            assert_eq!(
+                document.extensions().get("org.example.fixture"),
+                Some(&json!({"preserve": true}))
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_published_parser_boundaries() {
+        let valid: Value = serde_json::from_slice(VALID).unwrap();
+        let mut invalid_cases = Vec::new();
+
+        let mut unknown_field = valid.clone();
+        unknown_field["bindings"][0]["source"]["unexpected"] = true.into();
+        invalid_cases.push(unknown_field);
+
+        let mut cv_index = valid.clone();
+        cv_index["bindings"][0]["source"]["input_index"] = 4.into();
+        invalid_cases.push(cv_index);
+
+        let mut input_bound = valid.clone();
+        input_bound["bindings"][0]["transform"]["input_min"] = (-1_000_001).into();
+        invalid_cases.push(input_bound);
+
+        let mut empty_input_range = valid.clone();
+        empty_input_range["bindings"][0]["transform"]["input_min"] = 1_000_000.into();
+        invalid_cases.push(empty_input_range);
+
+        let mut output_bound = valid.clone();
+        output_bound["bindings"][0]["transform"]["output_max"] = 1_000_001.into();
+        invalid_cases.push(output_bound);
+
+        let mut invalid_id = valid.clone();
+        invalid_id["bindings"][0]["id"] = "invalid".into();
+        invalid_cases.push(invalid_id);
+
+        let mut invalid_extension = valid.clone();
+        invalid_extension["extensions"]["invalid"] = true.into();
+        invalid_cases.push(invalid_extension);
+
+        let mut unsorted = valid.clone();
+        let first = unsorted["bindings"][0].clone();
+        let mut second = first.clone();
+        second["id"] = SECOND_BINDING_ID.into();
+        unsorted["bindings"] = json!([second, first]);
+        invalid_cases.push(unsorted);
+
+        let mut duplicate_source_scope = valid;
+        let mut second = duplicate_source_scope["bindings"][0].clone();
+        second["id"] = SECOND_BINDING_ID.into();
+        duplicate_source_scope["bindings"] =
+            json!([duplicate_source_scope["bindings"][0].clone(), second]);
+        invalid_cases.push(duplicate_source_scope);
+
+        for value in invalid_cases {
+            assert!(ControlMappingDocument::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+
+        assert!(ControlMappingDocument::parse(&vec![b' '; MAX_DOCUMENT_BYTES + 1]).is_err());
+
+        let binding = ControlMappingDocument::parse(VALID).unwrap().bindings[0].clone();
+        let oversized = RawControlMappingDocument {
+            format: FORMAT.to_owned(),
+            format_version: FORMAT_VERSION,
+            id: MAPPING_ID.to_owned(),
+            project_id: PROJECT_ID.to_owned(),
+            bindings: vec![binding; MAX_BINDINGS + 1],
+            extensions: BTreeMap::new(),
+        };
+        assert!(matches!(
+            validate_document(oversized),
+            Err(error) if error.kind() == ControlMappingParseErrorKind::InvalidDomain
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one classified matrix keeps every public binding error and its expected identity visible together"
+    )]
+    fn classifies_every_project_binding_failure_and_preserves_binding_identity() {
+        let continuous = || {
+            parse_mapping(&mapping_value(
+                &json!({"kind": "cv-input", "input_index": 0}),
+                &json!({"kind": "global"}),
+                &linear_transform(),
+                &json!({"kind": "mixer-channel", "track_id": TRACK_ID, "parameter": "gain"}),
+            ))
+        };
+
+        assert_binding_failure(
+            &continuous(),
+            FOREIGN_ID,
+            &TestProject::default(),
+            ControlMappingBindingErrorKind::DescriptorIdMismatch,
+            None,
+        );
+        let foreign_project = TestProject::default().with_project_id(FOREIGN_ID);
+        assert_binding_failure(
+            &continuous(),
+            MAPPING_ID,
+            &foreign_project,
+            ControlMappingBindingErrorKind::ProjectIdMismatch,
+            None,
+        );
+        let document_collision = TestProject::default().with_nested_entity(MAPPING_ID);
+        assert_binding_failure(
+            &continuous(),
+            MAPPING_ID,
+            &document_collision,
+            ControlMappingBindingErrorKind::DocumentIdentityCollision,
+            None,
+        );
+
+        let mut cases = Vec::new();
+        let project = TestProject::default().with_entity(BINDING_ID);
+        cases.push((
+            continuous(),
+            project,
+            ControlMappingBindingErrorKind::IdentityCollision,
+        ));
+
+        let project = TestProject::default().with_cv_inputs(0);
+        cases.push((
+            continuous(),
+            project,
+            ControlMappingBindingErrorKind::CvInputUnavailable {
+                index: 0,
+                available: 0,
+            },
+        ));
+
+        let clock = edge_mapping(
+            "clock-input",
+            "rising",
+            &json!({"kind": "global"}),
+            &json!({"kind": "transport", "action": "play"}),
+            "invoke",
+        );
+        let project = TestProject::default().without(ProjectFact::Clock);
+        cases.push((
+            clock,
+            project,
+            ControlMappingBindingErrorKind::ClockInputUnavailable,
+        ));
+
+        let reset = edge_mapping(
+            "reset-input",
+            "falling",
+            &json!({"kind": "global"}),
+            &json!({"kind": "transport", "action": "reset"}),
+            "invoke",
+        );
+        let project = TestProject::default().without(ProjectFact::Reset);
+        cases.push((
+            reset,
+            project,
+            ControlMappingBindingErrorKind::ResetInputUnavailable,
+        ));
+
+        let track_scope = parse_mapping(&mapping_value(
+            &json!({"kind": "cv-input", "input_index": 0}),
+            &json!({"kind": "track", "track_id": TRACK_ID}),
+            &linear_transform(),
+            &json!({"kind": "mixer-main", "parameter": "gain"}),
+        ));
+        let project = TestProject::default().without(ProjectFact::Track);
+        cases.push((
+            track_scope,
+            project,
+            ControlMappingBindingErrorKind::TrackScopeMissing,
+        ));
+
+        let scene_scope = edge_mapping(
+            "clock-input",
+            "rising",
+            &json!({"kind": "scene", "scene_id": SCENE_ID}),
+            &json!({"kind": "transport", "action": "play"}),
+            "invoke",
+        );
+        let project = TestProject::default().without(ProjectFact::Scene);
+        cases.push((
+            scene_scope,
+            project,
+            ControlMappingBindingErrorKind::SceneScopeMissing,
+        ));
+
+        let mixer_scope = edge_mapping(
+            "clock-input",
+            "rising",
+            &json!({"kind": "mixer-page"}),
+            &json!({"kind": "transport", "action": "play"}),
+            "invoke",
+        );
+        let project = TestProject::default().without(ProjectFact::Mixer);
+        cases.push((
+            mixer_scope,
+            project,
+            ControlMappingBindingErrorKind::MixerScopeMissing,
+        ));
+
+        let project = TestProject::default().without(ProjectFact::MixerChannel);
+        cases.push((
+            continuous(),
+            project,
+            ControlMappingBindingErrorKind::MixerChannelMissing,
+        ));
+
+        let send = parse_mapping(&mapping_value(
+            &json!({"kind": "cv-input", "input_index": 0}),
+            &json!({"kind": "global"}),
+            &linear_transform(),
+            &json!({"kind": "mixer-send", "send_id": SEND_ID, "parameter": "gain"}),
+        ));
+        let project = TestProject::default().without(ProjectFact::MixerSend);
+        cases.push((
+            send,
+            project,
+            ControlMappingBindingErrorKind::MixerSendMissing,
+        ));
+
+        let scene_target = edge_mapping(
+            "clock-input",
+            "rising",
+            &json!({"kind": "global"}),
+            &json!({"kind": "scene", "scene_id": SCENE_ID, "action": "launch"}),
+            "invoke",
+        );
+        let project = TestProject::default().without(ProjectFact::Scene);
+        cases.push((
+            scene_target,
+            project,
+            ControlMappingBindingErrorKind::SceneTargetMissing,
+        ));
+
+        let solo = edge_mapping(
+            "clock-input",
+            "rising",
+            &json!({"kind": "global"}),
+            &json!({"kind": "mixer-channel", "track_id": TRACK_ID, "parameter": "solo"}),
+            "toggle",
+        );
+        let project = TestProject::default().without(ProjectFact::SoloSource);
+        cases.push((
+            solo,
+            project,
+            ControlMappingBindingErrorKind::SoloTargetNotSource,
+        ));
+
+        for target in [
+            json!({"kind": "mixer-main", "parameter": "gain"}),
+            json!({"kind": "mixer-cue", "parameter": "gain"}),
+        ] {
+            let document = parse_mapping(&mapping_value(
+                &json!({"kind": "cv-input", "input_index": 0}),
+                &json!({"kind": "global"}),
+                &linear_transform(),
+                &target,
+            ));
+            let project = TestProject::default().without(ProjectFact::Mixer);
+            cases.push((
+                document,
+                project,
+                ControlMappingBindingErrorKind::MixerTargetMissing,
+            ));
+        }
+
+        for (document, project, expected) in cases {
+            assert_binding_failure(&document, MAPPING_ID, &project, expected, Some(BINDING_ID));
+        }
+
+        for document in [
+            edge_mapping(
+                "clock-input",
+                "rising",
+                &json!({"kind": "mixer-page"}),
+                &json!({"kind": "transport", "action": "play"}),
+                "invoke",
+            ),
+            parse_mapping(&mapping_value(
+                &json!({"kind": "cv-input", "input_index": 0}),
+                &json!({"kind": "global"}),
+                &linear_transform(),
+                &json!({"kind": "mixer-main", "parameter": "gain"}),
+            )),
+            parse_mapping(&mapping_value(
+                &json!({"kind": "cv-input", "input_index": 0}),
+                &json!({"kind": "global"}),
+                &linear_transform(),
+                &json!({"kind": "mixer-cue", "parameter": "gain"}),
+            )),
+        ] {
+            document
+                .validate_for_project(MAPPING_ID, &TestProject::default())
+                .unwrap();
+        }
+    }
+
+    fn trigger_case(
+        source_kind: &str,
+        edge: &str,
+        scope_kind: &str,
+        behavior: &str,
+        target: Value,
+    ) -> (Value, Value, Value, Value) {
+        let scope = match scope_kind {
+            "track" => json!({"kind": "track", "track_id": TRACK_ID}),
+            "scene" => json!({"kind": "scene", "scene_id": SCENE_ID}),
+            kind => json!({"kind": kind}),
+        };
+        (
+            json!({"kind": source_kind, "edge": edge}),
+            scope,
+            json!({"kind": "trigger", "behavior": behavior}),
+            target,
+        )
+    }
+
+    fn linear_transform() -> Value {
+        json!({
+            "kind": "linear",
+            "input_min": -1_000_000,
+            "input_max": 1_000_000,
+            "output_min": 0,
+            "output_max": 1_000_000
+        })
+    }
+
+    fn continuous_binding(transform: ControlTransform, target: ControlTarget) -> ControlBinding {
+        ControlBinding {
+            id: BINDING_ID.to_owned(),
+            enabled: true,
+            source: ControlSource::CvInput { input_index: 0 },
+            scope: ControlScope::Global,
+            transform,
+            target,
+        }
+    }
+
+    fn edge_mapping(
+        source_kind: &str,
+        edge: &str,
+        scope: &Value,
+        target: &Value,
+        behavior: &str,
+    ) -> ControlMappingDocument {
+        parse_mapping(&mapping_value(
+            &json!({"kind": source_kind, "edge": edge}),
+            scope,
+            &json!({"kind": "trigger", "behavior": behavior}),
+            target,
+        ))
+    }
+
+    fn mapping_value(source: &Value, scope: &Value, transform: &Value, target: &Value) -> Value {
+        json!({
+            "format": FORMAT,
+            "format_version": FORMAT_VERSION,
+            "id": MAPPING_ID,
+            "project_id": PROJECT_ID,
+            "bindings": [{
+                "id": BINDING_ID,
+                "enabled": true,
+                "source": source,
+                "scope": scope,
+                "transform": transform,
+                "target": target
+            }],
+            "extensions": {"org.example.fixture": {"preserve": true}}
+        })
+    }
+
+    fn parse_mapping(value: &Value) -> ControlMappingDocument {
+        ControlMappingDocument::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
+    }
+
+    fn assert_binding_failure(
+        document: &ControlMappingDocument,
+        descriptor_id: &str,
+        project: &TestProject,
+        expected: ControlMappingBindingErrorKind,
+        binding_id: Option<&str>,
+    ) {
+        let error = document
+            .validate_for_project(descriptor_id, project)
+            .unwrap_err();
+        assert_eq!(error.kind(), expected);
+        assert_eq!(error.binding_id(), binding_id);
     }
 }

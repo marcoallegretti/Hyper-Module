@@ -13,6 +13,12 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const mappings = strictParse(
   await readFile(resolve(root, "fixtures/valid/control-mappings.json"), "utf8"),
 );
+const transformVectors = strictParse(
+  await readFile(
+    resolve(root, "fixtures/vectors/control-mapping-transforms.json"),
+    "utf8",
+  ),
+);
 const transform = mappings.bindings[0].transform;
 assertControlMappingInvariants(mappings);
 assert.equal(mapLinearControl(transform, -2_000_000), 0);
@@ -42,4 +48,29 @@ assert.throws(
     }),
   /source and scope combinations must be unique/,
 );
-console.log("Control mapping invariants passed: 9 deterministic cases");
+assert.equal(transformVectors.format, "hyper-control-mapping-transform-vectors");
+assert.equal(transformVectors.format_version, 1);
+assert.equal(
+  new Set(transformVectors.cases.map(({ name }) => name)).size,
+  transformVectors.cases.length,
+);
+for (const vector of transformVectors.cases) {
+  const normalized = mapLinearControl(vector.transform, vector.input);
+  assert.equal(normalized, vector.normalized, vector.name);
+  assert.equal(
+    normalizedTargetValue({ kind: "mixer-main", parameter: "gain" }, normalized),
+    vector.gain_millionths,
+    vector.name,
+  );
+  assert.equal(
+    normalizedTargetValue(
+      { kind: "mixer-channel", parameter: "pan" },
+      normalized,
+    ),
+    vector.pan_millionths,
+    vector.name,
+  );
+}
+console.log(
+  `Control mapping invariants passed: 9 deterministic cases and ${transformVectors.cases.length} shared vectors`,
+);

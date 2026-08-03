@@ -733,6 +733,14 @@ impl ControlMappingProject for LoadedMappingProject<'_> {
             .has_reset_input()
     }
 
+    fn has_mixer(&self) -> bool {
+        true
+    }
+
+    fn contains_nested_entity(&self, id: &str) -> bool {
+        self.nested_playback_ids.contains(id)
+    }
+
     fn contains_entity(&self, id: &str) -> bool {
         self.package
             .manifest()
