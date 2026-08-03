@@ -25,7 +25,7 @@ use hyper_mixer_runtime::{
 pub use hyper_mixer_runtime::{LocateState, PlaybackRecoveryTransportState, TransportCommand};
 #[cfg(test)]
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
-use hyper_playback_json::{CompiledMixerTrackKind, LoaderLimits};
+use hyper_playback_json::{CompiledMixerTap, CompiledMixerTrackKind, LoaderLimits};
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::ProjectPlaybackLimits;
 
@@ -33,7 +33,7 @@ mod worker;
 
 pub use worker::{
     DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeClosedSnapshot, IdeMixerChannel,
-    IdeRunningObservation, IdeScene, IdeWorkerCommand, IdeWorkerCommandFailure,
+    IdeMixerSend, IdeRunningObservation, IdeScene, IdeWorkerCommand, IdeWorkerCommandFailure,
     IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
     IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
     IdeWorkerShutdownReport, IdeWorkerStartError, MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS,
@@ -587,6 +587,21 @@ pub enum IdeMixerCommand {
         channel_index: usize,
         solo: bool,
     },
+    SendGain {
+        channel_index: usize,
+        send_index: usize,
+        gain_millionths: u32,
+    },
+    SendPan {
+        channel_index: usize,
+        send_index: usize,
+        pan_millionths: i32,
+    },
+    SendEnabled {
+        channel_index: usize,
+        send_index: usize,
+        enabled: bool,
+    },
     MainGain {
         gain_millionths: u32,
     },
@@ -643,6 +658,19 @@ pub struct IdeMixerMainState {
     pub muted: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeMixerSendTap {
+    PreFader,
+    PostFader,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IdeMixerSendState {
+    pub gain: f32,
+    pub pan: f32,
+    pub enabled: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RunningIdeSnapshot<'a> {
     pub project_id: &'a str,
@@ -655,6 +683,14 @@ pub struct RunningIdeSnapshot<'a> {
     pub mixer_channel_names: [&'a str; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_kinds: [IdeMixerChannelKind; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_states: [Option<IdeMixerChannelState>; MAX_IDE_MIXER_CHANNELS],
+    pub mixer_send_counts: [usize; MAX_IDE_MIXER_CHANNELS],
+    pub mixer_send_target_names:
+        [[&'a str; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS],
+    pub mixer_send_taps:
+        [[IdeMixerSendTap; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS],
+    pub mixer_send_states: [[Option<IdeMixerSendState>;
+        hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT];
+        MAX_IDE_MIXER_CHANNELS],
     pub mixer_main_state: Option<IdeMixerMainState>,
     pub output_state: OutputStreamState,
     pub output: OutputStreamSnapshot,
@@ -742,6 +778,14 @@ impl RunningDesktopIdeApplication {
         let mut mixer_channel_names = [""; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_kinds = [IdeMixerChannelKind::Audio; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_states = [None; MAX_IDE_MIXER_CHANNELS];
+        let mut mixer_send_counts = [0; MAX_IDE_MIXER_CHANNELS];
+        let mut mixer_send_target_names =
+            [[""; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS];
+        let mut mixer_send_taps = [[IdeMixerSendTap::PostFader;
+            hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT];
+            MAX_IDE_MIXER_CHANNELS];
+        let mut mixer_send_states =
+            [[None; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS];
         for (channel_index, slot) in mixer.slots().iter().enumerate() {
             mixer_channel_names[channel_index] = loaded.track_name(slot.track_id())?;
             mixer_channel_kinds[channel_index] = match slot.kind() {
@@ -757,6 +801,27 @@ impl RunningDesktopIdeApplication {
                     muted: state.muted(),
                     solo: state.solo(),
                 });
+            mixer_send_counts[channel_index] = slot.sends().len();
+            let channel_state = mixer_parameters.and_then(|state| state.channel(channel_index));
+            if channel_state.is_some_and(|state| state.send_count() != slot.sends().len()) {
+                return None;
+            }
+            for (send_index, send) in slot.sends().iter().enumerate() {
+                let target = mixer.slots().get(send.target_slot())?;
+                mixer_send_target_names[channel_index][send_index] =
+                    loaded.track_name(target.track_id())?;
+                mixer_send_taps[channel_index][send_index] = match send.tap() {
+                    CompiledMixerTap::PreFader => IdeMixerSendTap::PreFader,
+                    CompiledMixerTap::PostFader => IdeMixerSendTap::PostFader,
+                };
+                mixer_send_states[channel_index][send_index] = channel_state
+                    .and_then(|state| state.send(send_index))
+                    .map(|state| IdeMixerSendState {
+                        gain: state.parameters().gain.value(),
+                        pan: state.parameters().pan.value(),
+                        enabled: state.enabled(),
+                    });
+            }
         }
         let mixer_main_state = mixer_parameters.map(|state| IdeMixerMainState {
             gain: state.main_gain().value(),
@@ -773,6 +838,10 @@ impl RunningDesktopIdeApplication {
             mixer_channel_names,
             mixer_channel_kinds,
             mixer_channel_states,
+            mixer_send_counts,
+            mixer_send_target_names,
+            mixer_send_taps,
+            mixer_send_states,
             mixer_main_state,
             output_state: session.output_status().state(),
             output: session.counters().snapshot(),
@@ -846,6 +915,38 @@ impl RunningDesktopIdeApplication {
                             .resolve_mixer_channel_index(channel_index)
                             .map_err(IdeMixerCommandError::Resolve)?,
                         solo,
+                    },
+                    IdeMixerCommand::SendGain {
+                        channel_index,
+                        send_index,
+                        gain_millionths,
+                    } => MixerParameterCommand::SendGain {
+                        send: session
+                            .resolve_mixer_send_address(channel_index, send_index)
+                            .map_err(IdeMixerCommandError::Resolve)?,
+                        gain: LinearGain::from_millionths(gain_millionths)
+                            .map_err(IdeMixerCommandError::Parameter)?,
+                    },
+                    IdeMixerCommand::SendPan {
+                        channel_index,
+                        send_index,
+                        pan_millionths,
+                    } => MixerParameterCommand::SendPan {
+                        send: session
+                            .resolve_mixer_send_address(channel_index, send_index)
+                            .map_err(IdeMixerCommandError::Resolve)?,
+                        pan: Pan::from_millionths(pan_millionths)
+                            .map_err(IdeMixerCommandError::Parameter)?,
+                    },
+                    IdeMixerCommand::SendEnabled {
+                        channel_index,
+                        send_index,
+                        enabled,
+                    } => MixerParameterCommand::SendEnabled {
+                        send: session
+                            .resolve_mixer_send_address(channel_index, send_index)
+                            .map_err(IdeMixerCommandError::Resolve)?,
+                        enabled,
                     },
                     IdeMixerCommand::MainGain { gain_millionths } => {
                         MixerParameterCommand::MainGain {
@@ -936,34 +1037,61 @@ impl RunningDesktopIdeApplication {
 
 #[cfg(test)]
 fn validate_test_mixer_command(command: IdeMixerCommand) -> Result<(), IdeMixerCommandError> {
-    let channel_index = match command {
+    let (channel_index, send_index) = match command {
         IdeMixerCommand::ChannelGain {
             channel_index,
             gain_millionths,
         } => {
             LinearGain::from_millionths(gain_millionths)
                 .map_err(IdeMixerCommandError::Parameter)?;
-            Some(channel_index)
+            (Some(channel_index), None)
         }
         IdeMixerCommand::ChannelPan {
             channel_index,
             pan_millionths,
         } => {
             Pan::from_millionths(pan_millionths).map_err(IdeMixerCommandError::Parameter)?;
-            Some(channel_index)
+            (Some(channel_index), None)
         }
         IdeMixerCommand::ChannelMute { channel_index, .. }
-        | IdeMixerCommand::ChannelSolo { channel_index, .. } => Some(channel_index),
+        | IdeMixerCommand::ChannelSolo { channel_index, .. } => (Some(channel_index), None),
+        IdeMixerCommand::SendGain {
+            channel_index,
+            send_index,
+            gain_millionths,
+        } => {
+            LinearGain::from_millionths(gain_millionths)
+                .map_err(IdeMixerCommandError::Parameter)?;
+            (Some(channel_index), Some(send_index))
+        }
+        IdeMixerCommand::SendPan {
+            channel_index,
+            send_index,
+            pan_millionths,
+        } => {
+            Pan::from_millionths(pan_millionths).map_err(IdeMixerCommandError::Parameter)?;
+            (Some(channel_index), Some(send_index))
+        }
+        IdeMixerCommand::SendEnabled {
+            channel_index,
+            send_index,
+            ..
+        } => (Some(channel_index), Some(send_index)),
         IdeMixerCommand::MainGain { gain_millionths } => {
             LinearGain::from_millionths(gain_millionths)
                 .map_err(IdeMixerCommandError::Parameter)?;
-            None
+            (None, None)
         }
-        IdeMixerCommand::MainMute { .. } => None,
+        IdeMixerCommand::MainMute { .. } => (None, None),
     };
     if channel_index.is_some_and(|index| index >= MAX_IDE_MIXER_CHANNELS) {
         return Err(IdeMixerCommandError::Resolve(
             MixerParameterResolveError::ChannelNotFound,
+        ));
+    }
+    if send_index.is_some_and(|index| index >= hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT) {
+        return Err(IdeMixerCommandError::Resolve(
+            MixerParameterResolveError::SendNotFound,
         ));
     }
     Ok(())
@@ -1268,6 +1396,21 @@ mod tests {
                 channel_index: 0,
                 solo: true,
             },
+            IdeMixerCommand::SendGain {
+                channel_index: 0,
+                send_index: 0,
+                gain_millionths: 500_000,
+            },
+            IdeMixerCommand::SendPan {
+                channel_index: 0,
+                send_index: 0,
+                pan_millionths: 250_000,
+            },
+            IdeMixerCommand::SendEnabled {
+                channel_index: 0,
+                send_index: 0,
+                enabled: false,
+            },
             IdeMixerCommand::MainGain {
                 gain_millionths: 750_000,
             },
@@ -1300,6 +1443,16 @@ mod tests {
             }),
             Err(IdeMixerCommandError::Parameter(
                 ParameterError::PanOutOfRange
+            ))
+        );
+        assert_eq!(
+            running.try_send_mixer(IdeMixerCommand::SendEnabled {
+                channel_index: 0,
+                send_index: hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT,
+                enabled: true,
+            }),
+            Err(IdeMixerCommandError::Resolve(
+                MixerParameterResolveError::SendNotFound
             ))
         );
 

@@ -152,6 +152,14 @@ pub struct IdeMixerChannel {
     name: String,
     kind: IdeMixerChannelKind,
     state: Option<IdeMixerChannelState>,
+    sends: Vec<IdeMixerSend>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdeMixerSend {
+    target_name: String,
+    tap: super::IdeMixerSendTap,
+    state: Option<super::IdeMixerSendState>,
 }
 
 impl IdeMixerChannel {
@@ -167,6 +175,28 @@ impl IdeMixerChannel {
 
     #[must_use]
     pub const fn state(&self) -> Option<IdeMixerChannelState> {
+        self.state
+    }
+
+    #[must_use]
+    pub fn sends(&self) -> &[IdeMixerSend] {
+        &self.sends
+    }
+}
+
+impl IdeMixerSend {
+    #[must_use]
+    pub fn target_name(&self) -> &str {
+        &self.target_name
+    }
+
+    #[must_use]
+    pub const fn tap(&self) -> super::IdeMixerSendTap {
+        self.tap
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> Option<super::IdeMixerSendState> {
         self.state
     }
 }
@@ -894,10 +924,24 @@ fn running_observation(
         .try_reserve_exact(snapshot.mixer_channel_count)
         .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
     for channel_index in 0..snapshot.mixer_channel_count {
+        let mut sends = Vec::new();
+        sends
+            .try_reserve_exact(snapshot.mixer_send_counts[channel_index])
+            .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
+        for send_index in 0..snapshot.mixer_send_counts[channel_index] {
+            sends.push(IdeMixerSend {
+                target_name: try_project_owned(
+                    snapshot.mixer_send_target_names[channel_index][send_index],
+                )?,
+                tap: snapshot.mixer_send_taps[channel_index][send_index],
+                state: snapshot.mixer_send_states[channel_index][send_index],
+            });
+        }
         mixer_channels.push(IdeMixerChannel {
             name: try_project_owned(snapshot.mixer_channel_names[channel_index])?,
             kind: snapshot.mixer_channel_kinds[channel_index],
             state: snapshot.mixer_channel_states[channel_index],
+            sends,
         });
     }
     Ok(IdeRunningObservation {

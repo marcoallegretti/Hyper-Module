@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use hyper_desktop_ide::{
     DesktopIdeWorker, IdeApplicationConfig, IdeAudioOutputInventory, IdeMixerChannel,
-    IdeMixerChannelKind, IdeMixerCommand, IdeNativeCloseFailure, IdeOutputSelection,
-    IdeRunningObservation, IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind,
-    IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
-    IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState, TransportCommand,
-    desktop_ide_application_config,
+    IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap, IdeNativeCloseFailure,
+    IdeOutputSelection, IdeRunningObservation, IdeScene, IdeSceneAvailability, IdeWorkerCommand,
+    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError,
+    IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState,
+    TransportCommand, desktop_ide_application_config,
 };
 use slint::platform::PlatformError;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
@@ -347,6 +347,54 @@ fn bind_mixer_callbacks(ui: &MainWindow, worker: &WorkerCell) {
             }),
         );
     });
+
+    bind_send_callbacks(ui, worker);
+}
+
+fn bind_send_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+
+    let weak = ui.as_weak();
+    let worker_for_send_gain = Rc::clone(worker);
+    actions.on_mixer_send_gain(move |index, percent| {
+        submit_send_mixer_command(&weak, &worker_for_send_gain, index, |row| {
+            Ok(IdeMixerCommand::SendGain {
+                channel_index: usize::try_from(row.channel_index)
+                    .map_err(|_| MixerControlFailure::InvalidSelection)?,
+                send_index: usize::try_from(row.send_index)
+                    .map_err(|_| MixerControlFailure::InvalidSelection)?,
+                gain_millionths: gain_percent_to_millionths(percent)?,
+            })
+        });
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_send_pan = Rc::clone(worker);
+    actions.on_mixer_send_pan(move |index, percent| {
+        submit_send_mixer_command(&weak, &worker_for_send_pan, index, |row| {
+            Ok(IdeMixerCommand::SendPan {
+                channel_index: usize::try_from(row.channel_index)
+                    .map_err(|_| MixerControlFailure::InvalidSelection)?,
+                send_index: usize::try_from(row.send_index)
+                    .map_err(|_| MixerControlFailure::InvalidSelection)?,
+                pan_millionths: pan_percent_to_millionths(percent)?,
+            })
+        });
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_send_enabled = Rc::clone(worker);
+    actions.on_mixer_send_enabled(move |index| {
+        submit_send_mixer_command(&weak, &worker_for_send_enabled, index, |row| {
+            Ok(IdeMixerCommand::SendEnabled {
+                channel_index: usize::try_from(row.channel_index)
+                    .map_err(|_| MixerControlFailure::InvalidSelection)?,
+                send_index: usize::try_from(row.send_index)
+                    .map_err(|_| MixerControlFailure::InvalidSelection)?,
+                enabled: !row.enabled,
+            })
+        });
+    });
 }
 
 fn start_event_pump(ui: &MainWindow, worker: &WorkerCell, output_routes: &OutputRoutes) -> Timer {
@@ -632,7 +680,9 @@ fn reset_project(ui: &MainWindow) {
     ui.set_scene_count("—".into());
     ui.set_scenes(ModelRc::default());
     ui.set_mixer_visible(false);
+    ui.set_mixer_sends_visible(false);
     ui.set_mixer_channels(ModelRc::default());
+    ui.set_mixer_sends(ModelRc::default());
     ui.set_mixer_main_state_available(false);
     ui.set_mixer_main_gain_percent(0.0);
     ui.set_mixer_main_muted(false);
@@ -742,6 +792,46 @@ fn submit_channel_mixer_command(
     }
 }
 
+fn submit_send_mixer_command(
+    weak: &slint::Weak<MainWindow>,
+    worker: &WorkerCell,
+    index: i32,
+    build: impl FnOnce(&MixerSendRow) -> Result<IdeMixerCommand, MixerControlFailure>,
+) {
+    let Some(ui) = weak.upgrade() else {
+        return;
+    };
+    let row = match validate_mixer_send(ui.get_app_mode(), index, &ui.get_mixer_sends()) {
+        Ok(row) => row,
+        Err(reason) => {
+            ui.set_error_text(reason.message().into());
+            return;
+        }
+    };
+    match build(&row) {
+        Ok(command) => submit_to_ui(&ui, worker, IdeWorkerCommand::Mixer(command)),
+        Err(reason) => ui.set_error_text(reason.message().into()),
+    }
+}
+
+fn validate_mixer_send(
+    mode: AppMode,
+    index: i32,
+    sends: &ModelRc<MixerSendRow>,
+) -> Result<MixerSendRow, MixerControlFailure> {
+    let send_index = usize::try_from(index).map_err(|_| MixerControlFailure::InvalidSelection)?;
+    let row = sends
+        .row_data(send_index)
+        .ok_or(MixerControlFailure::StaleSelection)?;
+    if row.index != index {
+        return Err(MixerControlFailure::StaleSelection);
+    }
+    if mode != AppMode::Running || !row.state_available {
+        return Err(MixerControlFailure::StateUnavailable);
+    }
+    Ok(row)
+}
+
 fn validate_mixer_channel(
     mode: AppMode,
     index: i32,
@@ -824,6 +914,43 @@ fn mixer_rows(channels: &[IdeMixerChannel]) -> Vec<MixerChannelRow> {
         .collect()
 }
 
+fn mixer_send_rows(channels: &[IdeMixerChannel]) -> Vec<MixerSendRow> {
+    channels
+        .iter()
+        .enumerate()
+        .flat_map(|(channel_index, channel)| {
+            channel
+                .sends()
+                .iter()
+                .enumerate()
+                .map(move |(send_index, send)| {
+                    let state = send.state();
+                    MixerSendRow {
+                        index: -1,
+                        channel_index: i32::try_from(channel_index).unwrap_or(-1),
+                        send_index: i32::try_from(send_index).unwrap_or(-1),
+                        source_name: channel.name().into(),
+                        target_name: send.target_name().into(),
+                        tap: match send.tap() {
+                            IdeMixerSendTap::PreFader => "PRE-FADER",
+                            IdeMixerSendTap::PostFader => "POST-FADER",
+                        }
+                        .into(),
+                        state_available: state.is_some(),
+                        gain_percent: state.map_or(0.0, |state| state.gain * 100.0),
+                        pan_percent: state.map_or(0.0, |state| state.pan * 100.0),
+                        enabled: state.is_some_and(|state| state.enabled),
+                    }
+                })
+        })
+        .enumerate()
+        .map(|(index, mut row)| {
+            row.index = i32::try_from(index).unwrap_or(-1);
+            row
+        })
+        .collect()
+}
+
 const fn mixer_kind_name(kind: IdeMixerChannelKind) -> &'static str {
     match kind {
         IdeMixerChannelKind::Audio => "AUDIO",
@@ -863,6 +990,53 @@ fn set_mixer(ui: &MainWindow, channels: &[IdeMixerChannel]) {
     if !unchanged {
         ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(mixer_rows(channels)))));
     }
+    let current_sends = ui.get_mixer_sends();
+    if !mixer_sends_unchanged(&current_sends, channels) {
+        ui.set_mixer_sends(ModelRc::from(Rc::new(VecModel::from(mixer_send_rows(
+            channels,
+        )))));
+    }
+}
+
+fn mixer_sends_unchanged(sends: &ModelRc<MixerSendRow>, channels: &[IdeMixerChannel]) -> bool {
+    if sends.row_count()
+        != channels
+            .iter()
+            .map(|channel| channel.sends().len())
+            .sum::<usize>()
+    {
+        return false;
+    }
+    let mut flat_index = 0;
+    for (channel_index, channel) in channels.iter().enumerate() {
+        for (send_index, expected) in channel.sends().iter().enumerate() {
+            let Some(actual) = sends.row_data(flat_index) else {
+                return false;
+            };
+            let state = expected.state();
+            let tap = match expected.tap() {
+                IdeMixerSendTap::PreFader => "PRE-FADER",
+                IdeMixerSendTap::PostFader => "POST-FADER",
+            };
+            if actual.index != i32::try_from(flat_index).unwrap_or(-1)
+                || actual.channel_index != i32::try_from(channel_index).unwrap_or(-1)
+                || actual.send_index != i32::try_from(send_index).unwrap_or(-1)
+                || actual.source_name.as_str() != channel.name()
+                || actual.target_name.as_str() != expected.target_name()
+                || actual.tap.as_str() != tap
+                || actual.state_available != state.is_some()
+                || actual.gain_percent.to_bits()
+                    != state.map_or(0.0, |state| state.gain * 100.0).to_bits()
+                || actual.pan_percent.to_bits()
+                    != state.map_or(0.0, |state| state.pan * 100.0).to_bits()
+                || actual.enabled != state.is_some_and(|state| state.enabled)
+            {
+                return false;
+            }
+            flat_index += 1;
+        }
+    }
+    true
 }
 
 fn mode_after_closed_event(current: AppMode) -> AppMode {
@@ -1194,6 +1368,37 @@ mod tests {
         assert_eq!(
             pan_percent_to_millionths(-100.1),
             Err(MixerControlFailure::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn send_controls_require_current_observed_rows() {
+        let sends = ModelRc::from(Rc::new(VecModel::from(vec![MixerSendRow {
+            index: 0,
+            channel_index: 2,
+            send_index: 1,
+            source_name: "Drums".into(),
+            target_name: "Reverb".into(),
+            tap: "POST-FADER".into(),
+            state_available: true,
+            gain_percent: 50.0,
+            pan_percent: -25.0,
+            enabled: true,
+        }])));
+        let row = validate_mixer_send(AppMode::Running, 0, &sends).unwrap();
+        assert_eq!(row.channel_index, 2);
+        assert_eq!(row.send_index, 1);
+        assert_eq!(
+            validate_mixer_send(AppMode::Closed, 0, &sends).unwrap_err(),
+            MixerControlFailure::StateUnavailable
+        );
+        assert_eq!(
+            validate_mixer_send(AppMode::Running, 1, &sends).unwrap_err(),
+            MixerControlFailure::StaleSelection
+        );
+        assert_eq!(
+            validate_mixer_send(AppMode::Running, -1, &sends).unwrap_err(),
+            MixerControlFailure::InvalidSelection
         );
     }
 

@@ -31,6 +31,19 @@ export struct MixerChannelRow {
     solo-available: bool,
 }
 
+export struct MixerSendRow {
+    index: int,
+    channel-index: int,
+    send-index: int,
+    source-name: string,
+    target-name: string,
+    tap: string,
+    state-available: bool,
+    gain-percent: float,
+    pan-percent: float,
+    enabled: bool,
+}
+
 export global IdeActions {
     callback retry-discovery();
     callback refresh-outputs();
@@ -46,6 +59,9 @@ export global IdeActions {
     callback mixer-channel-solo(int);
     callback mixer-main-gain(float);
     callback mixer-main-mute();
+    callback mixer-send-gain(int, float);
+    callback mixer-send-pan(int, float);
+    callback mixer-send-enabled(int);
     callback close-project();
 }
 
@@ -112,7 +128,9 @@ export component MainWindow inherits Window {
     in property <string> scene-count: "—";
     in property <[SceneRow]> scenes: [];
     in-out property <bool> mixer-visible: false;
+    in-out property <bool> mixer-sends-visible: false;
     in property <[MixerChannelRow]> mixer-channels: [];
+    in property <[MixerSendRow]> mixer-sends: [];
     in property <bool> mixer-main-state-available: false;
     in property <float> mixer-main-gain-percent: 0;
     in property <bool> mixer-main-muted: false;
@@ -363,7 +381,7 @@ export component MainWindow inherits Window {
                 }
             }
 
-            if root.mixer-visible : Panel {
+            if root.mixer-visible && !root.mixer-sends-visible : Panel {
                 horizontal-stretch: 1;
                 VerticalLayout {
                     padding: 16px;
@@ -378,6 +396,7 @@ export component MainWindow inherits Window {
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         Button { text: "Performance"; clicked => { root.mixer-visible = false; } }
+                        Button { text: "Sends"; enabled: root.mixer-sends.length > 0; clicked => { root.mixer-sends-visible = true; } }
                         Text { text: root.stream-state; color: #8fa0b4; font-size: 12px; vertical-alignment: center; }
                     }
 
@@ -460,6 +479,70 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
+                }
+            }
+
+            if root.mixer-visible && root.mixer-sends-visible : Panel {
+                horizontal-stretch: 1;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 10px;
+
+                    HorizontalLayout {
+                        height: 48px;
+                        VerticalLayout {
+                            Text { text: "BASE SENDS"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            Text { text: "Compiled routes · automation may override base values"; color: #aebccc; font-size: 12px; }
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Button { text: "Channels"; clicked => { root.mixer-sends-visible = false; } }
+                        Button { text: "Performance"; clicked => { root.mixer-sends-visible = false; root.mixer-visible = false; } }
+                    }
+
+                    Rectangle { height: 1px; background: #27313d; }
+
+                    if root.mixer-sends.length == 0 : Text {
+                        text: "This compiled mixer has no sends.";
+                        color: #8fa0b4;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        vertical-stretch: 1;
+                    }
+
+                    GridLayout {
+                        spacing: 7px;
+                        for send[index] in root.mixer-sends : Rectangle {
+                            row: index / 2;
+                            col: Math.mod(index, 2);
+                            height: 48px;
+                            background: #0e141b;
+                            border-color: #27313d;
+                            border-width: 1px;
+                            border-radius: 6px;
+                            HorizontalLayout {
+                                padding: 4px;
+                                spacing: 5px;
+                                VerticalLayout {
+                                    width: 104px;
+                                    Text { text: send.source-name + " → " + send.target-name; accessible-label: send.source-name + " send to " + send.target-name; color: #dce5ef; font-size: 9px; overflow: elide; }
+                                    Text { text: send.tap; color: #65758a; font-size: 7px; }
+                                }
+                                Button { width: 48px; text: send.enabled ? "ON" : "OFF"; enabled: root.app-mode == AppMode.running && send.state-available; clicked => { IdeActions.mixer-send-enabled(send.index); } }
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    Text { text: "GAIN " + Math.round(send.gain-percent) + "%"; color: #8fa0b4; font-size: 8px; }
+                                    Slider { minimum: 0; maximum: 200; value: send.gain-percent; enabled: root.app-mode == AppMode.running && send.state-available; accessible-label: send.source-name + " send gain to " + send.target-name; released(value) => { IdeActions.mixer-send-gain(send.index, value); } }
+                                }
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    Text { text: "PAN " + Math.round(send.pan-percent); color: #8fa0b4; font-size: 8px; }
+                                    Slider { minimum: -100; maximum: 100; value: send.pan-percent; enabled: root.app-mode == AppMode.running && send.state-available; accessible-label: send.source-name + " send pan to " + send.target-name; released(value) => { IdeActions.mixer-send-pan(send.index, value); } }
+                                }
+                            }
+                        }
+                    }
+                    Rectangle { vertical-stretch: 1; background: transparent; }
                 }
             }
         }

@@ -600,6 +600,14 @@ impl SessionControlHandles {
         }
     }
 
+    fn resolve_send_address(
+        &self,
+        channel_index: usize,
+        send_index: usize,
+    ) -> Result<MixerSendHandle, MixerParameterResolveError> {
+        self.mixer().resolve_send_address(channel_index, send_index)
+    }
+
     fn try_send_mixer(
         &mut self,
         command: MixerParameterCommand,
@@ -1581,6 +1589,20 @@ impl DesktopPlaybackSession {
         send_id: &str,
     ) -> Result<MixerSendHandle, MixerParameterResolveError> {
         self.controls.resolve_send(send_id)
+    }
+
+    /// Resolves one compiled channel/send address through this session's mixer layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing-channel or missing-send rejection for an out-of-range address.
+    pub fn resolve_mixer_send_address(
+        &self,
+        channel_index: usize,
+        send_index: usize,
+    ) -> Result<MixerSendHandle, MixerParameterResolveError> {
+        self.controls
+            .resolve_send_address(channel_index, send_index)
     }
 
     /// Sends one ordinary IDE mixer command through the session's only control
