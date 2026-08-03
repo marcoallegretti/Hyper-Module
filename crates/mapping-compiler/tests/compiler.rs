@@ -377,6 +377,17 @@ fn runtime_bindings_have_no_owned_or_drop_state() {
     assert!(!core::mem::needs_drop::<
         hyper_mapping_compiler::CompiledControlBinding,
     >());
+
+    let mapping = document(&[binding(
+        BINDING_ID,
+        true,
+        cv_source(),
+        json!({"kind": "global"}),
+        linear_transform(),
+        json!({"kind": "mixer-main", "parameter": "gain"}),
+    )]);
+    let compiled = compile_control_mapping(&mapping, MAPPING_ID, &Resolver::default()).unwrap();
+    assert_eq!(compiled.try_to_owned().unwrap(), compiled);
 }
 
 fn document(bindings: &[Value]) -> ControlMappingDocument {

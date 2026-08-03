@@ -11,8 +11,11 @@ workspace = true
 [dependencies]
 hyper-arrangement-renderer = { path = "../../../crates/arrangement-renderer" }
 hyper-audio-engine = { path = "../../../crates/audio-engine" }
+hyper-control-runtime = { path = "../../RUNTIME/control-runtime" }
+hyper-control-mappings = { path = "../../../crates/control-mappings" }
 hyper-media-cache = { path = "../../../crates/media-cache" }
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
+hyper-mapping-compiler = { path = "../../../crates/mapping-compiler" }
 hyper-playback-compiler = { path = "../../../crates/playback-compiler" }
 hyper-playback-json = { path = "../../../crates/playback-json" }
 hyper-playback-session = { path = "../../../crates/playback-session" }

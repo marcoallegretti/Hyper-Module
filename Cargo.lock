@@ -489,6 +489,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-control-runtime"
+version = "0.1.0"
+dependencies = [
+ "hyper-control-mappings",
+ "hyper-mapping-compiler",
+]
+
+[[package]]
 name = "hyper-desktop-audio"
 version = "0.1.0"
 dependencies = [
@@ -496,6 +504,9 @@ dependencies = [
  "hyper-arrangement-renderer",
  "hyper-audio-engine",
  "hyper-audio-source",
+ "hyper-control-mappings",
+ "hyper-control-runtime",
+ "hyper-mapping-compiler",
  "hyper-media-cache",
  "hyper-mixer-runtime",
  "hyper-playback-compiler",

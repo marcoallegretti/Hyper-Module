@@ -750,6 +750,19 @@ impl MixerParameterCommandSender {
         self.layout.resolve_send_address(channel_index, send_index)
     }
 
+    /// Validates one command against this runtime's opaque target layout
+    /// without inspecting queue state or enqueueing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a foreign channel/send or unavailable-solo rejection.
+    pub fn validate_command(
+        &self,
+        command: MixerParameterCommand,
+    ) -> Result<(), MixerParameterTargetError> {
+        self.layout.validate(command)
+    }
+
     /// Validates and enqueues one base-state change without waiting or allocating.
     ///
     /// # Errors
@@ -760,8 +773,7 @@ impl MixerParameterCommandSender {
         &mut self,
         command: MixerParameterCommand,
     ) -> Result<(), MixerParameterCommandSendError> {
-        self.layout
-            .validate(command)
+        self.validate_command(command)
             .map_err(|source| MixerParameterCommandSendError::InvalidTarget { command, source })?;
         if self.is_disconnected() {
             return Err(MixerParameterCommandSendError::Disconnected(command));

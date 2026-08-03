@@ -85,6 +85,19 @@ pub use capture::{
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
+mod control_mapping;
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+pub use control_mapping::{
+    DesktopControlMappingRuntime, DesktopControlSink, DesktopControlSinkError,
+};
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
 mod desktop_input;
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),
@@ -862,12 +875,13 @@ mod playback_session;
     target_os = "windows"
 ))]
 pub use playback_session::{
-    DesktopOutputStartError, DesktopOutputStopError, DesktopPlaybackRecovery,
-    DesktopPlaybackRecoveryPendingStart, DesktopPlaybackRecoveryPendingStop,
-    DesktopPlaybackRecoveryPendingStopWait, DesktopPlaybackRecoveryPendingWait,
-    DesktopPlaybackRecoveryStartError, DesktopPlaybackRecoveryStopError, DesktopPlaybackSession,
-    DesktopPlaybackSessionBuildError, DesktopPlaybackSessionInput,
-    DesktopPlaybackSessionStartError, DesktopPlaybackSessionStopError, DesktopProjectOpenError,
+    DesktopControlMappingBuildError, DesktopOutputStartError, DesktopOutputStopError,
+    DesktopPlaybackRecovery, DesktopPlaybackRecoveryPendingStart,
+    DesktopPlaybackRecoveryPendingStop, DesktopPlaybackRecoveryPendingStopWait,
+    DesktopPlaybackRecoveryPendingWait, DesktopPlaybackRecoveryStartError,
+    DesktopPlaybackRecoveryStopError, DesktopPlaybackSession, DesktopPlaybackSessionBuildError,
+    DesktopPlaybackSessionInput, DesktopPlaybackSessionStartError, DesktopPlaybackSessionStopError,
+    DesktopProjectOpenError,
 };
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),

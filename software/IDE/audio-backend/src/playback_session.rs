@@ -4,7 +4,8 @@ use super::pipewire_output::PipeWireThreadRunner;
 #[cfg(target_os = "windows")]
 use super::wasapi_output::WasapiThreadRunner;
 use super::{
-    CheckpointedOutputProcessor, DesktopInputStartError, DesktopInputStopError,
+    CheckpointedOutputProcessor, DesktopControlMappingRuntime, DesktopControlSink,
+    DesktopControlSinkError, DesktopInputStartError, DesktopInputStopError,
     DesktopMonitoringConfig, DesktopMonitoringControl, DesktopOutputConfig, MonitoringSnapshot,
     OutputStreamCounters, OutputStreamStatus, PendingNativeShutdown, PendingNativeShutdownWait,
     PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
@@ -24,7 +25,9 @@ use core::error::Error;
 use core::fmt;
 use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::StereoOutput;
-use hyper_media_cache::PreparePlaybackError;
+use hyper_control_runtime::{ControlRuntime, ControlRuntimeBuildErrorReason};
+use hyper_mapping_compiler::{CompiledControlMappingTable, ControlMappingCompileError};
+use hyper_media_cache::{DecodedMediaCache, PreparePlaybackError};
 use hyper_mixer_runtime::{
     LoudnessCommandSender, MixerParameterCommandSender, MixerParameterStateRestoreError,
     OutputMeterReceiver, RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError,
@@ -33,7 +36,7 @@ use hyper_mixer_runtime::{
 };
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
-use hyper_playback_json::{AdapterCompileError, MediaAssetFact};
+use hyper_playback_json::{AdapterCompileError, LoadedPlaybackProject, MediaAssetFact};
 use hyper_playback_session::PreparedPlaybackSession;
 use hyper_project_loader::{
     PreparedProjectPlayback, ProjectPlaybackError, ProjectPlaybackLimits, prepare_project_playback,
@@ -207,9 +210,46 @@ pub enum DesktopPlaybackSessionBuildError {
     Media(PreparePlaybackError),
     Runtime(RuntimeCreationError),
     MixerRecovery(MixerParameterStateRestoreError),
+    ControlMappingCopy(ControlMappingCompileError),
+    ControlMapping(DesktopControlMappingBuildError),
     ScratchCapacityUnavailable,
     Output(TransportOutputCreationError),
     MonitoringScratchCapacityUnavailable,
+}
+
+#[derive(Debug)]
+pub enum DesktopControlMappingBuildError {
+    CapacityUnavailable,
+    Target {
+        binding_index: usize,
+        source: DesktopControlSinkError,
+    },
+}
+
+impl fmt::Display for DesktopControlMappingBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityUnavailable => {
+                formatter.write_str("control mapping runtime capacity is unavailable")
+            }
+            Self::Target {
+                binding_index,
+                source,
+            } => write!(
+                formatter,
+                "control mapping binding {binding_index} could not bind: {source}"
+            ),
+        }
+    }
+}
+
+impl Error for DesktopControlMappingBuildError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Target { source, .. } => Some(source),
+            Self::CapacityUnavailable => None,
+        }
+    }
 }
 
 impl fmt::Display for DesktopPlaybackSessionBuildError {
@@ -227,6 +267,12 @@ impl fmt::Display for DesktopPlaybackSessionBuildError {
             Self::Runtime(source) => write!(formatter, "runtime construction failed: {source}"),
             Self::MixerRecovery(source) => {
                 write!(formatter, "mixer recovery failed: {source}")
+            }
+            Self::ControlMappingCopy(source) => {
+                write!(formatter, "control mapping copy failed: {source}")
+            }
+            Self::ControlMapping(source) => {
+                write!(formatter, "control mapping runtime failed: {source}")
             }
             Self::ScratchCapacityUnavailable => {
                 formatter.write_str("render scratch capacity is unavailable")
@@ -248,6 +294,8 @@ impl Error for DesktopPlaybackSessionBuildError {
             Self::Media(source) => Some(source),
             Self::Runtime(source) => Some(source),
             Self::MixerRecovery(source) => Some(source),
+            Self::ControlMappingCopy(source) => Some(source),
+            Self::ControlMapping(source) => Some(source),
             Self::Output(source) => Some(source),
             Self::SampleRateMismatch { .. }
             | Self::AssetFactCapacityUnavailable
@@ -391,11 +439,19 @@ impl Error for DesktopProjectOpenError {
 
 #[derive(Debug)]
 struct SessionHandles {
-    commands: TransportCommandSender,
-    mixer_parameter_commands: MixerParameterCommandSender,
+    controls: SessionControlHandles,
     loudness_commands: LoudnessCommandSender,
     meters: OutputMeterReceiver,
     recovery: PlaybackRecoveryCheckpoint,
+}
+
+#[derive(Debug)]
+enum SessionControlHandles {
+    Direct {
+        transport: TransportCommandSender,
+        mixer: MixerParameterCommandSender,
+    },
+    Mapping(DesktopControlMappingRuntime),
 }
 
 #[derive(Debug)]
@@ -408,8 +464,7 @@ enum SessionPublication {
 #[derive(Debug)]
 pub struct DesktopPlaybackSession {
     output: DesktopOutputStream,
-    commands: TransportCommandSender,
-    mixer_parameter_commands: MixerParameterCommandSender,
+    controls: SessionControlHandles,
     loudness_commands: LoudnessCommandSender,
     meters: OutputMeterReceiver,
     recovery: PlaybackRecoveryCheckpoint,
@@ -1241,18 +1296,31 @@ impl DesktopPlaybackSession {
     ) -> Result<Self, DesktopPlaybackSessionStartError> {
         let sample_rate_hz = config.sample_rate_hz();
         let maximum_block_frames = config.maximum_block_frames();
+        let control_mapping = source
+            .project()
+            .and_then(PreparedProjectPlayback::compiled_control_mapping)
+            .map(CompiledControlMappingTable::try_to_owned)
+            .transpose()
+            .map_err(|source| {
+                DesktopPlaybackSessionStartError::Build(
+                    DesktopPlaybackSessionBuildError::ControlMappingCopy(source),
+                )
+            })?;
         let (publication_sender, publication_receiver) = sync_channel(1);
         let thread_source = source.clone();
         let output =
             DesktopOutputStream::start_with_thread_initializer(config.native(), move |runner| {
                 initialize_session(
                     runner,
-                    thread_source.session(),
-                    sample_rate_hz,
-                    maximum_block_frames,
-                    initial_checkpoint.as_deref(),
+                    SessionInitialization {
+                        input: thread_source.session(),
+                        sample_rate_hz,
+                        maximum_block_frames,
+                        initial_checkpoint: initial_checkpoint.as_deref(),
+                        control_mapping,
+                        monitoring,
+                    },
                     &publication_sender,
-                    monitoring,
                 )
             });
 
@@ -1260,8 +1328,7 @@ impl DesktopPlaybackSession {
             Ok(output) => match publication_receiver.recv() {
                 Ok(SessionPublication::Prepared(handles)) => Ok(Self {
                     output,
-                    commands: handles.commands,
-                    mixer_parameter_commands: handles.mixer_parameter_commands,
+                    controls: handles.controls,
                     loudness_commands: handles.loudness_commands,
                     meters: handles.meters,
                     recovery: handles.recovery,
@@ -1283,13 +1350,33 @@ impl DesktopPlaybackSession {
     }
 
     #[must_use]
-    pub fn command_sender(&mut self) -> &mut TransportCommandSender {
-        &mut self.commands
+    /// Returns direct transport control only for sessions without a compiled mapping.
+    ///
+    /// Mapped sessions retain exclusive ownership so toggle state cannot diverge
+    /// from commands sent through another application-thread authority.
+    pub fn command_sender(&mut self) -> Option<&mut TransportCommandSender> {
+        match &mut self.controls {
+            SessionControlHandles::Direct { transport, .. } => Some(transport),
+            SessionControlHandles::Mapping(_) => None,
+        }
     }
 
     #[must_use]
-    pub fn mixer_parameter_command_sender(&mut self) -> &mut MixerParameterCommandSender {
-        &mut self.mixer_parameter_commands
+    /// Returns direct mixer control only for sessions without a compiled mapping.
+    pub fn mixer_parameter_command_sender(&mut self) -> Option<&mut MixerParameterCommandSender> {
+        match &mut self.controls {
+            SessionControlHandles::Direct { mixer, .. } => Some(mixer),
+            SessionControlHandles::Mapping(_) => None,
+        }
+    }
+
+    #[must_use]
+    /// Returns the dispatcher that exclusively owns mapped mixer and transport control.
+    pub fn control_mapping_runtime(&mut self) -> Option<&mut DesktopControlMappingRuntime> {
+        match &mut self.controls {
+            SessionControlHandles::Mapping(runtime) => Some(runtime),
+            SessionControlHandles::Direct { .. } => None,
+        }
     }
 
     #[must_use]
@@ -1374,8 +1461,7 @@ impl DesktopPlaybackSession {
     ) -> Result<DesktopPlaybackRecovery, DesktopPlaybackRecoveryStopError> {
         let Self {
             output,
-            commands: _,
-            mixer_parameter_commands: _,
+            controls: _,
             loudness_commands: _,
             meters: _,
             recovery,
@@ -1434,8 +1520,7 @@ impl DesktopPlaybackSession {
     pub fn stop(self) -> Result<(), DesktopPlaybackSessionStopError> {
         let Self {
             output,
-            commands: _,
-            mixer_parameter_commands: _,
+            controls: _,
             loudness_commands: _,
             meters: _,
             recovery: _,
@@ -1480,32 +1565,34 @@ fn classify_output_start_failure(
     }
 }
 
-fn initialize_session(
-    runner: DesktopThreadRunner,
-    input: &DesktopPlaybackSessionInput,
+struct SessionInitialization<'a> {
+    input: &'a DesktopPlaybackSessionInput,
     sample_rate_hz: u32,
     maximum_block_frames: usize,
-    initial_checkpoint: Option<&PlaybackRecoverySnapshot>,
-    publication: &SyncSender<SessionPublication>,
+    initial_checkpoint: Option<&'a PlaybackRecoverySnapshot>,
+    control_mapping: Option<CompiledControlMappingTable>,
     monitoring: Option<MonitoringConsumer>,
-) -> Result<(), NativeDesktopOutputStartError> {
-    let (project, mixer, automation, media) = input.parts();
-    if project.sample_rate_hz() != sample_rate_hz {
-        return fail_build(
-            publication,
-            DesktopPlaybackSessionBuildError::SampleRateMismatch {
-                project: project.sample_rate_hz(),
-                output: sample_rate_hz,
-            },
-        );
-    }
+}
 
-    let mut facts: Vec<MediaAssetFact<'_>> = Vec::new();
-    facts
-        .try_reserve_exact(media.asset_count())
-        .map_err(|_| DesktopPlaybackSessionBuildError::AssetFactCapacityUnavailable)
+fn initialize_session(
+    runner: DesktopThreadRunner,
+    initialization: SessionInitialization<'_>,
+    publication: &SyncSender<SessionPublication>,
+) -> Result<(), NativeDesktopOutputStartError> {
+    let SessionInitialization {
+        input,
+        sample_rate_hz,
+        maximum_block_frames,
+        initial_checkpoint,
+        control_mapping,
+        monitoring,
+    } = initialization;
+    let (project, mixer, automation, media) = input.parts();
+    validate_session_sample_rate(project, sample_rate_hz)
         .or_else(|source| fail_build(publication, source))?;
-    facts.extend(media.media_asset_facts());
+
+    let facts =
+        collect_media_asset_facts(media).or_else(|source| fail_build(publication, source))?;
 
     let graph = project
         .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
@@ -1547,15 +1634,9 @@ fn initialize_session(
 
     let (commands, mixer_parameter_commands, mut transport) =
         RoutedTransportRuntime::with_command_queues(runtime);
-    if let Some(checkpoint) = initial_checkpoint {
-        transport.apply_command(checkpoint.restore_command());
-        if let Some(mixer_parameter_state) = checkpoint.mixer_parameter_state() {
-            transport
-                .restore_mixer_parameter_state(&mixer_parameter_state)
-                .map_err(DesktopPlaybackSessionBuildError::MixerRecovery)
-                .or_else(|source| fail_build(publication, source))?;
-        }
-    }
+    restore_transport_checkpoint(&mut transport, initial_checkpoint)
+        .map_err(DesktopPlaybackSessionBuildError::MixerRecovery)
+        .or_else(|source| fail_build(publication, source))?;
     let (mut meter_sender, meters) = output_meter_channel();
     let (loudness_commands, loudness_command_receiver) = loudness_command_channel();
     let processor = TransportOutputProcessor::try_new(
@@ -1572,15 +1653,20 @@ fn initialize_session(
         .transpose()
         .or_else(|source| fail_build(publication, source))?;
     let (publisher, recovery) = playback_recovery_channel(initial_checkpoint);
-    publication
-        .try_send(SessionPublication::Prepared(SessionHandles {
-            commands,
-            mixer_parameter_commands,
-            loudness_commands,
-            meters,
-            recovery: recovery.clone(),
-        }))
-        .map_err(|_| callback_error("playback control publication failed".to_owned()))?;
+    let controls = build_session_controls(
+        commands,
+        mixer_parameter_commands,
+        recovery.clone(),
+        control_mapping,
+    )
+    .or_else(|source| fail_build(publication, source))?;
+    publish_session_handles(
+        publication,
+        controls,
+        loudness_commands,
+        meters,
+        recovery.clone(),
+    )?;
     if let Some(monitoring) = monitoring {
         runner.run_transport_output_with_checkpoint(
             MonitoredTransportOutputProcessor {
@@ -1592,6 +1678,96 @@ fn initialize_session(
     } else {
         runner.run_transport_output_with_checkpoint(processor, publisher)
     }
+}
+
+fn validate_session_sample_rate(
+    project: &LoadedPlaybackProject,
+    output_sample_rate_hz: u32,
+) -> Result<(), DesktopPlaybackSessionBuildError> {
+    if project.sample_rate_hz() == output_sample_rate_hz {
+        Ok(())
+    } else {
+        Err(DesktopPlaybackSessionBuildError::SampleRateMismatch {
+            project: project.sample_rate_hz(),
+            output: output_sample_rate_hz,
+        })
+    }
+}
+
+fn collect_media_asset_facts(
+    media: &DecodedMediaCache,
+) -> Result<Vec<MediaAssetFact<'_>>, DesktopPlaybackSessionBuildError> {
+    let mut facts = Vec::new();
+    facts
+        .try_reserve_exact(media.asset_count())
+        .map_err(|_| DesktopPlaybackSessionBuildError::AssetFactCapacityUnavailable)?;
+    facts.extend(media.media_asset_facts());
+    Ok(facts)
+}
+
+fn publish_session_handles(
+    publication: &SyncSender<SessionPublication>,
+    controls: SessionControlHandles,
+    loudness_commands: LoudnessCommandSender,
+    meters: OutputMeterReceiver,
+    recovery: PlaybackRecoveryCheckpoint,
+) -> Result<(), NativeDesktopOutputStartError> {
+    publication
+        .try_send(SessionPublication::Prepared(SessionHandles {
+            controls,
+            loudness_commands,
+            meters,
+            recovery,
+        }))
+        .map_err(|_| callback_error("playback control publication failed".to_owned()))
+}
+
+fn restore_transport_checkpoint<R: hyper_mixer_runtime::TrackWindowRenderer>(
+    transport: &mut RoutedTransportRuntime<R>,
+    checkpoint: Option<&PlaybackRecoverySnapshot>,
+) -> Result<(), MixerParameterStateRestoreError> {
+    let Some(checkpoint) = checkpoint else {
+        return Ok(());
+    };
+    transport.apply_command(checkpoint.restore_command());
+    if let Some(mixer_parameter_state) = checkpoint.mixer_parameter_state() {
+        transport.restore_mixer_parameter_state(&mixer_parameter_state)?;
+    }
+    Ok(())
+}
+
+fn build_session_controls(
+    transport: TransportCommandSender,
+    mixer: MixerParameterCommandSender,
+    recovery: PlaybackRecoveryCheckpoint,
+    control_mapping: Option<CompiledControlMappingTable>,
+) -> Result<SessionControlHandles, DesktopPlaybackSessionBuildError> {
+    let Some(table) = control_mapping else {
+        return Ok(SessionControlHandles::Direct { transport, mixer });
+    };
+    let sink = DesktopControlSink::new(transport, mixer, recovery);
+    ControlRuntime::try_new(table, sink)
+        .map(SessionControlHandles::Mapping)
+        .map_err(classify_control_mapping_build_error)
+}
+
+fn classify_control_mapping_build_error(
+    error: hyper_control_runtime::ControlRuntimeBuildError<DesktopControlSink>,
+) -> DesktopPlaybackSessionBuildError {
+    let (reason, _table, _sink) = error.into_parts();
+    let source = match reason {
+        ControlRuntimeBuildErrorReason::CapacityUnavailable => {
+            DesktopControlMappingBuildError::CapacityUnavailable
+        }
+        ControlRuntimeBuildErrorReason::Target {
+            binding_index,
+            source,
+        } => DesktopControlMappingBuildError::Target {
+            binding_index,
+            source,
+        },
+    };
+    DesktopPlaybackSessionBuildError::ControlMapping(source)
 }
 
 fn output_is_pinned(config: &DesktopOutputConfig) -> bool {
@@ -1649,14 +1825,13 @@ mod tests {
     use crate::monitoring_session::realtime_allocator::HeapMeasurement;
     use crate::{BoundedBackendThread, acquire_backend_thread_permit};
     use hyper_audio_source::DecodeLimits;
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
     use hyper_audio_source::DecodedAudio;
+    use hyper_control_runtime::RuntimeControlSink;
     use hyper_media_cache::CacheLimits;
     #[cfg(all(target_os = "linux", target_endian = "little"))]
     use hyper_mixer_runtime::{LocateState, PlaybackRecoveryTransportState, TransportCommand};
     use hyper_playback_json::LoaderLimits;
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
     use hyper_playback_session::{
         DecodedPlaybackAsset, PlaybackDocumentBytes, PlaybackSessionAssemblyInput,
         assemble_playback_session,
@@ -1669,24 +1844,19 @@ mod tests {
     #[derive(Debug)]
     struct UnusedPlaybackSource;
 
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
     const LIVE_PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122337500";
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
     const LIVE_ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-001122337504";
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
     const LIVE_TIMELINE: &[u8] = br#"{
         "format":"hyper-timeline","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337501",
         "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","ticks_per_quarter":1920,
         "tempo_events":[{"tick":0,"microseconds_per_quarter":1000000}],
         "meter_events":[{"tick":0,"numerator":4,"denominator":4}],"extensions":{}
     }"#;
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
     const LIVE_TRACK: &[u8] = br#"{
         "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337502",
         "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Audio","kind":"audio","order":0,
         "active":true,"clip_ids":["018f47a2-6b2d-7c11-8a44-001122337503"],"extensions":{}
     }"#;
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
     const LIVE_CLIP: &[u8] = br#"{
         "format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337503",
         "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","track_id":"018f47a2-6b2d-7c11-8a44-001122337502","name":"Clip","enabled":true,
@@ -1697,14 +1867,12 @@ mod tests {
         "warp_markers":[{"tick":0,"source_frame_offset":0},{"tick":4,"source_frame_offset":100}],
         "extensions":{}
     }"#;
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
     const LIVE_ARRANGEMENT: &[u8] = br#"{
         "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337505",
         "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Main","enabled":true,
         "placements":[{"id":"018f47a2-6b2d-7c11-8a44-001122337506","track_id":"018f47a2-6b2d-7c11-8a44-001122337502","clip_id":"018f47a2-6b2d-7c11-8a44-001122337503","start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}],
         "scene_launches":[],"extensions":{}
     }"#;
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
     const LIVE_MIXER: &[u8] = br#"{
         "format":"hyper-mixer","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337507",
         "project_id":"018f47a2-6b2d-7c11-8a44-001122337500",
@@ -1900,7 +2068,6 @@ mod tests {
         assert_eq!(counters.snapshot().processor_failure_count, 0);
     }
 
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
     fn live_session_input() -> PreparedPlaybackSession {
         assemble_playback_session(PlaybackSessionAssemblyInput {
             documents: PlaybackDocumentBytes {
@@ -1928,6 +2095,43 @@ mod tests {
             },
         })
         .unwrap()
+    }
+
+    #[test]
+    fn desktop_mapping_sink_binds_numeric_targets_and_both_command_domains() {
+        let input = live_session_input();
+        let (project, mixer, _, media) = input.parts();
+        let facts = collect_media_asset_facts(media).unwrap();
+        let graph = project
+            .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+            .unwrap();
+        let prepared = media.prepare_playback(&graph).unwrap();
+        let runtime = RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, 64).unwrap();
+        let (transport, mixer, _runtime) = RoutedTransportRuntime::with_command_queues(runtime);
+        let (_publisher, recovery) = playback_recovery_channel(None);
+        let mut sink = DesktopControlSink::new(transport, mixer, recovery);
+
+        assert!(
+            sink.validate_target(hyper_control_runtime::RuntimeControlTarget::Channel {
+                channel_index: 0,
+                parameter: hyper_control_mappings::ChannelParameter::Gain,
+            })
+            .is_ok()
+        );
+        assert!(matches!(
+            sink.validate_target(hyper_control_runtime::RuntimeControlTarget::Channel {
+                channel_index: 1,
+                parameter: hyper_control_mappings::ChannelParameter::Gain,
+            }),
+            Err(DesktopControlSinkError::Resolve(_))
+        ));
+        sink.try_send(hyper_control_runtime::RuntimeControlCommand::ChannelGain {
+            channel_index: 0,
+            gain_millionths: 500_000,
+        })
+        .unwrap();
+        sink.try_send(hyper_control_runtime::RuntimeControlCommand::TransportStart)
+            .unwrap();
     }
 
     #[cfg(all(target_os = "linux", target_endian = "little"))]
@@ -1968,6 +2172,7 @@ mod tests {
 
         session
             .command_sender()
+            .unwrap()
             .try_send(TransportCommand::Locate {
                 frame: 32,
                 state: LocateState::Stopped,
@@ -2004,6 +2209,7 @@ mod tests {
 
         replacement
             .command_sender()
+            .unwrap()
             .try_send(TransportCommand::Start)
             .unwrap();
         let rolling = wait_for_checkpoint(&replacement_checkpoint, |snapshot| {

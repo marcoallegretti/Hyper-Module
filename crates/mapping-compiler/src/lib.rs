@@ -171,6 +171,21 @@ impl CompiledControlMappingTable {
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
     }
+
+    /// Creates another owned table without changing either authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlMappingCompileError::CapacityUnavailable`] when the
+    /// exact binding storage cannot be reserved.
+    pub fn try_to_owned(&self) -> Result<Self, ControlMappingCompileError> {
+        let mut bindings = Vec::new();
+        bindings
+            .try_reserve_exact(self.bindings.len())
+            .map_err(|_| ControlMappingCompileError::CapacityUnavailable)?;
+        bindings.extend_from_slice(&self.bindings);
+        Ok(Self { bindings })
+    }
 }
 
 pub trait ControlMappingResolver: ControlMappingProject {

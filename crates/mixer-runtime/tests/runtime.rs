@@ -1125,6 +1125,10 @@ fn live_mixer_command_queue_validates_targets_backpressure_and_disconnection() {
         solo: true,
     };
     assert_eq!(
+        sender.validate_command(invalid_solo),
+        Err(MixerParameterTargetError::SoloUnavailable { channel: group })
+    );
+    assert_eq!(
         sender.try_send(invalid_solo),
         Err(MixerParameterCommandSendError::InvalidTarget {
             command: invalid_solo,
