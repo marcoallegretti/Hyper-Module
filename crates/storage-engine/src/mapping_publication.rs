@@ -2164,6 +2164,45 @@ mod tests {
     }
 
     #[test]
+    fn coordinated_recovery_reports_completed_mapping_work_before_recording_failure() {
+        let fixture = Fixture::new(false);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ =
+                publish_control_mapping_observed(&fixture.root, fixture.request(), |phase, _| {
+                    assert_ne!(
+                        phase,
+                        PublicationPhase::Transaction,
+                        "simulated process crash"
+                    );
+                    Ok(())
+                });
+        }));
+        assert!(result.is_err());
+        let recording_transaction = fixture
+            .root
+            .join("backups")
+            .join(format!(".recording-import-{}", Uuid::new_v4()));
+        fs::create_dir(&recording_transaction).unwrap();
+        fs::write(recording_transaction.join("transaction.json"), b"{}").unwrap();
+
+        let error = crate::recover_project_transactions(&fixture.root).unwrap_err();
+
+        assert_eq!(error.completed().control_mappings().len(), 1);
+        assert_eq!(
+            error.completed().control_mappings()[0].disposition(),
+            ControlMappingPublicationRecoveryDisposition::RolledBack
+        );
+        assert!(error.completed().recordings().is_empty());
+        assert!(matches!(
+            error.recovery_source(),
+            crate::ProjectTransactionRecoveryErrorSource::Recording(_)
+        ));
+        assert_eq!(fixture.transaction_count(), 0);
+        assert!(recording_transaction.exists());
+        assert!(!fixture.root.join("mappings").exists());
+    }
+
+    #[test]
     fn recovers_a_crash_after_mapping_replacement_as_a_rollback() {
         let fixture = Fixture::new(true);
         let result = catch_unwind(AssertUnwindSafe(|| {

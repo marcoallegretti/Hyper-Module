@@ -107,6 +107,10 @@ impl Error for ProjectTransactionRecoveryError {
 /// and mapping pair needed by later package verification. Recording import is
 /// then recovered through the same shared project lock.
 ///
+/// Recovery is fail-closed when another project storage transaction owns that
+/// lock. Callers may retry after the competing transaction has completed; this
+/// function does not promise a consistent result during concurrent mutation.
+///
 /// # Errors
 ///
 /// Returns the failing recovery authority together with all prior completed
@@ -141,6 +145,7 @@ pub fn recover_project_transactions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recording_import::ProjectLock;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -160,5 +165,32 @@ mod tests {
         assert!(report.is_empty());
         assert!(!root.join("backups").exists());
         fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_project_mutation_fails_closed_and_can_be_retried() {
+        let root = std::env::temp_dir().join(format!(
+            "hyper-project-recovery-busy-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("backups")).unwrap();
+        let backups =
+            cap_std::fs::Dir::open_ambient_dir(root.join("backups"), cap_std::ambient_authority())
+                .unwrap();
+        let lock = ProjectLock::acquire(&backups).unwrap();
+
+        let error = recover_project_transactions(&root).unwrap_err();
+
+        assert!(error.completed().is_empty());
+        assert!(matches!(
+            error.recovery_source(),
+            ProjectTransactionRecoveryErrorSource::ControlMapping(_)
+        ));
+        drop(lock);
+        assert!(recover_project_transactions(&root).unwrap().is_empty());
+        drop(backups);
+        fs::remove_dir_all(root).unwrap();
     }
 }
