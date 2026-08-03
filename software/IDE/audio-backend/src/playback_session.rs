@@ -458,6 +458,29 @@ enum SessionControlHandles {
 }
 
 impl SessionControlHandles {
+    fn mapping_statuses(&self) -> Option<&[hyper_control_runtime::ControlBindingStatus]> {
+        match self {
+            Self::Mapping(runtime) => Some(runtime.statuses()),
+            Self::Direct { .. } => None,
+        }
+    }
+
+    fn dispatch_mapping_event(
+        &mut self,
+        event: hyper_control_runtime::ControlEvent,
+        context: hyper_control_runtime::ControlContext,
+    ) -> Option<
+        Result<
+            hyper_control_runtime::ControlDispatchOutcome,
+            hyper_control_runtime::ControlDispatchError<DesktopControlSinkError>,
+        >,
+    > {
+        match self {
+            Self::Mapping(runtime) => Some(runtime.dispatch(event, context)),
+            Self::Direct { .. } => None,
+        }
+    }
+
     fn try_send_transport(
         &mut self,
         command: TransportCommand,
@@ -1449,13 +1472,31 @@ impl DesktopPlaybackSession {
         self.controls.try_send_mixer(command)
     }
 
+    /// Returns immutable availability evidence for every enabled compiled
+    /// control binding, or `None` when the project has no mapping table.
     #[must_use]
-    /// Returns the dispatcher that exclusively owns mapped mixer and transport control.
-    pub fn control_mapping_runtime(&mut self) -> Option<&mut DesktopControlMappingRuntime> {
-        match &mut self.controls {
-            SessionControlHandles::Mapping(runtime) => Some(runtime),
-            SessionControlHandles::Direct { .. } => None,
-        }
+    pub fn control_mapping_statuses(
+        &self,
+    ) -> Option<&[hyper_control_runtime::ControlBindingStatus]> {
+        self.controls.mapping_statuses()
+    }
+
+    /// Dispatches one software-supplied source event through this session's
+    /// exclusive mapping owner.
+    ///
+    /// `None` means the project has no compiled mapping table. This method does
+    /// not imply physical input ingestion or select an IDE context implicitly.
+    pub fn dispatch_control_event(
+        &mut self,
+        event: hyper_control_runtime::ControlEvent,
+        context: hyper_control_runtime::ControlContext,
+    ) -> Option<
+        Result<
+            hyper_control_runtime::ControlDispatchOutcome,
+            hyper_control_runtime::ControlDispatchError<DesktopControlSinkError>,
+        >,
+    > {
+        self.controls.dispatch_mapping_event(event, context)
     }
 
     #[must_use]
@@ -2354,15 +2395,14 @@ mod tests {
         controls
             .try_send_transport(TransportCommand::Start)
             .unwrap();
-        let SessionControlHandles::Mapping(mapping) = &mut controls else {
-            panic!("a compiled mapping must publish the coordinated mapping owner");
-        };
+        assert_eq!(controls.mapping_statuses().unwrap().len(), 1);
         assert_eq!(
-            mapping
-                .dispatch(
+            controls
+                .dispatch_mapping_event(
                     hyper_control_runtime::ControlEvent::Clock { edge: Edge::Rising },
                     hyper_control_runtime::ControlContext::default(),
                 )
+                .unwrap()
                 .unwrap(),
             hyper_control_runtime::ControlDispatchOutcome::Sent {
                 binding_index: 0,
@@ -2395,17 +2435,16 @@ mod tests {
             )),
         )
         .unwrap();
-        let SessionControlHandles::Mapping(mapping) = &mut controls else {
-            panic!("a compiled mapping must publish the coordinated mapping owner");
-        };
+        assert_eq!(controls.mapping_statuses().unwrap().len(), 1);
 
         for (edge, muted) in [(Edge::Rising, true), (Edge::Falling, false)] {
             assert_eq!(
-                mapping
-                    .dispatch(
+                controls
+                    .dispatch_mapping_event(
                         hyper_control_runtime::ControlEvent::Clock { edge },
                         hyper_control_runtime::ControlContext::default(),
                     )
+                    .unwrap()
                     .unwrap(),
                 hyper_control_runtime::ControlDispatchOutcome::Sent {
                     binding_index: 0,
