@@ -582,6 +582,16 @@ struct MixerParameterSendLayout {
 }
 
 impl MixerParameterLayout {
+    fn resolve_channel_index(
+        &self,
+        channel_index: usize,
+    ) -> Result<MixerChannelHandle, MixerParameterResolveError> {
+        self.channels
+            .get(channel_index)
+            .map(|channel| channel.handle)
+            .ok_or(MixerParameterResolveError::ChannelNotFound)
+    }
+
     fn resolve_channel(
         &self,
         track_id: &str,
@@ -598,6 +608,18 @@ impl MixerParameterLayout {
             .iter()
             .flat_map(|channel| &channel.sends)
             .find(|send| send.id == send_id)
+            .map(|send| send.handle)
+            .ok_or(MixerParameterResolveError::SendNotFound)
+    }
+
+    fn resolve_send_address(
+        &self,
+        channel_index: usize,
+        send_index: usize,
+    ) -> Result<MixerSendHandle, MixerParameterResolveError> {
+        self.channels
+            .get(channel_index)
+            .and_then(|channel| channel.sends.get(send_index))
             .map(|send| send.handle)
             .ok_or(MixerParameterResolveError::SendNotFound)
     }
@@ -681,6 +703,22 @@ impl MixerParameterCommandSender {
         self.layout.resolve_channel(track_id)
     }
 
+    /// Resolves one compiled mixer slot into a handle bound to this runtime.
+    ///
+    /// This numeric address is valid only when it was compiled from the same
+    /// immutable mixer graph used to construct this sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MixerParameterResolveError::ChannelNotFound`] when
+    /// `channel_index` is outside the prepared mixer layout.
+    pub fn resolve_channel_index(
+        &self,
+        channel_index: usize,
+    ) -> Result<MixerChannelHandle, MixerParameterResolveError> {
+        self.layout.resolve_channel_index(channel_index)
+    }
+
     /// Resolves one persisted send identity into a handle bound to this runtime.
     ///
     /// # Errors
@@ -692,6 +730,24 @@ impl MixerParameterCommandSender {
         send_id: &str,
     ) -> Result<MixerSendHandle, MixerParameterResolveError> {
         self.layout.resolve_send(send_id)
+    }
+
+    /// Resolves one compiled channel/send address into a handle bound to this
+    /// runtime.
+    ///
+    /// This numeric address is valid only when it was compiled from the same
+    /// immutable mixer graph used to construct this sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MixerParameterResolveError::SendNotFound`] when either index
+    /// does not identify a prepared send.
+    pub fn resolve_send_address(
+        &self,
+        channel_index: usize,
+        send_index: usize,
+    ) -> Result<MixerSendHandle, MixerParameterResolveError> {
+        self.layout.resolve_send_address(channel_index, send_index)
     }
 
     /// Validates and enqueues one base-state change without waiting or allocating.

@@ -1166,6 +1166,32 @@ fn live_mixer_command_queue_validates_targets_backpressure_and_disconnection() {
 }
 
 #[test]
+fn live_mixer_targets_resolve_from_compiled_numeric_addresses() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (_transport_sender, sender, _transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+    let source = sender.resolve_channel(GRAPH_SOURCE_TRACK_ID).unwrap();
+    let send_a = sender.resolve_send(GRAPH_SEND_A_ID).unwrap();
+
+    assert_eq!(sender.resolve_channel_index(0), Ok(source));
+    assert_eq!(sender.resolve_send_address(0, 0), Ok(send_a));
+    assert_eq!(
+        sender.resolve_channel_index(usize::MAX),
+        Err(MixerParameterResolveError::ChannelNotFound)
+    );
+    assert_eq!(
+        sender.resolve_send_address(0, usize::MAX),
+        Err(MixerParameterResolveError::SendNotFound)
+    );
+    assert_eq!(
+        sender.resolve_send_address(usize::MAX, 0),
+        Err(MixerParameterResolveError::SendNotFound)
+    );
+}
+
+#[test]
 fn live_mixer_commands_apply_while_stopped_and_without_a_block_ramp() {
     let fixture = graph_fixture();
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
