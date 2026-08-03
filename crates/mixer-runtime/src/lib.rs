@@ -727,6 +727,12 @@ impl MixerParameterCommandSender {
         MAX_QUEUED_MIXER_PARAMETER_COMMANDS
     }
 
+    /// Returns the immutable channel count in this sender's compiled layout.
+    #[must_use]
+    pub fn channel_count(&self) -> usize {
+        self.layout.channels.len()
+    }
+
     #[must_use]
     pub fn is_disconnected(&self) -> bool {
         let disconnected = self.producer.is_abandoned();

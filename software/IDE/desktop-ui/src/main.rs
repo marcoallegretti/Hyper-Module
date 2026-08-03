@@ -8,8 +8,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use hyper_desktop_ide::{
-    DesktopIdeWorker, IdeApplicationConfig, IdeAudioOutputInventory, IdeNativeCloseFailure,
-    IdeOutputSelection, IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind,
+    DesktopIdeWorker, IdeApplicationConfig, IdeAudioOutputInventory, IdeMixerChannel,
+    IdeMixerChannelKind, IdeMixerCommand, IdeNativeCloseFailure, IdeOutputSelection,
+    IdeRunningObservation, IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind,
     IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
     IdeWorkerShutdownReport, PlaybackRecoveryTransportState, TransportCommand,
     desktop_ide_application_config,
@@ -25,6 +26,7 @@ const UI_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const INITIAL_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const FINAL_SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 const MAX_VISIBLE_SCENE_NAME_CHARS: usize = 20;
+const MAX_VISIBLE_MIXER_NAME_CHARS: usize = 10;
 
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
 type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
@@ -40,6 +42,27 @@ enum SceneLaunchFailure {
     InvalidSelection,
     StaleSelection,
     NotReady,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MixerControlFailure {
+    InvalidSelection,
+    StaleSelection,
+    StateUnavailable,
+    SoloUnavailable,
+    InvalidValue,
+}
+
+impl MixerControlFailure {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::InvalidSelection => "Mixer channel selection is invalid",
+            Self::StaleSelection => "Mixer channel selection is no longer available",
+            Self::StateUnavailable => "Mixer base state is not yet available",
+            Self::SoloUnavailable => "Solo is unavailable for this mixer channel",
+            Self::InvalidValue => "Mixer control value is outside its supported range",
+        }
+    }
 }
 
 impl SceneLaunchFailure {
@@ -222,6 +245,98 @@ fn bind_playback_callbacks(ui: &MainWindow, worker: &WorkerCell) {
     actions.on_close_project(move || {
         submit(&weak, &worker_for_close, IdeWorkerCommand::CloseProject);
     });
+
+    bind_mixer_callbacks(ui, worker);
+}
+
+fn bind_mixer_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+
+    let weak = ui.as_weak();
+    let worker_for_gain = Rc::clone(worker);
+    actions.on_mixer_channel_gain(move |index, percent| {
+        submit_channel_mixer_command(&weak, &worker_for_gain, index, |channel_index, _| {
+            Ok(IdeMixerCommand::ChannelGain {
+                channel_index,
+                gain_millionths: gain_percent_to_millionths(percent)?,
+            })
+        });
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_pan = Rc::clone(worker);
+    actions.on_mixer_channel_pan(move |index, percent| {
+        submit_channel_mixer_command(&weak, &worker_for_pan, index, |channel_index, _| {
+            Ok(IdeMixerCommand::ChannelPan {
+                channel_index,
+                pan_millionths: pan_percent_to_millionths(percent)?,
+            })
+        });
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_mute = Rc::clone(worker);
+    actions.on_mixer_channel_mute(move |index| {
+        submit_channel_mixer_command(&weak, &worker_for_mute, index, |channel_index, row| {
+            Ok(IdeMixerCommand::ChannelMute {
+                channel_index,
+                muted: !row.muted,
+            })
+        });
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_solo = Rc::clone(worker);
+    actions.on_mixer_channel_solo(move |index| {
+        submit_channel_mixer_command(&weak, &worker_for_solo, index, |channel_index, row| {
+            if !row.solo_available {
+                return Err(MixerControlFailure::SoloUnavailable);
+            }
+            Ok(IdeMixerCommand::ChannelSolo {
+                channel_index,
+                solo: !row.solo,
+            })
+        });
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_main_gain = Rc::clone(worker);
+    actions.on_mixer_main_gain(move |percent| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_mixer_main_state_available() {
+            ui.set_error_text(MixerControlFailure::StateUnavailable.message().into());
+            return;
+        }
+        match gain_percent_to_millionths(percent) {
+            Ok(gain_millionths) => submit_to_ui(
+                &ui,
+                &worker_for_main_gain,
+                IdeWorkerCommand::Mixer(IdeMixerCommand::MainGain { gain_millionths }),
+            ),
+            Err(reason) => ui.set_error_text(reason.message().into()),
+        }
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_main_mute = Rc::clone(worker);
+    actions.on_mixer_main_mute(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_mixer_main_state_available() {
+            ui.set_error_text(MixerControlFailure::StateUnavailable.message().into());
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_main_mute,
+            IdeWorkerCommand::Mixer(IdeMixerCommand::MainMute {
+                muted: !ui.get_mixer_main_muted(),
+            }),
+        );
+    });
 }
 
 fn start_event_pump(ui: &MainWindow, worker: &WorkerCell, output_routes: &OutputRoutes) -> Timer {
@@ -334,6 +449,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::OpenProject => "Recovering and verifying project…",
         IdeWorkerCommandKind::Transport => "Transport command queued…",
+        IdeWorkerCommandKind::Mixer => "Mixer command queued…",
         IdeWorkerCommandKind::Observe => "Refreshing runtime evidence…",
         IdeWorkerCommandKind::CloseProject => "Closing project and native output…",
         IdeWorkerCommandKind::Shutdown => "Shutting down…",
@@ -367,6 +483,7 @@ fn apply_event(ui: &MainWindow, output_routes: &OutputRoutes, event: IdeWorkerEv
             ui.set_sample_rate(format!("{} Hz", observation.sample_rate_hz()).into());
             ui.set_scene_count(observation.scene_count().to_string().into());
             set_scenes(ui, observation.scenes());
+            apply_mixer_observation(ui, &observation);
             ui.set_stream_state(format!("{:?}", observation.output_state()).into());
             ui.set_callback_count(observation.output().callback_count.to_string().into());
             ui.set_xrun_count(
@@ -423,6 +540,10 @@ fn apply_event(ui: &MainWindow, output_routes: &OutputRoutes, event: IdeWorkerEv
             );
             ui.set_error_text(SharedString::default());
         }
+        IdeWorkerEvent::MixerQueued(_) => {
+            ui.set_status_text("Mixer base command queued for the audio runtime".into());
+            ui.set_error_text(SharedString::default());
+        }
         IdeWorkerEvent::Closing => {
             ui.set_app_mode(AppMode::Closing);
             ui.set_status_text("Waiting for native output to close…".into());
@@ -431,6 +552,19 @@ fn apply_event(ui: &MainWindow, output_routes: &OutputRoutes, event: IdeWorkerEv
             ui.set_app_mode(mode_after_failure(ui.get_app_mode(), command));
             ui.set_error_text(format!("{}: {reason}", command_status(command)).into());
         }
+    }
+}
+
+fn apply_mixer_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
+    set_mixer(ui, observation.mixer_channels());
+    if let Some(main) = observation.mixer_main() {
+        ui.set_mixer_main_state_available(true);
+        ui.set_mixer_main_gain_percent(main.gain * 100.0);
+        ui.set_mixer_main_muted(main.muted);
+    } else {
+        ui.set_mixer_main_state_available(false);
+        ui.set_mixer_main_gain_percent(0.0);
+        ui.set_mixer_main_muted(false);
     }
 }
 
@@ -483,6 +617,11 @@ fn reset_project(ui: &MainWindow) {
     ui.set_sample_rate("—".into());
     ui.set_scene_count("—".into());
     ui.set_scenes(ModelRc::default());
+    ui.set_mixer_visible(false);
+    ui.set_mixer_channels(ModelRc::default());
+    ui.set_mixer_main_state_available(false);
+    ui.set_mixer_main_gain_percent(0.0);
+    ui.set_mixer_main_muted(false);
     ui.set_transport_state("Stopped".into());
     ui.set_stream_state("No stream".into());
     ui.set_frame_position("0".into());
@@ -565,6 +704,71 @@ fn validate_scene_launch(
     Ok(scene_index)
 }
 
+fn submit_channel_mixer_command(
+    weak: &slint::Weak<MainWindow>,
+    worker: &WorkerCell,
+    index: i32,
+    build: impl FnOnce(usize, &MixerChannelRow) -> Result<IdeMixerCommand, MixerControlFailure>,
+) {
+    let Some(ui) = weak.upgrade() else {
+        return;
+    };
+    let (channel_index, row) =
+        match validate_mixer_channel(ui.get_app_mode(), index, &ui.get_mixer_channels()) {
+            Ok(validated) => validated,
+            Err(reason) => {
+                ui.set_error_text(reason.message().into());
+                return;
+            }
+        };
+    match build(channel_index, &row) {
+        Ok(command) => submit_to_ui(&ui, worker, IdeWorkerCommand::Mixer(command)),
+        Err(reason) => ui.set_error_text(reason.message().into()),
+    }
+}
+
+fn validate_mixer_channel(
+    mode: AppMode,
+    index: i32,
+    channels: &ModelRc<MixerChannelRow>,
+) -> Result<(usize, MixerChannelRow), MixerControlFailure> {
+    let channel_index =
+        usize::try_from(index).map_err(|_| MixerControlFailure::InvalidSelection)?;
+    let row = channels
+        .row_data(channel_index)
+        .ok_or(MixerControlFailure::StaleSelection)?;
+    if row.index != index {
+        return Err(MixerControlFailure::StaleSelection);
+    }
+    if mode != AppMode::Running || !row.state_available {
+        return Err(MixerControlFailure::StateUnavailable);
+    }
+    Ok((channel_index, row))
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "finite mixer gain percent is range-checked before rounding to its persisted domain"
+)]
+fn gain_percent_to_millionths(percent: f32) -> Result<u32, MixerControlFailure> {
+    if !percent.is_finite() || !(0.0..=200.0).contains(&percent) {
+        return Err(MixerControlFailure::InvalidValue);
+    }
+    Ok((percent * 10_000.0).round() as u32)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "finite mixer pan percent is range-checked before rounding to its persisted domain"
+)]
+fn pan_percent_to_millionths(percent: f32) -> Result<i32, MixerControlFailure> {
+    if !percent.is_finite() || !(-100.0..=100.0).contains(&percent) {
+        return Err(MixerControlFailure::InvalidValue);
+    }
+    Ok((percent * 10_000.0).round() as i32)
+}
+
 fn set_scenes(ui: &MainWindow, scenes: &[IdeScene]) {
     let current = ui.get_scenes();
     let unchanged = current.row_count() == scenes.len()
@@ -580,6 +784,69 @@ fn set_scenes(ui: &MainWindow, scenes: &[IdeScene]) {
         });
     if !unchanged {
         ui.set_scenes(ModelRc::from(Rc::new(VecModel::from(scene_rows(scenes)))));
+    }
+}
+
+fn mixer_rows(channels: &[IdeMixerChannel]) -> Vec<MixerChannelRow> {
+    channels
+        .iter()
+        .enumerate()
+        .map(|(index, channel)| {
+            let state = channel.state();
+            MixerChannelRow {
+                index: i32::try_from(index).unwrap_or(-1),
+                name: channel.name().into(),
+                display_name: compact_name(channel.name(), MAX_VISIBLE_MIXER_NAME_CHARS).into(),
+                kind: mixer_kind_name(channel.kind()).into(),
+                state_available: state.is_some(),
+                gain_percent: state.map_or(0.0, |state| state.gain * 100.0),
+                pan_percent: state.map_or(0.0, |state| state.pan * 100.0),
+                muted: state.is_some_and(|state| state.muted),
+                solo: state.is_some_and(|state| state.solo),
+                solo_available: channel.kind() == IdeMixerChannelKind::Audio,
+            }
+        })
+        .collect()
+}
+
+const fn mixer_kind_name(kind: IdeMixerChannelKind) -> &'static str {
+    match kind {
+        IdeMixerChannelKind::Audio => "AUDIO",
+        IdeMixerChannelKind::Group => "GROUP",
+        IdeMixerChannelKind::Return => "RETURN",
+    }
+}
+
+fn compact_name(name: &str, maximum_chars: usize) -> String {
+    if name.chars().count() <= maximum_chars {
+        return name.to_owned();
+    }
+    let mut display = name.chars().take(maximum_chars - 1).collect::<String>();
+    display.push('…');
+    display
+}
+
+fn set_mixer(ui: &MainWindow, channels: &[IdeMixerChannel]) {
+    let current = ui.get_mixer_channels();
+    let unchanged = current.row_count() == channels.len()
+        && channels.iter().enumerate().all(|(index, expected)| {
+            current.row_data(index).is_some_and(|actual| {
+                let state = expected.state();
+                actual.index == i32::try_from(index).unwrap_or(-1)
+                    && actual.name.as_str() == expected.name()
+                    && actual.kind.as_str() == mixer_kind_name(expected.kind())
+                    && actual.state_available == state.is_some()
+                    && actual.gain_percent.to_bits()
+                        == state.map_or(0.0, |state| state.gain * 100.0).to_bits()
+                    && actual.pan_percent.to_bits()
+                        == state.map_or(0.0, |state| state.pan * 100.0).to_bits()
+                    && actual.muted == state.is_some_and(|state| state.muted)
+                    && actual.solo == state.is_some_and(|state| state.solo)
+                    && actual.solo_available == (expected.kind() == IdeMixerChannelKind::Audio)
+            })
+        });
+    if !unchanged {
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(mixer_rows(channels)))));
     }
 }
 
@@ -828,6 +1095,61 @@ mod tests {
     }
 
     #[test]
+    fn mixer_controls_require_current_observed_rows_and_bounded_values() {
+        let channels = ModelRc::from(Rc::new(VecModel::from(vec![MixerChannelRow {
+            index: 0,
+            name: "Audio channel".into(),
+            display_name: "Audio".into(),
+            kind: "AUDIO".into(),
+            state_available: true,
+            gain_percent: 100.0,
+            pan_percent: 0.0,
+            muted: false,
+            solo: false,
+            solo_available: true,
+        }])));
+        assert!(validate_mixer_channel(AppMode::Running, 0, &channels).is_ok());
+        assert_eq!(
+            validate_mixer_channel(AppMode::Closed, 0, &channels).unwrap_err(),
+            MixerControlFailure::StateUnavailable
+        );
+        assert_eq!(
+            validate_mixer_channel(AppMode::Running, 1, &channels).unwrap_err(),
+            MixerControlFailure::StaleSelection
+        );
+        assert_eq!(
+            validate_mixer_channel(AppMode::Running, -1, &channels).unwrap_err(),
+            MixerControlFailure::InvalidSelection
+        );
+        assert_eq!(gain_percent_to_millionths(0.0), Ok(0));
+        assert_eq!(gain_percent_to_millionths(125.5), Ok(1_255_000));
+        assert_eq!(gain_percent_to_millionths(200.0), Ok(2_000_000));
+        assert_eq!(
+            gain_percent_to_millionths(200.1),
+            Err(MixerControlFailure::InvalidValue)
+        );
+        assert_eq!(
+            gain_percent_to_millionths(f32::NAN),
+            Err(MixerControlFailure::InvalidValue)
+        );
+        assert_eq!(pan_percent_to_millionths(-100.0), Ok(-1_000_000));
+        assert_eq!(pan_percent_to_millionths(25.25), Ok(252_500));
+        assert_eq!(pan_percent_to_millionths(100.0), Ok(1_000_000));
+        assert_eq!(
+            pan_percent_to_millionths(-100.1),
+            Err(MixerControlFailure::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn mixer_display_names_are_unicode_safe_and_bounded() {
+        assert_eq!(compact_name("Drums", MAX_VISIBLE_MIXER_NAME_CHARS), "Drums");
+        let display = compact_name("Élévation musicale", MAX_VISIBLE_MIXER_NAME_CHARS);
+        assert_eq!(display.chars().count(), MAX_VISIBLE_MIXER_NAME_CHARS);
+        assert!(display.ends_with('…'));
+    }
+
+    #[test]
     fn command_failures_restore_only_the_state_the_command_consumed() {
         assert_eq!(
             mode_after_failure(AppMode::Discovering, IdeWorkerCommandKind::Initialize),
@@ -851,6 +1173,10 @@ mod tests {
         );
         assert_eq!(
             mode_after_failure(AppMode::Running, IdeWorkerCommandKind::Transport),
+            AppMode::Running
+        );
+        assert_eq!(
+            mode_after_failure(AppMode::Running, IdeWorkerCommandKind::Mixer),
             AppMode::Running
         );
         assert_eq!(

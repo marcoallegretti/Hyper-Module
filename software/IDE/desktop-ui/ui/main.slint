@@ -1,4 +1,4 @@
-import { Button, ComboBox } from "std-widgets.slint";
+import { Button, ComboBox, Slider } from "std-widgets.slint";
 
 export enum AppMode {
     discovering,
@@ -18,6 +18,19 @@ export struct SceneRow {
     launchable: bool,
 }
 
+export struct MixerChannelRow {
+    index: int,
+    name: string,
+    display-name: string,
+    kind: string,
+    state-available: bool,
+    gain-percent: float,
+    pan-percent: float,
+    muted: bool,
+    solo: bool,
+    solo-available: bool,
+}
+
 export global IdeActions {
     callback retry-discovery();
     callback refresh-outputs();
@@ -26,6 +39,12 @@ export global IdeActions {
     callback transport-start();
     callback transport-stop();
     callback launch-scene(int);
+    callback mixer-channel-gain(int, float);
+    callback mixer-channel-pan(int, float);
+    callback mixer-channel-mute(int);
+    callback mixer-channel-solo(int);
+    callback mixer-main-gain(float);
+    callback mixer-main-mute();
     callback close-project();
 }
 
@@ -91,6 +110,11 @@ export component MainWindow inherits Window {
     in property <string> sample-rate: "—";
     in property <string> scene-count: "—";
     in property <[SceneRow]> scenes: [];
+    in-out property <bool> mixer-visible: false;
+    in property <[MixerChannelRow]> mixer-channels: [];
+    in property <bool> mixer-main-state-available: false;
+    in property <float> mixer-main-gain-percent: 0;
+    in property <bool> mixer-main-muted: false;
     in property <string> transport-state: "Stopped";
     in property <string> stream-state: "No stream";
     in property <string> frame-position: "0";
@@ -216,7 +240,7 @@ export component MainWindow inherits Window {
                 }
             }
 
-            Panel {
+            if !root.mixer-visible : Panel {
                 horizontal-stretch: 1;
                 VerticalLayout {
                     padding: 22px;
@@ -229,6 +253,11 @@ export component MainWindow inherits Window {
                             Text { text: root.transport-state; color: #edf2f8; font-size: 24px; font-weight: 650; }
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Button {
+                            text: "Mixer";
+                            enabled: root.app-mode == AppMode.running;
+                            clicked => { root.mixer-visible = true; }
+                        }
                         Text { text: root.stream-state; color: #8fa0b4; font-size: 12px; vertical-alignment: center; }
                     }
 
@@ -320,6 +349,106 @@ export component MainWindow inherits Window {
                         Rectangle {
                             row: 0; col: 3; height: 78px; background: #0e141b; border-radius: 6px;
                             VerticalLayout { padding: 12px; Text { text: "NATIVE XRUNS"; color: #65758a; font-size: 10px; } Text { text: root.xrun-count; color: #dce5ef; font-size: 18px; } }
+                        }
+                    }
+                }
+            }
+
+            if root.mixer-visible : Panel {
+                horizontal-stretch: 1;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+
+                    HorizontalLayout {
+                        height: 48px;
+                        spacing: 8px;
+                        VerticalLayout {
+                            Text { text: "BASE MIXER"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            Text { text: "Automation may override base values"; color: #aebccc; font-size: 12px; }
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Button { text: "Performance"; clicked => { root.mixer-visible = false; } }
+                        Text { text: root.stream-state; color: #8fa0b4; font-size: 12px; vertical-alignment: center; }
+                    }
+
+                    Rectangle { height: 1px; background: #27313d; }
+
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        for channel in root.mixer-channels : Rectangle {
+                            width: 72px;
+                            vertical-stretch: 1;
+                            background: #0e141b;
+                            border-color: #27313d;
+                            border-width: 1px;
+                            border-radius: 6px;
+                            VerticalLayout {
+                                padding: 7px;
+                                spacing: 5px;
+                                Text { text: channel.display-name; accessible-label: channel.name; color: #dce5ef; font-size: 10px; font-weight: 600; horizontal-alignment: center; overflow: elide; }
+                                Text { text: channel.kind; color: #65758a; font-size: 8px; horizontal-alignment: center; }
+                                Slider {
+                                    min-width: 28px;
+                                    max-width: 28px;
+                                    vertical-stretch: 1;
+                                    orientation: Orientation.vertical;
+                                    minimum: 0;
+                                    maximum: 200;
+                                    value: channel.gain-percent;
+                                    enabled: root.app-mode == AppMode.running && channel.state-available;
+                                    accessible-label: channel.name + " base gain";
+                                    released(value) => { IdeActions.mixer-channel-gain(channel.index, value); }
+                                }
+                                Text { text: Math.round(channel.gain-percent) + "%"; color: channel.state-available ? #aebccc : #65758a; font-size: 9px; horizontal-alignment: center; }
+                                Slider {
+                                    height: 24px;
+                                    minimum: -100;
+                                    maximum: 100;
+                                    value: channel.pan-percent;
+                                    enabled: root.app-mode == AppMode.running && channel.state-available;
+                                    accessible-label: channel.name + " base pan";
+                                    released(value) => { IdeActions.mixer-channel-pan(channel.index, value); }
+                                }
+                                Text { text: "PAN " + Math.round(channel.pan-percent); color: channel.state-available ? #aebccc : #65758a; font-size: 8px; horizontal-alignment: center; }
+                                HorizontalLayout {
+                                    spacing: 3px;
+                                    Button { text: channel.muted ? "M*" : "M"; accessible-label: channel.name + (channel.muted ? " muted" : " not muted"); enabled: root.app-mode == AppMode.running && channel.state-available; clicked => { IdeActions.mixer-channel-mute(channel.index); } }
+                                    Button { text: channel.solo ? "S*" : "S"; accessible-label: channel.name + (channel.solo ? " soloed" : " not soloed"); enabled: root.app-mode == AppMode.running && channel.state-available && channel.solo-available; clicked => { IdeActions.mixer-channel-solo(channel.index); } }
+                                }
+                                Text { text: channel.state-available ? "BASE" : "UNAVAILABLE"; color: channel.state-available ? #63e6b5 : #ff9d76; font-size: 7px; horizontal-alignment: center; }
+                            }
+                        }
+                        Rectangle {
+                            width: 76px;
+                            vertical-stretch: 1;
+                            background: #18202a;
+                            border-color: #3a4858;
+                            border-width: 1px;
+                            border-radius: 6px;
+                            VerticalLayout {
+                                padding: 7px;
+                                spacing: 5px;
+                                Text { text: "MAIN"; color: #edf2f8; font-size: 10px; font-weight: 700; horizontal-alignment: center; }
+                                Text { text: "OUTPUT"; color: #65758a; font-size: 8px; horizontal-alignment: center; }
+                                Slider {
+                                    min-width: 28px;
+                                    max-width: 28px;
+                                    vertical-stretch: 1;
+                                    orientation: Orientation.vertical;
+                                    minimum: 0;
+                                    maximum: 200;
+                                    value: root.mixer-main-gain-percent;
+                                    enabled: root.app-mode == AppMode.running && root.mixer-main-state-available;
+                                    accessible-label: "Main base gain";
+                                    released(value) => { IdeActions.mixer-main-gain(value); }
+                                }
+                                Text { text: Math.round(root.mixer-main-gain-percent) + "%"; color: root.mixer-main-state-available ? #aebccc : #65758a; font-size: 9px; horizontal-alignment: center; }
+                                Rectangle { vertical-stretch: 1; background: transparent; }
+                                Button { text: root.mixer-main-muted ? "MUTE ON" : "MUTE"; enabled: root.app-mode == AppMode.running && root.mixer-main-state-available; clicked => { IdeActions.mixer-main-mute(); } }
+                                Text { text: root.mixer-main-state-available ? "BASE" : "UNAVAILABLE"; color: root.mixer-main-state-available ? #63e6b5 : #ff9d76; font-size: 7px; horizontal-alignment: center; }
+                            }
                         }
                     }
                 }

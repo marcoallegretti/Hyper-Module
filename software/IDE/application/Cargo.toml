@@ -9,6 +9,7 @@ publish = false
 workspace = true
 
 [dependencies]
+hyper-audio-engine = { path = "../../../crates/audio-engine" }
 hyper-audio-source = { path = "../../../crates/audio-source" }
 hyper-desktop-audio = { path = "../audio-backend" }
 hyper-media-cache = { path = "../../../crates/media-cache" }

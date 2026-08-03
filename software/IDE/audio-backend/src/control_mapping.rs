@@ -132,6 +132,10 @@ impl DesktopControlSink {
         &self.transport
     }
 
+    pub(crate) const fn mixer_sender(&self) -> &MixerParameterCommandSender {
+        &self.mixer
+    }
+
     fn direct_mixer_update(
         &self,
         command: MixerParameterCommand,

@@ -500,6 +500,17 @@ impl SessionControlHandles {
         }
     }
 
+    fn mixer(&self) -> &MixerParameterCommandSender {
+        match self {
+            Self::Direct { mixer, .. } => mixer,
+            Self::Mapping(runtimes) => runtimes
+                .first()
+                .expect("mapping owner contains exactly one runtime")
+                .sink()
+                .mixer_sender(),
+        }
+    }
+
     fn mapping(&self) -> Option<&DesktopControlMappingRuntime> {
         match self {
             Self::Mapping(runtimes) => Some(
@@ -569,6 +580,13 @@ impl SessionControlHandles {
                 .sink()
                 .resolve_channel(track_id),
         }
+    }
+
+    fn resolve_channel_index(
+        &self,
+        channel_index: usize,
+    ) -> Result<MixerChannelHandle, MixerParameterResolveError> {
+        self.mixer().resolve_channel_index(channel_index)
     }
 
     fn resolve_send(&self, send_id: &str) -> Result<MixerSendHandle, MixerParameterResolveError> {
@@ -1523,6 +1541,24 @@ impl DesktopPlaybackSession {
             .map(DesktopSceneAvailability::from)
     }
 
+    /// Returns the fixed channel count in this session's compiled mixer layout.
+    #[must_use]
+    pub fn mixer_channel_count(&self) -> usize {
+        self.controls.mixer().channel_count()
+    }
+
+    /// Resolves one compiled channel index through this session's mixer layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing-channel rejection for an out-of-range index.
+    pub fn resolve_mixer_channel_index(
+        &self,
+        channel_index: usize,
+    ) -> Result<MixerChannelHandle, MixerParameterResolveError> {
+        self.controls.resolve_channel_index(channel_index)
+    }
+
     /// Resolves one track identity through this session's mixer layout.
     ///
     /// # Errors
@@ -1845,6 +1881,7 @@ fn initialize_session(
     restore_transport_checkpoint(&mut transport, initial_checkpoint)
         .map_err(DesktopPlaybackSessionBuildError::MixerRecovery)
         .or_else(|source| fail_build(publication, source))?;
+    let initial_mixer_parameter_state = transport.mixer_parameter_state();
     let (mut meter_sender, meters) = output_meter_channel();
     let (loudness_commands, loudness_command_receiver) = loudness_command_channel();
     let processor = TransportOutputProcessor::try_new(
@@ -1860,7 +1897,8 @@ fn initialize_session(
         .map(|monitoring| PlaybackMonitoringMixer::try_new(monitoring, maximum_block_frames))
         .transpose()
         .or_else(|source| fail_build(publication, source))?;
-    let (publisher, recovery) = playback_recovery_channel(initial_checkpoint);
+    let (publisher, recovery) =
+        playback_recovery_channel(initial_checkpoint, Some(&initial_mixer_parameter_state));
     let controls = build_session_controls(
         commands,
         mixer_parameter_commands,
@@ -2432,7 +2470,7 @@ mod tests {
         let prepared = media.prepare_playback(&graph).unwrap();
         let runtime = RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, 64).unwrap();
         let (transport, mixer, _runtime) = RoutedTransportRuntime::with_command_queues(runtime);
-        let (_publisher, recovery) = playback_recovery_channel(None);
+        let (_publisher, recovery) = playback_recovery_channel(None, None);
         let mut sink = DesktopControlSink::new(transport, mixer, recovery);
 
         assert!(
@@ -2477,7 +2515,7 @@ mod tests {
         let prepared = media.prepare_playback(&graph).unwrap();
         let runtime = RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, 64).unwrap();
         let (transport, mixer, _runtime) = RoutedTransportRuntime::with_command_queues(runtime);
-        let (_publisher, recovery) = playback_recovery_channel(None);
+        let (_publisher, recovery) = playback_recovery_channel(None, None);
         let mut controls = build_session_controls(
             transport,
             mixer,
@@ -2488,6 +2526,12 @@ mod tests {
 
         assert_eq!(controls.transport().scene_count(), 0);
         assert_eq!(controls.transport().scene_availability(0), None);
+        assert_eq!(controls.mixer().channel_count(), 1);
+        assert!(controls.resolve_channel_index(0).is_ok());
+        assert_eq!(
+            controls.resolve_channel_index(1),
+            Err(MixerParameterResolveError::ChannelNotFound)
+        );
         let channel = controls
             .resolve_channel("018f47a2-6b2d-7c11-8a44-001122337502")
             .unwrap();
@@ -2530,7 +2574,7 @@ mod tests {
         let prepared = media.prepare_playback(&graph).unwrap();
         let runtime = RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, 64).unwrap();
         let (transport, mixer, _runtime) = RoutedTransportRuntime::with_command_queues(runtime);
-        let (_publisher, recovery) = playback_recovery_channel(None);
+        let (_publisher, recovery) = playback_recovery_channel(None, None);
         let mut controls = build_session_controls(
             transport,
             mixer,

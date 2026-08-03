@@ -2133,6 +2133,7 @@ dependencies = [
 name = "hyper-desktop-ide"
 version = "0.1.0"
 dependencies = [
+ "hyper-audio-engine",
  "hyper-audio-source",
  "hyper-desktop-audio",
  "hyper-media-cache",

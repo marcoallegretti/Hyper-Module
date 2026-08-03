@@ -237,7 +237,7 @@ struct PlaybackRecoveryState {
 /// ```compile_fail
 /// use hyper_mixer_runtime::playback_recovery_channel;
 ///
-/// let (_, observer) = playback_recovery_channel(None);
+/// let (_, observer) = playback_recovery_channel(None, None);
 /// observer.publish_cycle(todo!(), None);
 /// ```
 #[derive(Clone, Debug, Default)]
@@ -282,7 +282,7 @@ impl PlaybackRecoveryCheckpoint {
 /// ```compile_fail
 /// use hyper_mixer_runtime::playback_recovery_channel;
 ///
-/// let (publisher, _) = playback_recovery_channel(None);
+/// let (publisher, _) = playback_recovery_channel(None, None);
 /// let duplicate = publisher.clone();
 /// ```
 #[derive(Debug)]
@@ -331,12 +331,21 @@ impl PlaybackRecoveryPublisher {
 }
 
 /// Creates one single-writer recovery publisher and its cloneable observer.
+///
+/// A mixer state retained by `snapshot` takes precedence. Otherwise the
+/// supplied initial state is observable without counting a synthetic transport
+/// cycle, allowing controls to inspect the runtime's compiled base values before
+/// the first native callback.
 #[must_use]
 pub fn playback_recovery_channel(
     snapshot: Option<&PlaybackRecoverySnapshot>,
+    initial_mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
 ) -> (PlaybackRecoveryPublisher, PlaybackRecoveryCheckpoint) {
     let mixer_parameters = AtomicMixerParameterState::default();
-    if let Some(state) = snapshot.and_then(|snapshot| snapshot.mixer_parameter_state.as_ref()) {
+    if let Some(state) = snapshot
+        .and_then(|snapshot| snapshot.mixer_parameter_state.as_ref())
+        .or(initial_mixer_parameter_state)
+    {
         mixer_parameters.store(state);
     }
     let inner = Arc::new(PlaybackRecoveryState {
@@ -462,7 +471,7 @@ mod tests {
 
     #[test]
     fn publication_updates_state_position_and_count() {
-        let (mut publisher, checkpoint) = playback_recovery_channel(None);
+        let (mut publisher, checkpoint) = playback_recovery_channel(None, None);
         publisher.publish(PlaybackRecoveryTransportState::Rolling, 256, None);
         assert_eq!(
             checkpoint.snapshot(),
@@ -501,7 +510,7 @@ mod tests {
 
     #[test]
     fn mixer_state_updates_only_with_a_committed_change_and_then_remains_current() {
-        let (mut publisher, checkpoint) = playback_recovery_channel(None);
+        let (mut publisher, checkpoint) = playback_recovery_channel(None, None);
         let mixer = mixer_snapshot(7, true);
 
         publisher.publish(PlaybackRecoveryTransportState::Rolling, 128, Some(&mixer));
@@ -516,7 +525,7 @@ mod tests {
     #[test]
     fn concurrent_snapshots_do_not_mix_publications() {
         const PUBLICATIONS: usize = 20_000;
-        let (mut publisher, checkpoint) = playback_recovery_channel(None);
+        let (mut publisher, checkpoint) = playback_recovery_channel(None, None);
         let barrier = Arc::new(Barrier::new(2));
         let writer_barrier = barrier.clone();
         let writer = thread::spawn(move || {
@@ -562,7 +571,9 @@ mod tests {
             committed_cycle_count: 7,
             mixer_parameter_state: Some(mixer),
         };
-        let (mut publisher, checkpoint) = playback_recovery_channel(Some(&snapshot));
+        let different_initial = mixer_snapshot(3, false);
+        let (mut publisher, checkpoint) =
+            playback_recovery_channel(Some(&snapshot), Some(&different_initial));
 
         assert_eq!(
             checkpoint.snapshot(),
@@ -575,5 +586,17 @@ mod tests {
         );
         publisher.publish(PlaybackRecoveryTransportState::Rolling, 640, None);
         assert_eq!(checkpoint.snapshot().committed_cycle_count(), 8);
+    }
+
+    #[test]
+    fn checkpoint_can_expose_initial_mixer_state_without_a_committed_cycle() {
+        let mixer = mixer_snapshot(5, false);
+        let (_publisher, checkpoint) = playback_recovery_channel(None, Some(&mixer));
+
+        let snapshot = checkpoint.snapshot();
+        assert_eq!(snapshot.state(), PlaybackRecoveryTransportState::Stopped);
+        assert_eq!(snapshot.position_frame(), 0);
+        assert_eq!(snapshot.committed_cycle_count(), 0);
+        assert_eq!(snapshot.mixer_parameter_state(), Some(mixer));
     }
 }

@@ -7,6 +7,7 @@ use core::mem::size_of;
 use std::path::Path;
 use std::time::Duration;
 
+use hyper_audio_engine::{LinearGain, Pan, ParameterError};
 use hyper_audio_source::{DecodeError, DecodeLimits};
 pub use hyper_desktop_audio::DesktopSceneAvailability as IdeSceneAvailability;
 use hyper_desktop_audio::{
@@ -17,22 +18,26 @@ use hyper_desktop_audio::{
     discover_desktop_output_targets,
 };
 use hyper_media_cache::CacheLimits;
-use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot};
+use hyper_mixer_runtime::{
+    LatestOutputMeterSnapshot, MixerParameterCommand, MixerParameterResolveError,
+    PlaybackRecoverySnapshot,
+};
 #[cfg(test)]
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
 pub use hyper_mixer_runtime::{PlaybackRecoveryTransportState, TransportCommand};
-use hyper_playback_json::LoaderLimits;
+use hyper_playback_json::{CompiledMixerTrackKind, LoaderLimits};
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::ProjectPlaybackLimits;
 
 mod worker;
 
 pub use worker::{
-    DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeClosedSnapshot, IdeRunningObservation,
-    IdeScene, IdeWorkerCommand, IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent,
-    IdeWorkerEventReceiveError, IdeWorkerJoinError, IdeWorkerPendingShutdownWait,
-    IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, IdeWorkerStartError,
-    MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS, desktop_ide_worker_supervisor_snapshot,
+    DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeClosedSnapshot, IdeMixerChannel,
+    IdeRunningObservation, IdeScene, IdeWorkerCommand, IdeWorkerCommandFailure,
+    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
+    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeWorkerShutdownReport, IdeWorkerStartError, MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS,
+    desktop_ide_worker_supervisor_snapshot,
 };
 
 const DESKTOP_MAXIMUM_BLOCK_FRAMES: usize = 4_096;
@@ -43,6 +48,8 @@ const DESKTOP_MAX_PROJECT_RESOURCE_BYTES: usize = 1_024 * 1_024 * 1_024;
 const DESKTOP_MAX_PROJECT_DECODED_BYTES: usize = 1_024 * 1_024 * 1_024;
 /// Maximum scene metadata rows published by the version-1 desktop IDE.
 pub const MAX_IDE_SCENES: usize = LoaderLimits::VERSION_1.max_scene_documents;
+/// Maximum channel rows published by the version-1 desktop IDE mixer.
+pub const MAX_IDE_MIXER_CHANNELS: usize = hyper_mixer_runtime::MAX_MAIN_MIXER_SLOTS;
 
 /// Builds the bounded playback policy used by the desktop IDE executable.
 ///
@@ -561,6 +568,81 @@ impl Error for IdeProjectOpenFailure {
     }
 }
 
+/// One base-mixer command addressed within the active compiled project layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeMixerCommand {
+    ChannelGain {
+        channel_index: usize,
+        gain_millionths: u32,
+    },
+    ChannelPan {
+        channel_index: usize,
+        pan_millionths: i32,
+    },
+    ChannelMute {
+        channel_index: usize,
+        muted: bool,
+    },
+    ChannelSolo {
+        channel_index: usize,
+        solo: bool,
+    },
+    MainGain {
+        gain_millionths: u32,
+    },
+    MainMute {
+        muted: bool,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+pub enum IdeMixerCommandError {
+    Parameter(ParameterError),
+    Resolve(MixerParameterResolveError),
+    Send(DesktopDirectControlError),
+}
+
+impl fmt::Display for IdeMixerCommandError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parameter(source) => source.fmt(formatter),
+            Self::Resolve(source) => source.fmt(formatter),
+            Self::Send(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeMixerCommandError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Parameter(source) => Some(source),
+            Self::Resolve(source) => Some(source),
+            Self::Send(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeMixerChannelKind {
+    Audio,
+    Group,
+    Return,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IdeMixerChannelState {
+    pub gain: f32,
+    pub pan: f32,
+    pub muted: bool,
+    pub solo: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IdeMixerMainState {
+    pub gain: f32,
+    pub muted: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RunningIdeSnapshot<'a> {
     pub project_id: &'a str,
@@ -569,6 +651,11 @@ pub struct RunningIdeSnapshot<'a> {
     pub scene_count: usize,
     pub scene_names: [&'a str; MAX_IDE_SCENES],
     pub scene_availability: [IdeSceneAvailability; MAX_IDE_SCENES],
+    pub mixer_channel_count: usize,
+    pub mixer_channel_names: [&'a str; MAX_IDE_MIXER_CHANNELS],
+    pub mixer_channel_kinds: [IdeMixerChannelKind; MAX_IDE_MIXER_CHANNELS],
+    pub mixer_channel_states: [Option<IdeMixerChannelState>; MAX_IDE_MIXER_CHANNELS],
+    pub mixer_main_state: Option<IdeMixerMainState>,
     pub output_state: OutputStreamState,
     pub output: OutputStreamSnapshot,
     pub recovery: PlaybackRecoverySnapshot,
@@ -595,6 +682,7 @@ enum IdePlaybackSessionOwner {
 #[derive(Debug)]
 struct TestPlaybackSession {
     commands: Vec<TransportCommand>,
+    mixer_commands: Vec<IdeMixerCommand>,
     meters: OutputMeterReceiver,
     close_failure: Option<IdeNativeCloseFailure>,
 }
@@ -604,6 +692,7 @@ impl Default for TestPlaybackSession {
     fn default() -> Self {
         Self {
             commands: Vec::new(),
+            mixer_commands: Vec::new(),
             meters: output_meter_channel().1,
             close_failure: None,
         }
@@ -628,7 +717,7 @@ impl RunningDesktopIdeApplication {
             IdePlaybackSessionOwner::Test(_) => return None,
         };
         let project = session.prepared_project()?;
-        let loaded = project.session().parts().0;
+        let (loaded, mixer, _, _) = project.session().parts();
         let scene_count = loaded.scene_count();
         if scene_count > MAX_IDE_SCENES || session.scene_count() != scene_count {
             return None;
@@ -639,6 +728,40 @@ impl RunningDesktopIdeApplication {
             scene_names[scene_index] = loaded.scene_name(scene_index)?;
             scene_availability[scene_index] = session.scene_availability(scene_index)?;
         }
+        let mixer_channel_count = mixer.slots().len();
+        if mixer_channel_count > MAX_IDE_MIXER_CHANNELS
+            || session.mixer_channel_count() != mixer_channel_count
+        {
+            return None;
+        }
+        let recovery = session.recovery_checkpoint().snapshot();
+        let mixer_parameters = recovery.mixer_parameter_state();
+        if mixer_parameters.is_some_and(|state| state.channel_count() != mixer_channel_count) {
+            return None;
+        }
+        let mut mixer_channel_names = [""; MAX_IDE_MIXER_CHANNELS];
+        let mut mixer_channel_kinds = [IdeMixerChannelKind::Audio; MAX_IDE_MIXER_CHANNELS];
+        let mut mixer_channel_states = [None; MAX_IDE_MIXER_CHANNELS];
+        for (channel_index, slot) in mixer.slots().iter().enumerate() {
+            mixer_channel_names[channel_index] = loaded.track_name(slot.track_id())?;
+            mixer_channel_kinds[channel_index] = match slot.kind() {
+                CompiledMixerTrackKind::Audio => IdeMixerChannelKind::Audio,
+                CompiledMixerTrackKind::Group => IdeMixerChannelKind::Group,
+                CompiledMixerTrackKind::Return => IdeMixerChannelKind::Return,
+            };
+            mixer_channel_states[channel_index] = mixer_parameters
+                .and_then(|state| state.channel(channel_index))
+                .map(|state| IdeMixerChannelState {
+                    gain: state.parameters().gain.value(),
+                    pan: state.parameters().pan.value(),
+                    muted: state.muted(),
+                    solo: state.solo(),
+                });
+        }
+        let mixer_main_state = mixer_parameters.map(|state| IdeMixerMainState {
+            gain: state.main_gain().value(),
+            muted: state.main_muted(),
+        });
         Some(RunningIdeSnapshot {
             project_id: project.package().manifest().project_id(),
             project_name: project.package().manifest().name(),
@@ -646,9 +769,14 @@ impl RunningDesktopIdeApplication {
             scene_count,
             scene_names,
             scene_availability,
+            mixer_channel_count,
+            mixer_channel_names,
+            mixer_channel_kinds,
+            mixer_channel_states,
+            mixer_main_state,
             output_state: session.output_status().state(),
             output: session.counters().snapshot(),
-            recovery: session.recovery_checkpoint().snapshot(),
+            recovery,
         })
     }
 
@@ -666,6 +794,77 @@ impl RunningDesktopIdeApplication {
             #[cfg(test)]
             IdePlaybackSessionOwner::Test(session) => {
                 session.commands.push(command);
+                Ok(())
+            }
+        }
+    }
+
+    /// Sends one validated base-mixer command through the only live owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns parameter-domain, channel-resolution, queue, or disconnection
+    /// evidence without publishing an optimistic state change.
+    pub fn try_send_mixer(&mut self, command: IdeMixerCommand) -> Result<(), IdeMixerCommandError> {
+        match &mut self.session {
+            IdePlaybackSessionOwner::Native(session) => {
+                let command = match command {
+                    IdeMixerCommand::ChannelGain {
+                        channel_index,
+                        gain_millionths,
+                    } => MixerParameterCommand::ChannelGain {
+                        channel: session
+                            .resolve_mixer_channel_index(channel_index)
+                            .map_err(IdeMixerCommandError::Resolve)?,
+                        gain: LinearGain::from_millionths(gain_millionths)
+                            .map_err(IdeMixerCommandError::Parameter)?,
+                    },
+                    IdeMixerCommand::ChannelPan {
+                        channel_index,
+                        pan_millionths,
+                    } => MixerParameterCommand::ChannelPan {
+                        channel: session
+                            .resolve_mixer_channel_index(channel_index)
+                            .map_err(IdeMixerCommandError::Resolve)?,
+                        pan: Pan::from_millionths(pan_millionths)
+                            .map_err(IdeMixerCommandError::Parameter)?,
+                    },
+                    IdeMixerCommand::ChannelMute {
+                        channel_index,
+                        muted,
+                    } => MixerParameterCommand::ChannelMute {
+                        channel: session
+                            .resolve_mixer_channel_index(channel_index)
+                            .map_err(IdeMixerCommandError::Resolve)?,
+                        muted,
+                    },
+                    IdeMixerCommand::ChannelSolo {
+                        channel_index,
+                        solo,
+                    } => MixerParameterCommand::ChannelSolo {
+                        channel: session
+                            .resolve_mixer_channel_index(channel_index)
+                            .map_err(IdeMixerCommandError::Resolve)?,
+                        solo,
+                    },
+                    IdeMixerCommand::MainGain { gain_millionths } => {
+                        MixerParameterCommand::MainGain {
+                            gain: LinearGain::from_millionths(gain_millionths)
+                                .map_err(IdeMixerCommandError::Parameter)?,
+                        }
+                    }
+                    IdeMixerCommand::MainMute { muted } => {
+                        MixerParameterCommand::MainMute { muted }
+                    }
+                };
+                session
+                    .try_send_mixer_parameter_command(command)
+                    .map_err(IdeMixerCommandError::Send)
+            }
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => {
+                validate_test_mixer_command(command)?;
+                session.mixer_commands.push(command);
                 Ok(())
             }
         }
@@ -733,6 +932,41 @@ impl RunningDesktopIdeApplication {
             }
         }
     }
+}
+
+#[cfg(test)]
+fn validate_test_mixer_command(command: IdeMixerCommand) -> Result<(), IdeMixerCommandError> {
+    let channel_index = match command {
+        IdeMixerCommand::ChannelGain {
+            channel_index,
+            gain_millionths,
+        } => {
+            LinearGain::from_millionths(gain_millionths)
+                .map_err(IdeMixerCommandError::Parameter)?;
+            Some(channel_index)
+        }
+        IdeMixerCommand::ChannelPan {
+            channel_index,
+            pan_millionths,
+        } => {
+            Pan::from_millionths(pan_millionths).map_err(IdeMixerCommandError::Parameter)?;
+            Some(channel_index)
+        }
+        IdeMixerCommand::ChannelMute { channel_index, .. }
+        | IdeMixerCommand::ChannelSolo { channel_index, .. } => Some(channel_index),
+        IdeMixerCommand::MainGain { gain_millionths } => {
+            LinearGain::from_millionths(gain_millionths)
+                .map_err(IdeMixerCommandError::Parameter)?;
+            None
+        }
+        IdeMixerCommand::MainMute { .. } => None,
+    };
+    if channel_index.is_some_and(|index| index >= MAX_IDE_MIXER_CHANNELS) {
+        return Err(IdeMixerCommandError::Resolve(
+            MixerParameterResolveError::ChannelNotFound,
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -997,5 +1231,73 @@ mod tests {
             running.close(),
             IdeCloseOutcome::Closed { failure: None, .. }
         ));
+    }
+
+    #[test]
+    fn running_owner_validates_and_serializes_base_mixer_commands() {
+        let application = DesktopIdeApplication::from_inventory(
+            config(256).unwrap(),
+            IdeAudioOutputInventory::default(),
+        );
+        let mut running = RunningDesktopIdeApplication {
+            application,
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        let commands = [
+            IdeMixerCommand::ChannelGain {
+                channel_index: 0,
+                gain_millionths: 1_250_000,
+            },
+            IdeMixerCommand::ChannelPan {
+                channel_index: 0,
+                pan_millionths: -250_000,
+            },
+            IdeMixerCommand::ChannelMute {
+                channel_index: 0,
+                muted: true,
+            },
+            IdeMixerCommand::ChannelSolo {
+                channel_index: 0,
+                solo: true,
+            },
+            IdeMixerCommand::MainGain {
+                gain_millionths: 750_000,
+            },
+            IdeMixerCommand::MainMute { muted: true },
+        ];
+        for command in commands {
+            running.try_send_mixer(command).unwrap();
+        }
+        assert_eq!(
+            running.try_send_mixer(IdeMixerCommand::ChannelGain {
+                channel_index: MAX_IDE_MIXER_CHANNELS,
+                gain_millionths: 1_000_000,
+            }),
+            Err(IdeMixerCommandError::Resolve(
+                MixerParameterResolveError::ChannelNotFound
+            ))
+        );
+        assert_eq!(
+            running.try_send_mixer(IdeMixerCommand::MainGain {
+                gain_millionths: 2_000_001,
+            }),
+            Err(IdeMixerCommandError::Parameter(
+                ParameterError::LinearGainOutOfRange
+            ))
+        );
+        assert_eq!(
+            running.try_send_mixer(IdeMixerCommand::ChannelPan {
+                channel_index: 0,
+                pan_millionths: -1_000_001,
+            }),
+            Err(IdeMixerCommandError::Parameter(
+                ParameterError::PanOutOfRange
+            ))
+        );
+
+        let IdePlaybackSessionOwner::Test(session) = &running.session else {
+            unreachable!("test constructed the deterministic session owner");
+        };
+        assert_eq!(session.mixer_commands, commands);
     }
 }

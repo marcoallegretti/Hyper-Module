@@ -14,9 +14,11 @@ use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSn
 
 use super::{
     DesktopIdeApplication, DesktopIdePendingClose, IdeApplicationConfig, IdeAudioOutputInventory,
-    IdeCloseOutcome, IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection,
-    IdeOutputSelectionError, IdePendingCloseWait, IdeProjectOpenError, IdeSceneAvailability,
-    OutputInventoryError, OutputStreamSnapshot, OutputStreamState, RunningDesktopIdeApplication,
+    IdeCloseOutcome, IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand,
+    IdeMixerCommandError, IdeMixerMainState, IdeNativeCloseFailure, IdeOutputDiscoveryError,
+    IdeOutputSelection, IdeOutputSelectionError, IdePendingCloseWait, IdeProjectOpenError,
+    IdeSceneAvailability, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
+    RunningDesktopIdeApplication,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -68,6 +70,7 @@ pub enum IdeWorkerCommandKind {
     SelectOutput,
     OpenProject,
     Transport,
+    Mixer,
     Observe,
     CloseProject,
     Shutdown,
@@ -81,6 +84,7 @@ pub enum IdeWorkerCommand {
     SelectOutput(String),
     OpenProject(PathBuf),
     Transport(TransportCommand),
+    Mixer(IdeMixerCommand),
     Observe,
     CloseProject,
     Shutdown,
@@ -96,6 +100,7 @@ impl IdeWorkerCommand {
             Self::SelectOutput(_) => IdeWorkerCommandKind::SelectOutput,
             Self::OpenProject(_) => IdeWorkerCommandKind::OpenProject,
             Self::Transport(_) => IdeWorkerCommandKind::Transport,
+            Self::Mixer(_) => IdeWorkerCommandKind::Mixer,
             Self::Observe => IdeWorkerCommandKind::Observe,
             Self::CloseProject => IdeWorkerCommandKind::CloseProject,
             Self::Shutdown => IdeWorkerCommandKind::Shutdown,
@@ -127,6 +132,8 @@ pub struct IdeRunningObservation {
     project_name: String,
     sample_rate_hz: u32,
     scenes: Vec<IdeScene>,
+    mixer_channels: Vec<IdeMixerChannel>,
+    mixer_main: Option<IdeMixerMainState>,
     output_state: OutputStreamState,
     output: OutputStreamSnapshot,
     recovery: PlaybackRecoverySnapshot,
@@ -138,6 +145,30 @@ pub struct IdeRunningObservation {
 pub struct IdeScene {
     name: String,
     availability: IdeSceneAvailability,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdeMixerChannel {
+    name: String,
+    kind: IdeMixerChannelKind,
+    state: Option<IdeMixerChannelState>,
+}
+
+impl IdeMixerChannel {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> IdeMixerChannelKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> Option<IdeMixerChannelState> {
+        self.state
+    }
 }
 
 impl IdeScene {
@@ -181,6 +212,16 @@ impl IdeRunningObservation {
     }
 
     #[must_use]
+    pub fn mixer_channels(&self) -> &[IdeMixerChannel] {
+        &self.mixer_channels
+    }
+
+    #[must_use]
+    pub const fn mixer_main(&self) -> Option<IdeMixerMainState> {
+        self.mixer_main
+    }
+
+    #[must_use]
     pub const fn output_state(&self) -> &OutputStreamState {
         &self.output_state
     }
@@ -207,6 +248,7 @@ pub enum IdeWorkerCommandFailure {
     OutputSelection(IdeOutputSelectionError),
     ProjectOpen(IdeProjectOpenError),
     Transport(super::DesktopDirectControlError),
+    Mixer(IdeMixerCommandError),
     InvalidState,
     Publication(OutputInventoryError),
     ProjectPublicationCapacityUnavailable,
@@ -220,6 +262,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::OutputSelection(source) => source.fmt(formatter),
             Self::ProjectOpen(source) => source.fmt(formatter),
             Self::Transport(source) => source.fmt(formatter),
+            Self::Mixer(source) => source.fmt(formatter),
             Self::InvalidState => {
                 formatter.write_str("command is invalid for the current IDE state")
             }
@@ -241,6 +284,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::OutputSelection(source) => Some(source),
             Self::ProjectOpen(source) => Some(source),
             Self::Transport(source) => Some(source),
+            Self::Mixer(source) => Some(source),
             Self::Publication(source) => Some(source),
             Self::InvalidState
             | Self::ProjectPublicationCapacityUnavailable
@@ -261,6 +305,7 @@ pub enum IdeWorkerEvent {
     },
     Running(IdeRunningObservation),
     TransportQueued(TransportCommand),
+    MixerQueued(IdeMixerCommand),
     Closing,
     CommandFailed {
         command: IdeWorkerCommandKind,
@@ -707,6 +752,15 @@ fn process_command(
             },
             _ => publish_failure(events, kind, IdeWorkerCommandFailure::InvalidState),
         },
+        IdeWorkerCommand::Mixer(command) => match state {
+            WorkerState::Running(application) => match application.try_send_mixer(command) {
+                Ok(()) => send_event(events, IdeWorkerEvent::MixerQueued(command)),
+                Err(reason) => {
+                    publish_failure(events, kind, IdeWorkerCommandFailure::Mixer(reason))
+                }
+            },
+            _ => publish_failure(events, kind, IdeWorkerCommandFailure::InvalidState),
+        },
         IdeWorkerCommand::Observe => publish_state(state, events, unpublished_native_failure),
         IdeWorkerCommand::CloseProject => {
             if !matches!(state, WorkerState::Running(_)) {
@@ -835,11 +889,24 @@ fn running_observation(
             availability: snapshot.scene_availability[scene_index],
         });
     }
+    let mut mixer_channels = Vec::new();
+    mixer_channels
+        .try_reserve_exact(snapshot.mixer_channel_count)
+        .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
+    for channel_index in 0..snapshot.mixer_channel_count {
+        mixer_channels.push(IdeMixerChannel {
+            name: try_project_owned(snapshot.mixer_channel_names[channel_index])?,
+            kind: snapshot.mixer_channel_kinds[channel_index],
+            state: snapshot.mixer_channel_states[channel_index],
+        });
+    }
     Ok(IdeRunningObservation {
         project_id,
         project_name,
         sample_rate_hz: snapshot.sample_rate_hz,
         scenes,
+        mixer_channels,
+        mixer_main: snapshot.mixer_main_state,
         output_state: snapshot.output_state,
         output: snapshot.output,
         recovery: snapshot.recovery,
@@ -1023,7 +1090,7 @@ mod tests {
     }
 
     #[test]
-    fn running_worker_queues_transport_and_closes_before_shutdown() {
+    fn running_worker_queues_runtime_commands_and_closes_before_shutdown() {
         let running = RunningDesktopIdeApplication {
             application: closed_application(),
             session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
@@ -1042,6 +1109,15 @@ mod tests {
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::TransportQueued(TransportCommand::Start)
+        ));
+        worker
+            .try_send(IdeWorkerCommand::Mixer(IdeMixerCommand::MainMute {
+                muted: true,
+            }))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::MixerQueued(IdeMixerCommand::MainMute { muted: true })
         ));
         worker.try_send(IdeWorkerCommand::CloseProject).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));

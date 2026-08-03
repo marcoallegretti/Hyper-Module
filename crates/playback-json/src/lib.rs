@@ -241,6 +241,7 @@ pub struct MediaAssetFact<'a> {
 #[derive(Clone, Debug)]
 struct LoadedTrack {
     id: String,
+    name: String,
     kind: TrackKind,
     order: u8,
     active: bool,
@@ -925,6 +926,15 @@ impl LoadedPlaybackProject {
         self.tracks.iter().position(|track| track.id == track_id)
     }
 
+    /// Returns a validated structural track name by stable identity.
+    #[must_use]
+    pub fn track_name(&self, track_id: &str) -> Option<&str> {
+        self.tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map(|track| track.name.as_str())
+    }
+
     #[must_use]
     pub fn is_audio_track(&self, track_id: &str) -> bool {
         self.tracks
@@ -1423,6 +1433,7 @@ fn load_track(
     }
     Ok(LoadedTrack {
         id: document.id,
+        name: document.name,
         kind,
         order: document.order,
         active: document.active,
@@ -3303,6 +3314,11 @@ mod tests {
         .unwrap();
         assert_eq!(loaded.project_id(), PROJECT_ID);
         assert_eq!(loaded.track_count(), 1);
+        assert_eq!(
+            loaded.track_name("018f47a2-6b2d-7c11-8a44-001122334456"),
+            Some("Audio")
+        );
+        assert_eq!(loaded.track_name("missing"), None);
         assert_eq!(loaded.clip_count(), 1);
         assert_eq!(loaded.placement_count(), 1);
         let schedule = loaded
