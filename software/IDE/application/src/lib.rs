@@ -22,9 +22,9 @@ use hyper_mixer_runtime::{
     LatestOutputMeterSnapshot, MixerParameterCommand, MixerParameterResolveError,
     PlaybackRecoverySnapshot,
 };
+pub use hyper_mixer_runtime::{LocateState, PlaybackRecoveryTransportState, TransportCommand};
 #[cfg(test)]
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
-pub use hyper_mixer_runtime::{PlaybackRecoveryTransportState, TransportCommand};
 use hyper_playback_json::{CompiledMixerTrackKind, LoaderLimits};
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::ProjectPlaybackLimits;
@@ -1209,6 +1209,10 @@ mod tests {
         };
         for command in [
             TransportCommand::Start,
+            TransportCommand::Locate {
+                frame: 0,
+                state: LocateState::Preserve,
+            },
             TransportCommand::LaunchScene { scene_index: 2 },
             TransportCommand::Stop,
         ] {
@@ -1221,6 +1225,10 @@ mod tests {
             session.commands,
             [
                 TransportCommand::Start,
+                TransportCommand::Locate {
+                    frame: 0,
+                    state: LocateState::Preserve,
+                },
                 TransportCommand::LaunchScene { scene_index: 2 },
                 TransportCommand::Stop,
             ]

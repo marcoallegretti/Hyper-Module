@@ -12,7 +12,7 @@ use hyper_desktop_ide::{
     IdeMixerChannelKind, IdeMixerCommand, IdeNativeCloseFailure, IdeOutputSelection,
     IdeRunningObservation, IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind,
     IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
-    IdeWorkerShutdownReport, PlaybackRecoveryTransportState, TransportCommand,
+    IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState, TransportCommand,
     desktop_ide_application_config,
 };
 use slint::platform::PlatformError;
@@ -217,6 +217,16 @@ fn bind_playback_callbacks(ui: &MainWindow, worker: &WorkerCell) {
             &weak,
             &worker_for_stop,
             IdeWorkerCommand::Transport(TransportCommand::Stop),
+        );
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_return = Rc::clone(worker);
+    actions.on_transport_return_start(move || {
+        submit(
+            &weak,
+            &worker_for_return,
+            IdeWorkerCommand::Transport(return_to_start_command()),
         );
     });
 
@@ -501,7 +511,11 @@ fn apply_event(ui: &MainWindow, output_routes: &OutputRoutes, event: IdeWorkerEv
                     )
                     .into(),
             );
-            ui.set_frame_position(observation.recovery().position_frame().to_string().into());
+            let position_frame = observation.recovery().position_frame();
+            ui.set_frame_position(position_frame.to_string().into());
+            ui.set_transport_clock(
+                format_transport_clock(position_frame, observation.sample_rate_hz()).into(),
+            );
             ui.set_transport_state(
                 match observation.recovery().state() {
                     PlaybackRecoveryTransportState::Stopped => "Stopped",
@@ -625,6 +639,7 @@ fn reset_project(ui: &MainWindow) {
     ui.set_transport_state("Stopped".into());
     ui.set_stream_state("No stream".into());
     ui.set_frame_position("0".into());
+    ui.set_transport_clock("00:00:00.000".into());
     ui.set_callback_count("0".into());
     ui.set_xrun_count("Unavailable".into());
     ui.set_left_meter(0.0);
@@ -889,6 +904,27 @@ fn meter_presentation(sample_peak: Option<f32>) -> (f32, String) {
     )
 }
 
+fn format_transport_clock(frame: usize, sample_rate_hz: u32) -> String {
+    if sample_rate_hz == 0 {
+        return "—".to_owned();
+    }
+    let total_milliseconds = (frame as u128 * 1_000) / u128::from(sample_rate_hz);
+    let milliseconds = total_milliseconds % 1_000;
+    let total_seconds = total_milliseconds / 1_000;
+    let seconds = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let minutes = total_minutes % 60;
+    let hours = total_minutes / 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}")
+}
+
+const fn return_to_start_command() -> TransportCommand {
+    TransportCommand::Locate {
+        frame: 0,
+        state: LocateState::Preserve,
+    }
+}
+
 fn native_failure_message(failure: IdeNativeCloseFailure) -> String {
     match failure {
         IdeNativeCloseFailure::RuntimeFailed => {
@@ -1023,6 +1059,26 @@ mod tests {
         assert_eq!(meter_presentation(Some(0.0)), (0.0, "-60.0 dB".to_owned()));
         assert_eq!(meter_presentation(Some(1.0)), (1.0, "0.0 dB".to_owned()));
         assert!((meter_presentation(Some(2.0)).0 - 1.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn transport_clock_uses_authoritative_frames_without_rounding_ahead() {
+        assert_eq!(format_transport_clock(0, 48_000), "00:00:00.000");
+        assert_eq!(format_transport_clock(71_999, 48_000), "00:00:01.499");
+        assert_eq!(format_transport_clock(72_000, 48_000), "00:00:01.500");
+        assert_eq!(format_transport_clock(172_800_000, 48_000), "01:00:00.000");
+        assert_eq!(format_transport_clock(1, 0), "—");
+    }
+
+    #[test]
+    fn return_to_start_preserves_the_observed_transport_state() {
+        assert_eq!(
+            return_to_start_command(),
+            TransportCommand::Locate {
+                frame: 0,
+                state: LocateState::Preserve,
+            }
+        );
     }
 
     #[test]

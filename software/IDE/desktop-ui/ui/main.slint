@@ -38,6 +38,7 @@ export global IdeActions {
     callback choose-project();
     callback transport-start();
     callback transport-stop();
+    callback transport-return-start();
     callback launch-scene(int);
     callback mixer-channel-gain(int, float);
     callback mixer-channel-pan(int, float);
@@ -118,6 +119,7 @@ export component MainWindow inherits Window {
     in property <string> transport-state: "Stopped";
     in property <string> stream-state: "No stream";
     in property <string> frame-position: "0";
+    in property <string> transport-clock: "00:00:00.000";
     in property <string> callback-count: "0";
     in property <string> xrun-count: "Unavailable";
     in property <float> left-meter: 0;
@@ -284,12 +286,19 @@ export component MainWindow inherits Window {
                                     clicked => { IdeActions.transport-stop(); }
                                 }
                                 Button {
+                                    text: "|◀  Return";
+                                    accessible-label: "Return transport to start";
+                                    enabled: root.app-mode == AppMode.running;
+                                    clicked => { IdeActions.transport-return-start(); }
+                                }
+                                Button {
                                     text: "Close project";
                                     enabled: root.app-mode == AppMode.running;
                                     clicked => { IdeActions.close-project(); }
                                 }
                             }
-                            Text { text: "Frame  " + root.frame-position; color: #8fa0b4; font-size: 12px; }
+                            Text { text: root.transport-clock; color: #dce5ef; font-size: 18px; font-weight: 600; horizontal-alignment: center; }
+                            Text { text: "Frame  " + root.frame-position; color: #8fa0b4; font-size: 11px; horizontal-alignment: center; }
                         }
                         Meter { width: 64px; level: root.left-meter; channel-name: "LEFT"; reading: root.left-reading; }
                         Meter { width: 64px; level: root.right-meter; channel-name: "RIGHT"; reading: root.right-reading; }
