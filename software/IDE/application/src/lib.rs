@@ -18,6 +18,16 @@ use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, T
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
 use hyper_project_loader::ProjectPlaybackLimits;
 
+mod worker;
+
+pub use worker::{
+    DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeClosedSnapshot, IdeRunningObservation,
+    IdeWorkerCommand, IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent,
+    IdeWorkerEventReceiveError, IdeWorkerJoinError, IdeWorkerPendingShutdownWait,
+    IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, IdeWorkerStartError,
+    MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS, desktop_ide_worker_supervisor_snapshot,
+};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdeAudioOutput {
     routing_id: String,
@@ -57,6 +67,10 @@ impl IdeAudioOutput {
     #[must_use]
     pub fn display_name(&self) -> &str {
         &self.display_name
+    }
+
+    fn try_to_owned(&self) -> Result<Self, OutputInventoryError> {
+        Self::try_new(&self.routing_id, &self.display_name)
     }
 }
 
@@ -160,6 +174,17 @@ impl IdeAudioOutputInventory {
         self.outputs
             .iter()
             .find(|output| output.routing_id == routing_id)
+    }
+
+    fn try_to_owned(&self) -> Result<Self, OutputInventoryError> {
+        let mut outputs = Vec::new();
+        outputs
+            .try_reserve_exact(self.outputs.len())
+            .map_err(|_| OutputInventoryError::CapacityUnavailable)?;
+        for output in &self.outputs {
+            outputs.push(output.try_to_owned()?);
+        }
+        Ok(Self { outputs })
     }
 }
 
@@ -487,6 +512,7 @@ enum IdePlaybackSessionOwner {
 struct TestPlaybackSession {
     commands: Vec<TransportCommand>,
     meters: OutputMeterReceiver,
+    close_failure: Option<IdeNativeCloseFailure>,
 }
 
 #[cfg(test)]
@@ -495,6 +521,7 @@ impl Default for TestPlaybackSession {
         Self {
             commands: Vec::new(),
             meters: output_meter_channel().1,
+            close_failure: None,
         }
     }
 }
@@ -580,10 +607,10 @@ impl RunningDesktopIdeApplication {
         let session = match session {
             IdePlaybackSessionOwner::Native(session) => session,
             #[cfg(test)]
-            IdePlaybackSessionOwner::Test(_) => {
+            IdePlaybackSessionOwner::Test(session) => {
                 return IdeCloseOutcome::Closed {
                     application,
-                    failure: None,
+                    failure: session.close_failure,
                 };
             }
         };

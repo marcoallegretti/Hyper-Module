@@ -537,6 +537,7 @@ dependencies = [
  "hyper-playback-json",
  "hyper-playback-session",
  "hyper-project-loader",
+ "hyper-thread-supervisor",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@ workspace = true
 hyper-desktop-audio = { path = "../audio-backend" }
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
 hyper-project-loader = { path = "../../../crates/project-loader" }
+hyper-thread-supervisor = { path = "../../../crates/thread-supervisor" }
 
 [dev-dependencies]
 hyper-audio-source = { path = "../../../crates/audio-source" }
