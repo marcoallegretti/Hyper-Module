@@ -1181,6 +1181,8 @@ fn live_mixer_targets_resolve_from_compiled_numeric_addresses() {
 
     assert_eq!(sender.resolve_channel_index(0), Ok(source));
     assert_eq!(sender.resolve_send_address(0, 0), Ok(send_a));
+    assert_eq!(sender.channel_index(source), Ok(0));
+    assert_eq!(sender.send_address(send_a), Ok((0, 0)));
     assert_eq!(
         sender.resolve_channel_index(usize::MAX),
         Err(MixerParameterResolveError::ChannelNotFound)

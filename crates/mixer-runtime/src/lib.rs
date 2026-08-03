@@ -624,6 +624,20 @@ impl MixerParameterLayout {
             .ok_or(MixerParameterResolveError::SendNotFound)
     }
 
+    fn channel_index(
+        &self,
+        channel: MixerChannelHandle,
+    ) -> Result<usize, MixerParameterTargetError> {
+        self.validate_channel(channel).map(|_| channel.slot)
+    }
+
+    fn send_address(
+        &self,
+        send: MixerSendHandle,
+    ) -> Result<(usize, usize), MixerParameterTargetError> {
+        self.validate_send(send).map(|()| (send.slot, send.send))
+    }
+
     fn validate(&self, command: MixerParameterCommand) -> Result<(), MixerParameterTargetError> {
         match command {
             MixerParameterCommand::ChannelGain { channel, .. }
@@ -748,6 +762,32 @@ impl MixerParameterCommandSender {
         send_index: usize,
     ) -> Result<MixerSendHandle, MixerParameterResolveError> {
         self.layout.resolve_send_address(channel_index, send_index)
+    }
+
+    /// Returns the compiled numeric address for an opaque channel handle bound
+    /// to this runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns a foreign-channel rejection for a handle from another runtime.
+    pub fn channel_index(
+        &self,
+        channel: MixerChannelHandle,
+    ) -> Result<usize, MixerParameterTargetError> {
+        self.layout.channel_index(channel)
+    }
+
+    /// Returns the compiled numeric address for an opaque send handle bound to
+    /// this runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns a foreign-send rejection for a handle from another runtime.
+    pub fn send_address(
+        &self,
+        send: MixerSendHandle,
+    ) -> Result<(usize, usize), MixerParameterTargetError> {
+        self.layout.send_address(send)
     }
 
     /// Validates one command against this runtime's opaque target layout

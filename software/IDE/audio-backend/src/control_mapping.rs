@@ -4,17 +4,47 @@ use core::fmt;
 use hyper_audio_engine::{LinearGain, Pan, ParameterError};
 use hyper_control_mappings::{ChannelParameter, MainParameter, SendParameter};
 use hyper_control_runtime::{
-    BooleanControlTarget, ControlRuntime, RuntimeControlCommand, RuntimeControlSink,
-    RuntimeControlTarget,
+    BooleanControlTarget, ControlRuntime, DirectControlStateUpdate, RuntimeControlCommand,
+    RuntimeControlSink, RuntimeControlTarget,
 };
 use hyper_mixer_runtime::{
-    LocateState, MixerParameterCommand, MixerParameterCommandSendError,
+    LocateState, MixerChannelHandle, MixerParameterCommand, MixerParameterCommandSendError,
     MixerParameterCommandSender, MixerParameterResolveError, MixerParameterTargetError,
-    PlaybackRecoveryCheckpoint, PlaybackRecoveryTransportState, TransportCommand,
+    MixerSendHandle, PlaybackRecoveryCheckpoint, PlaybackRecoveryTransportState, TransportCommand,
     TransportCommandSendError, TransportCommandSender,
 };
 
 pub type DesktopControlMappingRuntime = ControlRuntime<DesktopControlSink>;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DesktopDirectControlCommand {
+    Mixer(MixerParameterCommand),
+    Transport(TransportCommand),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DesktopDirectControlError {
+    Mixer(MixerParameterCommandSendError),
+    Transport(TransportCommandSendError),
+}
+
+impl fmt::Display for DesktopDirectControlError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mixer(source) => source.fmt(formatter),
+            Self::Transport(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for DesktopDirectControlError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Mixer(source) => Some(source),
+            Self::Transport(source) => Some(source),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum DesktopControlSinkError {
@@ -70,6 +100,73 @@ impl DesktopControlSink {
             transport,
             mixer,
             recovery,
+        }
+    }
+
+    /// Resolves one persisted track identity through the owned mixer layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing-channel rejection.
+    pub fn resolve_channel(
+        &self,
+        track_id: &str,
+    ) -> Result<MixerChannelHandle, MixerParameterResolveError> {
+        self.mixer.resolve_channel(track_id)
+    }
+
+    /// Resolves one persisted send identity through the owned mixer layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing-send rejection.
+    pub fn resolve_send(
+        &self,
+        send_id: &str,
+    ) -> Result<MixerSendHandle, MixerParameterResolveError> {
+        self.mixer.resolve_send(send_id)
+    }
+
+    fn direct_mixer_update(
+        &self,
+        command: MixerParameterCommand,
+    ) -> Result<DirectControlStateUpdate, MixerParameterTargetError> {
+        match command {
+            MixerParameterCommand::ChannelMute { channel, muted } => {
+                Ok(DirectControlStateUpdate::Boolean {
+                    target: BooleanControlTarget::ChannelMute {
+                        channel_index: self.mixer.channel_index(channel)?,
+                    },
+                    value: muted,
+                })
+            }
+            MixerParameterCommand::ChannelSolo { channel, solo } => {
+                Ok(DirectControlStateUpdate::Boolean {
+                    target: BooleanControlTarget::ChannelSolo {
+                        channel_index: self.mixer.channel_index(channel)?,
+                    },
+                    value: solo,
+                })
+            }
+            MixerParameterCommand::SendEnabled { send, enabled } => {
+                let (channel_index, send_index) = self.mixer.send_address(send)?;
+                Ok(DirectControlStateUpdate::Boolean {
+                    target: BooleanControlTarget::SendEnabled {
+                        channel_index,
+                        send_index,
+                    },
+                    value: enabled,
+                })
+            }
+            MixerParameterCommand::MainMute { muted } => Ok(DirectControlStateUpdate::Boolean {
+                target: BooleanControlTarget::MainMute,
+                value: muted,
+            }),
+            MixerParameterCommand::ChannelGain { .. }
+            | MixerParameterCommand::ChannelPan { .. }
+            | MixerParameterCommand::SendGain { .. }
+            | MixerParameterCommand::SendPan { .. }
+            | MixerParameterCommand::MainGain { .. } => Ok(DirectControlStateUpdate::Unchanged),
         }
     }
 
@@ -175,6 +272,8 @@ impl DesktopControlSink {
 
 impl RuntimeControlSink for DesktopControlSink {
     type Error = DesktopControlSinkError;
+    type DirectCommand = DesktopDirectControlCommand;
+    type DirectError = DesktopDirectControlError;
 
     fn validate_target(&self, target: RuntimeControlTarget) -> Result<(), Self::Error> {
         let command = match target {
@@ -286,5 +385,49 @@ impl RuntimeControlSink for DesktopControlSink {
         self.mixer
             .try_send(command)
             .map_err(DesktopControlSinkError::MixerSend)
+    }
+
+    fn try_send_direct(
+        &mut self,
+        command: Self::DirectCommand,
+    ) -> Result<DirectControlStateUpdate, Self::DirectError> {
+        match command {
+            DesktopDirectControlCommand::Mixer(command) => {
+                let update = self.direct_mixer_update(command).map_err(|source| {
+                    DesktopDirectControlError::Mixer(
+                        MixerParameterCommandSendError::InvalidTarget { command, source },
+                    )
+                })?;
+                self.mixer
+                    .try_send(command)
+                    .map_err(DesktopDirectControlError::Mixer)?;
+                Ok(update)
+            }
+            DesktopDirectControlCommand::Transport(command) => {
+                self.transport
+                    .try_send(command)
+                    .map_err(DesktopDirectControlError::Transport)?;
+                Ok(match command {
+                    TransportCommand::Start => {
+                        DirectControlStateUpdate::Transport { rolling: true }
+                    }
+                    TransportCommand::Stop => {
+                        DirectControlStateUpdate::Transport { rolling: false }
+                    }
+                    TransportCommand::Locate {
+                        state: LocateState::Stopped,
+                        ..
+                    } => DirectControlStateUpdate::Transport { rolling: false },
+                    TransportCommand::Locate {
+                        state: LocateState::Rolling,
+                        ..
+                    } => DirectControlStateUpdate::Transport { rolling: true },
+                    TransportCommand::Locate {
+                        state: LocateState::Preserve,
+                        ..
+                    } => DirectControlStateUpdate::Unchanged,
+                })
+            }
+        }
     }
 }

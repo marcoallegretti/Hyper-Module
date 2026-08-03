@@ -4,6 +4,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+#[path = "../../../../test-support/realtime_allocator.rs"]
+mod realtime_allocator;
+
 use hyper_control_mappings::{
     ChannelParameter, ControlBinding, ControlMappingDocument, ControlMappingProject, ControlScope,
     ControlSource, ControlTarget, ControlTransform, CueParameter, Edge, MainParameter, SceneAction,
@@ -12,10 +15,11 @@ use hyper_control_mappings::{
 use hyper_control_runtime::{
     BooleanControlTarget, ControlBindingAvailability, ControlBindingUnavailableReason,
     ControlContext, ControlDispatchError, ControlDispatchOutcome, ControlEvent, ControlRuntime,
-    ControlRuntimeBuildErrorReason, RuntimeControlCommand, RuntimeControlSink,
-    RuntimeControlTarget,
+    ControlRuntimeBuildErrorReason, DirectControlStateUpdate, RuntimeControlCommand,
+    RuntimeControlSink, RuntimeControlTarget,
 };
 use hyper_mapping_compiler::{ControlMappingResolver, MixerSendAddress, compile_control_mapping};
+use realtime_allocator::HeapMeasurement;
 
 const PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334455";
 const MAPPING_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334474";
@@ -112,6 +116,8 @@ struct Sink {
 
 impl RuntimeControlSink for Sink {
     type Error = SinkError;
+    type DirectCommand = RuntimeControlCommand;
+    type DirectError = SinkError;
 
     fn validate_target(&self, target: RuntimeControlTarget) -> Result<(), Self::Error> {
         if self.invalid_target == Some(target) {
@@ -146,6 +152,36 @@ impl RuntimeControlSink for Sink {
             self.commands.push(command);
             Ok(())
         }
+    }
+
+    fn try_send_direct(
+        &mut self,
+        command: Self::DirectCommand,
+    ) -> Result<DirectControlStateUpdate, Self::DirectError> {
+        self.try_send(command)?;
+        Ok(match command {
+            RuntimeControlCommand::MainMute { muted } => DirectControlStateUpdate::Boolean {
+                target: BooleanControlTarget::MainMute,
+                value: muted,
+            },
+            RuntimeControlCommand::TransportStart => {
+                DirectControlStateUpdate::Transport { rolling: true }
+            }
+            RuntimeControlCommand::TransportStop => {
+                DirectControlStateUpdate::Transport { rolling: false }
+            }
+            RuntimeControlCommand::ChannelGain { .. }
+            | RuntimeControlCommand::ChannelPan { .. }
+            | RuntimeControlCommand::ChannelMute { .. }
+            | RuntimeControlCommand::ChannelSolo { .. }
+            | RuntimeControlCommand::SendGain { .. }
+            | RuntimeControlCommand::SendPan { .. }
+            | RuntimeControlCommand::SendEnabled { .. }
+            | RuntimeControlCommand::MainGain { .. }
+            | RuntimeControlCommand::TransportLocateStartPreserve => {
+                DirectControlStateUpdate::Unchanged
+            }
+        })
     }
 }
 
@@ -531,4 +567,154 @@ fn transport_toggle_uses_owned_shadow_between_audio_cycles() {
             RuntimeControlCommand::TransportStop,
         ]
     );
+}
+
+#[test]
+fn direct_software_commands_share_and_rollback_mapping_shadows() {
+    let compiled = table(vec![
+        trigger_binding(
+            500,
+            ControlScope::MixerPage,
+            TriggerBehavior::Toggle,
+            ControlTarget::MixerMain {
+                parameter: MainParameter::Mute,
+            },
+        ),
+        trigger_binding(
+            501,
+            ControlScope::Track {
+                track_id: TRACK_ID.to_owned(),
+            },
+            TriggerBehavior::Invoke,
+            ControlTarget::Transport {
+                action: TransportAction::Toggle,
+            },
+        ),
+    ]);
+    let sink = Sink {
+        booleans: vec![(BooleanControlTarget::MainMute, false)],
+        transport_rolling: Some(false),
+        reject_on_attempt: Some(2),
+        ..Sink::default()
+    };
+    let mut runtime = ControlRuntime::try_new(compiled, sink).unwrap();
+
+    runtime
+        .try_send_direct(RuntimeControlCommand::MainMute { muted: true })
+        .unwrap();
+    assert_eq!(
+        runtime.try_send_direct(RuntimeControlCommand::TransportStart),
+        Err(SinkError::Rejected)
+    );
+    runtime
+        .dispatch(
+            ControlEvent::Clock { edge: Edge::Rising },
+            ControlContext::new(true, None, None),
+        )
+        .unwrap();
+    runtime
+        .dispatch(
+            ControlEvent::Clock { edge: Edge::Rising },
+            ControlContext::new(false, Some(0), None),
+        )
+        .unwrap();
+    assert_eq!(
+        runtime.sink().commands,
+        [
+            RuntimeControlCommand::MainMute { muted: true },
+            RuntimeControlCommand::MainMute { muted: false },
+            RuntimeControlCommand::TransportStart,
+        ]
+    );
+}
+
+#[test]
+fn dispatch_paths_perform_zero_heap_operations() {
+    let mut live = ControlRuntime::try_new(
+        table(vec![trigger_binding(
+            500,
+            ControlScope::Global,
+            TriggerBehavior::Toggle,
+            ControlTarget::MixerMain {
+                parameter: MainParameter::Mute,
+            },
+        )]),
+        Sink {
+            booleans: vec![(BooleanControlTarget::MainMute, false)],
+            commands: Vec::with_capacity(1),
+            ..Sink::default()
+        },
+    )
+    .unwrap();
+    let mut unavailable = ControlRuntime::try_new(
+        table(vec![cv_binding(
+            501,
+            ControlScope::Global,
+            ControlTarget::MixerCue {
+                parameter: CueParameter::Gain,
+            },
+        )]),
+        Sink::default(),
+    )
+    .unwrap();
+    let mut ambiguous = ControlRuntime::try_new(
+        table(vec![
+            cv_binding(
+                502,
+                ControlScope::Global,
+                ControlTarget::MixerMain {
+                    parameter: MainParameter::Gain,
+                },
+            ),
+            cv_binding(
+                503,
+                ControlScope::MixerPage,
+                ControlTarget::MixerChannel {
+                    track_id: TRACK_ID.to_owned(),
+                    parameter: ChannelParameter::Pan,
+                },
+            ),
+        ]),
+        Sink::default(),
+    )
+    .unwrap();
+
+    let measurement = HeapMeasurement::start_verified();
+    assert!(matches!(
+        live.dispatch(
+            ControlEvent::Clock { edge: Edge::Rising },
+            ControlContext::default(),
+        ),
+        Ok(ControlDispatchOutcome::Sent { .. })
+    ));
+    assert_eq!(
+        live.dispatch(
+            ControlEvent::Reset { edge: Edge::Rising },
+            ControlContext::default(),
+        ),
+        Ok(ControlDispatchOutcome::NoMatch)
+    );
+    assert!(matches!(
+        unavailable.dispatch(
+            ControlEvent::Cv {
+                input_index: 0,
+                value: 0,
+            },
+            ControlContext::default(),
+        ),
+        Ok(ControlDispatchOutcome::Unavailable { .. })
+    ));
+    assert!(matches!(
+        ambiguous.dispatch(
+            ControlEvent::Cv {
+                input_index: 0,
+                value: 0,
+            },
+            ControlContext::new(true, None, None),
+        ),
+        Err(ControlDispatchError::Ambiguous { .. })
+    ));
+    let heap_operations = measurement.finish();
+
+    assert_eq!(heap_operations, 0);
 }

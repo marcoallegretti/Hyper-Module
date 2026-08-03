@@ -5,9 +5,10 @@ use super::pipewire_output::PipeWireThreadRunner;
 use super::wasapi_output::WasapiThreadRunner;
 use super::{
     CheckpointedOutputProcessor, DesktopControlMappingRuntime, DesktopControlSink,
-    DesktopControlSinkError, DesktopInputStartError, DesktopInputStopError,
-    DesktopMonitoringConfig, DesktopMonitoringControl, DesktopOutputConfig, MonitoringSnapshot,
-    OutputStreamCounters, OutputStreamStatus, PendingNativeShutdown, PendingNativeShutdownWait,
+    DesktopControlSinkError, DesktopDirectControlCommand, DesktopDirectControlError,
+    DesktopInputStartError, DesktopInputStopError, DesktopMonitoringConfig,
+    DesktopMonitoringControl, DesktopOutputConfig, MonitoringSnapshot, OutputStreamCounters,
+    OutputStreamStatus, PendingNativeShutdown, PendingNativeShutdownWait,
     PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
 };
 #[cfg(all(target_os = "linux", target_endian = "little"))]
@@ -29,10 +30,12 @@ use hyper_control_runtime::{ControlRuntime, ControlRuntimeBuildErrorReason};
 use hyper_mapping_compiler::{CompiledControlMappingTable, ControlMappingCompileError};
 use hyper_media_cache::{DecodedMediaCache, PreparePlaybackError};
 use hyper_mixer_runtime::{
-    LoudnessCommandSender, MixerParameterCommandSender, MixerParameterStateRestoreError,
+    LoudnessCommandSender, MixerChannelHandle, MixerParameterCommand, MixerParameterCommandSender,
+    MixerParameterResolveError, MixerParameterStateRestoreError, MixerSendHandle,
     OutputMeterReceiver, RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError,
-    TransportCommandSender, TransportOutputCreationError, TransportOutputProcessor,
-    loudness_command_channel, output_meter_channel, playback_recovery_channel,
+    TransportCommand, TransportCommandSender, TransportOutputCreationError,
+    TransportOutputProcessor, loudness_command_channel, output_meter_channel,
+    playback_recovery_channel,
 };
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
@@ -452,6 +455,53 @@ enum SessionControlHandles {
         mixer: MixerParameterCommandSender,
     },
     Mapping(DesktopControlMappingRuntime),
+}
+
+impl SessionControlHandles {
+    fn try_send_transport(
+        &mut self,
+        command: TransportCommand,
+    ) -> Result<(), DesktopDirectControlError> {
+        match self {
+            Self::Direct { transport, .. } => transport
+                .try_send(command)
+                .map_err(DesktopDirectControlError::Transport),
+            Self::Mapping(runtime) => {
+                runtime.try_send_direct(DesktopDirectControlCommand::Transport(command))
+            }
+        }
+    }
+
+    fn resolve_channel(
+        &self,
+        track_id: &str,
+    ) -> Result<MixerChannelHandle, MixerParameterResolveError> {
+        match self {
+            Self::Direct { mixer, .. } => mixer.resolve_channel(track_id),
+            Self::Mapping(runtime) => runtime.sink().resolve_channel(track_id),
+        }
+    }
+
+    fn resolve_send(&self, send_id: &str) -> Result<MixerSendHandle, MixerParameterResolveError> {
+        match self {
+            Self::Direct { mixer, .. } => mixer.resolve_send(send_id),
+            Self::Mapping(runtime) => runtime.sink().resolve_send(send_id),
+        }
+    }
+
+    fn try_send_mixer(
+        &mut self,
+        command: MixerParameterCommand,
+    ) -> Result<(), DesktopDirectControlError> {
+        match self {
+            Self::Direct { mixer, .. } => mixer
+                .try_send(command)
+                .map_err(DesktopDirectControlError::Mixer),
+            Self::Mapping(runtime) => {
+                runtime.try_send_direct(DesktopDirectControlCommand::Mixer(command))
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1349,25 +1399,54 @@ impl DesktopPlaybackSession {
         }
     }
 
-    #[must_use]
-    /// Returns direct transport control only for sessions without a compiled mapping.
+    /// Sends one ordinary IDE transport command through the session's only
+    /// control owner.
     ///
-    /// Mapped sessions retain exclusive ownership so toggle state cannot diverge
-    /// from commands sent through another application-thread authority.
-    pub fn command_sender(&mut self) -> Option<&mut TransportCommandSender> {
-        match &mut self.controls {
-            SessionControlHandles::Direct { transport, .. } => Some(transport),
-            SessionControlHandles::Mapping(_) => None,
-        }
+    /// # Errors
+    ///
+    /// Returns the original bounded-queue rejection.
+    pub fn try_send_transport_command(
+        &mut self,
+        command: TransportCommand,
+    ) -> Result<(), DesktopDirectControlError> {
+        self.controls.try_send_transport(command)
     }
 
-    #[must_use]
-    /// Returns direct mixer control only for sessions without a compiled mapping.
-    pub fn mixer_parameter_command_sender(&mut self) -> Option<&mut MixerParameterCommandSender> {
-        match &mut self.controls {
-            SessionControlHandles::Direct { mixer, .. } => Some(mixer),
-            SessionControlHandles::Mapping(_) => None,
-        }
+    /// Resolves one track identity through this session's mixer layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing-channel rejection.
+    pub fn resolve_mixer_channel(
+        &self,
+        track_id: &str,
+    ) -> Result<MixerChannelHandle, MixerParameterResolveError> {
+        self.controls.resolve_channel(track_id)
+    }
+
+    /// Resolves one send identity through this session's mixer layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing-send rejection.
+    pub fn resolve_mixer_send(
+        &self,
+        send_id: &str,
+    ) -> Result<MixerSendHandle, MixerParameterResolveError> {
+        self.controls.resolve_send(send_id)
+    }
+
+    /// Sends one ordinary IDE mixer command through the session's only control
+    /// owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original target or bounded-queue rejection.
+    pub fn try_send_mixer_parameter_command(
+        &mut self,
+        command: MixerParameterCommand,
+    ) -> Result<(), DesktopDirectControlError> {
+        self.controls.try_send_mixer(command)
     }
 
     #[must_use]
@@ -1826,7 +1905,14 @@ mod tests {
     use crate::{BoundedBackendThread, acquire_backend_thread_permit};
     use hyper_audio_source::DecodeLimits;
     use hyper_audio_source::DecodedAudio;
+    use hyper_control_mappings::{
+        ChannelParameter, ControlBinding, ControlMappingDocument, ControlMappingProject,
+        ControlScope, ControlSource, ControlTarget, ControlTransform, Edge, TriggerBehavior,
+    };
     use hyper_control_runtime::RuntimeControlSink;
+    use hyper_mapping_compiler::{
+        ControlMappingResolver, MixerSendAddress, compile_control_mapping,
+    };
     use hyper_media_cache::CacheLimits;
     #[cfg(all(target_os = "linux", target_endian = "little"))]
     use hyper_mixer_runtime::{LocateState, PlaybackRecoveryTransportState, TransportCommand};
@@ -1836,6 +1922,7 @@ mod tests {
         DecodedPlaybackAsset, PlaybackDocumentBytes, PlaybackSessionAssemblyInput,
         assemble_playback_session,
     };
+    use std::collections::BTreeMap;
     use std::fs;
     use std::sync::mpsc::SyncSender;
     use std::thread;
@@ -1880,6 +1967,103 @@ mod tests {
         "return_buses":[],"main":{"gain_millionths":1000000,"mute":false},
         "cue":{"source":"main","gain_millionths":1000000,"mute":false},"extensions":{}
     }"#;
+    const LIVE_MAPPING_ID: &str = "018f47a2-6b2d-7c11-8a44-001122337508";
+    const LIVE_BINDING_ID: &str = "018f47a2-6b2d-7c11-8a44-001122337509";
+
+    struct LiveMappingProject;
+
+    impl ControlMappingProject for LiveMappingProject {
+        fn project_id(&self) -> &str {
+            LIVE_PROJECT_ID
+        }
+
+        fn cv_inputs(&self) -> u8 {
+            4
+        }
+
+        fn has_clock_input(&self) -> bool {
+            true
+        }
+
+        fn has_reset_input(&self) -> bool {
+            true
+        }
+
+        fn has_mixer(&self) -> bool {
+            true
+        }
+
+        fn contains_nested_entity(&self, id: &str) -> bool {
+            id == "018f47a2-6b2d-7c11-8a44-001122337502"
+        }
+
+        fn contains_entity(&self, _id: &str) -> bool {
+            false
+        }
+
+        fn contains_track(&self, id: &str) -> bool {
+            self.contains_nested_entity(id)
+        }
+
+        fn contains_scene(&self, _id: &str) -> bool {
+            false
+        }
+
+        fn contains_mixer_channel(&self, track_id: &str) -> bool {
+            self.contains_track(track_id)
+        }
+
+        fn contains_mixer_send(&self, _send_id: &str) -> bool {
+            false
+        }
+
+        fn is_solo_source_track(&self, track_id: &str) -> bool {
+            self.contains_track(track_id)
+        }
+    }
+
+    impl ControlMappingResolver for LiveMappingProject {
+        fn track_index(&self, track_id: &str) -> Option<usize> {
+            self.contains_track(track_id).then_some(0)
+        }
+
+        fn scene_index(&self, _scene_id: &str) -> Option<usize> {
+            None
+        }
+
+        fn mixer_channel_index(&self, track_id: &str) -> Option<usize> {
+            self.contains_mixer_channel(track_id).then_some(0)
+        }
+
+        fn mixer_send_address(&self, _send_id: &str) -> Option<MixerSendAddress> {
+            None
+        }
+    }
+
+    fn compiled_channel_mute_mapping() -> CompiledControlMappingTable {
+        let binding = ControlBinding::try_new(
+            LIVE_BINDING_ID.to_owned(),
+            true,
+            ControlSource::ClockInput { edge: Edge::Rising },
+            ControlScope::Global,
+            ControlTransform::Trigger {
+                behavior: TriggerBehavior::Toggle,
+            },
+            ControlTarget::MixerChannel {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122337502".to_owned(),
+                parameter: ChannelParameter::Mute,
+            },
+        )
+        .unwrap();
+        let document = ControlMappingDocument::try_new(
+            LIVE_MAPPING_ID.to_owned(),
+            LIVE_PROJECT_ID.to_owned(),
+            vec![binding],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        compile_control_mapping(&document, LIVE_MAPPING_ID, &LiveMappingProject).unwrap()
+    }
 
     impl DesktopPlaybackSource for UnusedPlaybackSource {
         fn session(&self) -> &PreparedPlaybackSession {
@@ -2134,6 +2318,58 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn mapped_session_controls_coordinate_direct_and_mapped_commands() {
+        let input = live_session_input();
+        let (project, mixer, _, media) = input.parts();
+        let facts = collect_media_asset_facts(media).unwrap();
+        let graph = project
+            .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+            .unwrap();
+        let prepared = media.prepare_playback(&graph).unwrap();
+        let runtime = RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, 64).unwrap();
+        let (transport, mixer, _runtime) = RoutedTransportRuntime::with_command_queues(runtime);
+        let (_publisher, recovery) = playback_recovery_channel(None);
+        let mut controls = build_session_controls(
+            transport,
+            mixer,
+            recovery,
+            Some(compiled_channel_mute_mapping()),
+        )
+        .unwrap();
+
+        let channel = controls
+            .resolve_channel("018f47a2-6b2d-7c11-8a44-001122337502")
+            .unwrap();
+        controls
+            .try_send_mixer(MixerParameterCommand::ChannelMute {
+                channel,
+                muted: true,
+            })
+            .unwrap();
+        controls
+            .try_send_transport(TransportCommand::Start)
+            .unwrap();
+        let SessionControlHandles::Mapping(mapping) = &mut controls else {
+            panic!("a compiled mapping must publish the coordinated mapping owner");
+        };
+        assert_eq!(
+            mapping
+                .dispatch(
+                    hyper_control_runtime::ControlEvent::Clock { edge: Edge::Rising },
+                    hyper_control_runtime::ControlContext::default(),
+                )
+                .unwrap(),
+            hyper_control_runtime::ControlDispatchOutcome::Sent {
+                binding_index: 0,
+                command: hyper_control_runtime::RuntimeControlCommand::ChannelMute {
+                    channel_index: 0,
+                    muted: false,
+                },
+            }
+        );
+    }
+
     #[cfg(all(target_os = "linux", target_endian = "little"))]
     fn wait_for_checkpoint(
         checkpoint: &PlaybackRecoveryCheckpoint,
@@ -2171,9 +2407,7 @@ mod tests {
         let old_checkpoint = session.recovery_checkpoint();
 
         session
-            .command_sender()
-            .unwrap()
-            .try_send(TransportCommand::Locate {
+            .try_send_transport_command(TransportCommand::Locate {
                 frame: 32,
                 state: LocateState::Stopped,
             })
@@ -2208,9 +2442,7 @@ mod tests {
         );
 
         replacement
-            .command_sender()
-            .unwrap()
-            .try_send(TransportCommand::Start)
+            .try_send_transport_command(TransportCommand::Start)
             .unwrap();
         let rolling = wait_for_checkpoint(&replacement_checkpoint, |snapshot| {
             snapshot.state() == PlaybackRecoveryTransportState::Rolling

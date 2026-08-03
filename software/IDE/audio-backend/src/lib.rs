@@ -92,6 +92,7 @@ mod control_mapping;
 ))]
 pub use control_mapping::{
     DesktopControlMappingRuntime, DesktopControlSink, DesktopControlSinkError,
+    DesktopDirectControlCommand, DesktopDirectControlError,
 };
 
 #[cfg(any(

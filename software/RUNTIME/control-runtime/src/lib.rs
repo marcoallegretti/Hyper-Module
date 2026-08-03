@@ -165,8 +165,22 @@ pub enum RuntimeControlCommand {
     TransportLocateStartPreserve,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectControlStateUpdate {
+    Unchanged,
+    Boolean {
+        target: BooleanControlTarget,
+        value: bool,
+    },
+    Transport {
+        rolling: bool,
+    },
+}
+
 pub trait RuntimeControlSink {
     type Error;
+    type DirectCommand;
+    type DirectError;
 
     /// Validates one compiled target without changing runtime state.
     ///
@@ -184,6 +198,16 @@ pub trait RuntimeControlSink {
     /// Returns a target, saturation, or disconnection rejection without
     /// applying the command.
     fn try_send(&mut self, command: RuntimeControlCommand) -> Result<(), Self::Error>;
+
+    /// Sends one direct software command and reports its shadow-state effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns the direct command rejection without applying a shadow update.
+    fn try_send_direct(
+        &mut self,
+        command: Self::DirectCommand,
+    ) -> Result<DirectControlStateUpdate, Self::DirectError>;
 }
 
 #[derive(Debug)]
@@ -436,6 +460,18 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
         })
     }
 
+    /// Sends one direct software command through the same queue owner as mapped
+    /// events and commits its state effect only after successful enqueue.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sink's direct command rejection without changing shadows.
+    pub fn try_send_direct(&mut self, command: S::DirectCommand) -> Result<(), S::DirectError> {
+        let update = self.sink.try_send_direct(command)?;
+        self.commit_direct_update(update);
+        Ok(())
+    }
+
     fn refresh_missing_state(&mut self) {
         for shadow in &mut self.boolean_shadows {
             if shadow.value.is_none() {
@@ -482,6 +518,24 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
             | RuntimeControlCommand::SendEnabled { .. }
             | RuntimeControlCommand::MainGain { .. }
             | RuntimeControlCommand::MainMute { .. } => {}
+        }
+    }
+
+    fn commit_direct_update(&mut self, update: DirectControlStateUpdate) {
+        match update {
+            DirectControlStateUpdate::Unchanged => {}
+            DirectControlStateUpdate::Boolean { target, value } => {
+                if let Some(shadow) = self
+                    .boolean_shadows
+                    .iter_mut()
+                    .find(|shadow| shadow.target == target)
+                {
+                    shadow.value = Some(value);
+                }
+            }
+            DirectControlStateUpdate::Transport { rolling } => {
+                self.transport_rolling = Some(rolling);
+            }
         }
     }
 }
