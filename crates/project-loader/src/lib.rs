@@ -11,6 +11,10 @@ use hyper_control_mappings::{
     ControlMappingBindingError, ControlMappingDocument, ControlMappingParseError,
     ControlMappingProject,
 };
+use hyper_mapping_compiler::{
+    CompiledControlMappingTable, ControlMappingCompileError, ControlMappingResolver,
+    MixerSendAddress, compile_control_mapping,
+};
 use hyper_playback_session::{
     DecodedPlaybackAsset, PlaybackDocumentBytes, PlaybackSessionAssemblyError,
     PlaybackSessionAssemblyInput, PlaybackSessionAssemblyLimits, PreparedPlaybackSession,
@@ -37,6 +41,7 @@ pub struct PreparedProjectPlayback {
     package: StructurallyVerifiedProject,
     session: PreparedPlaybackSession,
     control_mapping: Option<ControlMappingDocument>,
+    compiled_control_mapping: Option<CompiledControlMappingTable>,
     recording_metadata: Vec<RecordingMetadataDocument>,
 }
 
@@ -57,6 +62,11 @@ impl PreparedProjectPlayback {
     }
 
     #[must_use]
+    pub const fn compiled_control_mapping(&self) -> Option<&CompiledControlMappingTable> {
+        self.compiled_control_mapping.as_ref()
+    }
+
+    #[must_use]
     pub fn recording_metadata(&self) -> &[RecordingMetadataDocument] {
         &self.recording_metadata
     }
@@ -68,12 +78,14 @@ impl PreparedProjectPlayback {
         StructurallyVerifiedProject,
         PreparedPlaybackSession,
         Option<ControlMappingDocument>,
+        Option<CompiledControlMappingTable>,
         Vec<RecordingMetadataDocument>,
     ) {
         (
             self.package,
             self.session,
             self.control_mapping,
+            self.compiled_control_mapping,
             self.recording_metadata,
         )
     }
@@ -193,6 +205,7 @@ pub enum ProjectPlaybackError {
         source: ControlMappingParseError,
     },
     ControlMappingBinding(ControlMappingBindingError),
+    ControlMappingCompile(ControlMappingCompileError),
     RecordingMetadata {
         resource_id: String,
         source: RecordingMetadataParseError,
@@ -261,6 +274,9 @@ impl fmt::Display for ProjectPlaybackError {
                 "control-mapping resource {resource_id} is invalid: {source}"
             ),
             Self::ControlMappingBinding(source) => source.fmt(formatter),
+            Self::ControlMappingCompile(source) => {
+                write!(formatter, "control mapping could not be compiled: {source}")
+            }
             Self::RecordingMetadata {
                 resource_id,
                 source,
@@ -303,6 +319,7 @@ impl Error for ProjectPlaybackError {
             Self::Storage(source) => Some(source),
             Self::ControlMapping { source, .. } => Some(source),
             Self::ControlMappingBinding(source) => Some(source),
+            Self::ControlMappingCompile(source) => Some(source),
             Self::RecordingMetadata { source, .. } => Some(source),
             Self::ResourceJson { source, .. } => Some(source),
             Self::RecordingBinding(source) => Some(source),
@@ -379,10 +396,12 @@ pub fn prepare_project_playback(
     })
     .map_err(ProjectPlaybackError::Assembly)?;
     validate_recording_media(&session, &captured.recording_metadata, &decoded.facts)?;
-    if let Some(mapping) = &captured.control_mapping {
-        mapping
-            .document
-            .validate_for_project(
+    let compiled_control_mapping = captured
+        .control_mapping
+        .as_ref()
+        .map(|mapping| {
+            compile_control_mapping(
+                &mapping.document,
                 &mapping.descriptor_id,
                 &LoadedMappingProject {
                     package: &package,
@@ -390,13 +409,20 @@ pub fn prepare_project_playback(
                     nested_playback_ids: &captured.nested_playback_ids,
                 },
             )
-            .map_err(ProjectPlaybackError::ControlMappingBinding)?;
-    }
+            .map_err(|source| match source {
+                ControlMappingCompileError::Binding(source) => {
+                    ProjectPlaybackError::ControlMappingBinding(source)
+                }
+                source => ProjectPlaybackError::ControlMappingCompile(source),
+            })
+        })
+        .transpose()?;
     package.confirm_unchanged()?;
     Ok(PreparedProjectPlayback {
         package,
         session,
         control_mapping: captured.control_mapping.map(|mapping| mapping.document),
+        compiled_control_mapping,
         recording_metadata: captured
             .recording_metadata
             .into_iter()
@@ -792,6 +818,40 @@ impl ControlMappingProject for LoadedMappingProject<'_> {
 
     fn is_solo_source_track(&self, track_id: &str) -> bool {
         self.session.parts().0.is_audio_track(track_id)
+    }
+}
+
+impl ControlMappingResolver for LoadedMappingProject<'_> {
+    fn track_index(&self, track_id: &str) -> Option<usize> {
+        self.session.parts().0.track_index(track_id)
+    }
+
+    fn scene_index(&self, scene_id: &str) -> Option<usize> {
+        self.session.parts().0.scene_index(scene_id)
+    }
+
+    fn mixer_channel_index(&self, track_id: &str) -> Option<usize> {
+        self.session
+            .parts()
+            .1
+            .slots()
+            .iter()
+            .position(|slot| slot.track_id() == track_id)
+    }
+
+    fn mixer_send_address(&self, send_id: &str) -> Option<MixerSendAddress> {
+        self.session
+            .parts()
+            .1
+            .slots()
+            .iter()
+            .enumerate()
+            .find_map(|(channel_index, slot)| {
+                slot.sends()
+                    .iter()
+                    .position(|send| send.id() == send_id)
+                    .map(|send_index| MixerSendAddress::new(channel_index, send_index))
+            })
     }
 }
 

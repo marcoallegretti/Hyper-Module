@@ -142,6 +142,49 @@ pub enum ContinuousControlValue {
     PanMillionths(i32),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContinuousControlTarget {
+    Gain,
+    Pan,
+}
+
+/// Applies one validated linear transform and converts its normalized result
+/// into the selected continuous runtime domain. Trigger transforms return
+/// `None`.
+#[must_use]
+pub fn map_continuous_value(
+    transform: ControlTransform,
+    target: ContinuousControlTarget,
+    input: i32,
+) -> Option<ContinuousControlValue> {
+    let ControlTransform::Linear {
+        input_min,
+        input_max,
+        output_min,
+        output_max,
+    } = transform
+    else {
+        return None;
+    };
+    if input_min >= input_max {
+        return None;
+    }
+    let clamped = input.clamp(input_min, input_max);
+    let numerator = (i128::from(clamped) - i128::from(input_min))
+        * (i128::from(output_max) - i128::from(output_min));
+    let denominator = i128::from(input_max) - i128::from(input_min);
+    let normalized = i128::from(output_min) + numerator / denominator;
+    let normalized = i32::try_from(normalized).ok()?;
+    match target {
+        ContinuousControlTarget::Gain => Some(ContinuousControlValue::GainMillionths(
+            u32::try_from(normalized).ok()?.checked_mul(2)?,
+        )),
+        ContinuousControlTarget::Pan => Some(ContinuousControlValue::PanMillionths(
+            normalized.checked_mul(2)?.checked_sub(1_000_000)?,
+        )),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ControlBinding {
@@ -188,21 +231,7 @@ impl ControlBinding {
     /// domain conversion. Trigger bindings return `None`.
     #[must_use]
     pub fn map_continuous(&self, input: i32) -> Option<ContinuousControlValue> {
-        let ControlTransform::Linear {
-            input_min,
-            input_max,
-            output_min,
-            output_max,
-        } = self.transform
-        else {
-            return None;
-        };
-        let clamped = input.clamp(input_min, input_max);
-        let numerator = i64::from(clamped - input_min) * i64::from(output_max - output_min);
-        let denominator = i64::from(input_max - input_min);
-        let normalized = i64::from(output_min) + numerator / denominator;
-        let normalized = i32::try_from(normalized).ok()?;
-        match self.target {
+        let target = match self.target {
             ControlTarget::MixerChannel {
                 parameter: ChannelParameter::Gain,
                 ..
@@ -216,9 +245,7 @@ impl ControlBinding {
             }
             | ControlTarget::MixerCue {
                 parameter: CueParameter::Gain,
-            } => Some(ContinuousControlValue::GainMillionths(
-                u32::try_from(normalized).ok()?.checked_mul(2)?,
-            )),
+            } => ContinuousControlTarget::Gain,
             ControlTarget::MixerChannel {
                 parameter: ChannelParameter::Pan,
                 ..
@@ -226,16 +253,15 @@ impl ControlBinding {
             | ControlTarget::MixerSend {
                 parameter: SendParameter::Pan,
                 ..
-            } => Some(ContinuousControlValue::PanMillionths(
-                normalized.checked_mul(2)?.checked_sub(1_000_000)?,
-            )),
+            } => ContinuousControlTarget::Pan,
             ControlTarget::MixerChannel { .. }
             | ControlTarget::MixerSend { .. }
             | ControlTarget::MixerMain { .. }
             | ControlTarget::MixerCue { .. }
             | ControlTarget::Scene { .. }
-            | ControlTarget::Transport { .. } => None,
-        }
+            | ControlTarget::Transport { .. } => return None,
+        };
+        map_continuous_value(self.transform, target, input)
     }
 
     #[must_use]
@@ -1042,6 +1068,25 @@ mod tests {
             binding.map_continuous(2),
             Some(ContinuousControlValue::PanMillionths(-666_666))
         );
+    }
+
+    #[test]
+    fn direct_continuous_mapping_rejects_unvalidated_ranges_without_panicking() {
+        for (input_min, input_max) in [(0, 0), (1, 0)] {
+            assert_eq!(
+                map_continuous_value(
+                    ControlTransform::Linear {
+                        input_min,
+                        input_max,
+                        output_min: i32::MIN,
+                        output_max: i32::MAX,
+                    },
+                    ContinuousControlTarget::Pan,
+                    i32::MAX,
+                ),
+                None
+            );
+        }
     }
 
     #[test]

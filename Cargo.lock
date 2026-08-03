@@ -525,6 +525,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-mapping-compiler"
+version = "0.1.0"
+dependencies = [
+ "hyper-control-mappings",
+ "serde_json",
+]
+
+[[package]]
 name = "hyper-media-cache"
 version = "0.1.0"
 dependencies = [
@@ -608,6 +616,7 @@ version = "0.1.0"
 dependencies = [
  "hyper-audio-source",
  "hyper-control-mappings",
+ "hyper-mapping-compiler",
  "hyper-media-cache",
  "hyper-playback-json",
  "hyper-playback-session",

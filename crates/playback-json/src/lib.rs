@@ -919,6 +919,11 @@ impl LoadedPlaybackProject {
     }
 
     #[must_use]
+    pub fn track_index(&self, track_id: &str) -> Option<usize> {
+        self.tracks.iter().position(|track| track.id == track_id)
+    }
+
+    #[must_use]
     pub fn is_audio_track(&self, track_id: &str) -> bool {
         self.tracks
             .iter()
@@ -933,6 +938,11 @@ impl LoadedPlaybackProject {
     #[must_use]
     pub fn scene_count(&self) -> usize {
         self.scenes.len()
+    }
+
+    #[must_use]
+    pub fn scene_index(&self, scene_id: &str) -> Option<usize> {
+        self.scenes.iter().position(|scene| scene.id == scene_id)
     }
 
     #[must_use]

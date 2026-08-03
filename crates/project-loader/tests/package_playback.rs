@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use hyper_audio_source::{DecodeError, DecodeLimits};
 use hyper_control_mappings::ControlMappingBindingErrorKind;
+use hyper_mapping_compiler::{CompiledControlScope, CompiledControlSource, CompiledControlTarget};
 use hyper_media_cache::CacheLimits;
 use hyper_playback_json::LoaderLimits;
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
@@ -361,6 +362,8 @@ fn prepares_one_verified_owned_playback_session() {
     assert_eq!(prepared.session().project_id(), PROJECT_ID);
     assert_eq!(prepared.session().media_asset_count(), 1);
     assert!(!prepared.session().has_automation());
+    assert!(prepared.control_mapping().is_none());
+    assert!(prepared.compiled_control_mapping().is_none());
     assert!(prepared.recording_metadata().is_empty());
     prepared.package().confirm_unchanged().unwrap();
 }
@@ -558,7 +561,12 @@ fn loads_and_binds_one_verified_control_mapping() {
         MAPPING_ID,
         "mapping",
         "mappings/controller.json",
-        &control_mapping(MAPPING_ID, BINDING_ID, TRACK_ID, Value::Null),
+        &control_mapping(
+            MAPPING_ID,
+            BINDING_ID,
+            TRACK_ID,
+            json!({"kind": "track", "track_id": TRACK_ID}),
+        ),
     );
 
     let prepared = prepare_project_playback(&fixture.root, limits()).unwrap();
@@ -566,10 +574,30 @@ fn loads_and_binds_one_verified_control_mapping() {
     assert_eq!(mapping.id(), MAPPING_ID);
     assert_eq!(mapping.project_id(), PROJECT_ID);
     assert_eq!(mapping.bindings().len(), 1);
-    let (package, session, mapping, recording_metadata) = prepared.into_parts();
+    let compiled = prepared.compiled_control_mapping().unwrap();
+    assert_eq!(compiled.bindings().len(), 1);
+    let compiled_binding = compiled.bindings()[0];
+    assert_eq!(compiled_binding.source_binding_index(), 0);
+    assert_eq!(
+        compiled_binding.source(),
+        CompiledControlSource::CvInput { input_index: 0 }
+    );
+    assert_eq!(
+        compiled_binding.scope(),
+        CompiledControlScope::Track { track_index: 0 }
+    );
+    assert!(matches!(
+        compiled_binding.target(),
+        CompiledControlTarget::MixerChannel {
+            channel_index: 0,
+            parameter: hyper_control_mappings::ChannelParameter::Gain,
+        }
+    ));
+    let (package, session, mapping, compiled, recording_metadata) = prepared.into_parts();
     assert_eq!(package.manifest().project_id(), PROJECT_ID);
     assert_eq!(session.parts().0.project_id(), PROJECT_ID);
     assert_eq!(mapping.unwrap().id(), MAPPING_ID);
+    assert_eq!(compiled.unwrap().bindings().len(), 1);
     assert!(recording_metadata.is_empty());
 }
 
