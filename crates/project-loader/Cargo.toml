@@ -17,6 +17,7 @@ hyper-strict-json = { path = "../strict-json" }
 serde_json = "=1.0.151"
 
 [dev-dependencies]
+hyper-audio-engine = { path = "../audio-engine" }
 hyper-media-cache = { path = "../media-cache" }
 hyper-playback-json = { path = "../playback-json" }
 serde_json = "=1.0.151"

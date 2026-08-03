@@ -1324,6 +1324,35 @@ fn live_mixer_command_queue_validates_targets_backpressure_and_disconnection() {
 }
 
 #[test]
+fn live_mixer_fence_sequences_are_allocated_by_the_sole_sender() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (_transport_sender, mut sender, mut transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+
+    assert_eq!(sender.try_send_fence().unwrap(), Some(1));
+    assert_eq!(sender.try_send_fence().unwrap(), Some(2));
+    let capacity = sender.capacity();
+    for _ in 2..capacity {
+        sender
+            .try_send(MixerParameterCommand::MainMute { muted: false })
+            .unwrap();
+    }
+    assert!(matches!(
+        sender.try_send_fence(),
+        Err(MixerParameterCommandSendError::Full(
+            MixerParameterCommand::Fence(_)
+        ))
+    ));
+
+    let mut left = [0.0_f32; 1];
+    let mut right = [0.0_f32; 1];
+    process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(sender.try_send_fence().unwrap(), Some(3));
+}
+
+#[test]
 fn live_mixer_targets_resolve_from_compiled_numeric_addresses() {
     let fixture = graph_fixture();
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
@@ -1389,6 +1418,33 @@ fn live_mixer_commands_apply_while_stopped_and_without_a_block_ramp() {
         assert!((*left - source * 0.375).abs() <= f32::EPSILON);
         assert!((right - source * 0.25).abs() <= f32::EPSILON);
     }
+}
+
+#[test]
+fn mixer_fence_commits_after_every_earlier_command_in_a_successful_cycle() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (_transport_sender, mut parameter_sender, mut transport) =
+        GraphTransportRuntime::with_command_queues(runtime);
+    let mut left = [9.0_f32; 1];
+    let mut right = [9.0_f32; 1];
+
+    parameter_sender
+        .try_send(MixerParameterCommand::MainMute { muted: true })
+        .unwrap();
+    assert_eq!(parameter_sender.try_send_fence().unwrap(), Some(1));
+    assert_eq!(parameter_sender.committed_fence(), 0);
+
+    let cycle = process_transport(&mut transport, &mut left, &mut right).unwrap();
+
+    assert_eq!(cycle.applied_mixer_parameter_command_count(), 2);
+    assert!(transport.mixer_parameter_state().main_muted());
+    assert_eq!(parameter_sender.committed_fence(), 1);
+
+    assert_eq!(parameter_sender.try_send_fence().unwrap(), Some(2));
+    process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(parameter_sender.committed_fence(), 2);
 }
 
 #[test]
@@ -2005,6 +2061,7 @@ fn live_mixer_state_is_rolled_back_when_later_cycle_work_fails() {
     parameter_sender
         .try_send(MixerParameterCommand::MainMute { muted: true })
         .unwrap();
+    assert_eq!(parameter_sender.try_send_fence().unwrap(), Some(1));
     let mut scratch = [];
     let mut left = [9.0_f32; 1];
     let mut right = [9.0_f32; 1];
@@ -2018,6 +2075,7 @@ fn live_mixer_state_is_rolled_back_when_later_cycle_work_fails() {
     );
     assert!(matches!(failed, Err(RuntimeProcessError::Render(_))));
     assert_eq!(transport.state(), TransportState::Stopped);
+    assert_eq!(parameter_sender.committed_fence(), 0);
 
     transport_sender.try_send(TransportCommand::Start).unwrap();
     let recovered = process_transport(&mut transport, &mut left, &mut right).unwrap();

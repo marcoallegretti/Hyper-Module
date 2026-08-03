@@ -2141,6 +2141,8 @@ dependencies = [
  "hyper-playback-json",
  "hyper-playback-session",
  "hyper-project-loader",
+ "hyper-project-model",
+ "hyper-storage-engine",
  "hyper-thread-supervisor",
 ]
 
@@ -2251,6 +2253,7 @@ dependencies = [
  "hyper-strict-json",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
 ]
 
 [[package]]
@@ -2267,6 +2270,7 @@ dependencies = [
 name = "hyper-project-loader"
 version = "0.1.0"
 dependencies = [
+ "hyper-audio-engine",
  "hyper-audio-source",
  "hyper-control-mappings",
  "hyper-mapping-compiler",

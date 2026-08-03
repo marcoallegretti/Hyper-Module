@@ -434,6 +434,12 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
         &self.sink
     }
 
+    /// Returns exclusive access to the sole runtime sink owner.
+    #[must_use]
+    pub const fn sink_mut(&mut self) -> &mut S {
+        &mut self.sink
+    }
+
     /// Dispatches at most one active binding and never allocates.
     ///
     /// With no selected precedence between simultaneously active scopes, two

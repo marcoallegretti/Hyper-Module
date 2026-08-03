@@ -397,9 +397,22 @@ fn publish_control_mapping_observed(
             Ok(outcome)
         }
         Err(operation_error) => {
-            let Ok(tx) = read_transaction(&transaction, &transaction_name) else {
-                clear_and_remove_transaction(&backups, transaction, &transaction_name)?;
-                return Err(operation_error);
+            let tx = match read_transaction(&transaction, &transaction_name) {
+                Ok(tx) => tx,
+                Err(_) if missing_file(&transaction, TRANSACTION_NAME)? => {
+                    validate_prepublication_residue(&transaction, &transaction_name)?;
+                    clear_and_remove_transaction(&backups, transaction, &transaction_name)?;
+                    return Err(operation_error);
+                }
+                Err(source) => {
+                    return Err(ControlMappingPublicationError {
+                        kind: ControlMappingPublicationErrorKind::Recovery,
+                        message: "mapping publication failed and its durable transaction could not be read"
+                            .to_owned(),
+                        published: false,
+                        source: Some(Box::new(source)),
+                    });
+                }
             };
             match recover_transaction(
                 verified.root(),
@@ -2232,6 +2245,29 @@ mod tests {
                 .revision(),
             1
         );
+    }
+
+    #[test]
+    fn failed_mapping_publication_retains_a_present_but_unreadable_transaction() {
+        let fixture = Fixture::new(true);
+
+        let error =
+            publish_control_mapping_observed(&fixture.root, fixture.request(), |phase, _| {
+                if phase == PublicationPhase::Mapping {
+                    fs::write(fixture.transaction_path().join(TRANSACTION_NAME), b"{}").unwrap();
+                    return Err(failure(
+                        ControlMappingPublicationErrorKind::Io,
+                        "simulated publication failure",
+                    ));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ControlMappingPublicationErrorKind::Recovery);
+        assert_eq!(fixture.transaction_count(), 1);
+        assert!(fixture.transaction_path().join(TRANSACTION_NAME).exists());
+        assert!(verify_project_package(&fixture.root).is_err());
     }
 
     #[test]

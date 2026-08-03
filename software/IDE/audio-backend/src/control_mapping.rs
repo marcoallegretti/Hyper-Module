@@ -136,6 +136,14 @@ impl DesktopControlSink {
         &self.mixer
     }
 
+    pub(crate) fn try_send_mixer_fence(
+        &mut self,
+    ) -> Result<Option<u64>, DesktopDirectControlError> {
+        self.mixer
+            .try_send_fence()
+            .map_err(DesktopDirectControlError::Mixer)
+    }
+
     fn direct_mixer_update(
         &self,
         command: MixerParameterCommand,
@@ -175,7 +183,8 @@ impl DesktopControlSink {
             | MixerParameterCommand::ChannelPan { .. }
             | MixerParameterCommand::SendGain { .. }
             | MixerParameterCommand::SendPan { .. }
-            | MixerParameterCommand::MainGain { .. } => Ok(DirectControlStateUpdate::Unchanged),
+            | MixerParameterCommand::MainGain { .. }
+            | MixerParameterCommand::Fence(_) => Ok(DirectControlStateUpdate::Unchanged),
         }
     }
 

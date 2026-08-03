@@ -4,6 +4,7 @@
 mod mapping_publication;
 mod project_recovery;
 mod recording_import;
+mod resource_publication;
 mod stable_file;
 
 pub use mapping_publication::{
@@ -20,6 +21,12 @@ pub use recording_import::{
     RecordingImportError, RecordingImportOutcome, RecordingImportRecovery,
     RecordingImportRecoveryDisposition, RecordingImportRequest, import_finalized_recording_handoff,
     import_recording, recover_recording_imports,
+};
+pub use resource_publication::{
+    ProjectResourcePublicationError, ProjectResourcePublicationErrorKind,
+    ProjectResourcePublicationOutcome, ProjectResourcePublicationRecovery,
+    ProjectResourcePublicationRecoveryDisposition, ProjectResourcePublicationRequest,
+    publish_project_resource, recover_project_resource_publications,
 };
 
 use core::error::Error;

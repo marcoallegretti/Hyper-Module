@@ -66,6 +66,17 @@ impl LinearGain {
     pub const fn value(self) -> f32 {
         self.0
     }
+
+    /// Returns the nearest persisted integer-millionths representation.
+    ///
+    /// Values created by [`Self::from_millionths`] round-trip exactly. Values
+    /// created from an arbitrary floating-point amplitude are quantized to the
+    /// version-1 mixer document resolution.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn to_millionths(self) -> u32 {
+        (self.0 * GAIN_SCALE).round() as u32
+    }
 }
 
 /// A normalized pan or balance position in the range `-1.0..=1.0`.
@@ -109,6 +120,17 @@ impl Pan {
     #[must_use]
     pub const fn value(self) -> f32 {
         self.0
+    }
+
+    /// Returns the nearest persisted integer-millionths representation.
+    ///
+    /// Values created by [`Self::from_millionths`] round-trip exactly. Values
+    /// created from an arbitrary floating-point position are quantized to the
+    /// version-1 mixer document resolution.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn to_millionths(self) -> i32 {
+        (self.0 * PAN_SCALE).round() as i32
     }
 }
 
@@ -1272,6 +1294,24 @@ mod tests {
             Pan::from_millionths(-1_000_001),
             Err(ParameterError::PanOutOfRange)
         );
+    }
+
+    #[test]
+    fn persisted_parameter_grid_round_trips_without_float_drift() {
+        for millionths in 0..=2_000_000 {
+            assert_eq!(
+                LinearGain::from_millionths(millionths)
+                    .unwrap()
+                    .to_millionths(),
+                millionths
+            );
+        }
+        for millionths in -1_000_000..=1_000_000 {
+            assert_eq!(
+                Pan::from_millionths(millionths).unwrap().to_millionths(),
+                millionths
+            );
+        }
     }
 
     #[test]

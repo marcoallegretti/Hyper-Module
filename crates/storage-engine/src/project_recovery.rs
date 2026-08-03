@@ -3,19 +3,27 @@ use core::fmt;
 use std::path::Path;
 
 use super::{
-    ControlMappingPublicationError, ControlMappingPublicationRecovery, RecordingImportError,
-    RecordingImportRecovery, recover_control_mapping_publications, recover_recording_imports,
+    ControlMappingPublicationError, ControlMappingPublicationRecovery,
+    ProjectResourcePublicationError, ProjectResourcePublicationRecovery, RecordingImportError,
+    RecordingImportRecovery, recover_control_mapping_publications,
+    recover_project_resource_publications, recover_recording_imports,
 };
 
 /// Complete transaction-recovery evidence produced before an editable project
 /// is loaded by the desktop IDE.
 #[derive(Debug, Default)]
 pub struct ProjectTransactionRecoveryReport {
+    resources: Vec<ProjectResourcePublicationRecovery>,
     control_mappings: Vec<ControlMappingPublicationRecovery>,
     recordings: Vec<RecordingImportRecovery>,
 }
 
 impl ProjectTransactionRecoveryReport {
+    #[must_use]
+    pub fn resources(&self) -> &[ProjectResourcePublicationRecovery] {
+        &self.resources
+    }
+
     #[must_use]
     pub fn control_mappings(&self) -> &[ControlMappingPublicationRecovery] {
         &self.control_mappings
@@ -28,12 +36,13 @@ impl ProjectTransactionRecoveryReport {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.control_mappings.is_empty() && self.recordings.is_empty()
+        self.resources.is_empty() && self.control_mappings.is_empty() && self.recordings.is_empty()
     }
 }
 
 #[derive(Debug)]
 pub enum ProjectTransactionRecoveryErrorSource {
+    Resource(ProjectResourcePublicationError),
     ControlMapping(ControlMappingPublicationError),
     Recording(RecordingImportError),
 }
@@ -41,6 +50,7 @@ pub enum ProjectTransactionRecoveryErrorSource {
 impl fmt::Display for ProjectTransactionRecoveryErrorSource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Resource(source) => write!(formatter, "resource recovery failed: {source}"),
             Self::ControlMapping(source) => {
                 write!(formatter, "control-mapping recovery failed: {source}")
             }
@@ -52,6 +62,7 @@ impl fmt::Display for ProjectTransactionRecoveryErrorSource {
 impl Error for ProjectTransactionRecoveryErrorSource {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Resource(source) => Some(source),
             Self::ControlMapping(source) => Some(source),
             Self::Recording(source) => Some(source),
         }
@@ -63,7 +74,7 @@ impl Error for ProjectTransactionRecoveryErrorSource {
 #[derive(Debug)]
 pub struct ProjectTransactionRecoveryError {
     completed: ProjectTransactionRecoveryReport,
-    source: ProjectTransactionRecoveryErrorSource,
+    source: Box<ProjectTransactionRecoveryErrorSource>,
 }
 
 impl ProjectTransactionRecoveryError {
@@ -73,8 +84,8 @@ impl ProjectTransactionRecoveryError {
     }
 
     #[must_use]
-    pub const fn recovery_source(&self) -> &ProjectTransactionRecoveryErrorSource {
-        &self.source
+    pub fn recovery_source(&self) -> &ProjectTransactionRecoveryErrorSource {
+        self.source.as_ref()
     }
 
     #[must_use]
@@ -84,7 +95,7 @@ impl ProjectTransactionRecoveryError {
         ProjectTransactionRecoveryReport,
         ProjectTransactionRecoveryErrorSource,
     ) {
-        (self.completed, self.source)
+        (self.completed, *self.source)
     }
 }
 
@@ -96,16 +107,16 @@ impl fmt::Display for ProjectTransactionRecoveryError {
 
 impl Error for ProjectTransactionRecoveryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.source)
+        Some(self.source.as_ref())
     }
 }
 
 /// Recovers every known editable-project transaction family in deterministic
 /// order before normal project verification.
 ///
-/// Mapping publication is recovered first because it may repair the manifest
-/// and mapping pair needed by later package verification. Recording import is
-/// then recovered through the same shared project lock.
+/// Existing-resource publication is recovered first because it may repair a
+/// manifest/resource pair needed by later package verification. Mapping
+/// publication and recording import follow through the same shared lock.
 ///
 /// Recovery is fail-closed when another project storage transaction owns that
 /// lock. Callers may retry after the competing transaction has completed; this
@@ -119,25 +130,40 @@ pub fn recover_project_transactions(
     project_path: impl AsRef<Path>,
 ) -> Result<ProjectTransactionRecoveryReport, ProjectTransactionRecoveryError> {
     let project_path = project_path.as_ref();
-    let control_mappings =
-        recover_control_mapping_publications(project_path).map_err(|source| {
-            ProjectTransactionRecoveryError {
-                completed: ProjectTransactionRecoveryReport::default(),
-                source: ProjectTransactionRecoveryErrorSource::ControlMapping(source),
-            }
-        })?;
+    let resources = recover_project_resource_publications(project_path).map_err(|source| {
+        ProjectTransactionRecoveryError {
+            completed: ProjectTransactionRecoveryReport::default(),
+            source: Box::new(ProjectTransactionRecoveryErrorSource::Resource(source)),
+        }
+    })?;
+    let control_mappings = match recover_control_mapping_publications(project_path) {
+        Ok(control_mappings) => control_mappings,
+        Err(source) => {
+            return Err(ProjectTransactionRecoveryError {
+                completed: ProjectTransactionRecoveryReport {
+                    resources,
+                    ..ProjectTransactionRecoveryReport::default()
+                },
+                source: Box::new(ProjectTransactionRecoveryErrorSource::ControlMapping(
+                    source,
+                )),
+            });
+        }
+    };
     let report = ProjectTransactionRecoveryReport {
+        resources,
         control_mappings,
         recordings: Vec::new(),
     };
     match recover_recording_imports(project_path) {
         Ok(recordings) => Ok(ProjectTransactionRecoveryReport {
+            resources: report.resources,
             control_mappings: report.control_mappings,
             recordings,
         }),
         Err(source) => Err(ProjectTransactionRecoveryError {
             completed: report,
-            source: ProjectTransactionRecoveryErrorSource::Recording(source),
+            source: Box::new(ProjectTransactionRecoveryErrorSource::Recording(source)),
         }),
     }
 }
@@ -186,7 +212,7 @@ mod tests {
         assert!(error.completed().is_empty());
         assert!(matches!(
             error.recovery_source(),
-            ProjectTransactionRecoveryErrorSource::ControlMapping(_)
+            ProjectTransactionRecoveryErrorSource::Resource(_)
         ));
         drop(lock);
         assert!(recover_project_transactions(&root).unwrap().is_empty());

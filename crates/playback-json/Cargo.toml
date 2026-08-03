@@ -12,6 +12,7 @@ hyper-project-model = { path = "../project-model" }
 hyper-strict-json = { path = "../strict-json" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
+serde_json_canonicalizer = "=0.3.2"
 
 [dev-dependencies]
 hyper-audio-source = { path = "../audio-source" }

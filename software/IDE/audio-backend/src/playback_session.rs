@@ -624,6 +624,23 @@ impl SessionControlHandles {
             }
         }
     }
+
+    fn try_send_mixer_fence(&mut self) -> Result<Option<u64>, DesktopDirectControlError> {
+        match self {
+            Self::Direct { mixer, .. } => mixer
+                .try_send_fence()
+                .map_err(DesktopDirectControlError::Mixer),
+            Self::Mapping(runtimes) => runtimes
+                .first_mut()
+                .expect("mapping owner contains exactly one runtime")
+                .sink_mut()
+                .try_send_mixer_fence(),
+        }
+    }
+
+    fn committed_mixer_fence(&self) -> u64 {
+        self.mixer().committed_fence()
+    }
 }
 
 #[derive(Debug)]
@@ -1618,6 +1635,24 @@ impl DesktopPlaybackSession {
         self.controls.try_send_mixer(command)
     }
 
+    /// Allocates and enqueues a FIFO fence after all previously accepted mixer
+    /// commands. Its sequence is published only by a successful process cycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Ok(None)` only after the nonzero sequence space is exhausted,
+    /// or a bounded-queue/disconnection rejection.
+    pub fn try_send_mixer_fence(&mut self) -> Result<Option<u64>, DesktopDirectControlError> {
+        self.controls.try_send_mixer_fence()
+    }
+
+    /// Returns the greatest mixer fence committed by a successful process
+    /// cycle in this session.
+    #[must_use]
+    pub fn committed_mixer_fence(&self) -> u64 {
+        self.controls.committed_mixer_fence()
+    }
+
     /// Returns immutable availability evidence for every enabled compiled
     /// control binding, or `None` when the project has no mapping table.
     #[must_use]
@@ -2566,6 +2601,8 @@ mod tests {
         controls
             .try_send_transport(TransportCommand::Start)
             .unwrap();
+        assert_eq!(controls.try_send_mixer_fence().unwrap(), Some(1));
+        assert_eq!(controls.committed_mixer_fence(), 0);
         assert_eq!(controls.mapping_statuses().unwrap().len(), 1);
         assert_eq!(
             controls

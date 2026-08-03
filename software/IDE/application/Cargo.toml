@@ -17,6 +17,8 @@ hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
 hyper-playback-json = { path = "../../../crates/playback-json" }
 hyper-playback-session = { path = "../../../crates/playback-session" }
 hyper-project-loader = { path = "../../../crates/project-loader" }
+hyper-project-model = { path = "../../../crates/project-model" }
+hyper-storage-engine = { path = "../../../crates/storage-engine" }
 hyper-thread-supervisor = { path = "../../../crates/thread-supervisor" }
 
 [dev-dependencies]

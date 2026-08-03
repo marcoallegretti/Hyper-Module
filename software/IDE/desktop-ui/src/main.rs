@@ -251,6 +251,19 @@ fn bind_playback_callbacks(ui: &MainWindow, worker: &WorkerCell) {
     });
 
     let weak = ui.as_weak();
+    let worker_for_save = Rc::clone(worker);
+    actions.on_save_project(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_mixer_main_state_available() {
+            ui.set_error_text("Committed mixer state is not available to save".into());
+            return;
+        }
+        submit_to_ui(&ui, &worker_for_save, IdeWorkerCommand::SaveProject);
+    });
+
+    let weak = ui.as_weak();
     let worker_for_close = Rc::clone(worker);
     actions.on_close_project(move || {
         submit(&weak, &worker_for_close, IdeWorkerCommand::CloseProject);
@@ -479,6 +492,9 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
     };
     match worker.try_send(command) {
         Ok(()) => {
+            if command_kind == IdeWorkerCommandKind::SaveProject {
+                ui.set_app_mode(AppMode::Saving);
+            }
             ui.set_error_text(SharedString::default());
             ui.set_status_text(command_status(command_kind).into());
         }
@@ -508,6 +524,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::OpenProject => "Recovering and verifying project…",
         IdeWorkerCommandKind::Transport => "Transport command queued…",
         IdeWorkerCommandKind::Mixer => "Mixer command queued…",
+        IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
         IdeWorkerCommandKind::Observe => "Refreshing runtime evidence…",
         IdeWorkerCommandKind::CloseProject => "Closing project and native output…",
         IdeWorkerCommandKind::Shutdown => "Shutting down…",
@@ -534,60 +551,7 @@ fn apply_event(ui: &MainWindow, output_routes: &OutputRoutes, event: IdeWorkerEv
                 );
             }
         }
-        IdeWorkerEvent::Running(observation) => {
-            ui.set_app_mode(AppMode::Running);
-            ui.set_project_name(observation.project_name().into());
-            ui.set_project_id(observation.project_id().into());
-            ui.set_sample_rate(format!("{} Hz", observation.sample_rate_hz()).into());
-            ui.set_scene_count(observation.scene_count().to_string().into());
-            set_scenes(ui, observation.scenes());
-            apply_mixer_observation(ui, &observation);
-            ui.set_stream_state(format!("{:?}", observation.output_state()).into());
-            ui.set_callback_count(observation.output().callback_count.to_string().into());
-            ui.set_xrun_count(
-                observation
-                    .output()
-                    .native_xruns
-                    .map_or_else(
-                        || "Unavailable".to_owned(),
-                        |xrun| {
-                            xrun.recovery_count.map_or_else(
-                                || "Observed, count unavailable".to_owned(),
-                                |count| count.to_string(),
-                            )
-                        },
-                    )
-                    .into(),
-            );
-            let position_frame = observation.recovery().position_frame();
-            ui.set_frame_position(position_frame.to_string().into());
-            ui.set_transport_clock(
-                format_transport_clock(position_frame, observation.sample_rate_hz()).into(),
-            );
-            ui.set_transport_state(
-                match observation.recovery().state() {
-                    PlaybackRecoveryTransportState::Stopped => "Stopped",
-                    PlaybackRecoveryTransportState::Rolling => "Rolling",
-                }
-                .into(),
-            );
-            let (left_level, left_reading, right_level, right_reading) = observation
-                .meter()
-                .snapshot()
-                .map_or((0.0, "—".to_owned(), 0.0, "—".to_owned()), |snapshot| {
-                    let meter = snapshot.meter();
-                    let (left_level, left_reading) = meter_presentation(meter.left().sample_peak());
-                    let (right_level, right_reading) =
-                        meter_presentation(meter.right().sample_peak());
-                    (left_level, left_reading, right_level, right_reading)
-                });
-            ui.set_left_meter(left_level);
-            ui.set_right_meter(right_level);
-            ui.set_left_reading(left_reading.into());
-            ui.set_right_reading(right_reading.into());
-            ui.set_status_text("Runtime evidence updated".into());
-            ui.set_error_text(SharedString::default());
-        }
+        IdeWorkerEvent::Running(observation) => apply_running_event(ui, &observation),
         IdeWorkerEvent::TransportQueued(command) => {
             ui.set_status_text(
                 match command {
@@ -606,6 +570,21 @@ fn apply_event(ui: &MainWindow, output_routes: &OutputRoutes, event: IdeWorkerEv
             ui.set_status_text("Mixer base command queued for the audio runtime".into());
             ui.set_error_text(SharedString::default());
         }
+        IdeWorkerEvent::ProjectSaved { revision, changed } => {
+            ui.set_status_text(
+                if changed {
+                    format!("Project revision {revision} saved and reopened")
+                } else {
+                    format!("Project revision {revision} already matched the live mixer")
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::Saving => {
+            ui.set_app_mode(AppMode::Saving);
+            ui.set_status_text("Waiting for native output before atomic save…".into());
+        }
         IdeWorkerEvent::Closing => {
             ui.set_app_mode(AppMode::Closing);
             ui.set_status_text("Waiting for native output to close…".into());
@@ -615,6 +594,60 @@ fn apply_event(ui: &MainWindow, output_routes: &OutputRoutes, event: IdeWorkerEv
             ui.set_error_text(format!("{}: {reason}", command_status(command)).into());
         }
     }
+}
+
+fn apply_running_event(ui: &MainWindow, observation: &IdeRunningObservation) {
+    ui.set_app_mode(AppMode::Running);
+    ui.set_project_name(observation.project_name().into());
+    ui.set_project_id(observation.project_id().into());
+    ui.set_sample_rate(format!("{} Hz", observation.sample_rate_hz()).into());
+    ui.set_scene_count(observation.scene_count().to_string().into());
+    set_scenes(ui, observation.scenes());
+    apply_mixer_observation(ui, observation);
+    ui.set_stream_state(format!("{:?}", observation.output_state()).into());
+    ui.set_callback_count(observation.output().callback_count.to_string().into());
+    ui.set_xrun_count(
+        observation
+            .output()
+            .native_xruns
+            .map_or_else(
+                || "Unavailable".to_owned(),
+                |xrun| {
+                    xrun.recovery_count.map_or_else(
+                        || "Observed, count unavailable".to_owned(),
+                        |count| count.to_string(),
+                    )
+                },
+            )
+            .into(),
+    );
+    let position_frame = observation.recovery().position_frame();
+    ui.set_frame_position(position_frame.to_string().into());
+    ui.set_transport_clock(
+        format_transport_clock(position_frame, observation.sample_rate_hz()).into(),
+    );
+    ui.set_transport_state(
+        match observation.recovery().state() {
+            PlaybackRecoveryTransportState::Stopped => "Stopped",
+            PlaybackRecoveryTransportState::Rolling => "Rolling",
+        }
+        .into(),
+    );
+    let (left_level, left_reading, right_level, right_reading) = observation
+        .meter()
+        .snapshot()
+        .map_or((0.0, "—".to_owned(), 0.0, "—".to_owned()), |snapshot| {
+            let meter = snapshot.meter();
+            let (left_level, left_reading) = meter_presentation(meter.left().sample_peak());
+            let (right_level, right_reading) = meter_presentation(meter.right().sample_peak());
+            (left_level, left_reading, right_level, right_reading)
+        });
+    ui.set_left_meter(left_level);
+    ui.set_right_meter(right_level);
+    ui.set_left_reading(left_reading.into());
+    ui.set_right_reading(right_reading.into());
+    ui.set_status_text("Runtime evidence updated".into());
+    ui.set_error_text(SharedString::default());
 }
 
 fn apply_mixer_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
@@ -707,6 +740,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::OpenProject if current == AppMode::Opening => AppMode::Closed,
         IdeWorkerCommandKind::Observe if current == AppMode::Opening => AppMode::Running,
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
+        IdeWorkerCommandKind::SaveProject if current == AppMode::Saving => AppMode::Running,
         _ => current,
     }
 }
@@ -1438,6 +1472,10 @@ mod tests {
         );
         assert_eq!(
             mode_after_failure(AppMode::Running, IdeWorkerCommandKind::Mixer),
+            AppMode::Running
+        );
+        assert_eq!(
+            mode_after_failure(AppMode::Saving, IdeWorkerCommandKind::SaveProject),
             AppMode::Running
         );
         assert_eq!(

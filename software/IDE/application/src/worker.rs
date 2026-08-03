@@ -7,21 +7,26 @@ use std::sync::mpsc::{
     Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, TransportCommand};
 use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSnapshot};
 
 use super::{
-    DesktopIdeApplication, DesktopIdePendingClose, IdeApplicationConfig, IdeAudioOutputInventory,
-    IdeCloseOutcome, IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand,
-    IdeMixerCommandError, IdeMixerMainState, IdeNativeCloseFailure, IdeOutputDiscoveryError,
-    IdeOutputSelection, IdeOutputSelectionError, IdePendingCloseWait, IdeProjectOpenError,
-    IdeSceneAvailability, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
-    RunningDesktopIdeApplication,
+    DesktopIdeApplication, DesktopIdePendingClose, DesktopIdePendingSaveClose,
+    DesktopPlaybackRecovery, IdeApplicationConfig, IdeAudioOutputInventory, IdeCloseOutcome,
+    IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
+    IdeMixerMainState, IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection,
+    IdeOutputSelectionError, IdePendingCloseWait, IdePendingSaveCloseWait, IdeProjectOpenError,
+    IdeProjectSaveError, IdeSaveCloseOutcome, IdeSceneAvailability, OutputInventoryError,
+    OutputStreamSnapshot, OutputStreamState, RunningDesktopIdeApplication,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
+#[cfg(not(test))]
+const MIXER_SAVE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const MIXER_SAVE_COMMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const MAX_IDE_WORKER_COMMANDS: usize = 64;
 pub const MAX_IDE_WORKER_EVENTS: usize = 64;
 
@@ -71,6 +76,7 @@ pub enum IdeWorkerCommandKind {
     OpenProject,
     Transport,
     Mixer,
+    SaveProject,
     Observe,
     CloseProject,
     Shutdown,
@@ -85,6 +91,7 @@ pub enum IdeWorkerCommand {
     OpenProject(PathBuf),
     Transport(TransportCommand),
     Mixer(IdeMixerCommand),
+    SaveProject,
     Observe,
     CloseProject,
     Shutdown,
@@ -101,6 +108,7 @@ impl IdeWorkerCommand {
             Self::OpenProject(_) => IdeWorkerCommandKind::OpenProject,
             Self::Transport(_) => IdeWorkerCommandKind::Transport,
             Self::Mixer(_) => IdeWorkerCommandKind::Mixer,
+            Self::SaveProject => IdeWorkerCommandKind::SaveProject,
             Self::Observe => IdeWorkerCommandKind::Observe,
             Self::CloseProject => IdeWorkerCommandKind::CloseProject,
             Self::Shutdown => IdeWorkerCommandKind::Shutdown,
@@ -279,6 +287,7 @@ pub enum IdeWorkerCommandFailure {
     ProjectOpen(IdeProjectOpenError),
     Transport(super::DesktopDirectControlError),
     Mixer(IdeMixerCommandError),
+    ProjectSave(IdeProjectSaveError),
     InvalidState,
     Publication(OutputInventoryError),
     ProjectPublicationCapacityUnavailable,
@@ -293,6 +302,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::ProjectOpen(source) => source.fmt(formatter),
             Self::Transport(source) => source.fmt(formatter),
             Self::Mixer(source) => source.fmt(formatter),
+            Self::ProjectSave(source) => source.fmt(formatter),
             Self::InvalidState => {
                 formatter.write_str("command is invalid for the current IDE state")
             }
@@ -315,6 +325,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::ProjectOpen(source) => Some(source),
             Self::Transport(source) => Some(source),
             Self::Mixer(source) => Some(source),
+            Self::ProjectSave(source) => Some(source),
             Self::Publication(source) => Some(source),
             Self::InvalidState
             | Self::ProjectPublicationCapacityUnavailable
@@ -336,6 +347,11 @@ pub enum IdeWorkerEvent {
     Running(IdeRunningObservation),
     TransportQueued(TransportCommand),
     MixerQueued(IdeMixerCommand),
+    ProjectSaved {
+        revision: u64,
+        changed: bool,
+    },
+    Saving,
     Closing,
     CommandFailed {
         command: IdeWorkerCommandKind,
@@ -618,6 +634,12 @@ enum WorkerState {
     Undiscovered(IdeApplicationConfig),
     Closed(DesktopIdeApplication),
     Running(RunningDesktopIdeApplication),
+    SaveFence {
+        application: RunningDesktopIdeApplication,
+        sequence: u64,
+        deadline: Instant,
+    },
+    Saving(DesktopIdePendingSaveClose),
     Closing(DesktopIdePendingClose),
     Empty,
 }
@@ -632,10 +654,13 @@ fn run_worker(
         return finish_worker(state, unpublished_native_failure);
     }
     loop {
-        if !poll_closing(&mut state, events, &mut unpublished_native_failure) {
+        if !poll_pending_state(&mut state, events, &mut unpublished_native_failure) {
             return finish_worker(state, unpublished_native_failure);
         }
-        let command = if matches!(state, WorkerState::Closing(_)) {
+        let command = if matches!(
+            state,
+            WorkerState::SaveFence { .. } | WorkerState::Closing(_) | WorkerState::Saving(_)
+        ) {
             match commands.recv_timeout(WORKER_SHUTDOWN_POLL) {
                 Ok(command) => command,
                 Err(RecvTimeoutError::Timeout) => continue,
@@ -791,47 +816,32 @@ fn process_command(
             },
             _ => publish_failure(events, kind, IdeWorkerCommandFailure::InvalidState),
         },
+        IdeWorkerCommand::SaveProject => save_project(state, events),
         IdeWorkerCommand::Observe => publish_state(state, events, unpublished_native_failure),
-        IdeWorkerCommand::CloseProject => {
-            if !matches!(state, WorkerState::Running(_)) {
-                return publish_failure(events, kind, IdeWorkerCommandFailure::InvalidState);
-            }
-            let WorkerState::Running(application) = std::mem::replace(state, WorkerState::Empty)
-            else {
-                unreachable!("running state was checked before ownership transfer");
-            };
-            match application.close() {
-                IdeCloseOutcome::Closed {
-                    application,
-                    failure,
-                } => {
-                    *state = WorkerState::Closed(application);
-                    *unpublished_native_failure = failure;
-                    publish_state(state, events, unpublished_native_failure)
-                }
-                IdeCloseOutcome::Pending(pending) => {
-                    *state = WorkerState::Closing(pending);
-                    send_event(events, IdeWorkerEvent::Closing)
-                }
-            }
-        }
+        IdeWorkerCommand::CloseProject => close_project(
+            state,
+            events,
+            unpublished_native_failure,
+            IdeWorkerCommandKind::CloseProject,
+        ),
         IdeWorkerCommand::Shutdown => unreachable!("shutdown is handled by the worker loop"),
     }
 }
 
-fn poll_closing(
+fn close_project(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
     unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+    command: IdeWorkerCommandKind,
 ) -> bool {
-    if !matches!(state, WorkerState::Closing(_)) {
-        return true;
+    if !matches!(state, WorkerState::Running(_)) {
+        return publish_failure(events, command, IdeWorkerCommandFailure::InvalidState);
     }
-    let WorkerState::Closing(pending) = std::mem::replace(state, WorkerState::Empty) else {
-        unreachable!("closing state was checked before ownership transfer");
+    let WorkerState::Running(application) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("running state was checked before ownership transfer");
     };
-    match pending.wait(Duration::ZERO) {
-        IdePendingCloseWait::Closed {
+    match application.close() {
+        IdeCloseOutcome::Closed {
             application,
             failure,
         } => {
@@ -839,8 +849,249 @@ fn poll_closing(
             *unpublished_native_failure = failure;
             publish_state(state, events, unpublished_native_failure)
         }
-        IdePendingCloseWait::TimedOut(pending) => {
+        IdeCloseOutcome::Pending(pending) => {
             *state = WorkerState::Closing(pending);
+            send_event(events, IdeWorkerEvent::Closing)
+        }
+    }
+}
+
+fn save_project(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) -> bool {
+    let WorkerState::Running(application) = state else {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SaveProject,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    };
+    if !application.can_save_mixer() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SaveProject,
+            IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::ProjectSnapshotUnavailable),
+        );
+    }
+    let sequence = match application.try_send_mixer_fence() {
+        Ok(Some(sequence)) => sequence,
+        Ok(None) => {
+            return publish_failure(
+                events,
+                IdeWorkerCommandKind::SaveProject,
+                IdeWorkerCommandFailure::ProjectSave(
+                    IdeProjectSaveError::MixerFenceSequenceUnavailable,
+                ),
+            );
+        }
+        Err(source) => {
+            return publish_failure(
+                events,
+                IdeWorkerCommandKind::SaveProject,
+                IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::MixerCommit(source)),
+            );
+        }
+    };
+    let WorkerState::Running(application) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("running state was checked before save ownership transfer");
+    };
+    *state = WorkerState::SaveFence {
+        application,
+        sequence,
+        deadline: Instant::now() + MIXER_SAVE_COMMIT_TIMEOUT,
+    };
+    send_event(events, IdeWorkerEvent::Saving)
+}
+
+fn begin_save_close(
+    state: &mut WorkerState,
+    application: RunningDesktopIdeApplication,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    match application.close_for_save() {
+        IdeSaveCloseOutcome::Closed {
+            application,
+            recovery,
+            failure,
+        } => complete_save(state, application, recovery, failure, events),
+        IdeSaveCloseOutcome::Pending(pending) => {
+            *state = WorkerState::Saving(pending);
+            send_event(events, IdeWorkerEvent::Saving)
+        }
+        IdeSaveCloseOutcome::Unavailable {
+            application,
+            failure,
+        } => publish_closed_save_failure(
+            state,
+            application,
+            events,
+            failure.map_or(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+                IdeProjectSaveError::NativeClose,
+            ),
+        ),
+    }
+}
+
+fn publish_closed_save_failure(
+    state: &mut WorkerState,
+    application: DesktopIdeApplication,
+    events: &SyncSender<IdeWorkerEvent>,
+    reason: IdeProjectSaveError,
+) -> bool {
+    *state = WorkerState::Closed(application);
+    let mut no_native_failure = None;
+    if !publish_state(state, events, &mut no_native_failure) {
+        return false;
+    }
+    publish_failure(
+        events,
+        IdeWorkerCommandKind::SaveProject,
+        IdeWorkerCommandFailure::ProjectSave(reason),
+    )
+}
+
+fn complete_save(
+    state: &mut WorkerState,
+    application: DesktopIdeApplication,
+    recovery: DesktopPlaybackRecovery,
+    native_failure: Option<IdeNativeCloseFailure>,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    let Some(project_path) = recovery
+        .prepared_project()
+        .map(|project| project.package().root().to_path_buf())
+    else {
+        return publish_closed_save_failure(
+            state,
+            application,
+            events,
+            IdeProjectSaveError::ProjectSnapshotUnavailable,
+        );
+    };
+    let attempt = if let Some(failure) = native_failure {
+        Err(IdeProjectSaveError::NativeClose(failure))
+    } else {
+        RunningDesktopIdeApplication::prepare_mixer_save(&application, &recovery).and_then(|plan| {
+            plan.publish()
+                .map_err(|source| IdeProjectSaveError::Publication(Box::new(source)))
+        })
+    };
+    drop(recovery);
+    match application.open_project(&project_path) {
+        Ok(running) => {
+            *state = WorkerState::Running(running);
+            let mut no_native_failure = None;
+            if !publish_state(state, events, &mut no_native_failure) {
+                return false;
+            }
+            match attempt {
+                Ok(outcome) => send_event(
+                    events,
+                    IdeWorkerEvent::ProjectSaved {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                    },
+                ),
+                Err(reason) => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::SaveProject,
+                    IdeWorkerCommandFailure::ProjectSave(reason),
+                ),
+            }
+        }
+        Err(failure) => {
+            let (application, reopen) = failure.into_parts();
+            *state = WorkerState::Closed(application);
+            let mut no_native_failure = None;
+            if !publish_state(state, events, &mut no_native_failure) {
+                return false;
+            }
+            let reason = match attempt {
+                Ok(outcome) => IdeProjectSaveError::ReopenAfterPublication {
+                    outcome,
+                    source: Box::new(reopen),
+                },
+                Err(IdeProjectSaveError::Publication(publication)) => {
+                    IdeProjectSaveError::PublicationAndReopen {
+                        publication,
+                        reopen: Box::new(reopen),
+                    }
+                }
+                Err(IdeProjectSaveError::NativeClose(close)) => {
+                    IdeProjectSaveError::NativeCloseAndReopen {
+                        close,
+                        reopen: Box::new(reopen),
+                    }
+                }
+                Err(preparation) => IdeProjectSaveError::ReopenAfterPreparation {
+                    preparation: Box::new(preparation),
+                    reopen: Box::new(reopen),
+                },
+            };
+            publish_failure(
+                events,
+                IdeWorkerCommandKind::SaveProject,
+                IdeWorkerCommandFailure::ProjectSave(reason),
+            )
+        }
+    }
+}
+
+fn poll_pending_state(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+) -> bool {
+    match std::mem::replace(state, WorkerState::Empty) {
+        WorkerState::Closing(pending) => match pending.wait(Duration::ZERO) {
+            IdePendingCloseWait::Closed {
+                application,
+                failure,
+            } => {
+                *state = WorkerState::Closed(application);
+                *unpublished_native_failure = failure;
+                publish_state(state, events, unpublished_native_failure)
+            }
+            IdePendingCloseWait::TimedOut(pending) => {
+                *state = WorkerState::Closing(pending);
+                true
+            }
+        },
+        WorkerState::Saving(pending) => match pending.wait(Duration::ZERO) {
+            IdePendingSaveCloseWait::Closed {
+                application,
+                recovery,
+                failure,
+            } => complete_save(state, application, recovery, failure, events),
+            IdePendingSaveCloseWait::TimedOut(pending) => {
+                *state = WorkerState::Saving(pending);
+                true
+            }
+        },
+        WorkerState::SaveFence {
+            application,
+            sequence,
+            deadline,
+        } => {
+            if application.committed_mixer_fence() >= sequence {
+                begin_save_close(state, application, events)
+            } else if Instant::now() >= deadline {
+                *state = WorkerState::Running(application);
+                publish_failure(
+                    events,
+                    IdeWorkerCommandKind::SaveProject,
+                    IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::MixerCommitTimeout),
+                )
+            } else {
+                *state = WorkerState::SaveFence {
+                    application,
+                    sequence,
+                    deadline,
+                };
+                true
+            }
+        }
+        current => {
+            *state = current;
             true
         }
     }
@@ -876,6 +1127,7 @@ fn publish_state(
             }
         },
         WorkerState::Closing(_) => IdeWorkerEvent::Closing,
+        WorkerState::SaveFence { .. } | WorkerState::Saving(_) => IdeWorkerEvent::Saving,
         WorkerState::Undiscovered(_) | WorkerState::Empty => return true,
     };
     if send_event(events, event) {
@@ -996,9 +1248,17 @@ fn shutdown_state(mut state: WorkerState) -> Option<IdeNativeCloseFailure> {
                 IdeCloseOutcome::Closed { failure, .. } => return failure,
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
             },
+            WorkerState::SaveFence { application, .. } => match application.close() {
+                IdeCloseOutcome::Closed { failure, .. } => return failure,
+                IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
+            },
             WorkerState::Closing(pending) => match pending.wait(WORKER_SHUTDOWN_POLL) {
                 IdePendingCloseWait::Closed { failure, .. } => return failure,
                 IdePendingCloseWait::TimedOut(pending) => WorkerState::Closing(pending),
+            },
+            WorkerState::Saving(pending) => match pending.wait(WORKER_SHUTDOWN_POLL) {
+                IdePendingSaveCloseWait::Closed { failure, .. } => return failure,
+                IdePendingSaveCloseWait::TimedOut(pending) => WorkerState::Saving(pending),
             },
             WorkerState::Undiscovered(_) | WorkerState::Closed(_) | WorkerState::Empty => {
                 return None;
@@ -1163,9 +1423,154 @@ mod tests {
             recv(&worker),
             IdeWorkerEvent::MixerQueued(IdeMixerCommand::MainMute { muted: true })
         ));
+        worker.try_send(IdeWorkerCommand::SaveProject).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SaveProject,
+                reason: IdeWorkerCommandFailure::ProjectSave(
+                    IdeProjectSaveError::ProjectSnapshotUnavailable
+                ),
+            }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::Transport(TransportCommand::Stop))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::TransportQueued(TransportCommand::Stop)
+        ));
         worker.try_send(IdeWorkerCommand::CloseProject).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn save_waits_for_a_committed_mixer_fence_before_closing() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 4).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker.try_send(IdeWorkerCommand::SaveProject).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Saving));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SaveProject,
+                reason: IdeWorkerCommandFailure::ProjectSave(
+                    IdeProjectSaveError::ProjectSnapshotUnavailable
+                ),
+            }
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn save_fence_timeout_retains_the_running_application() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: false,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 4).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker.try_send(IdeWorkerCommand::SaveProject).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Saving));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SaveProject,
+                reason: IdeWorkerCommandFailure::ProjectSave(
+                    IdeProjectSaveError::MixerCommitTimeout
+                ),
+            }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::Transport(TransportCommand::Stop))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::TransportQueued(TransportCommand::Stop)
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn exhausted_save_fence_sequence_does_not_change_running_state() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                next_mixer_fence: 0,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let mut state = WorkerState::Running(running);
+        let (events, receiver) = sync_channel(1);
+
+        assert!(save_project(&mut state, &events));
+        assert!(matches!(state, WorkerState::Running(_)));
+        assert!(matches!(
+            receiver.recv_timeout(WAIT).unwrap(),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SaveProject,
+                reason: IdeWorkerCommandFailure::ProjectSave(
+                    IdeProjectSaveError::MixerFenceSequenceUnavailable
+                ),
+            }
+        ));
+    }
+
+    #[test]
+    fn terminal_save_failure_publishes_closed_before_the_reason() {
+        let mut state = WorkerState::Empty;
+        let (events, receiver) = sync_channel(2);
+
+        assert!(publish_closed_save_failure(
+            &mut state,
+            closed_application(),
+            &events,
+            IdeProjectSaveError::ProjectSnapshotUnavailable,
+        ));
+
+        assert!(matches!(state, WorkerState::Closed(_)));
+        assert!(matches!(
+            receiver.recv_timeout(WAIT).unwrap(),
+            IdeWorkerEvent::Closed { .. }
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(WAIT).unwrap(),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SaveProject,
+                reason: IdeWorkerCommandFailure::ProjectSave(
+                    IdeProjectSaveError::ProjectSnapshotUnavailable
+                ),
+            }
+        ));
     }
 
     #[test]

@@ -2,15 +2,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use hyper_audio_engine::{LinearGain, Pan};
 use hyper_audio_source::{DecodeError, DecodeLimits};
 use hyper_control_mappings::ControlMappingBindingErrorKind;
 use hyper_mapping_compiler::{CompiledControlScope, CompiledControlSource, CompiledControlTarget};
 use hyper_media_cache::CacheLimits;
-use hyper_playback_json::LoaderLimits;
+use hyper_playback_json::{
+    LoaderLimits, MixerBaseState, MixerChannelBaseState, serialize_mixer_base_state,
+};
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::{
     ProjectPlaybackError, ProjectPlaybackLimits, RecordingBindingErrorKind,
     prepare_project_playback,
+};
+use hyper_project_model::ResourceRole;
+use hyper_storage_engine::{
+    ProjectResourcePublicationRequest, publish_project_resource, verify_project_package,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -366,6 +373,69 @@ fn prepares_one_verified_owned_playback_session() {
     assert!(prepared.compiled_control_mapping().is_none());
     assert!(prepared.recording_metadata().is_empty());
     prepared.package().confirm_unchanged().unwrap();
+}
+
+#[test]
+fn serialized_mixer_publication_reopens_as_the_next_project_revision() {
+    let fixture = Fixture::new();
+    let verified = verify_project_package(&fixture.root).unwrap();
+    let descriptor = verified
+        .manifest()
+        .resources()
+        .iter()
+        .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+        .unwrap();
+    let source = verified.read_resource(descriptor.id()).unwrap();
+    let channel_gain = LinearGain::from_millionths(625_000).unwrap();
+    let channel_pan = Pan::from_millionths(-250_000).unwrap();
+    let main_gain = LinearGain::from_millionths(750_000).unwrap();
+    let serialized = serialize_mixer_base_state(
+        &source,
+        PROJECT_ID,
+        MIXER_ID,
+        &MixerBaseState {
+            channels: vec![MixerChannelBaseState {
+                track_id: TRACK_ID.to_owned(),
+                gain: channel_gain,
+                pan: channel_pan,
+                muted: true,
+                solo: true,
+                sends: Vec::new(),
+            }],
+            main_gain,
+            main_muted: true,
+        },
+        LoaderLimits::VERSION_1,
+    )
+    .unwrap();
+
+    let outcome = publish_project_resource(
+        &fixture.root,
+        ProjectResourcePublicationRequest {
+            expected_project_sha256: *verified.manifest_sha256(),
+            resource_id: MIXER_ID,
+            expected_role: ResourceRole::Mixer,
+            resource_bytes: &serialized,
+        },
+    )
+    .unwrap();
+
+    assert!(outcome.changed());
+    assert_eq!(outcome.project_revision(), 2);
+    let reopened = prepare_project_playback(&fixture.root, limits()).unwrap();
+    assert_eq!(reopened.package().manifest().revision(), 2);
+    assert_eq!(
+        reopened.package().manifest_sha256(),
+        outcome.project_identity()
+    );
+    let (_, mixer, _, _) = reopened.session().parts();
+    let channel = &mixer.slots()[0];
+    assert_eq!(channel.parameters().gain, channel_gain);
+    assert_eq!(channel.parameters().pan, channel_pan);
+    assert!(channel.muted());
+    assert!(channel.solo());
+    assert_eq!(mixer.main_gain(), main_gain);
+    assert!(mixer.main_muted());
 }
 
 #[test]

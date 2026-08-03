@@ -4,7 +4,7 @@
 use core::error::Error;
 use core::fmt;
 use core::mem::size_of;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hyper_audio_engine::{LinearGain, Pan, ParameterError};
@@ -13,9 +13,9 @@ pub use hyper_desktop_audio::DesktopSceneAvailability as IdeSceneAvailability;
 use hyper_desktop_audio::{
     DesktopDirectControlError, DesktopInputStopError, DesktopOutputConfig,
     DesktopOutputConfigError, DesktopOutputDiscoveryError, DesktopOutputStopError,
-    DesktopPlaybackRecoveryPendingStop, DesktopPlaybackRecoveryPendingStopWait,
-    DesktopPlaybackSession, DesktopProjectOpenError, OutputStreamSnapshot, OutputStreamState,
-    discover_desktop_output_targets,
+    DesktopPlaybackRecovery, DesktopPlaybackRecoveryPendingStop,
+    DesktopPlaybackRecoveryPendingStopWait, DesktopPlaybackSession, DesktopProjectOpenError,
+    OutputStreamSnapshot, OutputStreamState, discover_desktop_output_targets,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
@@ -25,9 +25,17 @@ use hyper_mixer_runtime::{
 pub use hyper_mixer_runtime::{LocateState, PlaybackRecoveryTransportState, TransportCommand};
 #[cfg(test)]
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
-use hyper_playback_json::{CompiledMixerTap, CompiledMixerTrackKind, LoaderLimits};
+use hyper_playback_json::{
+    CompiledMixerTap, CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
+    MixerSendBaseState, MixerStateSerializationError, serialize_mixer_base_state,
+};
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::ProjectPlaybackLimits;
+use hyper_project_model::ResourceRole;
+use hyper_storage_engine::{
+    ProjectResourcePublicationError, ProjectResourcePublicationOutcome,
+    ProjectResourcePublicationRequest, StorageError, publish_project_resource,
+};
 
 mod worker;
 
@@ -637,6 +645,152 @@ impl Error for IdeMixerCommandError {
     }
 }
 
+#[derive(Debug)]
+pub enum IdeProjectSaveError {
+    ProjectSnapshotUnavailable,
+    MixerCommit(DesktopDirectControlError),
+    MixerCommitTimeout,
+    MixerFenceSequenceUnavailable,
+    MixerStateUnavailable,
+    MixerResourceMissing,
+    MixerResourceAmbiguous,
+    MixerLayoutMismatch,
+    CapacityUnavailable,
+    Storage(StorageError),
+    Serialization(MixerStateSerializationError),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    Publication(Box<ProjectResourcePublicationError>),
+    ReopenAfterPreparation {
+        preparation: Box<IdeProjectSaveError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: ProjectResourcePublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<ProjectResourcePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl fmt::Display for IdeProjectSaveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProjectSnapshotUnavailable => {
+                formatter.write_str("running playback exposes no verified project snapshot")
+            }
+            Self::MixerCommit(source) => {
+                write!(
+                    formatter,
+                    "mixer state could not be prepared for save: {source}"
+                )
+            }
+            Self::MixerCommitTimeout => {
+                formatter.write_str("mixer state did not commit before the save deadline")
+            }
+            Self::MixerFenceSequenceUnavailable => {
+                formatter.write_str("mixer save sequence space is exhausted")
+            }
+            Self::MixerStateUnavailable => {
+                formatter.write_str("no committed live mixer state is available to save")
+            }
+            Self::MixerResourceMissing => {
+                formatter.write_str("verified project has no mixer resource")
+            }
+            Self::MixerResourceAmbiguous => {
+                formatter.write_str("verified project has multiple mixer resources")
+            }
+            Self::MixerLayoutMismatch => {
+                formatter.write_str("live mixer state disagrees with the compiled project layout")
+            }
+            Self::CapacityUnavailable => formatter.write_str("mixer save capacity is unavailable"),
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before save: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before save ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::Publication(source) => source.fmt(formatter),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "project save preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "project revision {} was saved but could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "project save failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeProjectSaveError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerCommit(source) => Some(source),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ProjectSnapshotUnavailable
+            | Self::MixerCommitTimeout
+            | Self::MixerFenceSequenceUnavailable
+            | Self::MixerStateUnavailable
+            | Self::MixerResourceMissing
+            | Self::MixerResourceAmbiguous
+            | Self::MixerLayoutMismatch
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IdeMixerSavePlan {
+    project_path: PathBuf,
+    expected_project_sha256: [u8; 32],
+    resource_id: String,
+    resource_bytes: Vec<u8>,
+}
+
+impl IdeMixerSavePlan {
+    fn publish(
+        &self,
+    ) -> Result<ProjectResourcePublicationOutcome, ProjectResourcePublicationError> {
+        publish_project_resource(
+            &self.project_path,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: self.expected_project_sha256,
+                resource_id: &self.resource_id,
+                expected_role: ResourceRole::Mixer,
+                resource_bytes: &self.resource_bytes,
+            },
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdeMixerChannelKind {
     Audio,
@@ -721,6 +875,10 @@ struct TestPlaybackSession {
     mixer_commands: Vec<IdeMixerCommand>,
     meters: OutputMeterReceiver,
     close_failure: Option<IdeNativeCloseFailure>,
+    save_eligible: bool,
+    commit_mixer_fences: bool,
+    committed_mixer_fence: u64,
+    next_mixer_fence: u64,
 }
 
 #[cfg(test)]
@@ -731,11 +889,138 @@ impl Default for TestPlaybackSession {
             mixer_commands: Vec::new(),
             meters: output_meter_channel().1,
             close_failure: None,
+            save_eligible: false,
+            commit_mixer_fences: false,
+            committed_mixer_fence: 0,
+            next_mixer_fence: 1,
         }
     }
 }
 
 impl RunningDesktopIdeApplication {
+    fn can_save_mixer(&self) -> bool {
+        match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session.prepared_project().is_some(),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => session.save_eligible,
+        }
+    }
+
+    fn try_send_mixer_fence(&mut self) -> Result<Option<u64>, DesktopDirectControlError> {
+        match &mut self.session {
+            IdePlaybackSessionOwner::Native(session) => session.try_send_mixer_fence(),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => {
+                let sequence = session.next_mixer_fence;
+                if sequence == 0 {
+                    return Ok(None);
+                }
+                session.next_mixer_fence = sequence.checked_add(1).unwrap_or(0);
+                if session.commit_mixer_fences {
+                    session.committed_mixer_fence = session.committed_mixer_fence.max(sequence);
+                }
+                Ok(Some(sequence))
+            }
+        }
+    }
+
+    #[must_use]
+    fn committed_mixer_fence(&self) -> u64 {
+        match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session.committed_mixer_fence(),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => session.committed_mixer_fence,
+        }
+    }
+
+    fn prepare_mixer_save(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+    ) -> Result<IdeMixerSavePlan, IdeProjectSaveError> {
+        let project = recovery
+            .prepared_project()
+            .ok_or(IdeProjectSaveError::ProjectSnapshotUnavailable)?;
+        let package = project.package();
+        let mut mixer_descriptors = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::Mixer);
+        let descriptor = mixer_descriptors
+            .next()
+            .ok_or(IdeProjectSaveError::MixerResourceMissing)?;
+        if mixer_descriptors.next().is_some() {
+            return Err(IdeProjectSaveError::MixerResourceAmbiguous);
+        }
+        let source = package
+            .read_resource(descriptor.id())
+            .map_err(IdeProjectSaveError::Storage)?;
+        let live = recovery
+            .checkpoint()
+            .mixer_parameter_state()
+            .ok_or(IdeProjectSaveError::MixerStateUnavailable)?;
+        let (_, mixer, _, _) = project.session().parts();
+        if live.channel_count() != mixer.slots().len() {
+            return Err(IdeProjectSaveError::MixerLayoutMismatch);
+        }
+        let mut channels = Vec::new();
+        channels
+            .try_reserve_exact(mixer.slots().len())
+            .map_err(|_| IdeProjectSaveError::CapacityUnavailable)?;
+        for (channel_index, slot) in mixer.slots().iter().enumerate() {
+            let channel = live
+                .channel(channel_index)
+                .ok_or(IdeProjectSaveError::MixerLayoutMismatch)?;
+            if channel.send_count() != slot.sends().len() {
+                return Err(IdeProjectSaveError::MixerLayoutMismatch);
+            }
+            let mut sends = Vec::new();
+            sends
+                .try_reserve_exact(slot.sends().len())
+                .map_err(|_| IdeProjectSaveError::CapacityUnavailable)?;
+            for (send_index, compiled_send) in slot.sends().iter().enumerate() {
+                let send = channel
+                    .send(send_index)
+                    .ok_or(IdeProjectSaveError::MixerLayoutMismatch)?;
+                let parameters = send.parameters();
+                sends.push(MixerSendBaseState {
+                    id: try_save_owned(compiled_send.id())?,
+                    gain: parameters.gain,
+                    pan: parameters.pan,
+                    enabled: send.enabled(),
+                });
+            }
+            let parameters = channel.parameters();
+            channels.push(MixerChannelBaseState {
+                track_id: try_save_owned(slot.track_id())?,
+                gain: parameters.gain,
+                pan: parameters.pan,
+                muted: channel.muted(),
+                solo: channel.solo(),
+                sends,
+            });
+        }
+        let state = MixerBaseState {
+            channels,
+            main_gain: live.main_gain(),
+            main_muted: live.main_muted(),
+        };
+        let resource_bytes = serialize_mixer_base_state(
+            &source,
+            package.manifest().project_id(),
+            descriptor.id(),
+            &state,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeProjectSaveError::Serialization)?;
+        Ok(IdeMixerSavePlan {
+            project_path: package.root().to_path_buf(),
+            expected_project_sha256: *package.manifest_sha256(),
+            resource_id: try_save_owned(descriptor.id())?,
+            resource_bytes,
+        })
+    }
+
     /// Observes the verified project and the latest non-owning runtime evidence.
     ///
     /// `None` means the underlying playback source exposes no verified project;
@@ -1033,6 +1318,64 @@ impl RunningDesktopIdeApplication {
             }
         }
     }
+
+    #[must_use]
+    #[allow(
+        clippy::infallible_destructuring_match,
+        reason = "the test-only session variant returns a deterministic unavailable outcome"
+    )]
+    fn close_for_save(self) -> IdeSaveCloseOutcome {
+        let Self {
+            application,
+            session,
+        } = self;
+        let session = match session {
+            IdePlaybackSessionOwner::Native(session) => session,
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => {
+                return IdeSaveCloseOutcome::Unavailable {
+                    application,
+                    failure: session.close_failure,
+                };
+            }
+        };
+        match session.into_recovery() {
+            Ok(recovery) => IdeSaveCloseOutcome::Closed {
+                application,
+                recovery,
+                failure: None,
+            },
+            Err(error) => {
+                let failure = classify_joined_close_failure(&error);
+                match error.into_pending() {
+                    Ok(pending) => IdeSaveCloseOutcome::Pending(DesktopIdePendingSaveClose {
+                        application,
+                        pending,
+                    }),
+                    Err(error) => match error.into_recovery() {
+                        Ok(recovery) => IdeSaveCloseOutcome::Closed {
+                            application,
+                            recovery,
+                            failure: Some(failure),
+                        },
+                        Err(_) => IdeSaveCloseOutcome::Unavailable {
+                            application,
+                            failure: Some(failure),
+                        },
+                    },
+                }
+            }
+        }
+    }
+}
+
+fn try_save_owned(value: &str) -> Result<String, IdeProjectSaveError> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| IdeProjectSaveError::CapacityUnavailable)?;
+    owned.push_str(value);
+    Ok(owned)
 }
 
 #[cfg(test)]
@@ -1114,6 +1457,71 @@ pub enum IdeCloseOutcome {
         failure: Option<IdeNativeCloseFailure>,
     },
     Pending(DesktopIdePendingClose),
+}
+
+#[derive(Debug)]
+enum IdeSaveCloseOutcome {
+    Closed {
+        application: DesktopIdeApplication,
+        recovery: DesktopPlaybackRecovery,
+        failure: Option<IdeNativeCloseFailure>,
+    },
+    Pending(DesktopIdePendingSaveClose),
+    Unavailable {
+        application: DesktopIdeApplication,
+        failure: Option<IdeNativeCloseFailure>,
+    },
+}
+
+#[derive(Debug)]
+struct DesktopIdePendingSaveClose {
+    application: DesktopIdeApplication,
+    pending: DesktopPlaybackRecoveryPendingStop,
+}
+
+#[derive(Debug)]
+enum IdePendingSaveCloseWait {
+    Closed {
+        application: DesktopIdeApplication,
+        recovery: DesktopPlaybackRecovery,
+        failure: Option<IdeNativeCloseFailure>,
+    },
+    TimedOut(DesktopIdePendingSaveClose),
+}
+
+impl DesktopIdePendingSaveClose {
+    #[must_use]
+    fn wait(self, timeout: Duration) -> IdePendingSaveCloseWait {
+        match self.pending.wait(timeout) {
+            DesktopPlaybackRecoveryPendingStopWait::Completed(recovery) => {
+                IdePendingSaveCloseWait::Closed {
+                    application: self.application,
+                    recovery,
+                    failure: None,
+                }
+            }
+            DesktopPlaybackRecoveryPendingStopWait::Failed(recovery) => {
+                IdePendingSaveCloseWait::Closed {
+                    application: self.application,
+                    recovery,
+                    failure: Some(IdeNativeCloseFailure::RuntimeFailed),
+                }
+            }
+            DesktopPlaybackRecoveryPendingStopWait::Panicked(recovery) => {
+                IdePendingSaveCloseWait::Closed {
+                    application: self.application,
+                    recovery,
+                    failure: Some(IdeNativeCloseFailure::ThreadPanicked),
+                }
+            }
+            DesktopPlaybackRecoveryPendingStopWait::TimedOut(pending) => {
+                IdePendingSaveCloseWait::TimedOut(Self {
+                    application: self.application,
+                    pending,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug)]

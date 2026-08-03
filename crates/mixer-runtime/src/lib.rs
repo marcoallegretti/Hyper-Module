@@ -4,6 +4,7 @@
 use core::error::Error;
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
+use std::sync::Arc;
 
 use hyper_arrangement_renderer::{
     ArrangementRenderer, PlaybackRenderError, PlaybackRenderer, PlaybackRendererCreationError,
@@ -322,6 +323,19 @@ pub enum MixerParameterCommand {
     MainMute {
         muted: bool,
     },
+    /// Opaque FIFO barrier allocated by the sole command producer.
+    #[doc(hidden)]
+    Fence(MixerParameterFence),
+}
+
+/// Opaque mixer barrier carried through the realtime command queue.
+///
+/// Only [`MixerParameterCommandSender::try_send_fence`] can construct a value,
+/// which keeps the monotonically increasing sequence namespace single-owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct MixerParameterFence {
+    sequence: u64,
 }
 
 /// Base parameters for one send in a recoverable mixer-state snapshot.
@@ -691,6 +705,7 @@ impl MixerParameterLayout {
             MixerParameterCommand::MainGain { .. } | MixerParameterCommand::MainMute { .. } => {
                 Ok(())
             }
+            MixerParameterCommand::Fence(_) => Ok(()),
         }
     }
 
@@ -719,6 +734,8 @@ impl MixerParameterLayout {
 pub struct MixerParameterCommandSender {
     producer: Producer<MixerParameterCommand>,
     layout: MixerParameterLayout,
+    committed_fence: Arc<AtomicU64>,
+    next_fence_sequence: u64,
 }
 
 impl MixerParameterCommandSender {
@@ -740,6 +757,34 @@ impl MixerParameterCommandSender {
             fence(Ordering::Acquire);
         }
         disconnected
+    }
+
+    /// Returns the greatest fence sequence committed by a successful process
+    /// cycle. Acquire ordering pairs with process-thread publication.
+    #[must_use]
+    pub fn committed_fence(&self) -> u64 {
+        self.committed_fence.load(Ordering::Acquire)
+    }
+
+    /// Allocates and enqueues the next FIFO fence without waiting or allocating.
+    ///
+    /// Returns `Ok(None)` only after the nonzero sequence space is exhausted.
+    /// Queue rejection does not consume a sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the opaque fence command when the bounded queue is full or the
+    /// receiving runtime has been destroyed.
+    pub fn try_send_fence(&mut self) -> Result<Option<u64>, MixerParameterCommandSendError> {
+        let sequence = self.next_fence_sequence;
+        if sequence == 0 {
+            return Ok(None);
+        }
+        self.try_send(MixerParameterCommand::Fence(MixerParameterFence {
+            sequence,
+        }))?;
+        self.next_fence_sequence = sequence.checked_add(1).unwrap_or(0);
+        Ok(Some(sequence))
     }
 
     /// Resolves one persisted track identity into a handle bound to this runtime.
@@ -2287,6 +2332,7 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
             }
             MixerParameterCommand::MainGain { gain } => self.main_gain = gain,
             MixerParameterCommand::MainMute { muted } => self.main_muted = muted,
+            MixerParameterCommand::Fence(_) => {}
         }
     }
 
@@ -2673,12 +2719,19 @@ pub struct RoutedTransportRuntime<R> {
     position_frame: usize,
     command_consumer: Option<Consumer<TransportCommand>>,
     mixer_parameter_command_consumer: Option<Consumer<MixerParameterCommand>>,
+    mixer_parameter_fence: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct LoudnessCycleControl {
     applied_command_count: usize,
     sender_disconnected: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MixerParameterDrain {
+    applied_command_count: usize,
+    greatest_fence: u64,
 }
 
 pub type GraphTransportRuntime<'prepared, 'cache, 'schedule> =
@@ -2696,6 +2749,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             position_frame: 0,
             command_consumer: None,
             mixer_parameter_command_consumer: None,
+            mixer_parameter_fence: None,
         }
     }
 
@@ -2722,6 +2776,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 position_frame: 0,
                 command_consumer: Some(consumer),
                 mixer_parameter_command_consumer: None,
+                mixer_parameter_fence: None,
             },
         )
     }
@@ -2742,6 +2797,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             RingBuffer::new(MAX_QUEUED_TRANSPORT_COMMANDS);
         let (parameter_producer, parameter_consumer) =
             RingBuffer::new(MAX_QUEUED_MIXER_PARAMETER_COMMANDS);
+        let committed_fence = Arc::new(AtomicU64::new(0));
         let (scene_count, scene_ready_mask, scene_disabled_mask, scene_consolidation_mask) =
             scene_command_layout(&runtime);
         (
@@ -2755,6 +2811,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             MixerParameterCommandSender {
                 producer: parameter_producer,
                 layout,
+                committed_fence: Arc::clone(&committed_fence),
+                next_fence_sequence: 1,
             },
             Self {
                 runtime,
@@ -2762,6 +2820,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 position_frame: 0,
                 command_consumer: Some(transport_consumer),
                 mixer_parameter_command_consumer: Some(parameter_consumer),
+                mixer_parameter_fence: Some(committed_fence),
             },
         )
     }
@@ -2890,13 +2949,15 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             }
         };
         let command_sender_disconnected = self.command_sender_disconnected();
-        let applied_mixer_parameter_command_count = self.drain_mixer_parameter_commands();
+        let mixer_parameter_drain = self.drain_mixer_parameter_commands();
+        let applied_mixer_parameter_command_count = mixer_parameter_drain.applied_command_count;
         let mixer_parameter_command_sender_disconnected =
             self.mixer_parameter_command_sender_disconnected();
         let start_frame = self.position_frame;
         if self.state == TransportState::Stopped {
             output.left.fill(0.0);
             output.right.fill(0.0);
+            self.commit_mixer_parameter_fence(mixer_parameter_drain.greatest_fence);
             return Ok(TransportCycle {
                 state: self.state,
                 start_frame,
@@ -2927,6 +2988,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             }
         };
         self.position_frame = next_frame;
+        self.commit_mixer_parameter_fence(mixer_parameter_drain.greatest_fence);
         Ok(TransportCycle {
             state: self.state,
             start_frame,
@@ -3077,8 +3139,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         disconnected
     }
 
-    fn drain_mixer_parameter_commands(&mut self) -> usize {
-        let mut applied = 0;
+    fn drain_mixer_parameter_commands(&mut self) -> MixerParameterDrain {
+        let mut drained = MixerParameterDrain::default();
         for _ in 0..MAX_QUEUED_MIXER_PARAMETER_COMMANDS {
             let command = self
                 .mixer_parameter_command_consumer
@@ -3087,10 +3149,21 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             let Some(command) = command else {
                 break;
             };
+            if let MixerParameterCommand::Fence(fence) = command {
+                drained.greatest_fence = drained.greatest_fence.max(fence.sequence);
+            }
             self.runtime.apply_mixer_parameter_command(command);
-            applied += 1;
+            drained.applied_command_count += 1;
         }
-        applied
+        drained
+    }
+
+    fn commit_mixer_parameter_fence(&self, sequence: u64) {
+        if sequence != 0
+            && let Some(committed) = &self.mixer_parameter_fence
+        {
+            committed.fetch_max(sequence, Ordering::Release);
+        }
     }
 
     fn mixer_parameter_command_sender_disconnected(&self) -> bool {

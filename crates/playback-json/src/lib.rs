@@ -32,6 +32,7 @@ use hyper_playback_compiler::{
 use hyper_project_model::{is_valid_entity_id, is_valid_extension_key};
 use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use serde_json::Value;
 
 use hyper_strict_json::{self as strict, StrictJsonError, StrictJsonErrorKind};
 
@@ -377,6 +378,122 @@ pub struct LoadedMixer {
     cue_muted: bool,
 }
 
+/// Persistable base parameters for one mixer send.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MixerSendBaseState {
+    pub id: String,
+    pub gain: LinearGain,
+    pub pan: Pan,
+    pub enabled: bool,
+}
+
+impl Eq for MixerSendBaseState {}
+
+/// Persistable base parameters for one mixer channel in compiled order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MixerChannelBaseState {
+    pub track_id: String,
+    pub gain: LinearGain,
+    pub pan: Pan,
+    pub muted: bool,
+    pub solo: bool,
+    pub sends: Vec<MixerSendBaseState>,
+}
+
+impl Eq for MixerChannelBaseState {}
+
+/// Complete persistable live base state for one mixer resource.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MixerBaseState {
+    pub channels: Vec<MixerChannelBaseState>,
+    pub main_gain: LinearGain,
+    pub main_muted: bool,
+}
+
+impl Eq for MixerBaseState {}
+
+#[derive(Debug)]
+pub enum MixerStateSerializationError {
+    Source(LoadError),
+    NonCanonicalSource,
+    MixerIdentityMismatch,
+    ChannelIdentityMismatch {
+        channel_index: usize,
+    },
+    SendIdentityMismatch {
+        channel_index: usize,
+        send_index: usize,
+    },
+    ChannelCountMismatch {
+        document: usize,
+        state: usize,
+    },
+    SendCountMismatch {
+        channel_index: usize,
+        document: usize,
+        state: usize,
+    },
+    InvalidDocumentShape,
+    Serialization(serde_json::Error),
+}
+
+impl fmt::Display for MixerStateSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => source.fmt(formatter),
+            Self::NonCanonicalSource => {
+                formatter.write_str("source mixer is not canonical RFC 8785 JSON")
+            }
+            Self::MixerIdentityMismatch => {
+                formatter.write_str("source mixer identity does not match the save request")
+            }
+            Self::ChannelIdentityMismatch { channel_index } => write!(
+                formatter,
+                "mixer channel {channel_index} identity does not match the live layout"
+            ),
+            Self::SendIdentityMismatch {
+                channel_index,
+                send_index,
+            } => write!(
+                formatter,
+                "mixer channel {channel_index} send {send_index} identity does not match the live layout"
+            ),
+            Self::ChannelCountMismatch { document, state } => write!(
+                formatter,
+                "mixer state has {state} channels; source mixer has {document}"
+            ),
+            Self::SendCountMismatch {
+                channel_index,
+                document,
+                state,
+            } => write!(
+                formatter,
+                "mixer channel {channel_index} state has {state} sends; source mixer has {document}"
+            ),
+            Self::InvalidDocumentShape => {
+                formatter.write_str("source mixer shape changed after typed validation")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for MixerStateSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::NonCanonicalSource
+            | Self::MixerIdentityMismatch
+            | Self::ChannelIdentityMismatch { .. }
+            | Self::SendIdentityMismatch { .. }
+            | Self::ChannelCountMismatch { .. }
+            | Self::SendCountMismatch { .. }
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CueSource {
     Main,
@@ -602,6 +719,166 @@ impl fmt::Display for MixerCompileError {
 }
 
 impl Error for MixerCompileError {}
+
+/// Rewrites only persisted base parameters in one canonical mixer document.
+///
+/// Channel, send, project, and mixer identities must match the live compiled
+/// layout supplied by the caller. Routing, return buses, cue state, and
+/// extension values are preserved. The returned document is canonical RFC
+/// 8785 JSON and is re-parsed through the strict typed boundary before it is
+/// returned.
+///
+/// # Errors
+///
+/// Returns a classified error for invalid or noncanonical source bytes,
+/// identity or layout disagreement, an exceeded version-1 bound, or failed
+/// canonical serialization.
+#[allow(
+    clippy::too_many_lines,
+    reason = "identity, bounded layout validation, selective mutation, and strict output reparse remain visible as one serialization boundary"
+)]
+pub fn serialize_mixer_base_state(
+    source: &[u8],
+    project_id: &str,
+    mixer_id: &str,
+    state: &MixerBaseState,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, MixerStateSerializationError> {
+    let location = DocumentLocation {
+        kind: DocumentKind::Mixer,
+        index: 0,
+    };
+    let document: MixerDocument = parse_document(source, location, limits.max_document_bytes)
+        .map_err(MixerStateSerializationError::Source)?;
+    validate_header(
+        &document.format,
+        document.format_version,
+        "hyper-mixer",
+        &document.project_id,
+        project_id,
+        location,
+    )
+    .map_err(MixerStateSerializationError::Source)?;
+    validate_contract_document(&document.id, None, &document.extensions, location)
+        .map_err(MixerStateSerializationError::Source)?;
+    if document.id != mixer_id {
+        return Err(MixerStateSerializationError::MixerIdentityMismatch);
+    }
+    enforce_loader_limit(
+        CollectionLimit::MixerChannels,
+        document.channels.len(),
+        limits.max_mixer_channels,
+        Some(location),
+    )
+    .map_err(MixerStateSerializationError::Source)?;
+    let send_count = document
+        .channels
+        .iter()
+        .try_fold(0_usize, |total, channel| {
+            total.checked_add(channel.sends.len())
+        })
+        .ok_or(MixerStateSerializationError::InvalidDocumentShape)?;
+    enforce_loader_limit(
+        CollectionLimit::MixerSends,
+        send_count,
+        limits.max_mixer_sends,
+        Some(location),
+    )
+    .map_err(MixerStateSerializationError::Source)?;
+    if document.channels.len() != state.channels.len() {
+        return Err(MixerStateSerializationError::ChannelCountMismatch {
+            document: document.channels.len(),
+            state: state.channels.len(),
+        });
+    }
+    for (channel_index, (document_channel, state_channel)) in
+        document.channels.iter().zip(&state.channels).enumerate()
+    {
+        if document_channel.track_id != state_channel.track_id {
+            return Err(MixerStateSerializationError::ChannelIdentityMismatch { channel_index });
+        }
+        if document_channel.sends.len() != state_channel.sends.len() {
+            return Err(MixerStateSerializationError::SendCountMismatch {
+                channel_index,
+                document: document_channel.sends.len(),
+                state: state_channel.sends.len(),
+            });
+        }
+        for (send_index, (document_send, state_send)) in document_channel
+            .sends
+            .iter()
+            .zip(&state_channel.sends)
+            .enumerate()
+        {
+            if document_send.id != state_send.id {
+                return Err(MixerStateSerializationError::SendIdentityMismatch {
+                    channel_index,
+                    send_index,
+                });
+            }
+        }
+    }
+
+    let mut value: Value =
+        serde_json::from_slice(source).map_err(MixerStateSerializationError::Serialization)?;
+    let canonical_source = serde_json_canonicalizer::to_vec(&value)
+        .map_err(MixerStateSerializationError::Serialization)?;
+    if canonical_source != source {
+        return Err(MixerStateSerializationError::NonCanonicalSource);
+    }
+    let channels = value
+        .get_mut("channels")
+        .and_then(Value::as_array_mut)
+        .ok_or(MixerStateSerializationError::InvalidDocumentShape)?;
+    for (channel, state_channel) in channels.iter_mut().zip(&state.channels) {
+        let channel = channel
+            .as_object_mut()
+            .ok_or(MixerStateSerializationError::InvalidDocumentShape)?;
+        channel.insert(
+            "gain_millionths".to_owned(),
+            state_channel.gain.to_millionths().into(),
+        );
+        channel.insert(
+            "pan_millionths".to_owned(),
+            state_channel.pan.to_millionths().into(),
+        );
+        channel.insert("mute".to_owned(), state_channel.muted.into());
+        channel.insert("solo".to_owned(), state_channel.solo.into());
+        let sends = channel
+            .get_mut("sends")
+            .and_then(Value::as_array_mut)
+            .ok_or(MixerStateSerializationError::InvalidDocumentShape)?;
+        for (send, state_send) in sends.iter_mut().zip(&state_channel.sends) {
+            let send = send
+                .as_object_mut()
+                .ok_or(MixerStateSerializationError::InvalidDocumentShape)?;
+            send.insert(
+                "gain_millionths".to_owned(),
+                state_send.gain.to_millionths().into(),
+            );
+            send.insert(
+                "pan_millionths".to_owned(),
+                state_send.pan.to_millionths().into(),
+            );
+            send.insert("enabled".to_owned(), state_send.enabled.into());
+        }
+    }
+    let main = value
+        .get_mut("main")
+        .and_then(Value::as_object_mut)
+        .ok_or(MixerStateSerializationError::InvalidDocumentShape)?;
+    main.insert(
+        "gain_millionths".to_owned(),
+        state.main_gain.to_millionths().into(),
+    );
+    main.insert("mute".to_owned(), state.main_muted.into());
+
+    let output = serde_json_canonicalizer::to_vec(&value)
+        .map_err(MixerStateSerializationError::Serialization)?;
+    let _: MixerDocument = parse_document(&output, location, limits.max_document_bytes)
+        .map_err(MixerStateSerializationError::Source)?;
+    Ok(output)
+}
 
 impl LoadedMixer {
     #[must_use]
@@ -3375,6 +3652,99 @@ mod tests {
                 true,
             )
         );
+    }
+
+    #[test]
+    fn serializes_live_mixer_base_state_without_losing_versioned_fields() {
+        let mut source: Value = serde_json::from_slice(MIXER).unwrap();
+        source["extensions"]["org.example.state"] = serde_json::json!({"opaque":[1, 2, 3]});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let state = MixerBaseState {
+            channels: vec![MixerChannelBaseState {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
+                gain: LinearGain::from_millionths(1_234_567).unwrap(),
+                pan: Pan::from_millionths(345_678).unwrap(),
+                muted: true,
+                solo: false,
+                sends: Vec::new(),
+            }],
+            main_gain: LinearGain::from_millionths(876_543).unwrap(),
+            main_muted: false,
+        };
+
+        let output = serialize_mixer_base_state(
+            &source,
+            PROJECT_ID,
+            "018f47a2-6b2d-7c11-8a44-001122334468",
+            &state,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(value["channels"][0]["gain_millionths"], 1_234_567);
+        assert_eq!(value["channels"][0]["pan_millionths"], 345_678);
+        assert_eq!(value["channels"][0]["mute"], true);
+        assert_eq!(value["channels"][0]["solo"], false);
+        assert_eq!(value["main"]["gain_millionths"], 876_543);
+        assert_eq!(value["main"]["mute"], false);
+        assert_eq!(value["cue"]["source"], "solo");
+        assert_eq!(
+            value["extensions"]["org.example.state"],
+            serde_json::json!({"opaque":[1, 2, 3]})
+        );
+        assert_eq!(serde_json_canonicalizer::to_vec(&value).unwrap(), output);
+    }
+
+    #[test]
+    fn mixer_save_rejects_layout_and_noncanonical_source_disagreement() {
+        let state = MixerBaseState {
+            channels: vec![MixerChannelBaseState {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334499".to_owned(),
+                gain: LinearGain::UNITY,
+                pan: Pan::CENTER,
+                muted: false,
+                solo: false,
+                sends: Vec::new(),
+            }],
+            main_gain: LinearGain::UNITY,
+            main_muted: false,
+        };
+        let canonical =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(MIXER).unwrap())
+                .unwrap();
+
+        assert!(matches!(
+            serialize_mixer_base_state(
+                &canonical,
+                PROJECT_ID,
+                "018f47a2-6b2d-7c11-8a44-001122334468",
+                &state,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(MixerStateSerializationError::ChannelIdentityMismatch { channel_index: 0 })
+        ));
+        assert!(matches!(
+            serialize_mixer_base_state(
+                MIXER,
+                PROJECT_ID,
+                "018f47a2-6b2d-7c11-8a44-001122334468",
+                &MixerBaseState {
+                    channels: vec![MixerChannelBaseState {
+                        track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
+                        gain: LinearGain::UNITY,
+                        pan: Pan::CENTER,
+                        muted: false,
+                        solo: false,
+                        sends: Vec::new(),
+                    }],
+                    main_gain: LinearGain::UNITY,
+                    main_muted: false,
+                },
+                LoaderLimits::VERSION_1,
+            ),
+            Err(MixerStateSerializationError::NonCanonicalSource)
+        ));
     }
 
     #[test]
