@@ -8,12 +8,13 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use hyper_desktop_ide::{
-    DesktopIdeWorker, IdeApplicationConfig, IdeAudioOutputInventory, IdeMixerChannel,
-    IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap, IdeNativeCloseFailure,
-    IdeOutputSelection, IdeRunningObservation, IdeScene, IdeSceneAvailability, IdeWorkerCommand,
-    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError,
-    IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState,
-    TransportCommand, desktop_ide_application_config,
+    DesktopIdeWorker, IdeApplicationConfig, IdeAudioInputInventory, IdeAudioOutputInventory,
+    IdeInputSelection, IdeMixerChannel, IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap,
+    IdeMonitoringCommand, IdeNativeCloseFailure, IdeOutputSelection, IdeRunningObservation,
+    IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
+    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState, TransportCommand,
+    desktop_ide_application_config,
 };
 use slint::platform::PlatformError;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
@@ -30,6 +31,14 @@ const MAX_VISIBLE_MIXER_NAME_CHARS: usize = 10;
 
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
 type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
+type InputRoutes = Rc<RefCell<Vec<InputRoute>>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InputRoute {
+    Disabled,
+    SystemDefault,
+    Routed(String),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UiSubmissionFailure {
@@ -82,6 +91,13 @@ struct OutputPresentation {
     selected: usize,
 }
 
+#[derive(Debug)]
+struct InputPresentation {
+    routes: Vec<InputRoute>,
+    names: Vec<SharedString>,
+    selected: usize,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("desktop IDE failed: {error}");
@@ -98,9 +114,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
     let worker = Rc::new(RefCell::new(Some(worker)));
     let output_routes = Rc::new(RefCell::new(Vec::new()));
+    let input_routes = Rc::new(RefCell::new(Vec::new()));
 
-    bind_callbacks(&ui, &worker, &output_routes);
-    let timer = start_event_pump(&ui, &worker, &output_routes);
+    bind_callbacks(&ui, &worker, &output_routes, &input_routes);
+    let timer = start_event_pump(&ui, &worker, &output_routes, &input_routes);
     let run_result = ui.run();
     timer.stop();
 
@@ -113,7 +130,12 @@ fn application_config() -> Result<IdeApplicationConfig, Box<dyn Error>> {
     Ok(desktop_ide_application_config()?)
 }
 
-fn bind_callbacks(ui: &MainWindow, worker: &WorkerCell, output_routes: &OutputRoutes) {
+fn bind_callbacks(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    output_routes: &OutputRoutes,
+    input_routes: &InputRoutes,
+) {
     let actions = ui.global::<IdeActions>();
 
     let weak = ui.as_weak();
@@ -147,6 +169,8 @@ fn bind_callbacks(ui: &MainWindow, worker: &WorkerCell, output_routes: &OutputRo
         );
         submit(&weak, &worker_for_selection, command);
     });
+
+    bind_input_selection_callbacks(ui, worker, input_routes);
 
     let weak = ui.as_weak();
     let worker_for_project = Rc::clone(worker);
@@ -195,6 +219,82 @@ fn bind_callbacks(ui: &MainWindow, worker: &WorkerCell, output_routes: &OutputRo
     });
 
     bind_playback_callbacks(ui, worker);
+    bind_monitoring_callbacks(ui, worker);
+}
+
+fn bind_input_selection_callbacks(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    input_routes: &InputRoutes,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_refresh = Rc::clone(worker);
+    actions.on_refresh_inputs(move || {
+        submit(&weak, &worker_for_refresh, IdeWorkerCommand::RefreshInputs);
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_selection = Rc::clone(worker);
+    let routes_for_selection = Rc::clone(input_routes);
+    actions.on_select_input(move |index| {
+        let selection = usize::try_from(index)
+            .ok()
+            .and_then(|index| routes_for_selection.borrow().get(index).cloned());
+        let Some(selection) = selection else {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_error_text("Audio input selection is no longer available".into());
+            }
+            return;
+        };
+        let command = match selection {
+            InputRoute::Disabled => IdeWorkerCommand::DisableInputMonitoring,
+            InputRoute::SystemDefault => IdeWorkerCommand::SelectSystemDefaultInput,
+            InputRoute::Routed(routing_id) => IdeWorkerCommand::SelectInput(routing_id),
+        };
+        submit(&weak, &worker_for_selection, command);
+    });
+}
+
+fn bind_monitoring_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+
+    let weak = ui.as_weak();
+    let worker_for_gain = Rc::clone(worker);
+    actions.on_monitor_gain(move |percent| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_monitoring_active() {
+            return;
+        }
+        match monitor_percent_to_millionths(percent) {
+            Ok(gain_millionths) => submit_to_ui(
+                &ui,
+                &worker_for_gain,
+                IdeWorkerCommand::Monitoring(IdeMonitoringCommand::Gain { gain_millionths }),
+            ),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_mute = Rc::clone(worker);
+    actions.on_monitor_mute(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_monitoring_active() {
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_mute,
+            IdeWorkerCommand::Monitoring(IdeMonitoringCommand::Mute {
+                muted: !ui.get_monitoring_muted(),
+            }),
+        );
+    });
 }
 
 fn bind_playback_callbacks(ui: &MainWindow, worker: &WorkerCell) {
@@ -410,11 +510,17 @@ fn bind_send_callbacks(ui: &MainWindow, worker: &WorkerCell) {
     });
 }
 
-fn start_event_pump(ui: &MainWindow, worker: &WorkerCell, output_routes: &OutputRoutes) -> Timer {
+fn start_event_pump(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    output_routes: &OutputRoutes,
+    input_routes: &InputRoutes,
+) -> Timer {
     let timer = Timer::default();
     let weak = ui.as_weak();
     let worker = Rc::clone(worker);
     let output_routes = Rc::clone(output_routes);
+    let input_routes = Rc::clone(input_routes);
     let mut observation_pending = false;
     timer.start(TimerMode::Repeated, UI_POLL_INTERVAL, move || {
         let Some(ui) = weak.upgrade() else {
@@ -430,7 +536,7 @@ fn start_event_pump(ui: &MainWindow, worker: &WorkerCell, output_routes: &Output
                     if completes_observation(&event) {
                         observation_pending = false;
                     }
-                    apply_event(&ui, &output_routes, event);
+                    apply_event(&ui, &output_routes, &input_routes, event);
                 }
                 Ok(None) => break,
                 Err(error) => {
@@ -518,12 +624,17 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::Initialize => "Discovering desktop audio outputs…",
         IdeWorkerCommandKind::RetryDiscovery => "Retrying desktop audio discovery…",
         IdeWorkerCommandKind::RefreshOutputs => "Refreshing desktop audio outputs…",
+        IdeWorkerCommandKind::RefreshInputs => "Refreshing desktop audio inputs…",
         IdeWorkerCommandKind::SelectSystemDefault | IdeWorkerCommandKind::SelectOutput => {
             "Applying audio output selection…"
         }
+        IdeWorkerCommandKind::DisableInputMonitoring
+        | IdeWorkerCommandKind::SelectSystemDefaultInput
+        | IdeWorkerCommandKind::SelectInput => "Applying input cue selection…",
         IdeWorkerCommandKind::OpenProject => "Recovering and verifying project…",
         IdeWorkerCommandKind::Transport => "Transport command queued…",
         IdeWorkerCommandKind::Mixer => "Mixer command queued…",
+        IdeWorkerCommandKind::Monitoring => "Applying input cue control…",
         IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
         IdeWorkerCommandKind::Observe => "Refreshing runtime evidence…",
         IdeWorkerCommandKind::CloseProject => "Closing project and native output…",
@@ -531,24 +642,34 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
     }
 }
 
-fn apply_event(ui: &MainWindow, output_routes: &OutputRoutes, event: IdeWorkerEvent) {
+fn apply_event(
+    ui: &MainWindow,
+    output_routes: &OutputRoutes,
+    input_routes: &InputRoutes,
+    event: IdeWorkerEvent,
+) {
     match event {
         IdeWorkerEvent::Closed {
             snapshot,
             native_failure,
+            input_failure,
         } => {
             apply_output_inventory(ui, output_routes, snapshot.outputs(), snapshot.selection());
+            apply_input_inventory(
+                ui,
+                input_routes,
+                snapshot.inputs(),
+                snapshot.input_selection(),
+            );
             reset_project(ui);
             let mode = mode_after_closed_event(ui.get_app_mode());
             ui.set_app_mode(mode);
             if mode == AppMode::Closed {
                 ui.set_status_text("Ready to open a verified project".into());
-                ui.set_error_text(
-                    native_failure
-                        .map(native_failure_message)
-                        .unwrap_or_default()
-                        .into(),
-                );
+                let error = native_failure.map(native_failure_message).or_else(|| {
+                    input_failure.map(|failure| format!("Audio input discovery failed: {failure}"))
+                });
+                ui.set_error_text(error.unwrap_or_default().into());
             }
         }
         IdeWorkerEvent::Running(observation) => apply_running_event(ui, &observation),
@@ -568,6 +689,10 @@ fn apply_event(ui: &MainWindow, output_routes: &OutputRoutes, event: IdeWorkerEv
         }
         IdeWorkerEvent::MixerQueued(_) => {
             ui.set_status_text("Mixer base command queued for the audio runtime".into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::MonitoringApplied(_) => {
+            ui.set_status_text("Input cue control applied".into());
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::ProjectSaved { revision, changed } => {
@@ -606,6 +731,22 @@ fn apply_running_event(ui: &MainWindow, observation: &IdeRunningObservation) {
     apply_mixer_observation(ui, observation);
     ui.set_stream_state(format!("{:?}", observation.output_state()).into());
     ui.set_callback_count(observation.output().callback_count.to_string().into());
+    if let Some(monitoring) = observation.monitoring() {
+        ui.set_monitoring_active(true);
+        ui.set_monitoring_gain_percent(monitoring.gain * 100.0);
+        ui.set_monitoring_muted(monitoring.muted);
+        ui.set_monitoring_state(format!("{:?}", monitoring.input_state).into());
+        ui.set_monitoring_frame_count(monitoring.bridge.accepted_frame_count.to_string().into());
+        let dropped_frames = monitoring
+            .input
+            .dropped_frame_count
+            .saturating_add(monitoring.bridge.overflow_frame_count)
+            .saturating_add(monitoring.bridge.consumer_closed_frame_count);
+        ui.set_monitoring_drop_count(dropped_frames.to_string().into());
+        ui.set_monitoring_underflow_count(monitoring.bridge.underflow_count.to_string().into());
+    } else {
+        reset_monitoring(ui);
+    }
     ui.set_xrun_count(
         observation
             .output()
@@ -706,6 +847,66 @@ fn output_presentation(
     }
 }
 
+fn apply_input_inventory(
+    ui: &MainWindow,
+    input_routes: &InputRoutes,
+    inventory: Option<&IdeAudioInputInventory>,
+    selection: &IdeInputSelection,
+) {
+    let presentation = input_presentation(inventory, selection);
+    *input_routes.borrow_mut() = presentation.routes;
+    ui.set_input_names(ModelRc::from(Rc::new(VecModel::from(presentation.names))));
+    ui.set_selected_input_index(i32::try_from(presentation.selected).unwrap_or(-1));
+    ui.set_input_discovery_available(inventory.is_some());
+}
+
+fn input_presentation(
+    inventory: Option<&IdeAudioInputInventory>,
+    selection: &IdeInputSelection,
+) -> InputPresentation {
+    let capacity = inventory.map_or(1, |inventory| inventory.inputs().len() + 2);
+    let mut routes = Vec::with_capacity(capacity);
+    let mut names = Vec::with_capacity(capacity);
+    routes.push(InputRoute::Disabled);
+    names.push(SharedString::from("Input cue off"));
+    if let Some(inventory) = inventory {
+        if !inventory.inputs().is_empty() {
+            routes.push(InputRoute::SystemDefault);
+            names.push(SharedString::from("System default input"));
+        }
+        for input in inventory.inputs() {
+            routes.push(InputRoute::Routed(input.routing_id().to_owned()));
+            names.push(input.display_name().into());
+        }
+    }
+    let selected = match selection {
+        IdeInputSelection::Disabled => 0,
+        IdeInputSelection::SystemDefault => routes
+            .iter()
+            .position(|route| matches!(route, InputRoute::SystemDefault))
+            .unwrap_or_else(|| {
+                let unavailable = routes.len();
+                routes.push(InputRoute::SystemDefault);
+                names.push("Unavailable system default input".into());
+                unavailable
+            }),
+        IdeInputSelection::Routed(selected) => routes
+            .iter()
+            .position(|route| matches!(route, InputRoute::Routed(route) if route == selected))
+            .unwrap_or_else(|| {
+                let unavailable = routes.len();
+                routes.push(InputRoute::Routed(selected.clone()));
+                names.push("Unavailable selected input".into());
+                unavailable
+            }),
+    };
+    InputPresentation {
+        routes,
+        names,
+        selected,
+    }
+}
+
 fn reset_project(ui: &MainWindow) {
     ui.set_project_name("No project open".into());
     ui.set_project_id("—".into());
@@ -725,10 +926,21 @@ fn reset_project(ui: &MainWindow) {
     ui.set_transport_clock("00:00:00.000".into());
     ui.set_callback_count("0".into());
     ui.set_xrun_count("Unavailable".into());
+    reset_monitoring(ui);
     ui.set_left_meter(0.0);
     ui.set_right_meter(0.0);
     ui.set_left_reading("—".into());
     ui.set_right_reading("—".into());
+}
+
+fn reset_monitoring(ui: &MainWindow) {
+    ui.set_monitoring_active(false);
+    ui.set_monitoring_gain_percent(0.0);
+    ui.set_monitoring_muted(false);
+    ui.set_monitoring_state("Off".into());
+    ui.set_monitoring_frame_count("0".into());
+    ui.set_monitoring_drop_count("0".into());
+    ui.set_monitoring_underflow_count("0".into());
 }
 
 fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMode {
@@ -893,6 +1105,18 @@ fn validate_mixer_channel(
 fn gain_percent_to_millionths(percent: f32) -> Result<u32, MixerControlFailure> {
     if !percent.is_finite() || !(0.0..=200.0).contains(&percent) {
         return Err(MixerControlFailure::InvalidValue);
+    }
+    Ok((percent * 10_000.0).round() as u32)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "finite input cue percent is range-checked before rounding to the backend domain"
+)]
+fn monitor_percent_to_millionths(percent: f32) -> Result<u32, &'static str> {
+    if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+        return Err("Input cue gain is outside its supported range");
     }
     Ok((percent * 10_000.0).round() as u32)
 }
@@ -1539,6 +1763,43 @@ mod tests {
             presentation.names[presentation.selected],
             SharedString::from("Unavailable selected output")
         );
+    }
+
+    #[test]
+    fn input_cue_presentation_keeps_off_and_stale_routes_explicit() {
+        let inventory = IdeAudioInputInventory::try_new(&[("input-a", "Input A")]).unwrap();
+        let disabled = input_presentation(Some(&inventory), &IdeInputSelection::Disabled);
+        assert_eq!(disabled.selected, 0);
+        assert_eq!(disabled.routes[0], InputRoute::Disabled);
+        assert_eq!(disabled.routes[1], InputRoute::SystemDefault);
+        assert_eq!(disabled.routes[2], InputRoute::Routed("input-a".to_owned()));
+
+        let unavailable = input_presentation(
+            Some(&inventory),
+            &IdeInputSelection::Routed("input-missing".to_owned()),
+        );
+        assert_eq!(unavailable.selected, 3);
+        assert_eq!(
+            unavailable.routes[unavailable.selected],
+            InputRoute::Routed("input-missing".to_owned())
+        );
+        assert_eq!(
+            unavailable.names[unavailable.selected],
+            SharedString::from("Unavailable selected input")
+        );
+
+        let undiscovered = input_presentation(None, &IdeInputSelection::Disabled);
+        assert_eq!(undiscovered.routes, [InputRoute::Disabled]);
+        assert_eq!(undiscovered.selected, 0);
+    }
+
+    #[test]
+    fn input_cue_gain_conversion_rejects_nonfinite_and_above_unity() {
+        assert_eq!(monitor_percent_to_millionths(0.0), Ok(0));
+        assert_eq!(monitor_percent_to_millionths(25.5), Ok(255_000));
+        assert_eq!(monitor_percent_to_millionths(100.0), Ok(1_000_000));
+        assert!(monitor_percent_to_millionths(100.1).is_err());
+        assert!(monitor_percent_to_millionths(f32::NAN).is_err());
     }
 
     #[test]

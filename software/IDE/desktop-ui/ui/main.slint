@@ -49,6 +49,10 @@ export global IdeActions {
     callback retry-discovery();
     callback refresh-outputs();
     callback select-output(int);
+    callback refresh-inputs();
+    callback select-input(int);
+    callback monitor-gain(float);
+    callback monitor-mute();
     callback choose-project();
     callback transport-start();
     callback transport-stop();
@@ -117,12 +121,22 @@ component Meter inherits Rectangle {
 export component MainWindow inherits Window {
     title: "Hyper Module — Desktop IDE";
     width: 1180px;
-    height: 720px;
+    height: 800px;
     background: #0b0f14;
 
     in property <AppMode> app-mode: AppMode.discovering;
     in property <[string]> output-names: [];
     in-out property <int> selected-output-index: 0;
+    in property <[string]> input-names: ["Input cue off"];
+    in-out property <int> selected-input-index: 0;
+    in property <bool> input-discovery-available: false;
+    in property <bool> monitoring-active: false;
+    in property <float> monitoring-gain-percent: 0;
+    in property <bool> monitoring-muted: false;
+    in property <string> monitoring-state: "Off";
+    in property <string> monitoring-frame-count: "0";
+    in property <string> monitoring-drop-count: "0";
+    in property <string> monitoring-underflow-count: "0";
     in property <string> project-location: "No project selected";
     in property <string> project-name: "No project open";
     in property <string> project-id: "—";
@@ -201,6 +215,7 @@ export component MainWindow inherits Window {
 
         HorizontalLayout {
             spacing: 16px;
+            horizontal-stretch: 1;
             vertical-stretch: 1;
 
             VerticalLayout {
@@ -208,12 +223,12 @@ export component MainWindow inherits Window {
                 spacing: 16px;
 
                 Panel {
-                    height: 210px;
+                    height: 326px;
                     VerticalLayout {
                         padding: 18px;
-                        spacing: 11px;
-                        Text { text: "AUDIO OUTPUT"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                        Text { text: "Playback destination"; color: #edf2f8; font-size: 17px; font-weight: 600; }
+                        spacing: 8px;
+                        Text { text: "AUDIO I/O"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: "Playback output"; color: #edf2f8; font-size: 14px; font-weight: 600; }
                         output-selector := ComboBox {
                             model: root.output-names;
                             current-index <=> root.selected-output-index;
@@ -223,7 +238,7 @@ export component MainWindow inherits Window {
                         HorizontalLayout {
                             spacing: 8px;
                             Button {
-                                text: "Refresh";
+                                text: "Refresh output";
                                 enabled: root.app-mode == AppMode.closed;
                                 clicked => { IdeActions.refresh-outputs(); }
                             }
@@ -233,12 +248,61 @@ export component MainWindow inherits Window {
                                 clicked => { IdeActions.retry-discovery(); }
                             }
                         }
-                        Text {
-                            text: "System default remains explicit; routed devices use opaque identities.";
-                            color: #728196;
-                            font-size: 10px;
-                            wrap: word-wrap;
+
+                        Rectangle { height: 1px; background: #27313d; }
+
+                        HorizontalLayout {
+                            Text { text: "INPUT CUE"; color: #edf2f8; font-size: 14px; font-weight: 600; }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Text {
+                                text: root.monitoring-active ? root.monitoring-state : "OFF";
+                                color: root.monitoring-active ? #63e6b5 : #728196;
+                                font-size: 10px;
+                                vertical-alignment: center;
+                            }
                         }
+                        input-selector := ComboBox {
+                            model: root.input-names;
+                            current-index <=> root.selected-input-index;
+                            enabled: root.app-mode == AppMode.closed;
+                            selected(_) => { IdeActions.select-input(self.current-index); }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button {
+                                text: "Refresh input";
+                                enabled: root.app-mode == AppMode.closed;
+                                clicked => { IdeActions.refresh-inputs(); }
+                            }
+                            Text {
+                                text: root.input-discovery-available ? "Ready" : "Unavailable";
+                                color: root.input-discovery-available ? #63e6b5 : #ff9d76;
+                                font-size: 10px;
+                                vertical-alignment: center;
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                Text { text: "GAIN  " + Math.round(root.monitoring-gain-percent) + "%"; color: #8fa0b4; font-size: 9px; }
+                                Slider {
+                                    minimum: 0;
+                                    maximum: 100;
+                                    value: root.monitoring-gain-percent;
+                                    enabled: root.app-mode == AppMode.running && root.monitoring-active;
+                                    accessible-label: "Input cue gain";
+                                    released(value) => { IdeActions.monitor-gain(value); }
+                                }
+                            }
+                            Button {
+                                width: 72px;
+                                text: root.monitoring-muted ? "MUTED" : "MUTE";
+                                enabled: root.app-mode == AppMode.running && root.monitoring-active;
+                                clicked => { IdeActions.monitor-mute(); }
+                            }
+                        }
+                        Text { text: "Global post-main cue only; this does not arm or route a track."; color: #728196; font-size: 9px; wrap: word-wrap; }
                     }
                 }
 
@@ -275,9 +339,15 @@ export component MainWindow inherits Window {
                 }
             }
 
-            if !root.mixer-visible : Panel {
+            right-pane := Rectangle {
                 horizontal-stretch: 1;
-                VerticalLayout {
+                vertical-stretch: 1;
+                background: transparent;
+
+                if !root.mixer-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
                     padding: 22px;
                     spacing: 18px;
 
@@ -387,13 +457,30 @@ export component MainWindow inherits Window {
                             row: 0; col: 3; height: 78px; background: #0e141b; border-radius: 6px;
                             VerticalLayout { padding: 12px; Text { text: "NATIVE XRUNS"; color: #65758a; font-size: 10px; } Text { text: root.xrun-count; color: #dce5ef; font-size: 18px; } }
                         }
+                        Rectangle {
+                            row: 1; col: 0; height: 64px; background: #0e141b; border-radius: 6px;
+                            VerticalLayout { padding: 10px; Text { text: "INPUT CUE"; color: #65758a; font-size: 9px; } Text { text: root.monitoring-state; color: root.monitoring-active ? #63e6b5 : #8fa0b4; font-size: 15px; } }
+                        }
+                        Rectangle {
+                            row: 1; col: 1; height: 64px; background: #0e141b; border-radius: 6px;
+                            VerticalLayout { padding: 10px; Text { text: "CUE FRAMES"; color: #65758a; font-size: 9px; } Text { text: root.monitoring-frame-count; color: #dce5ef; font-size: 15px; } }
+                        }
+                        Rectangle {
+                            row: 1; col: 2; height: 64px; background: #0e141b; border-radius: 6px;
+                            VerticalLayout { padding: 10px; Text { text: "DROPPED FRAMES"; color: #65758a; font-size: 9px; } Text { text: root.monitoring-drop-count; color: root.monitoring-drop-count == "0" ? #dce5ef : #ff9d76; font-size: 15px; } }
+                        }
+                        Rectangle {
+                            row: 1; col: 3; height: 64px; background: #0e141b; border-radius: 6px;
+                            VerticalLayout { padding: 10px; Text { text: "UNDERFLOWS"; color: #65758a; font-size: 9px; } Text { text: root.monitoring-underflow-count; color: root.monitoring-underflow-count == "0" ? #dce5ef : #ff9d76; font-size: 15px; } }
+                        }
+                    }
                     }
                 }
-            }
 
-            if root.mixer-visible && !root.mixer-sends-visible : Panel {
-                horizontal-stretch: 1;
-                VerticalLayout {
+                if root.mixer-visible && !root.mixer-sends-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
                     padding: 16px;
                     spacing: 12px;
 
@@ -489,12 +576,13 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
+                    }
                 }
-            }
 
-            if root.mixer-visible && root.mixer-sends-visible : Panel {
-                horizontal-stretch: 1;
-                VerticalLayout {
+                if root.mixer-visible && root.mixer-sends-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
                     padding: 16px;
                     spacing: 10px;
 
@@ -553,6 +641,7 @@ export component MainWindow inherits Window {
                         }
                     }
                     Rectangle { vertical-stretch: 1; background: transparent; }
+                    }
                 }
             }
         }

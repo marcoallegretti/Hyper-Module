@@ -14,11 +14,13 @@ use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSn
 
 use super::{
     DesktopIdeApplication, DesktopIdePendingClose, DesktopIdePendingSaveClose,
-    DesktopPlaybackRecovery, IdeApplicationConfig, IdeAudioOutputInventory, IdeCloseOutcome,
+    DesktopPlaybackRecovery, IdeApplicationConfig, IdeAudioInputInventory, IdeAudioOutputInventory,
+    IdeCloseOutcome, IdeInputDiscoveryError, IdeInputSelection, IdeInputSelectionError,
     IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
-    IdeMixerMainState, IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection,
-    IdeOutputSelectionError, IdePendingCloseWait, IdePendingSaveCloseWait, IdeProjectOpenError,
-    IdeProjectSaveError, IdeSaveCloseOutcome, IdeSceneAvailability, OutputInventoryError,
+    IdeMixerMainState, IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState,
+    IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError,
+    IdePendingCloseWait, IdePendingSaveCloseWait, IdeProjectOpenError, IdeProjectSaveError,
+    IdeSaveCloseOutcome, IdeSceneAvailability, InputInventoryError, OutputInventoryError,
     OutputStreamSnapshot, OutputStreamState, RunningDesktopIdeApplication,
 };
 
@@ -71,11 +73,16 @@ pub enum IdeWorkerCommandKind {
     Initialize,
     RetryDiscovery,
     RefreshOutputs,
+    RefreshInputs,
     SelectSystemDefault,
     SelectOutput,
+    DisableInputMonitoring,
+    SelectSystemDefaultInput,
+    SelectInput,
     OpenProject,
     Transport,
     Mixer,
+    Monitoring,
     SaveProject,
     Observe,
     CloseProject,
@@ -86,11 +93,16 @@ pub enum IdeWorkerCommandKind {
 pub enum IdeWorkerCommand {
     RetryDiscovery,
     RefreshOutputs,
+    RefreshInputs,
     SelectSystemDefault,
     SelectOutput(String),
+    DisableInputMonitoring,
+    SelectSystemDefaultInput,
+    SelectInput(String),
     OpenProject(PathBuf),
     Transport(TransportCommand),
     Mixer(IdeMixerCommand),
+    Monitoring(IdeMonitoringCommand),
     SaveProject,
     Observe,
     CloseProject,
@@ -103,11 +115,16 @@ impl IdeWorkerCommand {
         match self {
             Self::RetryDiscovery => IdeWorkerCommandKind::RetryDiscovery,
             Self::RefreshOutputs => IdeWorkerCommandKind::RefreshOutputs,
+            Self::RefreshInputs => IdeWorkerCommandKind::RefreshInputs,
             Self::SelectSystemDefault => IdeWorkerCommandKind::SelectSystemDefault,
             Self::SelectOutput(_) => IdeWorkerCommandKind::SelectOutput,
+            Self::DisableInputMonitoring => IdeWorkerCommandKind::DisableInputMonitoring,
+            Self::SelectSystemDefaultInput => IdeWorkerCommandKind::SelectSystemDefaultInput,
+            Self::SelectInput(_) => IdeWorkerCommandKind::SelectInput,
             Self::OpenProject(_) => IdeWorkerCommandKind::OpenProject,
             Self::Transport(_) => IdeWorkerCommandKind::Transport,
             Self::Mixer(_) => IdeWorkerCommandKind::Mixer,
+            Self::Monitoring(_) => IdeWorkerCommandKind::Monitoring,
             Self::SaveProject => IdeWorkerCommandKind::SaveProject,
             Self::Observe => IdeWorkerCommandKind::Observe,
             Self::CloseProject => IdeWorkerCommandKind::CloseProject,
@@ -119,7 +136,9 @@ impl IdeWorkerCommand {
 #[derive(Debug)]
 pub struct IdeClosedSnapshot {
     outputs: IdeAudioOutputInventory,
-    selection: IdeOutputSelection,
+    output_selection: IdeOutputSelection,
+    inputs: Option<IdeAudioInputInventory>,
+    input_selection: IdeInputSelection,
 }
 
 impl IdeClosedSnapshot {
@@ -129,8 +148,23 @@ impl IdeClosedSnapshot {
     }
 
     #[must_use]
+    pub const fn output_selection(&self) -> &IdeOutputSelection {
+        &self.output_selection
+    }
+
+    #[must_use]
     pub const fn selection(&self) -> &IdeOutputSelection {
-        &self.selection
+        self.output_selection()
+    }
+
+    #[must_use]
+    pub const fn inputs(&self) -> Option<&IdeAudioInputInventory> {
+        self.inputs.as_ref()
+    }
+
+    #[must_use]
+    pub const fn input_selection(&self) -> &IdeInputSelection {
+        &self.input_selection
     }
 }
 
@@ -144,6 +178,7 @@ pub struct IdeRunningObservation {
     mixer_main: Option<IdeMixerMainState>,
     output_state: OutputStreamState,
     output: OutputStreamSnapshot,
+    monitoring: Option<IdeMonitoringState>,
     recovery: PlaybackRecoverySnapshot,
     meter: LatestOutputMeterSnapshot,
 }
@@ -270,6 +305,11 @@ impl IdeRunningObservation {
     }
 
     #[must_use]
+    pub const fn monitoring(&self) -> Option<IdeMonitoringState> {
+        self.monitoring
+    }
+
+    #[must_use]
     pub const fn recovery(&self) -> PlaybackRecoverySnapshot {
         self.recovery
     }
@@ -283,13 +323,17 @@ impl IdeRunningObservation {
 #[derive(Debug)]
 pub enum IdeWorkerCommandFailure {
     Discovery(IdeOutputDiscoveryError),
+    InputDiscovery(IdeInputDiscoveryError),
     OutputSelection(IdeOutputSelectionError),
+    InputSelection(IdeInputSelectionError),
     ProjectOpen(IdeProjectOpenError),
     Transport(super::DesktopDirectControlError),
     Mixer(IdeMixerCommandError),
+    Monitoring(IdeMonitoringCommandError),
     ProjectSave(IdeProjectSaveError),
     InvalidState,
     Publication(OutputInventoryError),
+    InputPublication(InputInventoryError),
     ProjectPublicationCapacityUnavailable,
     ProjectSnapshotUnavailable,
 }
@@ -298,15 +342,19 @@ impl fmt::Display for IdeWorkerCommandFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Discovery(source) => source.fmt(formatter),
+            Self::InputDiscovery(source) => source.fmt(formatter),
             Self::OutputSelection(source) => source.fmt(formatter),
+            Self::InputSelection(source) => source.fmt(formatter),
             Self::ProjectOpen(source) => source.fmt(formatter),
             Self::Transport(source) => source.fmt(formatter),
             Self::Mixer(source) => source.fmt(formatter),
+            Self::Monitoring(source) => source.fmt(formatter),
             Self::ProjectSave(source) => source.fmt(formatter),
             Self::InvalidState => {
                 formatter.write_str("command is invalid for the current IDE state")
             }
             Self::Publication(source) => source.fmt(formatter),
+            Self::InputPublication(source) => source.fmt(formatter),
             Self::ProjectPublicationCapacityUnavailable => {
                 formatter.write_str("project observation capacity is unavailable")
             }
@@ -321,12 +369,16 @@ impl Error for IdeWorkerCommandFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Discovery(source) => Some(source),
+            Self::InputDiscovery(source) => Some(source),
             Self::OutputSelection(source) => Some(source),
+            Self::InputSelection(source) => Some(source),
             Self::ProjectOpen(source) => Some(source),
             Self::Transport(source) => Some(source),
             Self::Mixer(source) => Some(source),
+            Self::Monitoring(source) => Some(source),
             Self::ProjectSave(source) => Some(source),
             Self::Publication(source) => Some(source),
+            Self::InputPublication(source) => Some(source),
             Self::InvalidState
             | Self::ProjectPublicationCapacityUnavailable
             | Self::ProjectSnapshotUnavailable => None,
@@ -343,10 +395,12 @@ pub enum IdeWorkerEvent {
     Closed {
         snapshot: IdeClosedSnapshot,
         native_failure: Option<IdeNativeCloseFailure>,
+        input_failure: Option<IdeInputDiscoveryError>,
     },
     Running(IdeRunningObservation),
     TransportQueued(TransportCommand),
     MixerQueued(IdeMixerCommand),
+    MonitoringApplied(IdeMonitoringCommand),
     ProjectSaved {
         revision: u64,
         changed: bool,
@@ -722,9 +776,10 @@ fn discover(
         return publish_failure(events, command, IdeWorkerCommandFailure::InvalidState);
     };
     match DesktopIdeApplication::discover(*config) {
-        Ok(application) => {
+        Ok(discovery) => {
+            let (application, input_failure) = discovery.into_parts();
             *state = WorkerState::Closed(application);
-            publish_state(state, events, unpublished_native_failure)
+            publish_closed_state(state, events, unpublished_native_failure, input_failure)
         }
         Err(reason) => send_event(
             events,
@@ -733,6 +788,33 @@ fn discover(
                 reason: IdeWorkerCommandFailure::Discovery(reason),
             },
         ),
+    }
+}
+
+fn publish_closed_state(
+    state: &WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+    input_failure: Option<IdeInputDiscoveryError>,
+) -> bool {
+    let WorkerState::Closed(application) = state else {
+        return true;
+    };
+    match closed_snapshot(application) {
+        Ok(snapshot) => {
+            let event = IdeWorkerEvent::Closed {
+                snapshot,
+                native_failure: *unpublished_native_failure,
+                input_failure,
+            };
+            if send_event(events, event) {
+                *unpublished_native_failure = None;
+                true
+            } else {
+                false
+            }
+        }
+        Err(reason) => publish_failure(events, IdeWorkerCommandKind::Initialize, reason),
     }
 }
 
@@ -778,6 +860,12 @@ fn process_command(
             },
             _ => publish_failure(events, kind, IdeWorkerCommandFailure::InvalidState),
         },
+        command @ (IdeWorkerCommand::RefreshInputs
+        | IdeWorkerCommand::DisableInputMonitoring
+        | IdeWorkerCommand::SelectSystemDefaultInput
+        | IdeWorkerCommand::SelectInput(_)) => {
+            process_input_command(state, command, events, unpublished_native_failure)
+        }
         IdeWorkerCommand::OpenProject(path) => {
             if !matches!(state, WorkerState::Closed(_)) {
                 return publish_failure(events, kind, IdeWorkerCommandFailure::InvalidState);
@@ -816,6 +904,15 @@ fn process_command(
             },
             _ => publish_failure(events, kind, IdeWorkerCommandFailure::InvalidState),
         },
+        IdeWorkerCommand::Monitoring(command) => match state {
+            WorkerState::Running(application) => match application.apply_monitoring(command) {
+                Ok(()) => send_event(events, IdeWorkerEvent::MonitoringApplied(command)),
+                Err(reason) => {
+                    publish_failure(events, kind, IdeWorkerCommandFailure::Monitoring(reason))
+                }
+            },
+            _ => publish_failure(events, kind, IdeWorkerCommandFailure::InvalidState),
+        },
         IdeWorkerCommand::SaveProject => save_project(state, events),
         IdeWorkerCommand::Observe => publish_state(state, events, unpublished_native_failure),
         IdeWorkerCommand::CloseProject => close_project(
@@ -825,6 +922,38 @@ fn process_command(
             IdeWorkerCommandKind::CloseProject,
         ),
         IdeWorkerCommand::Shutdown => unreachable!("shutdown is handled by the worker loop"),
+    }
+}
+
+fn process_input_command(
+    state: &mut WorkerState,
+    command: IdeWorkerCommand,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+) -> bool {
+    let kind = command.kind();
+    let WorkerState::Closed(application) = state else {
+        return publish_failure(events, kind, IdeWorkerCommandFailure::InvalidState);
+    };
+    let result = match command {
+        IdeWorkerCommand::RefreshInputs => application
+            .refresh_inputs()
+            .map_err(IdeWorkerCommandFailure::InputDiscovery),
+        IdeWorkerCommand::DisableInputMonitoring => {
+            application.disable_input_monitoring();
+            Ok(())
+        }
+        IdeWorkerCommand::SelectSystemDefaultInput => application
+            .select_system_default_input()
+            .map_err(IdeWorkerCommandFailure::InputSelection),
+        IdeWorkerCommand::SelectInput(routing_id) => application
+            .select_input(&routing_id)
+            .map_err(IdeWorkerCommandFailure::InputSelection),
+        _ => unreachable!("caller admits only input commands"),
+    };
+    match result {
+        Ok(()) => publish_state(state, events, unpublished_native_failure),
+        Err(reason) => publish_failure(events, kind, reason),
     }
 }
 
@@ -1107,13 +1236,10 @@ fn publish_state(
             Ok(snapshot) => IdeWorkerEvent::Closed {
                 snapshot,
                 native_failure: *unpublished_native_failure,
+                input_failure: None,
             },
             Err(reason) => {
-                let delivered = publish_failure(
-                    events,
-                    IdeWorkerCommandKind::Observe,
-                    IdeWorkerCommandFailure::Publication(reason),
-                );
+                let delivered = publish_failure(events, IdeWorkerCommandKind::Observe, reason);
                 // A close failure must remain the only outstanding teardown result.
                 // Stop rather than allowing another project to open before that
                 // evidence can be returned by the terminal join report.
@@ -1142,15 +1268,36 @@ fn publish_state(
 
 fn closed_snapshot(
     application: &DesktopIdeApplication,
-) -> Result<IdeClosedSnapshot, OutputInventoryError> {
-    let outputs = application.outputs().try_to_owned()?;
-    let selection = match application.selection() {
+) -> Result<IdeClosedSnapshot, IdeWorkerCommandFailure> {
+    let outputs = application
+        .outputs()
+        .try_to_owned()
+        .map_err(IdeWorkerCommandFailure::Publication)?;
+    let output_selection = match application.output_selection() {
         IdeOutputSelection::SystemDefault => IdeOutputSelection::SystemDefault,
-        IdeOutputSelection::Routed(routing_id) => {
-            IdeOutputSelection::Routed(super::try_owned(routing_id)?)
-        }
+        IdeOutputSelection::Routed(routing_id) => IdeOutputSelection::Routed(
+            super::try_owned(routing_id).map_err(IdeWorkerCommandFailure::Publication)?,
+        ),
     };
-    Ok(IdeClosedSnapshot { outputs, selection })
+    let inputs = application
+        .inputs()
+        .map(IdeAudioInputInventory::try_to_owned)
+        .transpose()
+        .map_err(IdeWorkerCommandFailure::InputPublication)?;
+    let input_selection = match application.input_selection() {
+        IdeInputSelection::Disabled => IdeInputSelection::Disabled,
+        IdeInputSelection::SystemDefault => IdeInputSelection::SystemDefault,
+        IdeInputSelection::Routed(routing_id) => IdeInputSelection::Routed(
+            super::try_input_owned(routing_id)
+                .map_err(IdeWorkerCommandFailure::InputPublication)?,
+        ),
+    };
+    Ok(IdeClosedSnapshot {
+        outputs,
+        output_selection,
+        inputs,
+        input_selection,
+    })
 }
 
 fn running_observation(
@@ -1205,6 +1352,7 @@ fn running_observation(
         mixer_main: snapshot.mixer_main_state,
         output_state: snapshot.output_state,
         output: snapshot.output,
+        monitoring: snapshot.monitoring,
         recovery: snapshot.recovery,
         meter: application.read_latest_meter(),
     })
@@ -1307,9 +1455,10 @@ mod tests {
     }
 
     fn closed_application() -> DesktopIdeApplication {
-        DesktopIdeApplication::from_inventory(
+        DesktopIdeApplication::from_inventories(
             application_config(),
             IdeAudioOutputInventory::try_new(&[("route-a", "Output A")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[("input-a", "Input A")]).unwrap(),
         )
     }
 
@@ -1390,6 +1539,111 @@ mod tests {
         ));
         worker.try_send(IdeWorkerCommand::Observe).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn closed_worker_publishes_explicit_input_monitoring_selection() {
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 4, 4).unwrap();
+        let IdeWorkerEvent::Closed { snapshot, .. } = recv(&worker) else {
+            panic!("initial closed state must be published");
+        };
+        assert_eq!(snapshot.input_selection(), &IdeInputSelection::Disabled);
+        assert_eq!(snapshot.inputs().unwrap().inputs().len(), 1);
+
+        worker
+            .try_send(IdeWorkerCommand::SelectSystemDefaultInput)
+            .unwrap();
+        let IdeWorkerEvent::Closed { snapshot, .. } = recv(&worker) else {
+            panic!("system input selection must publish closed state");
+        };
+        assert_eq!(
+            snapshot.input_selection(),
+            &IdeInputSelection::SystemDefault
+        );
+
+        worker
+            .try_send(IdeWorkerCommand::SelectInput("input-a".to_owned()))
+            .unwrap();
+        let IdeWorkerEvent::Closed { snapshot, .. } = recv(&worker) else {
+            panic!("routed input selection must publish closed state");
+        };
+        assert_eq!(
+            snapshot.input_selection(),
+            &IdeInputSelection::Routed("input-a".to_owned())
+        );
+
+        worker
+            .try_send(IdeWorkerCommand::DisableInputMonitoring)
+            .unwrap();
+        let IdeWorkerEvent::Closed { snapshot, .. } = recv(&worker) else {
+            panic!("monitor disable must publish closed state");
+        };
+        assert_eq!(snapshot.input_selection(), &IdeInputSelection::Disabled);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn closed_publication_reports_input_discovery_failure_without_hiding_playback() {
+        let state = WorkerState::Closed(closed_application());
+        let (events, receiver) = sync_channel(1);
+        let mut unpublished_native_failure = None;
+
+        assert!(publish_closed_state(
+            &state,
+            &events,
+            &mut unpublished_native_failure,
+            Some(IdeInputDiscoveryError::Inventory(
+                InputInventoryError::EmptyRoutingId,
+            )),
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(WAIT).unwrap(),
+            IdeWorkerEvent::Closed {
+                snapshot,
+                native_failure: None,
+                input_failure: Some(IdeInputDiscoveryError::Inventory(
+                    InputInventoryError::EmptyRoutingId,
+                )),
+            } if snapshot.outputs().outputs().len() == 1
+        ));
+    }
+
+    #[test]
+    fn running_worker_rejects_monitoring_when_no_input_cue_is_active() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 2).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::Monitoring(IdeMonitoringCommand::Mute {
+                muted: true,
+            }))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Monitoring,
+                reason: IdeWorkerCommandFailure::Monitoring(IdeMonitoringCommandError::Unavailable,),
+            }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::Transport(TransportCommand::Stop))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::TransportQueued(TransportCommand::Stop)
+        ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
     }
 

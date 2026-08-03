@@ -11,11 +11,14 @@ use hyper_audio_engine::{LinearGain, Pan, ParameterError};
 use hyper_audio_source::{DecodeError, DecodeLimits};
 pub use hyper_desktop_audio::DesktopSceneAvailability as IdeSceneAvailability;
 use hyper_desktop_audio::{
-    DesktopDirectControlError, DesktopInputStopError, DesktopOutputConfig,
+    CaptureStreamSnapshot, DesktopDirectControlError, DesktopInputConfig, DesktopInputConfigError,
+    DesktopInputDiscoveryError, DesktopInputStopError, DesktopMonitoringConfig,
+    DesktopMonitoringConfigError, DesktopMonitoringControlError, DesktopOutputConfig,
     DesktopOutputConfigError, DesktopOutputDiscoveryError, DesktopOutputStopError,
     DesktopPlaybackRecovery, DesktopPlaybackRecoveryPendingStop,
     DesktopPlaybackRecoveryPendingStopWait, DesktopPlaybackSession, DesktopProjectOpenError,
-    OutputStreamSnapshot, OutputStreamState, discover_desktop_output_targets,
+    MonitoringSnapshot, OutputStreamSnapshot, OutputStreamState, StreamState,
+    discover_desktop_input_targets, discover_desktop_output_targets,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
@@ -49,6 +52,10 @@ pub use worker::{
 };
 
 const DESKTOP_MAXIMUM_BLOCK_FRAMES: usize = 4_096;
+const DESKTOP_MONITORING_TRANSPORT_FRAMES: usize = DESKTOP_MAXIMUM_BLOCK_FRAMES * 2;
+const DESKTOP_MONITORING_TARGET_FRAMES: usize = 256;
+const DESKTOP_MONITORING_CHUNK_FRAMES: usize = 64;
+const MONITOR_GAIN_MILLIONTHS_MAXIMUM: u32 = 1_000_000;
 const DESKTOP_MAX_AUDIO_FILE_BYTES: u64 = 512 * 1_024 * 1_024;
 const DESKTOP_MAX_AUDIO_FRAMES: u64 = 43_200_000;
 const DESKTOP_MAX_AUDIO_DECODED_BYTES: usize = 2 * 43_200_000 * size_of::<f32>();
@@ -285,6 +292,190 @@ impl IdeAudioOutputInventory {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdeAudioInput {
+    routing_id: String,
+    display_name: String,
+}
+
+impl IdeAudioInput {
+    /// Creates one owned input descriptor from an opaque routing identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputInventoryError`] for an empty field or embedded NUL.
+    pub fn try_new(routing_id: &str, display_name: &str) -> Result<Self, InputInventoryError> {
+        if routing_id.is_empty() {
+            return Err(InputInventoryError::EmptyRoutingId);
+        }
+        if routing_id.as_bytes().contains(&0) {
+            return Err(InputInventoryError::RoutingIdContainsNul);
+        }
+        if display_name.is_empty() {
+            return Err(InputInventoryError::EmptyDisplayName);
+        }
+        if display_name.as_bytes().contains(&0) {
+            return Err(InputInventoryError::DisplayNameContainsNul);
+        }
+        Ok(Self {
+            routing_id: try_input_owned(routing_id)?,
+            display_name: try_input_owned(display_name)?,
+        })
+    }
+
+    #[must_use]
+    pub fn routing_id(&self) -> &str {
+        &self.routing_id
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    fn try_to_owned(&self) -> Result<Self, InputInventoryError> {
+        Self::try_new(&self.routing_id, &self.display_name)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputInventoryError {
+    CapacityUnavailable,
+    EmptyRoutingId,
+    RoutingIdContainsNul,
+    EmptyDisplayName,
+    DisplayNameContainsNul,
+    DuplicateRoutingId { input_index: usize },
+}
+
+impl fmt::Display for InputInventoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityUnavailable => {
+                formatter.write_str("audio input inventory capacity is unavailable")
+            }
+            Self::EmptyRoutingId => formatter.write_str("audio input routing identity is empty"),
+            Self::RoutingIdContainsNul => {
+                formatter.write_str("audio input routing identity contains an embedded NUL")
+            }
+            Self::EmptyDisplayName => formatter.write_str("audio input display name is empty"),
+            Self::DisplayNameContainsNul => {
+                formatter.write_str("audio input display name contains an embedded NUL")
+            }
+            Self::DuplicateRoutingId { input_index } => write!(
+                formatter,
+                "audio input {input_index} duplicates an earlier routing identity"
+            ),
+        }
+    }
+}
+
+impl Error for InputInventoryError {}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IdeAudioInputInventory {
+    inputs: Vec<IdeAudioInput>,
+}
+
+impl IdeAudioInputInventory {
+    /// Copies and validates one deterministic input snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputInventoryError`] without publishing a partial inventory.
+    pub fn try_new(inputs: &[(&str, &str)]) -> Result<Self, InputInventoryError> {
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(inputs.len())
+            .map_err(|_| InputInventoryError::CapacityUnavailable)?;
+        for (input_index, (routing_id, display_name)) in inputs.iter().enumerate() {
+            if owned
+                .iter()
+                .any(|input: &IdeAudioInput| input.routing_id() == *routing_id)
+            {
+                return Err(InputInventoryError::DuplicateRoutingId { input_index });
+            }
+            owned.push(IdeAudioInput::try_new(routing_id, display_name)?);
+        }
+        Ok(Self { inputs: owned })
+    }
+
+    fn discover() -> Result<Self, IdeInputDiscoveryError> {
+        let discovered =
+            discover_desktop_input_targets().map_err(IdeInputDiscoveryError::Backend)?;
+        let mut inputs = Vec::new();
+        inputs
+            .try_reserve_exact(discovered.targets().len())
+            .map_err(|_| {
+                IdeInputDiscoveryError::Inventory(InputInventoryError::CapacityUnavailable)
+            })?;
+        for target in discovered.targets() {
+            if inputs
+                .iter()
+                .any(|input: &IdeAudioInput| input.routing_id() == target.routing_id())
+            {
+                return Err(IdeInputDiscoveryError::Inventory(
+                    InputInventoryError::DuplicateRoutingId {
+                        input_index: inputs.len(),
+                    },
+                ));
+            }
+            inputs.push(
+                IdeAudioInput::try_new(target.routing_id(), target.display_name())
+                    .map_err(IdeInputDiscoveryError::Inventory)?,
+            );
+        }
+        Ok(Self { inputs })
+    }
+
+    #[must_use]
+    pub fn inputs(&self) -> &[IdeAudioInput] {
+        &self.inputs
+    }
+
+    #[must_use]
+    pub fn find(&self, routing_id: &str) -> Option<&IdeAudioInput> {
+        self.inputs
+            .iter()
+            .find(|input| input.routing_id == routing_id)
+    }
+
+    fn try_to_owned(&self) -> Result<Self, InputInventoryError> {
+        let mut inputs = Vec::new();
+        inputs
+            .try_reserve_exact(self.inputs.len())
+            .map_err(|_| InputInventoryError::CapacityUnavailable)?;
+        for input in &self.inputs {
+            inputs.push(input.try_to_owned()?);
+        }
+        Ok(Self { inputs })
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeInputDiscoveryError {
+    Backend(DesktopInputDiscoveryError),
+    Inventory(InputInventoryError),
+}
+
+impl fmt::Display for IdeInputDiscoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backend(source) => source.fmt(formatter),
+            Self::Inventory(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeInputDiscoveryError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Backend(source) => Some(source),
+            Self::Inventory(source) => Some(source),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum IdeOutputDiscoveryError {
     Backend(DesktopOutputDiscoveryError),
@@ -315,15 +506,26 @@ pub enum IdeOutputSelection {
     Routed(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdeInputSelection {
+    Disabled,
+    SystemDefault,
+    Routed(String),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdeApplicationConfigError {
     Output(DesktopOutputConfigError),
+    Input(DesktopInputConfigError),
+    Monitoring(DesktopMonitoringConfigError),
 }
 
 impl fmt::Display for IdeApplicationConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Output(source) => source.fmt(formatter),
+            Self::Input(source) => source.fmt(formatter),
+            Self::Monitoring(source) => source.fmt(formatter),
         }
     }
 }
@@ -332,6 +534,8 @@ impl Error for IdeApplicationConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Output(source) => Some(source),
+            Self::Input(source) => Some(source),
+            Self::Monitoring(source) => Some(source),
         }
     }
 }
@@ -352,8 +556,18 @@ impl IdeApplicationConfig {
         maximum_block_frames: usize,
         project_limits: ProjectPlaybackLimits,
     ) -> Result<Self, IdeApplicationConfigError> {
-        DesktopOutputConfig::try_new(48_000, maximum_block_frames)
+        let output = DesktopOutputConfig::try_new(48_000, maximum_block_frames)
             .map_err(IdeApplicationConfigError::Output)?;
+        let input = DesktopInputConfig::try_new(48_000, maximum_block_frames)
+            .map_err(IdeApplicationConfigError::Input)?;
+        DesktopMonitoringConfig::try_new(
+            input,
+            output,
+            DESKTOP_MONITORING_TRANSPORT_FRAMES,
+            DESKTOP_MONITORING_TARGET_FRAMES,
+            DESKTOP_MONITORING_CHUNK_FRAMES,
+        )
+        .map_err(IdeApplicationConfigError::Monitoring)?;
         Ok(Self {
             maximum_block_frames,
             project_limits,
@@ -375,7 +589,32 @@ impl IdeApplicationConfig {
 pub struct DesktopIdeApplication {
     config: IdeApplicationConfig,
     outputs: IdeAudioOutputInventory,
-    selection: IdeOutputSelection,
+    output_selection: IdeOutputSelection,
+    inputs: Option<IdeAudioInputInventory>,
+    input_selection: IdeInputSelection,
+}
+
+#[derive(Debug)]
+pub struct IdeApplicationDiscovery {
+    application: DesktopIdeApplication,
+    input_failure: Option<IdeInputDiscoveryError>,
+}
+
+impl IdeApplicationDiscovery {
+    #[must_use]
+    pub const fn application(&self) -> &DesktopIdeApplication {
+        &self.application
+    }
+
+    #[must_use]
+    pub const fn input_failure(&self) -> Option<&IdeInputDiscoveryError> {
+        self.input_failure.as_ref()
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (DesktopIdeApplication, Option<IdeInputDiscoveryError>) {
+        (self.application, self.input_failure)
+    }
 }
 
 impl DesktopIdeApplication {
@@ -384,11 +623,23 @@ impl DesktopIdeApplication {
     /// # Errors
     ///
     /// Returns native discovery or fallible inventory construction errors.
-    pub fn discover(config: IdeApplicationConfig) -> Result<Self, IdeOutputDiscoveryError> {
-        Ok(Self {
-            config,
-            outputs: IdeAudioOutputInventory::discover()?,
-            selection: IdeOutputSelection::SystemDefault,
+    pub fn discover(
+        config: IdeApplicationConfig,
+    ) -> Result<IdeApplicationDiscovery, IdeOutputDiscoveryError> {
+        let outputs = IdeAudioOutputInventory::discover()?;
+        let (inputs, input_failure) = match IdeAudioInputInventory::discover() {
+            Ok(inputs) => (Some(inputs), None),
+            Err(error) => (None, Some(error)),
+        };
+        Ok(IdeApplicationDiscovery {
+            application: Self {
+                config,
+                outputs,
+                output_selection: IdeOutputSelection::SystemDefault,
+                inputs,
+                input_selection: IdeInputSelection::Disabled,
+            },
+            input_failure,
         })
     }
 
@@ -400,7 +651,24 @@ impl DesktopIdeApplication {
         Self {
             config,
             outputs,
-            selection: IdeOutputSelection::SystemDefault,
+            output_selection: IdeOutputSelection::SystemDefault,
+            inputs: None,
+            input_selection: IdeInputSelection::Disabled,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_inventories(
+        config: IdeApplicationConfig,
+        outputs: IdeAudioOutputInventory,
+        inputs: IdeAudioInputInventory,
+    ) -> Self {
+        Self {
+            config,
+            outputs,
+            output_selection: IdeOutputSelection::SystemDefault,
+            inputs: Some(inputs),
+            input_selection: IdeInputSelection::Disabled,
         }
     }
 
@@ -415,18 +683,36 @@ impl DesktopIdeApplication {
         Ok(())
     }
 
+    /// Replaces the input snapshot only after complete rediscovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns discovery errors while retaining the previous inventory and
+    /// selection. A previous routed selection can become unavailable after a
+    /// successful refresh and is then retained as explicit stale state.
+    pub fn refresh_inputs(&mut self) -> Result<(), IdeInputDiscoveryError> {
+        let inputs = IdeAudioInputInventory::discover()?;
+        self.inputs = Some(inputs);
+        Ok(())
+    }
+
     #[must_use]
     pub fn outputs(&self) -> &IdeAudioOutputInventory {
         &self.outputs
     }
 
     #[must_use]
+    pub fn output_selection(&self) -> &IdeOutputSelection {
+        &self.output_selection
+    }
+
+    #[must_use]
     pub fn selection(&self) -> &IdeOutputSelection {
-        &self.selection
+        self.output_selection()
     }
 
     pub fn select_system_default(&mut self) {
-        self.selection = IdeOutputSelection::SystemDefault;
+        self.output_selection = IdeOutputSelection::SystemDefault;
     }
 
     /// Selects one routing identity present in the latest device snapshot.
@@ -438,8 +724,57 @@ impl DesktopIdeApplication {
         if self.outputs.find(routing_id).is_none() {
             return Err(IdeOutputSelectionError::UnknownOutput);
         }
-        self.selection = IdeOutputSelection::Routed(
+        self.output_selection = IdeOutputSelection::Routed(
             try_owned(routing_id).map_err(|_| IdeOutputSelectionError::CapacityUnavailable)?,
+        );
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn inputs(&self) -> Option<&IdeAudioInputInventory> {
+        self.inputs.as_ref()
+    }
+
+    #[must_use]
+    pub const fn input_selection(&self) -> &IdeInputSelection {
+        &self.input_selection
+    }
+
+    pub fn disable_input_monitoring(&mut self) {
+        self.input_selection = IdeInputSelection::Disabled;
+    }
+
+    /// Selects the current operating-system default input for cue monitoring.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdeInputSelectionError`] until input discovery has succeeded
+    /// and published at least one routable capture target.
+    pub fn select_system_default_input(&mut self) -> Result<(), IdeInputSelectionError> {
+        let Some(inputs) = self.inputs.as_ref() else {
+            return Err(IdeInputSelectionError::DiscoveryUnavailable);
+        };
+        if inputs.inputs().is_empty() {
+            return Err(IdeInputSelectionError::NoInputsAvailable);
+        }
+        self.input_selection = IdeInputSelection::SystemDefault;
+        Ok(())
+    }
+
+    /// Selects one discovered input for cue monitoring.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdeInputSelectionError`] without changing selection.
+    pub fn select_input(&mut self, routing_id: &str) -> Result<(), IdeInputSelectionError> {
+        let Some(inputs) = self.inputs.as_ref() else {
+            return Err(IdeInputSelectionError::DiscoveryUnavailable);
+        };
+        if inputs.find(routing_id).is_none() {
+            return Err(IdeInputSelectionError::UnknownInput);
+        }
+        self.input_selection = IdeInputSelection::Routed(
+            try_input_owned(routing_id).map_err(|_| IdeInputSelectionError::CapacityUnavailable)?,
         );
         Ok(())
     }
@@ -466,7 +801,24 @@ impl DesktopIdeApplication {
                 });
             }
         };
-        match DesktopPlaybackSession::open_project(output, root, self.config.project_limits) {
+        let monitoring = match self.monitoring_config(output.clone()) {
+            Ok(monitoring) => monitoring,
+            Err(reason) => {
+                return Err(IdeProjectOpenFailure {
+                    application: self,
+                    reason,
+                });
+            }
+        };
+        let opened = match monitoring {
+            Some(monitoring) => DesktopPlaybackSession::open_project_monitored(
+                monitoring,
+                root,
+                self.config.project_limits,
+            ),
+            None => DesktopPlaybackSession::open_project(output, root, self.config.project_limits),
+        };
+        match opened {
             Ok(session) => Ok(RunningDesktopIdeApplication {
                 application: self,
                 session: IdePlaybackSessionOwner::Native(session),
@@ -481,7 +833,7 @@ impl DesktopIdeApplication {
     fn output_config(&self) -> Result<DesktopOutputConfig, IdeProjectOpenError> {
         let output = DesktopOutputConfig::try_new(48_000, self.config.maximum_block_frames)
             .map_err(IdeProjectOpenError::OutputConfig)?;
-        match &self.selection {
+        match &self.output_selection {
             IdeOutputSelection::SystemDefault => Ok(output),
             IdeOutputSelection::Routed(routing_id) => {
                 if self.outputs.find(routing_id).is_none() {
@@ -492,6 +844,48 @@ impl DesktopIdeApplication {
                     .map_err(IdeProjectOpenError::OutputConfig)
             }
         }
+    }
+
+    fn monitoring_config(
+        &self,
+        output: DesktopOutputConfig,
+    ) -> Result<Option<DesktopMonitoringConfig>, IdeProjectOpenError> {
+        let input = match &self.input_selection {
+            IdeInputSelection::Disabled => return Ok(None),
+            IdeInputSelection::SystemDefault => {
+                let inputs = self
+                    .inputs
+                    .as_ref()
+                    .ok_or(IdeProjectOpenError::InputDiscoveryUnavailable)?;
+                if inputs.inputs().is_empty() {
+                    return Err(IdeProjectOpenError::SelectedInputUnavailable);
+                }
+                DesktopInputConfig::try_new(48_000, self.config.maximum_block_frames)
+                    .map_err(IdeProjectOpenError::InputConfig)?
+            }
+            IdeInputSelection::Routed(routing_id) => {
+                let inputs = self
+                    .inputs
+                    .as_ref()
+                    .ok_or(IdeProjectOpenError::InputDiscoveryUnavailable)?;
+                if inputs.find(routing_id).is_none() {
+                    return Err(IdeProjectOpenError::SelectedInputUnavailable);
+                }
+                DesktopInputConfig::try_new(48_000, self.config.maximum_block_frames)
+                    .map_err(IdeProjectOpenError::InputConfig)?
+                    .with_routing_id(routing_id)
+                    .map_err(IdeProjectOpenError::InputConfig)?
+            }
+        };
+        DesktopMonitoringConfig::try_new(
+            input,
+            output,
+            DESKTOP_MONITORING_TRANSPORT_FRAMES,
+            DESKTOP_MONITORING_TARGET_FRAMES,
+            DESKTOP_MONITORING_CHUNK_FRAMES,
+        )
+        .map(Some)
+        .map_err(IdeProjectOpenError::MonitoringConfig)
     }
 }
 
@@ -512,10 +906,35 @@ impl fmt::Display for IdeOutputSelectionError {
 
 impl Error for IdeOutputSelectionError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeInputSelectionError {
+    DiscoveryUnavailable,
+    NoInputsAvailable,
+    UnknownInput,
+    CapacityUnavailable,
+}
+
+impl fmt::Display for IdeInputSelectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::DiscoveryUnavailable => "audio input discovery is unavailable",
+            Self::NoInputsAvailable => "no audio inputs are available",
+            Self::UnknownInput => "audio input is absent from the latest device snapshot",
+            Self::CapacityUnavailable => "audio input selection capacity is unavailable",
+        })
+    }
+}
+
+impl Error for IdeInputSelectionError {}
+
 #[derive(Debug)]
 pub enum IdeProjectOpenError {
     SelectedOutputUnavailable,
+    InputDiscoveryUnavailable,
+    SelectedInputUnavailable,
     OutputConfig(DesktopOutputConfigError),
+    InputConfig(DesktopInputConfigError),
+    MonitoringConfig(DesktopMonitoringConfigError),
     Project(DesktopProjectOpenError),
 }
 
@@ -525,7 +944,15 @@ impl fmt::Display for IdeProjectOpenError {
             Self::SelectedOutputUnavailable => {
                 formatter.write_str("selected audio output is no longer available")
             }
+            Self::InputDiscoveryUnavailable => {
+                formatter.write_str("audio input discovery is unavailable")
+            }
+            Self::SelectedInputUnavailable => {
+                formatter.write_str("selected audio input is no longer available")
+            }
             Self::OutputConfig(source) => source.fmt(formatter),
+            Self::InputConfig(source) => source.fmt(formatter),
+            Self::MonitoringConfig(source) => source.fmt(formatter),
             Self::Project(source) => source.fmt(formatter),
         }
     }
@@ -534,8 +961,12 @@ impl fmt::Display for IdeProjectOpenError {
 impl Error for IdeProjectOpenError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::SelectedOutputUnavailable => None,
+            Self::SelectedOutputUnavailable
+            | Self::InputDiscoveryUnavailable
+            | Self::SelectedInputUnavailable => None,
             Self::OutputConfig(source) => Some(source),
+            Self::InputConfig(source) => Some(source),
+            Self::MonitoringConfig(source) => Some(source),
             Self::Project(source) => Some(source),
         }
     }
@@ -641,6 +1072,39 @@ impl Error for IdeMixerCommandError {
             Self::Parameter(source) => Some(source),
             Self::Resolve(source) => Some(source),
             Self::Send(source) => Some(source),
+        }
+    }
+}
+
+/// One live control for the optional global input-cue path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeMonitoringCommand {
+    Gain { gain_millionths: u32 },
+    Mute { muted: bool },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeMonitoringCommandError {
+    Unavailable,
+    ExcessiveGain,
+    Backend(DesktopMonitoringControlError),
+}
+
+impl fmt::Display for IdeMonitoringCommandError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("input cue monitoring is not active"),
+            Self::ExcessiveGain => formatter.write_str("input cue gain must not exceed unity"),
+            Self::Backend(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeMonitoringCommandError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Backend(source) => Some(source),
+            Self::Unavailable | Self::ExcessiveGain => None,
         }
     }
 }
@@ -825,6 +1289,15 @@ pub struct IdeMixerSendState {
     pub enabled: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IdeMonitoringState {
+    pub gain: f32,
+    pub muted: bool,
+    pub input_state: StreamState,
+    pub input: CaptureStreamSnapshot,
+    pub bridge: MonitoringSnapshot,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RunningIdeSnapshot<'a> {
     pub project_id: &'a str,
@@ -848,6 +1321,7 @@ pub struct RunningIdeSnapshot<'a> {
     pub mixer_main_state: Option<IdeMixerMainState>,
     pub output_state: OutputStreamState,
     pub output: OutputStreamSnapshot,
+    pub monitoring: Option<IdeMonitoringState>,
     pub recovery: PlaybackRecoverySnapshot,
 }
 
@@ -1108,10 +1582,8 @@ impl RunningDesktopIdeApplication {
                     });
             }
         }
-        let mixer_main_state = mixer_parameters.map(|state| IdeMixerMainState {
-            gain: state.main_gain().value(),
-            muted: state.main_muted(),
-        });
+        let mixer_main_state = mixer_parameters.as_ref().map(ide_mixer_main_state);
+        let monitoring = session_monitoring_state(session).ok()?;
         Some(RunningIdeSnapshot {
             project_id: project.package().manifest().project_id(),
             project_name: project.package().manifest().name(),
@@ -1130,6 +1602,7 @@ impl RunningDesktopIdeApplication {
             mixer_main_state,
             output_state: session.output_status().state(),
             output: session.counters().snapshot(),
+            monitoring,
             recovery,
         })
     }
@@ -1256,6 +1729,48 @@ impl RunningDesktopIdeApplication {
         }
     }
 
+    /// Applies one lock-free input-cue control to the active monitored session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an explicit unavailable result for ordinary playback sessions,
+    /// rejects gain above unity, and preserves backend validation failures.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::infallible_destructuring_match,
+        reason = "the integer cue domain is bounded below exact f32 integer range, and the test-only owner has no monitor"
+    )]
+    pub fn apply_monitoring(
+        &mut self,
+        command: IdeMonitoringCommand,
+    ) -> Result<(), IdeMonitoringCommandError> {
+        let session = match &mut self.session {
+            IdePlaybackSessionOwner::Native(session) => session,
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => {
+                return Err(IdeMonitoringCommandError::Unavailable);
+            }
+        };
+        let control = session
+            .monitoring_control()
+            .ok_or(IdeMonitoringCommandError::Unavailable)?;
+        match command {
+            IdeMonitoringCommand::Gain { gain_millionths } => {
+                if gain_millionths > MONITOR_GAIN_MILLIONTHS_MAXIMUM {
+                    return Err(IdeMonitoringCommandError::ExcessiveGain);
+                }
+                let gain = gain_millionths as f32 / MONITOR_GAIN_MILLIONTHS_MAXIMUM as f32;
+                control
+                    .set_gain_linear(gain)
+                    .map_err(IdeMonitoringCommandError::Backend)
+            }
+            IdeMonitoringCommand::Mute { muted } => {
+                control.set_muted(muted);
+                Ok(())
+            }
+        }
+    }
+
     #[must_use]
     pub fn read_latest_meter(&mut self) -> LatestOutputMeterSnapshot {
         match &mut self.session {
@@ -1366,6 +1881,41 @@ impl RunningDesktopIdeApplication {
                 }
             }
         }
+    }
+}
+
+fn ide_mixer_main_state(
+    state: &hyper_mixer_runtime::MixerParameterStateSnapshot,
+) -> IdeMixerMainState {
+    IdeMixerMainState {
+        gain: state.main_gain().value(),
+        muted: state.main_muted(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InconsistentMonitoringState;
+
+fn session_monitoring_state(
+    session: &DesktopPlaybackSession,
+) -> Result<Option<IdeMonitoringState>, InconsistentMonitoringState> {
+    match (
+        session.monitoring_control(),
+        session.monitoring_input_status(),
+        session.monitoring_input_counters(),
+        session.monitoring_snapshot(),
+    ) {
+        (Some(control), Some(input_status), Some(input_counters), Some(bridge)) => {
+            Ok(Some(IdeMonitoringState {
+                gain: control.gain_linear(),
+                muted: control.muted(),
+                input_state: input_status.state(),
+                input: input_counters.snapshot(),
+                bridge,
+            }))
+        }
+        (None, None, None, None) => Ok(None),
+        _ => Err(InconsistentMonitoringState),
     }
 }
 
@@ -1596,6 +2146,15 @@ fn try_owned(value: &str) -> Result<String, OutputInventoryError> {
     Ok(owned)
 }
 
+fn try_input_owned(value: &str) -> Result<String, InputInventoryError> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| InputInventoryError::CapacityUnavailable)?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1672,6 +2231,74 @@ mod tests {
             &IdeOutputSelection::Routed("route-a".to_owned())
         );
         assert!(application.outputs().find("route-a").is_none());
+    }
+
+    #[test]
+    fn input_monitoring_is_default_off_and_requires_current_discovery() {
+        let outputs = IdeAudioOutputInventory::try_new(&[("output-a", "Output A")]).unwrap();
+        let inputs =
+            IdeAudioInputInventory::try_new(&[("input-a", "Input A"), ("input-b", "Input B")])
+                .unwrap();
+        let mut application =
+            DesktopIdeApplication::from_inventories(config(256).unwrap(), outputs, inputs);
+
+        assert_eq!(application.input_selection(), &IdeInputSelection::Disabled);
+        let output = application.output_config().unwrap();
+        assert!(application.monitoring_config(output).unwrap().is_none());
+
+        application.select_system_default_input().unwrap();
+        let monitoring = application
+            .monitoring_config(application.output_config().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(monitoring.input().routing_id(), None);
+        assert_eq!(
+            monitoring.transport_capacity_frames(),
+            DESKTOP_MONITORING_TRANSPORT_FRAMES
+        );
+        assert_eq!(
+            monitoring.target_latency_frames(),
+            DESKTOP_MONITORING_TARGET_FRAMES
+        );
+        assert_eq!(
+            monitoring.processing_chunk_frames(),
+            DESKTOP_MONITORING_CHUNK_FRAMES
+        );
+
+        application.select_input("input-b").unwrap();
+        let monitoring = application
+            .monitoring_config(application.output_config().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(monitoring.input().routing_id(), Some("input-b"));
+
+        application.inputs = Some(IdeAudioInputInventory::default());
+        assert!(matches!(
+            application.monitoring_config(application.output_config().unwrap()),
+            Err(IdeProjectOpenError::SelectedInputUnavailable)
+        ));
+        assert_eq!(
+            application.input_selection(),
+            &IdeInputSelection::Routed("input-b".to_owned())
+        );
+        application.disable_input_monitoring();
+        assert_eq!(application.input_selection(), &IdeInputSelection::Disabled);
+    }
+
+    #[test]
+    fn input_inventory_is_owned_ordered_and_unique() {
+        let inventory =
+            IdeAudioInputInventory::try_new(&[("route-b", "Mic"), ("route-a", "Line")]).unwrap();
+        assert_eq!(inventory.inputs()[0].routing_id(), "route-b");
+        assert_eq!(inventory.inputs()[1].display_name(), "Line");
+        assert_eq!(
+            IdeAudioInputInventory::try_new(&[("route", "One"), ("route", "Two")]),
+            Err(InputInventoryError::DuplicateRoutingId { input_index: 1 })
+        );
+        assert_eq!(
+            IdeAudioInput::try_new("", "Input"),
+            Err(InputInventoryError::EmptyRoutingId)
+        );
     }
 
     #[test]
