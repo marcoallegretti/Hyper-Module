@@ -1,0 +1,303 @@
+import { Button, ComboBox } from "std-widgets.slint";
+
+export enum AppMode {
+    discovering,
+    closed,
+    selecting,
+    opening,
+    running,
+    closing,
+    unavailable,
+}
+
+export global IdeActions {
+    callback retry-discovery();
+    callback refresh-outputs();
+    callback select-output(int);
+    callback choose-project();
+    callback transport-start();
+    callback transport-stop();
+    callback close-project();
+}
+
+component Panel inherits Rectangle {
+    background: #141a22;
+    border-color: #27313d;
+    border-width: 1px;
+    border-radius: 8px;
+}
+
+component Meter inherits Rectangle {
+    in property <float> level: 0;
+    in property <string> channel-name;
+    in property <string> reading: "—";
+
+    background: #090d12;
+    border-color: #27313d;
+    border-width: 1px;
+    border-radius: 5px;
+
+    Rectangle {
+        x: 5px;
+        y: 5px + (parent.height - 34px) * (1 - root.level);
+        width: parent.width - 10px;
+        height: (parent.height - 34px) * root.level;
+        border-radius: 3px;
+        background: root.level > 0.92 ? #ff5a55 : root.level > 0.72 ? #f5b83d : #3ddc97;
+    }
+
+    Text {
+        x: 0;
+        y: parent.height - 25px;
+        width: parent.width;
+        text: root.channel-name;
+        color: #95a3b5;
+        font-size: 11px;
+        horizontal-alignment: center;
+    }
+
+    Text {
+        x: 0;
+        y: 8px;
+        width: parent.width;
+        text: root.reading;
+        color: #e7edf5;
+        font-size: 11px;
+        horizontal-alignment: center;
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Hyper Module — Desktop IDE";
+    width: 1180px;
+    height: 720px;
+    background: #0b0f14;
+
+    in property <AppMode> app-mode: AppMode.discovering;
+    in property <[string]> output-names: [];
+    in-out property <int> selected-output-index: 0;
+    in property <string> project-location: "No project selected";
+    in property <string> project-name: "No project open";
+    in property <string> project-id: "—";
+    in property <string> sample-rate: "—";
+    in property <string> scene-count: "—";
+    in property <string> transport-state: "Stopped";
+    in property <string> stream-state: "No stream";
+    in property <string> frame-position: "0";
+    in property <string> callback-count: "0";
+    in property <string> xrun-count: "Unavailable";
+    in property <float> left-meter: 0;
+    in property <float> right-meter: 0;
+    in property <string> left-reading: "—";
+    in property <string> right-reading: "—";
+    in property <string> status-text: "Discovering desktop audio outputs…";
+    in property <string> error-text: "";
+
+    VerticalLayout {
+        padding: 22px;
+        spacing: 16px;
+
+        HorizontalLayout {
+            height: 58px;
+            alignment: center;
+
+            VerticalLayout {
+                spacing: 1px;
+                Text {
+                    text: "HYPER MODULE";
+                    color: #f2f6fb;
+                    font-size: 23px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "DESKTOP IDE  /  PLAYBACK CONTROL";
+                    color: #65758a;
+                    font-size: 11px;
+                    letter-spacing: 1.4px;
+                }
+            }
+
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+
+            Rectangle {
+                width: 144px;
+                height: 31px;
+                border-radius: 16px;
+                background: root.app-mode == AppMode.running ? #173d31
+                    : root.app-mode == AppMode.unavailable ? #492323 : #222b36;
+                Text {
+                    text: root.app-mode == AppMode.running ? "●  RUNNING"
+                        : root.app-mode == AppMode.opening ? "◌  OPENING"
+                        : root.app-mode == AppMode.selecting ? "◌  SELECTING"
+                        : root.app-mode == AppMode.closing ? "◌  CLOSING"
+                        : root.app-mode == AppMode.closed ? "●  READY"
+                        : root.app-mode == AppMode.unavailable ? "●  UNAVAILABLE"
+                        : "◌  DISCOVERING";
+                    color: root.app-mode == AppMode.running ? #63e6b5
+                        : root.app-mode == AppMode.unavailable ? #ff8b87 : #a9b5c4;
+                    font-size: 11px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 16px;
+            vertical-stretch: 1;
+
+            VerticalLayout {
+                width: 330px;
+                spacing: 16px;
+
+                Panel {
+                    height: 210px;
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 11px;
+                        Text { text: "AUDIO OUTPUT"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: "Playback destination"; color: #edf2f8; font-size: 17px; font-weight: 600; }
+                        output-selector := ComboBox {
+                            model: root.output-names;
+                            current-index <=> root.selected-output-index;
+                            enabled: root.app-mode == AppMode.closed;
+                            selected(_) => { IdeActions.select-output(self.current-index); }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button {
+                                text: "Refresh";
+                                enabled: root.app-mode == AppMode.closed;
+                                clicked => { IdeActions.refresh-outputs(); }
+                            }
+                            Button {
+                                text: "Retry discovery";
+                                enabled: root.app-mode == AppMode.unavailable;
+                                clicked => { IdeActions.retry-discovery(); }
+                            }
+                        }
+                        Text {
+                            text: "System default remains explicit; routed devices use opaque identities.";
+                            color: #728196;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                Panel {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 12px;
+                        Text { text: "PROJECT"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.project-name; color: #edf2f8; font-size: 18px; font-weight: 600; overflow: elide; }
+                        Text { text: root.project-location; color: #8290a2; font-size: 11px; wrap: word-wrap; vertical-stretch: 1; }
+                        Button {
+                            text: root.app-mode == AppMode.selecting ? "Selecting project…"
+                                : root.app-mode == AppMode.opening ? "Opening project…" : "Choose project folder";
+                            enabled: root.app-mode == AppMode.closed;
+                            clicked => { IdeActions.choose-project(); }
+                        }
+                        Text { text: "Verified identity"; color: #65758a; font-size: 10px; }
+                        Text { text: root.project-id; color: #b9c5d3; font-size: 11px; overflow: elide; }
+                    }
+                }
+            }
+
+            Panel {
+                horizontal-stretch: 1;
+                VerticalLayout {
+                    padding: 22px;
+                    spacing: 18px;
+
+                    HorizontalLayout {
+                        height: 62px;
+                        VerticalLayout {
+                            Text { text: "PERFORMANCE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            Text { text: root.transport-state; color: #edf2f8; font-size: 24px; font-weight: 650; }
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Text { text: root.stream-state; color: #8fa0b4; font-size: 12px; vertical-alignment: center; }
+                    }
+
+                    Rectangle { height: 1px; background: #27313d; }
+
+                    HorizontalLayout {
+                        height: 178px;
+                        spacing: 18px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            spacing: 14px;
+                            HorizontalLayout {
+                                alignment: center;
+                                spacing: 10px;
+                                Button {
+                                    text: "▶  Start";
+                                    enabled: root.app-mode == AppMode.running;
+                                    clicked => { IdeActions.transport-start(); }
+                                }
+                                Button {
+                                    text: "■  Stop";
+                                    enabled: root.app-mode == AppMode.running;
+                                    clicked => { IdeActions.transport-stop(); }
+                                }
+                                Button {
+                                    text: "Close project";
+                                    enabled: root.app-mode == AppMode.running;
+                                    clicked => { IdeActions.close-project(); }
+                                }
+                            }
+                            Text { text: "Frame  " + root.frame-position; color: #8fa0b4; font-size: 12px; }
+                        }
+                        Meter { width: 64px; level: root.left-meter; channel-name: "LEFT"; reading: root.left-reading; }
+                        Meter { width: 64px; level: root.right-meter; channel-name: "RIGHT"; reading: root.right-reading; }
+                    }
+
+                    Rectangle { height: 1px; background: #27313d; }
+
+                    Text { text: "RUNTIME EVIDENCE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+
+                    GridLayout {
+                        spacing: 10px;
+                        Rectangle {
+                            row: 0; col: 0; height: 78px; background: #0e141b; border-radius: 6px;
+                            VerticalLayout { padding: 12px; Text { text: "SAMPLE RATE"; color: #65758a; font-size: 10px; } Text { text: root.sample-rate; color: #dce5ef; font-size: 18px; } }
+                        }
+                        Rectangle {
+                            row: 0; col: 1; height: 78px; background: #0e141b; border-radius: 6px;
+                            VerticalLayout { padding: 12px; Text { text: "SCENES"; color: #65758a; font-size: 10px; } Text { text: root.scene-count; color: #dce5ef; font-size: 18px; } }
+                        }
+                        Rectangle {
+                            row: 1; col: 0; height: 78px; background: #0e141b; border-radius: 6px;
+                            VerticalLayout { padding: 12px; Text { text: "CALLBACKS"; color: #65758a; font-size: 10px; } Text { text: root.callback-count; color: #dce5ef; font-size: 18px; } }
+                        }
+                        Rectangle {
+                            row: 1; col: 1; height: 78px; background: #0e141b; border-radius: 6px;
+                            VerticalLayout { padding: 12px; Text { text: "NATIVE XRUNS"; color: #65758a; font-size: 10px; } Text { text: root.xrun-count; color: #dce5ef; font-size: 18px; } }
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            height: root.error-text == "" ? 38px : 52px;
+            border-radius: 6px;
+            background: root.error-text == "" ? #111820 : #3b2022;
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 14px;
+                Text {
+                    text: root.error-text == "" ? root.status-text : root.error-text;
+                    color: root.error-text == "" ? #8494a8 : #ffaaa6;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+}

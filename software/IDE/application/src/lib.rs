@@ -3,9 +3,11 @@
 
 use core::error::Error;
 use core::fmt;
+use core::mem::size_of;
 use std::path::Path;
 use std::time::Duration;
 
+use hyper_audio_source::{DecodeError, DecodeLimits};
 use hyper_desktop_audio::{
     DesktopDirectControlError, DesktopInputStopError, DesktopOutputConfig,
     DesktopOutputConfigError, DesktopOutputDiscoveryError, DesktopOutputStopError,
@@ -13,9 +15,13 @@ use hyper_desktop_audio::{
     DesktopPlaybackSession, DesktopProjectOpenError, OutputStreamSnapshot, OutputStreamState,
     discover_desktop_output_targets,
 };
-use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, TransportCommand};
+use hyper_media_cache::CacheLimits;
+use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot};
 #[cfg(test)]
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
+pub use hyper_mixer_runtime::{PlaybackRecoveryTransportState, TransportCommand};
+use hyper_playback_json::LoaderLimits;
+use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::ProjectPlaybackLimits;
 
 mod worker;
@@ -27,6 +33,79 @@ pub use worker::{
     IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, IdeWorkerStartError,
     MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS, desktop_ide_worker_supervisor_snapshot,
 };
+
+const DESKTOP_MAXIMUM_BLOCK_FRAMES: usize = 4_096;
+const DESKTOP_MAX_AUDIO_FILE_BYTES: u64 = 512 * 1_024 * 1_024;
+const DESKTOP_MAX_AUDIO_FRAMES: u64 = 43_200_000;
+const DESKTOP_MAX_AUDIO_DECODED_BYTES: usize = 2 * 43_200_000 * size_of::<f32>();
+const DESKTOP_MAX_PROJECT_RESOURCE_BYTES: usize = 1_024 * 1_024 * 1_024;
+const DESKTOP_MAX_PROJECT_DECODED_BYTES: usize = 1_024 * 1_024 * 1_024;
+
+/// Builds the bounded playback policy used by the desktop IDE executable.
+///
+/// The policy accepts version-1 documents, at most fifteen minutes of 48 kHz
+/// audio per decoded asset, and at most one GiB each of declared resources and
+/// cached decoded sample planes. These are desktop software limits, not evidence
+/// of embedded hardware capacity.
+///
+/// # Errors
+///
+/// Returns an invariant error if the fixed decode or output policy is invalid.
+pub fn desktop_ide_application_config()
+-> Result<IdeApplicationConfig, DesktopIdeApplicationConfigError> {
+    let audio = DecodeLimits::new(
+        DESKTOP_MAX_AUDIO_FILE_BYTES,
+        DESKTOP_MAX_AUDIO_FRAMES,
+        DESKTOP_MAX_AUDIO_DECODED_BYTES,
+    )
+    .map_err(DesktopIdeApplicationConfigError::Decode)?;
+    IdeApplicationConfig::try_new(
+        DESKTOP_MAXIMUM_BLOCK_FRAMES,
+        ProjectPlaybackLimits {
+            max_total_resource_bytes: DESKTOP_MAX_PROJECT_RESOURCE_BYTES,
+            audio,
+            session: PlaybackSessionAssemblyLimits {
+                documents: LoaderLimits::VERSION_1,
+                media_cache: CacheLimits {
+                    max_assets: LoaderLimits::VERSION_1.max_clip_documents,
+                    max_frames_per_asset: usize::try_from(DESKTOP_MAX_AUDIO_FRAMES)
+                        .map_err(|_| DesktopIdeApplicationConfigError::FrameLimitUnavailable)?,
+                    max_decoded_sample_bytes: DESKTOP_MAX_PROJECT_DECODED_BYTES,
+                },
+            },
+        },
+    )
+    .map_err(DesktopIdeApplicationConfigError::Application)
+}
+
+#[derive(Debug)]
+pub enum DesktopIdeApplicationConfigError {
+    Decode(DecodeError),
+    FrameLimitUnavailable,
+    Application(IdeApplicationConfigError),
+}
+
+impl fmt::Display for DesktopIdeApplicationConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Decode(source) => source.fmt(formatter),
+            Self::FrameLimitUnavailable => {
+                formatter.write_str("desktop IDE audio frame limit is unavailable on this platform")
+            }
+            Self::Application(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for DesktopIdeApplicationConfigError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Decode(source) => Some(source),
+            Self::Application(source) => Some(source),
+            Self::FrameLimitUnavailable => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdeAudioOutput {
@@ -819,6 +898,22 @@ mod tests {
         let config = config(512).unwrap();
         assert_eq!(config.maximum_block_frames(), 512);
         assert_eq!(config.project_limits().max_total_resource_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn desktop_launch_policy_is_bounded_to_version_one_playback() {
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        assert_eq!(config.maximum_block_frames(), DESKTOP_MAXIMUM_BLOCK_FRAMES);
+        assert_eq!(limits.audio.max_frames(), DESKTOP_MAX_AUDIO_FRAMES);
+        assert_eq!(
+            limits.session.media_cache.max_assets,
+            LoaderLimits::VERSION_1.max_clip_documents
+        );
+        assert!(
+            limits.session.media_cache.max_decoded_sample_bytes
+                >= limits.audio.max_decoded_sample_bytes()
+        );
     }
 
     #[test]

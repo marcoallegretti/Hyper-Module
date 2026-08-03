@@ -1,0 +1,24 @@
+[package]
+name = "hyper-desktop-ui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+hyper-desktop-ide = { path = "../application" }
+rfd = { version = "=0.17.2" }
+slint = { version = "=1.17.1", default-features = false, features = [
+    "accessibility",
+    "backend-winit",
+    "compat-1-2",
+    "renderer-femtovg",
+    "std",
+] }
+
+[build-dependencies]
+slint-build = "=1.17.1"
