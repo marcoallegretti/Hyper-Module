@@ -2144,9 +2144,11 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(fixture.transaction_count(), 1);
 
-        let recovered = recover_control_mapping_publications(&fixture.root).unwrap();
+        let report = crate::recover_project_transactions(&fixture.root).unwrap();
+        let recovered = report.control_mappings();
 
         assert_eq!(recovered.len(), 1);
+        assert!(report.recordings().is_empty());
         assert_eq!(
             recovered[0].disposition(),
             ControlMappingPublicationRecoveryDisposition::RolledBack

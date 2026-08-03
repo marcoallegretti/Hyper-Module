@@ -38,6 +38,9 @@ use hyper_playback_session::PreparedPlaybackSession;
 use hyper_project_loader::{
     PreparedProjectPlayback, ProjectPlaybackError, ProjectPlaybackLimits, prepare_project_playback,
 };
+use hyper_storage_engine::{
+    ProjectTransactionRecoveryError, ProjectTransactionRecoveryReport, recover_project_transactions,
+};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
@@ -342,15 +345,36 @@ impl Error for DesktopPlaybackSessionStopError {
 /// Failure to load and start one verified project on a desktop output.
 #[derive(Debug)]
 pub enum DesktopProjectOpenError {
-    Load(ProjectPlaybackError),
-    Start(DesktopPlaybackSessionStartError),
+    Recovery(ProjectTransactionRecoveryError),
+    Load {
+        source: Box<ProjectPlaybackError>,
+        recovery: ProjectTransactionRecoveryReport,
+    },
+    Start {
+        source: Box<DesktopPlaybackSessionStartError>,
+        recovery: ProjectTransactionRecoveryReport,
+    },
+}
+
+impl DesktopProjectOpenError {
+    /// Returns every recovery outcome completed before project open failed.
+    #[must_use]
+    pub const fn recovery_report(&self) -> &ProjectTransactionRecoveryReport {
+        match self {
+            Self::Recovery(source) => source.completed(),
+            Self::Load { recovery, .. } | Self::Start { recovery, .. } => recovery,
+        }
+    }
 }
 
 impl fmt::Display for DesktopProjectOpenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Load(source) => write!(formatter, "project loading failed: {source}"),
-            Self::Start(source) => write!(formatter, "desktop playback startup failed: {source}"),
+            Self::Recovery(source) => write!(formatter, "project recovery failed: {source}"),
+            Self::Load { source, .. } => write!(formatter, "project loading failed: {source}"),
+            Self::Start { source, .. } => {
+                write!(formatter, "desktop playback startup failed: {source}")
+            }
         }
     }
 }
@@ -358,8 +382,9 @@ impl fmt::Display for DesktopProjectOpenError {
 impl Error for DesktopProjectOpenError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Load(source) => Some(source),
-            Self::Start(source) => Some(source),
+            Self::Recovery(source) => Some(source),
+            Self::Load { source, .. } => Some(source.as_ref()),
+            Self::Start { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -391,6 +416,7 @@ pub struct DesktopPlaybackSession {
     config: DesktopOutputConfig,
     source: Arc<dyn DesktopPlaybackSource>,
     monitoring: Option<PlaybackMonitoringSession>,
+    project_open_recovery: Option<ProjectTransactionRecoveryReport>,
 }
 
 #[derive(Debug)]
@@ -399,6 +425,23 @@ struct PlaybackMonitoringSession {
     config: DesktopMonitoringConfig,
     counters: MonitoringCounters,
     control: DesktopMonitoringControl,
+}
+
+fn recover_and_prepare_project(
+    root: &Path,
+    limits: ProjectPlaybackLimits,
+) -> Result<(PreparedProjectPlayback, ProjectTransactionRecoveryReport), DesktopProjectOpenError> {
+    let recovery = recover_project_transactions(root).map_err(DesktopProjectOpenError::Recovery)?;
+    let project = match prepare_project_playback(root, limits) {
+        Ok(project) => project,
+        Err(source) => {
+            return Err(DesktopProjectOpenError::Load {
+                source: Box::new(source),
+                recovery,
+            });
+        }
+    };
+    Ok((project, recovery))
 }
 
 struct PlaybackMonitoringMixer {
@@ -1028,13 +1071,16 @@ impl DesktopPlaybackSession {
     ///
     /// Project loading is a blocking application-thread operation and must not
     /// be called from an audio callback. The native output is not opened until
-    /// the complete project has passed structural and semantic verification.
+    /// interrupted editable-project transactions have been recovered and the
+    /// complete project has passed structural and semantic verification.
     /// The verified package, decoded media, and recording metadata remain
     /// owned by the live session and any recovery value derived from it.
     ///
     /// # Errors
     ///
-    /// Returns [`DesktopProjectOpenError::Load`] before native startup when the
+    /// Returns [`DesktopProjectOpenError::Recovery`] when interrupted project
+    /// transactions cannot be resolved without discarding evidence. Returns
+    /// [`DesktopProjectOpenError::Load`] before native startup when the
     /// project is invalid, changes during capture, exceeds a limit, or cannot
     /// be decoded. Returns [`DesktopProjectOpenError::Start`] when the verified
     /// project cannot be bound to the selected output.
@@ -1043,9 +1089,17 @@ impl DesktopPlaybackSession {
         root: impl AsRef<Path>,
         limits: ProjectPlaybackLimits,
     ) -> Result<Self, DesktopProjectOpenError> {
-        let project =
-            prepare_project_playback(root, limits).map_err(DesktopProjectOpenError::Load)?;
-        Self::start_project(config, project).map_err(DesktopProjectOpenError::Start)
+        let (project, recovery) = recover_and_prepare_project(root.as_ref(), limits)?;
+        match Self::start_project(config, project) {
+            Ok(mut session) => {
+                session.project_open_recovery = Some(recovery);
+                Ok(session)
+            }
+            Err(source) => Err(DesktopProjectOpenError::Start {
+                source: Box::new(source),
+                recovery,
+            }),
+        }
     }
 
     /// Verifies and starts one project with bounded live input monitoring.
@@ -1059,9 +1113,17 @@ impl DesktopPlaybackSession {
         root: impl AsRef<Path>,
         limits: ProjectPlaybackLimits,
     ) -> Result<Self, DesktopProjectOpenError> {
-        let project =
-            prepare_project_playback(root, limits).map_err(DesktopProjectOpenError::Load)?;
-        Self::start_project_monitored(monitoring, project).map_err(DesktopProjectOpenError::Start)
+        let (project, recovery) = recover_and_prepare_project(root.as_ref(), limits)?;
+        match Self::start_project_monitored(monitoring, project) {
+            Ok(mut session) => {
+                session.project_open_recovery = Some(recovery);
+                Ok(session)
+            }
+            Err(source) => Err(DesktopProjectOpenError::Start {
+                source: Box::new(source),
+                recovery,
+            }),
+        }
     }
 
     /// Starts an already verified project while retaining its package and
@@ -1206,6 +1268,7 @@ impl DesktopPlaybackSession {
                     config,
                     source,
                     monitoring: None,
+                    project_open_recovery: None,
                 }),
                 Ok(SessionPublication::Failed(source)) => {
                     Err(DesktopPlaybackSessionStartError::Build(source))
@@ -1244,6 +1307,13 @@ impl DesktopPlaybackSession {
     #[must_use]
     pub fn prepared_project(&self) -> Option<&PreparedProjectPlayback> {
         self.source.project()
+    }
+
+    /// Returns the transaction recovery evidence produced by a project-open
+    /// operation. Sessions started from an already prepared project have none.
+    #[must_use]
+    pub const fn project_open_recovery(&self) -> Option<&ProjectTransactionRecoveryReport> {
+        self.project_open_recovery.as_ref()
     }
 
     #[must_use]
@@ -1312,6 +1382,7 @@ impl DesktopPlaybackSession {
             config,
             source,
             monitoring,
+            project_open_recovery: _,
         } = self;
         let monitoring_config = monitoring
             .as_ref()
@@ -1371,6 +1442,7 @@ impl DesktopPlaybackSession {
             config: _,
             source: _,
             monitoring,
+            project_open_recovery: _,
         } = self;
         let input = monitoring
             .map(|monitoring| monitoring.input.stop().map_err(DesktopInputStopError::from))
@@ -1589,9 +1661,10 @@ mod tests {
         DecodedPlaybackAsset, PlaybackDocumentBytes, PlaybackSessionAssemblyInput,
         assemble_playback_session,
     };
+    use std::fs;
     use std::sync::mpsc::SyncSender;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[derive(Debug)]
     struct UnusedPlaybackSource;
@@ -1943,26 +2016,52 @@ mod tests {
     }
 
     #[test]
-    fn project_load_failure_precedes_native_output_startup() {
+    fn project_recovery_failure_precedes_loading_and_native_output_startup() {
         let not_a_project = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         let config = DesktopOutputConfig::try_new(48_000, 256).unwrap();
         let error = DesktopPlaybackSession::open_project(config, &not_a_project, project_limits())
             .expect_err("a non-project path must fail before native output startup");
 
-        assert!(matches!(
-            error,
-            DesktopProjectOpenError::Load(ProjectPlaybackError::Storage(_))
+        assert!(matches!(error, DesktopProjectOpenError::Recovery(_)));
+    }
+
+    #[test]
+    fn transaction_free_open_reaches_loading_without_creating_recovery_storage() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hyper-desktop-project-open-{}-{unique}",
+            std::process::id()
         ));
+        fs::create_dir(&root).unwrap();
+
+        let config = DesktopOutputConfig::try_new(48_000, 256).unwrap();
+        let error = DesktopPlaybackSession::open_project(config, &root, project_limits())
+            .expect_err("an empty project must fail during loading");
+
+        assert!(matches!(
+            &error,
+            DesktopProjectOpenError::Load { source, recovery }
+                if matches!(source.as_ref(), ProjectPlaybackError::Storage(_))
+                    && recovery.is_empty()
+        ));
+        assert!(!root.join("backups").exists());
+        fs::remove_dir(&root).unwrap();
     }
 
     #[test]
     fn project_open_error_preserves_start_failure_source() {
-        let error = DesktopProjectOpenError::Start(DesktopPlaybackSessionStartError::Build(
-            DesktopPlaybackSessionBuildError::SampleRateMismatch {
-                project: 44_100,
-                output: 48_000,
-            },
-        ));
+        let error = DesktopProjectOpenError::Start {
+            source: Box::new(DesktopPlaybackSessionStartError::Build(
+                DesktopPlaybackSessionBuildError::SampleRateMismatch {
+                    project: 44_100,
+                    output: 48_000,
+                },
+            )),
+            recovery: ProjectTransactionRecoveryReport::default(),
+        };
 
         assert_eq!(
             error.to_string(),
@@ -1973,6 +2072,7 @@ mod tests {
             Some(source) if source.to_string()
                 == "project sample rate is 44100 Hz; output is configured for 48000 Hz"
         ));
+        assert!(error.recovery_report().is_empty());
     }
 
     #[test]

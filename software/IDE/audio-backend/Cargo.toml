@@ -21,6 +21,7 @@ hyper-recording-journal = { path = "../../../crates/recording-journal" }
 hyper-recording-metadata = { path = "../../../crates/recording-metadata" }
 hyper-recording-transport = { path = "../../../crates/recording-transport" }
 hyper-recording-worker = { path = "../../../crates/recording-worker" }
+hyper-storage-engine = { path = "../../../crates/storage-engine" }
 hyper-thread-supervisor = { path = "../../../crates/thread-supervisor" }
 ringbuf = "=0.5.1"
 rubato = { version = "=4.0.0", default-features = false }

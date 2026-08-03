@@ -238,7 +238,9 @@ pub fn recover_recording_imports(
 ) -> Result<Vec<RecordingImportRecovery>, RecordingImportError> {
     let (root_path, root_dir) = open_stable_project_root(project_path.as_ref())
         .map_err(|error| caused("open project root for recovery", error))?;
-    let backups = open_or_create_dir(&root_dir, "backups")?;
+    let Some(backups) = open_optional_dir(&root_dir, "backups")? else {
+        return Ok(Vec::new());
+    };
     let _lock = ProjectLock::acquire(&backups)?;
     let mut transaction_names = Vec::new();
     let entries = backups
@@ -1482,9 +1484,11 @@ mod tests {
         .unwrap();
         fs::write(transaction_path.join("recording.wav"), b"partial").unwrap();
 
-        let recovered = recover_recording_imports(&fixture.root).unwrap();
+        let report = crate::recover_project_transactions(&fixture.root).unwrap();
+        let recovered = report.recordings();
 
         assert_eq!(recovered.len(), 1);
+        assert!(report.control_mappings().is_empty());
         assert_eq!(recovered[0].transaction_id(), id.to_string());
         assert_eq!(
             recovered[0].disposition(),

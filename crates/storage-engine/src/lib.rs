@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod mapping_publication;
+mod project_recovery;
 mod recording_import;
 mod stable_file;
 
@@ -10,6 +11,10 @@ pub use mapping_publication::{
     ControlMappingPublicationOutcome, ControlMappingPublicationRecovery,
     ControlMappingPublicationRecoveryDisposition, ControlMappingPublicationRequest,
     publish_control_mapping, recover_control_mapping_publications,
+};
+pub use project_recovery::{
+    ProjectTransactionRecoveryError, ProjectTransactionRecoveryErrorSource,
+    ProjectTransactionRecoveryReport, recover_project_transactions,
 };
 pub use recording_import::{
     RecordingImportError, RecordingImportOutcome, RecordingImportRecovery,

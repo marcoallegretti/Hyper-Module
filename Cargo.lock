@@ -506,6 +506,7 @@ dependencies = [
  "hyper-recording-metadata",
  "hyper-recording-transport",
  "hyper-recording-worker",
+ "hyper-storage-engine",
  "hyper-thread-supervisor",
  "libspa-sys",
  "pipewire",
