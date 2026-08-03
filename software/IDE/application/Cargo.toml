@@ -1,0 +1,20 @@
+[package]
+name = "hyper-desktop-ide"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+hyper-desktop-audio = { path = "../audio-backend" }
+hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
+hyper-project-loader = { path = "../../../crates/project-loader" }
+
+[dev-dependencies]
+hyper-audio-source = { path = "../../../crates/audio-source" }
+hyper-media-cache = { path = "../../../crates/media-cache" }
+hyper-playback-json = { path = "../../../crates/playback-json" }
+hyper-playback-session = { path = "../../../crates/playback-session" }

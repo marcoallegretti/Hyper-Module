@@ -23,6 +23,7 @@ members = [
     "crates/strict-json",
     "crates/thread-supervisor",
     "software/IDE/audio-backend",
+    "software/IDE/application",
     "software/IDE/fs-authority",
     "software/IDE/mapping-editor",
     "software/IDE/panel-simulator",

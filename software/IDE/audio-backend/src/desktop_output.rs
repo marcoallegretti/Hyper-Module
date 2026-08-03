@@ -2,15 +2,9 @@ use core::error::Error;
 use core::fmt;
 
 #[cfg(all(target_os = "linux", target_endian = "little"))]
-use super::{
-    PipeWireOutputConfig, PipeWireOutputTarget, PipeWireTargetDiscoveryError,
-    discover_pipewire_output_targets,
-};
+use super::{PipeWireOutputConfig, PipeWireTargetDiscoveryError, discover_pipewire_output_targets};
 #[cfg(target_os = "windows")]
-use super::{
-    WasapiEndpointDiscoveryError, WasapiOutputConfig, WasapiOutputEndpoint,
-    discover_wasapi_output_endpoints,
-};
+use super::{WasapiEndpointDiscoveryError, WasapiOutputConfig, discover_wasapi_output_endpoints};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DesktopOutputTarget {
@@ -27,26 +21,6 @@ impl DesktopOutputTarget {
     #[must_use]
     pub fn display_name(&self) -> &str {
         &self.display_name
-    }
-}
-
-#[cfg(all(target_os = "linux", target_endian = "little"))]
-impl From<&PipeWireOutputTarget> for DesktopOutputTarget {
-    fn from(target: &PipeWireOutputTarget) -> Self {
-        Self {
-            routing_id: target.routing_id().to_owned(),
-            display_name: target.display_name().to_owned(),
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl From<&WasapiOutputEndpoint> for DesktopOutputTarget {
-    fn from(target: &WasapiOutputEndpoint) -> Self {
-        Self {
-            routing_id: target.routing_id().to_owned(),
-            display_name: target.display_name().to_owned(),
-        }
     }
 }
 
@@ -200,22 +174,31 @@ impl DesktopOutputConfig {
 }
 
 #[derive(Debug)]
-pub struct DesktopOutputDiscoveryError {
+pub enum DesktopOutputDiscoveryError {
     #[cfg(all(target_os = "linux", target_endian = "little"))]
-    source: PipeWireTargetDiscoveryError,
+    Backend(PipeWireTargetDiscoveryError),
     #[cfg(target_os = "windows")]
-    source: WasapiEndpointDiscoveryError,
+    Backend(WasapiEndpointDiscoveryError),
+    CapacityUnavailable,
 }
 
 impl fmt::Display for DesktopOutputDiscoveryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.source.fmt(formatter)
+        match self {
+            Self::Backend(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("desktop output discovery capacity is unavailable")
+            }
+        }
     }
 }
 
 impl Error for DesktopOutputDiscoveryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.source)
+        match self {
+            Self::Backend(source) => Some(source),
+            Self::CapacityUnavailable => None,
+        }
     }
 }
 
@@ -228,18 +211,32 @@ impl Error for DesktopOutputDiscoveryError {
 pub fn discover_desktop_output_targets() -> Result<DesktopOutputTargets, DesktopOutputDiscoveryError>
 {
     #[cfg(all(target_os = "linux", target_endian = "little"))]
-    let native = discover_pipewire_output_targets()
-        .map_err(|source| DesktopOutputDiscoveryError { source })?;
+    let native =
+        discover_pipewire_output_targets().map_err(DesktopOutputDiscoveryError::Backend)?;
     #[cfg(target_os = "windows")]
-    let native = discover_wasapi_output_endpoints()
-        .map_err(|source| DesktopOutputDiscoveryError { source })?;
+    let native =
+        discover_wasapi_output_endpoints().map_err(DesktopOutputDiscoveryError::Backend)?;
 
-    let targets = native
-        .targets()
-        .iter()
-        .map(DesktopOutputTarget::from)
-        .collect();
+    let mut targets = Vec::new();
+    targets
+        .try_reserve_exact(native.targets().len())
+        .map_err(|_| DesktopOutputDiscoveryError::CapacityUnavailable)?;
+    for target in native.targets() {
+        targets.push(DesktopOutputTarget {
+            routing_id: try_copy_discovered(target.routing_id())?,
+            display_name: try_copy_discovered(target.display_name())?,
+        });
+    }
     Ok(DesktopOutputTargets { targets })
+}
+
+fn try_copy_discovered(value: &str) -> Result<String, DesktopOutputDiscoveryError> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| DesktopOutputDiscoveryError::CapacityUnavailable)?;
+    owned.push_str(value);
+    Ok(owned)
 }
 
 #[cfg(test)]

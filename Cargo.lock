@@ -527,6 +527,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-desktop-ide"
+version = "0.1.0"
+dependencies = [
+ "hyper-audio-source",
+ "hyper-desktop-audio",
+ "hyper-media-cache",
+ "hyper-mixer-runtime",
+ "hyper-playback-json",
+ "hyper-playback-session",
+ "hyper-project-loader",
+]
+
+[[package]]
 name = "hyper-fs-authority"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,862 @@
+#![doc = "Single-owner desktop IDE application state above native audio playback."]
+#![forbid(unsafe_code)]
+
+use core::error::Error;
+use core::fmt;
+use std::path::Path;
+use std::time::Duration;
+
+use hyper_desktop_audio::{
+    DesktopDirectControlError, DesktopInputStopError, DesktopOutputConfig,
+    DesktopOutputConfigError, DesktopOutputDiscoveryError, DesktopOutputStopError,
+    DesktopPlaybackRecoveryPendingStop, DesktopPlaybackRecoveryPendingStopWait,
+    DesktopPlaybackSession, DesktopProjectOpenError, OutputStreamSnapshot, OutputStreamState,
+    discover_desktop_output_targets,
+};
+use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, TransportCommand};
+#[cfg(test)]
+use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
+use hyper_project_loader::ProjectPlaybackLimits;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdeAudioOutput {
+    routing_id: String,
+    display_name: String,
+}
+
+impl IdeAudioOutput {
+    /// Creates one owned output descriptor from an opaque routing identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutputInventoryError`] for an empty field or embedded NUL.
+    pub fn try_new(routing_id: &str, display_name: &str) -> Result<Self, OutputInventoryError> {
+        if routing_id.is_empty() {
+            return Err(OutputInventoryError::EmptyRoutingId);
+        }
+        if routing_id.as_bytes().contains(&0) {
+            return Err(OutputInventoryError::RoutingIdContainsNul);
+        }
+        if display_name.is_empty() {
+            return Err(OutputInventoryError::EmptyDisplayName);
+        }
+        if display_name.as_bytes().contains(&0) {
+            return Err(OutputInventoryError::DisplayNameContainsNul);
+        }
+        Ok(Self {
+            routing_id: try_owned(routing_id)?,
+            display_name: try_owned(display_name)?,
+        })
+    }
+
+    #[must_use]
+    pub fn routing_id(&self) -> &str {
+        &self.routing_id
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputInventoryError {
+    CapacityUnavailable,
+    EmptyRoutingId,
+    RoutingIdContainsNul,
+    EmptyDisplayName,
+    DisplayNameContainsNul,
+    DuplicateRoutingId { output_index: usize },
+}
+
+impl fmt::Display for OutputInventoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityUnavailable => {
+                formatter.write_str("audio output inventory capacity is unavailable")
+            }
+            Self::EmptyRoutingId => formatter.write_str("audio output routing identity is empty"),
+            Self::RoutingIdContainsNul => {
+                formatter.write_str("audio output routing identity contains an embedded NUL")
+            }
+            Self::EmptyDisplayName => formatter.write_str("audio output display name is empty"),
+            Self::DisplayNameContainsNul => {
+                formatter.write_str("audio output display name contains an embedded NUL")
+            }
+            Self::DuplicateRoutingId { output_index } => write!(
+                formatter,
+                "audio output {output_index} duplicates an earlier routing identity"
+            ),
+        }
+    }
+}
+
+impl Error for OutputInventoryError {}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IdeAudioOutputInventory {
+    outputs: Vec<IdeAudioOutput>,
+}
+
+impl IdeAudioOutputInventory {
+    /// Copies and validates one deterministic output snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutputInventoryError`] without publishing a partial inventory.
+    pub fn try_new(outputs: &[(&str, &str)]) -> Result<Self, OutputInventoryError> {
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(outputs.len())
+            .map_err(|_| OutputInventoryError::CapacityUnavailable)?;
+        for (output_index, (routing_id, display_name)) in outputs.iter().enumerate() {
+            if owned
+                .iter()
+                .any(|output: &IdeAudioOutput| output.routing_id() == *routing_id)
+            {
+                return Err(OutputInventoryError::DuplicateRoutingId { output_index });
+            }
+            owned.push(IdeAudioOutput::try_new(routing_id, display_name)?);
+        }
+        Ok(Self { outputs: owned })
+    }
+
+    fn discover() -> Result<Self, IdeOutputDiscoveryError> {
+        let discovered =
+            discover_desktop_output_targets().map_err(IdeOutputDiscoveryError::Backend)?;
+        let mut outputs = Vec::new();
+        outputs
+            .try_reserve_exact(discovered.targets().len())
+            .map_err(|_| {
+                IdeOutputDiscoveryError::Inventory(OutputInventoryError::CapacityUnavailable)
+            })?;
+        for target in discovered.targets() {
+            if outputs
+                .iter()
+                .any(|output: &IdeAudioOutput| output.routing_id() == target.routing_id())
+            {
+                return Err(IdeOutputDiscoveryError::Inventory(
+                    OutputInventoryError::DuplicateRoutingId {
+                        output_index: outputs.len(),
+                    },
+                ));
+            }
+            outputs.push(
+                IdeAudioOutput::try_new(target.routing_id(), target.display_name())
+                    .map_err(IdeOutputDiscoveryError::Inventory)?,
+            );
+        }
+        Ok(Self { outputs })
+    }
+
+    #[must_use]
+    pub fn outputs(&self) -> &[IdeAudioOutput] {
+        &self.outputs
+    }
+
+    #[must_use]
+    pub fn find(&self, routing_id: &str) -> Option<&IdeAudioOutput> {
+        self.outputs
+            .iter()
+            .find(|output| output.routing_id == routing_id)
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeOutputDiscoveryError {
+    Backend(DesktopOutputDiscoveryError),
+    Inventory(OutputInventoryError),
+}
+
+impl fmt::Display for IdeOutputDiscoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backend(source) => source.fmt(formatter),
+            Self::Inventory(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeOutputDiscoveryError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Backend(source) => Some(source),
+            Self::Inventory(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdeOutputSelection {
+    SystemDefault,
+    Routed(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeApplicationConfigError {
+    Output(DesktopOutputConfigError),
+}
+
+impl fmt::Display for IdeApplicationConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Output(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeApplicationConfigError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Output(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdeApplicationConfig {
+    maximum_block_frames: usize,
+    project_limits: ProjectPlaybackLimits,
+}
+
+impl IdeApplicationConfig {
+    /// Creates the fixed 48 kHz desktop application policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdeApplicationConfigError`] when callback capacity is invalid.
+    pub fn try_new(
+        maximum_block_frames: usize,
+        project_limits: ProjectPlaybackLimits,
+    ) -> Result<Self, IdeApplicationConfigError> {
+        DesktopOutputConfig::try_new(48_000, maximum_block_frames)
+            .map_err(IdeApplicationConfigError::Output)?;
+        Ok(Self {
+            maximum_block_frames,
+            project_limits,
+        })
+    }
+
+    #[must_use]
+    pub const fn maximum_block_frames(self) -> usize {
+        self.maximum_block_frames
+    }
+
+    #[must_use]
+    pub const fn project_limits(self) -> ProjectPlaybackLimits {
+        self.project_limits
+    }
+}
+
+#[derive(Debug)]
+pub struct DesktopIdeApplication {
+    config: IdeApplicationConfig,
+    outputs: IdeAudioOutputInventory,
+    selection: IdeOutputSelection,
+}
+
+impl DesktopIdeApplication {
+    /// Discovers outputs and publishes one closed application owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns native discovery or fallible inventory construction errors.
+    pub fn discover(config: IdeApplicationConfig) -> Result<Self, IdeOutputDiscoveryError> {
+        Ok(Self {
+            config,
+            outputs: IdeAudioOutputInventory::discover()?,
+            selection: IdeOutputSelection::SystemDefault,
+        })
+    }
+
+    #[must_use]
+    pub const fn from_inventory(
+        config: IdeApplicationConfig,
+        outputs: IdeAudioOutputInventory,
+    ) -> Self {
+        Self {
+            config,
+            outputs,
+            selection: IdeOutputSelection::SystemDefault,
+        }
+    }
+
+    /// Replaces the device snapshot only after complete rediscovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns discovery errors while retaining the previous inventory.
+    pub fn refresh_outputs(&mut self) -> Result<(), IdeOutputDiscoveryError> {
+        let outputs = IdeAudioOutputInventory::discover()?;
+        self.outputs = outputs;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn outputs(&self) -> &IdeAudioOutputInventory {
+        &self.outputs
+    }
+
+    #[must_use]
+    pub fn selection(&self) -> &IdeOutputSelection {
+        &self.selection
+    }
+
+    pub fn select_system_default(&mut self) {
+        self.selection = IdeOutputSelection::SystemDefault;
+    }
+
+    /// Selects one routing identity present in the latest device snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdeOutputSelectionError`] without changing selection.
+    pub fn select_output(&mut self, routing_id: &str) -> Result<(), IdeOutputSelectionError> {
+        if self.outputs.find(routing_id).is_none() {
+            return Err(IdeOutputSelectionError::UnknownOutput);
+        }
+        self.selection = IdeOutputSelection::Routed(
+            try_owned(routing_id).map_err(|_| IdeOutputSelectionError::CapacityUnavailable)?,
+        );
+        Ok(())
+    }
+
+    /// Opens one verified project and transfers the closed owner into running state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unchanged closed application together with the failure.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the failure retains the sole closed application owner without allocating after project-open failure"
+    )]
+    pub fn open_project(
+        self,
+        root: impl AsRef<Path>,
+    ) -> Result<RunningDesktopIdeApplication, IdeProjectOpenFailure> {
+        let output = match self.output_config() {
+            Ok(output) => output,
+            Err(reason) => {
+                return Err(IdeProjectOpenFailure {
+                    application: self,
+                    reason,
+                });
+            }
+        };
+        match DesktopPlaybackSession::open_project(output, root, self.config.project_limits) {
+            Ok(session) => Ok(RunningDesktopIdeApplication {
+                application: self,
+                session: IdePlaybackSessionOwner::Native(session),
+            }),
+            Err(source) => Err(IdeProjectOpenFailure {
+                application: self,
+                reason: IdeProjectOpenError::Project(source),
+            }),
+        }
+    }
+
+    fn output_config(&self) -> Result<DesktopOutputConfig, IdeProjectOpenError> {
+        let output = DesktopOutputConfig::try_new(48_000, self.config.maximum_block_frames)
+            .map_err(IdeProjectOpenError::OutputConfig)?;
+        match &self.selection {
+            IdeOutputSelection::SystemDefault => Ok(output),
+            IdeOutputSelection::Routed(routing_id) => {
+                if self.outputs.find(routing_id).is_none() {
+                    return Err(IdeProjectOpenError::SelectedOutputUnavailable);
+                }
+                output
+                    .with_routing_id(routing_id)
+                    .map_err(IdeProjectOpenError::OutputConfig)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeOutputSelectionError {
+    UnknownOutput,
+    CapacityUnavailable,
+}
+
+impl fmt::Display for IdeOutputSelectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnknownOutput => "audio output is absent from the latest device snapshot",
+            Self::CapacityUnavailable => "audio output selection capacity is unavailable",
+        })
+    }
+}
+
+impl Error for IdeOutputSelectionError {}
+
+#[derive(Debug)]
+pub enum IdeProjectOpenError {
+    SelectedOutputUnavailable,
+    OutputConfig(DesktopOutputConfigError),
+    Project(DesktopProjectOpenError),
+}
+
+impl fmt::Display for IdeProjectOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SelectedOutputUnavailable => {
+                formatter.write_str("selected audio output is no longer available")
+            }
+            Self::OutputConfig(source) => source.fmt(formatter),
+            Self::Project(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeProjectOpenError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::SelectedOutputUnavailable => None,
+            Self::OutputConfig(source) => Some(source),
+            Self::Project(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct IdeProjectOpenFailure {
+    application: DesktopIdeApplication,
+    reason: IdeProjectOpenError,
+}
+
+impl IdeProjectOpenFailure {
+    #[must_use]
+    pub const fn application(&self) -> &DesktopIdeApplication {
+        &self.application
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> &IdeProjectOpenError {
+        &self.reason
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (DesktopIdeApplication, IdeProjectOpenError) {
+        (self.application, self.reason)
+    }
+}
+
+impl fmt::Display for IdeProjectOpenFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.reason.fmt(formatter)
+    }
+}
+
+impl Error for IdeProjectOpenFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.reason)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RunningIdeSnapshot<'a> {
+    pub project_id: &'a str,
+    pub project_name: &'a str,
+    pub sample_rate_hz: u32,
+    pub scene_count: usize,
+    pub output_state: OutputStreamState,
+    pub output: OutputStreamSnapshot,
+    pub recovery: PlaybackRecoverySnapshot,
+}
+
+#[derive(Debug)]
+pub struct RunningDesktopIdeApplication {
+    application: DesktopIdeApplication,
+    session: IdePlaybackSessionOwner,
+}
+
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the small alternative exists only in tests; production has one unboxed native owner"
+)]
+enum IdePlaybackSessionOwner {
+    Native(DesktopPlaybackSession),
+    #[cfg(test)]
+    Test(TestPlaybackSession),
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestPlaybackSession {
+    commands: Vec<TransportCommand>,
+    meters: OutputMeterReceiver,
+}
+
+#[cfg(test)]
+impl Default for TestPlaybackSession {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            meters: output_meter_channel().1,
+        }
+    }
+}
+
+impl RunningDesktopIdeApplication {
+    /// Observes the verified project and the latest non-owning runtime evidence.
+    ///
+    /// `None` means the underlying playback source exposes no verified project;
+    /// it is not evidence that output is ready, failed, or disconnected. Sessions
+    /// created by [`DesktopIdeApplication::open_project`] retain that project.
+    #[must_use]
+    #[allow(
+        clippy::infallible_destructuring_match,
+        reason = "the second owner variant is compiled only for deterministic controller tests"
+    )]
+    pub fn snapshot(&self) -> Option<RunningIdeSnapshot<'_>> {
+        let session = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session,
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => return None,
+        };
+        let project = session.prepared_project()?;
+        let loaded = project.session().parts().0;
+        Some(RunningIdeSnapshot {
+            project_id: project.package().manifest().project_id(),
+            project_name: project.package().manifest().name(),
+            sample_rate_hz: project.session().sample_rate_hz(),
+            scene_count: loaded.scene_count(),
+            output_state: session.output_status().state(),
+            output: session.counters().snapshot(),
+            recovery: session.recovery_checkpoint().snapshot(),
+        })
+    }
+
+    /// Sends a bounded transport or scene command through the only live owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns queue, target, or disconnection evidence unchanged.
+    pub fn try_send_transport(
+        &mut self,
+        command: TransportCommand,
+    ) -> Result<(), DesktopDirectControlError> {
+        match &mut self.session {
+            IdePlaybackSessionOwner::Native(session) => session.try_send_transport_command(command),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => {
+                session.commands.push(command);
+                Ok(())
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn read_latest_meter(&mut self) -> LatestOutputMeterSnapshot {
+        match &mut self.session {
+            IdePlaybackSessionOwner::Native(session) => session.meter_receiver().read_latest(),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => session.meters.read_latest(),
+        }
+    }
+
+    #[must_use]
+    pub fn application(&self) -> &DesktopIdeApplication {
+        &self.application
+    }
+
+    /// Closes the project while retaining pending thread ownership when needed.
+    ///
+    /// A terminal outcome returns the closed application controller and consumes
+    /// backend restart recovery. Opening another project performs verification and
+    /// loading again.
+    #[must_use]
+    #[allow(
+        clippy::infallible_destructuring_match,
+        reason = "the second owner variant is compiled only for deterministic controller tests"
+    )]
+    pub fn close(self) -> IdeCloseOutcome {
+        let Self {
+            application,
+            session,
+        } = self;
+        let session = match session {
+            IdePlaybackSessionOwner::Native(session) => session,
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => {
+                return IdeCloseOutcome::Closed {
+                    application,
+                    failure: None,
+                };
+            }
+        };
+        match session.into_recovery() {
+            Ok(_recovery) => IdeCloseOutcome::Closed {
+                application,
+                failure: None,
+            },
+            Err(error) => {
+                let failure = classify_joined_close_failure(&error);
+                match error.into_pending() {
+                    Ok(pending) => IdeCloseOutcome::Pending(DesktopIdePendingClose {
+                        application,
+                        pending,
+                    }),
+                    Err(error) => {
+                        drop(error);
+                        IdeCloseOutcome::Closed {
+                            application,
+                            failure: Some(failure),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeNativeCloseFailure {
+    RuntimeFailed,
+    ThreadPanicked,
+}
+
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "pending native ownership must transfer without a new allocation after shutdown has begun"
+)]
+pub enum IdeCloseOutcome {
+    Closed {
+        application: DesktopIdeApplication,
+        failure: Option<IdeNativeCloseFailure>,
+    },
+    Pending(DesktopIdePendingClose),
+}
+
+#[derive(Debug)]
+pub struct DesktopIdePendingClose {
+    application: DesktopIdeApplication,
+    pending: DesktopPlaybackRecoveryPendingStop,
+}
+
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a timed-out native owner must be returned without allocating after the bounded wait"
+)]
+pub enum IdePendingCloseWait {
+    Closed {
+        application: DesktopIdeApplication,
+        failure: Option<IdeNativeCloseFailure>,
+    },
+    TimedOut(DesktopIdePendingClose),
+}
+
+impl DesktopIdePendingClose {
+    #[must_use]
+    pub fn wait(self, timeout: Duration) -> IdePendingCloseWait {
+        match self.pending.wait(timeout) {
+            DesktopPlaybackRecoveryPendingStopWait::Completed(_recovery) => {
+                IdePendingCloseWait::Closed {
+                    application: self.application,
+                    failure: None,
+                }
+            }
+            DesktopPlaybackRecoveryPendingStopWait::Failed(_recovery) => {
+                IdePendingCloseWait::Closed {
+                    application: self.application,
+                    failure: Some(IdeNativeCloseFailure::RuntimeFailed),
+                }
+            }
+            DesktopPlaybackRecoveryPendingStopWait::Panicked(_recovery) => {
+                IdePendingCloseWait::Closed {
+                    application: self.application,
+                    failure: Some(IdeNativeCloseFailure::ThreadPanicked),
+                }
+            }
+            DesktopPlaybackRecoveryPendingStopWait::TimedOut(pending) => {
+                IdePendingCloseWait::TimedOut(Self {
+                    application: self.application,
+                    pending,
+                })
+            }
+        }
+    }
+}
+
+fn classify_joined_close_failure(
+    error: &hyper_desktop_audio::DesktopPlaybackRecoveryStopError,
+) -> IdeNativeCloseFailure {
+    if matches!(error.input, Some(DesktopInputStopError::ThreadPanicked))
+        || matches!(error.output, Some(DesktopOutputStopError::ThreadPanicked))
+    {
+        IdeNativeCloseFailure::ThreadPanicked
+    } else {
+        IdeNativeCloseFailure::RuntimeFailed
+    }
+}
+
+fn try_owned(value: &str) -> Result<String, OutputInventoryError> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| OutputInventoryError::CapacityUnavailable)?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper_audio_source::DecodeLimits;
+    use hyper_media_cache::CacheLimits;
+    use hyper_playback_json::LoaderLimits;
+    use hyper_playback_session::PlaybackSessionAssemblyLimits;
+
+    fn config(
+        maximum_block_frames: usize,
+    ) -> Result<IdeApplicationConfig, IdeApplicationConfigError> {
+        IdeApplicationConfig::try_new(
+            maximum_block_frames,
+            ProjectPlaybackLimits {
+                max_total_resource_bytes: 1_048_576,
+                audio: DecodeLimits::new(1_048_576, 48_000, 384_000).unwrap(),
+                session: PlaybackSessionAssemblyLimits {
+                    documents: LoaderLimits::VERSION_1,
+                    media_cache: CacheLimits {
+                        max_assets: 8,
+                        max_frames_per_asset: 48_000,
+                        max_decoded_sample_bytes: 3_072_000,
+                    },
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn output_inventory_is_owned_ordered_and_unique() {
+        let inventory =
+            IdeAudioOutputInventory::try_new(&[("route-b", "Speakers"), ("route-a", "Headphones")])
+                .unwrap();
+        assert_eq!(inventory.outputs()[0].routing_id(), "route-b");
+        assert_eq!(inventory.outputs()[1].display_name(), "Headphones");
+        assert_eq!(
+            IdeAudioOutputInventory::try_new(&[("route", "One"), ("route", "Two")]),
+            Err(OutputInventoryError::DuplicateRoutingId { output_index: 1 })
+        );
+        assert_eq!(
+            IdeAudioOutput::try_new("", "Output"),
+            Err(OutputInventoryError::EmptyRoutingId)
+        );
+        assert_eq!(
+            IdeAudioOutput::try_new("route", ""),
+            Err(OutputInventoryError::EmptyDisplayName)
+        );
+    }
+
+    #[test]
+    fn output_selection_is_explicit_and_rejects_stale_inventory() {
+        let outputs = IdeAudioOutputInventory::try_new(&[("route-a", "Output A")]).unwrap();
+        let mut application = DesktopIdeApplication::from_inventory(config(256).unwrap(), outputs);
+        assert_eq!(application.selection(), &IdeOutputSelection::SystemDefault);
+        assert_eq!(
+            application.select_output("missing"),
+            Err(IdeOutputSelectionError::UnknownOutput)
+        );
+        application.select_output("route-a").unwrap();
+        assert_eq!(
+            application.selection(),
+            &IdeOutputSelection::Routed("route-a".to_owned())
+        );
+
+        application.outputs = IdeAudioOutputInventory::default();
+        let failure = application.open_project("project-is-not-read").unwrap_err();
+        assert!(matches!(
+            failure.reason(),
+            IdeProjectOpenError::SelectedOutputUnavailable
+        ));
+        let (application, _) = failure.into_parts();
+        assert_eq!(
+            application.selection(),
+            &IdeOutputSelection::Routed("route-a".to_owned())
+        );
+        assert!(application.outputs().find("route-a").is_none());
+    }
+
+    #[test]
+    fn application_policy_is_fixed_to_validated_callback_capacity() {
+        assert!(matches!(
+            config(0),
+            Err(IdeApplicationConfigError::Output(
+                DesktopOutputConfigError::InvalidMaximumBlockFrames { actual: 0, .. }
+            ))
+        ));
+        let config = config(512).unwrap();
+        assert_eq!(config.maximum_block_frames(), 512);
+        assert_eq!(config.project_limits().max_total_resource_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn project_load_failure_returns_the_unchanged_closed_application() {
+        let outputs = IdeAudioOutputInventory::try_new(&[("route-a", "Output A")]).unwrap();
+        let mut application = DesktopIdeApplication::from_inventory(config(256).unwrap(), outputs);
+        application.select_output("route-a").unwrap();
+        let missing = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-missing-project-{}",
+            std::process::id()
+        ));
+        assert!(!missing.exists(), "test path must remain absent");
+
+        let failure = application.open_project(&missing).unwrap_err();
+        assert!(matches!(
+            failure.reason(),
+            IdeProjectOpenError::Project(
+                DesktopProjectOpenError::Recovery(_) | DesktopProjectOpenError::Load { .. }
+            )
+        ));
+        let (application, _) = failure.into_parts();
+        assert_eq!(
+            application.selection(),
+            &IdeOutputSelection::Routed("route-a".to_owned())
+        );
+        assert_eq!(application.outputs().outputs().len(), 1);
+        assert_eq!(
+            application.outputs().outputs()[0].display_name(),
+            "Output A"
+        );
+    }
+
+    #[test]
+    fn running_owner_serializes_transport_and_returns_to_closed_state() {
+        let application = DesktopIdeApplication::from_inventory(
+            config(256).unwrap(),
+            IdeAudioOutputInventory::default(),
+        );
+        let mut running = RunningDesktopIdeApplication {
+            application,
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        for command in [
+            TransportCommand::Start,
+            TransportCommand::LaunchScene { scene_index: 2 },
+            TransportCommand::Stop,
+        ] {
+            running.try_send_transport(command).unwrap();
+        }
+        let IdePlaybackSessionOwner::Test(session) = &running.session else {
+            unreachable!("test constructed the deterministic session owner");
+        };
+        assert_eq!(
+            session.commands,
+            [
+                TransportCommand::Start,
+                TransportCommand::LaunchScene { scene_index: 2 },
+                TransportCommand::Stop,
+            ]
+        );
+        assert!(running.snapshot().is_none());
+        assert!(running.read_latest_meter().snapshot().is_none());
+        assert!(matches!(
+            running.close(),
+            IdeCloseOutcome::Closed { failure: None, .. }
+        ));
+    }
+}

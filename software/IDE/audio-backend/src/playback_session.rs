@@ -881,11 +881,11 @@ impl DesktopPlaybackRecoveryPendingStop {
     /// Waits for teardown while retaining exactly one restart authority.
     #[must_use]
     pub fn wait(mut self, timeout: std::time::Duration) -> DesktopPlaybackRecoveryPendingStopWait {
-        let deadline = std::time::Instant::now() + timeout;
+        let started = std::time::Instant::now();
         let mut failed = self.failed;
         let mut panicked = self.panicked;
         for input in [true, false] {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let remaining = timeout.saturating_sub(started.elapsed());
             let result = if input {
                 wait_pending_shutdown(&mut self.input, remaining)
             } else {
@@ -1038,11 +1038,11 @@ impl DesktopPlaybackRecoveryPendingStart {
     /// recovery value that may create the next output.
     #[must_use]
     pub fn wait(mut self, timeout: std::time::Duration) -> DesktopPlaybackRecoveryPendingWait {
-        let deadline = std::time::Instant::now() + timeout;
+        let started = std::time::Instant::now();
         let mut failed = self.failed;
         let mut panicked = self.panicked;
         for input in [true, false] {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let remaining = timeout.saturating_sub(started.elapsed());
             let result = if input {
                 wait_pending_shutdown(&mut self.input, remaining)
             } else {
@@ -3012,7 +3012,7 @@ mod tests {
         };
         release_sender.send(()).unwrap();
         assert!(matches!(
-            pending.wait(Duration::from_secs(1)),
+            pending.wait(Duration::MAX),
             DesktopPlaybackRecoveryPendingStopWait::Completed(_)
         ));
     }
