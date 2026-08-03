@@ -234,16 +234,18 @@ impl MappingLearnSession {
         &self.editor
     }
 
-    /// Returns the time-derived Learn phase without changing editor state.
+    /// Returns the time-derived Learn phase and advances the session's
+    /// monotonic observation boundary.
     ///
     /// # Errors
     ///
     /// Rejects a timestamp older than the last timestamp accepted by this
     /// session. A captured candidate remains available after the armed deadline.
-    pub fn phase(&self, now: Instant) -> Result<MappingLearnPhase<'_>, MappingLearnClockError> {
+    pub fn phase(&mut self, now: Instant) -> Result<MappingLearnPhase<'_>, MappingLearnClockError> {
         if now < self.last_observed_at {
             return Err(MappingLearnClockError::ClockRegressed);
         }
+        self.last_observed_at = now;
         if let Some((candidate, captured_at)) = &self.candidate {
             return Ok(MappingLearnPhase::Candidate {
                 source: candidate.source(),

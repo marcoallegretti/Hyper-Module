@@ -285,8 +285,9 @@ fn learn_keeps_the_first_compatible_candidate_temporary_until_confirmation() {
     learn
         .observe(captured_at, ControlSource::CvInput { input_index: 3 })
         .unwrap();
+    let candidate_observed_at = deadline + Duration::from_secs(1);
     assert_eq!(
-        learn.phase(deadline + Duration::from_secs(1)).unwrap(),
+        learn.phase(candidate_observed_at).unwrap(),
         MappingLearnPhase::Candidate {
             source: &ControlSource::CvInput { input_index: 3 },
             captured_at,
@@ -294,12 +295,12 @@ fn learn_keeps_the_first_compatible_candidate_temporary_until_confirmation() {
     );
     assert!(matches!(
         learn.observe(
-            captured_at + Duration::from_millis(1),
+            candidate_observed_at + Duration::from_millis(1),
             ControlSource::CvInput { input_index: 2 }
         ),
         Err(MappingLearnCaptureError::CandidateAlreadyCaptured)
     ));
-    let invalid_retry_at = captured_at + Duration::from_millis(2);
+    let invalid_retry_at = candidate_observed_at + Duration::from_millis(2);
     assert_eq!(
         learn.retry(invalid_retry_at, invalid_retry_at),
         Err(MappingLearnRetryError::DeadlineNotFuture)
@@ -373,6 +374,13 @@ fn learn_timeout_retry_and_cancel_are_explicit_and_failure_atomic() {
         MappingLearnPhase::TimedOut { deadline }
     );
     assert!(matches!(
+        learn.observe(
+            deadline.checked_sub(Duration::from_millis(1)).unwrap(),
+            ControlSource::CvInput { input_index: 1 }
+        ),
+        Err(MappingLearnCaptureError::ClockRegressed)
+    ));
+    assert!(matches!(
         learn.observe(deadline, ControlSource::CvInput { input_index: 1 }),
         Err(MappingLearnCaptureError::TimedOut)
     ));
@@ -438,6 +446,69 @@ fn learn_rejects_incompatible_sources_and_preserves_editor_authority() {
         MappingLearnPhase::Armed { deadline }
     );
     assert_eq!(learn.cancel().cancel(), original);
+}
+
+#[test]
+fn learn_rejections_return_the_complete_session_authority() {
+    let original = document(vec![binding(
+        FIRST_BINDING_ID,
+        true,
+        0,
+        ControlScope::Global,
+    )]);
+    let started_at = Instant::now();
+    let deadline = started_at + Duration::from_secs(5);
+    let learn = MappingEditor::new(original.clone())
+        .begin_learn(FIRST_BINDING_ID, started_at, deadline)
+        .unwrap();
+
+    let Err(rejected) = learn.confirm(started_at) else {
+        panic!("confirmation without a candidate must be rejected");
+    };
+    assert_eq!(
+        rejected.reason(),
+        MappingLearnConfirmationError::CandidateMissing
+    );
+    let mut learn = rejected.into_session();
+    let observed_at = started_at + Duration::from_millis(2);
+    assert_eq!(
+        learn.phase(observed_at).unwrap(),
+        MappingLearnPhase::Armed { deadline }
+    );
+    assert_eq!(
+        learn.retry(started_at + Duration::from_millis(1), deadline),
+        Err(MappingLearnRetryError::ClockRegressed)
+    );
+
+    let captured_at = observed_at + Duration::from_millis(1);
+    learn
+        .observe(captured_at, ControlSource::CvInput { input_index: 2 })
+        .unwrap();
+    let Err(rejected) = learn.confirm(observed_at) else {
+        panic!("confirmation with regressed time must return the Learn session");
+    };
+    assert_eq!(
+        rejected.reason(),
+        MappingLearnConfirmationError::ClockRegressed
+    );
+    let mut learn = rejected.into_session();
+    assert_eq!(learn.editor().revision().value(), 0);
+    assert_eq!(
+        learn.phase(captured_at).unwrap(),
+        MappingLearnPhase::Candidate {
+            source: &ControlSource::CvInput { input_index: 2 },
+            captured_at,
+        }
+    );
+
+    let editor = learn
+        .confirm(captured_at + Duration::from_millis(1))
+        .unwrap();
+    assert_eq!(editor.revision().value(), 1);
+    assert_eq!(
+        editor.bindings()[0].source(),
+        &ControlSource::CvInput { input_index: 2 }
+    );
 }
 
 struct ProjectFixture {
