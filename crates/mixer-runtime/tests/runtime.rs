@@ -5,6 +5,7 @@ use hyper_audio_engine::{
     InterleavedStereoCallback, LinearGain, LoudnessMeasurementCommand, LoudnessMeasurementState,
     MAX_PROCESS_FRAMES, Pan, StereoCallbackError, StereoOutput,
 };
+use hyper_media_cache::PreparedSceneAvailability;
 use hyper_mixer_runtime::{
     EbuLoudnessPresentationConfig, EbuLoudnessScale, FlatMainRuntime, GraphMainRuntime,
     GraphTransportRuntime, LocateState, LoudnessCommandSendError, LoudnessCommandSender,
@@ -438,6 +439,16 @@ fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() 
         PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 50)
             .unwrap();
     let (mut sender, mut transport) = PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+    assert_eq!(sender.scene_count(), 2);
+    assert_eq!(
+        sender.scene_availability(0),
+        Some(PreparedSceneAvailability::Ready)
+    );
+    assert_eq!(
+        sender.scene_availability(1),
+        Some(PreparedSceneAvailability::Ready)
+    );
+    assert_eq!(sender.scene_availability(2), None);
     sender
         .try_send(TransportCommand::Locate {
             frame: 100,

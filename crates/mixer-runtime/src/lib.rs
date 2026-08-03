@@ -965,6 +965,30 @@ impl TransportCommandSender {
         disconnected
     }
 
+    /// Returns the immutable number of validated scene targets in this command domain.
+    #[must_use]
+    pub const fn scene_count(&self) -> usize {
+        self.scene_count
+    }
+
+    /// Returns the prepared launch status for a scene, or `None` outside the validated domain.
+    #[must_use]
+    pub fn scene_availability(&self, scene_index: usize) -> Option<PreparedSceneAvailability> {
+        if scene_index >= self.scene_count {
+            return None;
+        }
+        let bit = 1_u8 << scene_index;
+        Some(if self.scene_ready_mask & bit != 0 {
+            PreparedSceneAvailability::Ready
+        } else if self.scene_disabled_mask & bit != 0 {
+            PreparedSceneAvailability::Disabled
+        } else if self.scene_consolidation_mask & bit != 0 {
+            PreparedSceneAvailability::ConsolidationRequired
+        } else {
+            PreparedSceneAvailability::NotPrepared
+        })
+    }
+
     /// Validates command-domain targets without enqueueing.
     ///
     /// # Errors
@@ -975,21 +999,11 @@ impl TransportCommandSender {
         command: TransportCommand,
     ) -> Result<(), TransportCommandSendError> {
         if let TransportCommand::LaunchScene { scene_index } = command {
-            if scene_index >= self.scene_count {
+            let Some(reason) = self.scene_availability(scene_index) else {
                 return Err(TransportCommandSendError::MissingScene {
                     command,
                     available: self.scene_count,
                 });
-            }
-            let bit = 1_u8 << scene_index;
-            let reason = if self.scene_ready_mask & bit != 0 {
-                PreparedSceneAvailability::Ready
-            } else if self.scene_disabled_mask & bit != 0 {
-                PreparedSceneAvailability::Disabled
-            } else if self.scene_consolidation_mask & bit != 0 {
-                PreparedSceneAvailability::ConsolidationRequired
-            } else {
-                PreparedSceneAvailability::NotPrepared
             };
             if reason != PreparedSceneAvailability::Ready {
                 return Err(TransportCommandSendError::SceneUnavailable { command, reason });

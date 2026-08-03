@@ -8,6 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use hyper_audio_source::{DecodeError, DecodeLimits};
+pub use hyper_desktop_audio::DesktopSceneAvailability as IdeSceneAvailability;
 use hyper_desktop_audio::{
     DesktopDirectControlError, DesktopInputStopError, DesktopOutputConfig,
     DesktopOutputConfigError, DesktopOutputDiscoveryError, DesktopOutputStopError,
@@ -28,7 +29,7 @@ mod worker;
 
 pub use worker::{
     DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeClosedSnapshot, IdeRunningObservation,
-    IdeWorkerCommand, IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent,
+    IdeScene, IdeWorkerCommand, IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent,
     IdeWorkerEventReceiveError, IdeWorkerJoinError, IdeWorkerPendingShutdownWait,
     IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, IdeWorkerStartError,
     MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS, desktop_ide_worker_supervisor_snapshot,
@@ -40,6 +41,8 @@ const DESKTOP_MAX_AUDIO_FRAMES: u64 = 43_200_000;
 const DESKTOP_MAX_AUDIO_DECODED_BYTES: usize = 2 * 43_200_000 * size_of::<f32>();
 const DESKTOP_MAX_PROJECT_RESOURCE_BYTES: usize = 1_024 * 1_024 * 1_024;
 const DESKTOP_MAX_PROJECT_DECODED_BYTES: usize = 1_024 * 1_024 * 1_024;
+/// Maximum scene metadata rows published by the version-1 desktop IDE.
+pub const MAX_IDE_SCENES: usize = LoaderLimits::VERSION_1.max_scene_documents;
 
 /// Builds the bounded playback policy used by the desktop IDE executable.
 ///
@@ -564,6 +567,8 @@ pub struct RunningIdeSnapshot<'a> {
     pub project_name: &'a str,
     pub sample_rate_hz: u32,
     pub scene_count: usize,
+    pub scene_names: [&'a str; MAX_IDE_SCENES],
+    pub scene_availability: [IdeSceneAvailability; MAX_IDE_SCENES],
     pub output_state: OutputStreamState,
     pub output: OutputStreamSnapshot,
     pub recovery: PlaybackRecoverySnapshot,
@@ -624,11 +629,23 @@ impl RunningDesktopIdeApplication {
         };
         let project = session.prepared_project()?;
         let loaded = project.session().parts().0;
+        let scene_count = loaded.scene_count();
+        if scene_count > MAX_IDE_SCENES || session.scene_count() != scene_count {
+            return None;
+        }
+        let mut scene_names = [""; MAX_IDE_SCENES];
+        let mut scene_availability = [IdeSceneAvailability::NotPrepared; MAX_IDE_SCENES];
+        for scene_index in 0..scene_count {
+            scene_names[scene_index] = loaded.scene_name(scene_index)?;
+            scene_availability[scene_index] = session.scene_availability(scene_index)?;
+        }
         Some(RunningIdeSnapshot {
             project_id: project.package().manifest().project_id(),
             project_name: project.package().manifest().name(),
             sample_rate_hz: project.session().sample_rate_hz(),
-            scene_count: loaded.scene_count(),
+            scene_count,
+            scene_names,
+            scene_availability,
             output_state: session.output_status().state(),
             output: session.counters().snapshot(),
             recovery: session.recovery_checkpoint().snapshot(),

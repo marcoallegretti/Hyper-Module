@@ -10,6 +10,14 @@ export enum AppMode {
     unavailable,
 }
 
+export struct SceneRow {
+    index: int,
+    name: string,
+    display-name: string,
+    availability: string,
+    launchable: bool,
+}
+
 export global IdeActions {
     callback retry-discovery();
     callback refresh-outputs();
@@ -17,6 +25,7 @@ export global IdeActions {
     callback choose-project();
     callback transport-start();
     callback transport-stop();
+    callback launch-scene(int);
     callback close-project();
 }
 
@@ -81,6 +90,7 @@ export component MainWindow inherits Window {
     in property <string> project-id: "—";
     in property <string> sample-rate: "—";
     in property <string> scene-count: "—";
+    in property <[SceneRow]> scenes: [];
     in property <string> transport-state: "Stopped";
     in property <string> stream-state: "No stream";
     in property <string> frame-position: "0";
@@ -225,7 +235,7 @@ export component MainWindow inherits Window {
                     Rectangle { height: 1px; background: #27313d; }
 
                     HorizontalLayout {
-                        height: 178px;
+                        height: 112px;
                         spacing: 18px;
                         VerticalLayout {
                             horizontal-stretch: 1;
@@ -258,6 +268,39 @@ export component MainWindow inherits Window {
 
                     Rectangle { height: 1px; background: #27313d; }
 
+                    VerticalLayout {
+                        height: 110px;
+                        spacing: 8px;
+                        Text { text: "SCENE LAUNCHER"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        GridLayout {
+                            spacing: 6px;
+                            for scene[index] in root.scenes : VerticalLayout {
+                                row: index / 4;
+                                col: Math.mod(index, 4);
+                                min-width: 170px;
+                                max-width: 170px;
+                                spacing: 2px;
+                                Button {
+                                    min-width: 0px;
+                                    max-width: 170px;
+                                    text: scene.display-name;
+                                    accessible-label: scene.name + ", " + scene.availability;
+                                    enabled: root.app-mode == AppMode.running && scene.launchable;
+                                    clicked => { IdeActions.launch-scene(scene.index); }
+                                }
+                                Text {
+                                    text: scene.availability;
+                                    color: scene.launchable ? #63e6b5 : #8fa0b4;
+                                    font-size: 9px;
+                                    horizontal-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: #27313d; }
+
                     Text { text: "RUNTIME EVIDENCE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
 
                     GridLayout {
@@ -271,11 +314,11 @@ export component MainWindow inherits Window {
                             VerticalLayout { padding: 12px; Text { text: "SCENES"; color: #65758a; font-size: 10px; } Text { text: root.scene-count; color: #dce5ef; font-size: 18px; } }
                         }
                         Rectangle {
-                            row: 1; col: 0; height: 78px; background: #0e141b; border-radius: 6px;
+                            row: 0; col: 2; height: 78px; background: #0e141b; border-radius: 6px;
                             VerticalLayout { padding: 12px; Text { text: "CALLBACKS"; color: #65758a; font-size: 10px; } Text { text: root.callback-count; color: #dce5ef; font-size: 18px; } }
                         }
                         Rectangle {
-                            row: 1; col: 1; height: 78px; background: #0e141b; border-radius: 6px;
+                            row: 0; col: 3; height: 78px; background: #0e141b; border-radius: 6px;
                             VerticalLayout { padding: 12px; Text { text: "NATIVE XRUNS"; color: #65758a; font-size: 10px; } Text { text: root.xrun-count; color: #dce5ef; font-size: 18px; } }
                         }
                     }

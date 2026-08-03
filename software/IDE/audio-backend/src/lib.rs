@@ -882,7 +882,7 @@ pub use playback_session::{
     DesktopPlaybackRecoveryPendingWait, DesktopPlaybackRecoveryStartError,
     DesktopPlaybackRecoveryStopError, DesktopPlaybackSession, DesktopPlaybackSessionBuildError,
     DesktopPlaybackSessionInput, DesktopPlaybackSessionStartError, DesktopPlaybackSessionStopError,
-    DesktopProjectOpenError,
+    DesktopProjectOpenError, DesktopSceneAvailability,
 };
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),

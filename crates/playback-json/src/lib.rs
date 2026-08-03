@@ -293,6 +293,7 @@ struct LoadedSceneSlot {
 #[derive(Clone, Debug)]
 struct LoadedScene {
     id: String,
+    name: String,
     enabled: bool,
     order: u8,
     launch_quantization: LaunchQuantization,
@@ -946,6 +947,14 @@ impl LoadedPlaybackProject {
         self.scenes.iter().position(|scene| scene.id == scene_id)
     }
 
+    /// Returns a validated scene name by its canonical order.
+    #[must_use]
+    pub fn scene_name(&self, scene_index: usize) -> Option<&str> {
+        self.scenes
+            .get(scene_index)
+            .map(|scene| scene.name.as_str())
+    }
+
     #[must_use]
     pub fn placement_count(&self) -> usize {
         self.arrangement
@@ -1565,6 +1574,7 @@ fn load_scene(
     }
     Ok(LoadedScene {
         id: document.id,
+        name: document.name,
         enabled: document.enabled,
         order: document.order,
         launch_quantization,
@@ -1590,6 +1600,7 @@ fn load_scenes(
             limits.max_scene_slots,
         )?);
     }
+    scenes.sort_unstable_by_key(|scene| scene.order);
     Ok(scenes)
 }
 
@@ -4006,6 +4017,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(loaded.scene_count(), 1);
+        assert_eq!(loaded.scene_name(0), Some("Verse"));
+        assert_eq!(loaded.scene_name(1), None);
+        let later_scene = br#"{
+            "format":"hyper-scene","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334462",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Outro","order":1,"enabled":true,
+            "launch_quantization":{"mode":"immediate"},"slots":[],"extensions":{}
+        }"#;
+        let unordered_scenes: [&[u8]; 2] = [later_scene, SCENE];
+        let ordered = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &unordered_scenes, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(ordered.scene_name(0), Some("Verse"));
+        assert_eq!(ordered.scene_name(1), Some("Outro"));
         assert!(matches!(
             loaded.compile(
                 &[MediaAssetFact {

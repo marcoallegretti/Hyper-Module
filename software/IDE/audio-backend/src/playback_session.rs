@@ -462,7 +462,44 @@ enum SessionControlHandles {
     Mapping(Vec<DesktopControlMappingRuntime>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Desktop-facing launch status for one validated project scene.
+pub enum DesktopSceneAvailability {
+    /// The scene has all required prepared audio and accepts launch commands.
+    Ready,
+    /// The scene document is explicitly disabled.
+    Disabled,
+    /// The scene requires offline consolidation before realtime playback.
+    ConsolidationRequired,
+    /// Required scene audio is not prepared in the active session.
+    NotPrepared,
+}
+
+impl From<hyper_media_cache::PreparedSceneAvailability> for DesktopSceneAvailability {
+    fn from(source: hyper_media_cache::PreparedSceneAvailability) -> Self {
+        match source {
+            hyper_media_cache::PreparedSceneAvailability::Ready => Self::Ready,
+            hyper_media_cache::PreparedSceneAvailability::Disabled => Self::Disabled,
+            hyper_media_cache::PreparedSceneAvailability::ConsolidationRequired => {
+                Self::ConsolidationRequired
+            }
+            hyper_media_cache::PreparedSceneAvailability::NotPrepared => Self::NotPrepared,
+        }
+    }
+}
+
 impl SessionControlHandles {
+    fn transport(&self) -> &TransportCommandSender {
+        match self {
+            Self::Direct { transport, .. } => transport,
+            Self::Mapping(runtimes) => runtimes
+                .first()
+                .expect("mapping owner contains exactly one runtime")
+                .sink()
+                .transport_sender(),
+        }
+    }
+
     fn mapping(&self) -> Option<&DesktopControlMappingRuntime> {
         match self {
             Self::Mapping(runtimes) => Some(
@@ -762,6 +799,7 @@ impl DesktopPlaybackRecoveryStopError {
 
     /// Returns restart authority only when the backend thread is known to have
     /// terminated.
+    /// Returns the fixed number of validated scenes owned by this session.
     #[must_use]
     pub fn recovery(&self) -> Option<&DesktopPlaybackRecovery> {
         if self.has_pending_shutdown() {
@@ -786,6 +824,7 @@ impl DesktopPlaybackRecoveryStopError {
         }
     }
 
+    /// Returns one scene's fixed prepared launch status.
     #[must_use]
     pub fn is_shutdown_pending(&self) -> bool {
         self.has_pending_shutdown()
@@ -1469,6 +1508,19 @@ impl DesktopPlaybackSession {
         command: TransportCommand,
     ) -> Result<(), DesktopDirectControlError> {
         self.controls.try_send_transport(command)
+    }
+
+    #[must_use]
+    pub fn scene_count(&self) -> usize {
+        self.controls.transport().scene_count()
+    }
+
+    #[must_use]
+    pub fn scene_availability(&self, scene_index: usize) -> Option<DesktopSceneAvailability> {
+        self.controls
+            .transport()
+            .scene_availability(scene_index)
+            .map(DesktopSceneAvailability::from)
     }
 
     /// Resolves one track identity through this session's mixer layout.
@@ -2434,6 +2486,8 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(controls.transport().scene_count(), 0);
+        assert_eq!(controls.transport().scene_availability(0), None);
         let channel = controls
             .resolve_channel("018f47a2-6b2d-7c11-8a44-001122337502")
             .unwrap();

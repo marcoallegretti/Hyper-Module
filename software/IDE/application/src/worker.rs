@@ -15,8 +15,8 @@ use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSn
 use super::{
     DesktopIdeApplication, DesktopIdePendingClose, IdeApplicationConfig, IdeAudioOutputInventory,
     IdeCloseOutcome, IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection,
-    IdeOutputSelectionError, IdePendingCloseWait, IdeProjectOpenError, OutputInventoryError,
-    OutputStreamSnapshot, OutputStreamState, RunningDesktopIdeApplication,
+    IdeOutputSelectionError, IdePendingCloseWait, IdeProjectOpenError, IdeSceneAvailability,
+    OutputInventoryError, OutputStreamSnapshot, OutputStreamState, RunningDesktopIdeApplication,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -126,11 +126,32 @@ pub struct IdeRunningObservation {
     project_id: String,
     project_name: String,
     sample_rate_hz: u32,
-    scene_count: usize,
+    scenes: Vec<IdeScene>,
     output_state: OutputStreamState,
     output: OutputStreamSnapshot,
     recovery: PlaybackRecoverySnapshot,
     meter: LatestOutputMeterSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Owned UI-thread observation of one validated project scene.
+pub struct IdeScene {
+    name: String,
+    availability: IdeSceneAvailability,
+}
+
+impl IdeScene {
+    /// Returns the validated project-supplied scene name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the session's prepared launch status for this scene.
+    #[must_use]
+    pub const fn availability(&self) -> IdeSceneAvailability {
+        self.availability
+    }
 }
 
 impl IdeRunningObservation {
@@ -150,8 +171,13 @@ impl IdeRunningObservation {
     }
 
     #[must_use]
-    pub const fn scene_count(&self) -> usize {
-        self.scene_count
+    pub fn scene_count(&self) -> usize {
+        self.scenes.len()
+    }
+
+    #[must_use]
+    pub fn scenes(&self) -> &[IdeScene] {
+        &self.scenes
     }
 
     #[must_use]
@@ -183,6 +209,7 @@ pub enum IdeWorkerCommandFailure {
     Transport(super::DesktopDirectControlError),
     InvalidState,
     Publication(OutputInventoryError),
+    ProjectPublicationCapacityUnavailable,
     ProjectSnapshotUnavailable,
 }
 
@@ -197,6 +224,9 @@ impl fmt::Display for IdeWorkerCommandFailure {
                 formatter.write_str("command is invalid for the current IDE state")
             }
             Self::Publication(source) => source.fmt(formatter),
+            Self::ProjectPublicationCapacityUnavailable => {
+                formatter.write_str("project observation capacity is unavailable")
+            }
             Self::ProjectSnapshotUnavailable => {
                 formatter.write_str("running playback exposes no verified project snapshot")
             }
@@ -212,7 +242,9 @@ impl Error for IdeWorkerCommandFailure {
             Self::ProjectOpen(source) => Some(source),
             Self::Transport(source) => Some(source),
             Self::Publication(source) => Some(source),
-            Self::InvalidState | Self::ProjectSnapshotUnavailable => None,
+            Self::InvalidState
+            | Self::ProjectPublicationCapacityUnavailable
+            | Self::ProjectSnapshotUnavailable => None,
         }
     }
 }
@@ -791,20 +823,37 @@ fn running_observation(
     let snapshot = application
         .snapshot()
         .ok_or(IdeWorkerCommandFailure::ProjectSnapshotUnavailable)?;
-    let project_id =
-        super::try_owned(snapshot.project_id).map_err(IdeWorkerCommandFailure::Publication)?;
-    let project_name =
-        super::try_owned(snapshot.project_name).map_err(IdeWorkerCommandFailure::Publication)?;
+    let project_id = try_project_owned(snapshot.project_id)?;
+    let project_name = try_project_owned(snapshot.project_name)?;
+    let mut scenes = Vec::new();
+    scenes
+        .try_reserve_exact(snapshot.scene_count)
+        .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
+    for scene_index in 0..snapshot.scene_count {
+        scenes.push(IdeScene {
+            name: try_project_owned(snapshot.scene_names[scene_index])?,
+            availability: snapshot.scene_availability[scene_index],
+        });
+    }
     Ok(IdeRunningObservation {
         project_id,
         project_name,
         sample_rate_hz: snapshot.sample_rate_hz,
-        scene_count: snapshot.scene_count,
+        scenes,
         output_state: snapshot.output_state,
         output: snapshot.output,
         recovery: snapshot.recovery,
         meter: application.read_latest_meter(),
     })
+}
+
+fn try_project_owned(value: &str) -> Result<String, IdeWorkerCommandFailure> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
+    owned.push_str(value);
+    Ok(owned)
 }
 
 fn publish_failure(

@@ -9,13 +9,13 @@ use std::time::Duration;
 
 use hyper_desktop_ide::{
     DesktopIdeWorker, IdeApplicationConfig, IdeAudioOutputInventory, IdeNativeCloseFailure,
-    IdeOutputSelection, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
-    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeOutputSelection, IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind,
+    IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
     IdeWorkerShutdownReport, PlaybackRecoveryTransportState, TransportCommand,
     desktop_ide_application_config,
 };
 use slint::platform::PlatformError;
-use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 slint::include_modules!();
 
@@ -24,6 +24,7 @@ const WORKER_EVENT_CAPACITY: usize = 16;
 const UI_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const INITIAL_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const FINAL_SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
+const MAX_VISIBLE_SCENE_NAME_CHARS: usize = 20;
 
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
 type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
@@ -32,6 +33,23 @@ type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
 enum UiSubmissionFailure {
     Full,
     Disconnected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SceneLaunchFailure {
+    InvalidSelection,
+    StaleSelection,
+    NotReady,
+}
+
+impl SceneLaunchFailure {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::InvalidSelection => "Scene selection is invalid",
+            Self::StaleSelection => "Scene selection is no longer available",
+            Self::NotReady => "Scene is not ready for launch",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -153,6 +171,12 @@ fn bind_callbacks(ui: &MainWindow, worker: &WorkerCell, output_routes: &OutputRo
         }
     });
 
+    bind_playback_callbacks(ui, worker);
+}
+
+fn bind_playback_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+
     let weak = ui.as_weak();
     let worker_for_start = Rc::clone(worker);
     actions.on_transport_start(move || {
@@ -170,6 +194,26 @@ fn bind_callbacks(ui: &MainWindow, worker: &WorkerCell, output_routes: &OutputRo
             &weak,
             &worker_for_stop,
             IdeWorkerCommand::Transport(TransportCommand::Stop),
+        );
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_scene = Rc::clone(worker);
+    actions.on_launch_scene(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let scene_index = match validate_scene_launch(ui.get_app_mode(), index, &ui.get_scenes()) {
+            Ok(scene_index) => scene_index,
+            Err(reason) => {
+                ui.set_error_text(reason.message().into());
+                return;
+            }
+        };
+        submit_to_ui(
+            &ui,
+            &worker_for_scene,
+            IdeWorkerCommand::Transport(TransportCommand::LaunchScene { scene_index }),
         );
     });
 
@@ -322,6 +366,7 @@ fn apply_event(ui: &MainWindow, output_routes: &OutputRoutes, event: IdeWorkerEv
             ui.set_project_id(observation.project_id().into());
             ui.set_sample_rate(format!("{} Hz", observation.sample_rate_hz()).into());
             ui.set_scene_count(observation.scene_count().to_string().into());
+            set_scenes(ui, observation.scenes());
             ui.set_stream_state(format!("{:?}", observation.output_state()).into());
             ui.set_callback_count(observation.output().callback_count.to_string().into());
             ui.set_xrun_count(
@@ -437,6 +482,7 @@ fn reset_project(ui: &MainWindow) {
     ui.set_project_id("—".into());
     ui.set_sample_rate("—".into());
     ui.set_scene_count("—".into());
+    ui.set_scenes(ModelRc::default());
     ui.set_transport_state("Stopped".into());
     ui.set_stream_state("No stream".into());
     ui.set_frame_position("0".into());
@@ -455,8 +501,85 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Unavailable
         }
         IdeWorkerCommandKind::OpenProject if current == AppMode::Opening => AppMode::Closed,
+        IdeWorkerCommandKind::Observe if current == AppMode::Opening => AppMode::Running,
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
         _ => current,
+    }
+}
+
+fn scene_rows(scenes: &[IdeScene]) -> Vec<SceneRow> {
+    scenes
+        .iter()
+        .enumerate()
+        .map(|(index, scene)| {
+            let (availability, launchable) = scene_availability_presentation(scene.availability());
+            SceneRow {
+                index: i32::try_from(index).unwrap_or(-1),
+                name: scene.name().into(),
+                display_name: scene_display_name(scene.name()).into(),
+                availability: availability.into(),
+                launchable,
+            }
+        })
+        .collect()
+}
+
+fn scene_display_name(name: &str) -> String {
+    if name.chars().count() <= MAX_VISIBLE_SCENE_NAME_CHARS {
+        return name.to_owned();
+    }
+    let mut display = name
+        .chars()
+        .take(MAX_VISIBLE_SCENE_NAME_CHARS - 1)
+        .collect::<String>();
+    display.push('…');
+    display
+}
+
+const fn scene_availability_presentation(
+    availability: IdeSceneAvailability,
+) -> (&'static str, bool) {
+    match availability {
+        IdeSceneAvailability::Ready => ("Ready", true),
+        IdeSceneAvailability::Disabled => ("Disabled", false),
+        IdeSceneAvailability::ConsolidationRequired => ("Consolidation required", false),
+        IdeSceneAvailability::NotPrepared => ("Audio unavailable", false),
+    }
+}
+
+fn validate_scene_launch(
+    mode: AppMode,
+    index: i32,
+    scenes: &ModelRc<SceneRow>,
+) -> Result<usize, SceneLaunchFailure> {
+    let scene_index = usize::try_from(index).map_err(|_| SceneLaunchFailure::InvalidSelection)?;
+    let scene = scenes
+        .row_data(scene_index)
+        .ok_or(SceneLaunchFailure::StaleSelection)?;
+    if scene.index != index {
+        return Err(SceneLaunchFailure::StaleSelection);
+    }
+    if mode != AppMode::Running || !scene.launchable {
+        return Err(SceneLaunchFailure::NotReady);
+    }
+    Ok(scene_index)
+}
+
+fn set_scenes(ui: &MainWindow, scenes: &[IdeScene]) {
+    let current = ui.get_scenes();
+    let unchanged = current.row_count() == scenes.len()
+        && scenes.iter().enumerate().all(|(index, expected)| {
+            current.row_data(index).is_some_and(|actual| {
+                let (availability, launchable) =
+                    scene_availability_presentation(expected.availability());
+                actual.index == i32::try_from(index).unwrap_or(-1)
+                    && actual.name.as_str() == expected.name()
+                    && actual.availability.as_str() == availability
+                    && actual.launchable == launchable
+            })
+        });
+    if !unchanged {
+        ui.set_scenes(ModelRc::from(Rc::new(VecModel::from(scene_rows(scenes)))));
     }
 }
 
@@ -636,6 +759,75 @@ mod tests {
     }
 
     #[test]
+    fn scene_availability_is_presented_without_overstating_launchability() {
+        assert_eq!(
+            scene_availability_presentation(IdeSceneAvailability::Ready),
+            ("Ready", true)
+        );
+        assert_eq!(
+            scene_availability_presentation(IdeSceneAvailability::Disabled),
+            ("Disabled", false)
+        );
+        assert_eq!(
+            scene_availability_presentation(IdeSceneAvailability::ConsolidationRequired),
+            ("Consolidation required", false)
+        );
+        assert_eq!(
+            scene_availability_presentation(IdeSceneAvailability::NotPrepared),
+            ("Audio unavailable", false)
+        );
+    }
+
+    #[test]
+    fn scene_display_names_are_unicode_safe_and_bounded() {
+        assert_eq!(scene_display_name("Verse"), "Verse");
+        let display = scene_display_name("Ambient interlude with instruments");
+        assert_eq!(display.chars().count(), MAX_VISIBLE_SCENE_NAME_CHARS);
+        assert!(display.ends_with('…'));
+        let unicode = scene_display_name("Élévation très longue scène musicale");
+        assert_eq!(unicode.chars().count(), MAX_VISIBLE_SCENE_NAME_CHARS);
+        assert!(unicode.ends_with('…'));
+    }
+
+    #[test]
+    fn scene_launch_requires_current_ready_running_row() {
+        let scenes = ModelRc::from(Rc::new(VecModel::from(vec![
+            SceneRow {
+                index: 0,
+                name: "Verse".into(),
+                display_name: "Verse".into(),
+                availability: "Ready".into(),
+                launchable: true,
+            },
+            SceneRow {
+                index: 1,
+                name: "Break".into(),
+                display_name: "Break".into(),
+                availability: "Disabled".into(),
+                launchable: false,
+            },
+        ])));
+
+        assert_eq!(validate_scene_launch(AppMode::Running, 0, &scenes), Ok(0));
+        assert_eq!(
+            validate_scene_launch(AppMode::Closed, 0, &scenes),
+            Err(SceneLaunchFailure::NotReady)
+        );
+        assert_eq!(
+            validate_scene_launch(AppMode::Running, 1, &scenes),
+            Err(SceneLaunchFailure::NotReady)
+        );
+        assert_eq!(
+            validate_scene_launch(AppMode::Running, 2, &scenes),
+            Err(SceneLaunchFailure::StaleSelection)
+        );
+        assert_eq!(
+            validate_scene_launch(AppMode::Running, -1, &scenes),
+            Err(SceneLaunchFailure::InvalidSelection)
+        );
+    }
+
+    #[test]
     fn command_failures_restore_only_the_state_the_command_consumed() {
         assert_eq!(
             mode_after_failure(AppMode::Discovering, IdeWorkerCommandKind::Initialize),
@@ -659,6 +851,10 @@ mod tests {
         );
         assert_eq!(
             mode_after_failure(AppMode::Running, IdeWorkerCommandKind::Transport),
+            AppMode::Running
+        );
+        assert_eq!(
+            mode_after_failure(AppMode::Opening, IdeWorkerCommandKind::Observe),
             AppMode::Running
         );
     }
