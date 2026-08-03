@@ -3,6 +3,7 @@
 
 use core::error::Error;
 use core::fmt;
+use std::path::Path;
 
 use hyper_control_mappings::{
     ControlBinding, ControlMappingDocument, ControlMappingParseError, MAX_BINDINGS,
@@ -10,6 +11,10 @@ use hyper_control_mappings::{
 use hyper_mapping_compiler::{
     CompiledControlMappingTable, ControlMappingCompileError, ControlMappingResolver,
     compile_control_mapping,
+};
+use hyper_storage_engine::{
+    ControlMappingPublicationError, ControlMappingPublicationOutcome,
+    ControlMappingPublicationRequest, publish_control_mapping,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +131,7 @@ impl Error for MappingEditorPreviewError {
 
 pub struct MappingEditorPreview {
     revision: MappingEditorRevision,
+    expected_project_sha256: Option<[u8; 32]>,
     document: ControlMappingDocument,
     compiled: CompiledControlMappingTable,
     canonical_json: Vec<u8>,
@@ -135,6 +141,13 @@ impl MappingEditorPreview {
     #[must_use]
     pub const fn revision(&self) -> MappingEditorRevision {
         self.revision
+    }
+
+    /// Returns the project identity captured for durable publication, when the
+    /// preview was created through [`MappingEditor::preview_for_project`].
+    #[must_use]
+    pub const fn expected_project_sha256(&self) -> Option<&[u8; 32]> {
+        self.expected_project_sha256.as_ref()
     }
 
     #[must_use]
@@ -203,12 +216,18 @@ impl Error for RejectedMappingConfirmation {}
 
 #[derive(Debug)]
 pub struct ConfirmedMappingEdit {
+    expected_project_sha256: Option<[u8; 32]>,
     document: ControlMappingDocument,
     compiled: CompiledControlMappingTable,
     canonical_json: Vec<u8>,
 }
 
 impl ConfirmedMappingEdit {
+    #[must_use]
+    pub const fn expected_project_sha256(&self) -> Option<&[u8; 32]> {
+        self.expected_project_sha256.as_ref()
+    }
+
     #[must_use]
     pub const fn document(&self) -> &ControlMappingDocument {
         &self.document
@@ -224,9 +243,59 @@ impl ConfirmedMappingEdit {
         &self.canonical_json
     }
 
+    /// Durably publishes this confirmed edit against the exact project
+    /// identity used for its project-bound preview.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MappingEditorPublicationError::UnboundPreview`] when the edit
+    /// was confirmed from an in-memory-only preview, or forwards a classified
+    /// storage rejection. The confirmed edit remains available for retry.
+    pub fn publish(
+        &self,
+        project_path: impl AsRef<Path>,
+    ) -> Result<ControlMappingPublicationOutcome, MappingEditorPublicationError> {
+        let expected_project_sha256 = self
+            .expected_project_sha256
+            .ok_or(MappingEditorPublicationError::UnboundPreview)?;
+        publish_control_mapping(
+            project_path,
+            ControlMappingPublicationRequest {
+                expected_project_sha256,
+                mapping_bytes: &self.canonical_json,
+            },
+        )
+        .map_err(MappingEditorPublicationError::Storage)
+    }
+
     #[must_use]
     pub fn into_parts(self) -> (ControlMappingDocument, CompiledControlMappingTable, Vec<u8>) {
         (self.document, self.compiled, self.canonical_json)
+    }
+}
+
+#[derive(Debug)]
+pub enum MappingEditorPublicationError {
+    UnboundPreview,
+    Storage(ControlMappingPublicationError),
+}
+
+impl fmt::Display for MappingEditorPublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnboundPreview => formatter
+                .write_str("control mapping preview is not bound to a verified project identity"),
+            Self::Storage(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for MappingEditorPublicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Storage(source) => Some(source),
+            Self::UnboundPreview => None,
+        }
     }
 }
 
@@ -422,6 +491,29 @@ impl MappingEditor {
         &self,
         resolver: &impl ControlMappingResolver,
     ) -> Result<MappingEditorPreview, MappingEditorPreviewError> {
+        self.build_preview(resolver, None)
+    }
+
+    /// Creates a compiled preview bound to the exact verified project manifest
+    /// identity that supplied the resolver. Only this preview form can later be
+    /// published by [`ConfirmedMappingEdit::publish`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::preview`].
+    pub fn preview_for_project(
+        &self,
+        resolver: &impl ControlMappingResolver,
+        expected_project_sha256: [u8; 32],
+    ) -> Result<MappingEditorPreview, MappingEditorPreviewError> {
+        self.build_preview(resolver, Some(expected_project_sha256))
+    }
+
+    fn build_preview(
+        &self,
+        resolver: &impl ControlMappingResolver,
+        expected_project_sha256: Option<[u8; 32]>,
+    ) -> Result<MappingEditorPreview, MappingEditorPreviewError> {
         let conflicts = self
             .inspect_conflicts()
             .map_err(|_| MappingEditorPreviewError::CapacityUnavailable)?;
@@ -445,6 +537,7 @@ impl MappingEditor {
             .map_err(MappingEditorPreviewError::Serialization)?;
         Ok(MappingEditorPreview {
             revision: self.revision,
+            expected_project_sha256,
             document,
             compiled,
             canonical_json,
@@ -472,6 +565,7 @@ impl MappingEditor {
             }));
         }
         Ok(ConfirmedMappingEdit {
+            expected_project_sha256: preview.expected_project_sha256,
             document: preview.document,
             compiled: preview.compiled,
             canonical_json: preview.canonical_json,

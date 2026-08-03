@@ -1,4 +1,7 @@
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use hyper_control_mappings::{
     ChannelParameter, ControlBinding, ControlMappingDocument, ControlMappingProject, ControlScope,
@@ -9,8 +12,11 @@ use hyper_mapping_compiler::{
 };
 use hyper_mapping_editor::{
     MappingConflictKind, MappingEditor, MappingEditorConfirmationError, MappingEditorMutationError,
-    MappingEditorPreviewError,
+    MappingEditorPreviewError, MappingEditorPublicationError,
 };
+use hyper_storage_engine::verify_project_package;
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
 const PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-201122334400";
 const MAPPING_ID: &str = "018f47a2-6b2d-7c11-8a44-201122334401";
@@ -20,6 +26,8 @@ const SEND_ID: &str = "018f47a2-6b2d-7c11-8a44-201122334404";
 const FIRST_BINDING_ID: &str = "018f47a2-6b2d-7c11-8a44-201122334405";
 const SECOND_BINDING_ID: &str = "018f47a2-6b2d-7c11-8a44-201122334406";
 const THIRD_BINDING_ID: &str = "018f47a2-6b2d-7c11-8a44-201122334407";
+const TIMELINE_ID: &str = "018f47a2-6b2d-7c11-8a44-201122334408";
+static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
 struct Resolver;
 
@@ -249,6 +257,121 @@ fn binding_limit_is_enforced_before_mutation() {
     );
     assert_eq!(editor.revision(), revision);
     assert_eq!(editor.bindings().len(), MAX_BINDINGS);
+}
+
+struct ProjectFixture {
+    root: PathBuf,
+}
+
+impl ProjectFixture {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "hyper-mapping-editor-publication-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("timeline")).unwrap();
+        let timeline = br#"{"format":"mapping-editor-timeline"}"#;
+        fs::write(root.join("timeline/timeline.json"), timeline).unwrap();
+        let manifest = json!({
+            "format": "hyper-project",
+            "format_version": 1,
+            "project_id": PROJECT_ID,
+            "revision": 1,
+            "name": "Mapping editor publication fixture",
+            "sample_rate_hz": 48000,
+            "required_capabilities": {
+                "format": "hyper-hardware-capabilities",
+                "format_version": 1,
+                "audio_inputs": 0,
+                "audio_outputs": 0,
+                "cv_inputs": 4,
+                "cv_outputs": 0,
+                "gate_outputs": 0,
+                "has_clock_input": true,
+                "has_reset_input": true,
+                "has_clock_output": false,
+                "usb_mode": "none",
+                "has_ethernet": false,
+                "extensions": {}
+            },
+            "resources": [{
+                "id": TIMELINE_ID,
+                "role": "timeline",
+                "path": "timeline/timeline.json",
+                "media_type": "application/json",
+                "byte_length": timeline.len(),
+                "sha256": hex_digest(Sha256::digest(timeline).into()),
+                "extensions": {}
+            }],
+            "assets": [],
+            "extensions": {}
+        });
+        fs::write(
+            root.join("project.json"),
+            serde_json_canonicalizer::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        Self { root }
+    }
+
+    fn identity(&self) -> [u8; 32] {
+        *verify_project_package(&self.root)
+            .unwrap()
+            .manifest_sha256()
+    }
+}
+
+impl Drop for ProjectFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn only_project_bound_confirmation_can_publish_durably() {
+    let fixture = ProjectFixture::new();
+    let original = document(vec![binding(
+        FIRST_BINDING_ID,
+        true,
+        0,
+        ControlScope::Global,
+    )]);
+
+    let unbound_editor = MappingEditor::new(original.clone());
+    let unbound_preview = unbound_editor.preview(&Resolver).unwrap();
+    let unbound = unbound_editor.confirm(unbound_preview).unwrap();
+    assert!(matches!(
+        unbound.publish(&fixture.root),
+        Err(MappingEditorPublicationError::UnboundPreview)
+    ));
+
+    let editor = MappingEditor::new(original);
+    let preview = editor
+        .preview_for_project(&Resolver, fixture.identity())
+        .unwrap();
+    assert_eq!(preview.expected_project_sha256(), Some(&fixture.identity()));
+    let confirmed = editor.confirm(preview).unwrap();
+    let published = confirmed.publish(&fixture.root).unwrap();
+
+    assert!(published.changed());
+    assert_eq!(published.project_revision(), 2);
+    assert_eq!(published.mapping_id(), MAPPING_ID);
+    let verified = verify_project_package(&fixture.root).unwrap();
+    assert_eq!(
+        verified.read_resource(MAPPING_ID).unwrap(),
+        confirmed.canonical_json()
+    );
+}
+
+fn hex_digest(digest: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut output, "{byte:02x}").unwrap();
+    }
+    output
 }
 
 fn document(bindings: Vec<ControlBinding>) -> ControlMappingDocument {

@@ -539,7 +539,10 @@ version = "0.1.0"
 dependencies = [
  "hyper-control-mappings",
  "hyper-mapping-compiler",
+ "hyper-storage-engine",
  "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
 ]
 
 [[package]]
@@ -698,6 +701,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "hound",
+ "hyper-control-mappings",
  "hyper-project-model",
  "hyper-recording-metadata",
  "hyper-strict-json",

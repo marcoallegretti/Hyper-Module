@@ -1222,12 +1222,12 @@ fn hex_digest(digest: [u8; 32]) -> String {
     output
 }
 
-struct ProjectLock {
+pub(crate) struct ProjectLock {
     _file: File,
 }
 
 impl ProjectLock {
-    fn acquire(backups: &Dir) -> Result<Self, RecordingImportError> {
+    pub(crate) fn acquire(backups: &Dir) -> Result<Self, RecordingImportError> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         let capability_file = backups
