@@ -261,6 +261,20 @@ impl ControlBinding {
         &self.target
     }
 
+    /// Reports whether two bindings compete for the same version-1 source
+    /// while their scopes are active together.
+    ///
+    /// A momentary clock or reset binding owns both edges: its configured edge
+    /// activates the target and the opposite edge releases it. Other trigger
+    /// behaviors continue to own only their configured edge.
+    #[must_use]
+    pub fn source_scope_conflicts_with(&self, other: &Self) -> bool {
+        self.scope == other.scope
+            && (self.source == other.source
+                || (same_edge_source(&self.source, &other.source)
+                    && (is_momentary(self.transform) || is_momentary(other.transform))))
+    }
+
     /// Applies a validated CV binding's exact integer transform and target
     /// domain conversion. Trigger bindings return `None`.
     #[must_use]
@@ -458,7 +472,6 @@ pub trait ControlMappingProject {
 pub enum ControlMappingParseErrorKind {
     Json(StrictJsonErrorKind),
     InvalidDomain,
-    CapacityUnavailable,
 }
 
 #[derive(Debug)]
@@ -639,26 +652,13 @@ fn validate_document(
         validate_binding_domain(binding)?;
     }
 
-    let mut by_source_scope = Vec::new();
-    by_source_scope
-        .try_reserve_exact(raw.bindings.len())
-        .map_err(|_| {
-            parse_error(
-                ControlMappingParseErrorKind::CapacityUnavailable,
-                "control mapping uniqueness capacity is unavailable",
-            )
-        })?;
-    by_source_scope.extend(raw.bindings.iter());
-    by_source_scope.sort_unstable_by(|left, right| {
-        left.source
-            .cmp(&right.source)
-            .then_with(|| left.scope.cmp(&right.scope))
-    });
     require(
-        by_source_scope
-            .windows(2)
-            .all(|pair| pair[0].source != pair[1].source || pair[0].scope != pair[1].scope),
-        "control source and scope combinations are not unique",
+        raw.bindings.iter().enumerate().all(|(index, binding)| {
+            raw.bindings[index + 1..]
+                .iter()
+                .all(|other| !binding.source_scope_conflicts_with(other))
+        }),
+        "control source ownership and scope combinations are not unique",
     )?;
 
     Ok(ControlMappingDocument {
@@ -667,6 +667,26 @@ fn validate_document(
         bindings: raw.bindings,
         extensions: raw.extensions,
     })
+}
+
+fn same_edge_source(left: &ControlSource, right: &ControlSource) -> bool {
+    matches!(
+        (left, right),
+        (
+            ControlSource::ClockInput { .. },
+            ControlSource::ClockInput { .. }
+        ) | (
+            ControlSource::ResetInput { .. },
+            ControlSource::ResetInput { .. }
+        )
+    )
+}
+
+fn is_momentary(transform: ControlTransform) -> bool {
+    transform
+        == (ControlTransform::Trigger {
+            behavior: TriggerBehavior::Momentary,
+        })
 }
 
 fn validate_binding_domain(binding: &ControlBinding) -> Result<(), ControlMappingParseError> {
@@ -1459,6 +1479,72 @@ mod tests {
             validate_document(oversized),
             Err(error) if error.kind() == ControlMappingParseErrorKind::InvalidDomain
         ));
+    }
+
+    #[test]
+    fn momentary_bindings_reserve_both_edges_only_within_their_scope() {
+        let make = |id: &str, edge, scope, behavior| {
+            ControlBinding::try_new(
+                id.to_owned(),
+                true,
+                ControlSource::ClockInput { edge },
+                scope,
+                ControlTransform::Trigger { behavior },
+                ControlTarget::MixerMain {
+                    parameter: MainParameter::Mute,
+                },
+            )
+            .unwrap()
+        };
+        let rising_momentary = make(
+            BINDING_ID,
+            Edge::Rising,
+            ControlScope::Global,
+            TriggerBehavior::Momentary,
+        );
+        let falling_toggle = make(
+            SECOND_BINDING_ID,
+            Edge::Falling,
+            ControlScope::Global,
+            TriggerBehavior::Toggle,
+        );
+        assert!(
+            ControlMappingDocument::try_new(
+                MAPPING_ID.to_owned(),
+                PROJECT_ID.to_owned(),
+                vec![rising_momentary.clone(), falling_toggle.clone()],
+                BTreeMap::new(),
+            )
+            .is_err()
+        );
+
+        let rising_toggle = make(
+            BINDING_ID,
+            Edge::Rising,
+            ControlScope::Global,
+            TriggerBehavior::Toggle,
+        );
+        ControlMappingDocument::try_new(
+            MAPPING_ID.to_owned(),
+            PROJECT_ID.to_owned(),
+            vec![rising_toggle, falling_toggle],
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+        let scoped_falling = make(
+            SECOND_BINDING_ID,
+            Edge::Falling,
+            ControlScope::MixerPage,
+            TriggerBehavior::Toggle,
+        );
+        ControlMappingDocument::try_new(
+            MAPPING_ID.to_owned(),
+            PROJECT_ID.to_owned(),
+            vec![rising_momentary, scoped_falling],
+            BTreeMap::new(),
+        )
+        .unwrap();
     }
 
     #[test]

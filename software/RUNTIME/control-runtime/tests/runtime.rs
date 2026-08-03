@@ -212,10 +212,26 @@ fn trigger_binding(
     behavior: TriggerBehavior,
     target: ControlTarget,
 ) -> ControlBinding {
+    trigger_binding_from(
+        index,
+        ControlSource::ClockInput { edge: Edge::Rising },
+        scope,
+        behavior,
+        target,
+    )
+}
+
+fn trigger_binding_from(
+    index: u16,
+    source: ControlSource,
+    scope: ControlScope,
+    behavior: TriggerBehavior,
+    target: ControlTarget,
+) -> ControlBinding {
     ControlBinding::try_new(
         binding_id(index),
         true,
-        ControlSource::ClockInput { edge: Edge::Rising },
+        source,
         scope,
         ControlTransform::Trigger { behavior },
         target,
@@ -339,9 +355,7 @@ fn unsupported_domains_are_reported_and_never_reach_the_sink() {
             ControlBindingAvailability::Unavailable(
                 ControlBindingUnavailableReason::CueOutputUnavailable
             ),
-            ControlBindingAvailability::Unavailable(
-                ControlBindingUnavailableReason::MomentarySourceStateUnavailable
-            ),
+            ControlBindingAvailability::Live,
             ControlBindingAvailability::Unavailable(
                 ControlBindingUnavailableReason::InteractiveSceneLaunchUnavailable
             ),
@@ -363,6 +377,213 @@ fn unsupported_domains_are_reported_and_never_reach_the_sink() {
         }
     );
     assert!(runtime.sink().commands.is_empty());
+}
+
+#[test]
+fn momentary_bindings_use_the_configured_edge_for_activation_and_the_opposite_for_release() {
+    let compiled = table(vec![
+        trigger_binding_from(
+            500,
+            ControlSource::ClockInput { edge: Edge::Rising },
+            ControlScope::Global,
+            TriggerBehavior::Momentary,
+            ControlTarget::MixerMain {
+                parameter: MainParameter::Mute,
+            },
+        ),
+        trigger_binding_from(
+            501,
+            ControlSource::ResetInput {
+                edge: Edge::Falling,
+            },
+            ControlScope::Track {
+                track_id: TRACK_ID.to_owned(),
+            },
+            TriggerBehavior::Momentary,
+            ControlTarget::MixerChannel {
+                track_id: TRACK_ID.to_owned(),
+                parameter: ChannelParameter::Solo,
+            },
+        ),
+    ]);
+    let mut runtime = ControlRuntime::try_new(compiled, Sink::default()).unwrap();
+
+    for event in [
+        ControlEvent::Clock { edge: Edge::Rising },
+        ControlEvent::Clock {
+            edge: Edge::Falling,
+        },
+    ] {
+        assert!(matches!(
+            runtime.dispatch(event, ControlContext::default()),
+            Ok(ControlDispatchOutcome::Sent { .. })
+        ));
+    }
+    for event in [
+        ControlEvent::Reset {
+            edge: Edge::Falling,
+        },
+        ControlEvent::Reset { edge: Edge::Rising },
+    ] {
+        assert!(matches!(
+            runtime.dispatch(event, ControlContext::new(false, Some(0), None)),
+            Ok(ControlDispatchOutcome::Sent { .. })
+        ));
+    }
+
+    assert_eq!(
+        runtime.sink().commands,
+        [
+            RuntimeControlCommand::MainMute { muted: true },
+            RuntimeControlCommand::MainMute { muted: false },
+            RuntimeControlCommand::ChannelSolo {
+                channel_index: 0,
+                solo: true,
+            },
+            RuntimeControlCommand::ChannelSolo {
+                channel_index: 0,
+                solo: false,
+            },
+        ]
+    );
+}
+
+#[test]
+fn momentary_release_keeps_cycle_ownership_across_context_changes() {
+    let compiled = table(vec![
+        trigger_binding_from(
+            500,
+            ControlSource::ClockInput { edge: Edge::Rising },
+            ControlScope::Track {
+                track_id: TRACK_ID.to_owned(),
+            },
+            TriggerBehavior::Momentary,
+            ControlTarget::MixerChannel {
+                track_id: TRACK_ID.to_owned(),
+                parameter: ChannelParameter::Solo,
+            },
+        ),
+        trigger_binding_from(
+            501,
+            ControlSource::ClockInput {
+                edge: Edge::Falling,
+            },
+            ControlScope::MixerPage,
+            TriggerBehavior::Toggle,
+            ControlTarget::MixerMain {
+                parameter: MainParameter::Mute,
+            },
+        ),
+    ]);
+    let mut runtime = ControlRuntime::try_new(
+        compiled,
+        Sink {
+            booleans: vec![(BooleanControlTarget::MainMute, false)],
+            ..Sink::default()
+        },
+    )
+    .unwrap();
+
+    runtime
+        .dispatch(
+            ControlEvent::Clock { edge: Edge::Rising },
+            ControlContext::new(false, Some(0), None),
+        )
+        .unwrap();
+    runtime
+        .dispatch(
+            ControlEvent::Clock {
+                edge: Edge::Falling,
+            },
+            ControlContext::new(true, None, None),
+        )
+        .unwrap();
+    runtime
+        .dispatch(
+            ControlEvent::Clock {
+                edge: Edge::Falling,
+            },
+            ControlContext::new(true, None, None),
+        )
+        .unwrap();
+
+    assert_eq!(
+        runtime.sink().commands,
+        [
+            RuntimeControlCommand::ChannelSolo {
+                channel_index: 0,
+                solo: true,
+            },
+            RuntimeControlCommand::ChannelSolo {
+                channel_index: 0,
+                solo: false,
+            },
+            RuntimeControlCommand::MainMute { muted: true },
+        ]
+    );
+}
+
+#[test]
+fn momentary_capture_starts_and_clears_only_after_successful_delivery() {
+    let compiled = table(vec![trigger_binding(
+        500,
+        ControlScope::Track {
+            track_id: TRACK_ID.to_owned(),
+        },
+        TriggerBehavior::Momentary,
+        ControlTarget::MixerChannel {
+            track_id: TRACK_ID.to_owned(),
+            parameter: ChannelParameter::Mute,
+        },
+    )]);
+    let mut runtime = ControlRuntime::try_new(
+        compiled,
+        Sink {
+            reject_on_attempt: Some(2),
+            ..Sink::default()
+        },
+    )
+    .unwrap();
+    let release = ControlEvent::Clock {
+        edge: Edge::Falling,
+    };
+
+    assert_eq!(
+        runtime
+            .dispatch(release, ControlContext::new(false, Some(0), None))
+            .unwrap(),
+        ControlDispatchOutcome::NoMatch
+    );
+    runtime
+        .dispatch(
+            ControlEvent::Clock { edge: Edge::Rising },
+            ControlContext::new(false, Some(0), None),
+        )
+        .unwrap();
+    assert!(matches!(
+        runtime.dispatch(release, ControlContext::default()),
+        Err(ControlDispatchError::Sink {
+            binding_index: 0,
+            source: SinkError::Rejected,
+            ..
+        })
+    ));
+    runtime
+        .dispatch(release, ControlContext::default())
+        .unwrap();
+    assert_eq!(
+        runtime.sink().commands,
+        [
+            RuntimeControlCommand::ChannelMute {
+                channel_index: 0,
+                muted: true,
+            },
+            RuntimeControlCommand::ChannelMute {
+                channel_index: 0,
+                muted: false,
+            },
+        ]
+    );
 }
 
 #[test]
@@ -678,7 +899,6 @@ fn dispatch_paths_perform_zero_heap_operations() {
         Sink::default(),
     )
     .unwrap();
-
     let measurement = HeapMeasurement::start_verified();
     assert!(matches!(
         live.dispatch(
@@ -714,6 +934,36 @@ fn dispatch_paths_perform_zero_heap_operations() {
         ),
         Err(ControlDispatchError::Ambiguous { .. })
     ));
+    let heap_operations = measurement.finish();
+
+    assert_eq!(heap_operations, 0);
+}
+
+#[test]
+fn momentary_dispatch_performs_zero_heap_operations() {
+    let mut runtime = ControlRuntime::try_new(
+        table(vec![trigger_binding(
+            504,
+            ControlScope::Global,
+            TriggerBehavior::Momentary,
+            ControlTarget::MixerMain {
+                parameter: MainParameter::Mute,
+            },
+        )]),
+        Sink {
+            commands: Vec::with_capacity(2),
+            ..Sink::default()
+        },
+    )
+    .unwrap();
+
+    let measurement = HeapMeasurement::start_verified();
+    for edge in [Edge::Rising, Edge::Falling] {
+        assert!(matches!(
+            runtime.dispatch(ControlEvent::Clock { edge }, ControlContext::default()),
+            Ok(ControlDispatchOutcome::Sent { .. })
+        ));
+    }
     let heap_operations = measurement.finish();
 
     assert_eq!(heap_operations, 0);

@@ -446,40 +446,36 @@ impl MappingEditor {
         Ok(removed)
     }
 
-    /// Returns every blocking version-1 source/scope collision in deterministic
-    /// table-index order. A group of N colliding bindings produces N-1 linked
-    /// diagnostics, covering every member with bounded output.
+    /// Returns every blocking version-1 source-ownership/scope collision in
+    /// deterministic table-index order. Momentary edge bindings own both edges
+    /// of their physical source. A connected group of N colliding bindings
+    /// produces N-1 diagnostics, covering every member with bounded output.
     ///
     /// # Errors
     ///
     /// Returns a capacity rejection without changing the editor.
     pub fn inspect_conflicts(&self) -> Result<Vec<MappingConflict>, MappingEditorMutationError> {
-        let mut ordered = Vec::new();
-        ordered
-            .try_reserve_exact(self.bindings.len())
-            .map_err(|_| MappingEditorMutationError::CapacityUnavailable)?;
-        ordered.extend(self.bindings.iter().enumerate());
-        ordered.sort_unstable_by(|left, right| {
-            left.1
-                .source()
-                .cmp(right.1.source())
-                .then_with(|| left.1.scope().cmp(right.1.scope()))
-                .then_with(|| left.1.id().cmp(right.1.id()))
-        });
-
         let mut conflicts = Vec::new();
         conflicts
             .try_reserve_exact(self.bindings.len().saturating_sub(1))
             .map_err(|_| MappingEditorMutationError::CapacityUnavailable)?;
-        for pair in ordered.windows(2) {
-            if pair[0].1.source() == pair[1].1.source() && pair[0].1.scope() == pair[1].1.scope() {
-                let first_binding_index = pair[0].0.min(pair[1].0);
-                let second_binding_index = pair[0].0.max(pair[1].0);
-                conflicts.push(MappingConflict {
-                    kind: MappingConflictKind::SourceScopeCollision,
-                    first_binding_index,
-                    second_binding_index,
-                });
+        let mut components = Vec::new();
+        components
+            .try_reserve_exact(self.bindings.len())
+            .map_err(|_| MappingEditorMutationError::CapacityUnavailable)?;
+        components.extend(0..self.bindings.len());
+        for distance in 1..self.bindings.len() {
+            for first in 0..self.bindings.len() - distance {
+                let second = first + distance;
+                if self.bindings[first].source_scope_conflicts_with(&self.bindings[second])
+                    && union_components(&mut components, first, second)
+                {
+                    conflicts.push(MappingConflict {
+                        kind: MappingConflictKind::SourceScopeCollision,
+                        first_binding_index: first,
+                        second_binding_index: second,
+                    });
+                }
             }
         }
         conflicts.sort_unstable_by_key(|conflict| {
@@ -606,4 +602,22 @@ impl MappingEditor {
                     .is_ok_and(|index| document.bindings()[index] == *binding)
             })
     }
+}
+
+fn component_root(components: &mut [usize], mut index: usize) -> usize {
+    while components[index] != index {
+        components[index] = components[components[index]];
+        index = components[index];
+    }
+    index
+}
+
+fn union_components(components: &mut [usize], left: usize, right: usize) -> bool {
+    let left_root = component_root(components, left);
+    let right_root = component_root(components, right);
+    if left_root == right_root {
+        return false;
+    }
+    components[right_root] = left_root;
+    true
 }

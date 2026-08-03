@@ -194,6 +194,55 @@ fn conflicts_are_bounded_deterministic_and_block_preview_without_touching_origin
 }
 
 #[test]
+fn momentary_binding_reserves_both_edges_in_the_same_scope() {
+    let mut editor = MappingEditor::new(document(Vec::new()));
+    editor
+        .insert_binding(edge_boolean_binding(
+            FIRST_BINDING_ID,
+            Edge::Rising,
+            TriggerBehavior::Momentary,
+        ))
+        .unwrap();
+    editor
+        .insert_binding(edge_boolean_binding(
+            SECOND_BINDING_ID,
+            Edge::Rising,
+            TriggerBehavior::Toggle,
+        ))
+        .unwrap();
+    editor
+        .insert_binding(edge_boolean_binding(
+            THIRD_BINDING_ID,
+            Edge::Falling,
+            TriggerBehavior::Toggle,
+        ))
+        .unwrap();
+    let conflicts = editor.inspect_conflicts().unwrap();
+    assert_eq!(conflicts.len(), 2);
+    assert_eq!(conflicts[0].first_binding_index(), 0);
+    assert_eq!(conflicts[0].second_binding_index(), 1);
+    assert_eq!(conflicts[1].first_binding_index(), 0);
+    assert_eq!(conflicts[1].second_binding_index(), 2);
+
+    let mut independent_edges = MappingEditor::new(document(Vec::new()));
+    independent_edges
+        .insert_binding(edge_boolean_binding(
+            FIRST_BINDING_ID,
+            Edge::Rising,
+            TriggerBehavior::Toggle,
+        ))
+        .unwrap();
+    independent_edges
+        .insert_binding(edge_boolean_binding(
+            SECOND_BINDING_ID,
+            Edge::Falling,
+            TriggerBehavior::Toggle,
+        ))
+        .unwrap();
+    assert!(independent_edges.inspect_conflicts().unwrap().is_empty());
+}
+
+#[test]
 fn stale_confirmation_returns_both_authorities_for_recovery() {
     let original = document(vec![binding(
         FIRST_BINDING_ID,
@@ -667,6 +716,20 @@ fn trigger_binding(id: &str) -> ControlBinding {
         },
         ControlTarget::Transport {
             action: TransportAction::Play,
+        },
+    )
+    .unwrap()
+}
+
+fn edge_boolean_binding(id: &str, edge: Edge, behavior: TriggerBehavior) -> ControlBinding {
+    ControlBinding::try_new(
+        id.to_owned(),
+        true,
+        ControlSource::ClockInput { edge },
+        ControlScope::Global,
+        ControlTransform::Trigger { behavior },
+        ControlTarget::MixerMain {
+            parameter: hyper_control_mappings::MainParameter::Mute,
         },
     )
     .unwrap()

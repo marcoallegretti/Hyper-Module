@@ -62,7 +62,6 @@ impl ControlContext {
 pub enum ControlBindingUnavailableReason {
     CueOutputUnavailable,
     InteractiveSceneLaunchUnavailable,
-    MomentarySourceStateUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -260,12 +259,30 @@ struct BooleanShadow {
     value: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MomentaryCapture(Option<u8>);
+
+impl MomentaryCapture {
+    fn binding(self) -> Option<usize> {
+        self.0.map(usize::from)
+    }
+
+    fn replace(&mut self, runtime_index: Option<usize>) {
+        self.0 = runtime_index.map(|index| {
+            u8::try_from(index)
+                .expect("a validated version-1 mapping table has at most 256 bindings")
+        });
+    }
+}
+
 #[derive(Debug)]
 pub struct ControlRuntime<S: RuntimeControlSink> {
     table: CompiledControlMappingTable,
     statuses: Vec<ControlBindingStatus>,
     boolean_shadows: Vec<BooleanShadow>,
     transport_rolling: Option<bool>,
+    clock_capture: MomentaryCapture,
+    reset_capture: MomentaryCapture,
     sink: S,
 }
 
@@ -356,7 +373,8 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
                         sink,
                     });
                 }
-                if let Some(target) = boolean_target(*binding)
+                if binding.trigger_behavior() == Some(TriggerBehavior::Toggle)
+                    && let Some(target) = boolean_target(*binding)
                     && !boolean_shadows
                         .iter()
                         .any(|shadow: &BooleanShadow| shadow.target == target)
@@ -378,6 +396,8 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
             statuses,
             boolean_shadows,
             transport_rolling,
+            clock_capture: MomentaryCapture::default(),
+            reset_capture: MomentaryCapture::default(),
             sink,
         })
     }
@@ -395,7 +415,10 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
     /// Dispatches at most one active binding and never allocates.
     ///
     /// With no selected precedence between simultaneously active scopes, two
-    /// matching bindings are rejected before any command is sent.
+    /// matching activations are rejected before any command is sent. A
+    /// successfully delivered momentary activation captures its physical edge
+    /// source until release delivery, so later context changes cannot strand
+    /// the target or transfer the paired edge to another binding.
     ///
     /// # Errors
     ///
@@ -407,16 +430,19 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
         context: ControlContext,
     ) -> Result<ControlDispatchOutcome, ControlDispatchError<S::Error>> {
         let source = event.source();
-        let mut selected = None;
+        let captured = self.captured_binding(source);
+        let mut selected = captured;
         let mut second = None;
-        let mut count = 0_usize;
-        for (runtime_index, binding) in self.table.bindings().iter().enumerate() {
-            if binding.source() == source && context.activates(binding.scope()) {
-                count += 1;
-                if selected.is_none() {
-                    selected = Some(runtime_index);
-                } else if second.is_none() {
-                    second = Some(runtime_index);
+        let mut count = usize::from(captured.is_some());
+        if captured.is_none() {
+            for (runtime_index, binding) in self.table.bindings().iter().enumerate() {
+                if binding.source() == source && context.activates(binding.scope()) {
+                    count += 1;
+                    if selected.is_none() {
+                        selected = Some(runtime_index);
+                    } else if second.is_none() {
+                        second = Some(runtime_index);
+                    }
                 }
             }
         }
@@ -453,6 +479,7 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
                 command,
                 source,
             })?;
+        self.commit_momentary_cycle(runtime_index, event);
         self.commit_shadow(command);
         Ok(ControlDispatchOutcome::Sent {
             binding_index,
@@ -490,9 +517,12 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
     ) -> Option<RuntimeControlCommand> {
         match event {
             ControlEvent::Cv { value, .. } => continuous_command(binding, value),
-            ControlEvent::Clock { .. } | ControlEvent::Reset { .. } => {
-                trigger_command(binding, &self.boolean_shadows, self.transport_rolling)
-            }
+            ControlEvent::Clock { .. } | ControlEvent::Reset { .. } => trigger_command(
+                binding,
+                event,
+                &self.boolean_shadows,
+                self.transport_rolling,
+            ),
         }
     }
 
@@ -538,6 +568,27 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
             }
         }
     }
+
+    fn captured_binding(&self, source: CompiledControlSource) -> Option<usize> {
+        match source {
+            CompiledControlSource::ClockInput { .. } => self.clock_capture.binding(),
+            CompiledControlSource::ResetInput { .. } => self.reset_capture.binding(),
+            CompiledControlSource::CvInput { .. } => None,
+        }
+    }
+
+    fn commit_momentary_cycle(&mut self, runtime_index: usize, event: ControlEvent) {
+        let binding = self.table.bindings()[runtime_index];
+        if binding.trigger_behavior() != Some(TriggerBehavior::Momentary) {
+            return;
+        }
+        let capture = (binding.source() == event.source()).then_some(runtime_index);
+        match event {
+            ControlEvent::Clock { .. } => self.clock_capture.replace(capture),
+            ControlEvent::Reset { .. } => self.reset_capture.replace(capture),
+            ControlEvent::Cv { .. } => {}
+        }
+    }
 }
 
 fn binding_availability(binding: CompiledControlBinding) -> ControlBindingAvailability {
@@ -551,15 +602,6 @@ fn binding_availability(binding: CompiledControlBinding) -> ControlBindingAvaila
         } => ControlBindingAvailability::Unavailable(
             ControlBindingUnavailableReason::InteractiveSceneLaunchUnavailable,
         ),
-        CompiledControlTarget::MixerChannel { .. }
-        | CompiledControlTarget::MixerSend { .. }
-        | CompiledControlTarget::MixerMain { .. }
-            if binding.trigger_behavior() == Some(TriggerBehavior::Momentary) =>
-        {
-            ControlBindingAvailability::Unavailable(
-                ControlBindingUnavailableReason::MomentarySourceStateUnavailable,
-            )
-        }
         CompiledControlTarget::MixerChannel { .. }
         | CompiledControlTarget::MixerSend { .. }
         | CompiledControlTarget::MixerMain { .. }
@@ -675,6 +717,7 @@ fn continuous_command(
 
 fn trigger_command(
     binding: CompiledControlBinding,
+    event: ControlEvent,
     shadows: &[BooleanShadow],
     transport_rolling: Option<bool>,
 ) -> Option<RuntimeControlCommand> {
@@ -684,14 +727,24 @@ fn trigger_command(
             parameter: ChannelParameter::Mute,
         } => Some(RuntimeControlCommand::ChannelMute {
             channel_index,
-            muted: !shadow_value(shadows, BooleanControlTarget::ChannelMute { channel_index })?,
+            muted: trigger_boolean_value(
+                binding,
+                event,
+                shadows,
+                BooleanControlTarget::ChannelMute { channel_index },
+            )?,
         }),
         CompiledControlTarget::MixerChannel {
             channel_index,
             parameter: ChannelParameter::Solo,
         } => Some(RuntimeControlCommand::ChannelSolo {
             channel_index,
-            solo: !shadow_value(shadows, BooleanControlTarget::ChannelSolo { channel_index })?,
+            solo: trigger_boolean_value(
+                binding,
+                event,
+                shadows,
+                BooleanControlTarget::ChannelSolo { channel_index },
+            )?,
         }),
         CompiledControlTarget::MixerSend {
             address,
@@ -699,7 +752,9 @@ fn trigger_command(
         } => Some(RuntimeControlCommand::SendEnabled {
             channel_index: address.channel_index(),
             send_index: address.send_index(),
-            enabled: !shadow_value(
+            enabled: trigger_boolean_value(
+                binding,
+                event,
                 shadows,
                 BooleanControlTarget::SendEnabled {
                     channel_index: address.channel_index(),
@@ -710,7 +765,7 @@ fn trigger_command(
         CompiledControlTarget::MixerMain {
             parameter: MainParameter::Mute,
         } => Some(RuntimeControlCommand::MainMute {
-            muted: !shadow_value(shadows, BooleanControlTarget::MainMute)?,
+            muted: trigger_boolean_value(binding, event, shadows, BooleanControlTarget::MainMute)?,
         }),
         CompiledControlTarget::Transport { action } => match action {
             TransportAction::Play => Some(RuntimeControlCommand::TransportStart),
@@ -727,6 +782,19 @@ fn trigger_command(
         | CompiledControlTarget::MixerMain { .. }
         | CompiledControlTarget::MixerCue { .. }
         | CompiledControlTarget::Scene { .. } => None,
+    }
+}
+
+fn trigger_boolean_value(
+    binding: CompiledControlBinding,
+    event: ControlEvent,
+    shadows: &[BooleanShadow],
+    target: BooleanControlTarget,
+) -> Option<bool> {
+    match binding.trigger_behavior()? {
+        TriggerBehavior::Toggle => Some(!shadow_value(shadows, target)?),
+        TriggerBehavior::Momentary => Some(binding.source() == event.source()),
+        TriggerBehavior::Invoke => None,
     }
 }
 

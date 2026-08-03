@@ -2041,14 +2041,18 @@ mod tests {
     }
 
     fn compiled_channel_mute_mapping() -> CompiledControlMappingTable {
+        compiled_channel_mute_mapping_with(TriggerBehavior::Toggle)
+    }
+
+    fn compiled_channel_mute_mapping_with(
+        behavior: TriggerBehavior,
+    ) -> CompiledControlMappingTable {
         let binding = ControlBinding::try_new(
             LIVE_BINDING_ID.to_owned(),
             true,
             ControlSource::ClockInput { edge: Edge::Rising },
             ControlScope::Global,
-            ControlTransform::Trigger {
-                behavior: TriggerBehavior::Toggle,
-            },
+            ControlTransform::Trigger { behavior },
             ControlTarget::MixerChannel {
                 track_id: "018f47a2-6b2d-7c11-8a44-001122337502".to_owned(),
                 parameter: ChannelParameter::Mute,
@@ -2368,6 +2372,50 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn mapped_desktop_session_delivers_momentary_activation_and_release() {
+        let input = live_session_input();
+        let (project, mixer, _, media) = input.parts();
+        let facts = collect_media_asset_facts(media).unwrap();
+        let graph = project
+            .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+            .unwrap();
+        let prepared = media.prepare_playback(&graph).unwrap();
+        let runtime = RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, 64).unwrap();
+        let (transport, mixer, _runtime) = RoutedTransportRuntime::with_command_queues(runtime);
+        let (_publisher, recovery) = playback_recovery_channel(None);
+        let mut controls = build_session_controls(
+            transport,
+            mixer,
+            recovery,
+            Some(compiled_channel_mute_mapping_with(
+                TriggerBehavior::Momentary,
+            )),
+        )
+        .unwrap();
+        let SessionControlHandles::Mapping(mapping) = &mut controls else {
+            panic!("a compiled mapping must publish the coordinated mapping owner");
+        };
+
+        for (edge, muted) in [(Edge::Rising, true), (Edge::Falling, false)] {
+            assert_eq!(
+                mapping
+                    .dispatch(
+                        hyper_control_runtime::ControlEvent::Clock { edge },
+                        hyper_control_runtime::ControlContext::default(),
+                    )
+                    .unwrap(),
+                hyper_control_runtime::ControlDispatchOutcome::Sent {
+                    binding_index: 0,
+                    command: hyper_control_runtime::RuntimeControlCommand::ChannelMute {
+                        channel_index: 0,
+                        muted,
+                    },
+                }
+            );
+        }
     }
 
     #[cfg(all(target_os = "linux", target_endian = "little"))]
