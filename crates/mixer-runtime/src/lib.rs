@@ -15,8 +15,9 @@ use hyper_audio_engine::{
     MixerCreationError, Pan, ParameterError, ProcessError, StereoBlockMeter, StereoCallbackError,
     StereoMixer, StereoOutput,
 };
-use hyper_media_cache::{PreparedPlayback, PreparedSchedule};
+use hyper_media_cache::{PreparedPlayback, PreparedSceneAvailability, PreparedSchedule};
 use hyper_playback_compiler::FrameTimelineError;
+use hyper_playback_compiler::scene::{SceneRuntimeCheckpoint, SceneRuntimeError};
 use hyper_playback_json::{
     AutomationChannelParameter, AutomationMainParameter, AutomationSendParameter, AutomationTarget,
     AutomationValue, CompiledAutomation, CompiledMainMixer, CompiledMixerDestination,
@@ -134,6 +135,7 @@ pub enum RuntimeProcessError {
     OutputLengthMismatch { left: usize, right: usize },
     BlockLimit { actual: usize, maximum: usize },
     FrameRangeOverflow,
+    Scene(SceneRuntimeError),
     Automation(FrameTimelineError),
     AutomationValueMismatch,
     Parameter(ParameterError),
@@ -156,6 +158,7 @@ impl fmt::Display for RuntimeProcessError {
                 "runtime block has {actual} frames; configured maximum is {maximum}"
             ),
             Self::FrameRangeOverflow => formatter.write_str("runtime frame range overflowed"),
+            Self::Scene(source) => write!(formatter, "interactive scene launch failed: {source}"),
             Self::Automation(source) => write!(formatter, "automation evaluation failed: {source}"),
             Self::AutomationValueMismatch => {
                 formatter.write_str("compiled automation value differs from its target domain")
@@ -178,6 +181,7 @@ impl Error for RuntimeProcessError {
             Self::Mixer(source) => Some(source),
             Self::Automation(source) => Some(source),
             Self::Parameter(source) => Some(source),
+            Self::Scene(source) => Some(source),
             Self::OutputLengthMismatch { .. }
             | Self::BlockLimit { .. }
             | Self::FrameRangeOverflow
@@ -204,19 +208,31 @@ pub enum TransportCommand {
     Start,
     Stop,
     Locate { frame: usize, state: LocateState },
+    LaunchScene { scene_index: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportCommandSendError {
     Full(TransportCommand),
     Disconnected(TransportCommand),
+    MissingScene {
+        command: TransportCommand,
+        available: usize,
+    },
+    SceneUnavailable {
+        command: TransportCommand,
+        reason: PreparedSceneAvailability,
+    },
 }
 
 impl TransportCommandSendError {
     #[must_use]
     pub const fn command(self) -> TransportCommand {
         match self {
-            Self::Full(command) | Self::Disconnected(command) => command,
+            Self::Full(command)
+            | Self::Disconnected(command)
+            | Self::MissingScene { command, .. }
+            | Self::SceneUnavailable { command, .. } => command,
         }
     }
 }
@@ -228,6 +244,22 @@ impl fmt::Display for TransportCommandSendError {
             Self::Disconnected(_) => {
                 formatter.write_str("transport command receiver is disconnected")
             }
+            Self::MissingScene { available, .. } => write!(
+                formatter,
+                "scene launch target is missing; {available} scenes are available"
+            ),
+            Self::SceneUnavailable { reason, .. } => match reason {
+                PreparedSceneAvailability::Disabled => formatter.write_str("scene is disabled"),
+                PreparedSceneAvailability::ConsolidationRequired => {
+                    formatter.write_str("scene requires consolidation before interactive launch")
+                }
+                PreparedSceneAvailability::NotPrepared => {
+                    formatter.write_str("scene audio is not prepared")
+                }
+                PreparedSceneAvailability::Ready => {
+                    formatter.write_str("scene launch is unexpectedly unavailable")
+                }
+            },
         }
     }
 }
@@ -912,6 +944,10 @@ pub fn loudness_command_channel() -> (LoudnessCommandSender, LoudnessCommandRece
 #[derive(Debug)]
 pub struct TransportCommandSender {
     producer: Producer<TransportCommand>,
+    scene_count: usize,
+    scene_ready_mask: u8,
+    scene_disabled_mask: u8,
+    scene_consolidation_mask: u8,
 }
 
 impl TransportCommandSender {
@@ -929,13 +965,47 @@ impl TransportCommandSender {
         disconnected
     }
 
+    /// Validates command-domain targets without enqueueing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing or unavailable scene rejection.
+    pub fn validate_command(
+        &self,
+        command: TransportCommand,
+    ) -> Result<(), TransportCommandSendError> {
+        if let TransportCommand::LaunchScene { scene_index } = command {
+            if scene_index >= self.scene_count {
+                return Err(TransportCommandSendError::MissingScene {
+                    command,
+                    available: self.scene_count,
+                });
+            }
+            let bit = 1_u8 << scene_index;
+            let reason = if self.scene_ready_mask & bit != 0 {
+                PreparedSceneAvailability::Ready
+            } else if self.scene_disabled_mask & bit != 0 {
+                PreparedSceneAvailability::Disabled
+            } else if self.scene_consolidation_mask & bit != 0 {
+                PreparedSceneAvailability::ConsolidationRequired
+            } else {
+                PreparedSceneAvailability::NotPrepared
+            };
+            if reason != PreparedSceneAvailability::Ready {
+                return Err(TransportCommandSendError::SceneUnavailable { command, reason });
+            }
+        }
+        Ok(())
+    }
+
     /// Attempts to enqueue one command without waiting or allocating.
     ///
     /// # Errors
     ///
-    /// Returns the original command when the fixed queue is full or when the
-    /// receiving transport has already been destroyed.
+    /// Returns the original command for an invalid/unavailable scene, when the
+    /// fixed queue is full, or when the receiving transport was destroyed.
     pub fn try_send(&mut self, command: TransportCommand) -> Result<(), TransportCommandSendError> {
+        self.validate_command(command)?;
         if self.is_disconnected() {
             return Err(TransportCommandSendError::Disconnected(command));
         }
@@ -1707,6 +1777,8 @@ mod sealed {
 
 #[doc(hidden)]
 pub trait TrackWindowRenderer: sealed::TrackWindowRenderer {
+    type Checkpoint: Copy;
+
     fn render_track_window(
         &mut self,
         start_frame: usize,
@@ -1715,11 +1787,23 @@ pub trait TrackWindowRenderer: sealed::TrackWindowRenderer {
     ) -> Result<RenderedWindow, RuntimeProcessError>;
 
     fn seek(&mut self, frame: usize);
+
+    fn checkpoint(&self) -> Self::Checkpoint;
+
+    fn restore(&mut self, checkpoint: Self::Checkpoint);
+
+    fn scene_count(&self) -> usize;
+
+    fn scene_availability(&self, scene_index: usize) -> PreparedSceneAvailability;
+
+    fn queue_scene_launch(&mut self, scene_index: usize) -> Result<(), SceneRuntimeError>;
 }
 
 impl sealed::TrackWindowRenderer for ArrangementRenderer<'_, '_, '_> {}
 
 impl TrackWindowRenderer for ArrangementRenderer<'_, '_, '_> {
+    type Checkpoint = ();
+
     fn render_track_window(
         &mut self,
         start_frame: usize,
@@ -1731,11 +1815,29 @@ impl TrackWindowRenderer for ArrangementRenderer<'_, '_, '_> {
     }
 
     fn seek(&mut self, _frame: usize) {}
+
+    fn checkpoint(&self) -> Self::Checkpoint {}
+
+    fn restore(&mut self, (): Self::Checkpoint) {}
+
+    fn scene_count(&self) -> usize {
+        0
+    }
+
+    fn scene_availability(&self, _scene_index: usize) -> PreparedSceneAvailability {
+        PreparedSceneAvailability::NotPrepared
+    }
+
+    fn queue_scene_launch(&mut self, scene_index: usize) -> Result<(), SceneRuntimeError> {
+        Err(SceneRuntimeError::MissingScene { scene_index })
+    }
 }
 
 impl sealed::TrackWindowRenderer for PlaybackRenderer<'_, '_, '_, '_, '_> {}
 
-impl TrackWindowRenderer for PlaybackRenderer<'_, '_, '_, '_, '_> {
+impl<'resource> TrackWindowRenderer for PlaybackRenderer<'_, '_, '_, '_, 'resource> {
+    type Checkpoint = SceneRuntimeCheckpoint<'resource>;
+
     fn render_track_window(
         &mut self,
         start_frame: usize,
@@ -1748,6 +1850,26 @@ impl TrackWindowRenderer for PlaybackRenderer<'_, '_, '_, '_, '_> {
 
     fn seek(&mut self, frame: usize) {
         PlaybackRenderer::seek(self, frame);
+    }
+
+    fn checkpoint(&self) -> Self::Checkpoint {
+        PlaybackRenderer::checkpoint(self)
+    }
+
+    fn restore(&mut self, checkpoint: Self::Checkpoint) {
+        PlaybackRenderer::restore(self, checkpoint);
+    }
+
+    fn scene_count(&self) -> usize {
+        PlaybackRenderer::scene_count(self)
+    }
+
+    fn scene_availability(&self, scene_index: usize) -> PreparedSceneAvailability {
+        PlaybackRenderer::scene_availability(self, scene_index)
+    }
+
+    fn queue_scene_launch(&mut self, scene_index: usize) -> Result<(), SceneRuntimeError> {
+        PlaybackRenderer::queue_scene_launch(self, scene_index)
     }
 }
 
@@ -2084,6 +2206,26 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
 
     pub fn seek(&mut self, frame: usize) {
         self.renderer.seek(frame);
+    }
+
+    fn renderer_checkpoint(&self) -> R::Checkpoint {
+        self.renderer.checkpoint()
+    }
+
+    fn restore_renderer(&mut self, checkpoint: R::Checkpoint) {
+        self.renderer.restore(checkpoint);
+    }
+
+    fn scene_count(&self) -> usize {
+        self.renderer.scene_count()
+    }
+
+    fn scene_availability(&self, scene_index: usize) -> PreparedSceneAvailability {
+        self.renderer.scene_availability(scene_index)
+    }
+
+    fn queue_scene_launch(&mut self, scene_index: usize) -> Result<(), SceneRuntimeError> {
+        self.renderer.queue_scene_launch(scene_index)
     }
 
     fn take_parameter_layout(&mut self) -> MixerParameterLayout {
@@ -2544,8 +2686,16 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     #[must_use]
     pub fn with_command_queue(runtime: RoutedMainRuntime<R>) -> (TransportCommandSender, Self) {
         let (producer, consumer) = RingBuffer::new(MAX_QUEUED_TRANSPORT_COMMANDS);
+        let (scene_count, scene_ready_mask, scene_disabled_mask, scene_consolidation_mask) =
+            scene_command_layout(&runtime);
         (
-            TransportCommandSender { producer },
+            TransportCommandSender {
+                producer,
+                scene_count,
+                scene_ready_mask,
+                scene_disabled_mask,
+                scene_consolidation_mask,
+            },
             Self {
                 runtime,
                 state: TransportState::Stopped,
@@ -2572,9 +2722,15 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             RingBuffer::new(MAX_QUEUED_TRANSPORT_COMMANDS);
         let (parameter_producer, parameter_consumer) =
             RingBuffer::new(MAX_QUEUED_MIXER_PARAMETER_COMMANDS);
+        let (scene_count, scene_ready_mask, scene_disabled_mask, scene_consolidation_mask) =
+            scene_command_layout(&runtime);
         (
             TransportCommandSender {
                 producer: transport_producer,
+                scene_count,
+                scene_ready_mask,
+                scene_disabled_mask,
+                scene_consolidation_mask,
             },
             MixerParameterCommandSender {
                 producer: parameter_producer,
@@ -2635,7 +2791,12 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     }
 
     /// Applies one transport command for the next process cycle.
-    pub fn apply_command(&mut self, command: TransportCommand) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneRuntimeError`] when a synchronous scene command targets
+    /// an unknown/disabled scene or cannot resolve its launch boundary.
+    pub fn apply_command(&mut self, command: TransportCommand) -> Result<(), SceneRuntimeError> {
         match command {
             TransportCommand::Start => self.state = TransportState::Rolling,
             TransportCommand::Stop => self.state = TransportState::Stopped,
@@ -2648,7 +2809,11 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                     LocateState::Rolling => self.state = TransportState::Rolling,
                 }
             }
+            TransportCommand::LaunchScene { scene_index } => {
+                self.runtime.queue_scene_launch(scene_index)?;
+            }
         }
+        Ok(())
     }
 
     /// Processes the next transport-owned callback window.
@@ -2692,7 +2857,18 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         let committed_state = self.state;
         let committed_position = self.position_frame;
         let committed_parameters = self.runtime.capture_parameter_state();
-        let applied_command_count = self.drain_commands();
+        let committed_renderer = self.runtime.renderer_checkpoint();
+        let applied_command_count = match self.drain_commands() {
+            Ok(count) => count,
+            Err(source) => {
+                self.state = committed_state;
+                self.position_frame = committed_position;
+                self.runtime.restore_renderer(committed_renderer);
+                self.runtime
+                    .restore_parameter_state_unchecked(&committed_parameters);
+                return Err(RuntimeProcessError::Scene(source));
+            }
+        };
         let command_sender_disconnected = self.command_sender_disconnected();
         let applied_mixer_parameter_command_count = self.drain_mixer_parameter_commands();
         let mixer_parameter_command_sender_disconnected =
@@ -2724,7 +2900,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             Err(source) => {
                 self.state = committed_state;
                 self.position_frame = committed_position;
-                self.runtime.seek(committed_position);
+                self.runtime.restore_renderer(committed_renderer);
                 self.runtime
                     .restore_parameter_state_unchecked(&committed_parameters);
                 return Err(source);
@@ -2854,7 +3030,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         })
     }
 
-    fn drain_commands(&mut self) -> usize {
+    fn drain_commands(&mut self) -> Result<usize, SceneRuntimeError> {
         let mut applied = 0;
         for _ in 0..MAX_QUEUED_TRANSPORT_COMMANDS {
             let command = self
@@ -2864,10 +3040,10 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             let Some(command) = command else {
                 break;
             };
-            self.apply_command(command);
+            self.apply_command(command)?;
             applied += 1;
         }
-        applied
+        Ok(applied)
     }
 
     fn command_sender_disconnected(&self) -> bool {
@@ -2907,6 +3083,26 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         }
         disconnected
     }
+}
+
+fn scene_command_layout<R: TrackWindowRenderer>(
+    runtime: &RoutedMainRuntime<R>,
+) -> (usize, u8, u8, u8) {
+    let scene_count = runtime.scene_count();
+    debug_assert!(scene_count <= hyper_playback_compiler::scene::VERSION_1_MAX_SCENES);
+    let mut ready = 0_u8;
+    let mut disabled = 0_u8;
+    let mut consolidation = 0_u8;
+    for scene_index in 0..scene_count {
+        let target = match runtime.scene_availability(scene_index) {
+            PreparedSceneAvailability::Ready => &mut ready,
+            PreparedSceneAvailability::Disabled => &mut disabled,
+            PreparedSceneAvailability::ConsolidationRequired => &mut consolidation,
+            PreparedSceneAvailability::NotPrepared => continue,
+        };
+        *target |= 1_u8 << scene_index;
+    }
+    (scene_count, ready, disabled, consolidation)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

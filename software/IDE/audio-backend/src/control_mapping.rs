@@ -4,8 +4,9 @@ use core::fmt;
 use hyper_audio_engine::{LinearGain, Pan, ParameterError};
 use hyper_control_mappings::{ChannelParameter, MainParameter, SendParameter};
 use hyper_control_runtime::{
-    BooleanControlTarget, ControlRuntime, DirectControlStateUpdate, RuntimeControlCommand,
-    RuntimeControlSink, RuntimeControlTarget,
+    BooleanControlTarget, ControlBindingAvailability, ControlBindingUnavailableReason,
+    ControlRuntime, DirectControlStateUpdate, RuntimeControlCommand, RuntimeControlSink,
+    RuntimeControlTarget,
 };
 use hyper_mixer_runtime::{
     LocateState, MixerChannelHandle, MixerParameterCommand, MixerParameterCommandSendError,
@@ -263,7 +264,8 @@ impl DesktopControlSink {
             }
             RuntimeControlCommand::TransportStart
             | RuntimeControlCommand::TransportStop
-            | RuntimeControlCommand::TransportLocateStartPreserve => {
+            | RuntimeControlCommand::TransportLocateStartPreserve
+            | RuntimeControlCommand::SceneLaunch { .. } => {
                 Err(DesktopControlSinkError::CommandDomain)
             }
         }
@@ -326,11 +328,51 @@ impl RuntimeControlSink for DesktopControlSink {
                 MainParameter::Mute => RuntimeControlCommand::MainMute { muted: false },
             },
             RuntimeControlTarget::Transport => return Ok(()),
+            RuntimeControlTarget::Scene { scene_index } => {
+                return self
+                    .transport
+                    .validate_command(TransportCommand::LaunchScene { scene_index })
+                    .map_err(DesktopControlSinkError::TransportSend);
+            }
         };
         let command = self.mixer_command(command)?;
         self.mixer
             .validate_command(command)
             .map_err(DesktopControlSinkError::Target)
+    }
+
+    fn target_availability(&self, target: RuntimeControlTarget) -> ControlBindingAvailability {
+        let RuntimeControlTarget::Scene { scene_index } = target else {
+            return ControlBindingAvailability::Live;
+        };
+        match self
+            .transport
+            .validate_command(TransportCommand::LaunchScene { scene_index })
+        {
+            Ok(()) => ControlBindingAvailability::Live,
+            Err(TransportCommandSendError::SceneUnavailable { reason, .. }) => {
+                let reason = match reason {
+                    hyper_media_cache::PreparedSceneAvailability::Disabled => {
+                        ControlBindingUnavailableReason::SceneDisabled
+                    }
+                    hyper_media_cache::PreparedSceneAvailability::ConsolidationRequired => {
+                        ControlBindingUnavailableReason::SceneConsolidationRequired
+                    }
+                    hyper_media_cache::PreparedSceneAvailability::NotPrepared
+                    | hyper_media_cache::PreparedSceneAvailability::Ready => {
+                        ControlBindingUnavailableReason::SceneAudioNotPrepared
+                    }
+                };
+                ControlBindingAvailability::Unavailable(reason)
+            }
+            Err(
+                TransportCommandSendError::MissingScene { .. }
+                | TransportCommandSendError::Full(_)
+                | TransportCommandSendError::Disconnected(_),
+            ) => ControlBindingAvailability::Unavailable(
+                ControlBindingUnavailableReason::SceneAudioNotPrepared,
+            ),
+        }
     }
 
     fn boolean_state(&self, target: BooleanControlTarget) -> Option<bool> {
@@ -365,6 +407,9 @@ impl RuntimeControlSink for DesktopControlSink {
                 frame: 0,
                 state: LocateState::Preserve,
             }),
+            RuntimeControlCommand::SceneLaunch { scene_index } => {
+                Some(TransportCommand::LaunchScene { scene_index })
+            }
             RuntimeControlCommand::ChannelGain { .. }
             | RuntimeControlCommand::ChannelPan { .. }
             | RuntimeControlCommand::ChannelMute { .. }
@@ -425,7 +470,8 @@ impl RuntimeControlSink for DesktopControlSink {
                     TransportCommand::Locate {
                         state: LocateState::Preserve,
                         ..
-                    } => DirectControlStateUpdate::Unchanged,
+                    }
+                    | TransportCommand::LaunchScene { .. } => DirectControlStateUpdate::Unchanged,
                 })
             }
         }

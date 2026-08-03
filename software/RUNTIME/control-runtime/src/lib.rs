@@ -61,7 +61,9 @@ impl ControlContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlBindingUnavailableReason {
     CueOutputUnavailable,
-    InteractiveSceneLaunchUnavailable,
+    SceneDisabled,
+    SceneConsolidationRequired,
+    SceneAudioNotPrepared,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,6 +120,9 @@ pub enum RuntimeControlTarget {
         parameter: MainParameter,
     },
     Transport,
+    Scene {
+        scene_index: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,6 +167,9 @@ pub enum RuntimeControlCommand {
     TransportStart,
     TransportStop,
     TransportLocateStartPreserve,
+    SceneLaunch {
+        scene_index: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,6 +195,15 @@ pub trait RuntimeControlSink {
     ///
     /// Returns a target-layout or capability rejection.
     fn validate_target(&self, target: RuntimeControlTarget) -> Result<(), Self::Error>;
+
+    fn target_availability(&self, target: RuntimeControlTarget) -> ControlBindingAvailability {
+        match target {
+            RuntimeControlTarget::Scene { .. } => ControlBindingAvailability::Unavailable(
+                ControlBindingUnavailableReason::SceneAudioNotPrepared,
+            ),
+            _ => ControlBindingAvailability::Live,
+        }
+    }
     fn boolean_state(&self, target: BooleanControlTarget) -> Option<bool>;
     fn transport_rolling(&self) -> Option<bool>;
 
@@ -359,7 +376,12 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
         }
 
         for binding in table.bindings() {
-            let availability = binding_availability(*binding);
+            let mut availability = binding_availability(*binding);
+            if availability == ControlBindingAvailability::Live
+                && let Some(target) = runtime_target(*binding)
+            {
+                availability = sink.target_availability(target);
+            }
             if availability == ControlBindingAvailability::Live {
                 let target = runtime_target(*binding)
                     .expect("a live compiled binding has one executable runtime target");
@@ -539,6 +561,7 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
             RuntimeControlCommand::TransportStart => self.transport_rolling = Some(true),
             RuntimeControlCommand::TransportStop => self.transport_rolling = Some(false),
             RuntimeControlCommand::TransportLocateStartPreserve
+            | RuntimeControlCommand::SceneLaunch { .. }
             | RuntimeControlCommand::ChannelGain { .. }
             | RuntimeControlCommand::ChannelPan { .. }
             | RuntimeControlCommand::ChannelMute { .. }
@@ -596,13 +619,8 @@ fn binding_availability(binding: CompiledControlBinding) -> ControlBindingAvaila
         CompiledControlTarget::MixerCue { .. } => ControlBindingAvailability::Unavailable(
             ControlBindingUnavailableReason::CueOutputUnavailable,
         ),
-        CompiledControlTarget::Scene {
-            action: SceneAction::Launch,
-            ..
-        } => ControlBindingAvailability::Unavailable(
-            ControlBindingUnavailableReason::InteractiveSceneLaunchUnavailable,
-        ),
-        CompiledControlTarget::MixerChannel { .. }
+        CompiledControlTarget::Scene { .. }
+        | CompiledControlTarget::MixerChannel { .. }
         | CompiledControlTarget::MixerSend { .. }
         | CompiledControlTarget::MixerMain { .. }
         | CompiledControlTarget::Transport { .. } => ControlBindingAvailability::Live,
@@ -629,10 +647,12 @@ fn runtime_target(binding: CompiledControlBinding) -> Option<RuntimeControlTarge
             Some(RuntimeControlTarget::Main { parameter })
         }
         CompiledControlTarget::Transport { .. } => Some(RuntimeControlTarget::Transport),
+        CompiledControlTarget::Scene { scene_index, .. } => {
+            Some(RuntimeControlTarget::Scene { scene_index })
+        }
         CompiledControlTarget::MixerCue {
             parameter: CueParameter::Gain | CueParameter::Mute,
-        }
-        | CompiledControlTarget::Scene { .. } => None,
+        } => None,
     }
 }
 
@@ -777,11 +797,14 @@ fn trigger_command(
             }),
             TransportAction::Reset => Some(RuntimeControlCommand::TransportLocateStartPreserve),
         },
+        CompiledControlTarget::Scene {
+            scene_index,
+            action: SceneAction::Launch,
+        } => Some(RuntimeControlCommand::SceneLaunch { scene_index }),
         CompiledControlTarget::MixerChannel { .. }
         | CompiledControlTarget::MixerSend { .. }
         | CompiledControlTarget::MixerMain { .. }
-        | CompiledControlTarget::MixerCue { .. }
-        | CompiledControlTarget::Scene { .. } => None,
+        | CompiledControlTarget::MixerCue { .. } => None,
     }
 }
 
@@ -834,6 +857,7 @@ fn command_boolean_state(command: RuntimeControlCommand) -> Option<(BooleanContr
         | RuntimeControlCommand::MainGain { .. }
         | RuntimeControlCommand::TransportStart
         | RuntimeControlCommand::TransportStop
-        | RuntimeControlCommand::TransportLocateStartPreserve => None,
+        | RuntimeControlCommand::TransportLocateStartPreserve
+        | RuntimeControlCommand::SceneLaunch { .. } => None,
     }
 }

@@ -215,6 +215,7 @@ pub enum DesktopPlaybackSessionBuildError {
     MixerRecovery(MixerParameterStateRestoreError),
     ControlMappingCopy(ControlMappingCompileError),
     ControlMapping(DesktopControlMappingBuildError),
+    ControlMappingOwnerCapacityUnavailable,
     ScratchCapacityUnavailable,
     Output(TransportOutputCreationError),
     MonitoringScratchCapacityUnavailable,
@@ -277,6 +278,9 @@ impl fmt::Display for DesktopPlaybackSessionBuildError {
             Self::ControlMapping(source) => {
                 write!(formatter, "control mapping runtime failed: {source}")
             }
+            Self::ControlMappingOwnerCapacityUnavailable => {
+                formatter.write_str("control mapping owner capacity is unavailable")
+            }
             Self::ScratchCapacityUnavailable => {
                 formatter.write_str("render scratch capacity is unavailable")
             }
@@ -302,6 +306,7 @@ impl Error for DesktopPlaybackSessionBuildError {
             Self::Output(source) => Some(source),
             Self::SampleRateMismatch { .. }
             | Self::AssetFactCapacityUnavailable
+            | Self::ControlMappingOwnerCapacityUnavailable
             | Self::ScratchCapacityUnavailable
             | Self::MonitoringScratchCapacityUnavailable => None,
         }
@@ -454,15 +459,34 @@ enum SessionControlHandles {
         transport: TransportCommandSender,
         mixer: MixerParameterCommandSender,
     },
-    Mapping(DesktopControlMappingRuntime),
+    Mapping(Vec<DesktopControlMappingRuntime>),
 }
 
 impl SessionControlHandles {
-    fn mapping_statuses(&self) -> Option<&[hyper_control_runtime::ControlBindingStatus]> {
+    fn mapping(&self) -> Option<&DesktopControlMappingRuntime> {
         match self {
-            Self::Mapping(runtime) => Some(runtime.statuses()),
+            Self::Mapping(runtimes) => Some(
+                runtimes
+                    .first()
+                    .expect("mapping owner contains exactly one runtime"),
+            ),
             Self::Direct { .. } => None,
         }
+    }
+
+    fn mapping_mut(&mut self) -> Option<&mut DesktopControlMappingRuntime> {
+        match self {
+            Self::Mapping(runtimes) => Some(
+                runtimes
+                    .first_mut()
+                    .expect("mapping owner contains exactly one runtime"),
+            ),
+            Self::Direct { .. } => None,
+        }
+    }
+
+    fn mapping_statuses(&self) -> Option<&[hyper_control_runtime::ControlBindingStatus]> {
+        self.mapping().map(DesktopControlMappingRuntime::statuses)
     }
 
     fn dispatch_mapping_event(
@@ -475,10 +499,8 @@ impl SessionControlHandles {
             hyper_control_runtime::ControlDispatchError<DesktopControlSinkError>,
         >,
     > {
-        match self {
-            Self::Mapping(runtime) => Some(runtime.dispatch(event, context)),
-            Self::Direct { .. } => None,
-        }
+        self.mapping_mut()
+            .map(|runtime| runtime.dispatch(event, context))
     }
 
     fn try_send_transport(
@@ -489,7 +511,10 @@ impl SessionControlHandles {
             Self::Direct { transport, .. } => transport
                 .try_send(command)
                 .map_err(DesktopDirectControlError::Transport),
-            Self::Mapping(runtime) => {
+            Self::Mapping(runtimes) => {
+                let runtime = runtimes
+                    .first_mut()
+                    .expect("mapping owner contains exactly one runtime");
                 runtime.try_send_direct(DesktopDirectControlCommand::Transport(command))
             }
         }
@@ -501,14 +526,22 @@ impl SessionControlHandles {
     ) -> Result<MixerChannelHandle, MixerParameterResolveError> {
         match self {
             Self::Direct { mixer, .. } => mixer.resolve_channel(track_id),
-            Self::Mapping(runtime) => runtime.sink().resolve_channel(track_id),
+            Self::Mapping(runtimes) => runtimes
+                .first()
+                .expect("mapping owner contains exactly one runtime")
+                .sink()
+                .resolve_channel(track_id),
         }
     }
 
     fn resolve_send(&self, send_id: &str) -> Result<MixerSendHandle, MixerParameterResolveError> {
         match self {
             Self::Direct { mixer, .. } => mixer.resolve_send(send_id),
-            Self::Mapping(runtime) => runtime.sink().resolve_send(send_id),
+            Self::Mapping(runtimes) => runtimes
+                .first()
+                .expect("mapping owner contains exactly one runtime")
+                .sink()
+                .resolve_send(send_id),
         }
     }
 
@@ -520,7 +553,10 @@ impl SessionControlHandles {
             Self::Direct { mixer, .. } => mixer
                 .try_send(command)
                 .map_err(DesktopDirectControlError::Mixer),
-            Self::Mapping(runtime) => {
+            Self::Mapping(runtimes) => {
+                let runtime = runtimes
+                    .first_mut()
+                    .expect("mapping owner contains exactly one runtime");
                 runtime.try_send_direct(DesktopDirectControlCommand::Mixer(command))
             }
         }
@@ -1849,7 +1885,9 @@ fn restore_transport_checkpoint<R: hyper_mixer_runtime::TrackWindowRenderer>(
     let Some(checkpoint) = checkpoint else {
         return Ok(());
     };
-    transport.apply_command(checkpoint.restore_command());
+    transport
+        .apply_command(checkpoint.restore_command())
+        .expect("recovery checkpoints never contain scene-launch commands");
     if let Some(mixer_parameter_state) = checkpoint.mixer_parameter_state() {
         transport.restore_mixer_parameter_state(&mixer_parameter_state)?;
     }
@@ -1866,9 +1904,14 @@ fn build_session_controls(
         return Ok(SessionControlHandles::Direct { transport, mixer });
     };
     let sink = DesktopControlSink::new(transport, mixer, recovery);
-    ControlRuntime::try_new(table, sink)
-        .map(SessionControlHandles::Mapping)
-        .map_err(classify_control_mapping_build_error)
+    let runtime =
+        ControlRuntime::try_new(table, sink).map_err(classify_control_mapping_build_error)?;
+    let mut runtimes = Vec::new();
+    runtimes
+        .try_reserve_exact(1)
+        .map_err(|_| DesktopPlaybackSessionBuildError::ControlMappingOwnerCapacityUnavailable)?;
+    runtimes.push(runtime);
+    Ok(SessionControlHandles::Mapping(runtimes))
 }
 
 fn classify_control_mapping_build_error(
@@ -2354,6 +2397,14 @@ mod tests {
             }),
             Err(DesktopControlSinkError::Resolve(_))
         ));
+        assert_eq!(
+            sink.target_availability(hyper_control_runtime::RuntimeControlTarget::Scene {
+                scene_index: 0,
+            }),
+            hyper_control_runtime::ControlBindingAvailability::Unavailable(
+                hyper_control_runtime::ControlBindingUnavailableReason::SceneAudioNotPrepared,
+            )
+        );
         sink.try_send(hyper_control_runtime::RuntimeControlCommand::ChannelGain {
             channel_index: 0,
             gain_millionths: 500_000,

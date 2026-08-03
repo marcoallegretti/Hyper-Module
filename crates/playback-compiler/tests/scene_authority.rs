@@ -439,3 +439,98 @@ fn scene_resource_limits_and_references_are_checked() {
         })
     ));
 }
+
+#[test]
+fn interactive_launch_is_quantized_transactional_and_cleared_by_seek() {
+    let tracks = [SceneTrackResource {
+        id: "track",
+        active: true,
+    }];
+    let clips = [SceneClipResource {
+        id: "one-shot",
+        track_id: "track",
+        enabled: true,
+        duration_ticks: 2,
+        loop_enabled: false,
+    }];
+    let play_slots = [SceneSlotResource {
+        track_id: "track",
+        action: SceneSlotAction::Play {
+            clip_id: "one-shot",
+        },
+    }];
+    let stop_slots = [SceneSlotResource {
+        track_id: "track",
+        action: SceneSlotAction::Stop,
+    }];
+    let scenes = [
+        SceneResource {
+            id: "play",
+            enabled: true,
+            order: 0,
+            launch_quantization: LaunchQuantization::Grid { quantum_ticks: 4 },
+            slots: &play_slots,
+        },
+        SceneResource {
+            id: "stop",
+            enabled: true,
+            order: 1,
+            launch_quantization: LaunchQuantization::Immediate,
+            slots: &stop_slots,
+        },
+    ];
+    let compiled = compile_scene_performance(
+        timeline(),
+        ScenePerformanceInput {
+            enabled: true,
+            tracks: &tracks,
+            clips: &clips,
+            scenes: &scenes,
+            launches: &[],
+        },
+        SceneLimits::VERSION_1,
+    )
+    .unwrap();
+    assert_eq!(compiled.scene_count(), 2);
+    assert_eq!(compiled.scene_id(0), Some("play"));
+    assert_eq!(compiled.interactive_clips().count(), 1);
+
+    let mut runtime = compiled.runtime_at(1).unwrap();
+    runtime.queue_scene_launch(0).unwrap();
+    let checkpoint = runtime.checkpoint();
+    let mut segments = Vec::new();
+    let failure = runtime.try_process_window(1, 60, |segment| {
+        segments.push((
+            segment.offset_frames,
+            segment.track_states[0].map(PlayingSceneClip::clip_id),
+        ));
+        (segment.offset_frames < 49).then_some(()).ok_or("render")
+    });
+    assert!(matches!(
+        failure,
+        Err(SceneProcessError::Observer("render"))
+    ));
+    assert_eq!(runtime.checkpoint(), checkpoint);
+
+    let mut rendered_segments = Vec::new();
+    runtime
+        .process_window(1, 130, |segment| {
+            rendered_segments.push((
+                segment.offset_frames,
+                segment.frame_count,
+                segment.track_states[0].map(PlayingSceneClip::clip_id),
+            ));
+        })
+        .unwrap();
+    assert_eq!(
+        rendered_segments,
+        [(0, 49, None), (49, 25, Some("one-shot")), (74, 56, None)]
+    );
+
+    runtime.seek(50);
+    assert_eq!(runtime.track_states(), [None]);
+    runtime.queue_scene_launch(0).unwrap();
+    runtime.queue_scene_launch(1).unwrap();
+    runtime.process_window(50, 1, |_| {}).unwrap();
+    assert_eq!(runtime.track_states(), [None]);
+}

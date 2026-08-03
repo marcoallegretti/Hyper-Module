@@ -5,8 +5,9 @@ use hyper_media_cache::{
     CacheLimits, DecodedMediaCacheBuilder, PrepareSceneAudioError, SceneAudioBinding,
 };
 use hyper_playback_compiler::scene::{
-    LaunchQuantization, SceneClipResource, SceneLimits, ScenePerformanceInput, SceneResource,
-    SceneSlotAction, SceneSlotResource, SceneTrackResource, compile_scene_performance,
+    LaunchQuantization, SceneClipResource, SceneLimits, ScenePerformanceInput, ScenePlaybackSource,
+    SceneResource, SceneSlotAction, SceneSlotResource, SceneTrackResource,
+    compile_scene_performance,
 };
 use hyper_playback_compiler::{
     ClipCompileSpec, TempoEvent, TickRange, Timeline, WarpMarker, compile_scene_audio_clip,
@@ -134,14 +135,18 @@ fn prepared_scene_audio_launches_loops_stops_and_reaches_the_mixer() {
     let cache = cache_builder.seal();
     let bindings = [SceneAudioBinding {
         track_id: "track",
-        launch_id: "launch-play",
+        source: ScenePlaybackSource::Recorded {
+            launch_id: "launch-play",
+        },
         scene_id: "play",
         clip_id: "clip",
         asset_id: "asset",
         compiled: compiled_audio,
     }];
     let mismatched_bindings = [SceneAudioBinding {
-        launch_id: "unknown-launch",
+        source: ScenePlaybackSource::Recorded {
+            launch_id: "unknown-launch",
+        },
         ..bindings[0]
     }];
     assert!(matches!(

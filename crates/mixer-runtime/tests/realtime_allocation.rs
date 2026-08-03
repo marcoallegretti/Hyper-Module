@@ -136,7 +136,7 @@ fn prepared_combined_playback_performs_zero_heap_allocations() {
     )
     .unwrap();
     let mut transport = PreparedPlaybackTransportRuntime::new(runtime);
-    transport.apply_command(TransportCommand::Start);
+    transport.apply_command(TransportCommand::Start).unwrap();
     let mut arrangement_left = [0.0_f32; 64];
     let mut arrangement_right = [0.0_f32; 64];
     let mut scene_left = [0.0_f32; 64];
@@ -203,6 +203,7 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
 
     let measurement = HeapMeasurement::start_verified();
     let start_result = command_sender.try_send(TransportCommand::Start);
+    let scene_result = command_sender.try_send(TransportCommand::LaunchScene { scene_index: 0 });
     let channel_result =
         mixer_parameter_sender.resolve_channel("018f47a2-6b2d-7c11-8a44-001122336440");
     let parameter_result = channel_result.map(|channel| {
@@ -226,6 +227,7 @@ fn transport_output_processor_performs_zero_heap_allocations_for_variable_quanta
     let heap_operations = measurement.finish();
 
     assert!(start_result.is_ok());
+    assert!(scene_result.is_ok());
     assert!(parameter_result.is_ok_and(|result| result.is_ok()));
     assert!(loudness_result.is_ok());
     assert!(first_result.is_ok());

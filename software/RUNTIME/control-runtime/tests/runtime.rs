@@ -111,6 +111,7 @@ struct Sink {
     booleans: Vec<(BooleanControlTarget, bool)>,
     state_ready: Option<Arc<AtomicBool>>,
     transport_rolling: Option<bool>,
+    scene_ready: bool,
     commands: Vec<RuntimeControlCommand>,
 }
 
@@ -124,6 +125,18 @@ impl RuntimeControlSink for Sink {
             Err(SinkError::InvalidTarget)
         } else {
             Ok(())
+        }
+    }
+
+    fn target_availability(&self, target: RuntimeControlTarget) -> ControlBindingAvailability {
+        if matches!(target, RuntimeControlTarget::Scene { .. }) && self.scene_ready {
+            ControlBindingAvailability::Live
+        } else if matches!(target, RuntimeControlTarget::Scene { .. }) {
+            ControlBindingAvailability::Unavailable(
+                ControlBindingUnavailableReason::SceneAudioNotPrepared,
+            )
+        } else {
+            ControlBindingAvailability::Live
         }
     }
 
@@ -178,9 +191,8 @@ impl RuntimeControlSink for Sink {
             | RuntimeControlCommand::SendPan { .. }
             | RuntimeControlCommand::SendEnabled { .. }
             | RuntimeControlCommand::MainGain { .. }
-            | RuntimeControlCommand::TransportLocateStartPreserve => {
-                DirectControlStateUpdate::Unchanged
-            }
+            | RuntimeControlCommand::TransportLocateStartPreserve
+            | RuntimeControlCommand::SceneLaunch { .. } => DirectControlStateUpdate::Unchanged,
         })
     }
 }
@@ -357,7 +369,7 @@ fn unsupported_domains_are_reported_and_never_reach_the_sink() {
             ),
             ControlBindingAvailability::Live,
             ControlBindingAvailability::Unavailable(
-                ControlBindingUnavailableReason::InteractiveSceneLaunchUnavailable
+                ControlBindingUnavailableReason::SceneAudioNotPrepared
             ),
         ]
     );
@@ -445,6 +457,43 @@ fn momentary_bindings_use_the_configured_edge_for_activation_and_the_opposite_fo
                 solo: false,
             },
         ]
+    );
+}
+
+#[test]
+fn scene_launch_dispatches_one_prevalidated_numeric_command() {
+    let compiled = table(vec![trigger_binding(
+        700,
+        ControlScope::Global,
+        TriggerBehavior::Invoke,
+        ControlTarget::Scene {
+            scene_id: SCENE_ID.to_owned(),
+            action: SceneAction::Launch,
+        },
+    )]);
+    let mut runtime = ControlRuntime::try_new(
+        compiled,
+        Sink {
+            scene_ready: true,
+            ..Sink::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        runtime.statuses()[0].availability(),
+        ControlBindingAvailability::Live
+    );
+    assert_eq!(
+        runtime
+            .dispatch(
+                ControlEvent::Clock { edge: Edge::Rising },
+                ControlContext::default(),
+            )
+            .unwrap(),
+        ControlDispatchOutcome::Sent {
+            binding_index: 0,
+            command: RuntimeControlCommand::SceneLaunch { scene_index: 0 },
+        }
     );
 }
 

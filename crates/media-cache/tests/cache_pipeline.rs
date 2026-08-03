@@ -261,6 +261,10 @@ fn complete_playback_preparation_rejects_each_missing_authority_atomically() {
         "018f47a2-6b2d-7c11-8a44-001122335050"
     );
     assert_eq!(prepared.schedule().entries().len(), 1);
-    assert_eq!(prepared.scene_audio().entries().len(), 1);
+    assert_eq!(prepared.scene_audio().entries().len(), 2);
+    assert_eq!(
+        prepared.scene_audio().scene_availability(0),
+        hyper_media_cache::PreparedSceneAvailability::Ready
+    );
     assert_eq!(prepared.authority().track_count(), 2);
 }

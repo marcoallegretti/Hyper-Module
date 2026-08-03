@@ -8,8 +8,9 @@ use hyper_arrangement_renderer::{RenderScratchSlot, SceneRenderer};
 use hyper_audio_source::DecodedAudio;
 use hyper_media_cache::{CacheLimits, DecodedMediaCacheBuilder, SceneAudioBinding};
 use hyper_playback_compiler::scene::{
-    LaunchQuantization, SceneClipResource, SceneLimits, ScenePerformanceInput, SceneResource,
-    SceneSlotAction, SceneSlotResource, SceneTrackResource, compile_scene_performance,
+    LaunchQuantization, SceneClipResource, SceneLimits, ScenePerformanceInput, ScenePlaybackSource,
+    SceneResource, SceneSlotAction, SceneSlotResource, SceneTrackResource,
+    compile_scene_performance,
 };
 use hyper_playback_compiler::{
     ClipCompileSpec, TempoEvent, TickRange, Timeline, WarpMarker, compile_scene_audio_clip,
@@ -132,7 +133,9 @@ fn prepared_scene_rendering_performs_zero_heap_allocations() {
     let cache = builder.seal();
     let bindings = [SceneAudioBinding {
         track_id: "track",
-        launch_id: "launch",
+        source: ScenePlaybackSource::Recorded {
+            launch_id: "launch",
+        },
         scene_id: "scene",
         clip_id: "clip",
         asset_id: "asset",

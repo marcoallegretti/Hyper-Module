@@ -106,6 +106,30 @@ impl FrameTickPosition {
     }
 
     #[must_use]
+    pub const fn is_exact(self) -> bool {
+        self.remainder == 0
+    }
+
+    /// Resolves the next grid tick at or after this exact position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameTimelineError`] for a zero quantum or tick overflow.
+    pub fn quantize_forward(self, quantum_ticks: u64) -> Result<u64, FrameTimelineError> {
+        if quantum_ticks == 0 {
+            return Err(FrameTimelineError::TickOutOfRange);
+        }
+        if self.remainder == 0 && self.tick.is_multiple_of(quantum_ticks) {
+            return Ok(self.tick);
+        }
+        self.tick
+            .checked_div(quantum_ticks)
+            .and_then(|quotient| quotient.checked_add(1))
+            .and_then(|quotient| quotient.checked_mul(quantum_ticks))
+            .ok_or(FrameTimelineError::TickOutOfRange)
+    }
+
+    #[must_use]
     pub const fn is_at_or_after(self, tick: u64) -> bool {
         self.tick >= tick
     }
@@ -163,7 +187,7 @@ impl FrameTickPosition {
 }
 
 /// Owned step-tempo index for allocation-free sample-frame to tick conversion.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameTimeline {
     segments: Vec<FrameTempoSegment>,
 }
@@ -232,6 +256,34 @@ impl FrameTimeline {
             remainder: elapsed % segment.tick_denominator,
             denominator: segment.tick_denominator,
         })
+    }
+
+    /// Converts an absolute project tick to the first sample frame whose
+    /// start is at or after that tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameTimelineError`] if checked arithmetic fails or the
+    /// resulting frame lies outside the platform range.
+    pub fn tick_to_frame_ceil(&self, tick: u64) -> Result<usize, FrameTimelineError> {
+        let segment_index = self
+            .segments
+            .partition_point(|segment| segment.start_tick <= tick)
+            .saturating_sub(1);
+        let segment = self.segments[segment_index];
+        let elapsed = u128::from(tick - segment.start_tick)
+            .checked_mul(segment.tick_denominator)
+            .ok_or(FrameTimelineError::ArithmeticOverflow)?;
+        let numerator = segment
+            .start_frame_numerator
+            .checked_add(elapsed)
+            .ok_or(FrameTimelineError::ArithmeticOverflow)?;
+        let denominator = u128::from(TICKS_PER_QUARTER) * MICROSECONDS_PER_SECOND;
+        let frame = numerator
+            .checked_add(denominator - 1)
+            .ok_or(FrameTimelineError::ArithmeticOverflow)?
+            / denominator;
+        usize::try_from(frame).map_err(|_| FrameTimelineError::TickOutOfRange)
     }
 }
 
@@ -831,6 +883,37 @@ pub fn compile_scene_audio_clip(
             frame_count: placement_frame_count,
         },
     })
+}
+
+/// Compiles a reusable native-rate clip for interactive scene launches.
+///
+/// Because a live request may be quantized anywhere on the project timeline,
+/// every declared tempo segment must preserve the clip's native tick-to-frame
+/// rate. Projects requiring time-stretching remain explicit consolidation
+/// work instead of being approximated in the realtime path.
+///
+/// # Errors
+///
+/// Returns [`CompileError`] for invalid clip data, arithmetic failure, or a
+/// native execution requirement that needs consolidation.
+pub fn compile_interactive_scene_audio_clip(
+    timeline: Timeline<'_>,
+    clip: ClipCompileSpec<'_>,
+) -> Result<CompiledSceneAudioClip, CompileError> {
+    validate_clip(clip)?;
+    for event in timeline.tempo_events {
+        if !tempo_matches_clip_rate(
+            timeline.sample_rate_hz,
+            event.microseconds_per_quarter,
+            clip.duration_ticks,
+            clip.source_frame_count,
+        )? {
+            return Err(CompileError::ConsolidationRequired(
+                ConsolidationReason::TimeStretch,
+            ));
+        }
+    }
+    compile_scene_audio_clip(timeline, clip, 0)
 }
 
 fn validate_clip(clip: ClipCompileSpec<'_>) -> Result<(), CompileError> {

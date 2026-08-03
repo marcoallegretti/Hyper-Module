@@ -4,7 +4,7 @@ use core::convert::Infallible;
 use core::error::Error;
 use core::fmt;
 
-use crate::{Timeline, TimelineError};
+use crate::{FrameTimeline, FrameTimelineError, Timeline, TimelineError};
 
 pub const VERSION_1_MAX_SCENE_TRACKS: usize = 8;
 pub const VERSION_1_MAX_SCENES: usize = 8;
@@ -158,6 +158,7 @@ pub enum SceneCompileError {
         slot_index: usize,
     },
     Timeline(TimelineError),
+    FrameTimeline(FrameTimelineError),
 }
 
 impl fmt::Display for SceneCompileError {
@@ -247,6 +248,9 @@ impl fmt::Display for SceneCompileError {
                 "scene launch {launch_index} slot {slot_index} exceeds the tick domain"
             ),
             Self::Timeline(error) => write!(formatter, "scene timeline is invalid: {error}"),
+            Self::FrameTimeline(error) => {
+                write!(formatter, "scene frame timeline is invalid: {error}")
+            }
         }
     }
 }
@@ -255,6 +259,7 @@ impl Error for SceneCompileError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Timeline(error) => Some(error),
+            Self::FrameTimeline(error) => Some(error),
             _ => None,
         }
     }
@@ -266,9 +271,26 @@ impl From<TimelineError> for SceneCompileError {
     }
 }
 
+impl From<FrameTimelineError> for SceneCompileError {
+    fn from(error: FrameTimelineError) -> Self {
+        Self::FrameTimeline(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScenePlaybackSource<'a> {
+    Recorded {
+        launch_id: &'a str,
+    },
+    Interactive {
+        scene_index: usize,
+        slot_index: usize,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlayingSceneClip<'a> {
-    launch_id: &'a str,
+    source: ScenePlaybackSource<'a>,
     scene_id: &'a str,
     clip_id: &'a str,
     started_at_tick: u64,
@@ -279,8 +301,16 @@ pub struct PlayingSceneClip<'a> {
 
 impl<'a> PlayingSceneClip<'a> {
     #[must_use]
-    pub const fn launch_id(self) -> &'a str {
-        self.launch_id
+    pub const fn source(self) -> ScenePlaybackSource<'a> {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn launch_id(self) -> Option<&'a str> {
+        match self.source {
+            ScenePlaybackSource::Recorded { launch_id } => Some(launch_id),
+            ScenePlaybackSource::Interactive { .. } => None,
+        }
     }
 
     #[must_use]
@@ -332,9 +362,36 @@ struct CompiledSceneTrack<'a> {
     actions: Vec<TrackAction<'a>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompiledTemplateAction<'a> {
+    Play {
+        clip_id: &'a str,
+        duration_frames: usize,
+        loop_enabled: bool,
+        enabled: bool,
+    },
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompiledSceneTemplateSlot<'a> {
+    track_index: usize,
+    action: CompiledTemplateAction<'a>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompiledSceneTemplate<'a> {
+    id: &'a str,
+    enabled: bool,
+    launch_quantization: LaunchQuantization,
+    slots: Vec<CompiledSceneTemplateSlot<'a>>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledScenePerformance<'a> {
     tracks: Vec<CompiledSceneTrack<'a>>,
+    scenes: Vec<CompiledSceneTemplate<'a>>,
+    timeline: FrameTimeline,
 }
 
 impl<'resource> CompiledScenePerformance<'resource> {
@@ -353,6 +410,60 @@ impl<'resource> CompiledScenePerformance<'resource> {
         self.tracks
             .get(index)
             .map(|track| !track.actions.is_empty())
+    }
+
+    #[must_use]
+    pub fn track_has_scene_slots(&self, index: usize) -> Option<bool> {
+        self.tracks.get(index).map(|_| {
+            self.scenes
+                .iter()
+                .any(|scene| scene.slots.iter().any(|slot| slot.track_index == index))
+        })
+    }
+
+    #[must_use]
+    pub fn scene_count(&self) -> usize {
+        self.scenes.len()
+    }
+
+    #[must_use]
+    pub fn scene_id(&self, index: usize) -> Option<&'resource str> {
+        self.scenes.get(index).map(|scene| scene.id)
+    }
+
+    #[must_use]
+    pub fn scene_enabled(&self, index: usize) -> Option<bool> {
+        self.scenes.get(index).map(|scene| scene.enabled)
+    }
+
+    pub fn interactive_clips(
+        &self,
+    ) -> impl Iterator<Item = (usize, usize, &'resource str, &'resource str, bool)> + '_ {
+        self.scenes
+            .iter()
+            .enumerate()
+            .flat_map(move |(scene_index, scene)| {
+                scene
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(slot_index, slot)| {
+                        if let CompiledTemplateAction::Play {
+                            clip_id, enabled, ..
+                        } = slot.action
+                        {
+                            Some((
+                                scene_index,
+                                slot_index,
+                                self.tracks[slot.track_index].id,
+                                clip_id,
+                                enabled,
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+            })
     }
 
     pub fn playing_clips(
@@ -427,8 +538,70 @@ pub fn compile_scene_performance<'resource>(
         });
     }
 
+    let scenes = compile_scene_templates(timeline, input)?;
     compile_launches(timeline, input, &mut tracks)?;
-    Ok(CompiledScenePerformance { tracks })
+    let frame_timeline = FrameTimeline::try_new(timeline.sample_rate_hz(), timeline.tempo_events)?;
+    Ok(CompiledScenePerformance {
+        tracks,
+        scenes,
+        timeline: frame_timeline,
+    })
+}
+
+fn compile_scene_templates<'resource>(
+    timeline: Timeline<'_>,
+    input: ScenePerformanceInput<'_, 'resource>,
+) -> Result<Vec<CompiledSceneTemplate<'resource>>, SceneCompileError> {
+    let mut scenes = Vec::new();
+    scenes
+        .try_reserve_exact(input.scenes.len())
+        .map_err(|_| SceneCompileError::CapacityUnavailable)?;
+    for (scene_index, scene) in input.scenes.iter().enumerate() {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(scene.slots.len())
+            .map_err(|_| SceneCompileError::CapacityUnavailable)?;
+        for (slot_index, slot) in scene.slots.iter().enumerate() {
+            let track_index = find_track(input.tracks, slot.track_id).ok_or(
+                SceneCompileError::MissingSlotTrack {
+                    scene_index,
+                    slot_index,
+                },
+            )?;
+            let action = match slot.action {
+                SceneSlotAction::Stop => CompiledTemplateAction::Stop,
+                SceneSlotAction::Play { clip_id } => {
+                    let clip_index = find_clip(input.clips, clip_id).ok_or(
+                        SceneCompileError::MissingSlotClip {
+                            scene_index,
+                            slot_index,
+                        },
+                    )?;
+                    let clip = input.clips[clip_index];
+                    CompiledTemplateAction::Play {
+                        clip_id,
+                        duration_frames: timeline.tick_to_frame_ceil(clip.duration_ticks)?,
+                        loop_enabled: clip.loop_enabled,
+                        enabled: input.enabled
+                            && scene.enabled
+                            && input.tracks[track_index].active
+                            && clip.enabled,
+                    }
+                }
+            };
+            slots.push(CompiledSceneTemplateSlot {
+                track_index,
+                action,
+            });
+        }
+        scenes.push(CompiledSceneTemplate {
+            id: scene.id,
+            enabled: input.enabled && scene.enabled,
+            launch_quantization: scene.launch_quantization,
+            slots,
+        });
+    }
+    Ok(scenes)
 }
 
 fn compile_launches<'resource>(
@@ -490,7 +663,9 @@ fn compile_launches<'resource>(
                         Some(timeline.tick_to_frame_ceil(end_tick)?)
                     };
                     CompiledAction::Play(PlayingSceneClip {
-                        launch_id: launch.id,
+                        source: ScenePlaybackSource::Recorded {
+                            launch_id: launch.id,
+                        },
                         scene_id: scene.id,
                         clip_id,
                         started_at_tick: launch.tick,
@@ -650,6 +825,9 @@ pub enum SceneRuntimeError {
     CapacityUnavailable,
     WindowNotContiguous { expected: usize, actual: usize },
     FrameOverflow,
+    MissingScene { scene_index: usize },
+    SceneDisabled { scene_index: usize },
+    Timeline(FrameTimelineError),
 }
 
 impl fmt::Display for SceneRuntimeError {
@@ -663,11 +841,29 @@ impl fmt::Display for SceneRuntimeError {
                 "scene window begins at frame {actual}; expected {expected}"
             ),
             Self::FrameOverflow => formatter.write_str("scene window exceeds the frame domain"),
+            Self::MissingScene { scene_index } => {
+                write!(formatter, "scene {scene_index} is missing")
+            }
+            Self::SceneDisabled { scene_index } => {
+                write!(formatter, "scene {scene_index} is disabled")
+            }
+            Self::Timeline(source) => write!(formatter, "scene launch timing failed: {source}"),
         }
     }
 }
 
-impl Error for SceneRuntimeError {}
+impl Error for SceneRuntimeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Timeline(source) => Some(source),
+            Self::CapacityUnavailable
+            | Self::WindowNotContiguous { .. }
+            | Self::FrameOverflow
+            | Self::MissingScene { .. }
+            | Self::SceneDisabled { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum SceneProcessError<E> {
@@ -680,6 +876,24 @@ pub struct SceneSegment<'state, 'resource> {
     pub offset_frames: usize,
     pub frame_count: usize,
     pub track_states: &'state [Option<PlayingSceneClip<'resource>>],
+    pub track_controlled: &'state [bool],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingSceneLaunch {
+    scene_index: usize,
+    tick: u64,
+    frame: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SceneRuntimeCheckpoint<'resource> {
+    states: [Option<PlayingSceneClip<'resource>>; VERSION_1_MAX_SCENE_TRACKS],
+    cursors: [usize; VERSION_1_MAX_SCENE_TRACKS],
+    controlled: [bool; VERSION_1_MAX_SCENE_TRACKS],
+    track_count: usize,
+    position: usize,
+    pending: Option<PendingSceneLaunch>,
 }
 
 #[derive(Debug)]
@@ -687,7 +901,9 @@ pub struct SceneRuntime<'plan, 'resource> {
     plan: &'plan CompiledScenePerformance<'resource>,
     states: Vec<Option<PlayingSceneClip<'resource>>>,
     cursors: Vec<usize>,
+    controlled: Vec<bool>,
     position: usize,
+    pending: Option<PendingSceneLaunch>,
 }
 
 impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
@@ -705,11 +921,18 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
             .try_reserve_exact(plan.tracks.len())
             .map_err(|_| SceneRuntimeError::CapacityUnavailable)?;
         cursors.resize(plan.tracks.len(), 0);
+        let mut controlled = Vec::new();
+        controlled
+            .try_reserve_exact(plan.tracks.len())
+            .map_err(|_| SceneRuntimeError::CapacityUnavailable)?;
+        controlled.resize(plan.tracks.len(), false);
         let mut runtime = Self {
             plan,
             states,
             cursors,
+            controlled,
             position: frame,
+            pending: None,
         };
         runtime.seek(frame);
         Ok(runtime)
@@ -725,10 +948,112 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
         &self.states
     }
 
+    #[must_use]
+    pub fn track_controlled(&self) -> &[bool] {
+        &self.controlled
+    }
+
+    #[must_use]
+    pub fn scene_count(&self) -> usize {
+        self.plan.scene_count()
+    }
+
+    #[must_use]
+    pub fn checkpoint(&self) -> SceneRuntimeCheckpoint<'resource> {
+        let mut states = [None; VERSION_1_MAX_SCENE_TRACKS];
+        states[..self.states.len()].copy_from_slice(&self.states);
+        let mut cursors = [0; VERSION_1_MAX_SCENE_TRACKS];
+        cursors[..self.cursors.len()].copy_from_slice(&self.cursors);
+        let mut controlled = [false; VERSION_1_MAX_SCENE_TRACKS];
+        controlled[..self.controlled.len()].copy_from_slice(&self.controlled);
+        SceneRuntimeCheckpoint {
+            states,
+            cursors,
+            controlled,
+            track_count: self.states.len(),
+            position: self.position,
+            pending: self.pending,
+        }
+    }
+
+    pub fn restore(&mut self, checkpoint: SceneRuntimeCheckpoint<'resource>) {
+        debug_assert_eq!(checkpoint.track_count, self.states.len());
+        self.states
+            .copy_from_slice(&checkpoint.states[..checkpoint.track_count]);
+        self.cursors
+            .copy_from_slice(&checkpoint.cursors[..checkpoint.track_count]);
+        self.controlled
+            .copy_from_slice(&checkpoint.controlled[..checkpoint.track_count]);
+        self.position = checkpoint.position;
+        self.pending = checkpoint.pending;
+    }
+
+    /// Replaces any pending interactive launch with the latest request.
+    ///
+    /// The launch executes at the current callback boundary for immediate
+    /// scenes or at the first exact grid boundary at or after it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneRuntimeError`] for an unknown or disabled scene, or if
+    /// its quantized execution position exceeds the timeline domain.
+    pub fn queue_scene_launch(&mut self, scene_index: usize) -> Result<(), SceneRuntimeError> {
+        let scene = self
+            .plan
+            .scenes
+            .get(scene_index)
+            .ok_or(SceneRuntimeError::MissingScene { scene_index })?;
+        if !scene.enabled {
+            return Err(SceneRuntimeError::SceneDisabled { scene_index });
+        }
+        let position = self
+            .plan
+            .timeline
+            .position_at_frame(self.position)
+            .map_err(SceneRuntimeError::Timeline)?;
+        let (tick, frame) = match scene.launch_quantization {
+            LaunchQuantization::Immediate => (position.whole_tick(), self.position),
+            LaunchQuantization::Grid { quantum_ticks } => {
+                let tick = position
+                    .quantize_forward(quantum_ticks)
+                    .map_err(SceneRuntimeError::Timeline)?;
+                let frame = if position.is_exact() && tick == position.whole_tick() {
+                    self.position
+                } else {
+                    self.plan
+                        .timeline
+                        .tick_to_frame_ceil(tick)
+                        .map_err(SceneRuntimeError::Timeline)?
+                };
+                (tick, frame)
+            }
+        };
+        for slot in &scene.slots {
+            if let CompiledTemplateAction::Play {
+                duration_frames,
+                loop_enabled: false,
+                ..
+            } = slot.action
+            {
+                frame
+                    .checked_add(duration_frames)
+                    .ok_or(SceneRuntimeError::FrameOverflow)?;
+            }
+        }
+        self.pending = Some(PendingSceneLaunch {
+            scene_index,
+            tick,
+            frame,
+        });
+        Ok(())
+    }
+
     /// Reconstructs per-track state at an arbitrary sample frame.
     pub fn seek(&mut self, frame: usize) {
         self.position = frame;
+        self.pending = None;
         for (track_index, track) in self.plan.tracks.iter().enumerate() {
+            self.controlled[track_index] = !track.actions.is_empty();
             let cursor = track
                 .actions
                 .partition_point(|action| action.frame <= frame);
@@ -797,11 +1122,14 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
             .checked_add(frame_count)
             .ok_or(SceneProcessError::Runtime(SceneRuntimeError::FrameOverflow))?;
         let saved_position = self.position;
+        let saved_pending = self.pending;
         let track_count = self.states.len();
         let mut saved_states = [None; VERSION_1_MAX_SCENE_TRACKS];
         saved_states[..track_count].copy_from_slice(&self.states);
         let mut saved_cursors = [0_usize; VERSION_1_MAX_SCENE_TRACKS];
         saved_cursors[..track_count].copy_from_slice(&self.cursors);
+        let mut saved_controlled = [false; VERSION_1_MAX_SCENE_TRACKS];
+        saved_controlled[..track_count].copy_from_slice(&self.controlled);
         let mut segment_count = 0;
         while self.position < end_frame {
             self.apply_boundary();
@@ -810,10 +1138,14 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
                 offset_frames: self.position - start_frame,
                 frame_count: next_boundary - self.position,
                 track_states: &self.states,
+                track_controlled: &self.controlled,
             }) {
                 self.position = saved_position;
                 self.states.copy_from_slice(&saved_states[..track_count]);
                 self.cursors.copy_from_slice(&saved_cursors[..track_count]);
+                self.controlled
+                    .copy_from_slice(&saved_controlled[..track_count]);
+                self.pending = saved_pending;
                 return Err(SceneProcessError::Observer(error));
             }
             segment_count += 1;
@@ -844,6 +1176,37 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
                 self.cursors[track_index] += 1;
             }
         }
+        if let Some(pending) = self
+            .pending
+            .filter(|pending| pending.frame <= self.position)
+        {
+            let scene = &self.plan.scenes[pending.scene_index];
+            for (slot_index, slot) in scene.slots.iter().enumerate() {
+                self.controlled[slot.track_index] = true;
+                self.states[slot.track_index] = match slot.action {
+                    CompiledTemplateAction::Stop => None,
+                    CompiledTemplateAction::Play {
+                        clip_id,
+                        duration_frames,
+                        loop_enabled,
+                        enabled,
+                        ..
+                    } => Some(PlayingSceneClip {
+                        source: ScenePlaybackSource::Interactive {
+                            scene_index: pending.scene_index,
+                            slot_index,
+                        },
+                        scene_id: scene.id,
+                        clip_id,
+                        started_at_tick: pending.tick,
+                        started_at_frame: pending.frame,
+                        natural_end_frame: (!loop_enabled).then(|| pending.frame + duration_frames),
+                        enabled,
+                    }),
+                };
+            }
+            self.pending = None;
+        }
     }
 
     fn next_boundary(&self, end_frame: usize) -> usize {
@@ -860,6 +1223,9 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
             {
                 boundary = boundary.min(end);
             }
+        }
+        if let Some(pending) = self.pending.filter(|pending| pending.frame > self.position) {
+            boundary = boundary.min(pending.frame);
         }
         boundary
     }

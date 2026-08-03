@@ -26,7 +26,8 @@ use hyper_playback_compiler::scene::{
 };
 use hyper_playback_compiler::{
     ClipCompileSpec, CompileError, CompiledPlacement, CompiledSceneAudioClip, TempoEvent,
-    TickRange, Timeline, TimelineError, WarpMarker, compile_scene_audio_clip,
+    TickRange, Timeline, TimelineError, WarpMarker, compile_interactive_scene_audio_clip,
+    compile_scene_audio_clip,
 };
 use hyper_project_model::{is_valid_entity_id, is_valid_extension_key};
 use serde::de::{IgnoredAny, MapAccess, Visitor};
@@ -1027,11 +1028,14 @@ impl LoadedPlaybackProject {
         )
         .map_err(AdapterCompileError::Scene)?;
         let scene_audio = compile_scene_audio_bindings(self, assets, timeline, &scene_authority)?;
+        let interactive_scene_audio =
+            compile_interactive_scene_audio_bindings(self, assets, timeline, &scene_authority)?;
         Ok(CompiledPlaybackGraph {
             project_id: &self.project_id,
             arrangement,
             scene_authority,
             scene_audio,
+            interactive_scene_audio,
         })
     }
 }
@@ -1069,6 +1073,7 @@ pub struct CompiledPlaybackGraph<'project> {
     arrangement: OwnedCompiledSchedule,
     scene_authority: CompiledScenePerformance<'project>,
     scene_audio: Vec<CompiledSceneAudioBinding<'project>>,
+    interactive_scene_audio: Vec<CompiledInteractiveSceneAudioBinding<'project>>,
 }
 
 impl<'project> CompiledPlaybackGraph<'project> {
@@ -1091,6 +1096,11 @@ impl<'project> CompiledPlaybackGraph<'project> {
     pub fn scene_audio(&self) -> &[CompiledSceneAudioBinding<'project>] {
         &self.scene_audio
     }
+
+    #[must_use]
+    pub fn interactive_scene_audio(&self) -> &[CompiledInteractiveSceneAudioBinding<'project>] {
+        &self.interactive_scene_audio
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1101,6 +1111,24 @@ pub struct CompiledSceneAudioBinding<'project> {
     pub clip_id: &'project str,
     pub asset_id: &'project str,
     pub compiled: CompiledSceneAudioClip,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InteractiveSceneAudioAvailability {
+    Ready,
+    ConsolidationRequired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompiledInteractiveSceneAudioBinding<'project> {
+    pub scene_index: usize,
+    pub slot_index: usize,
+    pub track_id: &'project str,
+    pub scene_id: &'project str,
+    pub clip_id: &'project str,
+    pub asset_id: &'project str,
+    pub availability: InteractiveSceneAudioAvailability,
+    pub compiled: Option<CompiledSceneAudioClip>,
 }
 
 #[derive(Debug)]
@@ -2643,6 +2671,9 @@ fn compile_scene_audio_bindings<'project>(
         .try_reserve_exact(binding_count)
         .map_err(|_| AdapterCompileError::CapacityUnavailable)?;
     for (binding_index, (track_id, playing)) in authority.playing_clips().enumerate() {
+        let launch_id = playing
+            .launch_id()
+            .ok_or(AdapterCompileError::InconsistentCompiledGraph)?;
         let clip = project
             .clips
             .iter()
@@ -2678,10 +2709,82 @@ fn compile_scene_audio_bindings<'project>(
         })?;
         output.push(CompiledSceneAudioBinding {
             track_id,
-            launch_id: playing.launch_id(),
+            launch_id,
             scene_id: playing.scene_id(),
             clip_id: playing.clip_id(),
             asset_id: &clip.asset_id,
+            compiled,
+        });
+    }
+    Ok(output)
+}
+
+fn compile_interactive_scene_audio_bindings<'project>(
+    project: &'project LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    timeline: Timeline<'_>,
+    authority: &CompiledScenePerformance<'project>,
+) -> Result<Vec<CompiledInteractiveSceneAudioBinding<'project>>, AdapterCompileError> {
+    let binding_count = authority.interactive_clips().count();
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(binding_count)
+        .map_err(|_| AdapterCompileError::CapacityUnavailable)?;
+    for (binding_index, (scene_index, slot_index, track_id, clip_id, enabled)) in
+        authority.interactive_clips().enumerate()
+    {
+        let scene_id = authority
+            .scene_id(scene_index)
+            .ok_or(AdapterCompileError::InconsistentCompiledGraph)?;
+        let clip = project
+            .clips
+            .iter()
+            .find(|clip| clip.id == clip_id)
+            .ok_or(AdapterCompileError::InconsistentCompiledGraph)?;
+        let asset = assets
+            .iter()
+            .find(|asset| asset.id == clip.asset_id)
+            .ok_or(AdapterCompileError::InconsistentCompiledGraph)?;
+        let result = compile_interactive_scene_audio_clip(
+            timeline,
+            ClipCompileSpec {
+                enabled,
+                duration_ticks: clip.duration_ticks,
+                source_start_frame: clip.source_start_frame,
+                source_frame_count: clip.source_frame_count,
+                asset_frame_count: asset.frame_count,
+                source_sample_rate_hz: asset.sample_rate_hz,
+                loop_enabled: clip.loop_enabled,
+                loop_range: clip.loop_range,
+                reverse: clip.reverse,
+                gain_decibels: clip.gain_decibels,
+                transpose_cents: clip.transpose_cents,
+                fade_in_ticks: clip.fade_in_ticks,
+                fade_out_ticks: clip.fade_out_ticks,
+                warp_markers: &clip.warp_markers,
+            },
+        );
+        let (availability, compiled) = match result {
+            Ok(compiled) => (InteractiveSceneAudioAvailability::Ready, Some(compiled)),
+            Err(CompileError::ConsolidationRequired(_)) => (
+                InteractiveSceneAudioAvailability::ConsolidationRequired,
+                None,
+            ),
+            Err(error) => {
+                return Err(AdapterCompileError::SceneAudio {
+                    binding_index,
+                    error,
+                });
+            }
+        };
+        output.push(CompiledInteractiveSceneAudioBinding {
+            scene_index,
+            slot_index,
+            track_id,
+            scene_id,
+            clip_id,
+            asset_id: &clip.asset_id,
+            availability,
             compiled,
         });
     }
@@ -3931,6 +4034,11 @@ mod tests {
         assert!(graph.arrangement().entries().is_empty());
         assert_eq!(graph.scene_authority().track_count(), 1);
         assert_eq!(graph.scene_audio().len(), 1);
+        assert_eq!(graph.interactive_scene_audio().len(), 1);
+        assert_eq!(
+            graph.interactive_scene_audio()[0].availability,
+            InteractiveSceneAudioAvailability::Ready
+        );
         assert_eq!(
             graph.scene_audio()[0].launch_id,
             "018f47a2-6b2d-7c11-8a44-001122334465"

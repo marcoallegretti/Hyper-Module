@@ -7,10 +7,13 @@ use core::mem::size_of;
 
 use hyper_audio_source::DecodedAudio;
 use hyper_clip_engine::{ClipOutput, ClipPlacement, ClipPlanError, ClipRenderPlan};
-use hyper_playback_compiler::scene::{CompiledScenePerformance, PlayingSceneClip};
+use hyper_playback_compiler::scene::{
+    CompiledScenePerformance, PlayingSceneClip, ScenePlaybackSource,
+};
 use hyper_playback_compiler::{CompiledSceneAudioClip, PrepareError};
 use hyper_playback_json::{
-    CompiledPlaybackGraph, MediaAssetFact, OwnedCompiledSchedule, OwnedScheduleEntry,
+    CompiledPlaybackGraph, InteractiveSceneAudioAvailability, MediaAssetFact,
+    OwnedCompiledSchedule, OwnedScheduleEntry,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -358,7 +361,18 @@ impl DecodedMediaCache {
                 placement,
             });
         }
-        Ok(PreparedSceneAudio { entries })
+        let mut scene_availability = Vec::new();
+        scene_availability
+            .try_reserve_exact(authority.scene_count())
+            .map_err(|_| PrepareSceneAudioError::CapacityUnavailable)?;
+        scene_availability.resize(
+            authority.scene_count(),
+            PreparedSceneAvailability::NotPrepared,
+        );
+        Ok(PreparedSceneAudio {
+            entries,
+            scene_availability,
+        })
     }
 
     /// Atomically binds every scene play action in a compiled playback graph.
@@ -377,13 +391,77 @@ impl DecodedMediaCache {
             .map_err(|_| PrepareSceneAudioError::CapacityUnavailable)?;
         bindings.extend(graph.scene_audio().iter().map(|entry| SceneAudioBinding {
             track_id: entry.track_id,
-            launch_id: entry.launch_id,
+            source: ScenePlaybackSource::Recorded {
+                launch_id: entry.launch_id,
+            },
             scene_id: entry.scene_id,
             clip_id: entry.clip_id,
             asset_id: entry.asset_id,
             compiled: entry.compiled,
         }));
-        self.prepare_scene_audio(graph.scene_authority(), &bindings)
+        let mut prepared = self.prepare_scene_audio(graph.scene_authority(), &bindings)?;
+        prepared.scene_availability.clear();
+        prepared
+            .scene_availability
+            .try_reserve_exact(graph.scene_authority().scene_count())
+            .map_err(|_| PrepareSceneAudioError::CapacityUnavailable)?;
+        prepared
+            .scene_availability
+            .extend(
+                (0..graph.scene_authority().scene_count()).map(|scene_index| {
+                    if graph.scene_authority().scene_enabled(scene_index) == Some(true) {
+                        PreparedSceneAvailability::Ready
+                    } else {
+                        PreparedSceneAvailability::Disabled
+                    }
+                }),
+            );
+        prepared
+            .entries
+            .try_reserve_exact(graph.interactive_scene_audio().len())
+            .map_err(|_| PrepareSceneAudioError::CapacityUnavailable)?;
+        for (binding_index, binding) in graph.interactive_scene_audio().iter().enumerate() {
+            let Some(compiled) = binding.compiled else {
+                if matches!(
+                    binding.availability,
+                    InteractiveSceneAudioAvailability::ConsolidationRequired
+                ) {
+                    if prepared.scene_availability[binding.scene_index]
+                        == PreparedSceneAvailability::Ready
+                    {
+                        prepared.scene_availability[binding.scene_index] =
+                            PreparedSceneAvailability::ConsolidationRequired;
+                    }
+                    continue;
+                }
+                return Err(PrepareSceneAudioError::AuthorityMismatch { binding_index });
+            };
+            let cached = self
+                .find(binding.asset_id)
+                .ok_or(PrepareSceneAudioError::MissingAsset { binding_index })?;
+            let (plan, placement) = compiled.prepare(&cached.audio).map_err(|source| {
+                PrepareSceneAudioError::InvalidAsset {
+                    binding_index,
+                    source,
+                }
+            })?;
+            prepared.entries.push(PreparedSceneAudioEntry {
+                binding: SceneAudioBinding {
+                    track_id: binding.track_id,
+                    source: ScenePlaybackSource::Interactive {
+                        scene_index: binding.scene_index,
+                        slot_index: binding.slot_index,
+                    },
+                    scene_id: binding.scene_id,
+                    clip_id: binding.clip_id,
+                    asset_id: binding.asset_id,
+                    compiled,
+                },
+                plan,
+                placement,
+            });
+        }
+        Ok(prepared)
     }
 
     /// Atomically binds every arrangement placement and scene play action in a
@@ -415,7 +493,7 @@ impl DecodedMediaCache {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SceneAudioBinding<'a> {
     pub track_id: &'a str,
-    pub launch_id: &'a str,
+    pub source: ScenePlaybackSource<'a>,
     pub scene_id: &'a str,
     pub clip_id: &'a str,
     pub asset_id: &'a str,
@@ -423,13 +501,13 @@ pub struct SceneAudioBinding<'a> {
 }
 
 impl SceneAudioBinding<'_> {
-    fn key(&self) -> (&str, &str, &str) {
-        (self.track_id, self.launch_id, self.clip_id)
+    fn key(&self) -> (&str, ScenePlaybackSource<'_>, &str) {
+        (self.track_id, self.source, self.clip_id)
     }
 
     fn matches(&self, track_id: &str, playing: PlayingSceneClip<'_>) -> bool {
         self.track_id == track_id
-            && self.launch_id == playing.launch_id()
+            && self.source == playing.source()
             && self.scene_id == playing.scene_id()
             && self.clip_id == playing.clip_id()
     }
@@ -566,12 +644,29 @@ impl<'cache, 'graph, 'project> PreparedPlayback<'cache, 'graph, 'project> {
 #[derive(Debug)]
 pub struct PreparedSceneAudio<'cache, 'binding> {
     entries: Vec<PreparedSceneAudioEntry<'cache, 'binding>>,
+    scene_availability: Vec<PreparedSceneAvailability>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedSceneAvailability {
+    Ready,
+    Disabled,
+    ConsolidationRequired,
+    NotPrepared,
 }
 
 impl<'cache, 'binding> PreparedSceneAudio<'cache, 'binding> {
     #[must_use]
     pub fn entries(&self) -> &[PreparedSceneAudioEntry<'cache, 'binding>] {
         &self.entries
+    }
+
+    #[must_use]
+    pub fn scene_availability(&self, scene_index: usize) -> PreparedSceneAvailability {
+        self.scene_availability
+            .get(scene_index)
+            .copied()
+            .unwrap_or(PreparedSceneAvailability::NotPrepared)
     }
 
     #[must_use]

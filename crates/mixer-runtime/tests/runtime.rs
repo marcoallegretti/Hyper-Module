@@ -360,7 +360,7 @@ fn combined_transport_renders_each_track_authority_and_reconstructs_scene_state_
         PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 100)
             .unwrap();
     let mut transport = PreparedPlaybackTransportRuntime::new(runtime);
-    transport.apply_command(TransportCommand::Start);
+    transport.apply_command(TransportCommand::Start).unwrap();
 
     let mut arrangement_left = [9.0_f32; 100];
     let mut arrangement_right = [9.0_f32; 100];
@@ -396,10 +396,12 @@ fn combined_transport_renders_each_track_authority_and_reconstructs_scene_state_
     assert_samples(&output_left, &fixture.arrangement_samples);
     assert_samples(&output_right, &expected_scene);
 
-    transport.apply_command(TransportCommand::Locate {
-        frame: 25,
-        state: LocateState::Rolling,
-    });
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: 25,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
     let mut arrangement_left = [9.0_f32; 50];
     let mut arrangement_right = [9.0_f32; 50];
     let mut scene_left = [9.0_f32; 50];
@@ -425,6 +427,137 @@ fn combined_transport_renders_each_track_authority_and_reconstructs_scene_state_
     assert_eq!(transport.position_frame(), 75);
     assert_samples(&output_left, &fixture.arrangement_samples[25..75]);
     assert_samples(&output_right, &fixture.scene_samples[..50]);
+}
+
+#[test]
+fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 50)
+            .unwrap();
+    let (mut sender, mut transport) = PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+    sender
+        .try_send(TransportCommand::Locate {
+            frame: 100,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    sender
+        .try_send(TransportCommand::LaunchScene { scene_index: 0 })
+        .unwrap();
+
+    let mut arrangement_left = [9.0_f32; 50];
+    let mut arrangement_right = [9.0_f32; 50];
+    let mut scene_left = [9.0_f32; 50];
+    let mut scene_right = [9.0_f32; 50];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut output_left = [9.0_f32; 50];
+    let mut output_right = [9.0_f32; 50];
+    let launched = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut output_left,
+                right: &mut output_right,
+            },
+        )
+        .unwrap();
+    assert_eq!(launched.applied_command_count(), 2);
+    assert_samples(&output_left, &[0.0; 50]);
+    assert_samples(&output_right, &fixture.scene_samples[..50]);
+
+    sender
+        .try_send(TransportCommand::LaunchScene { scene_index: 1 })
+        .unwrap();
+    transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut output_left,
+                right: &mut output_right,
+            },
+        )
+        .unwrap();
+    assert_samples(&output_left, &[0.0; 50]);
+    assert_samples(&output_right, &[0.0; 50]);
+}
+
+#[test]
+fn failed_cycle_restores_the_prior_interactive_scene_state() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 25)
+            .unwrap();
+    let (mut sender, mut transport) = PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+    sender
+        .try_send(TransportCommand::Locate {
+            frame: 100,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    sender
+        .try_send(TransportCommand::LaunchScene { scene_index: 0 })
+        .unwrap();
+
+    let mut arrangement_left = [0.0_f32; 25];
+    let mut arrangement_right = [0.0_f32; 25];
+    let mut scene_left = [0.0_f32; 25];
+    let mut scene_right = [0.0_f32; 25];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut output_left = [0.0_f32; 25];
+    let mut output_right = [0.0_f32; 25];
+    transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut output_left,
+                right: &mut output_right,
+            },
+        )
+        .unwrap();
+
+    sender
+        .try_send(TransportCommand::LaunchScene { scene_index: 1 })
+        .unwrap();
+    let mut incomplete_left = [0.0_f32; 25];
+    let mut incomplete_right = [0.0_f32; 25];
+    let mut incomplete = [RenderScratchSlot::new(
+        &mut incomplete_left,
+        &mut incomplete_right,
+    )];
+    assert!(
+        transport
+            .process_cycle(
+                &mut incomplete,
+                StereoOutput {
+                    left: &mut output_left,
+                    right: &mut output_right,
+                },
+            )
+            .is_err()
+    );
+    assert_eq!(transport.position_frame(), 125);
+
+    transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut output_left,
+                right: &mut output_right,
+            },
+        )
+        .unwrap();
+    assert_samples(&output_right, &fixture.scene_samples[25..50]);
 }
 
 #[test]
@@ -906,7 +1039,7 @@ fn transport_owns_stopped_rolling_and_located_callback_windows() {
     assert_eq!(empty_stopped.frame_count(), 0);
     assert_eq!(transport.position_frame(), 0);
 
-    transport.apply_command(TransportCommand::Start);
+    transport.apply_command(TransportCommand::Start).unwrap();
     let empty_rolling =
         process_transport(&mut transport, &mut empty_left, &mut empty_right).unwrap();
     assert_eq!(empty_rolling.state(), TransportState::Rolling);
@@ -926,7 +1059,7 @@ fn transport_owns_stopped_rolling_and_located_callback_windows() {
     assert_eq!(consecutive.position_frame(), 16);
     assert_eq!(transport.position_frame(), 16);
 
-    transport.apply_command(TransportCommand::Stop);
+    transport.apply_command(TransportCommand::Stop).unwrap();
     left.fill(9.0);
     right.fill(9.0);
     process_transport(&mut transport, &mut left, &mut right).unwrap();
@@ -934,18 +1067,22 @@ fn transport_owns_stopped_rolling_and_located_callback_windows() {
     assert_constant(&left, 0.0);
     assert_constant(&right, 0.0);
 
-    transport.apply_command(TransportCommand::Locate {
-        frame: 25,
-        state: LocateState::Preserve,
-    });
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: 25,
+            state: LocateState::Preserve,
+        })
+        .unwrap();
     assert_eq!(transport.state(), TransportState::Stopped);
     process_transport(&mut transport, &mut left, &mut right).unwrap();
     assert_eq!(transport.position_frame(), 25);
 
-    transport.apply_command(TransportCommand::Locate {
-        frame: 25,
-        state: LocateState::Rolling,
-    });
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: 25,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
     let mut seek_left = [9.0_f32; 1];
     let mut seek_right = [9.0_f32; 1];
     let sought = process_transport(&mut transport, &mut seek_left, &mut seek_right).unwrap();
@@ -955,20 +1092,24 @@ fn transport_owns_stopped_rolling_and_located_callback_windows() {
     assert!((seek_left[0] - 0.223_861_44).abs() <= f32::EPSILON);
     assert!((seek_right[0] - 0.176_986_44).abs() <= f32::EPSILON);
 
-    transport.apply_command(TransportCommand::Locate {
-        frame: 40,
-        state: LocateState::Stopped,
-    });
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: 40,
+            state: LocateState::Stopped,
+        })
+        .unwrap();
     process_transport(&mut transport, &mut seek_left, &mut seek_right).unwrap();
     assert_eq!(transport.state(), TransportState::Stopped);
     assert_eq!(transport.position_frame(), 40);
     assert_constant(&seek_left, 0.0);
     assert_constant(&seek_right, 0.0);
 
-    transport.apply_command(TransportCommand::Locate {
-        frame: usize::MAX - 1,
-        state: LocateState::Rolling,
-    });
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: usize::MAX - 1,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
     let mut overflow_left = [9.0_f32; 2];
     let mut overflow_right = [9.0_f32; 2];
     assert_eq!(
@@ -986,10 +1127,12 @@ fn failed_transport_cycle_preserves_position_and_output() {
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
     let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
     let mut transport = GraphTransportRuntime::new(runtime);
-    transport.apply_command(TransportCommand::Locate {
-        frame: 12,
-        state: LocateState::Rolling,
-    });
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: 12,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
     let mut scratch_left = [[7.0_f32; 2]; 5];
     let mut scratch_right = [[7.0_f32; 2]; 5];
     let [left_0, left_1, left_2, left_3, left_4] = &mut scratch_left;
