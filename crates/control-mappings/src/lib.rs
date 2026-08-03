@@ -7,25 +7,25 @@ use std::collections::BTreeMap;
 
 use hyper_project_model::{is_valid_entity_id, is_valid_extension_key};
 use hyper_strict_json::{StrictJsonError, StrictJsonErrorKind};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const FORMAT: &str = "hyper-control-mappings";
 const FORMAT_VERSION: u8 = 1;
 const MAX_DOCUMENT_BYTES: usize = 1_048_576;
-const MAX_BINDINGS: usize = 4_096;
+pub const MAX_BINDINGS: usize = 4_096;
 const NORMALIZED_SIGNED_MIN: i32 = -1_000_000;
 const NORMALIZED_SIGNED_MAX: i32 = 1_000_000;
 const NORMALIZED_UNSIGNED_MAX: i32 = 1_000_000;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Edge {
     Rising,
     Falling,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControlSource {
     CvInput { input_index: u8 },
@@ -33,7 +33,7 @@ pub enum ControlSource {
     ResetInput { edge: Edge },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControlScope {
     Global,
@@ -42,7 +42,7 @@ pub enum ControlScope {
     Scene { scene_id: String },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TriggerBehavior {
     Invoke,
@@ -50,7 +50,7 @@ pub enum TriggerBehavior {
     Momentary,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControlTransform {
     Linear {
@@ -64,7 +64,7 @@ pub enum ControlTransform {
     },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChannelParameter {
     Gain,
@@ -73,7 +73,7 @@ pub enum ChannelParameter {
     Solo,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SendParameter {
     Gain,
@@ -81,21 +81,21 @@ pub enum SendParameter {
     Enabled,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MainParameter {
     Gain,
     Mute,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CueParameter {
     Gain,
     Mute,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControlTarget {
     MixerChannel {
@@ -121,13 +121,13 @@ pub enum ControlTarget {
     },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SceneAction {
     Launch,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportAction {
     Play,
@@ -185,7 +185,7 @@ pub fn map_continuous_value(
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlBinding {
     id: String,
@@ -197,6 +197,36 @@ pub struct ControlBinding {
 }
 
 impl ControlBinding {
+    /// Constructs one schema-valid binding independently of a project graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error for an invalid identity, source/transform pair,
+    /// target domain, range, or referenced identity shape.
+    pub fn try_new(
+        id: String,
+        enabled: bool,
+        source: ControlSource,
+        scope: ControlScope,
+        transform: ControlTransform,
+        target: ControlTarget,
+    ) -> Result<Self, ControlMappingParseError> {
+        let binding = Self {
+            id,
+            enabled,
+            source,
+            scope,
+            transform,
+            target,
+        };
+        require(
+            is_valid_entity_id(&binding.id),
+            "control binding ID is invalid",
+        )?;
+        validate_binding_domain(&binding)?;
+        Ok(binding)
+    }
+
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
@@ -205,6 +235,10 @@ impl ControlBinding {
     #[must_use]
     pub const fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub const fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
     }
 
     #[must_use]
@@ -282,6 +316,31 @@ pub struct ControlMappingDocument {
 }
 
 impl ControlMappingDocument {
+    /// Constructs one complete version-1 mapping document from typed parts.
+    ///
+    /// Bindings must already be strictly ordered by unique identity. Project
+    /// references are validated separately through [`Self::validate_for_project`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a schema-domain, ordering, uniqueness, capacity, or extension
+    /// rejection.
+    pub fn try_new(
+        id: String,
+        project_id: String,
+        bindings: Vec<ControlBinding>,
+        extensions: BTreeMap<String, Value>,
+    ) -> Result<Self, ControlMappingParseError> {
+        validate_document(RawControlMappingDocument {
+            format: FORMAT.to_owned(),
+            format_version: FORMAT_VERSION,
+            id,
+            project_id,
+            bindings,
+            extensions,
+        })
+    }
+
     /// Parses and validates one complete version-1 mapping document.
     ///
     /// Project capabilities and cross-resource references are validated by
@@ -314,6 +373,23 @@ impl ControlMappingDocument {
     #[must_use]
     pub const fn extensions(&self) -> &BTreeMap<String, Value> {
         &self.extensions
+    }
+
+    /// Serializes this validated document as RFC 8785 canonical JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error if a retained extension value cannot be
+    /// represented by the canonical JSON serializer.
+    pub fn to_canonical_json(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json_canonicalizer::to_vec(&SerializableControlMappingDocument {
+            format: FORMAT,
+            format_version: FORMAT_VERSION,
+            id: &self.id,
+            project_id: &self.project_id,
+            bindings: &self.bindings,
+            extensions: &self.extensions,
+        })
     }
 
     /// Binds every mapping identity, capability, scope, and target reference
@@ -351,6 +427,16 @@ impl ControlMappingDocument {
         }
         Ok(())
     }
+}
+
+#[derive(Serialize)]
+struct SerializableControlMappingDocument<'document> {
+    format: &'static str,
+    format_version: u8,
+    id: &'document str,
+    project_id: &'document str,
+    bindings: &'document [ControlBinding],
+    extensions: &'document BTreeMap<String, Value>,
 }
 
 pub trait ControlMappingProject {
@@ -1039,6 +1125,51 @@ mod tests {
             binding.map_continuous(2_000_000),
             Some(ContinuousControlValue::GainMillionths(2_000_000))
         );
+    }
+
+    #[test]
+    fn typed_construction_and_canonical_serialization_round_trip() {
+        let parsed = ControlMappingDocument::parse(VALID).unwrap();
+        let binding = ControlBinding::try_new(
+            parsed.bindings()[0].id().to_owned(),
+            parsed.bindings()[0].enabled(),
+            parsed.bindings()[0].source().clone(),
+            parsed.bindings()[0].scope().clone(),
+            parsed.bindings()[0].transform(),
+            parsed.bindings()[0].target().clone(),
+        )
+        .unwrap();
+        let constructed = ControlMappingDocument::try_new(
+            parsed.id().to_owned(),
+            parsed.project_id().to_owned(),
+            vec![binding],
+            parsed.extensions().clone(),
+        )
+        .unwrap();
+        assert_eq!(constructed, parsed);
+
+        let canonical = constructed.to_canonical_json().unwrap();
+        let value: Value = serde_json::from_slice(VALID).unwrap();
+        assert_eq!(canonical, serde_json_canonicalizer::to_vec(&value).unwrap());
+        assert_eq!(ControlMappingDocument::parse(&canonical).unwrap(), parsed);
+    }
+
+    #[test]
+    fn typed_binding_construction_reuses_the_parser_domain_authority() {
+        let error = ControlBinding::try_new(
+            BINDING_ID.to_owned(),
+            true,
+            ControlSource::CvInput { input_index: 0 },
+            ControlScope::Global,
+            ControlTransform::Trigger {
+                behavior: TriggerBehavior::Invoke,
+            },
+            ControlTarget::Transport {
+                action: TransportAction::Play,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ControlMappingParseErrorKind::InvalidDomain);
     }
 
     #[test]

@@ -485,6 +485,7 @@ dependencies = [
  "hyper-strict-json",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
 ]
 
 [[package]]
@@ -529,6 +530,15 @@ name = "hyper-mapping-compiler"
 version = "0.1.0"
 dependencies = [
  "hyper-control-mappings",
+ "serde_json",
+]
+
+[[package]]
+name = "hyper-mapping-editor"
+version = "0.1.0"
+dependencies = [
+ "hyper-control-mappings",
+ "hyper-mapping-compiler",
  "serde_json",
 ]
 

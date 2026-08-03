@@ -24,6 +24,7 @@ members = [
     "crates/thread-supervisor",
     "software/IDE/audio-backend",
     "software/IDE/fs-authority",
+    "software/IDE/mapping-editor",
     "software/IDE/panel-simulator",
 ]
 exclude = ["third_party/pipewire"]
