@@ -2,17 +2,21 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use hyper_control_mappings::{
     ChannelParameter, ControlBinding, ControlMappingDocument, ControlMappingProject, ControlScope,
-    ControlSource, ControlTarget, ControlTransform, MAX_BINDINGS,
+    ControlSource, ControlTarget, ControlTransform, Edge, MAX_BINDINGS, TransportAction,
+    TriggerBehavior,
 };
 use hyper_mapping_compiler::{
     CompiledControlScope, CompiledControlTarget, ControlMappingResolver, MixerSendAddress,
 };
 use hyper_mapping_editor::{
     MappingConflictKind, MappingEditor, MappingEditorConfirmationError, MappingEditorMutationError,
-    MappingEditorPreviewError, MappingEditorPublicationError,
+    MappingEditorPreviewError, MappingEditorPublicationError, MappingLearnCaptureError,
+    MappingLearnClockError, MappingLearnConfirmationError, MappingLearnPhase,
+    MappingLearnRetryError, MappingLearnStartError,
 };
 use hyper_storage_engine::verify_project_package;
 use serde_json::json;
@@ -259,6 +263,183 @@ fn binding_limit_is_enforced_before_mutation() {
     assert_eq!(editor.bindings().len(), MAX_BINDINGS);
 }
 
+#[test]
+fn learn_keeps_the_first_compatible_candidate_temporary_until_confirmation() {
+    let original = document(vec![binding(
+        FIRST_BINDING_ID,
+        true,
+        0,
+        ControlScope::Global,
+    )]);
+    let started_at = Instant::now();
+    let deadline = started_at + Duration::from_secs(7);
+    let mut learn = MappingEditor::new(original.clone())
+        .begin_learn(FIRST_BINDING_ID, started_at, deadline)
+        .unwrap();
+
+    assert_eq!(
+        learn.phase(started_at).unwrap(),
+        MappingLearnPhase::Armed { deadline }
+    );
+    let captured_at = started_at + Duration::from_millis(25);
+    learn
+        .observe(captured_at, ControlSource::CvInput { input_index: 3 })
+        .unwrap();
+    assert_eq!(
+        learn.phase(deadline + Duration::from_secs(1)).unwrap(),
+        MappingLearnPhase::Candidate {
+            source: &ControlSource::CvInput { input_index: 3 },
+            captured_at,
+        }
+    );
+    assert!(matches!(
+        learn.observe(
+            captured_at + Duration::from_millis(1),
+            ControlSource::CvInput { input_index: 2 }
+        ),
+        Err(MappingLearnCaptureError::CandidateAlreadyCaptured)
+    ));
+    let invalid_retry_at = captured_at + Duration::from_millis(2);
+    assert_eq!(
+        learn.retry(invalid_retry_at, invalid_retry_at),
+        Err(MappingLearnRetryError::DeadlineNotFuture)
+    );
+    assert_eq!(
+        learn.phase(invalid_retry_at).unwrap(),
+        MappingLearnPhase::Candidate {
+            source: &ControlSource::CvInput { input_index: 3 },
+            captured_at,
+        }
+    );
+    assert_eq!(
+        learn.editor().bindings()[0].source(),
+        original.bindings()[0].source()
+    );
+    assert_eq!(learn.editor().revision().value(), 0);
+
+    let editor = learn.confirm(deadline + Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        editor.bindings()[0].source(),
+        &ControlSource::CvInput { input_index: 3 }
+    );
+    assert_eq!(editor.revision().value(), 1);
+}
+
+#[test]
+fn learn_accepts_edge_sources_for_trigger_bindings() {
+    let original = document(vec![trigger_binding(FIRST_BINDING_ID)]);
+    let started_at = Instant::now();
+    let deadline = started_at + Duration::from_secs(1);
+    let mut learn = MappingEditor::new(original)
+        .begin_learn(FIRST_BINDING_ID, started_at, deadline)
+        .unwrap();
+    let captured_at = started_at + Duration::from_millis(1);
+
+    learn
+        .observe(
+            captured_at,
+            ControlSource::ResetInput {
+                edge: Edge::Falling,
+            },
+        )
+        .unwrap();
+    let editor = learn.confirm(captured_at).unwrap();
+
+    assert_eq!(
+        editor.bindings()[0].source(),
+        &ControlSource::ResetInput {
+            edge: Edge::Falling,
+        }
+    );
+    assert_eq!(editor.revision().value(), 1);
+}
+
+#[test]
+fn learn_timeout_retry_and_cancel_are_explicit_and_failure_atomic() {
+    let original = document(vec![binding(
+        FIRST_BINDING_ID,
+        true,
+        0,
+        ControlScope::Global,
+    )]);
+    let started_at = Instant::now();
+    let deadline = started_at + Duration::from_millis(10);
+    let mut learn = MappingEditor::new(original.clone())
+        .begin_learn(FIRST_BINDING_ID, started_at, deadline)
+        .unwrap();
+
+    assert_eq!(
+        learn.phase(deadline).unwrap(),
+        MappingLearnPhase::TimedOut { deadline }
+    );
+    assert!(matches!(
+        learn.observe(deadline, ControlSource::CvInput { input_index: 1 }),
+        Err(MappingLearnCaptureError::TimedOut)
+    ));
+    let Err(rejected) = learn.confirm(deadline) else {
+        panic!("timed-out Learn must not publish an editor mutation");
+    };
+    assert_eq!(rejected.reason(), MappingLearnConfirmationError::TimedOut);
+    let mut learn = rejected.into_session();
+
+    let retried_at = deadline + Duration::from_millis(1);
+    let retry_deadline = retried_at + Duration::from_secs(2);
+    learn.retry(retried_at, retry_deadline).unwrap();
+    assert_eq!(
+        learn.retry(retried_at, retried_at),
+        Err(MappingLearnRetryError::DeadlineNotFuture)
+    );
+    assert_eq!(
+        learn.phase(started_at),
+        Err(MappingLearnClockError::ClockRegressed)
+    );
+
+    let editor = learn.cancel();
+    assert_eq!(editor.cancel(), original);
+}
+
+#[test]
+fn learn_rejects_incompatible_sources_and_preserves_editor_authority() {
+    let original = document(vec![binding(
+        FIRST_BINDING_ID,
+        true,
+        0,
+        ControlScope::Global,
+    )]);
+    let started_at = Instant::now();
+    let deadline = started_at + Duration::from_secs(1);
+
+    let rejected = MappingEditor::new(original.clone())
+        .begin_learn(SECOND_BINDING_ID, started_at, deadline)
+        .unwrap_err();
+    assert_eq!(rejected.reason(), MappingLearnStartError::BindingMissing);
+    let editor = rejected.into_editor();
+    let rejected = editor
+        .begin_learn(FIRST_BINDING_ID, started_at, started_at)
+        .unwrap_err();
+    assert_eq!(rejected.reason(), MappingLearnStartError::DeadlineNotFuture);
+
+    let mut learn = rejected
+        .into_editor()
+        .begin_learn(FIRST_BINDING_ID, started_at, deadline)
+        .unwrap();
+    let error = learn
+        .observe(
+            started_at + Duration::from_millis(1),
+            ControlSource::ClockInput { edge: Edge::Rising },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MappingLearnCaptureError::IncompatibleSource(_)
+    ));
+    assert_eq!(
+        learn.phase(started_at + Duration::from_millis(1)).unwrap(),
+        MappingLearnPhase::Armed { deadline }
+    );
+    assert_eq!(learn.cancel().cancel(), original);
+}
+
 struct ProjectFixture {
     root: PathBuf,
 }
@@ -399,6 +580,22 @@ fn binding(id: &str, enabled: bool, input_index: u8, scope: ControlScope) -> Con
         ControlTarget::MixerChannel {
             track_id: TRACK_ID.to_owned(),
             parameter: ChannelParameter::Gain,
+        },
+    )
+    .unwrap()
+}
+
+fn trigger_binding(id: &str) -> ControlBinding {
+    ControlBinding::try_new(
+        id.to_owned(),
+        true,
+        ControlSource::ClockInput { edge: Edge::Rising },
+        ControlScope::Global,
+        ControlTransform::Trigger {
+            behavior: TriggerBehavior::Invoke,
+        },
+        ControlTarget::Transport {
+            action: TransportAction::Play,
         },
     )
     .unwrap()

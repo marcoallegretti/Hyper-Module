@@ -1,5 +1,13 @@
-#![doc = "Transactional manual editing for version-1 control mappings."]
+#![doc = "Transactional editing for version-1 control mappings."]
 #![forbid(unsafe_code)]
+
+mod learn;
+
+pub use learn::{
+    MappingLearnCaptureError, MappingLearnClockError, MappingLearnConfirmationError,
+    MappingLearnPhase, MappingLearnRetryError, MappingLearnSession, MappingLearnStartError,
+    RejectedMappingLearnConfirmation, RejectedMappingLearnStart,
+};
 
 use core::error::Error;
 use core::fmt;
