@@ -7,6 +7,9 @@ export enum AppMode {
     opening,
     running,
     saving,
+    preparing-recording,
+    recording,
+    finalizing-recording,
     closing,
     unavailable,
 }
@@ -68,6 +71,9 @@ export global IdeActions {
     callback mixer-send-pan(int, float);
     callback mixer-send-enabled(int);
     callback save-project();
+    callback start-recording();
+    callback stop-recording();
+    callback abort-recording();
     callback close-project();
 }
 
@@ -150,6 +156,11 @@ export component MainWindow inherits Window {
     in property <bool> mixer-main-state-available: false;
     in property <float> mixer-main-gain-percent: 0;
     in property <bool> mixer-main-muted: false;
+    in property <[string]> recording-target-names: [];
+    in-out property <int> selected-recording-target-index: 0;
+    in property <string> recording-target: "—";
+    in property <string> recording-frame-count: "0";
+    in property <string> recording-drop-count: "0";
     in property <string> transport-state: "Stopped";
     in property <string> stream-state: "No stream";
     in property <string> frame-position: "0";
@@ -192,10 +203,14 @@ export component MainWindow inherits Window {
                 width: 144px;
                 height: 31px;
                 border-radius: 16px;
-                background: root.app-mode == AppMode.running ? #173d31
+                background: root.app-mode == AppMode.recording ? #542126
+                    : root.app-mode == AppMode.running ? #173d31
                     : root.app-mode == AppMode.unavailable ? #492323 : #222b36;
                 Text {
-                    text: root.app-mode == AppMode.running ? "●  RUNNING"
+                    text: root.app-mode == AppMode.recording ? "●  RECORDING"
+                        : root.app-mode == AppMode.preparing-recording ? "◌  PREPARING"
+                        : root.app-mode == AppMode.finalizing-recording ? "◌  FINALIZING"
+                        : root.app-mode == AppMode.running ? "●  RUNNING"
                         : root.app-mode == AppMode.opening ? "◌  OPENING"
                         : root.app-mode == AppMode.saving ? "◌  SAVING"
                         : root.app-mode == AppMode.selecting ? "◌  SELECTING"
@@ -203,7 +218,8 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.closed ? "●  READY"
                         : root.app-mode == AppMode.unavailable ? "●  UNAVAILABLE"
                         : "◌  DISCOVERING";
-                    color: root.app-mode == AppMode.running ? #63e6b5
+                    color: root.app-mode == AppMode.recording ? #ff8b87
+                        : root.app-mode == AppMode.running ? #63e6b5
                         : root.app-mode == AppMode.unavailable ? #ff8b87 : #a9b5c4;
                     font-size: 11px;
                     font-weight: 600;
@@ -223,10 +239,10 @@ export component MainWindow inherits Window {
                 spacing: 16px;
 
                 Panel {
-                    height: 326px;
+                    height: 298px;
                     VerticalLayout {
-                        padding: 18px;
-                        spacing: 8px;
+                        padding: 14px;
+                        spacing: 6px;
                         Text { text: "AUDIO I/O"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
                         Text { text: "Playback output"; color: #edf2f8; font-size: 14px; font-weight: 600; }
                         output-selector := ComboBox {
@@ -290,7 +306,7 @@ export component MainWindow inherits Window {
                                     minimum: 0;
                                     maximum: 100;
                                     value: root.monitoring-gain-percent;
-                                    enabled: root.app-mode == AppMode.running && root.monitoring-active;
+                                    enabled: (root.app-mode == AppMode.running || root.app-mode == AppMode.recording) && root.monitoring-active;
                                     accessible-label: "Input cue gain";
                                     released(value) => { IdeActions.monitor-gain(value); }
                                 }
@@ -298,7 +314,7 @@ export component MainWindow inherits Window {
                             Button {
                                 width: 72px;
                                 text: root.monitoring-muted ? "MUTED" : "MUTE";
-                                enabled: root.app-mode == AppMode.running && root.monitoring-active;
+                                enabled: (root.app-mode == AppMode.running || root.app-mode == AppMode.recording) && root.monitoring-active;
                                 clicked => { IdeActions.monitor-mute(); }
                             }
                         }
@@ -309,8 +325,8 @@ export component MainWindow inherits Window {
                 Panel {
                     vertical-stretch: 1;
                     VerticalLayout {
-                        padding: 18px;
-                        spacing: 12px;
+                        padding: 14px;
+                        spacing: 8px;
                         Text { text: "PROJECT"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
                         Text { text: root.project-name; color: #edf2f8; font-size: 18px; font-weight: 600; overflow: elide; }
                         Text { text: root.project-location; color: #8290a2; font-size: 11px; wrap: word-wrap; vertical-stretch: 1; }
@@ -335,6 +351,34 @@ export component MainWindow inherits Window {
                         }
                         Text { text: "Verified identity"; color: #65758a; font-size: 10px; }
                         Text { text: root.project-id; color: #b9c5d3; font-size: 11px; overflow: elide; }
+                        Rectangle { height: 1px; background: #27313d; }
+                        Text { text: "CAPTURE TAKE"; color: #6f8197; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
+                        ComboBox {
+                            model: root.recording-target-names;
+                            current-index <=> root.selected-recording-target-index;
+                            enabled: root.app-mode == AppMode.running && root.monitoring-active && root.recording-target-names.length > 0;
+                            accessible-label: "Recording target audio track";
+                        }
+                        if root.app-mode == AppMode.recording : HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Stop & import"; clicked => { IdeActions.stop-recording(); } }
+                            Button { text: "Abort"; clicked => { IdeActions.abort-recording(); } }
+                        }
+                        if root.app-mode != AppMode.recording : Button {
+                            text: root.app-mode == AppMode.preparing-recording ? "Preparing capture…"
+                                : root.app-mode == AppMode.finalizing-recording ? "Finalizing capture…"
+                                : "Record take";
+                            enabled: root.app-mode == AppMode.running && root.monitoring-active && root.recording-target-names.length > 0;
+                            clicked => { IdeActions.start-recording(); }
+                        }
+                        Text {
+                            text: root.app-mode == AppMode.recording
+                                ? root.recording-target + "  ·  " + root.recording-frame-count + " frames  ·  " + root.recording-drop-count + " rejected"
+                                : "Takes must stay under 15 minutes; overruns retain recovery data. Playback pauses; no synchronized overdub.";
+                            color: root.app-mode == AppMode.recording ? #ffaaa6 : #728196;
+                            font-size: 9px;
+                            wrap: word-wrap;
+                        }
                     }
                 }
             }

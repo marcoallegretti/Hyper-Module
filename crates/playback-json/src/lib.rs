@@ -1193,6 +1193,12 @@ impl LoadedPlaybackProject {
         self.sample_rate_hz
     }
 
+    /// Returns the validated version-1 step-tempo map in project order.
+    #[must_use]
+    pub fn tempo_events(&self) -> &[TempoEvent] {
+        &self.tempo_events
+    }
+
     #[must_use]
     pub fn track_count(&self) -> usize {
         self.tracks.len()

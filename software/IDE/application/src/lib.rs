@@ -40,13 +40,20 @@ use hyper_storage_engine::{
     ProjectResourcePublicationRequest, StorageError, publish_project_resource,
 };
 
+mod recording;
 mod worker;
+
+pub use recording::{
+    IdeRecordingAbortError, IdeRecordingAbortOutcome, IdeRecordingError, IdeRecordingFinalizeError,
+    IdeRecordingImportOutcome, IdeRecordingObservation, IdeRecordingPreparationError,
+    IdeRecordingStartError,
+};
 
 pub use worker::{
     DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeClosedSnapshot, IdeMixerChannel,
-    IdeMixerSend, IdeRunningObservation, IdeScene, IdeWorkerCommand, IdeWorkerCommandFailure,
-    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
-    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeMixerSend, IdeRecordingState, IdeRunningObservation, IdeScene, IdeWorkerCommand,
+    IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError,
+    IdeWorkerJoinError, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
     IdeWorkerShutdownReport, IdeWorkerStartError, MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS,
     desktop_ide_worker_supervisor_snapshot,
 };
@@ -56,6 +63,11 @@ const DESKTOP_MONITORING_TRANSPORT_FRAMES: usize = DESKTOP_MAXIMUM_BLOCK_FRAMES 
 const DESKTOP_MONITORING_TARGET_FRAMES: usize = 256;
 const DESKTOP_MONITORING_CHUNK_FRAMES: usize = 64;
 const MONITOR_GAIN_MILLIONTHS_MAXIMUM: u32 = 1_000_000;
+const DESKTOP_RECORDING_TRANSPORT_FRAMES: usize = DESKTOP_MAXIMUM_BLOCK_FRAMES * 4;
+const DESKTOP_RECORDING_DRAIN_FRAMES: usize = DESKTOP_MAXIMUM_BLOCK_FRAMES;
+const DESKTOP_RECORDING_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+const DESKTOP_RECORDING_MAXIMUM_FRAMES: u64 = DESKTOP_MAX_AUDIO_FRAMES;
+const DESKTOP_RECORDING_DIRECTORY: &str = "recording-captures";
 const DESKTOP_MAX_AUDIO_FILE_BYTES: u64 = 512 * 1_024 * 1_024;
 const DESKTOP_MAX_AUDIO_FRAMES: u64 = 43_200_000;
 const DESKTOP_MAX_AUDIO_DECODED_BYTES: usize = 2 * 43_200_000 * size_of::<f32>();
@@ -850,8 +862,23 @@ impl DesktopIdeApplication {
         &self,
         output: DesktopOutputConfig,
     ) -> Result<Option<DesktopMonitoringConfig>, IdeProjectOpenError> {
-        let input = match &self.input_selection {
-            IdeInputSelection::Disabled => return Ok(None),
+        let Some(input) = self.input_config()? else {
+            return Ok(None);
+        };
+        DesktopMonitoringConfig::try_new(
+            input,
+            output,
+            DESKTOP_MONITORING_TRANSPORT_FRAMES,
+            DESKTOP_MONITORING_TARGET_FRAMES,
+            DESKTOP_MONITORING_CHUNK_FRAMES,
+        )
+        .map(Some)
+        .map_err(IdeProjectOpenError::MonitoringConfig)
+    }
+
+    fn input_config(&self) -> Result<Option<DesktopInputConfig>, IdeProjectOpenError> {
+        match &self.input_selection {
+            IdeInputSelection::Disabled => Ok(None),
             IdeInputSelection::SystemDefault => {
                 let inputs = self
                     .inputs
@@ -861,7 +888,8 @@ impl DesktopIdeApplication {
                     return Err(IdeProjectOpenError::SelectedInputUnavailable);
                 }
                 DesktopInputConfig::try_new(48_000, self.config.maximum_block_frames)
-                    .map_err(IdeProjectOpenError::InputConfig)?
+                    .map(Some)
+                    .map_err(IdeProjectOpenError::InputConfig)
             }
             IdeInputSelection::Routed(routing_id) => {
                 let inputs = self
@@ -874,18 +902,10 @@ impl DesktopIdeApplication {
                 DesktopInputConfig::try_new(48_000, self.config.maximum_block_frames)
                     .map_err(IdeProjectOpenError::InputConfig)?
                     .with_routing_id(routing_id)
-                    .map_err(IdeProjectOpenError::InputConfig)?
+                    .map(Some)
+                    .map_err(IdeProjectOpenError::InputConfig)
             }
-        };
-        DesktopMonitoringConfig::try_new(
-            input,
-            output,
-            DESKTOP_MONITORING_TRANSPORT_FRAMES,
-            DESKTOP_MONITORING_TARGET_FRAMES,
-            DESKTOP_MONITORING_CHUNK_FRAMES,
-        )
-        .map(Some)
-        .map_err(IdeProjectOpenError::MonitoringConfig)
+        }
     }
 }
 
@@ -1300,6 +1320,7 @@ pub struct IdeMonitoringState {
 
 #[derive(Clone, Copy, Debug)]
 pub struct RunningIdeSnapshot<'a> {
+    pub project_path: &'a Path,
     pub project_id: &'a str,
     pub project_name: &'a str,
     pub sample_rate_hz: u32,
@@ -1307,6 +1328,7 @@ pub struct RunningIdeSnapshot<'a> {
     pub scene_names: [&'a str; MAX_IDE_SCENES],
     pub scene_availability: [IdeSceneAvailability; MAX_IDE_SCENES],
     pub mixer_channel_count: usize,
+    pub mixer_channel_ids: [&'a str; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_names: [&'a str; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_kinds: [IdeMixerChannelKind; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_states: [Option<IdeMixerChannelState>; MAX_IDE_MIXER_CHANNELS],
@@ -1505,6 +1527,10 @@ impl RunningDesktopIdeApplication {
         clippy::infallible_destructuring_match,
         reason = "the second owner variant is compiled only for deterministic controller tests"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the snapshot performs one linear bounded assembly of the verified project and runtime state"
+    )]
     pub fn snapshot(&self) -> Option<RunningIdeSnapshot<'_>> {
         let session = match &self.session {
             IdePlaybackSessionOwner::Native(session) => session,
@@ -1534,6 +1560,7 @@ impl RunningDesktopIdeApplication {
         if mixer_parameters.is_some_and(|state| state.channel_count() != mixer_channel_count) {
             return None;
         }
+        let mut mixer_channel_ids = [""; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_names = [""; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_kinds = [IdeMixerChannelKind::Audio; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_states = [None; MAX_IDE_MIXER_CHANNELS];
@@ -1546,6 +1573,7 @@ impl RunningDesktopIdeApplication {
         let mut mixer_send_states =
             [[None; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS];
         for (channel_index, slot) in mixer.slots().iter().enumerate() {
+            mixer_channel_ids[channel_index] = slot.track_id();
             mixer_channel_names[channel_index] = loaded.track_name(slot.track_id())?;
             mixer_channel_kinds[channel_index] = match slot.kind() {
                 CompiledMixerTrackKind::Audio => IdeMixerChannelKind::Audio,
@@ -1585,6 +1613,7 @@ impl RunningDesktopIdeApplication {
         let mixer_main_state = mixer_parameters.as_ref().map(ide_mixer_main_state);
         let monitoring = session_monitoring_state(session).ok()?;
         Some(RunningIdeSnapshot {
+            project_path: project.package().root(),
             project_id: project.package().manifest().project_id(),
             project_name: project.package().manifest().name(),
             sample_rate_hz: project.session().sample_rate_hz(),
@@ -1592,6 +1621,7 @@ impl RunningDesktopIdeApplication {
             scene_names,
             scene_availability,
             mixer_channel_count,
+            mixer_channel_ids,
             mixer_channel_names,
             mixer_channel_kinds,
             mixer_channel_states,
@@ -2320,6 +2350,7 @@ mod tests {
         let limits = config.project_limits();
         assert_eq!(config.maximum_block_frames(), DESKTOP_MAXIMUM_BLOCK_FRAMES);
         assert_eq!(limits.audio.max_frames(), DESKTOP_MAX_AUDIO_FRAMES);
+        assert_eq!(DESKTOP_RECORDING_MAXIMUM_FRAMES, DESKTOP_MAX_AUDIO_FRAMES);
         assert_eq!(
             limits.session.media_cache.max_assets,
             LoaderLimits::VERSION_1.max_clip_documents

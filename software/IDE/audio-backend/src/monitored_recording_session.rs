@@ -25,7 +25,7 @@ use core::error::Error;
 use core::fmt;
 use hyper_recording_metadata::{RecordingMetadataBuildError, RecordingMetadataContext};
 use hyper_recording_transport::{
-    RecordingProducer, RecordingPushError, RecordingTransportBuildError,
+    RecordingProducer, RecordingPushError, RecordingTransportBuildError, RecordingTransportSnapshot,
 };
 use hyper_recording_worker::{RecordingWorkerCompletion, RecordingWorkerStartError};
 use std::path::{Path, PathBuf};
@@ -165,6 +165,7 @@ pub enum DesktopMonitoredRecordingStartError {
     RecordingConfig(DesktopRecordingSessionConfigError),
     RecordingTransport(RecordingTransportBuildError),
     RecordingWriter(RecordingWorkerStartError),
+    MonitoringControl(super::DesktopMonitoringControlError),
     Input {
         journal_path: PathBuf,
         source: DesktopInputStartError,
@@ -187,7 +188,8 @@ impl DesktopMonitoredRecordingStartError {
             Self::MonitoringCapacityUnavailable
             | Self::RecordingConfig(_)
             | Self::RecordingTransport(_)
-            | Self::RecordingWriter(_) => None,
+            | Self::RecordingWriter(_)
+            | Self::MonitoringControl(_) => None,
         }
     }
 }
@@ -206,6 +208,9 @@ impl fmt::Display for DesktopMonitoredRecordingStartError {
             }
             Self::RecordingWriter(source) => {
                 write!(formatter, "recording writer startup failed: {source}")
+            }
+            Self::MonitoringControl(source) => {
+                write!(formatter, "recording monitor control is invalid: {source}")
             }
             Self::Input {
                 journal_path,
@@ -242,6 +247,7 @@ impl Error for DesktopMonitoredRecordingStartError {
             Self::RecordingConfig(source) => Some(source),
             Self::RecordingTransport(source) => Some(source),
             Self::RecordingWriter(source) => Some(source),
+            Self::MonitoringControl(source) => Some(source),
             Self::Input { source, .. } => Some(source),
             Self::Output { source, .. } => Some(source),
             Self::MonitoringCapacityUnavailable => None,
@@ -408,9 +414,28 @@ impl DesktopMonitoredRecordingSession {
     pub fn start(
         config: DesktopMonitoredRecordingConfig,
     ) -> Result<Self, DesktopMonitoredRecordingStartError> {
+        Self::start_with_monitor_state(config, 1.0, false)
+    }
+
+    /// Starts capture with an initial monitor state applied before either
+    /// native stream is published.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::start`] and rejects an invalid
+    /// initial gain before the recording writer or native streams are started.
+    pub fn start_with_monitor_state(
+        config: DesktopMonitoredRecordingConfig,
+        monitor_gain: f32,
+        monitor_muted: bool,
+    ) -> Result<Self, DesktopMonitoredRecordingStartError> {
         let (monitoring_producer, mut monitoring_consumer, monitoring_counters, control) =
             try_monitoring_transport(&config.monitoring)
                 .map_err(|_| DesktopMonitoredRecordingStartError::MonitoringCapacityUnavailable)?;
+        control
+            .set_gain_linear(monitor_gain)
+            .map_err(DesktopMonitoredRecordingStartError::MonitoringControl)?;
+        control.set_muted(monitor_muted);
         let native_input = NativeInputConfig::from(&config.recording.input);
         let (recording_producer, recording) = start_recording_core(config.recording.clone())
             .map_err(|source| match source {
@@ -482,6 +507,12 @@ impl DesktopMonitoredRecordingSession {
     #[must_use]
     pub fn monitoring_snapshot(&self) -> MonitoringSnapshot {
         self.monitoring_counters.snapshot()
+    }
+
+    /// Returns authoritative lossless recording transport progress.
+    #[must_use]
+    pub fn recording_snapshot(&self) -> RecordingTransportSnapshot {
+        self.recording.transport_snapshot()
     }
 
     #[must_use]
@@ -641,10 +672,15 @@ impl DesktopMonitoredRecordingSession {
 mod tests {
     use super::super::monitoring_session::realtime_allocator::HeapMeasurement;
     use super::*;
+    use crate::DesktopMonitoringControlError;
     use hyper_recording_journal::JournalConfig;
     use hyper_recording_transport::try_recording_transport;
     use hyper_recording_worker::RecordingWorkerConfig;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
     fn recording_config() -> DesktopRecordingSessionConfig {
         DesktopRecordingSessionConfig {
@@ -696,6 +732,36 @@ mod tests {
                 output_hz: 44_100
             }
         ));
+    }
+
+    #[test]
+    fn invalid_initial_monitor_gain_precedes_writer_and_native_startup() {
+        let id = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "hyper-desktop-monitored-recording-{id}-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let mut recording = recording_config();
+        recording.writer.journal_path = directory.join("take.journal");
+        recording.writer.final_wav_path = directory.join("take.wav");
+        let config = DesktopMonitoredRecordingConfig::try_new(
+            recording,
+            DesktopOutputConfig::try_new(48_000, 128).unwrap(),
+            1_024,
+            256,
+            128,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            DesktopMonitoredRecordingSession::start_with_monitor_state(config, f32::NAN, false),
+            Err(DesktopMonitoredRecordingStartError::MonitoringControl(
+                DesktopMonitoringControlError::NonFiniteGain
+            ))
+        ));
+        assert!(fs::read_dir(&directory).unwrap().next().is_none());
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]

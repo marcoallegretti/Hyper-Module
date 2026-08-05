@@ -12,7 +12,8 @@ use hyper_recording_metadata::{
     FinalizedRecordingMetadata, RecordingMetadataBuildError, RecordingMetadataContext,
 };
 use hyper_recording_transport::{
-    RecordingProducer, RecordingTransportBuildError, try_recording_transport,
+    RecordingProducer, RecordingTransportBuildError, RecordingTransportCounters,
+    RecordingTransportSnapshot, try_recording_transport,
 };
 use hyper_recording_worker::{
     RecordingDispositionError, RecordingWorker, RecordingWorkerCompletion, RecordingWorkerConfig,
@@ -443,6 +444,7 @@ pub(crate) struct RecordingSessionCore {
     writer: RecordingWorker,
     journal_path: PathBuf,
     completion_timeout: Duration,
+    transport_counters: RecordingTransportCounters,
 }
 
 pub(crate) enum RecordingCoreStartError {
@@ -467,6 +469,7 @@ pub(crate) fn start_recording_core(
     validate_config(&config).map_err(RecordingCoreStartError::Config)?;
     let (producer, consumer) = try_recording_transport(config.transport_capacity_frames)
         .map_err(RecordingCoreStartError::Transport)?;
+    let transport_counters = producer.counters();
     let journal_path = config.writer.journal_path.clone();
     let writer =
         RecordingWorker::start(config.writer, consumer).map_err(RecordingCoreStartError::Writer)?;
@@ -476,6 +479,7 @@ pub(crate) fn start_recording_core(
             writer,
             journal_path,
             completion_timeout: config.completion_timeout,
+            transport_counters,
         },
     ))
 }
@@ -484,6 +488,11 @@ impl RecordingSessionCore {
     #[must_use]
     pub(crate) fn journal_path(&self) -> &Path {
         &self.journal_path
+    }
+
+    #[must_use]
+    pub(crate) fn transport_snapshot(&self) -> RecordingTransportSnapshot {
+        self.transport_counters.snapshot()
     }
 
     pub(crate) fn abort_and_settle(mut self) -> DesktopRecordingWriterSettlement {
@@ -578,6 +587,12 @@ impl DesktopRecordingSession {
     #[must_use]
     pub fn counters(&self) -> CaptureStreamCounters {
         self.input.counters()
+    }
+
+    /// Returns authoritative producer/writer transport progress for this take.
+    #[must_use]
+    pub fn recording_snapshot(&self) -> RecordingTransportSnapshot {
+        self.recording.transport_snapshot()
     }
 
     #[must_use]
@@ -965,6 +980,33 @@ mod tests {
         ));
         assert!(fs::read_dir(&directory).unwrap().next().is_none());
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn recording_core_exposes_authoritative_transport_progress() {
+        let id = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "hyper-desktop-recording-progress-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let mut config = config();
+        config.writer.journal_path = directory.join("take.journal");
+        config.writer.final_wav_path = directory.join("take.wav");
+        let Ok((mut producer, recording)) = start_recording_core(config) else {
+            panic!("valid recording core must start");
+        };
+
+        producer.push(&[0.25, -0.25, 0.5, -0.5]).unwrap();
+        assert_eq!(recording.transport_snapshot().accepted_frame_count, 2);
+
+        drop(producer);
+        assert!(matches!(
+            recording.abort_and_settle(),
+            DesktopRecordingWriterSettlement::Completed(completion)
+                if matches!(*completion, RecordingWorkerCompletion::Aborted { frames: 2, .. })
+        ));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

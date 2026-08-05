@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, TransportCommand};
 use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSnapshot};
 
+use super::recording::{IdeRecordingPlan, IdeRecordingTarget, RecordingDesktopIdeApplication};
 use super::{
     DesktopIdeApplication, DesktopIdePendingClose, DesktopIdePendingSaveClose,
     DesktopPlaybackRecovery, IdeApplicationConfig, IdeAudioInputInventory, IdeAudioOutputInventory,
@@ -20,8 +21,10 @@ use super::{
     IdeMixerMainState, IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState,
     IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError,
     IdePendingCloseWait, IdePendingSaveCloseWait, IdeProjectOpenError, IdeProjectSaveError,
-    IdeSaveCloseOutcome, IdeSceneAvailability, InputInventoryError, OutputInventoryError,
-    OutputStreamSnapshot, OutputStreamState, RunningDesktopIdeApplication,
+    IdeRecordingAbortError, IdeRecordingAbortOutcome, IdeRecordingError, IdeRecordingImportOutcome,
+    IdeRecordingObservation, IdeSaveCloseOutcome, IdeSceneAvailability, InputInventoryError,
+    LocateState, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
+    RunningDesktopIdeApplication,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -32,15 +35,30 @@ const MIXER_SAVE_COMMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const MAX_IDE_WORKER_COMMANDS: usize = 64;
 pub const MAX_IDE_WORKER_EVENTS: usize = 64;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default)]
 pub struct IdeWorkerShutdownReport {
     native_failure: Option<IdeNativeCloseFailure>,
+    recording_abort: Option<Result<IdeRecordingAbortOutcome, IdeRecordingAbortError>>,
 }
 
 impl IdeWorkerShutdownReport {
     #[must_use]
-    pub const fn native_failure(self) -> Option<IdeNativeCloseFailure> {
+    pub const fn native_failure(&self) -> Option<IdeNativeCloseFailure> {
         self.native_failure
+    }
+
+    #[must_use]
+    pub fn recording_abort(
+        &self,
+    ) -> Option<Result<&IdeRecordingAbortOutcome, &IdeRecordingAbortError>> {
+        self.recording_abort.as_ref().map(|result| result.as_ref())
+    }
+
+    #[must_use]
+    pub fn into_recording_abort(
+        self,
+    ) -> Option<Result<IdeRecordingAbortOutcome, IdeRecordingAbortError>> {
+        self.recording_abort
     }
 }
 
@@ -84,6 +102,9 @@ pub enum IdeWorkerCommandKind {
     Mixer,
     Monitoring,
     SaveProject,
+    StartRecording,
+    StopRecording,
+    AbortRecording,
     Observe,
     CloseProject,
     Shutdown,
@@ -104,6 +125,9 @@ pub enum IdeWorkerCommand {
     Mixer(IdeMixerCommand),
     Monitoring(IdeMonitoringCommand),
     SaveProject,
+    StartRecording { channel_index: usize },
+    StopRecording,
+    AbortRecording,
     Observe,
     CloseProject,
     Shutdown,
@@ -126,6 +150,9 @@ impl IdeWorkerCommand {
             Self::Mixer(_) => IdeWorkerCommandKind::Mixer,
             Self::Monitoring(_) => IdeWorkerCommandKind::Monitoring,
             Self::SaveProject => IdeWorkerCommandKind::SaveProject,
+            Self::StartRecording { .. } => IdeWorkerCommandKind::StartRecording,
+            Self::StopRecording => IdeWorkerCommandKind::StopRecording,
+            Self::AbortRecording => IdeWorkerCommandKind::AbortRecording,
             Self::Observe => IdeWorkerCommandKind::Observe,
             Self::CloseProject => IdeWorkerCommandKind::CloseProject,
             Self::Shutdown => IdeWorkerCommandKind::Shutdown,
@@ -183,6 +210,66 @@ pub struct IdeRunningObservation {
     meter: LatestOutputMeterSnapshot,
 }
 
+#[derive(Debug)]
+pub struct IdeRecordingState {
+    project_id: String,
+    project_name: String,
+    track_id: String,
+    track_name: String,
+    sample_rate_hz: u32,
+    start_frame: usize,
+    start_tick: u64,
+    journal_path: PathBuf,
+    observation: IdeRecordingObservation,
+}
+
+impl IdeRecordingState {
+    #[must_use]
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    #[must_use]
+    pub fn project_name(&self) -> &str {
+        &self.project_name
+    }
+
+    #[must_use]
+    pub fn track_id(&self) -> &str {
+        &self.track_id
+    }
+
+    #[must_use]
+    pub fn track_name(&self) -> &str {
+        &self.track_name
+    }
+
+    #[must_use]
+    pub const fn sample_rate_hz(&self) -> u32 {
+        self.sample_rate_hz
+    }
+
+    #[must_use]
+    pub const fn start_frame(&self) -> usize {
+        self.start_frame
+    }
+
+    #[must_use]
+    pub const fn start_tick(&self) -> u64 {
+        self.start_tick
+    }
+
+    #[must_use]
+    pub fn journal_path(&self) -> &std::path::Path {
+        &self.journal_path
+    }
+
+    #[must_use]
+    pub const fn observation(&self) -> IdeRecordingObservation {
+        self.observation
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Owned UI-thread observation of one validated project scene.
 pub struct IdeScene {
@@ -192,6 +279,7 @@ pub struct IdeScene {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct IdeMixerChannel {
+    id: String,
     name: String,
     kind: IdeMixerChannelKind,
     state: Option<IdeMixerChannelState>,
@@ -206,6 +294,11 @@ pub struct IdeMixerSend {
 }
 
 impl IdeMixerChannel {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -331,6 +424,7 @@ pub enum IdeWorkerCommandFailure {
     Mixer(IdeMixerCommandError),
     Monitoring(IdeMonitoringCommandError),
     ProjectSave(IdeProjectSaveError),
+    Recording(IdeRecordingError),
     InvalidState,
     Publication(OutputInventoryError),
     InputPublication(InputInventoryError),
@@ -350,6 +444,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::Mixer(source) => source.fmt(formatter),
             Self::Monitoring(source) => source.fmt(formatter),
             Self::ProjectSave(source) => source.fmt(formatter),
+            Self::Recording(source) => source.fmt(formatter),
             Self::InvalidState => {
                 formatter.write_str("command is invalid for the current IDE state")
             }
@@ -377,6 +472,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::Mixer(source) => Some(source),
             Self::Monitoring(source) => Some(source),
             Self::ProjectSave(source) => Some(source),
+            Self::Recording(source) => Some(source),
             Self::Publication(source) => Some(source),
             Self::InputPublication(source) => Some(source),
             Self::InvalidState
@@ -405,6 +501,11 @@ pub enum IdeWorkerEvent {
         revision: u64,
         changed: bool,
     },
+    RecordingPreparing,
+    Recording(IdeRecordingState),
+    RecordingFinalizing,
+    RecordingImported(IdeRecordingImportOutcome),
+    RecordingAborted(IdeRecordingAbortOutcome),
     Saving,
     Closing,
     CommandFailed {
@@ -693,6 +794,17 @@ enum WorkerState {
         sequence: u64,
         deadline: Instant,
     },
+    RecordingFence {
+        application: RunningDesktopIdeApplication,
+        target: IdeRecordingTarget,
+        sequence: u64,
+        deadline: Instant,
+    },
+    RecordingClosing {
+        pending: DesktopIdePendingSaveClose,
+        target: IdeRecordingTarget,
+    },
+    Recording(RecordingDesktopIdeApplication),
     Saving(DesktopIdePendingSaveClose),
     Closing(DesktopIdePendingClose),
     Empty,
@@ -713,7 +825,11 @@ fn run_worker(
         }
         let command = if matches!(
             state,
-            WorkerState::SaveFence { .. } | WorkerState::Closing(_) | WorkerState::Saving(_)
+            WorkerState::SaveFence { .. }
+                | WorkerState::RecordingFence { .. }
+                | WorkerState::RecordingClosing { .. }
+                | WorkerState::Closing(_)
+                | WorkerState::Saving(_)
         ) {
             match commands.recv_timeout(WORKER_SHUTDOWN_POLL) {
                 Ok(command) => command,
@@ -904,16 +1020,13 @@ fn process_command(
             },
             _ => publish_failure(events, kind, IdeWorkerCommandFailure::InvalidState),
         },
-        IdeWorkerCommand::Monitoring(command) => match state {
-            WorkerState::Running(application) => match application.apply_monitoring(command) {
-                Ok(()) => send_event(events, IdeWorkerEvent::MonitoringApplied(command)),
-                Err(reason) => {
-                    publish_failure(events, kind, IdeWorkerCommandFailure::Monitoring(reason))
-                }
-            },
-            _ => publish_failure(events, kind, IdeWorkerCommandFailure::InvalidState),
-        },
+        IdeWorkerCommand::Monitoring(command) => process_monitoring_command(state, command, events),
         IdeWorkerCommand::SaveProject => save_project(state, events),
+        IdeWorkerCommand::StartRecording { channel_index } => {
+            start_recording(state, channel_index, events)
+        }
+        IdeWorkerCommand::StopRecording => finalize_recording(state, events),
+        IdeWorkerCommand::AbortRecording => abort_recording(state, events),
         IdeWorkerCommand::Observe => publish_state(state, events, unpublished_native_failure),
         IdeWorkerCommand::CloseProject => close_project(
             state,
@@ -922,6 +1035,32 @@ fn process_command(
             IdeWorkerCommandKind::CloseProject,
         ),
         IdeWorkerCommand::Shutdown => unreachable!("shutdown is handled by the worker loop"),
+    }
+}
+
+fn process_monitoring_command(
+    state: &mut WorkerState,
+    command: IdeMonitoringCommand,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    let result = match state {
+        WorkerState::Running(application) => application.apply_monitoring(command),
+        WorkerState::Recording(application) => application.apply_monitoring(command),
+        _ => {
+            return publish_failure(
+                events,
+                IdeWorkerCommandKind::Monitoring,
+                IdeWorkerCommandFailure::InvalidState,
+            );
+        }
+    };
+    match result {
+        Ok(()) => send_event(events, IdeWorkerEvent::MonitoringApplied(command)),
+        Err(reason) => publish_failure(
+            events,
+            IdeWorkerCommandKind::Monitoring,
+            IdeWorkerCommandFailure::Monitoring(reason),
+        ),
     }
 }
 
@@ -954,6 +1093,406 @@ fn process_input_command(
     match result {
         Ok(()) => publish_state(state, events, unpublished_native_failure),
         Err(reason) => publish_failure(events, kind, reason),
+    }
+}
+
+fn start_recording(
+    state: &mut WorkerState,
+    channel_index: usize,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    let WorkerState::Running(application) = state else {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::StartRecording,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    };
+    if !application.can_save_mixer() {
+        return publish_recording_failure(
+            events,
+            IdeWorkerCommandKind::StartRecording,
+            IdeRecordingError::Preparation(
+                super::IdeRecordingPreparationError::ProjectSnapshotUnavailable,
+            ),
+        );
+    }
+    let target = match application.prepare_recording_target(channel_index) {
+        Ok(target) => target,
+        Err(source) => {
+            return publish_recording_failure(
+                events,
+                IdeWorkerCommandKind::StartRecording,
+                IdeRecordingError::Preparation(source),
+            );
+        }
+    };
+    if let Err(source) = application.try_send_transport(TransportCommand::Stop) {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::StartRecording,
+            IdeWorkerCommandFailure::Transport(source),
+        );
+    }
+    let sequence = match application.try_send_mixer_fence() {
+        Ok(Some(sequence)) => sequence,
+        Ok(None) => {
+            return publish_recording_failure(
+                events,
+                IdeWorkerCommandKind::StartRecording,
+                IdeRecordingError::MixerSave(Box::new(
+                    IdeProjectSaveError::MixerFenceSequenceUnavailable,
+                )),
+            );
+        }
+        Err(source) => {
+            return publish_recording_failure(
+                events,
+                IdeWorkerCommandKind::StartRecording,
+                IdeRecordingError::MixerSave(Box::new(IdeProjectSaveError::MixerCommit(source))),
+            );
+        }
+    };
+    let WorkerState::Running(application) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("running state was checked before recording ownership transfer");
+    };
+    *state = WorkerState::RecordingFence {
+        application,
+        target,
+        sequence,
+        deadline: Instant::now() + MIXER_SAVE_COMMIT_TIMEOUT,
+    };
+    send_event(events, IdeWorkerEvent::RecordingPreparing)
+}
+
+fn begin_recording_close(
+    state: &mut WorkerState,
+    application: RunningDesktopIdeApplication,
+    target: IdeRecordingTarget,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    match application.close_for_save() {
+        IdeSaveCloseOutcome::Closed {
+            application,
+            recovery,
+            failure,
+        } => complete_recording_start(state, application, recovery, target, failure, events),
+        IdeSaveCloseOutcome::Pending(pending) => {
+            *state = WorkerState::RecordingClosing { pending, target };
+            send_event(events, IdeWorkerEvent::RecordingPreparing)
+        }
+        IdeSaveCloseOutcome::Unavailable {
+            application,
+            failure,
+        } => {
+            let observed_frame = target.observed_frame();
+            reopen_after_recording_failure(
+                state,
+                application,
+                target.project_path(),
+                observed_frame,
+                failure.map_or(
+                    IdeRecordingError::Preparation(
+                        super::IdeRecordingPreparationError::ProjectSnapshotUnavailable,
+                    ),
+                    IdeRecordingError::NativeClose,
+                ),
+                events,
+                IdeWorkerCommandKind::StartRecording,
+            )
+        }
+    }
+}
+
+fn complete_recording_start(
+    state: &mut WorkerState,
+    application: DesktopIdeApplication,
+    recovery: DesktopPlaybackRecovery,
+    target: IdeRecordingTarget,
+    native_failure: Option<IdeNativeCloseFailure>,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    let project_path = target.project_path().to_path_buf();
+    let start_frame = recovery.checkpoint().position_frame();
+    if let Some(failure) = native_failure {
+        drop(recovery);
+        return reopen_after_recording_failure(
+            state,
+            application,
+            &project_path,
+            start_frame,
+            IdeRecordingError::NativeClose(failure),
+            events,
+            IdeWorkerCommandKind::StartRecording,
+        );
+    }
+    let plan = match IdeRecordingPlan::prepare(target, &recovery) {
+        Ok(plan) => plan,
+        Err(source) => {
+            drop(recovery);
+            return reopen_after_recording_failure(
+                state,
+                application,
+                &project_path,
+                start_frame,
+                IdeRecordingError::Preparation(source),
+                events,
+                IdeWorkerCommandKind::StartRecording,
+            );
+        }
+    };
+    let publication = RunningDesktopIdeApplication::prepare_mixer_save(&application, &recovery)
+        .and_then(|save| {
+            save.publish()
+                .map_err(|source| IdeProjectSaveError::Publication(Box::new(source)))
+        });
+    drop(recovery);
+    if let Err(source) = publication {
+        return reopen_after_recording_failure(
+            state,
+            application,
+            &project_path,
+            start_frame,
+            IdeRecordingError::MixerSave(Box::new(source)),
+            events,
+            IdeWorkerCommandKind::StartRecording,
+        );
+    }
+    match application.start_recording(plan) {
+        Ok(recording) => {
+            *state = WorkerState::Recording(recording);
+            let mut no_native_failure = None;
+            publish_state(state, events, &mut no_native_failure)
+        }
+        Err(failure) => {
+            let super::recording::IdeRecordingStartFailure {
+                application,
+                project_path,
+                start_frame,
+                reason,
+            } = *failure;
+            reopen_after_recording_failure(
+                state,
+                application,
+                &project_path,
+                start_frame,
+                IdeRecordingError::Start(Box::new(reason)),
+                events,
+                IdeWorkerCommandKind::StartRecording,
+            )
+        }
+    }
+}
+
+fn finalize_recording(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) -> bool {
+    if !matches!(state, WorkerState::Recording(_)) {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::StopRecording,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    }
+    if !send_event(events, IdeWorkerEvent::RecordingFinalizing) {
+        return false;
+    }
+    let WorkerState::Recording(recording) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("recording state was checked before finalization");
+    };
+    match recording.finalize() {
+        Ok(finalized) => reopen_after_recording_import(state, finalized, events),
+        Err(failure) => {
+            let super::recording::IdeRecordingFinalizeFailure {
+                application,
+                project_path,
+                start_frame,
+                reason,
+            } = *failure;
+            reopen_after_recording_failure(
+                state,
+                application,
+                &project_path,
+                start_frame,
+                IdeRecordingError::Finalize(Box::new(reason)),
+                events,
+                IdeWorkerCommandKind::StopRecording,
+            )
+        }
+    }
+}
+
+fn abort_recording(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) -> bool {
+    if !matches!(state, WorkerState::Recording(_)) {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::AbortRecording,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    }
+    if !send_event(events, IdeWorkerEvent::RecordingFinalizing) {
+        return false;
+    }
+    let WorkerState::Recording(recording) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("recording state was checked before abort");
+    };
+    match recording.abort() {
+        Ok(aborted) => reopen_after_recording_abort(state, aborted, events),
+        Err(failure) => {
+            let super::recording::IdeRecordingAbortFailure {
+                application,
+                project_path,
+                start_frame,
+                reason,
+            } = *failure;
+            reopen_after_recording_failure(
+                state,
+                application,
+                &project_path,
+                start_frame,
+                IdeRecordingError::Abort(Box::new(reason)),
+                events,
+                IdeWorkerCommandKind::AbortRecording,
+            )
+        }
+    }
+}
+
+fn reopen_after_recording_failure(
+    state: &mut WorkerState,
+    application: DesktopIdeApplication,
+    project_path: &std::path::Path,
+    start_frame: usize,
+    operation: IdeRecordingError,
+    events: &SyncSender<IdeWorkerEvent>,
+    command: IdeWorkerCommandKind,
+) -> bool {
+    match application.open_project(project_path) {
+        Ok(mut running) => {
+            let restore = running.try_send_transport(TransportCommand::Locate {
+                frame: start_frame,
+                state: LocateState::Stopped,
+            });
+            *state = WorkerState::Running(running);
+            let mut no_native_failure = None;
+            if !publish_state(state, events, &mut no_native_failure) {
+                return false;
+            }
+            let reason = match restore {
+                Ok(()) => operation,
+                Err(restore) => IdeRecordingError::RestoreAfterFailure {
+                    operation: Box::new(operation),
+                    restore,
+                },
+            };
+            publish_recording_failure(events, command, reason)
+        }
+        Err(failure) => {
+            let (application, reopen) = failure.into_parts();
+            *state = WorkerState::Closed(application);
+            let mut no_native_failure = None;
+            if !publish_state(state, events, &mut no_native_failure) {
+                return false;
+            }
+            publish_recording_failure(
+                events,
+                command,
+                IdeRecordingError::ReopenAfterFailure {
+                    operation: Box::new(operation),
+                    reopen: Box::new(reopen),
+                },
+            )
+        }
+    }
+}
+
+fn reopen_after_recording_import(
+    state: &mut WorkerState,
+    finalized: super::recording::IdeRecordingFinalized,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    match finalized.application.open_project(&finalized.project_path) {
+        Ok(mut running) => {
+            let restore = running.try_send_transport(TransportCommand::Locate {
+                frame: finalized.start_frame,
+                state: LocateState::Stopped,
+            });
+            *state = WorkerState::Running(running);
+            let mut no_native_failure = None;
+            if !publish_state(state, events, &mut no_native_failure)
+                || !send_event(events, IdeWorkerEvent::RecordingImported(finalized.outcome))
+            {
+                return false;
+            }
+            match restore {
+                Ok(()) => true,
+                Err(source) => publish_recording_failure(
+                    events,
+                    IdeWorkerCommandKind::StopRecording,
+                    IdeRecordingError::Restore(source),
+                ),
+            }
+        }
+        Err(failure) => {
+            let (application, reopen) = failure.into_parts();
+            *state = WorkerState::Closed(application);
+            let mut no_native_failure = None;
+            if !publish_state(state, events, &mut no_native_failure) {
+                return false;
+            }
+            publish_recording_failure(
+                events,
+                IdeWorkerCommandKind::StopRecording,
+                IdeRecordingError::ImportedButReopenFailed {
+                    outcome: Box::new(finalized.outcome),
+                    reopen: Box::new(reopen),
+                },
+            )
+        }
+    }
+}
+
+fn reopen_after_recording_abort(
+    state: &mut WorkerState,
+    aborted: super::recording::IdeRecordingAborted,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    match aborted.application.open_project(&aborted.project_path) {
+        Ok(mut running) => {
+            let restore = running.try_send_transport(TransportCommand::Locate {
+                frame: aborted.start_frame,
+                state: LocateState::Stopped,
+            });
+            *state = WorkerState::Running(running);
+            let mut no_native_failure = None;
+            if !publish_state(state, events, &mut no_native_failure)
+                || !send_event(events, IdeWorkerEvent::RecordingAborted(aborted.outcome))
+            {
+                return false;
+            }
+            match restore {
+                Ok(()) => true,
+                Err(source) => publish_recording_failure(
+                    events,
+                    IdeWorkerCommandKind::AbortRecording,
+                    IdeRecordingError::Restore(source),
+                ),
+            }
+        }
+        Err(failure) => {
+            let (application, reopen) = failure.into_parts();
+            *state = WorkerState::Closed(application);
+            let mut no_native_failure = None;
+            if !publish_state(state, events, &mut no_native_failure) {
+                return false;
+            }
+            publish_recording_failure(
+                events,
+                IdeWorkerCommandKind::AbortRecording,
+                IdeRecordingError::AbortedButReopenFailed {
+                    outcome: Box::new(aborted.outcome),
+                    reopen: Box::new(reopen),
+                },
+            )
+        }
     }
 }
 
@@ -1196,6 +1735,17 @@ fn poll_pending_state(
                 true
             }
         },
+        WorkerState::RecordingClosing { pending, target } => match pending.wait(Duration::ZERO) {
+            IdePendingSaveCloseWait::Closed {
+                application,
+                recovery,
+                failure,
+            } => complete_recording_start(state, application, recovery, target, failure, events),
+            IdePendingSaveCloseWait::TimedOut(pending) => {
+                *state = WorkerState::RecordingClosing { pending, target };
+                true
+            }
+        },
         WorkerState::SaveFence {
             application,
             sequence,
@@ -1213,6 +1763,31 @@ fn poll_pending_state(
             } else {
                 *state = WorkerState::SaveFence {
                     application,
+                    sequence,
+                    deadline,
+                };
+                true
+            }
+        }
+        WorkerState::RecordingFence {
+            application,
+            target,
+            sequence,
+            deadline,
+        } => {
+            if application.committed_mixer_fence() >= sequence {
+                begin_recording_close(state, application, target, events)
+            } else if Instant::now() >= deadline {
+                *state = WorkerState::Running(application);
+                publish_recording_failure(
+                    events,
+                    IdeWorkerCommandKind::StartRecording,
+                    IdeRecordingError::MixerSave(Box::new(IdeProjectSaveError::MixerCommitTimeout)),
+                )
+            } else {
+                *state = WorkerState::RecordingFence {
+                    application,
+                    target,
                     sequence,
                     deadline,
                 };
@@ -1252,8 +1827,17 @@ fn publish_state(
                 return publish_failure(events, IdeWorkerCommandKind::Observe, reason);
             }
         },
+        WorkerState::Recording(application) => match recording_observation(application) {
+            Ok(observation) => IdeWorkerEvent::Recording(observation),
+            Err(reason) => {
+                return publish_failure(events, IdeWorkerCommandKind::Observe, reason);
+            }
+        },
         WorkerState::Closing(_) => IdeWorkerEvent::Closing,
         WorkerState::SaveFence { .. } | WorkerState::Saving(_) => IdeWorkerEvent::Saving,
+        WorkerState::RecordingFence { .. } | WorkerState::RecordingClosing { .. } => {
+            IdeWorkerEvent::RecordingPreparing
+        }
         WorkerState::Undiscovered(_) | WorkerState::Empty => return true,
     };
     if send_event(events, event) {
@@ -1337,6 +1921,7 @@ fn running_observation(
             });
         }
         mixer_channels.push(IdeMixerChannel {
+            id: try_project_owned(snapshot.mixer_channel_ids[channel_index])?,
             name: try_project_owned(snapshot.mixer_channel_names[channel_index])?,
             kind: snapshot.mixer_channel_kinds[channel_index],
             state: snapshot.mixer_channel_states[channel_index],
@@ -1358,6 +1943,22 @@ fn running_observation(
     })
 }
 
+fn recording_observation(
+    application: &RecordingDesktopIdeApplication,
+) -> Result<IdeRecordingState, IdeWorkerCommandFailure> {
+    Ok(IdeRecordingState {
+        project_id: try_project_owned(application.project_id())?,
+        project_name: try_project_owned(application.project_name())?,
+        track_id: try_project_owned(application.track_id())?,
+        track_name: try_project_owned(application.track_name())?,
+        sample_rate_hz: application.sample_rate_hz(),
+        start_frame: application.start_frame(),
+        start_tick: application.start_tick(),
+        journal_path: application.journal_path().to_path_buf(),
+        observation: application.observation(),
+    })
+}
+
 fn try_project_owned(value: &str) -> Result<String, IdeWorkerCommandFailure> {
     let mut owned = String::new();
     owned
@@ -1375,6 +1976,14 @@ fn publish_failure(
     send_event(events, IdeWorkerEvent::CommandFailed { command, reason })
 }
 
+fn publish_recording_failure(
+    events: &SyncSender<IdeWorkerEvent>,
+    command: IdeWorkerCommandKind,
+    reason: IdeRecordingError,
+) -> bool {
+    publish_failure(events, command, IdeWorkerCommandFailure::Recording(reason))
+}
+
 fn send_event(events: &SyncSender<IdeWorkerEvent>, event: IdeWorkerEvent) -> bool {
     events.send(event).is_ok()
 }
@@ -1383,33 +1992,57 @@ fn finish_worker(
     state: WorkerState,
     unpublished_native_failure: Option<IdeNativeCloseFailure>,
 ) -> IdeWorkerShutdownReport {
-    let shutdown_native_failure = shutdown_state(state);
+    let (shutdown_native_failure, recording_abort) = shutdown_state(state);
     IdeWorkerShutdownReport {
         native_failure: unpublished_native_failure.or(shutdown_native_failure),
+        recording_abort,
     }
 }
 
-fn shutdown_state(mut state: WorkerState) -> Option<IdeNativeCloseFailure> {
+fn shutdown_state(
+    mut state: WorkerState,
+) -> (
+    Option<IdeNativeCloseFailure>,
+    Option<Result<IdeRecordingAbortOutcome, IdeRecordingAbortError>>,
+) {
     loop {
         state = match state {
             WorkerState::Running(application) => match application.close() {
-                IdeCloseOutcome::Closed { failure, .. } => return failure,
+                IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
             },
             WorkerState::SaveFence { application, .. } => match application.close() {
-                IdeCloseOutcome::Closed { failure, .. } => return failure,
+                IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
+                IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
+            },
+            WorkerState::RecordingFence { application, .. } => match application.close() {
+                IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
             },
             WorkerState::Closing(pending) => match pending.wait(WORKER_SHUTDOWN_POLL) {
-                IdePendingCloseWait::Closed { failure, .. } => return failure,
+                IdePendingCloseWait::Closed { failure, .. } => return (failure, None),
                 IdePendingCloseWait::TimedOut(pending) => WorkerState::Closing(pending),
             },
             WorkerState::Saving(pending) => match pending.wait(WORKER_SHUTDOWN_POLL) {
-                IdePendingSaveCloseWait::Closed { failure, .. } => return failure,
+                IdePendingSaveCloseWait::Closed { failure, .. } => return (failure, None),
                 IdePendingSaveCloseWait::TimedOut(pending) => WorkerState::Saving(pending),
             },
+            WorkerState::RecordingClosing { pending, target } => {
+                match pending.wait(WORKER_SHUTDOWN_POLL) {
+                    IdePendingSaveCloseWait::Closed { failure, .. } => return (failure, None),
+                    IdePendingSaveCloseWait::TimedOut(pending) => {
+                        WorkerState::RecordingClosing { pending, target }
+                    }
+                }
+            }
+            WorkerState::Recording(recording) => {
+                return match recording.abort() {
+                    Ok(aborted) => (None, Some(Ok(aborted.outcome))),
+                    Err(failure) => (None, Some(Err(failure.reason))),
+                };
+            }
             WorkerState::Undiscovered(_) | WorkerState::Closed(_) | WorkerState::Empty => {
-                return None;
+                return (None, None);
             }
         };
     }
@@ -1644,6 +2277,66 @@ mod tests {
             recv(&worker),
             IdeWorkerEvent::TransportQueued(TransportCommand::Stop)
         ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn recording_preparation_failure_retains_the_running_owner() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 3, 3).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::StartRecording { channel_index: 0 })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::StartRecording,
+                reason: IdeWorkerCommandFailure::Recording(IdeRecordingError::Preparation(
+                    crate::IdeRecordingPreparationError::ProjectSnapshotUnavailable
+                )),
+            }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::Transport(TransportCommand::Stop))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::TransportQueued(TransportCommand::Stop)
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn recording_commands_are_rejected_while_closed() {
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 4, 4).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        for command in [
+            IdeWorkerCommand::StartRecording { channel_index: 0 },
+            IdeWorkerCommand::StopRecording,
+            IdeWorkerCommand::AbortRecording,
+        ] {
+            let kind = command.kind();
+            worker.try_send(command).unwrap();
+            assert!(matches!(
+                recv(&worker),
+                IdeWorkerEvent::CommandFailed {
+                    command,
+                    reason: IdeWorkerCommandFailure::InvalidState,
+                } if command == kind
+            ));
+        }
         assert_eq!(shutdown_report(worker).native_failure(), None);
     }
 

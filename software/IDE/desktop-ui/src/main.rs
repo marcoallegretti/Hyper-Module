@@ -10,11 +10,11 @@ use std::time::Duration;
 use hyper_desktop_ide::{
     DesktopIdeWorker, IdeApplicationConfig, IdeAudioInputInventory, IdeAudioOutputInventory,
     IdeInputSelection, IdeMixerChannel, IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap,
-    IdeMonitoringCommand, IdeNativeCloseFailure, IdeOutputSelection, IdeRunningObservation,
-    IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
-    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
-    IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState, TransportCommand,
-    desktop_ide_application_config,
+    IdeMonitoringCommand, IdeNativeCloseFailure, IdeOutputSelection, IdeRecordingAbortOutcome,
+    IdeRecordingImportOutcome, IdeRunningObservation, IdeScene, IdeSceneAvailability,
+    IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait,
+    IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState,
+    PlaybackRecoveryTransportState, TransportCommand, desktop_ide_application_config,
 };
 use slint::platform::PlatformError;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
@@ -32,6 +32,7 @@ const MAX_VISIBLE_MIXER_NAME_CHARS: usize = 10;
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
 type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
 type InputRoutes = Rc<RefCell<Vec<InputRoute>>>;
+type RecordingRoutes = Rc<RefCell<Vec<usize>>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum InputRoute {
@@ -115,9 +116,22 @@ fn run() -> Result<(), Box<dyn Error>> {
     let worker = Rc::new(RefCell::new(Some(worker)));
     let output_routes = Rc::new(RefCell::new(Vec::new()));
     let input_routes = Rc::new(RefCell::new(Vec::new()));
+    let recording_routes = Rc::new(RefCell::new(Vec::new()));
 
-    bind_callbacks(&ui, &worker, &output_routes, &input_routes);
-    let timer = start_event_pump(&ui, &worker, &output_routes, &input_routes);
+    bind_callbacks(
+        &ui,
+        &worker,
+        &output_routes,
+        &input_routes,
+        &recording_routes,
+    );
+    let timer = start_event_pump(
+        &ui,
+        &worker,
+        &output_routes,
+        &input_routes,
+        &recording_routes,
+    );
     let run_result = ui.run();
     timer.stop();
 
@@ -135,6 +149,7 @@ fn bind_callbacks(
     worker: &WorkerCell,
     output_routes: &OutputRoutes,
     input_routes: &InputRoutes,
+    recording_routes: &RecordingRoutes,
 ) {
     let actions = ui.global::<IdeActions>();
 
@@ -220,6 +235,7 @@ fn bind_callbacks(
 
     bind_playback_callbacks(ui, worker);
     bind_monitoring_callbacks(ui, worker);
+    bind_recording_callbacks(ui, worker, recording_routes);
 }
 
 fn bind_input_selection_callbacks(
@@ -265,7 +281,9 @@ fn bind_monitoring_callbacks(ui: &MainWindow, worker: &WorkerCell) {
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        if ui.get_app_mode() != AppMode::Running || !ui.get_monitoring_active() {
+        if !matches!(ui.get_app_mode(), AppMode::Running | AppMode::Recording)
+            || !ui.get_monitoring_active()
+        {
             return;
         }
         match monitor_percent_to_millionths(percent) {
@@ -284,7 +302,9 @@ fn bind_monitoring_callbacks(ui: &MainWindow, worker: &WorkerCell) {
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        if ui.get_app_mode() != AppMode::Running || !ui.get_monitoring_active() {
+        if !matches!(ui.get_app_mode(), AppMode::Running | AppMode::Recording)
+            || !ui.get_monitoring_active()
+        {
             return;
         }
         submit_to_ui(
@@ -294,6 +314,60 @@ fn bind_monitoring_callbacks(ui: &MainWindow, worker: &WorkerCell) {
                 muted: !ui.get_monitoring_muted(),
             }),
         );
+    });
+}
+
+fn bind_recording_callbacks(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    recording_routes: &RecordingRoutes,
+) {
+    let actions = ui.global::<IdeActions>();
+
+    let weak = ui.as_weak();
+    let worker_for_start = Rc::clone(worker);
+    let routes_for_start = Rc::clone(recording_routes);
+    actions.on_start_recording(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_monitoring_active() {
+            return;
+        }
+        let selected = usize::try_from(ui.get_selected_recording_target_index())
+            .ok()
+            .and_then(|index| routes_for_start.borrow().get(index).copied());
+        let Some(channel_index) = selected else {
+            ui.set_error_text("Recording target is no longer available".into());
+            return;
+        };
+        submit_to_ui(
+            &ui,
+            &worker_for_start,
+            IdeWorkerCommand::StartRecording { channel_index },
+        );
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_stop = Rc::clone(worker);
+    actions.on_stop_recording(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() == AppMode::Recording {
+            submit_to_ui(&ui, &worker_for_stop, IdeWorkerCommand::StopRecording);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_abort = Rc::clone(worker);
+    actions.on_abort_recording(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() == AppMode::Recording {
+            submit_to_ui(&ui, &worker_for_abort, IdeWorkerCommand::AbortRecording);
+        }
     });
 }
 
@@ -515,12 +589,14 @@ fn start_event_pump(
     worker: &WorkerCell,
     output_routes: &OutputRoutes,
     input_routes: &InputRoutes,
+    recording_routes: &RecordingRoutes,
 ) -> Timer {
     let timer = Timer::default();
     let weak = ui.as_weak();
     let worker = Rc::clone(worker);
     let output_routes = Rc::clone(output_routes);
     let input_routes = Rc::clone(input_routes);
+    let recording_routes = Rc::clone(recording_routes);
     let mut observation_pending = false;
     timer.start(TimerMode::Repeated, UI_POLL_INTERVAL, move || {
         let Some(ui) = weak.upgrade() else {
@@ -536,7 +612,7 @@ fn start_event_pump(
                     if completes_observation(&event) {
                         observation_pending = false;
                     }
-                    apply_event(&ui, &output_routes, &input_routes, event);
+                    apply_event(&ui, &output_routes, &input_routes, &recording_routes, event);
                 }
                 Ok(None) => break,
                 Err(error) => {
@@ -546,7 +622,7 @@ fn start_event_pump(
                 }
             }
         }
-        if ui.get_app_mode() != AppMode::Running {
+        if !matches!(ui.get_app_mode(), AppMode::Running | AppMode::Recording) {
             observation_pending = false;
         } else if !observation_pending {
             match worker.try_send(IdeWorkerCommand::Observe) {
@@ -566,6 +642,7 @@ fn completes_observation(event: &IdeWorkerEvent) -> bool {
     matches!(
         event,
         IdeWorkerEvent::Running(_)
+            | IdeWorkerEvent::Recording(_)
             | IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::Observe,
                 ..
@@ -598,8 +675,15 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
     };
     match worker.try_send(command) {
         Ok(()) => {
-            if command_kind == IdeWorkerCommandKind::SaveProject {
-                ui.set_app_mode(AppMode::Saving);
+            match command_kind {
+                IdeWorkerCommandKind::SaveProject => ui.set_app_mode(AppMode::Saving),
+                IdeWorkerCommandKind::StartRecording => {
+                    ui.set_app_mode(AppMode::PreparingRecording);
+                }
+                IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording => {
+                    ui.set_app_mode(AppMode::FinalizingRecording);
+                }
+                _ => {}
             }
             ui.set_error_text(SharedString::default());
             ui.set_status_text(command_status(command_kind).into());
@@ -636,6 +720,11 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::Mixer => "Mixer command queued…",
         IdeWorkerCommandKind::Monitoring => "Applying input cue control…",
         IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
+        IdeWorkerCommandKind::StartRecording => {
+            "Stopping playback and preparing an exclusive monitored capture…"
+        }
+        IdeWorkerCommandKind::StopRecording => "Verifying and importing the recorded take…",
+        IdeWorkerCommandKind::AbortRecording => "Aborting capture and retaining recovery data…",
         IdeWorkerCommandKind::Observe => "Refreshing runtime evidence…",
         IdeWorkerCommandKind::CloseProject => "Closing project and native output…",
         IdeWorkerCommandKind::Shutdown => "Shutting down…",
@@ -646,6 +735,7 @@ fn apply_event(
     ui: &MainWindow,
     output_routes: &OutputRoutes,
     input_routes: &InputRoutes,
+    recording_routes: &RecordingRoutes,
     event: IdeWorkerEvent,
 ) {
     match event {
@@ -661,7 +751,7 @@ fn apply_event(
                 snapshot.inputs(),
                 snapshot.input_selection(),
             );
-            reset_project(ui);
+            reset_project(ui, recording_routes);
             let mode = mode_after_closed_event(ui.get_app_mode());
             ui.set_app_mode(mode);
             if mode == AppMode::Closed {
@@ -672,7 +762,9 @@ fn apply_event(
                 ui.set_error_text(error.unwrap_or_default().into());
             }
         }
-        IdeWorkerEvent::Running(observation) => apply_running_event(ui, &observation),
+        IdeWorkerEvent::Running(observation) => {
+            apply_running_event(ui, recording_routes, &observation);
+        }
         IdeWorkerEvent::TransportQueued(command) => {
             ui.set_status_text(
                 match command {
@@ -706,6 +798,20 @@ fn apply_event(
             );
             ui.set_error_text(SharedString::default());
         }
+        IdeWorkerEvent::RecordingPreparing => {
+            ui.set_app_mode(AppMode::PreparingRecording);
+            ui.set_transport_state("Stopped for capture".into());
+            ui.set_status_text("Saving mixer state and transferring audio ownership…".into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::Recording(observation) => apply_recording_event(ui, &observation),
+        IdeWorkerEvent::RecordingFinalizing => {
+            ui.set_app_mode(AppMode::FinalizingRecording);
+            ui.set_status_text("Stopping capture and verifying the recorded WAV…".into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RecordingImported(outcome) => apply_recording_imported(ui, &outcome),
+        IdeWorkerEvent::RecordingAborted(outcome) => apply_recording_aborted(ui, &outcome),
         IdeWorkerEvent::Saving => {
             ui.set_app_mode(AppMode::Saving);
             ui.set_status_text("Waiting for native output before atomic save…".into());
@@ -721,7 +827,49 @@ fn apply_event(
     }
 }
 
-fn apply_running_event(ui: &MainWindow, observation: &IdeRunningObservation) {
+fn apply_recording_imported(ui: &MainWindow, outcome: &IdeRecordingImportOutcome) {
+    let monitor_warning = outcome
+        .monitor_output_error()
+        .map_or_else(String::new, |error| {
+            format!("; cue output shutdown warning: {error}")
+        });
+    ui.set_status_text(
+        format!(
+            "Imported {} frames as project revision {} ({}) · recovery journal retained at {}{}",
+            outcome.frames(),
+            outcome.project_revision(),
+            outcome.recording_path(),
+            outcome.journal_path().display(),
+            monitor_warning,
+        )
+        .into(),
+    );
+    ui.set_error_text(SharedString::default());
+}
+
+fn apply_recording_aborted(ui: &MainWindow, outcome: &IdeRecordingAbortOutcome) {
+    let monitor_warning = outcome
+        .monitor_output_error()
+        .map_or_else(String::new, |error| {
+            format!("; cue output shutdown warning: {error}")
+        });
+    ui.set_status_text(
+        format!(
+            "Capture aborted after {} frames; recovery journal retained at {}{}",
+            outcome.frames(),
+            outcome.journal_path().display(),
+            monitor_warning,
+        )
+        .into(),
+    );
+    ui.set_error_text(SharedString::default());
+}
+
+fn apply_running_event(
+    ui: &MainWindow,
+    recording_routes: &RecordingRoutes,
+    observation: &IdeRunningObservation,
+) {
     ui.set_app_mode(AppMode::Running);
     ui.set_project_name(observation.project_name().into());
     ui.set_project_id(observation.project_id().into());
@@ -729,6 +877,7 @@ fn apply_running_event(ui: &MainWindow, observation: &IdeRunningObservation) {
     ui.set_scene_count(observation.scene_count().to_string().into());
     set_scenes(ui, observation.scenes());
     apply_mixer_observation(ui, observation);
+    set_recording_targets(ui, recording_routes, observation.mixer_channels());
     ui.set_stream_state(format!("{:?}", observation.output_state()).into());
     ui.set_callback_count(observation.output().callback_count.to_string().into());
     if let Some(monitoring) = observation.monitoring() {
@@ -765,7 +914,11 @@ fn apply_running_event(ui: &MainWindow, observation: &IdeRunningObservation) {
     let position_frame = observation.recovery().position_frame();
     ui.set_frame_position(position_frame.to_string().into());
     ui.set_transport_clock(
-        format_transport_clock(position_frame, observation.sample_rate_hz()).into(),
+        format_transport_clock(
+            u64::try_from(position_frame).unwrap_or(u64::MAX),
+            observation.sample_rate_hz(),
+        )
+        .into(),
     );
     ui.set_transport_state(
         match observation.recovery().state() {
@@ -789,6 +942,87 @@ fn apply_running_event(ui: &MainWindow, observation: &IdeRunningObservation) {
     ui.set_right_reading(right_reading.into());
     ui.set_status_text("Runtime evidence updated".into());
     ui.set_error_text(SharedString::default());
+}
+
+fn apply_recording_event(ui: &MainWindow, state: &hyper_desktop_ide::IdeRecordingState) {
+    let observation = state.observation();
+    ui.set_app_mode(AppMode::Recording);
+    ui.set_project_name(state.project_name().into());
+    ui.set_project_id(state.project_id().into());
+    ui.set_sample_rate(format!("{} Hz", state.sample_rate_hz()).into());
+    ui.set_recording_target(state.track_name().into());
+    ui.set_recording_frame_count(observation.accepted_frames().to_string().into());
+    ui.set_recording_drop_count(observation.rejected_frames().to_string().into());
+    ui.set_transport_state("Recording · playback paused".into());
+    ui.set_stream_state(format!("Capture {:?}", observation.input_state()).into());
+    ui.set_frame_position(state.start_frame().to_string().into());
+    ui.set_transport_clock(
+        format_transport_clock(observation.accepted_frames(), state.sample_rate_hz()).into(),
+    );
+    ui.set_callback_count(observation.input().callback_count.to_string().into());
+    ui.set_monitoring_active(true);
+    ui.set_monitoring_gain_percent(observation.monitor_gain() * 100.0);
+    ui.set_monitoring_muted(observation.monitor_muted());
+    ui.set_monitoring_state(format!("{:?}", observation.input_state()).into());
+    ui.set_monitoring_frame_count(
+        observation
+            .monitoring()
+            .accepted_frame_count
+            .to_string()
+            .into(),
+    );
+    let monitoring_drops = observation
+        .input()
+        .dropped_frame_count
+        .saturating_add(observation.monitoring().overflow_frame_count)
+        .saturating_add(observation.monitoring().consumer_closed_frame_count);
+    ui.set_monitoring_drop_count(monitoring_drops.to_string().into());
+    ui.set_monitoring_underflow_count(observation.monitoring().underflow_count.to_string().into());
+    ui.set_xrun_count(
+        observation
+            .output()
+            .native_xruns
+            .map_or_else(
+                || "Unavailable".to_owned(),
+                |xrun| {
+                    xrun.recovery_count.map_or_else(
+                        || "Observed, count unavailable".to_owned(),
+                        |count| count.to_string(),
+                    )
+                },
+            )
+            .into(),
+    );
+    ui.set_left_meter(0.0);
+    ui.set_right_meter(0.0);
+    ui.set_left_reading("—".into());
+    ui.set_right_reading("—".into());
+    ui.set_status_text("Capturing a monitored take; project playback remains paused".into());
+    ui.set_error_text(SharedString::default());
+}
+
+fn set_recording_targets(
+    ui: &MainWindow,
+    recording_routes: &RecordingRoutes,
+    channels: &[IdeMixerChannel],
+) {
+    let previous = usize::try_from(ui.get_selected_recording_target_index())
+        .ok()
+        .and_then(|index| recording_routes.borrow().get(index).copied());
+    let mut routes = Vec::new();
+    let mut names = Vec::new();
+    for (channel_index, channel) in channels.iter().enumerate() {
+        if channel.kind() == IdeMixerChannelKind::Audio {
+            routes.push(channel_index);
+            names.push(SharedString::from(channel.name()));
+        }
+    }
+    let selected = previous
+        .and_then(|previous| routes.iter().position(|route| *route == previous))
+        .unwrap_or(0);
+    *recording_routes.borrow_mut() = routes;
+    ui.set_recording_target_names(ModelRc::from(Rc::new(VecModel::from(names))));
+    ui.set_selected_recording_target_index(i32::try_from(selected).unwrap_or(-1));
 }
 
 fn apply_mixer_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
@@ -907,7 +1141,7 @@ fn input_presentation(
     }
 }
 
-fn reset_project(ui: &MainWindow) {
+fn reset_project(ui: &MainWindow, recording_routes: &RecordingRoutes) {
     ui.set_project_name("No project open".into());
     ui.set_project_id("—".into());
     ui.set_sample_rate("—".into());
@@ -920,6 +1154,12 @@ fn reset_project(ui: &MainWindow) {
     ui.set_mixer_main_state_available(false);
     ui.set_mixer_main_gain_percent(0.0);
     ui.set_mixer_main_muted(false);
+    recording_routes.borrow_mut().clear();
+    ui.set_recording_target_names(ModelRc::default());
+    ui.set_selected_recording_target_index(0);
+    ui.set_recording_target("—".into());
+    ui.set_recording_frame_count("0".into());
+    ui.set_recording_drop_count("0".into());
     ui.set_transport_state("Stopped".into());
     ui.set_stream_state("No stream".into());
     ui.set_frame_position("0".into());
@@ -953,6 +1193,14 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::Observe if current == AppMode::Opening => AppMode::Running,
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
         IdeWorkerCommandKind::SaveProject if current == AppMode::Saving => AppMode::Running,
+        IdeWorkerCommandKind::StartRecording if current == AppMode::PreparingRecording => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording
+            if current == AppMode::FinalizingRecording =>
+        {
+            AppMode::Running
+        }
         _ => current,
     }
 }
@@ -1336,11 +1584,11 @@ fn meter_presentation(sample_peak: Option<f32>) -> (f32, String) {
     )
 }
 
-fn format_transport_clock(frame: usize, sample_rate_hz: u32) -> String {
+fn format_transport_clock(frame: u64, sample_rate_hz: u32) -> String {
     if sample_rate_hz == 0 {
         return "—".to_owned();
     }
-    let total_milliseconds = (frame as u128 * 1_000) / u128::from(sample_rate_hz);
+    let total_milliseconds = (u128::from(frame) * 1_000) / u128::from(sample_rate_hz);
     let milliseconds = total_milliseconds % 1_000;
     let total_seconds = total_milliseconds / 1_000;
     let seconds = total_seconds % 60;
@@ -1384,9 +1632,12 @@ fn finish_shutdown(
     result: Result<IdeWorkerShutdownReport, hyper_desktop_ide::IdeWorkerJoinError>,
 ) -> Result<(), DesktopUiShutdownError> {
     let report = result.map_err(DesktopUiShutdownError::Join)?;
-    match report.native_failure() {
-        Some(failure) => Err(DesktopUiShutdownError::Native(failure)),
-        None => Ok(()),
+    if let Some(failure) = report.native_failure() {
+        return Err(DesktopUiShutdownError::Native(failure));
+    }
+    match report.into_recording_abort() {
+        Some(Err(source)) => Err(DesktopUiShutdownError::RecordingAbort(source)),
+        Some(Ok(_)) | None => Ok(()),
     }
 }
 
@@ -1395,6 +1646,7 @@ enum DesktopUiShutdownError {
     TimedOut,
     Join(hyper_desktop_ide::IdeWorkerJoinError),
     Native(IdeNativeCloseFailure),
+    RecordingAbort(hyper_desktop_ide::IdeRecordingAbortError),
 }
 
 impl fmt::Display for DesktopUiShutdownError {
@@ -1405,6 +1657,12 @@ impl fmt::Display for DesktopUiShutdownError {
             }
             Self::Join(source) => source.fmt(formatter),
             Self::Native(failure) => formatter.write_str(&native_failure_message(*failure)),
+            Self::RecordingAbort(source) => {
+                write!(
+                    formatter,
+                    "recording could not be aborted during shutdown: {source}"
+                )
+            }
         }
     }
 }
@@ -1413,6 +1671,7 @@ impl Error for DesktopUiShutdownError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Join(source) => Some(source),
+            Self::RecordingAbort(source) => Some(source),
             Self::TimedOut | Self::Native(_) => None,
         }
     }
@@ -1424,18 +1683,21 @@ fn finish_exit(
 ) -> Result<(), DesktopUiExitError> {
     match (run, shutdown) {
         (Ok(()), Ok(())) => Ok(()),
-        (Err(run), Ok(())) => Err(DesktopUiExitError::Run(run)),
+        (Err(run), Ok(())) => Err(DesktopUiExitError::Run(Box::new(run))),
         (Ok(()), Err(shutdown)) => Err(DesktopUiExitError::Shutdown(shutdown)),
-        (Err(run), Err(shutdown)) => Err(DesktopUiExitError::RunAndShutdown { run, shutdown }),
+        (Err(run), Err(shutdown)) => Err(DesktopUiExitError::RunAndShutdown {
+            run: Box::new(run),
+            shutdown,
+        }),
     }
 }
 
 #[derive(Debug)]
 enum DesktopUiExitError {
-    Run(PlatformError),
+    Run(Box<PlatformError>),
     Shutdown(DesktopUiShutdownError),
     RunAndShutdown {
-        run: PlatformError,
+        run: Box<PlatformError>,
         shutdown: DesktopUiShutdownError,
     },
 }
@@ -1703,6 +1965,27 @@ mod tests {
             AppMode::Running
         );
         assert_eq!(
+            mode_after_failure(
+                AppMode::PreparingRecording,
+                IdeWorkerCommandKind::StartRecording,
+            ),
+            AppMode::Running
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::FinalizingRecording,
+                IdeWorkerCommandKind::StopRecording,
+            ),
+            AppMode::Running
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::FinalizingRecording,
+                IdeWorkerCommandKind::AbortRecording,
+            ),
+            AppMode::Running
+        );
+        assert_eq!(
             mode_after_failure(AppMode::Opening, IdeWorkerCommandKind::Observe),
             AppMode::Running
         );
@@ -1808,12 +2091,10 @@ mod tests {
             Err(PlatformError::Unsupported),
             Err(DesktopUiShutdownError::TimedOut),
         );
-        assert!(matches!(
-            result,
-            Err(DesktopUiExitError::RunAndShutdown {
-                run: PlatformError::Unsupported,
-                shutdown: DesktopUiShutdownError::TimedOut,
-            })
-        ));
+        let Err(DesktopUiExitError::RunAndShutdown { run, shutdown }) = result else {
+            panic!("compound failures must remain distinct");
+        };
+        assert!(matches!(*run, PlatformError::Unsupported));
+        assert!(matches!(shutdown, DesktopUiShutdownError::TimedOut));
     }
 }

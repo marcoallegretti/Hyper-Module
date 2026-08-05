@@ -2133,17 +2133,23 @@ dependencies = [
 name = "hyper-desktop-ide"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "hyper-audio-engine",
  "hyper-audio-source",
  "hyper-desktop-audio",
  "hyper-media-cache",
  "hyper-mixer-runtime",
+ "hyper-playback-compiler",
  "hyper-playback-json",
  "hyper-playback-session",
  "hyper-project-loader",
  "hyper-project-model",
+ "hyper-recording-journal",
+ "hyper-recording-metadata",
+ "hyper-recording-worker",
  "hyper-storage-engine",
  "hyper-thread-supervisor",
+ "uuid",
 ]
 
 [[package]]
