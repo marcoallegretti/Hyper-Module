@@ -22,12 +22,12 @@ use super::{
     DesktopIdeApplication, DesktopIdePendingClose, DesktopIdePendingSaveClose,
     DesktopPlaybackRecovery, IdeApplicationConfig, IdeArrangementLocateError,
     IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
-    IdeAudioPreviewError, IdeCloseOutcome, IdeInputDiscoveryError, IdeInputSelection,
-    IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError, IdeMixerChannelKind,
-    IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError, IdeMixerMainState,
-    IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure,
-    IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError, IdeOutputTestError,
-    IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
+    IdeAudioPreviewError, IdeAudioTrackAdditionError, IdeCloseOutcome, IdeInputDiscoveryError,
+    IdeInputSelection, IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError,
+    IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
+    IdeMixerMainState, IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState,
+    IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError,
+    IdeOutputTestError, IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
     IdePendingCloseWait, IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait,
     IdePendingSaveCloseWait, IdeProjectOpenError, IdeProjectSaveError, IdeRecordingAbortError,
     IdeRecordingAbortOutcome, IdeRecordingError, IdeRecordingImportOutcome,
@@ -117,6 +117,7 @@ pub enum IdeWorkerCommandKind {
     Mixer,
     Monitoring,
     SaveProject,
+    AddAudioTrack,
     StartRecording,
     StopRecording,
     AbortRecording,
@@ -159,6 +160,9 @@ pub enum IdeWorkerCommand {
     Mixer(IdeMixerCommand),
     Monitoring(IdeMonitoringCommand),
     SaveProject,
+    AddAudioTrack {
+        name: String,
+    },
     StartRecording {
         channel_index: usize,
     },
@@ -197,6 +201,7 @@ impl IdeWorkerCommand {
             Self::Mixer(_) => IdeWorkerCommandKind::Mixer,
             Self::Monitoring(_) => IdeWorkerCommandKind::Monitoring,
             Self::SaveProject => IdeWorkerCommandKind::SaveProject,
+            Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
             Self::StartRecording { .. } => IdeWorkerCommandKind::StartRecording,
             Self::StopRecording => IdeWorkerCommandKind::StopRecording,
             Self::AbortRecording => IdeWorkerCommandKind::AbortRecording,
@@ -374,6 +379,7 @@ pub struct IdeRunningObservation {
     recording_takes: Vec<IdeRecordingTake>,
     preview: IdeAudioPreviewObservation,
     scenes: Vec<IdeScene>,
+    track_count: usize,
     mixer_channels: Vec<IdeMixerChannel>,
     mixer_main: Option<IdeMixerMainState>,
     output_state: OutputStreamState,
@@ -571,6 +577,11 @@ impl IdeRunningObservation {
     }
 
     #[must_use]
+    pub const fn track_count(&self) -> usize {
+        self.track_count
+    }
+
+    #[must_use]
     pub fn mixer_channels(&self) -> &[IdeMixerChannel] {
         &self.mixer_channels
     }
@@ -668,7 +679,7 @@ pub enum IdeWorkerCommandFailure {
     InputDiscovery(IdeInputDiscoveryError),
     OutputSelection(IdeOutputSelectionError),
     InputSelection(IdeInputSelectionError),
-    ProjectCreation(IdeProjectCreationError),
+    ProjectCreation(Box<IdeProjectCreationError>),
     ProjectOpen(IdeProjectOpenError),
     Transport(super::DesktopDirectControlError),
     Seek(IdeTransportSeekError),
@@ -678,6 +689,7 @@ pub enum IdeWorkerCommandFailure {
     Mixer(IdeMixerCommandError),
     Monitoring(IdeMonitoringCommandError),
     ProjectSave(IdeProjectSaveError),
+    AudioTrackAddition(Box<super::IdeAudioTrackAdditionError>),
     Recording(IdeRecordingError),
     AudioPreview(IdeAudioPreviewError),
     InvalidState,
@@ -704,6 +716,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::Mixer(source) => source.fmt(formatter),
             Self::Monitoring(source) => source.fmt(formatter),
             Self::ProjectSave(source) => source.fmt(formatter),
+            Self::AudioTrackAddition(source) => source.fmt(formatter),
             Self::Recording(source) => source.fmt(formatter),
             Self::AudioPreview(source) => source.fmt(formatter),
             Self::InvalidState => {
@@ -738,6 +751,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::Mixer(source) => Some(source),
             Self::Monitoring(source) => Some(source),
             Self::ProjectSave(source) => Some(source),
+            Self::AudioTrackAddition(source) => Some(source),
             Self::Recording(source) => Some(source),
             Self::AudioPreview(source) => Some(source),
             Self::Publication(source) => Some(source),
@@ -772,6 +786,9 @@ pub enum IdeWorkerEvent {
         revision: u64,
         changed: bool,
     },
+    AudioTrackAdded {
+        revision: u64,
+    },
     RecordingPreparing,
     Recording(IdeRecordingState),
     RecordingFinalizing,
@@ -781,6 +798,7 @@ pub enum IdeWorkerEvent {
     AudioPreviewStopRequested,
     AudioPreviewControlApplied(IdeAudioPreviewControlCommand),
     Saving,
+    AudioTrackAdding,
     Closing,
     CommandFailed {
         command: IdeWorkerCommandKind,
@@ -1070,6 +1088,7 @@ enum WorkerState {
     Running(RunningDesktopIdeApplication),
     SaveFence {
         application: RunningDesktopIdeApplication,
+        operation: ProjectMutation,
         sequence: u64,
         deadline: Instant,
     },
@@ -1090,9 +1109,34 @@ enum WorkerState {
         target: IdeRecordingTarget,
     },
     Recording(RecordingDesktopIdeApplication),
-    Saving(DesktopIdePendingSaveClose),
+    Saving {
+        pending: DesktopIdePendingSaveClose,
+        operation: ProjectMutation,
+    },
     Closing(DesktopIdePendingClose),
     Empty,
+}
+
+#[derive(Debug)]
+enum ProjectMutation {
+    SaveMixer,
+    AddAudioTrack { name: String },
+}
+
+impl ProjectMutation {
+    const fn command(&self) -> IdeWorkerCommandKind {
+        match self {
+            Self::SaveMixer => IdeWorkerCommandKind::SaveProject,
+            Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
+        }
+    }
+
+    const fn pending_event(&self) -> IdeWorkerEvent {
+        match self {
+            Self::SaveMixer => IdeWorkerEvent::Saving,
+            Self::AddAudioTrack { .. } => IdeWorkerEvent::AudioTrackAdding,
+        }
+    }
 }
 
 fn run_worker(
@@ -1116,7 +1160,7 @@ fn run_worker(
                 | WorkerState::RecordingClosing { .. }
                 | WorkerState::OutputTestStopping { .. }
                 | WorkerState::Closing(_)
-                | WorkerState::Saving(_)
+                | WorkerState::Saving { .. }
         ) {
             match commands.recv_timeout(WORKER_SHUTDOWN_POLL) {
                 Ok(command) => command,
@@ -1307,6 +1351,7 @@ fn process_command(
         },
         IdeWorkerCommand::Monitoring(command) => process_monitoring_command(state, command, events),
         IdeWorkerCommand::SaveProject => save_project(state, events),
+        IdeWorkerCommand::AddAudioTrack { name } => add_audio_track(state, events, &name),
         IdeWorkerCommand::StartRecording { channel_index } => {
             start_recording(state, channel_index, events)
         }
@@ -1359,7 +1404,9 @@ fn create_project(
             return publish_failure(
                 events,
                 IdeWorkerCommandKind::CreateProject,
-                IdeWorkerCommandFailure::ProjectCreation(IdeProjectCreationError::Creation(source)),
+                IdeWorkerCommandFailure::ProjectCreation(Box::new(
+                    IdeProjectCreationError::Creation(source),
+                )),
             );
         }
     };
@@ -1376,12 +1423,12 @@ fn create_project(
             publish_failure(
                 events,
                 IdeWorkerCommandKind::CreateProject,
-                IdeWorkerCommandFailure::ProjectCreation(
+                IdeWorkerCommandFailure::ProjectCreation(Box::new(
                     IdeProjectCreationError::CreatedButNotOpened {
                         project_path,
                         source,
                     },
-                ),
+                )),
             )
         }
     }
@@ -2266,17 +2313,55 @@ fn close_project(
 }
 
 fn save_project(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) -> bool {
-    let WorkerState::Running(application) = state else {
+    begin_project_mutation_request(state, events, ProjectMutation::SaveMixer)
+}
+
+fn add_audio_track(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    name: &str,
+) -> bool {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 120 {
         return publish_failure(
             events,
-            IdeWorkerCommandKind::SaveProject,
-            IdeWorkerCommandFailure::InvalidState,
+            IdeWorkerCommandKind::AddAudioTrack,
+            IdeWorkerCommandFailure::AudioTrackAddition(Box::new(
+                IdeAudioTrackAdditionError::InvalidName,
+            )),
         );
+    }
+    let mut normalized = String::new();
+    if normalized.try_reserve_exact(name.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::AddAudioTrack,
+            IdeWorkerCommandFailure::AudioTrackAddition(Box::new(
+                IdeAudioTrackAdditionError::CapacityUnavailable,
+            )),
+        );
+    }
+    normalized.push_str(name);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::AddAudioTrack { name: normalized },
+    )
+}
+
+fn begin_project_mutation_request(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    operation: ProjectMutation,
+) -> bool {
+    let command = operation.command();
+    let WorkerState::Running(application) = state else {
+        return publish_failure(events, command, IdeWorkerCommandFailure::InvalidState);
     };
     if application.audio_preview_is_active() {
         return publish_failure(
             events,
-            IdeWorkerCommandKind::SaveProject,
+            command,
             IdeWorkerCommandFailure::AudioPreview(IdeAudioPreviewError::Command(
                 hyper_desktop_audio::DesktopAudioPreviewCommandError::PreviewBusy,
             )),
@@ -2285,8 +2370,11 @@ fn save_project(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) ->
     if !application.can_save_mixer() {
         return publish_failure(
             events,
-            IdeWorkerCommandKind::SaveProject,
-            IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::ProjectSnapshotUnavailable),
+            command,
+            project_mutation_save_failure(
+                &operation,
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ),
         );
     }
     let sequence = match application.try_send_mixer_fence() {
@@ -2294,8 +2382,9 @@ fn save_project(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) ->
         Ok(None) => {
             return publish_failure(
                 events,
-                IdeWorkerCommandKind::SaveProject,
-                IdeWorkerCommandFailure::ProjectSave(
+                command,
+                project_mutation_save_failure(
+                    &operation,
                     IdeProjectSaveError::MixerFenceSequenceUnavailable,
                 ),
             );
@@ -2303,8 +2392,8 @@ fn save_project(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) ->
         Err(source) => {
             return publish_failure(
                 events,
-                IdeWorkerCommandKind::SaveProject,
-                IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::MixerCommit(source)),
+                command,
+                project_mutation_save_failure(&operation, IdeProjectSaveError::MixerCommit(source)),
             );
         }
     };
@@ -2313,15 +2402,32 @@ fn save_project(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) ->
     };
     *state = WorkerState::SaveFence {
         application,
+        operation,
         sequence,
         deadline: Instant::now() + MIXER_SAVE_COMMIT_TIMEOUT,
     };
-    send_event(events, IdeWorkerEvent::Saving)
+    let WorkerState::SaveFence { operation, .. } = state else {
+        unreachable!();
+    };
+    send_event(events, operation.pending_event())
+}
+
+fn project_mutation_save_failure(
+    operation: &ProjectMutation,
+    reason: IdeProjectSaveError,
+) -> IdeWorkerCommandFailure {
+    match operation {
+        ProjectMutation::SaveMixer => IdeWorkerCommandFailure::ProjectSave(reason),
+        ProjectMutation::AddAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackAddition(
+            Box::new(IdeAudioTrackAdditionError::MixerSave(Box::new(reason))),
+        ),
+    }
 }
 
 fn begin_save_close(
     state: &mut WorkerState,
     application: RunningDesktopIdeApplication,
+    operation: ProjectMutation,
     events: &SyncSender<IdeWorkerEvent>,
 ) -> bool {
     match application.close_for_save() {
@@ -2329,69 +2435,124 @@ fn begin_save_close(
             application,
             recovery,
             failure,
-        } => complete_save(state, application, recovery, failure, events),
+        } => complete_project_mutation(state, application, recovery, operation, failure, events),
         IdeSaveCloseOutcome::Pending(pending) => {
-            *state = WorkerState::Saving(pending);
-            send_event(events, IdeWorkerEvent::Saving)
+            let event = operation.pending_event();
+            *state = WorkerState::Saving { pending, operation };
+            send_event(events, event)
         }
         IdeSaveCloseOutcome::Unavailable {
             application,
             failure,
-        } => publish_closed_save_failure(
-            state,
-            application,
-            events,
-            failure.map_or(
-                IdeProjectSaveError::ProjectSnapshotUnavailable,
-                IdeProjectSaveError::NativeClose,
-            ),
-        ),
+        } => {
+            let reason = failure.map_or_else(
+                || {
+                    project_mutation_save_failure(
+                        &operation,
+                        IdeProjectSaveError::ProjectSnapshotUnavailable,
+                    )
+                },
+                |failure| project_mutation_native_close_failure(&operation, failure),
+            );
+            publish_closed_project_mutation_failure(
+                state,
+                application,
+                events,
+                operation.command(),
+                reason,
+            )
+        }
     }
 }
 
-fn publish_closed_save_failure(
+fn publish_closed_project_mutation_failure(
     state: &mut WorkerState,
     application: DesktopIdeApplication,
     events: &SyncSender<IdeWorkerEvent>,
-    reason: IdeProjectSaveError,
+    command: IdeWorkerCommandKind,
+    reason: IdeWorkerCommandFailure,
 ) -> bool {
     *state = WorkerState::Closed(application);
     let mut no_native_failure = None;
     if !publish_state(state, events, &mut no_native_failure) {
         return false;
     }
-    publish_failure(
-        events,
-        IdeWorkerCommandKind::SaveProject,
-        IdeWorkerCommandFailure::ProjectSave(reason),
-    )
+    publish_failure(events, command, reason)
 }
 
-fn complete_save(
+fn project_mutation_native_close_failure(
+    operation: &ProjectMutation,
+    failure: IdeNativeCloseFailure,
+) -> IdeWorkerCommandFailure {
+    match operation {
+        ProjectMutation::SaveMixer => {
+            IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::NativeClose(failure))
+        }
+        ProjectMutation::AddAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackAddition(
+            Box::new(IdeAudioTrackAdditionError::NativeClose(failure)),
+        ),
+    }
+}
+
+enum ProjectMutationAttempt {
+    Save(Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeProjectSaveError>),
+    AddAudioTrack(
+        Result<hyper_storage_engine::AudioTrackPublicationOutcome, IdeAudioTrackAdditionError>,
+    ),
+}
+
+fn complete_project_mutation(
     state: &mut WorkerState,
     application: DesktopIdeApplication,
     recovery: DesktopPlaybackRecovery,
+    operation: ProjectMutation,
     native_failure: Option<IdeNativeCloseFailure>,
     events: &SyncSender<IdeWorkerEvent>,
 ) -> bool {
+    let command = operation.command();
     let Some(project_path) = recovery
         .prepared_project()
         .map(|project| project.package().root().to_path_buf())
     else {
-        return publish_closed_save_failure(
+        return publish_closed_project_mutation_failure(
             state,
             application,
             events,
-            IdeProjectSaveError::ProjectSnapshotUnavailable,
+            command,
+            project_mutation_save_failure(
+                &operation,
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ),
         );
     };
-    let attempt = if let Some(failure) = native_failure {
-        Err(IdeProjectSaveError::NativeClose(failure))
-    } else {
-        RunningDesktopIdeApplication::prepare_mixer_save(&application, &recovery).and_then(|plan| {
-            plan.publish()
-                .map_err(|source| IdeProjectSaveError::Publication(Box::new(source)))
-        })
+    let attempt = match operation {
+        ProjectMutation::SaveMixer => {
+            ProjectMutationAttempt::Save(if let Some(failure) = native_failure {
+                Err(IdeProjectSaveError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_mixer_save(&application, &recovery).and_then(
+                    |plan| {
+                        plan.publish()
+                            .map_err(|source| IdeProjectSaveError::Publication(Box::new(source)))
+                    },
+                )
+            })
+        }
+        ProjectMutation::AddAudioTrack { name } => {
+            ProjectMutationAttempt::AddAudioTrack(if let Some(failure) = native_failure {
+                Err(IdeAudioTrackAdditionError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_audio_track_addition(
+                    &application,
+                    &recovery,
+                    &name,
+                )
+                .and_then(|plan| {
+                    plan.publish()
+                        .map_err(|source| IdeAudioTrackAdditionError::Publication(Box::new(source)))
+                })
+            })
+        }
     };
     drop(recovery);
     match application.open_project(&project_path) {
@@ -2402,17 +2563,28 @@ fn complete_save(
                 return false;
             }
             match attempt {
-                Ok(outcome) => send_event(
+                ProjectMutationAttempt::Save(Ok(outcome)) => send_event(
                     events,
                     IdeWorkerEvent::ProjectSaved {
                         revision: outcome.project_revision(),
                         changed: outcome.changed(),
                     },
                 ),
-                Err(reason) => publish_failure(
+                ProjectMutationAttempt::Save(Err(reason)) => publish_failure(
                     events,
                     IdeWorkerCommandKind::SaveProject,
                     IdeWorkerCommandFailure::ProjectSave(reason),
+                ),
+                ProjectMutationAttempt::AddAudioTrack(Ok(outcome)) => send_event(
+                    events,
+                    IdeWorkerEvent::AudioTrackAdded {
+                        revision: outcome.project_revision(),
+                    },
+                ),
+                ProjectMutationAttempt::AddAudioTrack(Err(reason)) => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::AddAudioTrack,
+                    IdeWorkerCommandFailure::AudioTrackAddition(Box::new(reason)),
                 ),
             }
         }
@@ -2423,37 +2595,80 @@ fn complete_save(
             if !publish_state(state, events, &mut no_native_failure) {
                 return false;
             }
-            let reason = match attempt {
-                Ok(outcome) => IdeProjectSaveError::ReopenAfterPublication {
-                    outcome,
-                    source: Box::new(reopen),
-                },
-                Err(IdeProjectSaveError::Publication(publication)) => {
-                    IdeProjectSaveError::PublicationAndReopen {
-                        publication,
-                        reopen: Box::new(reopen),
-                    }
-                }
-                Err(IdeProjectSaveError::NativeClose(close)) => {
-                    IdeProjectSaveError::NativeCloseAndReopen {
-                        close,
-                        reopen: Box::new(reopen),
-                    }
-                }
-                Err(preparation) => IdeProjectSaveError::ReopenAfterPreparation {
-                    preparation: Box::new(preparation),
-                    reopen: Box::new(reopen),
-                },
-            };
-            publish_failure(
-                events,
-                IdeWorkerCommandKind::SaveProject,
-                IdeWorkerCommandFailure::ProjectSave(reason),
-            )
+            let reason = project_mutation_reopen_failure(attempt, reopen);
+            publish_failure(events, command, reason)
         }
     }
 }
 
+fn project_mutation_reopen_failure(
+    attempt: ProjectMutationAttempt,
+    reopen: IdeProjectOpenError,
+) -> IdeWorkerCommandFailure {
+    match attempt {
+        ProjectMutationAttempt::Save(Ok(outcome)) => {
+            IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::ReopenAfterPublication {
+                outcome,
+                source: Box::new(reopen),
+            })
+        }
+        ProjectMutationAttempt::Save(Err(IdeProjectSaveError::Publication(publication))) => {
+            IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            })
+        }
+        ProjectMutationAttempt::Save(Err(IdeProjectSaveError::NativeClose(close))) => {
+            IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            })
+        }
+        ProjectMutationAttempt::Save(Err(preparation)) => {
+            IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::ReopenAfterPreparation {
+                preparation: Box::new(preparation),
+                reopen: Box::new(reopen),
+            })
+        }
+        ProjectMutationAttempt::AddAudioTrack(Ok(outcome)) => {
+            IdeWorkerCommandFailure::AudioTrackAddition(Box::new(
+                IdeAudioTrackAdditionError::ReopenAfterPublication {
+                    outcome,
+                    source: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::AddAudioTrack(Err(IdeAudioTrackAdditionError::Publication(
+            publication,
+        ))) => IdeWorkerCommandFailure::AudioTrackAddition(Box::new(
+            IdeAudioTrackAdditionError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::AddAudioTrack(Err(IdeAudioTrackAdditionError::NativeClose(
+            close,
+        ))) => IdeWorkerCommandFailure::AudioTrackAddition(Box::new(
+            IdeAudioTrackAdditionError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::AddAudioTrack(Err(preparation)) => {
+            IdeWorkerCommandFailure::AudioTrackAddition(Box::new(
+                IdeAudioTrackAdditionError::ReopenAfterPreparation {
+                    preparation: Box::new(preparation),
+                    reopen: Box::new(reopen),
+                },
+            ))
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one state-machine boundary retains the sole application owner across every pending native transition"
+)]
 fn poll_pending_state(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -2474,14 +2689,16 @@ fn poll_pending_state(
                 true
             }
         },
-        WorkerState::Saving(pending) => match pending.wait(Duration::ZERO) {
+        WorkerState::Saving { pending, operation } => match pending.wait(Duration::ZERO) {
             IdePendingSaveCloseWait::Closed {
                 application,
                 recovery,
                 failure,
-            } => complete_save(state, application, recovery, failure, events),
+            } => {
+                complete_project_mutation(state, application, recovery, operation, failure, events)
+            }
             IdePendingSaveCloseWait::TimedOut(pending) => {
-                *state = WorkerState::Saving(pending);
+                *state = WorkerState::Saving { pending, operation };
                 true
             }
         },
@@ -2498,21 +2715,24 @@ fn poll_pending_state(
         },
         WorkerState::SaveFence {
             application,
+            operation,
             sequence,
             deadline,
         } => {
             if application.committed_mixer_fence() >= sequence {
-                begin_save_close(state, application, events)
+                begin_save_close(state, application, operation, events)
             } else if Instant::now() >= deadline {
+                let command = operation.command();
+                let reason = project_mutation_save_failure(
+                    &operation,
+                    IdeProjectSaveError::MixerCommitTimeout,
+                );
                 *state = WorkerState::Running(application);
-                publish_failure(
-                    events,
-                    IdeWorkerCommandKind::SaveProject,
-                    IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::MixerCommitTimeout),
-                )
+                publish_failure(events, command, reason)
             } else {
                 *state = WorkerState::SaveFence {
                     application,
+                    operation,
                     sequence,
                     deadline,
                 };
@@ -2663,7 +2883,9 @@ fn publish_state(
             }
         },
         WorkerState::Closing(_) => IdeWorkerEvent::Closing,
-        WorkerState::SaveFence { .. } | WorkerState::Saving(_) => IdeWorkerEvent::Saving,
+        WorkerState::SaveFence { operation, .. } | WorkerState::Saving { operation, .. } => {
+            operation.pending_event()
+        }
         WorkerState::RecordingFence { .. } | WorkerState::RecordingClosing { .. } => {
             IdeWorkerEvent::RecordingPreparing
         }
@@ -2715,6 +2937,10 @@ fn closed_snapshot(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one conversion publishes a coherent bounded snapshot from a single runtime observation"
+)]
 fn running_observation(
     application: &mut RunningDesktopIdeApplication,
 ) -> Result<IdeRunningObservation, IdeWorkerCommandFailure> {
@@ -2810,6 +3036,7 @@ fn running_observation(
             asset_id: preview_asset_id,
         },
         scenes,
+        track_count: snapshot.track_count,
         mixer_channels,
         mixer_main: snapshot.mixer_main_state,
         output_state: snapshot.output_state,
@@ -2923,10 +3150,14 @@ fn shutdown_state(
                 IdePendingCloseWait::Closed { failure, .. } => return (failure, None),
                 IdePendingCloseWait::TimedOut(pending) => WorkerState::Closing(pending),
             },
-            WorkerState::Saving(pending) => match pending.wait(WORKER_SHUTDOWN_POLL) {
-                IdePendingSaveCloseWait::Closed { failure, .. } => return (failure, None),
-                IdePendingSaveCloseWait::TimedOut(pending) => WorkerState::Saving(pending),
-            },
+            WorkerState::Saving { pending, operation } => {
+                match pending.wait(WORKER_SHUTDOWN_POLL) {
+                    IdePendingSaveCloseWait::Closed { failure, .. } => return (failure, None),
+                    IdePendingSaveCloseWait::TimedOut(pending) => {
+                        WorkerState::Saving { pending, operation }
+                    }
+                }
+            }
             WorkerState::RecordingClosing { pending, target } => {
                 match pending.wait(WORKER_SHUTDOWN_POLL) {
                     IdePendingSaveCloseWait::Closed { failure, .. } => return (failure, None),
@@ -3145,10 +3376,9 @@ mod tests {
             recv(&worker),
             IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::CreateProject,
-                reason: IdeWorkerCommandFailure::ProjectCreation(
-                    IdeProjectCreationError::Creation(source)
-                ),
-            } if source.kind() == ProjectCreationErrorKind::InvalidRequest
+                reason: IdeWorkerCommandFailure::ProjectCreation(reason),
+            } if matches!(reason.as_ref(), IdeProjectCreationError::Creation(source)
+                if source.kind() == ProjectCreationErrorKind::InvalidRequest)
         ));
         worker.try_send(IdeWorkerCommand::Observe).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
@@ -3179,14 +3409,17 @@ mod tests {
             .unwrap();
         let IdeWorkerEvent::CommandFailed {
             command: IdeWorkerCommandKind::CreateProject,
-            reason:
-                IdeWorkerCommandFailure::ProjectCreation(IdeProjectCreationError::CreatedButNotOpened {
-                    project_path: failed_path,
-                    source: IdeProjectOpenError::SelectedOutputUnavailable,
-                }),
+            reason: IdeWorkerCommandFailure::ProjectCreation(reason),
         } = recv(&worker)
         else {
             panic!("creation must report a preserved project after open failure");
+        };
+        let IdeProjectCreationError::CreatedButNotOpened {
+            project_path: failed_path,
+            source: IdeProjectOpenError::SelectedOutputUnavailable,
+        } = *reason
+        else {
+            panic!("creation must retain the project path and open failure");
         };
         assert_eq!(
             failed_path,
@@ -3708,6 +3941,82 @@ mod tests {
     }
 
     #[test]
+    fn audio_track_addition_validates_name_before_changing_running_state() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 3).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::AddAudioTrack {
+                name: "   ".to_owned(),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::AddAudioTrack,
+                reason: IdeWorkerCommandFailure::AudioTrackAddition(reason),
+            } if matches!(reason.as_ref(), IdeAudioTrackAdditionError::InvalidName)
+        ));
+        worker
+            .try_send(IdeWorkerCommand::Transport(TransportCommand::Stop))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::TransportQueued(TransportCommand::Stop)
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn audio_track_addition_waits_for_the_mixer_fence_before_closing() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 4).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::AddAudioTrack {
+                name: " Vocal ".to_owned(),
+            })
+            .unwrap();
+
+        assert!(matches!(recv(&worker), IdeWorkerEvent::AudioTrackAdding));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::AddAudioTrack,
+                reason: IdeWorkerCommandFailure::AudioTrackAddition(reason),
+            } if matches!(reason.as_ref(), IdeAudioTrackAdditionError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
     fn exhausted_save_fence_sequence_does_not_change_running_state() {
         let running = RunningDesktopIdeApplication {
             application: closed_application(),
@@ -3738,11 +4047,12 @@ mod tests {
         let mut state = WorkerState::Empty;
         let (events, receiver) = sync_channel(2);
 
-        assert!(publish_closed_save_failure(
+        assert!(publish_closed_project_mutation_failure(
             &mut state,
             closed_application(),
             &events,
-            IdeProjectSaveError::ProjectSnapshotUnavailable,
+            IdeWorkerCommandKind::SaveProject,
+            IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::ProjectSnapshotUnavailable,),
         ));
 
         assert!(matches!(state, WorkerState::Closed(_)));

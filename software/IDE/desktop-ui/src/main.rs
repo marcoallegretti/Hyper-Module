@@ -668,6 +668,8 @@ fn bind_playback_callbacks(
         submit_to_ui(&ui, &worker_for_save, IdeWorkerCommand::SaveProject);
     });
 
+    bind_audio_track_callback(ui, worker);
+
     let weak = ui.as_weak();
     let worker_for_close = Rc::clone(worker);
     actions.on_close_project(move || {
@@ -675,6 +677,33 @@ fn bind_playback_callbacks(
     });
 
     bind_mixer_callbacks(ui, worker);
+}
+
+fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_track = Rc::clone(worker);
+    actions.on_add_audio_track(move |name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || ui.get_track_count() >= 8 {
+            ui.set_error_text("The current project cannot add another audio track".into());
+            return;
+        }
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 120 {
+            ui.set_error_text("Audio-track name must contain 1 through 120 characters".into());
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_track,
+            IdeWorkerCommand::AddAudioTrack {
+                name: name.to_owned(),
+            },
+        );
+    });
 }
 
 fn bind_loudness_callbacks(ui: &MainWindow, worker: &WorkerCell) {
@@ -1014,6 +1043,7 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 }
                 IdeWorkerCommandKind::CreateProject => ui.set_app_mode(AppMode::Creating),
                 IdeWorkerCommandKind::SaveProject => ui.set_app_mode(AppMode::Saving),
+                IdeWorkerCommandKind::AddAudioTrack => ui.set_app_mode(AppMode::AddingTrack),
                 IdeWorkerCommandKind::StartRecording => {
                     ui.set_app_mode(AppMode::PreparingRecording);
                 }
@@ -1066,6 +1096,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::Mixer => "Mixer command queued…",
         IdeWorkerCommandKind::Monitoring => "Applying input cue control…",
         IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
+        IdeWorkerCommandKind::AddAudioTrack => {
+            "Saving mixer state, adding the audio track, and reopening project…"
+        }
         IdeWorkerCommandKind::StartRecording => {
             "Stopping playback and preparing an exclusive monitored capture…"
         }
@@ -1149,16 +1182,9 @@ fn apply_event(
             ui.set_status_text("Input cue control applied".into());
             ui.set_error_text(SharedString::default());
         }
-        IdeWorkerEvent::ProjectSaved { revision, changed } => {
-            ui.set_status_text(
-                if changed {
-                    format!("Project revision {revision} saved and reopened")
-                } else {
-                    format!("Project revision {revision} already matched the live mixer")
-                }
-                .into(),
-            );
-            ui.set_error_text(SharedString::default());
+        event @ IdeWorkerEvent::ProjectSaved { .. } => apply_project_saved_event(ui, &event),
+        event @ (IdeWorkerEvent::AudioTrackAdded { .. } | IdeWorkerEvent::AudioTrackAdding) => {
+            apply_audio_track_event(ui, &event);
         }
         IdeWorkerEvent::RecordingPreparing => {
             ui.set_app_mode(AppMode::PreparingRecording);
@@ -1189,6 +1215,36 @@ fn apply_event(
             ui.set_app_mode(mode_after_failure(ui.get_app_mode(), command));
             ui.set_error_text(format!("{}: {reason}", command_status(command)).into());
         }
+    }
+}
+
+fn apply_project_saved_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    let IdeWorkerEvent::ProjectSaved { revision, changed } = event else {
+        unreachable!("project-save event dispatcher received another event");
+    };
+    ui.set_status_text(
+        if *changed {
+            format!("Project revision {revision} saved and reopened")
+        } else {
+            format!("Project revision {revision} already matched the live mixer")
+        }
+        .into(),
+    );
+    ui.set_error_text(SharedString::default());
+}
+
+fn apply_audio_track_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioTrackAdded { revision } => {
+            ui.set_new_track_visible(false);
+            ui.set_status_text(format!("Audio track added in project revision {revision}").into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioTrackAdding => {
+            ui.set_app_mode(AppMode::AddingTrack);
+            ui.set_status_text("Waiting for native output before adding the audio track…".into());
+        }
+        _ => unreachable!("audio-track event dispatcher received another event"),
     }
 }
 
@@ -1350,6 +1406,10 @@ fn apply_running_event(
     ui.set_project_id(observation.project_id().into());
     ui.set_sample_rate(format!("{} Hz", observation.sample_rate_hz()).into());
     ui.set_scene_count(observation.scene_count().to_string().into());
+    ui.set_track_count(i32::try_from(observation.track_count()).unwrap_or(8));
+    if !ui.get_new_track_visible() {
+        ui.set_new_track_name(format!("Audio {}", observation.track_count() + 1).into());
+    }
     set_scenes(ui, observation.scenes());
     apply_mixer_observation(ui, observation);
     set_recording_targets(ui, recording_routes, observation.mixer_channels());
@@ -1977,6 +2037,9 @@ fn reset_project(
     ui.set_project_id("—".into());
     ui.set_sample_rate("—".into());
     ui.set_scene_count("—".into());
+    ui.set_track_count(0);
+    ui.set_new_track_visible(false);
+    ui.set_new_track_name("Audio 2".into());
     ui.set_scenes(ModelRc::default());
     ui.set_mixer_visible(false);
     ui.set_mixer_sends_visible(false);
@@ -2045,6 +2108,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::Observe if current == AppMode::Opening => AppMode::Running,
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
         IdeWorkerCommandKind::SaveProject if current == AppMode::Saving => AppMode::Running,
+        IdeWorkerCommandKind::AddAudioTrack if current == AppMode::AddingTrack => AppMode::Running,
         IdeWorkerCommandKind::StartRecording if current == AppMode::PreparingRecording => {
             AppMode::Running
         }
@@ -2886,6 +2950,10 @@ mod tests {
         );
         assert_eq!(
             mode_after_failure(AppMode::Saving, IdeWorkerCommandKind::SaveProject),
+            AppMode::Running
+        );
+        assert_eq!(
+            mode_after_failure(AppMode::AddingTrack, IdeWorkerCommandKind::AddAudioTrack,),
             AppMode::Running
         );
         assert_eq!(

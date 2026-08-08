@@ -32,7 +32,7 @@ use hyper_playback_compiler::{
 use hyper_project_model::{is_valid_entity_id, is_valid_extension_key};
 use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use hyper_strict_json::{self as strict, StrictJsonError, StrictJsonErrorKind};
 
@@ -495,6 +495,79 @@ impl Error for MixerStateSerializationError {
     }
 }
 
+/// Canonical version-1 resources required to append one audio track.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioTrackAdditionDocuments {
+    track: Vec<u8>,
+    mixer: Vec<u8>,
+}
+
+impl AudioTrackAdditionDocuments {
+    #[must_use]
+    pub fn track(&self) -> &[u8] {
+        &self.track
+    }
+
+    #[must_use]
+    pub fn mixer(&self) -> &[u8] {
+        &self.mixer
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, Vec<u8>) {
+        (self.track, self.mixer)
+    }
+}
+
+#[derive(Debug)]
+pub enum AudioTrackAdditionSerializationError {
+    Source(LoadError),
+    TrackCapacity,
+    InvalidTrackIdentity,
+    MixerIdentityMismatch,
+    InvalidTrackName,
+    InvalidDocumentShape,
+    Serialization(serde_json::Error),
+}
+
+impl fmt::Display for AudioTrackAdditionSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => source.fmt(formatter),
+            Self::TrackCapacity => {
+                formatter.write_str("the version-1 project cannot append another audio track")
+            }
+            Self::InvalidTrackIdentity => {
+                formatter.write_str("the new audio-track identity is invalid or already in use")
+            }
+            Self::MixerIdentityMismatch => {
+                formatter.write_str("source mixer identity does not match the edit request")
+            }
+            Self::InvalidTrackName => {
+                formatter.write_str("the new audio-track name is outside the version-1 domain")
+            }
+            Self::InvalidDocumentShape => {
+                formatter.write_str("source mixer shape changed after typed validation")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioTrackAdditionSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::TrackCapacity
+            | Self::InvalidTrackIdentity
+            | Self::MixerIdentityMismatch
+            | Self::InvalidTrackName
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CueSource {
     Main,
@@ -879,6 +952,117 @@ pub fn serialize_mixer_base_state(
     let _: MixerDocument = parse_document(&output, location, limits.max_document_bytes)
         .map_err(MixerStateSerializationError::Source)?;
     Ok(output)
+}
+
+/// Builds and validates the canonical track and mixer documents for appending
+/// one active audio track at the end of a loaded version-1 project.
+///
+/// The supplied source mixer is preserved while a new unity-gain, center-pan
+/// channel is appended. Routing, sends, cue state, and namespaced extension
+/// values are unchanged.
+///
+/// # Errors
+///
+/// Returns a classified rejection for invalid identity or name input, exhausted
+/// version-1 capacity, malformed source bytes, or a
+/// candidate mixer that does not resolve against the extended project.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the edit boundary explicitly binds project, media, mixer, live-state, and new-track identities"
+)]
+pub fn serialize_audio_track_addition(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_mixer: &[u8],
+    mixer_id: &str,
+    track_id: &str,
+    track_name: &str,
+    limits: LoaderLimits,
+) -> Result<AudioTrackAdditionDocuments, AudioTrackAdditionSerializationError> {
+    let next_order = project
+        .tracks
+        .iter()
+        .map(|track| track.order)
+        .max()
+        .map_or(Some(0), |order| order.checked_add(1))
+        .filter(|order| *order <= 7)
+        .ok_or(AudioTrackAdditionSerializationError::TrackCapacity)?;
+    if project.tracks.len() >= limits.max_track_documents {
+        return Err(AudioTrackAdditionSerializationError::TrackCapacity);
+    }
+    let name_length = track_name.chars().count();
+    if track_name.trim() != track_name
+        || !(1..=MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length)
+    {
+        return Err(AudioTrackAdditionSerializationError::InvalidTrackName);
+    }
+    if !is_valid_entity_id(track_id)
+        || track_id == project.project_id
+        || project_contains_identity(project, track_id)
+        || assets.iter().any(|asset| asset.id == track_id)
+    {
+        return Err(AudioTrackAdditionSerializationError::InvalidTrackIdentity);
+    }
+
+    let loaded_mixer = project
+        .load_mixer(source_mixer, assets, limits)
+        .map_err(AudioTrackAdditionSerializationError::Source)?;
+    if loaded_mixer.id() != mixer_id {
+        return Err(AudioTrackAdditionSerializationError::MixerIdentityMismatch);
+    }
+
+    let track = serde_json_canonicalizer::to_vec(&json!({
+        "format": "hyper-track",
+        "format_version": 1,
+        "id": track_id,
+        "project_id": project.project_id,
+        "name": track_name,
+        "kind": "audio",
+        "order": next_order,
+        "active": true,
+        "clip_ids": [],
+        "extensions": {}
+    }))
+    .map_err(AudioTrackAdditionSerializationError::Serialization)?;
+    let added = load_track(
+        &track,
+        project.tracks.len(),
+        &project.project_id,
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(AudioTrackAdditionSerializationError::Source)?;
+    let mut extended = project.clone();
+    extended
+        .tracks
+        .try_reserve(1)
+        .map_err(|_| AudioTrackAdditionSerializationError::Source(capacity_error()))?;
+    extended.tracks.push(added);
+    validate_track_hierarchy(&extended.tracks)
+        .map_err(AudioTrackAdditionSerializationError::Source)?;
+    validate_loaded_identities(&extended).map_err(AudioTrackAdditionSerializationError::Source)?;
+
+    let mut mixer_value: Value = serde_json::from_slice(source_mixer)
+        .map_err(AudioTrackAdditionSerializationError::Serialization)?;
+    let channels = mixer_value
+        .get_mut("channels")
+        .and_then(Value::as_array_mut)
+        .ok_or(AudioTrackAdditionSerializationError::InvalidDocumentShape)?;
+    channels.push(json!({
+        "track_id": track_id,
+        "gain_millionths": 1_000_000,
+        "pan_millionths": 0,
+        "mute": false,
+        "solo": false,
+        "destination": {"kind": "main"},
+        "sends": []
+    }));
+    let mixer = serde_json_canonicalizer::to_vec(&mixer_value)
+        .map_err(AudioTrackAdditionSerializationError::Serialization)?;
+    extended
+        .load_mixer(&mixer, assets, limits)
+        .map_err(AudioTrackAdditionSerializationError::Source)?;
+    Ok(AudioTrackAdditionDocuments { track, mixer })
 }
 
 impl LoadedMixer {
@@ -3782,6 +3966,132 @@ mod tests {
             serde_json::json!({"opaque":[1, 2, 3]})
         );
         assert_eq!(serde_json_canonicalizer::to_vec(&value).unwrap(), output);
+    }
+
+    #[test]
+    fn serializes_a_validated_audio_track_and_matching_mixer_channel() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut source: Value = serde_json::from_slice(MIXER).unwrap();
+        source["extensions"]["org.example.state"] = json!({"opaque": true});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let state = MixerBaseState {
+            channels: vec![MixerChannelBaseState {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
+                gain: LinearGain::from_millionths(1_250_000).unwrap(),
+                pan: Pan::from_millionths(125_000).unwrap(),
+                muted: true,
+                solo: false,
+                sends: Vec::new(),
+            }],
+            main_gain: LinearGain::from_millionths(900_000).unwrap(),
+            main_muted: false,
+        };
+        let source = serialize_mixer_base_state(
+            &source,
+            PROJECT_ID,
+            "018f47a2-6b2d-7c11-8a44-001122334468",
+            &state,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let documents = serialize_audio_track_addition(
+            &loaded,
+            &asset_facts(),
+            &source,
+            "018f47a2-6b2d-7c11-8a44-001122334468",
+            "018f47a2-6b2d-7c11-8a44-001122334469",
+            "Vocal",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let track: Value = serde_json::from_slice(documents.track()).unwrap();
+        let mixer: Value = serde_json::from_slice(documents.mixer()).unwrap();
+
+        assert_eq!(track["name"], "Vocal");
+        assert_eq!(track["kind"], "audio");
+        assert_eq!(track["order"], 1);
+        assert_eq!(track["clip_ids"], json!([]));
+        assert_eq!(mixer["channels"].as_array().unwrap().len(), 2);
+        assert_eq!(mixer["channels"][0]["gain_millionths"], 1_250_000);
+        assert_eq!(mixer["channels"][0]["mute"], true);
+        assert_eq!(
+            mixer["channels"][1]["track_id"],
+            "018f47a2-6b2d-7c11-8a44-001122334469"
+        );
+        assert_eq!(mixer["channels"][1]["gain_millionths"], 1_000_000);
+        assert_eq!(mixer["channels"][1]["pan_millionths"], 0);
+        assert_eq!(mixer["main"]["gain_millionths"], 900_000);
+        assert_eq!(
+            mixer["extensions"]["org.example.state"],
+            json!({"opaque": true})
+        );
+        assert_eq!(
+            serde_json_canonicalizer::to_vec(&track).unwrap(),
+            documents.track()
+        );
+        assert_eq!(
+            serde_json_canonicalizer::to_vec(&mixer).unwrap(),
+            documents.mixer()
+        );
+    }
+
+    #[test]
+    fn audio_track_addition_refuses_capacity_and_identity_conflicts() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let capacity = LoaderLimits {
+            max_track_documents: 1,
+            ..LoaderLimits::VERSION_1
+        };
+
+        assert!(matches!(
+            serialize_audio_track_addition(
+                &loaded,
+                &asset_facts(),
+                MIXER,
+                "018f47a2-6b2d-7c11-8a44-001122334468",
+                "018f47a2-6b2d-7c11-8a44-001122334469",
+                "Vocal",
+                capacity,
+            ),
+            Err(AudioTrackAdditionSerializationError::TrackCapacity)
+        ));
+        assert!(matches!(
+            serialize_audio_track_addition(
+                &loaded,
+                &asset_facts(),
+                MIXER,
+                "018f47a2-6b2d-7c11-8a44-001122334468",
+                "018f47a2-6b2d-7c11-8a44-001122334457",
+                "Vocal",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioTrackAdditionSerializationError::InvalidTrackIdentity)
+        ));
+        assert!(matches!(
+            serialize_audio_track_addition(
+                &loaded,
+                &asset_facts(),
+                MIXER,
+                "018f47a2-6b2d-7c11-8a44-001122334469",
+                "018f47a2-6b2d-7c11-8a44-00112233446a",
+                "Vocal",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioTrackAdditionSerializationError::MixerIdentityMismatch)
+        ));
     }
 
     #[test]

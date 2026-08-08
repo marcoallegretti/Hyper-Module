@@ -46,8 +46,9 @@ use hyper_mixer_runtime::{
 #[cfg(test)]
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
 use hyper_playback_json::{
-    CompiledMixerTap, CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
-    MixerSendBaseState, MixerStateSerializationError, serialize_mixer_base_state,
+    AudioTrackAdditionSerializationError, CompiledMixerTap, CompiledMixerTrackKind, LoaderLimits,
+    MixerBaseState, MixerChannelBaseState, MixerSendBaseState, MixerStateSerializationError,
+    serialize_audio_track_addition, serialize_mixer_base_state,
 };
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 pub use hyper_playback_session::{
@@ -56,8 +57,9 @@ pub use hyper_playback_session::{
 use hyper_project_loader::ProjectPlaybackLimits;
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
-    ProjectResourcePublicationError, ProjectResourcePublicationOutcome,
-    ProjectResourcePublicationRequest, StorageError, publish_project_resource,
+    AudioTrackPublicationOutcome, AudioTrackPublicationRequest, ProjectResourcePublicationError,
+    ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest, StorageError,
+    publish_audio_track, publish_project_resource,
 };
 
 mod recording;
@@ -1753,11 +1755,126 @@ impl Error for IdeProjectSaveError {
 }
 
 #[derive(Debug)]
+pub enum IdeAudioTrackAdditionError {
+    InvalidName,
+    MixerSave(Box<IdeProjectSaveError>),
+    Serialization(AudioTrackAdditionSerializationError),
+    CapacityUnavailable,
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeAudioTrackAdditionError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: AudioTrackPublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<ProjectResourcePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl fmt::Display for IdeAudioTrackAdditionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidName => {
+                formatter.write_str("audio-track name must contain 1 through 120 characters")
+            }
+            Self::MixerSave(source) => {
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("audio-track edit capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before adding the audio track: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before adding the audio track ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-track preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "audio track {} was added in project revision {} but the project could not be reopened: {source}",
+                outcome.track_id(),
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-track publication failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAudioTrackAdditionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidName | Self::CapacityUnavailable | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct IdeMixerSavePlan {
     project_path: PathBuf,
     expected_project_sha256: [u8; 32],
     resource_id: String,
     resource_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct IdeAudioTrackAdditionPlan {
+    project_path: PathBuf,
+    expected_project_sha256: [u8; 32],
+    track_id: String,
+    track_bytes: Vec<u8>,
+    mixer_id: String,
+    mixer_bytes: Vec<u8>,
+}
+
+impl IdeAudioTrackAdditionPlan {
+    fn publish(&self) -> Result<AudioTrackPublicationOutcome, ProjectResourcePublicationError> {
+        publish_audio_track(
+            &self.project_path,
+            AudioTrackPublicationRequest {
+                expected_project_sha256: self.expected_project_sha256,
+                track_id: &self.track_id,
+                track_bytes: &self.track_bytes,
+                mixer_id: &self.mixer_id,
+                mixer_bytes: &self.mixer_bytes,
+            },
+        )
+    }
 }
 
 impl IdeMixerSavePlan {
@@ -1830,6 +1947,7 @@ pub struct RunningIdeSnapshot<'a> {
     pub arrangement: Arc<IdePlaybackArrangement>,
     pub recording_metadata: &'a [hyper_recording_metadata::RecordingMetadataDocument],
     pub scene_count: usize,
+    pub track_count: usize,
     pub scene_names: [&'a str; MAX_IDE_SCENES],
     pub scene_availability: [IdeSceneAvailability; MAX_IDE_SCENES],
     pub mixer_channel_count: usize,
@@ -2041,6 +2159,50 @@ impl RunningDesktopIdeApplication {
         })
     }
 
+    fn prepare_audio_track_addition(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        track_name: &str,
+    ) -> Result<IdeAudioTrackAdditionPlan, IdeAudioTrackAdditionError> {
+        let name_length = track_name.chars().count();
+        if track_name.trim() != track_name || !(1..=120).contains(&name_length) {
+            return Err(IdeAudioTrackAdditionError::InvalidName);
+        }
+        let mixer_plan = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAudioTrackAdditionError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAudioTrackAdditionError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeAudioTrackAdditionError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let track_id = uuid::Uuid::new_v4().to_string();
+        let documents = serialize_audio_track_addition(
+            project,
+            &assets,
+            &mixer_plan.resource_bytes,
+            &mixer_plan.resource_id,
+            &track_id,
+            track_name,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeAudioTrackAdditionError::Serialization)?;
+        let (track_bytes, mixer_bytes) = documents.into_parts();
+        Ok(IdeAudioTrackAdditionPlan {
+            project_path: mixer_plan.project_path,
+            expected_project_sha256: mixer_plan.expected_project_sha256,
+            track_id,
+            track_bytes,
+            mixer_id: mixer_plan.resource_id,
+            mixer_bytes,
+        })
+    }
+
     /// Observes the verified project and the latest non-owning runtime evidence.
     ///
     /// `None` means the underlying playback source exposes no verified project;
@@ -2146,6 +2308,7 @@ impl RunningDesktopIdeApplication {
             arrangement: project.session().shared_arrangement(),
             recording_metadata: project.recording_metadata(),
             scene_count,
+            track_count: loaded.track_count(),
             scene_names,
             scene_availability,
             mixer_channel_count,

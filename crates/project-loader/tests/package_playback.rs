@@ -8,7 +8,8 @@ use hyper_control_mappings::ControlMappingBindingErrorKind;
 use hyper_mapping_compiler::{CompiledControlScope, CompiledControlSource, CompiledControlTarget};
 use hyper_media_cache::CacheLimits;
 use hyper_playback_json::{
-    LoaderLimits, MixerBaseState, MixerChannelBaseState, serialize_mixer_base_state,
+    LoaderLimits, MixerBaseState, MixerChannelBaseState, serialize_audio_track_addition,
+    serialize_mixer_base_state,
 };
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::{
@@ -17,8 +18,8 @@ use hyper_project_loader::{
 };
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
-    ProjectCreationRequest, ProjectResourcePublicationRequest, create_project,
-    publish_project_resource, verify_project_package,
+    AudioTrackPublicationRequest, ProjectCreationRequest, ProjectResourcePublicationRequest,
+    create_project, publish_audio_track, publish_project_resource, verify_project_package,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -40,6 +41,7 @@ const FOREIGN_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334462";
 const SECOND_MAPPING_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334463";
 const BINDING_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334464";
 const AUTOMATION_TAKE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334465";
+const ADDED_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334466";
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -393,6 +395,78 @@ fn newly_created_project_prepares_as_an_empty_recordable_session() {
 
     drop(prepared);
     drop(creation);
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn added_audio_track_reopens_as_a_recordable_mixer_channel() {
+    let parent = std::env::temp_dir().join(format!(
+        "hyper-project-track-addition-loader-{}-{}",
+        std::process::id(),
+        NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&parent).unwrap();
+    let creation = create_project(
+        &parent,
+        ProjectCreationRequest {
+            directory_name: "Tracked Session",
+            project_name: "Tracked Session",
+        },
+    )
+    .unwrap();
+    let project_path = creation.project().root().to_owned();
+    let prepared = prepare_project_playback(&project_path, limits()).unwrap();
+    let mixer_descriptor = prepared
+        .package()
+        .manifest()
+        .resources()
+        .iter()
+        .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+        .unwrap();
+    let mixer_id = mixer_descriptor.id().to_owned();
+    let mixer_bytes = prepared.package().read_resource(&mixer_id).unwrap();
+    let expected_project_sha256 = *prepared.package().manifest_sha256();
+    let (project, _, _, media) = prepared.session().parts();
+    let assets = media.media_asset_facts().collect::<Vec<_>>();
+    let documents = serialize_audio_track_addition(
+        project,
+        &assets,
+        &mixer_bytes,
+        &mixer_id,
+        ADDED_TRACK_ID,
+        "Vocal",
+        LoaderLimits::VERSION_1,
+    )
+    .unwrap();
+    let (track_bytes, mixer_bytes) = documents.into_parts();
+    drop(prepared);
+    drop(creation);
+
+    let outcome = publish_audio_track(
+        &project_path,
+        AudioTrackPublicationRequest {
+            expected_project_sha256,
+            track_id: ADDED_TRACK_ID,
+            track_bytes: &track_bytes,
+            mixer_id: &mixer_id,
+            mixer_bytes: &mixer_bytes,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(outcome.project_revision(), 2);
+    assert_eq!(outcome.track_id(), ADDED_TRACK_ID);
+    let reopened = prepare_project_playback(&project_path, limits()).unwrap();
+    let (project, mixer, _, media) = reopened.session().parts();
+    assert_eq!(project.track_count(), 2);
+    assert_eq!(project.track_name_at(1), Some("Vocal"));
+    assert_eq!(project.clip_count(), 0);
+    assert_eq!(mixer.slots().len(), 2);
+    assert_eq!(mixer.slots()[1].track_id(), ADDED_TRACK_ID);
+    assert_eq!(media.asset_count(), 0);
+    reopened.package().confirm_unchanged().unwrap();
+
+    drop(reopened);
     fs::remove_dir_all(parent).unwrap();
 }
 
