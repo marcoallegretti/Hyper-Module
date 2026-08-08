@@ -553,6 +553,7 @@ impl From<TimelineError> for CompileError {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CompiledPlacement {
     arrangement_start_frame: usize,
+    arrangement_end_frame: usize,
     expected_source_sample_rate_hz: u32,
     expected_source_frame_count: usize,
     clip_spec: NativeClipSpec,
@@ -613,6 +614,11 @@ impl CompiledPlacement {
     #[must_use]
     pub const fn arrangement_start_frame(self) -> usize {
         self.arrangement_start_frame
+    }
+
+    #[must_use]
+    pub const fn arrangement_end_frame(self) -> usize {
+        self.arrangement_end_frame
     }
 
     #[must_use]
@@ -772,6 +778,7 @@ pub fn compile_placement(
 
     Ok(CompiledPlacement {
         arrangement_start_frame,
+        arrangement_end_frame,
         expected_source_sample_rate_hz: clip.source_sample_rate_hz,
         expected_source_frame_count: clip.asset_frame_count,
         clip_spec: NativeClipSpec {

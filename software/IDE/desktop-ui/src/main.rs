@@ -11,9 +11,9 @@ use hyper_desktop_ide::{
     DesktopAudioPreviewState, DesktopIdeWorker, IdeApplicationConfig, IdeAudioInputInventory,
     IdeAudioOutputInventory, IdeAudioPreviewControlCommand, IdeInputSelection, IdeMixerChannel,
     IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap, IdeMonitoringCommand,
-    IdeNativeCloseFailure, IdeOutputSelection, IdeRecordingAbortOutcome, IdeRecordingCaptureKind,
-    IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation, IdeScene,
-    IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
+    IdeNativeCloseFailure, IdeOutputSelection, IdePlaybackExtent, IdeRecordingAbortOutcome,
+    IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation,
+    IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
     IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
     IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState, TransportCommand,
     desktop_ide_application_config,
@@ -36,6 +36,7 @@ type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
 type InputRoutes = Rc<RefCell<Vec<InputRoute>>>;
 type RecordingRoutes = Rc<RefCell<Vec<usize>>>;
 type TakeRoutes = Rc<RefCell<Vec<String>>>;
+type PlaybackExtentCell = Rc<RefCell<Option<usize>>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum InputRoute {
@@ -121,6 +122,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let input_routes = Rc::new(RefCell::new(Vec::new()));
     let recording_routes = Rc::new(RefCell::new(Vec::new()));
     let take_routes = Rc::new(RefCell::new(Vec::new()));
+    let playback_extent = Rc::new(RefCell::new(None));
 
     bind_callbacks(
         &ui,
@@ -129,6 +131,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         &input_routes,
         &recording_routes,
         &take_routes,
+        &playback_extent,
     );
     let timer = start_event_pump(
         &ui,
@@ -137,6 +140,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         &input_routes,
         &recording_routes,
         &take_routes,
+        &playback_extent,
     );
     let run_result = ui.run();
     timer.stop();
@@ -157,6 +161,7 @@ fn bind_callbacks(
     input_routes: &InputRoutes,
     recording_routes: &RecordingRoutes,
     take_routes: &TakeRoutes,
+    playback_extent: &PlaybackExtentCell,
 ) {
     let actions = ui.global::<IdeActions>();
 
@@ -240,7 +245,7 @@ fn bind_callbacks(
         }
     });
 
-    bind_playback_callbacks(ui, worker);
+    bind_playback_callbacks(ui, worker, playback_extent);
     bind_monitoring_callbacks(ui, worker);
     bind_recording_callbacks(ui, worker, recording_routes);
     bind_audio_preview_callbacks(ui, worker, take_routes);
@@ -450,7 +455,11 @@ fn bind_audio_preview_callbacks(ui: &MainWindow, worker: &WorkerCell, take_route
     });
 }
 
-fn bind_playback_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+fn bind_playback_callbacks(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    playback_extent: &PlaybackExtentCell,
+) {
     let actions = ui.global::<IdeActions>();
 
     let weak = ui.as_weak();
@@ -481,6 +490,26 @@ fn bind_playback_callbacks(ui: &MainWindow, worker: &WorkerCell) {
             &worker_for_return,
             IdeWorkerCommand::Transport(return_to_start_command()),
         );
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_seek = Rc::clone(worker);
+    let extent_for_seek = Rc::clone(playback_extent);
+    actions.on_transport_seek(move |percent| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        let Some(end_frame) = *extent_for_seek.borrow() else {
+            ui.set_error_text("Finite playback extent is no longer available".into());
+            return;
+        };
+        match seek_percent_to_frame(percent, end_frame) {
+            Ok(frame) => submit_to_ui(&ui, &worker_for_seek, IdeWorkerCommand::Seek { frame }),
+            Err(message) => ui.set_error_text(message.into()),
+        }
     });
 
     let weak = ui.as_weak();
@@ -670,6 +699,7 @@ fn start_event_pump(
     input_routes: &InputRoutes,
     recording_routes: &RecordingRoutes,
     take_routes: &TakeRoutes,
+    playback_extent: &PlaybackExtentCell,
 ) -> Timer {
     let timer = Timer::default();
     let weak = ui.as_weak();
@@ -678,6 +708,7 @@ fn start_event_pump(
     let input_routes = Rc::clone(input_routes);
     let recording_routes = Rc::clone(recording_routes);
     let take_routes = Rc::clone(take_routes);
+    let playback_extent = Rc::clone(playback_extent);
     let mut observation_pending = false;
     timer.start(TimerMode::Repeated, UI_POLL_INTERVAL, move || {
         let Some(ui) = weak.upgrade() else {
@@ -699,6 +730,7 @@ fn start_event_pump(
                         &input_routes,
                         &recording_routes,
                         &take_routes,
+                        &playback_extent,
                         event,
                     );
                 }
@@ -811,6 +843,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::SelectInput => "Applying input cue selection…",
         IdeWorkerCommandKind::OpenProject => "Recovering and verifying project…",
         IdeWorkerCommandKind::Transport => "Transport command queued…",
+        IdeWorkerCommandKind::Seek => "Bounded transport locate queued…",
         IdeWorkerCommandKind::Mixer => "Mixer command queued…",
         IdeWorkerCommandKind::Monitoring => "Applying input cue control…",
         IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
@@ -836,6 +869,7 @@ fn apply_event(
     input_routes: &InputRoutes,
     recording_routes: &RecordingRoutes,
     take_routes: &TakeRoutes,
+    playback_extent: &PlaybackExtentCell,
     event: IdeWorkerEvent,
 ) {
     match event {
@@ -851,7 +885,7 @@ fn apply_event(
                 snapshot.inputs(),
                 snapshot.input_selection(),
             );
-            reset_project(ui, recording_routes, take_routes);
+            reset_project(ui, recording_routes, take_routes, playback_extent);
             let mode = mode_after_closed_event(ui.get_app_mode());
             ui.set_app_mode(mode);
             if mode == AppMode::Closed {
@@ -862,9 +896,13 @@ fn apply_event(
                 ui.set_error_text(error.unwrap_or_default().into());
             }
         }
-        IdeWorkerEvent::Running(observation) => {
-            apply_running_event(ui, recording_routes, take_routes, &observation);
-        }
+        IdeWorkerEvent::Running(observation) => apply_running_event(
+            ui,
+            recording_routes,
+            take_routes,
+            playback_extent,
+            &observation,
+        ),
         IdeWorkerEvent::TransportQueued(command) => {
             ui.set_status_text(
                 match command {
@@ -990,6 +1028,7 @@ fn apply_running_event(
     ui: &MainWindow,
     recording_routes: &RecordingRoutes,
     take_routes: &TakeRoutes,
+    playback_extent: &PlaybackExtentCell,
     observation: &IdeRunningObservation,
 ) {
     ui.set_project_name(observation.project_name().into());
@@ -1000,6 +1039,7 @@ fn apply_running_event(
     apply_mixer_observation(ui, observation);
     set_recording_targets(ui, recording_routes, observation.mixer_channels());
     set_recording_takes(ui, take_routes, observation);
+    set_playback_extent(ui, playback_extent, observation);
     ui.set_stream_state(format!("{:?}", observation.output_state()).into());
     ui.set_callback_count(observation.output().callback_count.to_string().into());
     if let Some(monitoring) = observation.monitoring() {
@@ -1168,6 +1208,70 @@ fn format_take_detail(take: &IdeRecordingTake) -> String {
         format_transport_clock(take.frame_count(), take.sample_rate_hz()),
         take.sample_rate_hz()
     )
+}
+
+fn set_playback_extent(
+    ui: &MainWindow,
+    playback_extent: &PlaybackExtentCell,
+    observation: &IdeRunningObservation,
+) {
+    match observation.playback_extent() {
+        IdePlaybackExtent::Bounded { end_frame } => {
+            *playback_extent.borrow_mut() = Some(end_frame);
+            ui.set_transport_extent_bounded(true);
+            ui.set_transport_seek_available(end_frame > 0);
+            ui.set_transport_end_clock(
+                format_transport_clock(
+                    u64::try_from(end_frame).unwrap_or(u64::MAX),
+                    observation.sample_rate_hz(),
+                )
+                .into(),
+            );
+            ui.set_transport_progress_percent(frame_progress_percent(
+                observation.recovery().position_frame(),
+                end_frame,
+            ));
+        }
+        IdePlaybackExtent::Unbounded => {
+            *playback_extent.borrow_mut() = None;
+            ui.set_transport_extent_bounded(false);
+            ui.set_transport_seek_available(false);
+            ui.set_transport_end_clock("—".into());
+            ui.set_transport_progress_percent(0.0);
+        }
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "finite seek percent is bounded before conversion to one-millionth resolution"
+)]
+fn seek_percent_to_frame(percent: f32, end_frame: usize) -> Result<usize, &'static str> {
+    if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+        return Err("Transport seek position is outside its supported range");
+    }
+    let millionths = (percent * 10_000.0).round() as u32;
+    let scaled = (end_frame as u128)
+        .checked_mul(u128::from(millionths))
+        .and_then(|value| value.checked_add(500_000))
+        .ok_or("Transport seek position exceeds the supported frame domain")?;
+    usize::try_from(scaled / 1_000_000)
+        .map_err(|_| "Transport seek position exceeds the supported frame domain")
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the computed progress domain is at most one million and exactly representable by f32"
+)]
+fn frame_progress_percent(position_frame: usize, end_frame: usize) -> f32 {
+    if end_frame == 0 {
+        return 0.0;
+    }
+    let millionths =
+        u32::try_from((position_frame.min(end_frame) as u128) * 1_000_000 / (end_frame as u128))
+            .unwrap_or(1_000_000);
+    millionths as f32 / 10_000.0
 }
 
 fn apply_recording_event(ui: &MainWindow, state: &hyper_desktop_ide::IdeRecordingState) {
@@ -1367,7 +1471,12 @@ fn input_presentation(
     }
 }
 
-fn reset_project(ui: &MainWindow, recording_routes: &RecordingRoutes, take_routes: &TakeRoutes) {
+fn reset_project(
+    ui: &MainWindow,
+    recording_routes: &RecordingRoutes,
+    take_routes: &TakeRoutes,
+    playback_extent: &PlaybackExtentCell,
+) {
     ui.set_project_name("No project open".into());
     ui.set_project_id("—".into());
     ui.set_sample_rate("—".into());
@@ -1394,6 +1503,11 @@ fn reset_project(ui: &MainWindow, recording_routes: &RecordingRoutes, take_route
     ui.set_preview_muted(false);
     ui.set_preview_state("Idle".into());
     ui.set_preview_progress("—".into());
+    *playback_extent.borrow_mut() = None;
+    ui.set_transport_extent_bounded(false);
+    ui.set_transport_seek_available(false);
+    ui.set_transport_progress_percent(0.0);
+    ui.set_transport_end_clock("—".into());
     ui.set_transport_state("Stopped".into());
     ui.set_stream_state("No stream".into());
     ui.set_frame_position("0".into());
@@ -2011,6 +2125,29 @@ mod tests {
         assert_eq!(format_transport_clock(72_000, 48_000), "00:00:01.500");
         assert_eq!(format_transport_clock(172_800_000, 48_000), "01:00:00.000");
         assert_eq!(format_transport_clock(1, 0), "—");
+    }
+
+    #[test]
+    fn normalized_seek_maps_exact_endpoints_and_nearest_frames() {
+        assert_eq!(seek_percent_to_frame(0.0, 43_200_000), Ok(0));
+        assert_eq!(seek_percent_to_frame(50.0, 43_200_000), Ok(21_600_000));
+        assert_eq!(seek_percent_to_frame(100.0, 43_200_000), Ok(43_200_000));
+        assert_eq!(seek_percent_to_frame(33.3333, 3), Ok(1));
+        assert!(seek_percent_to_frame(f32::NAN, 100).is_err());
+        assert!(seek_percent_to_frame(100.1, 100).is_err());
+    }
+
+    #[test]
+    fn transport_progress_is_bounded_by_the_compiled_endpoint() {
+        assert_eq!(frame_progress_percent(0, 0).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(
+            frame_progress_percent(25, 100).to_bits(),
+            25.0_f32.to_bits()
+        );
+        assert_eq!(
+            frame_progress_percent(150, 100).to_bits(),
+            100.0_f32.to_bits()
+        );
     }
 
     #[test]

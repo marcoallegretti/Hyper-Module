@@ -72,6 +72,7 @@ export global IdeActions {
     callback transport-start();
     callback transport-stop();
     callback transport-return-start();
+    callback transport-seek(float);
     callback launch-scene(int);
     callback mixer-channel-gain(int, float);
     callback mixer-channel-pan(int, float);
@@ -187,6 +188,10 @@ export component MainWindow inherits Window {
     in property <string> stream-state: "No stream";
     in property <string> frame-position: "0";
     in property <string> transport-clock: "00:00:00.000";
+    in property <bool> transport-extent-bounded: false;
+    in property <bool> transport-seek-available: false;
+    in property <float> transport-progress-percent: 0;
+    in property <string> transport-end-clock: "—";
     in property <string> callback-count: "0";
     in property <string> xrun-count: "Unavailable";
     in property <float> left-meter: 0;
@@ -444,7 +449,7 @@ export component MainWindow inherits Window {
                     Rectangle { height: 1px; background: #27313d; }
 
                     HorizontalLayout {
-                        height: 112px;
+                        height: 146px;
                         spacing: 18px;
                         VerticalLayout {
                             horizontal-stretch: 1;
@@ -472,6 +477,23 @@ export component MainWindow inherits Window {
                             }
                             Text { text: root.transport-clock; color: #dce5ef; font-size: 18px; font-weight: 600; horizontal-alignment: center; }
                             Text { text: "Frame  " + root.frame-position; color: #8fa0b4; font-size: 11px; horizontal-alignment: center; }
+                            VerticalLayout {
+                                spacing: 2px;
+                                Slider {
+                                    minimum: 0;
+                                    maximum: 100;
+                                    value: root.transport-progress-percent;
+                                    enabled: root.app-mode == AppMode.running && root.transport-seek-available;
+                                    accessible-label: "Locate within finite compiled playback range";
+                                    released(value) => { IdeActions.transport-seek(value); }
+                                }
+                                Text {
+                                    text: root.transport-extent-bounded ? "0:00  ·  COMPILED PLAYBACK RANGE  ·  " + root.transport-end-clock : "OPEN-ENDED RECORDED SCENE AUTHORITY · SEEK RANGE UNAVAILABLE";
+                                    color: root.transport-extent-bounded ? #65758a : #b58a67;
+                                    font-size: 9px;
+                                    horizontal-alignment: center;
+                                }
+                            }
                         }
                         Meter { width: 64px; level: root.left-meter; channel-name: "LEFT"; reading: root.left-reading; }
                         Meter { width: 64px; level: root.right-meter; channel-name: "RIGHT"; reading: root.right-reading; }

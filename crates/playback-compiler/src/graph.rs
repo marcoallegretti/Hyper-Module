@@ -511,17 +511,8 @@ fn compile_entries<'a>(
         }) {
             return Err(GraphError::OverlappingPlacements { placement_index });
         }
-        track_frame_ends[resolved.track_index] = Some(
-            resolved
-                .entry
-                .compiled
-                .arrangement_start_frame()
-                .checked_add(resolved.entry.compiled.frame_count())
-                .ok_or(GraphError::PlacementCompilation {
-                    placement_index,
-                    error: CompileError::ArithmeticOverflow,
-                })?,
-        );
+        track_frame_ends[resolved.track_index] =
+            Some(resolved.entry.compiled.arrangement_end_frame());
         entries.push(resolved.entry);
     }
 

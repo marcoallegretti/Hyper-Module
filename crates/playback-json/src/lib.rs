@@ -1367,6 +1367,15 @@ impl OwnedCompiledSchedule {
     pub fn entries(&self) -> &[OwnedScheduleEntry] {
         &self.entries
     }
+
+    #[must_use]
+    pub fn end_frame(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| entry.compiled.arrangement_end_frame())
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Debug)]

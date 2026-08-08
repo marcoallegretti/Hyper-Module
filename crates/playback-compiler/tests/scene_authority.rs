@@ -1,7 +1,8 @@
 use hyper_playback_compiler::scene::{
-    LaunchQuantization, PlayingSceneClip, SceneClipResource, SceneCompileError, SceneLimits,
-    ScenePerformanceInput, SceneProcessError, SceneResource, SceneRuntimeError, SceneSlotAction,
-    SceneSlotResource, SceneTrackResource, compile_scene_performance,
+    LaunchQuantization, PlayingSceneClip, RecordedSceneExtent, SceneClipResource,
+    SceneCompileError, SceneLimits, ScenePerformanceInput, SceneProcessError, SceneResource,
+    SceneRuntimeError, SceneSlotAction, SceneSlotResource, SceneTrackResource,
+    compile_scene_performance,
 };
 use hyper_playback_compiler::{TempoEvent, Timeline};
 
@@ -129,6 +130,37 @@ fn scene_authority_is_sparse_sample_exact_and_seekable() {
     assert_eq!(compiled.track_count(), 2);
     assert_eq!(compiled.track_id(0), Some("track-a"));
     assert_eq!(compiled.track_id(2), None);
+    assert_eq!(
+        compiled.recorded_extent(),
+        RecordedSceneExtent::Finite { end_frame: 113 }
+    );
+
+    let open_ended = compile_scene_performance(
+        timeline(),
+        ScenePerformanceInput {
+            enabled: true,
+            tracks: &tracks,
+            clips: &clips,
+            scenes: &scenes,
+            launches: &launches[..1],
+        },
+        SceneLimits::VERSION_1,
+    )
+    .unwrap();
+    assert_eq!(open_ended.recorded_extent(), RecordedSceneExtent::Unbounded);
+    let empty = compile_scene_performance(
+        timeline(),
+        ScenePerformanceInput {
+            enabled: true,
+            tracks: &tracks,
+            clips: &clips,
+            scenes: &scenes,
+            launches: &[],
+        },
+        SceneLimits::VERSION_1,
+    )
+    .unwrap();
+    assert_eq!(empty.recorded_extent(), RecordedSceneExtent::Empty);
 
     let mut runtime = compiled.runtime_at(0).unwrap();
     let mut boundaries = Vec::new();

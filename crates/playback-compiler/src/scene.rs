@@ -394,10 +394,43 @@ pub struct CompiledScenePerformance<'a> {
     timeline: FrameTimeline,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordedSceneExtent {
+    Empty,
+    Finite { end_frame: usize },
+    Unbounded,
+}
+
 impl<'resource> CompiledScenePerformance<'resource> {
     #[must_use]
     pub fn track_count(&self) -> usize {
         self.tracks.len()
+    }
+
+    /// Returns the exact extent of recorded scene authority. Interactive scene
+    /// templates do not contribute until they are launched at runtime.
+    #[must_use]
+    pub fn recorded_extent(&self) -> RecordedSceneExtent {
+        let mut end_frame = None::<usize>;
+        for track in &self.tracks {
+            let Some(action) = track.actions.last() else {
+                continue;
+            };
+            let track_end = match action.action {
+                CompiledAction::Stop => action.frame,
+                CompiledAction::Play(playing) if !playing.enabled() => action.frame,
+                CompiledAction::Play(playing) => {
+                    let Some(end_frame) = playing.natural_end_frame() else {
+                        return RecordedSceneExtent::Unbounded;
+                    };
+                    end_frame
+                }
+            };
+            end_frame = Some(end_frame.map_or(track_end, |current| current.max(track_end)));
+        }
+        end_frame.map_or(RecordedSceneExtent::Empty, |end_frame| {
+            RecordedSceneExtent::Finite { end_frame }
+        })
     }
 
     #[must_use]

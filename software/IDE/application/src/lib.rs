@@ -35,6 +35,7 @@ use hyper_playback_json::{
     CompiledMixerTap, CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
     MixerSendBaseState, MixerStateSerializationError, serialize_mixer_base_state,
 };
+pub use hyper_playback_session::PlaybackExtent as IdePlaybackExtent;
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::ProjectPlaybackLimits;
 use hyper_project_model::ResourceRole;
@@ -1152,6 +1153,42 @@ pub enum IdeAudioPreviewError {
     Control(DesktopAudioPreviewControlError),
 }
 
+#[derive(Debug)]
+pub enum IdeTransportSeekError {
+    Unavailable,
+    Unbounded,
+    OutOfRange { requested: usize, end_frame: usize },
+    Send(DesktopDirectControlError),
+}
+
+impl fmt::Display for IdeTransportSeekError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("verified playback extent is unavailable"),
+            Self::Unbounded => {
+                formatter.write_str("recorded scene authority has no finite playback endpoint")
+            }
+            Self::OutOfRange {
+                requested,
+                end_frame,
+            } => write!(
+                formatter,
+                "requested frame {requested} exceeds playback endpoint {end_frame}"
+            ),
+            Self::Send(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeTransportSeekError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Send(source) => Some(source),
+            Self::Unavailable | Self::Unbounded | Self::OutOfRange { .. } => None,
+        }
+    }
+}
+
 impl fmt::Display for IdeAudioPreviewError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1385,6 +1422,7 @@ pub struct RunningIdeSnapshot<'a> {
     pub project_id: &'a str,
     pub project_name: &'a str,
     pub sample_rate_hz: u32,
+    pub playback_extent: IdePlaybackExtent,
     pub recording_metadata: &'a [hyper_recording_metadata::RecordingMetadataDocument],
     pub scene_count: usize,
     pub scene_names: [&'a str; MAX_IDE_SCENES],
@@ -1438,6 +1476,7 @@ struct TestPlaybackSession {
     commit_mixer_fences: bool,
     committed_mixer_fence: u64,
     next_mixer_fence: u64,
+    extent: IdePlaybackExtent,
 }
 
 #[cfg(test)]
@@ -1452,6 +1491,7 @@ impl Default for TestPlaybackSession {
             commit_mixer_fences: false,
             committed_mixer_fence: 0,
             next_mixer_fence: 1,
+            extent: IdePlaybackExtent::Bounded { end_frame: 0 },
         }
     }
 }
@@ -1691,6 +1731,7 @@ impl RunningDesktopIdeApplication {
             project_id: project.package().manifest().project_id(),
             project_name: project.package().manifest().name(),
             sample_rate_hz: project.session().sample_rate_hz(),
+            playback_extent: project.session().extent(),
             recording_metadata: project.recording_metadata(),
             scene_count,
             scene_names,
@@ -1730,6 +1771,38 @@ impl RunningDesktopIdeApplication {
                 Ok(())
             }
         }
+    }
+
+    /// Locates within the exact finite endpoint compiled for this project.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-project sessions, open-ended recorded scene authority,
+    /// out-of-range frames, and bounded command delivery failures.
+    pub fn try_seek(&mut self, frame: usize) -> Result<(), IdeTransportSeekError> {
+        let extent = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session
+                .prepared_project()
+                .ok_or(IdeTransportSeekError::Unavailable)?
+                .session()
+                .extent(),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => session.extent,
+        };
+        let IdePlaybackExtent::Bounded { end_frame } = extent else {
+            return Err(IdeTransportSeekError::Unbounded);
+        };
+        if frame > end_frame {
+            return Err(IdeTransportSeekError::OutOfRange {
+                requested: frame,
+                end_frame,
+            });
+        }
+        self.try_send_transport(TransportCommand::Locate {
+            frame,
+            state: LocateState::Preserve,
+        })
+        .map_err(IdeTransportSeekError::Send)
     }
 
     /// Sends one validated base-mixer command through the only live owner.
@@ -2618,6 +2691,48 @@ mod tests {
             running.close(),
             IdeCloseOutcome::Closed { failure: None, .. }
         ));
+    }
+
+    #[test]
+    fn bounded_seek_rejects_unbounded_and_out_of_range_positions_without_queueing() {
+        let application = DesktopIdeApplication::from_inventory(
+            config(256).unwrap(),
+            IdeAudioOutputInventory::default(),
+        );
+        let mut running = RunningDesktopIdeApplication {
+            application,
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                extent: IdePlaybackExtent::Bounded { end_frame: 1_000 },
+                ..TestPlaybackSession::default()
+            }),
+        };
+        assert!(matches!(
+            running.try_seek(1_001),
+            Err(IdeTransportSeekError::OutOfRange {
+                requested: 1_001,
+                end_frame: 1_000
+            })
+        ));
+        running.try_seek(750).unwrap();
+        let IdePlaybackSessionOwner::Test(session) = &mut running.session else {
+            unreachable!("test constructed the deterministic session owner");
+        };
+        assert_eq!(
+            session.commands,
+            [TransportCommand::Locate {
+                frame: 750,
+                state: LocateState::Preserve,
+            }]
+        );
+        session.extent = IdePlaybackExtent::Unbounded;
+        assert!(matches!(
+            running.try_seek(0),
+            Err(IdeTransportSeekError::Unbounded)
+        ));
+        let IdePlaybackSessionOwner::Test(session) = &running.session else {
+            unreachable!("test constructed the deterministic session owner");
+        };
+        assert_eq!(session.commands.len(), 1);
     }
 
     #[test]

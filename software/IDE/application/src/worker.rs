@@ -25,8 +25,8 @@ use super::{
     IdeOutputSelection, IdeOutputSelectionError, IdePendingCloseWait, IdePendingSaveCloseWait,
     IdeProjectOpenError, IdeProjectSaveError, IdeRecordingAbortError, IdeRecordingAbortOutcome,
     IdeRecordingError, IdeRecordingImportOutcome, IdeRecordingObservation, IdeSaveCloseOutcome,
-    IdeSceneAvailability, InputInventoryError, LocateState, OutputInventoryError,
-    OutputStreamSnapshot, OutputStreamState, RunningDesktopIdeApplication,
+    IdeSceneAvailability, IdeTransportSeekError, InputInventoryError, LocateState,
+    OutputInventoryError, OutputStreamSnapshot, OutputStreamState, RunningDesktopIdeApplication,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -101,6 +101,7 @@ pub enum IdeWorkerCommandKind {
     SelectInput,
     OpenProject,
     Transport,
+    Seek,
     Mixer,
     Monitoring,
     SaveProject,
@@ -127,6 +128,7 @@ pub enum IdeWorkerCommand {
     SelectInput(String),
     OpenProject(PathBuf),
     Transport(TransportCommand),
+    Seek { frame: usize },
     Mixer(IdeMixerCommand),
     Monitoring(IdeMonitoringCommand),
     SaveProject,
@@ -155,6 +157,7 @@ impl IdeWorkerCommand {
             Self::SelectInput(_) => IdeWorkerCommandKind::SelectInput,
             Self::OpenProject(_) => IdeWorkerCommandKind::OpenProject,
             Self::Transport(_) => IdeWorkerCommandKind::Transport,
+            Self::Seek { .. } => IdeWorkerCommandKind::Seek,
             Self::Mixer(_) => IdeWorkerCommandKind::Mixer,
             Self::Monitoring(_) => IdeWorkerCommandKind::Monitoring,
             Self::SaveProject => IdeWorkerCommandKind::SaveProject,
@@ -330,6 +333,7 @@ pub struct IdeRunningObservation {
     project_id: String,
     project_name: String,
     sample_rate_hz: u32,
+    playback_extent: super::IdePlaybackExtent,
     recording_takes: Vec<IdeRecordingTake>,
     preview: IdeAudioPreviewObservation,
     scenes: Vec<IdeScene>,
@@ -500,6 +504,11 @@ impl IdeRunningObservation {
     }
 
     #[must_use]
+    pub const fn playback_extent(&self) -> super::IdePlaybackExtent {
+        self.playback_extent
+    }
+
+    #[must_use]
     pub fn recording_takes(&self) -> &[IdeRecordingTake] {
         &self.recording_takes
     }
@@ -563,6 +572,7 @@ pub enum IdeWorkerCommandFailure {
     InputSelection(IdeInputSelectionError),
     ProjectOpen(IdeProjectOpenError),
     Transport(super::DesktopDirectControlError),
+    Seek(IdeTransportSeekError),
     Mixer(IdeMixerCommandError),
     Monitoring(IdeMonitoringCommandError),
     ProjectSave(IdeProjectSaveError),
@@ -584,6 +594,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::InputSelection(source) => source.fmt(formatter),
             Self::ProjectOpen(source) => source.fmt(formatter),
             Self::Transport(source) => source.fmt(formatter),
+            Self::Seek(source) => source.fmt(formatter),
             Self::Mixer(source) => source.fmt(formatter),
             Self::Monitoring(source) => source.fmt(formatter),
             Self::ProjectSave(source) => source.fmt(formatter),
@@ -613,6 +624,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::InputSelection(source) => Some(source),
             Self::ProjectOpen(source) => Some(source),
             Self::Transport(source) => Some(source),
+            Self::Seek(source) => Some(source),
             Self::Mixer(source) => Some(source),
             Self::Monitoring(source) => Some(source),
             Self::ProjectSave(source) => Some(source),
@@ -1158,6 +1170,7 @@ fn process_command(
             }
         }
         IdeWorkerCommand::Transport(command) => process_transport_command(state, command, events),
+        IdeWorkerCommand::Seek { frame } => process_seek_command(state, frame, events),
         IdeWorkerCommand::Mixer(command) => match state {
             WorkerState::Running(application) => match application.try_send_mixer(command) {
                 Ok(()) => send_event(events, IdeWorkerEvent::MixerQueued(command)),
@@ -1216,6 +1229,43 @@ fn process_transport_command(
         _ => publish_failure(
             events,
             IdeWorkerCommandKind::Transport,
+            IdeWorkerCommandFailure::InvalidState,
+        ),
+    }
+}
+
+fn process_seek_command(
+    state: &mut WorkerState,
+    frame: usize,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    match state {
+        WorkerState::Running(application) if application.audio_preview_is_active() => {
+            publish_failure(
+                events,
+                IdeWorkerCommandKind::Seek,
+                IdeWorkerCommandFailure::AudioPreview(IdeAudioPreviewError::Command(
+                    hyper_desktop_audio::DesktopAudioPreviewCommandError::PreviewBusy,
+                )),
+            )
+        }
+        WorkerState::Running(application) => match application.try_seek(frame) {
+            Ok(()) => send_event(
+                events,
+                IdeWorkerEvent::TransportQueued(TransportCommand::Locate {
+                    frame,
+                    state: LocateState::Preserve,
+                }),
+            ),
+            Err(reason) => publish_failure(
+                events,
+                IdeWorkerCommandKind::Seek,
+                IdeWorkerCommandFailure::Seek(reason),
+            ),
+        },
+        _ => publish_failure(
+            events,
+            IdeWorkerCommandKind::Seek,
             IdeWorkerCommandFailure::InvalidState,
         ),
     }
@@ -2334,6 +2384,7 @@ fn running_observation(
         project_id,
         project_name,
         sample_rate_hz: snapshot.sample_rate_hz,
+        playback_extent: snapshot.playback_extent,
         recording_takes,
         preview: IdeAudioPreviewObservation {
             snapshot: snapshot.preview,
@@ -2470,7 +2521,9 @@ impl Drop for CompletionSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{IdeAudioOutputInventory, IdePlaybackSessionOwner, TestPlaybackSession};
+    use crate::{
+        IdeAudioOutputInventory, IdePlaybackExtent, IdePlaybackSessionOwner, TestPlaybackSession,
+    };
     use hyper_audio_source::DecodeLimits;
     use hyper_media_cache::CacheLimits;
     use hyper_playback_json::LoaderLimits;
@@ -2687,6 +2740,50 @@ mod tests {
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::TransportQueued(TransportCommand::Stop)
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn running_worker_queues_only_bounded_seek_positions() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                extent: IdePlaybackExtent::Bounded { end_frame: 2_000 },
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 3, 3).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::Seek { frame: 1_500 })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::TransportQueued(TransportCommand::Locate {
+                frame: 1_500,
+                state: LocateState::Preserve,
+            })
+        ));
+        worker
+            .try_send(IdeWorkerCommand::Seek { frame: 2_001 })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Seek,
+                reason: IdeWorkerCommandFailure::Seek(IdeTransportSeekError::OutOfRange {
+                    requested: 2_001,
+                    end_frame: 2_000,
+                }),
+            }
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
     }

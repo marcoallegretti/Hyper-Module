@@ -9,7 +9,7 @@ use hyper_media_cache::{
     CacheBuildError, CacheLimits, DecodedMediaCache, DecodedMediaCacheBuilder, PreparePlaybackError,
 };
 use hyper_playback_compiler::graph::GraphLimits;
-use hyper_playback_compiler::scene::SceneLimits;
+use hyper_playback_compiler::scene::{RecordedSceneExtent, SceneLimits};
 use hyper_playback_json::{
     AdapterCompileError, AutomationCompileError, CompiledAutomation, CompiledMixerGraph, LoadError,
     LoadedPlaybackProject, LoaderLimits, MediaAssetFact, MixerCompileError, PlaybackJsonInput,
@@ -81,6 +81,28 @@ pub struct PreparedPlaybackSession {
     mixer: CompiledMixerGraph,
     automation: Option<CompiledAutomation>,
     media: DecodedMediaCache,
+    extent: PlaybackExtent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackExtent {
+    Bounded { end_frame: usize },
+    Unbounded,
+}
+
+fn playback_extent(
+    arrangement_end_frame: usize,
+    recorded_scene_extent: RecordedSceneExtent,
+) -> PlaybackExtent {
+    match recorded_scene_extent {
+        RecordedSceneExtent::Empty => PlaybackExtent::Bounded {
+            end_frame: arrangement_end_frame,
+        },
+        RecordedSceneExtent::Finite { end_frame } => PlaybackExtent::Bounded {
+            end_frame: arrangement_end_frame.max(end_frame),
+        },
+        RecordedSceneExtent::Unbounded => PlaybackExtent::Unbounded,
+    }
 }
 
 impl PreparedPlaybackSession {
@@ -102,6 +124,11 @@ impl PreparedPlaybackSession {
     #[must_use]
     pub fn has_automation(&self) -> bool {
         self.automation.is_some()
+    }
+
+    #[must_use]
+    pub const fn extent(&self) -> PlaybackExtent {
+        self.extent
     }
 
     #[must_use]
@@ -331,6 +358,10 @@ pub fn assemble_playback_session(
     let graph = project
         .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
         .map_err(PlaybackSessionAssemblyError::Playback)?;
+    let extent = playback_extent(
+        graph.arrangement().end_frame(),
+        graph.scene_authority().recorded_extent(),
+    );
     let _prepared = media
         .prepare_playback(&graph)
         .map_err(PlaybackSessionAssemblyError::MediaBinding)?;
@@ -340,6 +371,7 @@ pub fn assemble_playback_session(
         mixer,
         automation,
         media,
+        extent,
     })
 }
 
@@ -471,6 +503,7 @@ mod tests {
         assert_eq!(session.sample_rate_hz(), 48_000);
         assert_eq!(session.media_asset_count(), 1);
         assert!(session.has_automation());
+        assert_eq!(session.extent(), PlaybackExtent::Bounded { end_frame: 100 });
         let (project, mixer, automation, media) = session.parts();
         assert_eq!(project.project_id(), mixer.project_id());
         assert_eq!(
@@ -485,6 +518,26 @@ mod tests {
             Some(project.project_id())
         );
         assert!(media.contains("018f47a2-6b2d-7c11-8a44-001122337504"));
+    }
+
+    #[test]
+    fn playback_extent_combines_arrangement_and_recorded_scene_authority() {
+        assert_eq!(
+            playback_extent(100, RecordedSceneExtent::Empty),
+            PlaybackExtent::Bounded { end_frame: 100 }
+        );
+        assert_eq!(
+            playback_extent(100, RecordedSceneExtent::Finite { end_frame: 75 }),
+            PlaybackExtent::Bounded { end_frame: 100 }
+        );
+        assert_eq!(
+            playback_extent(100, RecordedSceneExtent::Finite { end_frame: 150 }),
+            PlaybackExtent::Bounded { end_frame: 150 }
+        );
+        assert_eq!(
+            playback_extent(100, RecordedSceneExtent::Unbounded),
+            PlaybackExtent::Unbounded
+        );
     }
 
     #[test]
