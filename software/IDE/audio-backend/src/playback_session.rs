@@ -1,3 +1,4 @@
+use super::audio_preview_session::DesktopAudioPreviewProcessor;
 use super::monitoring_session::{MonitoringConsumer, MonitoringCounters, try_monitoring_transport};
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 use super::pipewire_output::PipeWireThreadRunner;
@@ -219,6 +220,7 @@ pub enum DesktopPlaybackSessionBuildError {
     ScratchCapacityUnavailable,
     Output(TransportOutputCreationError),
     MonitoringScratchCapacityUnavailable,
+    AudioPreview(super::DesktopAudioPreviewBuildError),
 }
 
 #[derive(Debug)]
@@ -290,6 +292,9 @@ impl fmt::Display for DesktopPlaybackSessionBuildError {
             Self::MonitoringScratchCapacityUnavailable => {
                 formatter.write_str("playback monitoring scratch capacity is unavailable")
             }
+            Self::AudioPreview(source) => {
+                write!(formatter, "audio preview preparation failed: {source}")
+            }
         }
     }
 }
@@ -304,6 +309,7 @@ impl Error for DesktopPlaybackSessionBuildError {
             Self::ControlMappingCopy(source) => Some(source),
             Self::ControlMapping(source) => Some(source),
             Self::Output(source) => Some(source),
+            Self::AudioPreview(source) => Some(source),
             Self::SampleRateMismatch { .. }
             | Self::AssetFactCapacityUnavailable
             | Self::ControlMappingOwnerCapacityUnavailable
@@ -451,6 +457,7 @@ struct SessionHandles {
     loudness_commands: LoudnessCommandSender,
     meters: OutputMeterReceiver,
     recovery: PlaybackRecoveryCheckpoint,
+    preview: super::DesktopAudioPreviewControl,
 }
 
 #[derive(Debug)]
@@ -657,6 +664,7 @@ pub struct DesktopPlaybackSession {
     loudness_commands: LoudnessCommandSender,
     meters: OutputMeterReceiver,
     recovery: PlaybackRecoveryCheckpoint,
+    preview: super::DesktopAudioPreviewControl,
     config: DesktopOutputConfig,
     source: Arc<dyn DesktopPlaybackSource>,
     monitoring: Option<PlaybackMonitoringSession>,
@@ -764,13 +772,14 @@ fn mix_monitoring_interleaved(output: StereoOutput<'_>, monitoring: &[f32]) -> b
     true
 }
 
-struct MonitoredTransportOutputProcessor<'state, 'buffers, R> {
+struct PreviewingTransportOutputProcessor<'state, 'buffers, 'media, R> {
     playback: TransportOutputProcessor<'state, 'buffers, R>,
-    monitoring: PlaybackMonitoringMixer,
+    monitoring: Option<PlaybackMonitoringMixer>,
+    preview: DesktopAudioPreviewProcessor<'media>,
 }
 
 impl<R: hyper_mixer_runtime::TrackWindowRenderer> CheckpointedOutputProcessor
-    for MonitoredTransportOutputProcessor<'_, '_, R>
+    for PreviewingTransportOutputProcessor<'_, '_, '_, R>
 {
     type Error = hyper_audio_engine::StereoCallbackError<hyper_mixer_runtime::RuntimeProcessError>;
 
@@ -785,8 +794,16 @@ impl<R: hyper_mixer_runtime::TrackWindowRenderer> CheckpointedOutputProcessor
         let Self {
             playback,
             monitoring,
+            preview,
         } = self;
-        playback.process_with_post_mix(output, |output| monitoring.mix(output))
+        playback.process_with_post_mix(output, |output| {
+            let mut output = output;
+            if !preview.process(&mut output)
+                && let Some(monitoring) = monitoring
+            {
+                monitoring.mix(output);
+            }
+        })
     }
 }
 
@@ -1505,6 +1522,9 @@ impl DesktopPlaybackSession {
                     runner,
                     SessionInitialization {
                         input: thread_source.session(),
+                        recordings: thread_source
+                            .project()
+                            .map_or(&[], PreparedProjectPlayback::recording_metadata),
                         sample_rate_hz,
                         maximum_block_frames,
                         initial_checkpoint: initial_checkpoint.as_deref(),
@@ -1523,6 +1543,7 @@ impl DesktopPlaybackSession {
                     loudness_commands: handles.loudness_commands,
                     meters: handles.meters,
                     recovery: handles.recovery,
+                    preview: handles.preview,
                     config,
                     source,
                     monitoring: None,
@@ -1551,6 +1572,48 @@ impl DesktopPlaybackSession {
         command: TransportCommand,
     ) -> Result<(), DesktopDirectControlError> {
         self.controls.try_send_transport(command)
+    }
+
+    /// Starts dry audition of one recording retained by the verified project.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-project sessions, unknown recording identities, an active
+    /// audition, or exhausted command sequencing.
+    pub fn try_start_audio_preview(
+        &self,
+        asset_id: &str,
+    ) -> Result<(), super::DesktopAudioPreviewCommandError> {
+        let project = self
+            .prepared_project()
+            .ok_or(super::DesktopAudioPreviewCommandError::ProjectUnavailable)?;
+        let (recording_index, recording) = project
+            .recording_metadata()
+            .iter()
+            .enumerate()
+            .find(|(_, recording)| recording.asset_id() == asset_id)
+            .ok_or(super::DesktopAudioPreviewCommandError::RecordingUnavailable)?;
+        self.preview
+            .request_start(recording_index, recording.frame_count())
+    }
+
+    /// Requests a five-millisecond ramp to silence for the active audition.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an inactive audition or exhausted command sequencing.
+    pub fn try_stop_audio_preview(&self) -> Result<(), super::DesktopAudioPreviewCommandError> {
+        self.preview.request_stop()
+    }
+
+    #[must_use]
+    pub fn audio_preview_snapshot(&self) -> super::DesktopAudioPreviewSnapshot {
+        self.preview.snapshot()
+    }
+
+    #[must_use]
+    pub const fn audio_preview_control(&self) -> &super::DesktopAudioPreviewControl {
+        &self.preview
     }
 
     #[must_use]
@@ -1766,6 +1829,7 @@ impl DesktopPlaybackSession {
             loudness_commands: _,
             meters: _,
             recovery,
+            preview: _,
             config,
             source,
             monitoring,
@@ -1825,6 +1889,7 @@ impl DesktopPlaybackSession {
             loudness_commands: _,
             meters: _,
             recovery: _,
+            preview: _,
             config: _,
             source: _,
             monitoring,
@@ -1868,6 +1933,7 @@ fn classify_output_start_failure(
 
 struct SessionInitialization<'a> {
     input: &'a DesktopPlaybackSessionInput,
+    recordings: &'a [hyper_recording_metadata::RecordingMetadataDocument],
     sample_rate_hz: u32,
     maximum_block_frames: usize,
     initial_checkpoint: Option<&'a PlaybackRecoverySnapshot>,
@@ -1882,6 +1948,7 @@ fn initialize_session(
 ) -> Result<(), NativeDesktopOutputStartError> {
     let SessionInitialization {
         input,
+        recordings,
         sample_rate_hz,
         maximum_block_frames,
         initial_checkpoint,
@@ -1954,6 +2021,8 @@ fn initialize_session(
         .map(|monitoring| PlaybackMonitoringMixer::try_new(monitoring, maximum_block_frames))
         .transpose()
         .or_else(|source| fail_build(publication, source))?;
+    let (preview_control, preview) =
+        prepare_audio_preview(media, recordings, sample_rate_hz, publication)?;
     let (publisher, recovery) =
         playback_recovery_channel(initial_checkpoint, Some(&initial_mixer_parameter_state));
     let controls = build_session_controls(
@@ -1969,18 +2038,36 @@ fn initialize_session(
         loudness_commands,
         meters,
         recovery.clone(),
+        preview_control,
     )?;
-    if let Some(monitoring) = monitoring {
-        runner.run_transport_output_with_checkpoint(
-            MonitoredTransportOutputProcessor {
-                playback: processor,
-                monitoring,
-            },
-            publisher,
-        )
-    } else {
-        runner.run_transport_output_with_checkpoint(processor, publisher)
-    }
+    runner.run_transport_output_with_checkpoint(
+        PreviewingTransportOutputProcessor {
+            playback: processor,
+            monitoring,
+            preview,
+        },
+        publisher,
+    )
+}
+
+fn prepare_audio_preview<'a>(
+    media: &'a DecodedMediaCache,
+    recordings: &[hyper_recording_metadata::RecordingMetadataDocument],
+    sample_rate_hz: u32,
+    publication: &SyncSender<SessionPublication>,
+) -> Result<
+    (
+        super::DesktopAudioPreviewControl,
+        DesktopAudioPreviewProcessor<'a>,
+    ),
+    NativeDesktopOutputStartError,
+> {
+    let control = super::DesktopAudioPreviewControl::new();
+    let processor =
+        DesktopAudioPreviewProcessor::try_new(media, recordings, sample_rate_hz, control.clone())
+            .map_err(DesktopPlaybackSessionBuildError::AudioPreview)
+            .or_else(|source| fail_build(publication, source))?;
+    Ok((control, processor))
 }
 
 fn validate_session_sample_rate(
@@ -2014,6 +2101,7 @@ fn publish_session_handles(
     loudness_commands: LoudnessCommandSender,
     meters: OutputMeterReceiver,
     recovery: PlaybackRecoveryCheckpoint,
+    preview: super::DesktopAudioPreviewControl,
 ) -> Result<(), NativeDesktopOutputStartError> {
     publication
         .try_send(SessionPublication::Prepared(SessionHandles {
@@ -2021,6 +2109,7 @@ fn publish_session_handles(
             loudness_commands,
             meters,
             recovery,
+            preview,
         }))
         .map_err(|_| callback_error("playback control publication failed".to_owned()))
 }

@@ -252,6 +252,15 @@ impl DecodedMediaCache {
         self.find(asset_id).is_some()
     }
 
+    /// Returns immutable decoded audio for one verified asset identity.
+    ///
+    /// The cache retains ownership; callers cannot replace or mutate media
+    /// while a playback or audition owner borrows it.
+    #[must_use]
+    pub fn decoded_audio(&self, asset_id: &str) -> Option<&DecodedAudio> {
+        self.find(asset_id).map(|entry| &entry.audio)
+    }
+
     /// Returns facts derived from the exact decoded assets in this cache.
     #[must_use]
     pub fn media_asset_facts(&self) -> impl ExactSizeIterator<Item = MediaAssetFact<'_>> + '_ {

@@ -8,13 +8,15 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use hyper_desktop_ide::{
-    DesktopIdeWorker, IdeApplicationConfig, IdeAudioInputInventory, IdeAudioOutputInventory,
-    IdeInputSelection, IdeMixerChannel, IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap,
-    IdeMonitoringCommand, IdeNativeCloseFailure, IdeOutputSelection, IdeRecordingAbortOutcome,
-    IdeRecordingImportOutcome, IdeRunningObservation, IdeScene, IdeSceneAvailability,
-    IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait,
-    IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState,
-    PlaybackRecoveryTransportState, TransportCommand, desktop_ide_application_config,
+    DesktopAudioPreviewState, DesktopIdeWorker, IdeApplicationConfig, IdeAudioInputInventory,
+    IdeAudioOutputInventory, IdeAudioPreviewControlCommand, IdeInputSelection, IdeMixerChannel,
+    IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap, IdeMonitoringCommand,
+    IdeNativeCloseFailure, IdeOutputSelection, IdeRecordingAbortOutcome, IdeRecordingCaptureKind,
+    IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation, IdeScene,
+    IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
+    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState, TransportCommand,
+    desktop_ide_application_config,
 };
 use slint::platform::PlatformError;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
@@ -33,6 +35,7 @@ type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
 type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
 type InputRoutes = Rc<RefCell<Vec<InputRoute>>>;
 type RecordingRoutes = Rc<RefCell<Vec<usize>>>;
+type TakeRoutes = Rc<RefCell<Vec<String>>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum InputRoute {
@@ -117,6 +120,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let output_routes = Rc::new(RefCell::new(Vec::new()));
     let input_routes = Rc::new(RefCell::new(Vec::new()));
     let recording_routes = Rc::new(RefCell::new(Vec::new()));
+    let take_routes = Rc::new(RefCell::new(Vec::new()));
 
     bind_callbacks(
         &ui,
@@ -124,6 +128,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         &output_routes,
         &input_routes,
         &recording_routes,
+        &take_routes,
     );
     let timer = start_event_pump(
         &ui,
@@ -131,6 +136,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         &output_routes,
         &input_routes,
         &recording_routes,
+        &take_routes,
     );
     let run_result = ui.run();
     timer.stop();
@@ -150,6 +156,7 @@ fn bind_callbacks(
     output_routes: &OutputRoutes,
     input_routes: &InputRoutes,
     recording_routes: &RecordingRoutes,
+    take_routes: &TakeRoutes,
 ) {
     let actions = ui.global::<IdeActions>();
 
@@ -236,6 +243,7 @@ fn bind_callbacks(
     bind_playback_callbacks(ui, worker);
     bind_monitoring_callbacks(ui, worker);
     bind_recording_callbacks(ui, worker, recording_routes);
+    bind_audio_preview_callbacks(ui, worker, take_routes);
 }
 
 fn bind_input_selection_callbacks(
@@ -368,6 +376,77 @@ fn bind_recording_callbacks(
         if ui.get_app_mode() == AppMode::Recording {
             submit_to_ui(&ui, &worker_for_abort, IdeWorkerCommand::AbortRecording);
         }
+    });
+}
+
+fn bind_audio_preview_callbacks(ui: &MainWindow, worker: &WorkerCell, take_routes: &TakeRoutes) {
+    let actions = ui.global::<IdeActions>();
+
+    let weak = ui.as_weak();
+    let worker_for_toggle = Rc::clone(worker);
+    let routes_for_toggle = Rc::clone(take_routes);
+    actions.on_toggle_take_preview(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() == AppMode::Previewing && ui.get_preview_active() {
+            submit_to_ui(&ui, &worker_for_toggle, IdeWorkerCommand::StopAudioPreview);
+            return;
+        }
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        let asset_id = usize::try_from(index)
+            .ok()
+            .and_then(|index| routes_for_toggle.borrow().get(index).cloned());
+        let Some(asset_id) = asset_id else {
+            ui.set_error_text("Recorded take selection is no longer available".into());
+            return;
+        };
+        submit_to_ui(
+            &ui,
+            &worker_for_toggle,
+            IdeWorkerCommand::StartAudioPreview { asset_id },
+        );
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_gain = Rc::clone(worker);
+    actions.on_preview_gain(move |percent| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if !matches!(ui.get_app_mode(), AppMode::Running | AppMode::Previewing) {
+            return;
+        }
+        match preview_percent_to_millionths(percent) {
+            Ok(gain_millionths) => submit_to_ui(
+                &ui,
+                &worker_for_gain,
+                IdeWorkerCommand::AudioPreviewControl(IdeAudioPreviewControlCommand::Gain {
+                    gain_millionths,
+                }),
+            ),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_mute = Rc::clone(worker);
+    actions.on_preview_mute(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if !matches!(ui.get_app_mode(), AppMode::Running | AppMode::Previewing) {
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_mute,
+            IdeWorkerCommand::AudioPreviewControl(IdeAudioPreviewControlCommand::Mute {
+                muted: !ui.get_preview_muted(),
+            }),
+        );
     });
 }
 
@@ -590,6 +669,7 @@ fn start_event_pump(
     output_routes: &OutputRoutes,
     input_routes: &InputRoutes,
     recording_routes: &RecordingRoutes,
+    take_routes: &TakeRoutes,
 ) -> Timer {
     let timer = Timer::default();
     let weak = ui.as_weak();
@@ -597,6 +677,7 @@ fn start_event_pump(
     let output_routes = Rc::clone(output_routes);
     let input_routes = Rc::clone(input_routes);
     let recording_routes = Rc::clone(recording_routes);
+    let take_routes = Rc::clone(take_routes);
     let mut observation_pending = false;
     timer.start(TimerMode::Repeated, UI_POLL_INTERVAL, move || {
         let Some(ui) = weak.upgrade() else {
@@ -612,7 +693,14 @@ fn start_event_pump(
                     if completes_observation(&event) {
                         observation_pending = false;
                     }
-                    apply_event(&ui, &output_routes, &input_routes, &recording_routes, event);
+                    apply_event(
+                        &ui,
+                        &output_routes,
+                        &input_routes,
+                        &recording_routes,
+                        &take_routes,
+                        event,
+                    );
                 }
                 Ok(None) => break,
                 Err(error) => {
@@ -622,7 +710,10 @@ fn start_event_pump(
                 }
             }
         }
-        if !matches!(ui.get_app_mode(), AppMode::Running | AppMode::Recording) {
+        if !matches!(
+            ui.get_app_mode(),
+            AppMode::Running | AppMode::Previewing | AppMode::Recording
+        ) {
             observation_pending = false;
         } else if !observation_pending {
             match worker.try_send(IdeWorkerCommand::Observe) {
@@ -683,6 +774,9 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording => {
                     ui.set_app_mode(AppMode::FinalizingRecording);
                 }
+                IdeWorkerCommandKind::StartAudioPreview => {
+                    ui.set_app_mode(AppMode::PreparingPreview);
+                }
                 _ => {}
             }
             ui.set_error_text(SharedString::default());
@@ -725,6 +819,11 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::StopRecording => "Verifying and importing the recorded take…",
         IdeWorkerCommandKind::AbortRecording => "Aborting capture and retaining recovery data…",
+        IdeWorkerCommandKind::StartAudioPreview => {
+            "Stopping transport and preparing dry take audition…"
+        }
+        IdeWorkerCommandKind::StopAudioPreview => "Stopping take audition…",
+        IdeWorkerCommandKind::AudioPreviewControl => "Applying take audition control…",
         IdeWorkerCommandKind::Observe => "Refreshing runtime evidence…",
         IdeWorkerCommandKind::CloseProject => "Closing project and native output…",
         IdeWorkerCommandKind::Shutdown => "Shutting down…",
@@ -736,6 +835,7 @@ fn apply_event(
     output_routes: &OutputRoutes,
     input_routes: &InputRoutes,
     recording_routes: &RecordingRoutes,
+    take_routes: &TakeRoutes,
     event: IdeWorkerEvent,
 ) {
     match event {
@@ -751,7 +851,7 @@ fn apply_event(
                 snapshot.inputs(),
                 snapshot.input_selection(),
             );
-            reset_project(ui, recording_routes);
+            reset_project(ui, recording_routes, take_routes);
             let mode = mode_after_closed_event(ui.get_app_mode());
             ui.set_app_mode(mode);
             if mode == AppMode::Closed {
@@ -763,7 +863,7 @@ fn apply_event(
             }
         }
         IdeWorkerEvent::Running(observation) => {
-            apply_running_event(ui, recording_routes, &observation);
+            apply_running_event(ui, recording_routes, take_routes, &observation);
         }
         IdeWorkerEvent::TransportQueued(command) => {
             ui.set_status_text(
@@ -812,6 +912,9 @@ fn apply_event(
         }
         IdeWorkerEvent::RecordingImported(outcome) => apply_recording_imported(ui, &outcome),
         IdeWorkerEvent::RecordingAborted(outcome) => apply_recording_aborted(ui, &outcome),
+        event @ (IdeWorkerEvent::AudioPreviewPreparing
+        | IdeWorkerEvent::AudioPreviewStopRequested
+        | IdeWorkerEvent::AudioPreviewControlApplied(_)) => apply_audio_preview_event(ui, &event),
         IdeWorkerEvent::Saving => {
             ui.set_app_mode(AppMode::Saving);
             ui.set_status_text("Waiting for native output before atomic save…".into());
@@ -825,6 +928,24 @@ fn apply_event(
             ui.set_error_text(format!("{}: {reason}", command_status(command)).into());
         }
     }
+}
+
+fn apply_audio_preview_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioPreviewPreparing => {
+            ui.set_app_mode(AppMode::PreparingPreview);
+            ui.set_transport_state("Stopping for audition".into());
+            ui.set_status_text("Waiting for a committed stopped transport cycle…".into());
+        }
+        IdeWorkerEvent::AudioPreviewStopRequested => {
+            ui.set_status_text("Ramping take audition to silence…".into());
+        }
+        IdeWorkerEvent::AudioPreviewControlApplied(_) => {
+            ui.set_status_text("Take audition control applied".into());
+        }
+        _ => unreachable!("only audio-preview events are routed to this handler"),
+    }
+    ui.set_error_text(SharedString::default());
 }
 
 fn apply_recording_imported(ui: &MainWindow, outcome: &IdeRecordingImportOutcome) {
@@ -868,9 +989,9 @@ fn apply_recording_aborted(ui: &MainWindow, outcome: &IdeRecordingAbortOutcome) 
 fn apply_running_event(
     ui: &MainWindow,
     recording_routes: &RecordingRoutes,
+    take_routes: &TakeRoutes,
     observation: &IdeRunningObservation,
 ) {
-    ui.set_app_mode(AppMode::Running);
     ui.set_project_name(observation.project_name().into());
     ui.set_project_id(observation.project_id().into());
     ui.set_sample_rate(format!("{} Hz", observation.sample_rate_hz()).into());
@@ -878,6 +999,7 @@ fn apply_running_event(
     set_scenes(ui, observation.scenes());
     apply_mixer_observation(ui, observation);
     set_recording_targets(ui, recording_routes, observation.mixer_channels());
+    set_recording_takes(ui, take_routes, observation);
     ui.set_stream_state(format!("{:?}", observation.output_state()).into());
     ui.set_callback_count(observation.output().callback_count.to_string().into());
     if let Some(monitoring) = observation.monitoring() {
@@ -921,9 +1043,13 @@ fn apply_running_event(
         .into(),
     );
     ui.set_transport_state(
-        match observation.recovery().state() {
-            PlaybackRecoveryTransportState::Stopped => "Stopped",
-            PlaybackRecoveryTransportState::Rolling => "Rolling",
+        if observation.preview().state().is_active() {
+            "Auditioning take · transport stopped"
+        } else {
+            match observation.recovery().state() {
+                PlaybackRecoveryTransportState::Stopped => "Stopped",
+                PlaybackRecoveryTransportState::Rolling => "Rolling",
+            }
         }
         .into(),
     );
@@ -940,8 +1066,108 @@ fn apply_running_event(
     ui.set_right_meter(right_level);
     ui.set_left_reading(left_reading.into());
     ui.set_right_reading(right_reading.into());
-    ui.set_status_text("Runtime evidence updated".into());
-    ui.set_error_text(SharedString::default());
+    match observation.preview().state() {
+        DesktopAudioPreviewState::Starting
+        | DesktopAudioPreviewState::Playing
+        | DesktopAudioPreviewState::Stopping => {
+            ui.set_app_mode(AppMode::Previewing);
+            ui.set_status_text("Dry take audition · input cue temporarily suppressed".into());
+            ui.set_error_text(SharedString::default());
+        }
+        DesktopAudioPreviewState::Complete => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Take audition complete".into());
+            ui.set_error_text(SharedString::default());
+        }
+        DesktopAudioPreviewState::Failed => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Take audition stopped".into());
+            ui.set_error_text("The audio callback could not render this recorded take".into());
+        }
+        DesktopAudioPreviewState::Idle => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Runtime evidence updated".into());
+            ui.set_error_text(SharedString::default());
+        }
+    }
+}
+
+fn set_recording_takes(
+    ui: &MainWindow,
+    take_routes: &TakeRoutes,
+    observation: &IdeRunningObservation,
+) {
+    let preview = observation.preview();
+    let active_asset_id = preview.asset_id();
+    let takes = observation.recording_takes();
+    let mut routes = Vec::with_capacity(takes.len());
+    let mut rows = Vec::with_capacity(takes.len());
+    for (index, take) in takes.iter().enumerate() {
+        routes.push(take.asset_id().to_owned());
+        let active = active_asset_id == Some(take.asset_id());
+        rows.push(TakeRow {
+            index: i32::try_from(index).unwrap_or(-1),
+            track_name: take.track_name().into(),
+            captured_at: format_capture_time(take.captured_at_utc()).into(),
+            detail: format_take_detail(take).into(),
+            timeline_start: format!(
+                "Timeline tick {} · {}",
+                take.timeline_start_tick(),
+                capture_kind_name(take.capture_kind())
+            )
+            .into(),
+            active,
+            state: if active {
+                format!("{:?}", preview.state()).into()
+            } else {
+                SharedString::default()
+            },
+        });
+    }
+    *take_routes.borrow_mut() = routes;
+    ui.set_recording_takes(ModelRc::from(Rc::new(VecModel::from(rows))));
+    ui.set_preview_active(preview.state().is_active());
+    ui.set_preview_gain_percent(preview.gain() * 100.0);
+    ui.set_preview_muted(preview.muted());
+    ui.set_preview_state(format!("{:?}", preview.state()).into());
+    ui.set_preview_progress(if preview.total_frames() == 0 {
+        "—".into()
+    } else {
+        format!(
+            "{} / {}",
+            format_transport_clock(preview.played_frames(), observation.sample_rate_hz()),
+            format_transport_clock(preview.total_frames(), observation.sample_rate_hz())
+        )
+        .into()
+    });
+}
+
+const fn capture_kind_name(kind: IdeRecordingCaptureKind) -> &'static str {
+    match kind {
+        IdeRecordingCaptureKind::New => "NEW TAKE",
+        IdeRecordingCaptureKind::Overdub => "OVERDUB",
+    }
+}
+
+fn format_capture_time(captured_at_utc: &str) -> String {
+    captured_at_utc
+        .strip_suffix('Z')
+        .unwrap_or(captured_at_utc)
+        .replace('T', " ")
+}
+
+fn format_take_detail(take: &IdeRecordingTake) -> String {
+    let channels = match take.channels() {
+        1 => "Mono".to_owned(),
+        2 => "Stereo".to_owned(),
+        count => format!("{count} channels"),
+    };
+    format!(
+        "{} · {} · {} Hz",
+        channels,
+        format_transport_clock(take.frame_count(), take.sample_rate_hz()),
+        take.sample_rate_hz()
+    )
 }
 
 fn apply_recording_event(ui: &MainWindow, state: &hyper_desktop_ide::IdeRecordingState) {
@@ -1141,7 +1367,7 @@ fn input_presentation(
     }
 }
 
-fn reset_project(ui: &MainWindow, recording_routes: &RecordingRoutes) {
+fn reset_project(ui: &MainWindow, recording_routes: &RecordingRoutes, take_routes: &TakeRoutes) {
     ui.set_project_name("No project open".into());
     ui.set_project_id("—".into());
     ui.set_sample_rate("—".into());
@@ -1160,6 +1386,14 @@ fn reset_project(ui: &MainWindow, recording_routes: &RecordingRoutes) {
     ui.set_recording_target("—".into());
     ui.set_recording_frame_count("0".into());
     ui.set_recording_drop_count("0".into());
+    take_routes.borrow_mut().clear();
+    ui.set_recording_takes(ModelRc::default());
+    ui.set_takes_visible(false);
+    ui.set_preview_active(false);
+    ui.set_preview_gain_percent(25.0);
+    ui.set_preview_muted(false);
+    ui.set_preview_state("Idle".into());
+    ui.set_preview_progress("—".into());
     ui.set_transport_state("Stopped".into());
     ui.set_stream_state("No stream".into());
     ui.set_frame_position("0".into());
@@ -1199,6 +1433,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording
             if current == AppMode::FinalizingRecording =>
         {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::StartAudioPreview if current == AppMode::PreparingPreview => {
             AppMode::Running
         }
         _ => current,
@@ -1365,6 +1602,18 @@ fn gain_percent_to_millionths(percent: f32) -> Result<u32, MixerControlFailure> 
 fn monitor_percent_to_millionths(percent: f32) -> Result<u32, &'static str> {
     if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
         return Err("Input cue gain is outside its supported range");
+    }
+    Ok((percent * 10_000.0).round() as u32)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "finite audition percent is range-checked before rounding to the backend domain"
+)]
+fn preview_percent_to_millionths(percent: f32) -> Result<u32, &'static str> {
+    if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+        return Err("Take audition gain is outside its supported range");
     }
     Ok((percent * 10_000.0).round() as u32)
 }
@@ -2083,6 +2332,30 @@ mod tests {
         assert_eq!(monitor_percent_to_millionths(100.0), Ok(1_000_000));
         assert!(monitor_percent_to_millionths(100.1).is_err());
         assert!(monitor_percent_to_millionths(f32::NAN).is_err());
+    }
+
+    #[test]
+    fn take_audition_gain_conversion_rejects_nonfinite_and_above_unity() {
+        assert_eq!(preview_percent_to_millionths(0.0), Ok(0));
+        assert_eq!(preview_percent_to_millionths(25.5), Ok(255_000));
+        assert_eq!(preview_percent_to_millionths(100.0), Ok(1_000_000));
+        assert!(preview_percent_to_millionths(100.1).is_err());
+        assert!(preview_percent_to_millionths(f32::NAN).is_err());
+    }
+
+    #[test]
+    fn preview_preparation_failure_restores_running_mode() {
+        assert_eq!(
+            mode_after_failure(
+                AppMode::PreparingPreview,
+                IdeWorkerCommandKind::StartAudioPreview,
+            ),
+            AppMode::Running
+        );
+        assert_eq!(
+            mode_after_failure(AppMode::Previewing, IdeWorkerCommandKind::StopAudioPreview,),
+            AppMode::Previewing
+        );
     }
 
     #[test]

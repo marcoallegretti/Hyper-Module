@@ -1,4 +1,4 @@
-import { Button, ComboBox, Slider } from "std-widgets.slint";
+import { Button, ComboBox, ListView, Slider } from "std-widgets.slint";
 
 export enum AppMode {
     discovering,
@@ -6,6 +6,8 @@ export enum AppMode {
     selecting,
     opening,
     running,
+    preparing-preview,
+    previewing,
     saving,
     preparing-recording,
     recording,
@@ -48,6 +50,16 @@ export struct MixerSendRow {
     enabled: bool,
 }
 
+export struct TakeRow {
+    index: int,
+    track-name: string,
+    captured-at: string,
+    detail: string,
+    timeline-start: string,
+    active: bool,
+    state: string,
+}
+
 export global IdeActions {
     callback retry-discovery();
     callback refresh-outputs();
@@ -74,6 +86,9 @@ export global IdeActions {
     callback start-recording();
     callback stop-recording();
     callback abort-recording();
+    callback toggle-take-preview(int);
+    callback preview-gain(float);
+    callback preview-mute();
     callback close-project();
 }
 
@@ -151,6 +166,7 @@ export component MainWindow inherits Window {
     in property <[SceneRow]> scenes: [];
     in-out property <bool> mixer-visible: false;
     in-out property <bool> mixer-sends-visible: false;
+    in-out property <bool> takes-visible: false;
     in property <[MixerChannelRow]> mixer-channels: [];
     in property <[MixerSendRow]> mixer-sends: [];
     in property <bool> mixer-main-state-available: false;
@@ -161,6 +177,12 @@ export component MainWindow inherits Window {
     in property <string> recording-target: "—";
     in property <string> recording-frame-count: "0";
     in property <string> recording-drop-count: "0";
+    in property <[TakeRow]> recording-takes: [];
+    in property <bool> preview-active: false;
+    in property <float> preview-gain-percent: 25;
+    in property <bool> preview-muted: false;
+    in property <string> preview-state: "Idle";
+    in property <string> preview-progress: "—";
     in property <string> transport-state: "Stopped";
     in property <string> stream-state: "No stream";
     in property <string> frame-position: "0";
@@ -204,10 +226,13 @@ export component MainWindow inherits Window {
                 height: 31px;
                 border-radius: 16px;
                 background: root.app-mode == AppMode.recording ? #542126
+                    : root.app-mode == AppMode.previewing ? #173447
                     : root.app-mode == AppMode.running ? #173d31
                     : root.app-mode == AppMode.unavailable ? #492323 : #222b36;
                 Text {
                     text: root.app-mode == AppMode.recording ? "●  RECORDING"
+                        : root.app-mode == AppMode.previewing ? "▶  AUDITION"
+                        : root.app-mode == AppMode.preparing-preview ? "◌  PREPARING"
                         : root.app-mode == AppMode.preparing-recording ? "◌  PREPARING"
                         : root.app-mode == AppMode.finalizing-recording ? "◌  FINALIZING"
                         : root.app-mode == AppMode.running ? "●  RUNNING"
@@ -219,6 +244,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.unavailable ? "●  UNAVAILABLE"
                         : "◌  DISCOVERING";
                     color: root.app-mode == AppMode.recording ? #ff8b87
+                        : root.app-mode == AppMode.previewing ? #7dcfff
                         : root.app-mode == AppMode.running ? #63e6b5
                         : root.app-mode == AppMode.unavailable ? #ff8b87 : #a9b5c4;
                     font-size: 11px;
@@ -345,7 +371,7 @@ export component MainWindow inherits Window {
                             }
                             Button {
                                 text: "Close";
-                                enabled: root.app-mode == AppMode.running;
+                                enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing;
                                 clicked => { IdeActions.close-project(); }
                             }
                         }
@@ -388,7 +414,7 @@ export component MainWindow inherits Window {
                 vertical-stretch: 1;
                 background: transparent;
 
-                if !root.mixer-visible : Panel {
+                if !root.mixer-visible && !root.takes-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -402,6 +428,11 @@ export component MainWindow inherits Window {
                             Text { text: root.transport-state; color: #edf2f8; font-size: 24px; font-weight: 650; }
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Button {
+                            text: "Takes (" + root.recording-takes.length + ")";
+                            enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing;
+                            clicked => { root.takes-visible = true; }
+                        }
                         Button {
                             text: "Mixer";
                             enabled: root.app-mode == AppMode.running;
@@ -521,7 +552,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && !root.mixer-sends-visible : Panel {
+                if root.mixer-visible && !root.mixer-sends-visible && !root.takes-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -623,7 +654,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && root.mixer-sends-visible : Panel {
+                if root.mixer-visible && root.mixer-sends-visible && !root.takes-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -685,6 +716,129 @@ export component MainWindow inherits Window {
                         }
                     }
                     Rectangle { vertical-stretch: 1; background: transparent; }
+                    }
+                }
+
+                if root.takes-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 10px;
+
+                        HorizontalLayout {
+                            height: 48px;
+                            VerticalLayout {
+                                Text { text: "RECORDED TAKES"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                                Text { text: "Verified whole-file recordings · dry audition only"; color: #aebccc; font-size: 12px; }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: "Performance";
+                                clicked => { root.takes-visible = false; root.mixer-visible = false; root.mixer-sends-visible = false; }
+                            }
+                            Button {
+                                text: "Mixer";
+                                enabled: !root.preview-active;
+                                clicked => { root.takes-visible = false; root.mixer-visible = true; root.mixer-sends-visible = false; }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: #27313d; }
+
+                        if root.recording-takes.length == 0 : Text {
+                            text: "No verified recorded takes are present in this project.";
+                            color: #8fa0b4;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            vertical-stretch: 1;
+                        }
+
+                        if root.recording-takes.length > 0 : ListView {
+                            vertical-stretch: 1;
+                            for take in root.recording-takes : Rectangle {
+                                height: 74px;
+                                width: parent.width;
+                                background: take.active ? #102536 : #0e141b;
+                                border-color: take.active ? #37769a : #27313d;
+                                border-width: 1px;
+                                border-radius: 6px;
+                                HorizontalLayout {
+                                    padding: 9px;
+                                    spacing: 12px;
+                                    VerticalLayout {
+                                        width: 164px;
+                                        spacing: 2px;
+                                        Text { text: take.track-name; color: #edf2f8; font-size: 13px; font-weight: 600; overflow: elide; }
+                                        Text { text: take.captured-at; color: #8290a2; font-size: 9px; overflow: elide; }
+                                    }
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        spacing: 2px;
+                                        Text { text: take.detail; color: #b9c5d3; font-size: 11px; overflow: elide; }
+                                        Text { text: take.timeline-start; color: #65758a; font-size: 9px; overflow: elide; }
+                                    }
+                                    Text {
+                                        width: 74px;
+                                        text: take.state;
+                                        color: take.active ? #7dcfff : #65758a;
+                                        font-size: 9px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    Button {
+                                        width: 86px;
+                                        text: take.active && root.preview-active ? "Stop" : "Preview";
+                                        accessible-label: (take.active && root.preview-active ? "Stop preview of " : "Preview ") + take.track-name;
+                                        enabled: root.app-mode == AppMode.running || (root.app-mode == AppMode.previewing && take.active);
+                                        clicked => { IdeActions.toggle-take-preview(take.index); }
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: #27313d; }
+                        HorizontalLayout {
+                            height: 58px;
+                            spacing: 10px;
+                            VerticalLayout {
+                                width: 130px;
+                                Text { text: "AUDITION"; color: #65758a; font-size: 9px; }
+                                Text { text: root.preview-state; color: root.preview-active ? #7dcfff : #aebccc; font-size: 14px; font-weight: 600; }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                Text { text: "GAIN  " + Math.round(root.preview-gain-percent) + "%"; color: #8fa0b4; font-size: 9px; }
+                                Slider {
+                                    minimum: 0;
+                                    maximum: 100;
+                                    value: root.preview-gain-percent;
+                                    enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing;
+                                    accessible-label: "Recorded take audition gain";
+                                    released(value) => { IdeActions.preview-gain(value); }
+                                }
+                            }
+                            Button {
+                                width: 72px;
+                                text: root.preview-muted ? "MUTED" : "MUTE";
+                                enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing;
+                                clicked => { IdeActions.preview-mute(); }
+                            }
+                            Text {
+                                width: 126px;
+                                text: root.preview-progress;
+                                color: #aebccc;
+                                font-size: 10px;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
+                        }
+                        Text {
+                            text: "Audition does not insert, move, trim, or time-stretch arrangement clips.";
+                            color: #65758a;
+                            font-size: 9px;
+                        }
                     }
                 }
             }

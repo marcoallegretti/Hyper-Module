@@ -85,6 +85,21 @@ pub use capture::{
     all(target_os = "linux", target_endian = "little"),
     target_os = "windows"
 ))]
+mod audio_preview_session;
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
+pub use audio_preview_session::{
+    DesktopAudioPreviewBuildError, DesktopAudioPreviewCommandError, DesktopAudioPreviewControl,
+    DesktopAudioPreviewControlError, DesktopAudioPreviewSnapshot, DesktopAudioPreviewState,
+    StereoPreviewProcessor, StereoPreviewProcessorError, StereoPreviewRender, StereoPreviewSource,
+};
+
+#[cfg(any(
+    all(target_os = "linux", target_endian = "little"),
+    target_os = "windows"
+))]
 mod control_mapping;
 #[cfg(any(
     all(target_os = "linux", target_endian = "little"),

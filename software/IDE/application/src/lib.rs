@@ -9,16 +9,19 @@ use std::time::Duration;
 
 use hyper_audio_engine::{LinearGain, Pan, ParameterError};
 use hyper_audio_source::{DecodeError, DecodeLimits};
-pub use hyper_desktop_audio::DesktopSceneAvailability as IdeSceneAvailability;
 use hyper_desktop_audio::{
-    CaptureStreamSnapshot, DesktopDirectControlError, DesktopInputConfig, DesktopInputConfigError,
-    DesktopInputDiscoveryError, DesktopInputStopError, DesktopMonitoringConfig,
-    DesktopMonitoringConfigError, DesktopMonitoringControlError, DesktopOutputConfig,
-    DesktopOutputConfigError, DesktopOutputDiscoveryError, DesktopOutputStopError,
-    DesktopPlaybackRecovery, DesktopPlaybackRecoveryPendingStop,
+    CaptureStreamSnapshot, DesktopAudioPreviewCommandError, DesktopAudioPreviewControlError,
+    DesktopAudioPreviewSnapshot, DesktopDirectControlError, DesktopInputConfig,
+    DesktopInputConfigError, DesktopInputDiscoveryError, DesktopInputStopError,
+    DesktopMonitoringConfig, DesktopMonitoringConfigError, DesktopMonitoringControlError,
+    DesktopOutputConfig, DesktopOutputConfigError, DesktopOutputDiscoveryError,
+    DesktopOutputStopError, DesktopPlaybackRecovery, DesktopPlaybackRecoveryPendingStop,
     DesktopPlaybackRecoveryPendingStopWait, DesktopPlaybackSession, DesktopProjectOpenError,
     MonitoringSnapshot, OutputStreamSnapshot, OutputStreamState, StreamState,
     discover_desktop_input_targets, discover_desktop_output_targets,
+};
+pub use hyper_desktop_audio::{
+    DesktopAudioPreviewState, DesktopSceneAvailability as IdeSceneAvailability,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
@@ -50,10 +53,11 @@ pub use recording::{
 };
 
 pub use worker::{
-    DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeClosedSnapshot, IdeMixerChannel,
-    IdeMixerSend, IdeRecordingState, IdeRunningObservation, IdeScene, IdeWorkerCommand,
-    IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError,
-    IdeWorkerJoinError, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeAudioPreviewObservation,
+    IdeClosedSnapshot, IdeMixerChannel, IdeMixerSend, IdeRecordingCaptureKind, IdeRecordingState,
+    IdeRecordingTake, IdeRunningObservation, IdeScene, IdeWorkerCommand, IdeWorkerCommandFailure,
+    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
+    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
     IdeWorkerShutdownReport, IdeWorkerStartError, MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS,
     desktop_ide_worker_supervisor_snapshot,
 };
@@ -63,6 +67,7 @@ const DESKTOP_MONITORING_TRANSPORT_FRAMES: usize = DESKTOP_MAXIMUM_BLOCK_FRAMES 
 const DESKTOP_MONITORING_TARGET_FRAMES: usize = 256;
 const DESKTOP_MONITORING_CHUNK_FRAMES: usize = 64;
 const MONITOR_GAIN_MILLIONTHS_MAXIMUM: u32 = 1_000_000;
+const PREVIEW_GAIN_MILLIONTHS_MAXIMUM: u32 = 1_000_000;
 const DESKTOP_RECORDING_TRANSPORT_FRAMES: usize = DESKTOP_MAXIMUM_BLOCK_FRAMES * 4;
 const DESKTOP_RECORDING_DRAIN_FRAMES: usize = DESKTOP_MAXIMUM_BLOCK_FRAMES;
 const DESKTOP_RECORDING_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1129,6 +1134,61 @@ impl Error for IdeMonitoringCommandError {
     }
 }
 
+/// One lock-free control for dry recorded-take audition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeAudioPreviewControlCommand {
+    Gain { gain_millionths: u32 },
+    Mute { muted: bool },
+}
+
+#[derive(Debug)]
+pub enum IdeAudioPreviewError {
+    Unavailable,
+    ExcessiveGain,
+    MixerCommit(DesktopDirectControlError),
+    MixerCommitTimeout,
+    MixerFenceSequenceUnavailable,
+    Command(DesktopAudioPreviewCommandError),
+    Control(DesktopAudioPreviewControlError),
+}
+
+impl fmt::Display for IdeAudioPreviewError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("audio preview is unavailable"),
+            Self::ExcessiveGain => formatter.write_str("audio preview gain must not exceed unity"),
+            Self::MixerCommit(source) => {
+                write!(
+                    formatter,
+                    "audio preview stop fence could not be queued: {source}"
+                )
+            }
+            Self::MixerCommitTimeout => {
+                formatter.write_str("transport did not stop before audio preview")
+            }
+            Self::MixerFenceSequenceUnavailable => {
+                formatter.write_str("audio preview stop-fence sequence is exhausted")
+            }
+            Self::Command(source) => source.fmt(formatter),
+            Self::Control(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeAudioPreviewError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Command(source) => Some(source),
+            Self::Control(source) => Some(source),
+            Self::MixerCommit(source) => Some(source),
+            Self::Unavailable
+            | Self::ExcessiveGain
+            | Self::MixerCommitTimeout
+            | Self::MixerFenceSequenceUnavailable => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum IdeProjectSaveError {
     ProjectSnapshotUnavailable,
@@ -1320,10 +1380,12 @@ pub struct IdeMonitoringState {
 
 #[derive(Clone, Copy, Debug)]
 pub struct RunningIdeSnapshot<'a> {
+    pub(crate) loaded: &'a hyper_playback_json::LoadedPlaybackProject,
     pub project_path: &'a Path,
     pub project_id: &'a str,
     pub project_name: &'a str,
     pub sample_rate_hz: u32,
+    pub recording_metadata: &'a [hyper_recording_metadata::RecordingMetadataDocument],
     pub scene_count: usize,
     pub scene_names: [&'a str; MAX_IDE_SCENES],
     pub scene_availability: [IdeSceneAvailability; MAX_IDE_SCENES],
@@ -1344,6 +1406,7 @@ pub struct RunningIdeSnapshot<'a> {
     pub output_state: OutputStreamState,
     pub output: OutputStreamSnapshot,
     pub monitoring: Option<IdeMonitoringState>,
+    pub preview: DesktopAudioPreviewSnapshot,
     pub recovery: PlaybackRecoverySnapshot,
 }
 
@@ -1394,6 +1457,16 @@ impl Default for TestPlaybackSession {
 }
 
 impl RunningDesktopIdeApplication {
+    pub(crate) fn audio_preview_is_active(&self) -> bool {
+        match &self.session {
+            IdePlaybackSessionOwner::Native(session) => {
+                session.audio_preview_snapshot().state().is_active()
+            }
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => false,
+        }
+    }
+
     fn can_save_mixer(&self) -> bool {
         match &self.session {
             IdePlaybackSessionOwner::Native(session) => session.prepared_project().is_some(),
@@ -1613,10 +1686,12 @@ impl RunningDesktopIdeApplication {
         let mixer_main_state = mixer_parameters.as_ref().map(ide_mixer_main_state);
         let monitoring = session_monitoring_state(session).ok()?;
         Some(RunningIdeSnapshot {
+            loaded,
             project_path: project.package().root(),
             project_id: project.package().manifest().project_id(),
             project_name: project.package().manifest().name(),
             sample_rate_hz: project.session().sample_rate_hz(),
+            recording_metadata: project.recording_metadata(),
             scene_count,
             scene_names,
             scene_availability,
@@ -1633,6 +1708,7 @@ impl RunningDesktopIdeApplication {
             output_state: session.output_status().state(),
             output: session.counters().snapshot(),
             monitoring,
+            preview: session.audio_preview_snapshot(),
             recovery,
         })
     }
@@ -1754,6 +1830,115 @@ impl RunningDesktopIdeApplication {
             IdePlaybackSessionOwner::Test(session) => {
                 validate_test_mixer_command(command)?;
                 session.mixer_commands.push(command);
+                Ok(())
+            }
+        }
+    }
+
+    #[allow(
+        clippy::infallible_destructuring_match,
+        reason = "the test-only session variant makes this match fallible in test builds"
+    )]
+    pub(crate) fn validate_audio_preview_asset(
+        &self,
+        asset_id: &str,
+    ) -> Result<(), IdeAudioPreviewError> {
+        let session = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session,
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => {
+                return Err(IdeAudioPreviewError::Unavailable);
+            }
+        };
+        if session.audio_preview_snapshot().state().is_active() {
+            return Err(IdeAudioPreviewError::Command(
+                DesktopAudioPreviewCommandError::PreviewBusy,
+            ));
+        }
+        let project = session
+            .prepared_project()
+            .ok_or(IdeAudioPreviewError::Command(
+                DesktopAudioPreviewCommandError::ProjectUnavailable,
+            ))?;
+        project
+            .recording_metadata()
+            .iter()
+            .any(|recording| recording.asset_id() == asset_id)
+            .then_some(())
+            .ok_or(IdeAudioPreviewError::Command(
+                DesktopAudioPreviewCommandError::RecordingUnavailable,
+            ))
+    }
+
+    /// Starts one verified recorded take on the session's dry audition path.
+    ///
+    /// # Errors
+    ///
+    /// Rejects test-only/non-project sessions, unknown assets, and overlapping
+    /// previews without changing the active callback state.
+    pub fn try_start_audio_preview(&self, asset_id: &str) -> Result<(), IdeAudioPreviewError> {
+        match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session
+                .try_start_audio_preview(asset_id)
+                .map_err(IdeAudioPreviewError::Command),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => Err(IdeAudioPreviewError::Unavailable),
+        }
+    }
+
+    /// Requests a bounded ramp to silence for the active recorded-take preview.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an inactive or unavailable preview path.
+    pub fn try_stop_audio_preview(&self) -> Result<(), IdeAudioPreviewError> {
+        match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session
+                .try_stop_audio_preview()
+                .map_err(IdeAudioPreviewError::Command),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => Err(IdeAudioPreviewError::Unavailable),
+        }
+    }
+
+    /// Applies one lock-free gain or mute control to recorded-take audition.
+    ///
+    /// # Errors
+    ///
+    /// Rejects test-only sessions, gain above unity, and backend validation
+    /// failures without mutation.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the integer preview domain is bounded below exact f32 integer range"
+    )]
+    #[allow(
+        clippy::infallible_destructuring_match,
+        reason = "the test-only session variant makes this match fallible in test builds"
+    )]
+    pub fn apply_audio_preview_control(
+        &self,
+        command: IdeAudioPreviewControlCommand,
+    ) -> Result<(), IdeAudioPreviewError> {
+        let session = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session,
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => {
+                return Err(IdeAudioPreviewError::Unavailable);
+            }
+        };
+        let control = session.audio_preview_control();
+        match command {
+            IdeAudioPreviewControlCommand::Gain { gain_millionths } => {
+                if gain_millionths > PREVIEW_GAIN_MILLIONTHS_MAXIMUM {
+                    return Err(IdeAudioPreviewError::ExcessiveGain);
+                }
+                let gain = gain_millionths as f32 / PREVIEW_GAIN_MILLIONTHS_MAXIMUM as f32;
+                control
+                    .set_gain_linear(gain)
+                    .map_err(IdeAudioPreviewError::Control)
+            }
+            IdeAudioPreviewControlCommand::Mute { muted } => {
+                control.set_muted(muted);
                 Ok(())
             }
         }

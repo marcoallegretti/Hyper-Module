@@ -1,8 +1,10 @@
 #[path = "../../../../test-support/realtime_allocator.rs"]
 mod realtime_allocator;
 
+use hyper_audio_engine::StereoOutput;
 use hyper_desktop_audio::{
     CaptureCallback, CaptureCallbackStatus, OutputCallback, OutputCallbackStatus,
+    StereoPreviewProcessor, StereoPreviewSource,
 };
 use hyper_recording_transport::try_recording_transport;
 use realtime_allocator::HeapMeasurement;
@@ -117,5 +119,54 @@ fn capture_to_recording_transport_performs_zero_heap_allocations() {
     assert_eq!(saturated_status, CaptureCallbackStatus::ProcessorFailed);
     assert_eq!(callback.counters().snapshot().processor_failure_count, 1);
     assert_eq!(callback.counters().snapshot().dropped_frame_count, 2);
+    assert_eq!(heap_operations, 0);
+}
+
+#[test]
+fn preview_processing_and_gain_ramps_perform_zero_heap_allocations() {
+    let source = [0.25_f32; 1_024];
+    let mut processor = StereoPreviewProcessor::try_new(48_000, source.len()).unwrap();
+    let mut left = [0.0_f32; 128];
+    let mut right = [0.0_f32; 128];
+
+    let measurement = HeapMeasurement::start_verified();
+    let first = processor
+        .render(
+            StereoPreviewSource::Mono(&source),
+            &mut StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+            0.25,
+            false,
+        )
+        .unwrap();
+    let changed = processor
+        .render(
+            StereoPreviewSource::Mono(&source),
+            &mut StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+            0.5,
+            false,
+        )
+        .unwrap();
+    let muted = processor
+        .render(
+            StereoPreviewSource::Mono(&source),
+            &mut StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+            0.5,
+            true,
+        )
+        .unwrap();
+    let heap_operations = measurement.finish();
+
+    assert_eq!(first.rendered_frames(), 128);
+    assert_eq!(changed.rendered_frames(), 128);
+    assert_eq!(muted.rendered_frames(), 128);
     assert_eq!(heap_operations, 0);
 }
