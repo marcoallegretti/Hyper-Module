@@ -1857,12 +1857,20 @@ pub enum IdeAudioTrackRenamePublicationError {
 impl fmt::Display for IdeAudioTrackRenamePublicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Mixer(source) if source.published() => write!(
+                formatter,
+                "live mixer was preserved, but its project transaction cleanup is incomplete: {source}"
+            ),
             Self::Mixer(source) => {
                 write!(
                     formatter,
                     "live mixer could not be preserved before rename: {source}"
                 )
             }
+            Self::Track { source, .. } if source.published() => write!(
+                formatter,
+                "audio track was renamed, but its project transaction cleanup is incomplete: {source}"
+            ),
             Self::Track { mixer, source } if mixer.changed() => write!(
                 formatter,
                 "live mixer was preserved in project revision {} but the audio-track rename failed: {source}",
@@ -3623,7 +3631,7 @@ mod tests {
                 resource_bytes: changed_mixer.clone(),
             },
             track_id: track_id.clone(),
-            track_bytes: renamed_track,
+            track_bytes: renamed_track.clone(),
         };
 
         let outcome = retry.publish().unwrap();
@@ -3632,6 +3640,7 @@ mod tests {
         assert_eq!(outcome.project_revision(), 3);
         let verified = hyper_storage_engine::verify_project_package(&project_path).unwrap();
         assert_eq!(verified.read_resource(&mixer_id).unwrap(), changed_mixer);
+        let renamed_identity = *verified.manifest_sha256();
         drop(verified);
         let reopened =
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
@@ -3639,6 +3648,23 @@ mod tests {
             reopened.session().parts().0.track_name(&track_id),
             Some("Lead Vocal")
         );
+        drop(reopened);
+
+        let unchanged = IdeAudioTrackRenamePlan {
+            mixer: IdeMixerSavePlan {
+                project_path,
+                expected_project_sha256: renamed_identity,
+                resource_id: mixer_id,
+                resource_bytes: changed_mixer,
+            },
+            track_id,
+            track_bytes: renamed_track,
+        }
+        .publish()
+        .unwrap();
+
+        assert!(!unchanged.changed());
+        assert_eq!(unchanged.project_revision(), 3);
     }
 
     #[test]

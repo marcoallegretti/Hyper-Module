@@ -4333,6 +4333,57 @@ mod tests {
     }
 
     #[test]
+    fn audio_track_rename_enforces_canonical_source_and_unicode_name_boundaries() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
+        let source: Value = serde_json::from_slice(TRACK).unwrap();
+        let canonical = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let noncanonical = serde_json::to_vec_pretty(&source).unwrap();
+
+        assert!(matches!(
+            serialize_audio_track_rename(
+                &loaded,
+                &noncanonical,
+                track_id,
+                "Vocal",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioTrackRenameSerializationError::NonCanonicalSource)
+        ));
+        for invalid in [String::new(), "é".repeat(121)] {
+            assert!(matches!(
+                serialize_audio_track_rename(
+                    &loaded,
+                    TRACK,
+                    track_id,
+                    &invalid,
+                    LoaderLimits::VERSION_1,
+                ),
+                Err(AudioTrackRenameSerializationError::InvalidTrackName)
+            ));
+        }
+
+        let maximum = "é".repeat(120);
+        let renamed = serialize_audio_track_rename(
+            &loaded,
+            &canonical,
+            track_id,
+            &maximum,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&renamed).unwrap();
+
+        assert_eq!(value["name"].as_str(), Some(maximum.as_str()));
+    }
+
+    #[test]
     fn mixer_save_rejects_layout_and_noncanonical_source_disagreement() {
         let state = MixerBaseState {
             channels: vec![MixerChannelBaseState {
