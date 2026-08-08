@@ -8,6 +8,37 @@ use cap_std::fs::{Dir, OpenOptions};
 
 const LOCK_NAME: &str = "project-storage.lock";
 
+pub(crate) const PROJECT_RESOURCE_TRANSACTION_PREFIX: &str = ".project-resource-publication-";
+pub(crate) const AUDIO_TRACK_TRANSACTION_PREFIX: &str = ".audio-track-publication-";
+pub(crate) const CONTROL_MAPPING_TRANSACTION_PREFIX: &str = ".control-mapping-publication-";
+pub(crate) const RECORDING_IMPORT_TRANSACTION_PREFIX: &str = ".recording-import-";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectTransactionFamily {
+    ProjectResource,
+    AudioTrack,
+    ControlMapping,
+    RecordingImport,
+}
+
+impl ProjectTransactionFamily {
+    const ALL: [Self; 4] = [
+        Self::ProjectResource,
+        Self::AudioTrack,
+        Self::ControlMapping,
+        Self::RecordingImport,
+    ];
+
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::ProjectResource => PROJECT_RESOURCE_TRANSACTION_PREFIX,
+            Self::AudioTrack => AUDIO_TRACK_TRANSACTION_PREFIX,
+            Self::ControlMapping => CONTROL_MAPPING_TRANSACTION_PREFIX,
+            Self::RecordingImport => RECORDING_IMPORT_TRANSACTION_PREFIX,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ProjectLockError {
     Active,
@@ -90,6 +121,31 @@ impl ProjectLock {
         sync_dir(backups)?;
         Ok(Self { _file: file })
     }
+}
+
+pub(crate) fn find_unhandled_project_transaction(
+    backups: &Dir,
+    handled: &[ProjectTransactionFamily],
+) -> Result<Option<ProjectTransactionFamily>, ProjectLockError> {
+    let entries = backups.entries().map_err(|source| ProjectLockError::Io {
+        operation: "read project transaction directory",
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| ProjectLockError::Io {
+            operation: "read project transaction entry",
+            source,
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        for family in ProjectTransactionFamily::ALL {
+            if name.starts_with(family.prefix()) && !handled.contains(&family) {
+                return Ok(Some(family));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn sync_dir(directory: &Dir) -> Result<(), ProjectLockError> {

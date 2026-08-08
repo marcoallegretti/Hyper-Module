@@ -12,7 +12,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::project_lock::ProjectLock;
+use super::project_lock::{
+    AUDIO_TRACK_TRANSACTION_PREFIX, PROJECT_RESOURCE_TRANSACTION_PREFIX as TRANSACTION_PREFIX,
+    ProjectLock, ProjectTransactionFamily, find_unhandled_project_transaction,
+};
 use super::stable_file::read_open_stable;
 use super::{
     MANIFEST_NAME, MAX_JSON_BYTES, MAX_JSON_FILE_BYTES, StructurallyVerifiedProject,
@@ -20,7 +23,6 @@ use super::{
     verify_retained_project_candidate,
 };
 
-const TRANSACTION_PREFIX: &str = ".project-resource-publication-";
 const INTENT_NAME: &str = "intent.json";
 const INTENT_STAGING_NAME: &str = ".intent.json.tmp";
 const RESOURCE_STAGING_NAME: &str = "resource.json";
@@ -28,7 +30,6 @@ const PREVIOUS_RESOURCE_NAME: &str = "previous-resource.json";
 const PROJECT_STAGING_NAME: &str = "project.json";
 const PREVIOUS_PROJECT_NAME: &str = "previous-project.json";
 const TRANSACTION_NAME: &str = "transaction.json";
-const AUDIO_TRACK_TRANSACTION_PREFIX: &str = ".audio-track-publication-";
 const AUDIO_TRACK_STAGING_NAME: &str = "track.json";
 const AUDIO_TRACK_MIXER_STAGING_NAME: &str = "mixer.json";
 const AUDIO_TRACK_PREVIOUS_MIXER_NAME: &str = "previous-mixer.json";
@@ -419,6 +420,7 @@ fn publish_audio_track_observed(
             error,
         )
     })?;
+    reject_unhandled_resource_transactions(&backups)?;
     let recovered_resources =
         recover_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
     let recovered_tracks =
@@ -596,6 +598,7 @@ fn publish_project_resource_observed(
             error,
         )
     })?;
+    reject_unhandled_resource_transactions(&backups)?;
     let recovered = recover_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
     let recovered_tracks =
         recover_audio_track_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
@@ -748,6 +751,32 @@ fn publish_project_resource_observed(
             }
         }
     }
+}
+
+fn reject_unhandled_resource_transactions(
+    backups: &Dir,
+) -> Result<(), ProjectResourcePublicationError> {
+    let unhandled = find_unhandled_project_transaction(
+        backups,
+        &[
+            ProjectTransactionFamily::ProjectResource,
+            ProjectTransactionFamily::AudioTrack,
+        ],
+    )
+    .map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::TransactionUnavailable,
+            "inspect project transactions before resource publication",
+            error,
+        )
+    })?;
+    if unhandled.is_some() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "another project transaction requires recovery; reopen the current project revision",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3187,6 +3216,30 @@ mod tests {
     }
 
     #[test]
+    fn resource_publication_refuses_a_foreign_transaction_before_staging() {
+        let fixture = Fixture::new();
+        let foreign_name = format!(
+            "{}fixture",
+            crate::project_lock::CONTROL_MAPPING_TRANSACTION_PREFIX
+        );
+        let foreign = fixture.root.join("backups").join(&foreign_name);
+        fs::create_dir_all(&foreign).unwrap();
+
+        let error = publish_project_resource(&fixture.root, fixture.request()).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::ProjectChanged
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("mixer/mixer.json")).unwrap(),
+            fixture.original
+        );
+        assert!(foreign.exists());
+        assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
     fn rejects_stale_role_and_noncanonical_requests_without_mutation() {
         let fixture = Fixture::new();
         let mut stale = fixture.request();
@@ -3385,6 +3438,36 @@ mod tests {
     }
 
     #[test]
+    fn audio_track_publication_refuses_a_foreign_transaction_before_staging() {
+        let fixture = AudioTrackFixture::new();
+        let foreign_name = format!(
+            "{}fixture",
+            crate::project_lock::CONTROL_MAPPING_TRANSACTION_PREFIX
+        );
+        let foreign = fixture.root.join("backups").join(&foreign_name);
+        fs::create_dir(&foreign).unwrap();
+
+        let error = publish_audio_track(&fixture.root, fixture.request()).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::ProjectChanged
+        );
+        assert!(
+            !fixture
+                .root
+                .join(format!("tracks/{NEW_TRACK_ID}.json"))
+                .exists()
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("mixer/main.json")).unwrap(),
+            fixture.original_mixer
+        );
+        assert!(foreign.exists());
+        assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
     fn audio_track_publication_refuses_unrelated_mixer_edits() {
         let fixture = AudioTrackFixture::new();
         let mut changed: Value = serde_json::from_slice(&fixture.mixer).unwrap();
@@ -3457,6 +3540,71 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn staged_audio_track_blocks_mapping_until_global_recovery() {
+        let fixture = AudioTrackFixture::new();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = publish_audio_track_observed(&fixture.root, fixture.request(), |phase, _| {
+                assert_ne!(
+                    phase,
+                    AudioTrackPublicationPhase::Transaction,
+                    "simulated process crash"
+                );
+                Ok(())
+            });
+        }));
+        assert!(result.is_err());
+        assert_eq!(fixture.transaction_count(), 1);
+        let package = verify_project_package(&fixture.root).unwrap();
+        let mapping = serde_json_canonicalizer::to_vec(&json!({
+            "format":"hyper-control-mappings",
+            "format_version":1,
+            "id":"018f47a2-6b2d-7c11-8a44-00112233446a",
+            "project_id":package.manifest().project_id(),
+            "bindings":[],
+            "extensions":{}
+        }))
+        .unwrap();
+
+        let error = crate::publish_control_mapping(
+            &fixture.root,
+            crate::ControlMappingPublicationRequest {
+                expected_project_sha256: *package.manifest_sha256(),
+                mapping_bytes: &mapping,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            crate::ControlMappingPublicationErrorKind::ProjectChanged
+        );
+        assert_eq!(fixture.transaction_count(), 1);
+        let recovered = crate::recover_project_transactions(&fixture.root).unwrap();
+        assert_eq!(recovered.audio_tracks().len(), 1);
+        assert_eq!(
+            recovered.audio_tracks()[0].disposition(),
+            AudioTrackPublicationRecoveryDisposition::RolledBack
+        );
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            1
+        );
+        assert!(
+            !fixture
+                .root
+                .join(format!("tracks/{NEW_TRACK_ID}.json"))
+                .exists()
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("mixer/main.json")).unwrap(),
+            fixture.original_mixer
+        );
     }
 
     #[test]

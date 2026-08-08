@@ -17,13 +17,15 @@ use super::{
     MANIFEST_NAME, StructurallyVerifiedProject, open_stable_project_root, same_directory,
     verify_project_candidate, verify_project_package,
 };
-use crate::project_lock::ProjectLock;
+use crate::project_lock::{
+    ProjectLock, RECORDING_IMPORT_TRANSACTION_PREFIX as TRANSACTION_PREFIX,
+    find_unhandled_project_transaction,
+};
 
 const MAX_RECORDING_BYTES: u64 = u32::MAX as u64;
 const MAX_MANIFEST_BYTES: usize = 1_048_576;
 const MAX_HANDOFF_BYTES: usize = 2 * 1_048_576;
 const MAX_HANDOFF_PATH_BYTES: usize = 4_096;
-const TRANSACTION_PREFIX: &str = ".recording-import-";
 const TRANSACTION_INTENT_NAME: &str = "intent.json";
 const TRANSACTION_INTENT_STAGING_NAME: &str = ".intent.json.tmp";
 
@@ -323,6 +325,7 @@ fn import_recording_observed(
     let backups = open_or_create_dir(&verified.root_dir, "backups")?;
     let _lock = ProjectLock::acquire(&backups)
         .map_err(|error| caused("acquire project storage lock", error))?;
+    reject_unhandled_recording_transactions(&backups)?;
     verified
         .confirm_unchanged()
         .map_err(|error| caused("project changed before import", error))?;
@@ -505,6 +508,21 @@ fn run_import(
         recording_path: recording_relative.to_owned(),
         metadata_path: metadata_relative.to_owned(),
     })
+}
+
+fn reject_unhandled_recording_transactions(backups: &Dir) -> Result<(), RecordingImportError> {
+    let unhandled = find_unhandled_project_transaction(backups, &[]).map_err(|error| {
+        caused(
+            "inspect project transactions before recording import",
+            error,
+        )
+    })?;
+    if unhandled.is_some() {
+        return Err(failure(
+            "another project transaction requires recovery; reopen the current project revision",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_request(request: RecordingImportRequest<'_>) -> Result<(), RecordingImportError> {
@@ -1385,6 +1403,37 @@ mod tests {
             2
         );
         assert!(recover_recording_imports(&fixture.root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recording_import_refuses_unrecovered_project_transactions_before_staging() {
+        for prefix in [
+            crate::project_lock::AUDIO_TRACK_TRANSACTION_PREFIX,
+            TRANSACTION_PREFIX,
+        ] {
+            let fixture = Fixture::new(false);
+            let foreign = fixture
+                .root
+                .join("backups")
+                .join(format!("{prefix}fixture"));
+            fs::create_dir_all(&foreign).unwrap();
+
+            let error = import_recording(&fixture.root, fixture.request()).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                "another project transaction requires recovery; reopen the current project revision"
+            );
+            assert!(foreign.exists());
+            assert!(!fixture.root.join("assets/recordings").exists());
+            assert_eq!(
+                verify_project_package(&fixture.root)
+                    .unwrap()
+                    .manifest()
+                    .revision(),
+                1
+            );
+        }
     }
 
     #[test]

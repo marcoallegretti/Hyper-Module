@@ -13,7 +13,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::project_lock::ProjectLock;
+use super::project_lock::{
+    CONTROL_MAPPING_TRANSACTION_PREFIX as TRANSACTION_PREFIX, ProjectLock,
+    ProjectTransactionFamily, find_unhandled_project_transaction,
+};
 use super::stable_file::read_open_stable;
 use super::{
     MANIFEST_NAME, MAX_JSON_BYTES, MAX_JSON_FILE_BYTES, StructurallyVerifiedProject,
@@ -21,7 +24,6 @@ use super::{
     verify_retained_project_candidate,
 };
 
-const TRANSACTION_PREFIX: &str = ".control-mapping-publication-";
 const INTENT_NAME: &str = "intent.json";
 const INTENT_STAGING_NAME: &str = ".intent.json.tmp";
 const PROJECT_STAGING_NAME: &str = "project.json";
@@ -273,6 +275,21 @@ fn publish_control_mapping_observed(
             error,
         )
     })?;
+    let unhandled =
+        find_unhandled_project_transaction(&backups, &[ProjectTransactionFamily::ControlMapping])
+            .map_err(|error| {
+            caused(
+                ControlMappingPublicationErrorKind::TransactionUnavailable,
+                "inspect project transactions before mapping publication",
+                error,
+            )
+        })?;
+    if unhandled.is_some() {
+        return Err(failure(
+            ControlMappingPublicationErrorKind::ProjectChanged,
+            "another project transaction requires recovery; reopen the current project revision",
+        ));
+    }
     let recovered = recover_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
     if !recovered.is_empty() {
         return Err(failure(
@@ -2079,6 +2096,30 @@ mod tests {
     }
 
     #[test]
+    fn mapping_publication_refuses_a_foreign_transaction_before_staging() {
+        let fixture = Fixture::new(true);
+        let foreign_name = format!(
+            "{}fixture",
+            crate::project_lock::AUDIO_TRACK_TRANSACTION_PREFIX
+        );
+        let foreign = fixture.root.join("backups").join(&foreign_name);
+        fs::create_dir_all(&foreign).unwrap();
+
+        let error = publish_control_mapping(&fixture.root, fixture.request()).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ControlMappingPublicationErrorKind::ProjectChanged
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("mappings/manual.json")).unwrap(),
+            fixture.original_mapping
+        );
+        assert!(foreign.exists());
+        assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
     fn adds_the_first_mapping_and_its_owned_directory() {
         let fixture = Fixture::new(false);
 
@@ -2167,6 +2208,64 @@ mod tests {
             ControlMappingPublicationRecoveryDisposition::RolledBack
         );
         assert!(!fixture.root.join("mappings").exists());
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            1
+        );
+    }
+
+    #[test]
+    fn staged_mapping_blocks_resource_publication_until_global_recovery() {
+        let fixture = Fixture::new(false);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ =
+                publish_control_mapping_observed(&fixture.root, fixture.request(), |phase, _| {
+                    assert_ne!(
+                        phase,
+                        PublicationPhase::Transaction,
+                        "simulated process crash"
+                    );
+                    Ok(())
+                });
+        }));
+        assert!(result.is_err());
+        assert_eq!(fixture.transaction_count(), 1);
+        let package = verify_project_package(&fixture.root).unwrap();
+        let replacement = serde_json_canonicalizer::to_vec(&json!({
+            "format":"fixture-timeline",
+            "revision":2
+        }))
+        .unwrap();
+
+        let error = crate::publish_project_resource(
+            &fixture.root,
+            crate::ProjectResourcePublicationRequest {
+                expected_project_sha256: *package.manifest_sha256(),
+                resource_id: TIMELINE_ID,
+                expected_role: ResourceRole::Timeline,
+                resource_bytes: &replacement,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            crate::ProjectResourcePublicationErrorKind::ProjectChanged
+        );
+        assert_eq!(fixture.transaction_count(), 1);
+        let recovered = crate::recover_project_transactions(&fixture.root).unwrap();
+        assert_eq!(recovered.control_mappings().len(), 1);
+        assert_eq!(
+            recovered.control_mappings()[0].disposition(),
+            ControlMappingPublicationRecoveryDisposition::RolledBack
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("timeline/timeline.json")).unwrap(),
+            br#"{"format":"fixture-timeline"}"#
+        );
         assert_eq!(
             verify_project_package(&fixture.root)
                 .unwrap()

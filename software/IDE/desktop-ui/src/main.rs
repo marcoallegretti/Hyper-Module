@@ -1236,6 +1236,7 @@ fn apply_project_saved_event(ui: &MainWindow, event: &IdeWorkerEvent) {
 fn apply_audio_track_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::AudioTrackAdded { revision } => {
+            ui.set_new_track_name(next_audio_track_name(ui.get_track_count()));
             ui.set_new_track_visible(false);
             ui.set_status_text(format!("Audio track added in project revision {revision}").into());
             ui.set_error_text(SharedString::default());
@@ -1408,7 +1409,7 @@ fn apply_running_event(
     ui.set_scene_count(observation.scene_count().to_string().into());
     ui.set_track_count(i32::try_from(observation.track_count()).unwrap_or(8));
     if !ui.get_new_track_visible() {
-        ui.set_new_track_name(format!("Audio {}", observation.track_count() + 1).into());
+        ui.set_new_track_name(next_audio_track_name(ui.get_track_count()));
     }
     set_scenes(ui, observation.scenes());
     apply_mixer_observation(ui, observation);
@@ -1494,6 +1495,10 @@ fn apply_running_event(
             ui.set_error_text(SharedString::default());
         }
     }
+}
+
+fn next_audio_track_name(track_count: i32) -> SharedString {
+    format!("Audio {}", track_count.saturating_add(1)).into()
 }
 
 fn apply_output_meter_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
@@ -2686,6 +2691,12 @@ impl Error for DesktopUiExitError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_audio_track_name_uses_the_reopened_structural_count() {
+        assert_eq!(next_audio_track_name(2).as_str(), "Audio 3");
+        assert_eq!(next_audio_track_name(8).as_str(), "Audio 9");
+    }
 
     #[test]
     fn desktop_limits_match_the_fixed_version_one_playback_domain() {
