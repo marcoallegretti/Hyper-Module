@@ -23,12 +23,14 @@ use super::{
     IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError, IdeMixerChannelKind,
     IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError, IdeMixerMainState,
     IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure,
-    IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError, IdePendingCloseWait,
+    IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError, IdeOutputTestError,
+    IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
+    IdePendingCloseWait, IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait,
     IdePendingSaveCloseWait, IdeProjectOpenError, IdeProjectSaveError, IdeRecordingAbortError,
     IdeRecordingAbortOutcome, IdeRecordingError, IdeRecordingImportOutcome,
     IdeRecordingObservation, IdeSaveCloseOutcome, IdeSceneAvailability, IdeTransportSeekError,
     InputInventoryError, LocateState, OutputInventoryError, OutputStreamSnapshot,
-    OutputStreamState, RunningDesktopIdeApplication,
+    OutputStreamState, OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -101,6 +103,8 @@ pub enum IdeWorkerCommandKind {
     DisableInputMonitoring,
     SelectSystemDefaultInput,
     SelectInput,
+    StartOutputTest,
+    StopOutputTest,
     OpenProject,
     Transport,
     Seek,
@@ -130,6 +134,8 @@ pub enum IdeWorkerCommand {
     DisableInputMonitoring,
     SelectSystemDefaultInput,
     SelectInput(String),
+    StartOutputTest,
+    StopOutputTest,
     OpenProject(PathBuf),
     Transport(TransportCommand),
     Seek {
@@ -171,6 +177,8 @@ impl IdeWorkerCommand {
             Self::DisableInputMonitoring => IdeWorkerCommandKind::DisableInputMonitoring,
             Self::SelectSystemDefaultInput => IdeWorkerCommandKind::SelectSystemDefaultInput,
             Self::SelectInput(_) => IdeWorkerCommandKind::SelectInput,
+            Self::StartOutputTest => IdeWorkerCommandKind::StartOutputTest,
+            Self::StopOutputTest => IdeWorkerCommandKind::StopOutputTest,
             Self::OpenProject(_) => IdeWorkerCommandKind::OpenProject,
             Self::Transport(_) => IdeWorkerCommandKind::Transport,
             Self::Seek { .. } => IdeWorkerCommandKind::Seek,
@@ -611,6 +619,7 @@ pub enum IdeWorkerCommandFailure {
     Seek(IdeTransportSeekError),
     ArrangementLocate(IdeArrangementLocateError),
     Loudness(IdeLoudnessCommandError),
+    OutputTest(IdeOutputTestError),
     Mixer(IdeMixerCommandError),
     Monitoring(IdeMonitoringCommandError),
     ProjectSave(IdeProjectSaveError),
@@ -635,6 +644,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::Seek(source) => source.fmt(formatter),
             Self::ArrangementLocate(source) => source.fmt(formatter),
             Self::Loudness(source) => source.fmt(formatter),
+            Self::OutputTest(source) => source.fmt(formatter),
             Self::Mixer(source) => source.fmt(formatter),
             Self::Monitoring(source) => source.fmt(formatter),
             Self::ProjectSave(source) => source.fmt(formatter),
@@ -667,6 +677,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::Seek(source) => Some(source),
             Self::ArrangementLocate(source) => Some(source),
             Self::Loudness(source) => Some(source),
+            Self::OutputTest(source) => Some(source),
             Self::Mixer(source) => Some(source),
             Self::Monitoring(source) => Some(source),
             Self::ProjectSave(source) => Some(source),
@@ -693,6 +704,9 @@ pub enum IdeWorkerEvent {
         input_failure: Option<IdeInputDiscoveryError>,
     },
     Running(IdeRunningObservation),
+    OutputTest(IdeOutputTestSnapshot),
+    OutputTestStopping,
+    OutputTestStopped,
     TransportQueued(TransportCommand),
     LoudnessQueued(IdeLoudnessCommand),
     MixerQueued(IdeMixerCommand),
@@ -991,6 +1005,11 @@ impl DesktopIdeWorkerPendingShutdown {
 enum WorkerState {
     Undiscovered(IdeApplicationConfig),
     Closed(DesktopIdeApplication),
+    OutputTesting(OutputTestingDesktopIdeApplication),
+    OutputTestStopping {
+        pending: IdePendingOutputTestShutdown,
+        command: IdeWorkerCommandKind,
+    },
     Running(RunningDesktopIdeApplication),
     SaveFence {
         application: RunningDesktopIdeApplication,
@@ -1038,6 +1057,7 @@ fn run_worker(
                 | WorkerState::RecordingFence { .. }
                 | WorkerState::AudioPreviewFence { .. }
                 | WorkerState::RecordingClosing { .. }
+                | WorkerState::OutputTestStopping { .. }
                 | WorkerState::Closing(_)
                 | WorkerState::Saving(_)
         ) {
@@ -1192,25 +1212,12 @@ fn process_command(
         | IdeWorkerCommand::SelectInput(_)) => {
             process_input_command(state, command, events, unpublished_native_failure)
         }
+        IdeWorkerCommand::StartOutputTest => start_output_test(state, events),
+        IdeWorkerCommand::StopOutputTest => {
+            stop_output_test(state, events, unpublished_native_failure)
+        }
         IdeWorkerCommand::OpenProject(path) => {
-            if !matches!(state, WorkerState::Closed(_)) {
-                return publish_failure(events, kind, IdeWorkerCommandFailure::InvalidState);
-            }
-            let WorkerState::Closed(application) = std::mem::replace(state, WorkerState::Empty)
-            else {
-                unreachable!("closed state was checked before ownership transfer");
-            };
-            match application.open_project(path) {
-                Ok(running) => {
-                    *state = WorkerState::Running(running);
-                    publish_state(state, events, unpublished_native_failure)
-                }
-                Err(failure) => {
-                    let (application, reason) = failure.into_parts();
-                    *state = WorkerState::Closed(application);
-                    publish_failure(events, kind, IdeWorkerCommandFailure::ProjectOpen(reason))
-                }
-            }
+            open_project(state, path, events, unpublished_native_failure)
         }
         IdeWorkerCommand::Transport(command) => process_transport_command(state, command, events),
         IdeWorkerCommand::Seek { frame } => process_seek_command(state, frame, events),
@@ -1249,6 +1256,135 @@ fn process_command(
             IdeWorkerCommandKind::CloseProject,
         ),
         IdeWorkerCommand::Shutdown => unreachable!("shutdown is handled by the worker loop"),
+    }
+}
+
+fn open_project(
+    state: &mut WorkerState,
+    path: PathBuf,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+) -> bool {
+    if !matches!(state, WorkerState::Closed(_)) {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::OpenProject,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    }
+    let WorkerState::Closed(application) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("closed state was checked before ownership transfer");
+    };
+    match application.open_project(path) {
+        Ok(running) => {
+            *state = WorkerState::Running(running);
+            publish_state(state, events, unpublished_native_failure)
+        }
+        Err(failure) => {
+            let (application, reason) = failure.into_parts();
+            *state = WorkerState::Closed(application);
+            publish_failure(
+                events,
+                IdeWorkerCommandKind::OpenProject,
+                IdeWorkerCommandFailure::ProjectOpen(reason),
+            )
+        }
+    }
+}
+
+fn start_output_test(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) -> bool {
+    if !matches!(state, WorkerState::Closed(_)) {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::StartOutputTest,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    }
+    let WorkerState::Closed(application) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("closed state was checked before output-test ownership transfer");
+    };
+    match application.start_output_test() {
+        IdeOutputTestStartOutcome::Started(application) => {
+            *state = WorkerState::OutputTesting(application);
+            let mut no_native_failure = None;
+            publish_state(state, events, &mut no_native_failure)
+        }
+        IdeOutputTestStartOutcome::Failed {
+            application,
+            reason,
+        } => {
+            *state = WorkerState::Closed(application);
+            publish_failure(
+                events,
+                IdeWorkerCommandKind::StartOutputTest,
+                IdeWorkerCommandFailure::OutputTest(reason),
+            )
+        }
+        IdeOutputTestStartOutcome::Pending(pending) => {
+            *state = WorkerState::OutputTestStopping {
+                pending,
+                command: IdeWorkerCommandKind::StartOutputTest,
+            };
+            send_event(events, IdeWorkerEvent::OutputTestStopping)
+        }
+    }
+}
+
+fn stop_output_test(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+) -> bool {
+    if !matches!(state, WorkerState::OutputTesting(_)) {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::StopOutputTest,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    }
+    let WorkerState::OutputTesting(application) = std::mem::replace(state, WorkerState::Empty)
+    else {
+        unreachable!("output-test state was checked before ownership transfer");
+    };
+    match application.stop() {
+        IdeOutputTestStopOutcome::Closed {
+            application,
+            failure,
+        } => complete_output_test_stop(
+            state,
+            application,
+            failure,
+            IdeWorkerCommandKind::StopOutputTest,
+            events,
+            unpublished_native_failure,
+        ),
+        IdeOutputTestStopOutcome::Pending(pending) => {
+            *state = WorkerState::OutputTestStopping {
+                pending,
+                command: IdeWorkerCommandKind::StopOutputTest,
+            };
+            send_event(events, IdeWorkerEvent::OutputTestStopping)
+        }
+    }
+}
+
+fn complete_output_test_stop(
+    state: &mut WorkerState,
+    application: DesktopIdeApplication,
+    failure: Option<IdeOutputTestError>,
+    command: IdeWorkerCommandKind,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+) -> bool {
+    *state = WorkerState::Closed(application);
+    if !publish_state(state, events, unpublished_native_failure) {
+        return false;
+    }
+    match failure {
+        Some(reason) => {
+            publish_failure(events, command, IdeWorkerCommandFailure::OutputTest(reason))
+        }
+        None => send_event(events, IdeWorkerEvent::OutputTestStopped),
     }
 }
 
@@ -2286,8 +2422,37 @@ fn poll_pending_state(
             sequence,
             deadline,
         } => poll_audio_preview_fence(state, application, asset_id, sequence, deadline, events),
+        WorkerState::OutputTestStopping { pending, command } => {
+            poll_output_test_shutdown(state, pending, command, events, unpublished_native_failure)
+        }
         current => {
             *state = current;
+            true
+        }
+    }
+}
+
+fn poll_output_test_shutdown(
+    state: &mut WorkerState,
+    pending: IdePendingOutputTestShutdown,
+    command: IdeWorkerCommandKind,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+) -> bool {
+    match pending.wait(Duration::ZERO) {
+        IdePendingOutputTestShutdownWait::Closed {
+            application,
+            failure,
+        } => complete_output_test_stop(
+            state,
+            application,
+            failure,
+            command,
+            events,
+            unpublished_native_failure,
+        ),
+        IdePendingOutputTestShutdownWait::TimedOut(pending) => {
+            *state = WorkerState::OutputTestStopping { pending, command };
             true
         }
     }
@@ -2360,6 +2525,9 @@ fn publish_state(
                 return publish_failure(events, IdeWorkerCommandKind::Observe, reason);
             }
         },
+        WorkerState::OutputTesting(application) => {
+            IdeWorkerEvent::OutputTest(application.snapshot())
+        }
         WorkerState::Recording(application) => match recording_observation(application) {
             Ok(observation) => IdeWorkerEvent::Recording(observation),
             Err(reason) => {
@@ -2372,6 +2540,7 @@ fn publish_state(
             IdeWorkerEvent::RecordingPreparing
         }
         WorkerState::AudioPreviewFence { .. } => IdeWorkerEvent::AudioPreviewPreparing,
+        WorkerState::OutputTestStopping { .. } => IdeWorkerEvent::OutputTestStopping,
         WorkerState::Undiscovered(_) | WorkerState::Empty => return true,
     };
     if send_event(events, event) {
@@ -2587,6 +2756,25 @@ fn shutdown_state(
 ) {
     loop {
         state = match state {
+            WorkerState::OutputTesting(application) => match application.stop() {
+                IdeOutputTestStopOutcome::Closed { failure, .. } => {
+                    return (failure.as_ref().and_then(output_test_native_failure), None);
+                }
+                IdeOutputTestStopOutcome::Pending(pending) => WorkerState::OutputTestStopping {
+                    pending,
+                    command: IdeWorkerCommandKind::StopOutputTest,
+                },
+            },
+            WorkerState::OutputTestStopping { pending, command } => {
+                match pending.wait(WORKER_SHUTDOWN_POLL) {
+                    IdePendingOutputTestShutdownWait::Closed { failure, .. } => {
+                        return (failure.as_ref().and_then(output_test_native_failure), None);
+                    }
+                    IdePendingOutputTestShutdownWait::TimedOut(pending) => {
+                        WorkerState::OutputTestStopping { pending, command }
+                    }
+                }
+            }
             WorkerState::Running(application) => match application.close() {
                 IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
@@ -2632,6 +2820,27 @@ fn shutdown_state(
     }
 }
 
+fn output_test_native_failure(error: &IdeOutputTestError) -> Option<IdeNativeCloseFailure> {
+    match error {
+        IdeOutputTestError::OutputStop(
+            hyper_desktop_audio::DesktopOutputStopError::RuntimeFailed,
+        )
+        | IdeOutputTestError::PendingRuntimeFailed => Some(IdeNativeCloseFailure::RuntimeFailed),
+        IdeOutputTestError::OutputStop(
+            hyper_desktop_audio::DesktopOutputStopError::ThreadPanicked,
+        )
+        | IdeOutputTestError::PendingThreadPanicked => Some(IdeNativeCloseFailure::ThreadPanicked),
+        IdeOutputTestError::SelectedOutputUnavailable
+        | IdeOutputTestError::OutputConfig(_)
+        | IdeOutputTestError::ToneConfig(_)
+        | IdeOutputTestError::OutputStart(_)
+        | IdeOutputTestError::OutputStop(
+            hyper_desktop_audio::DesktopOutputStopError::ShutdownPending { .. },
+        )
+        | IdeOutputTestError::StartupCancellationCompleted => None,
+    }
+}
+
 struct CompletionSignal(SyncSender<()>);
 
 impl Drop for CompletionSignal {
@@ -2644,7 +2853,9 @@ impl Drop for CompletionSignal {
 mod tests {
     use super::*;
     use crate::{
-        IdeAudioOutputInventory, IdePlaybackExtent, IdePlaybackSessionOwner, TestPlaybackSession,
+        IdeAudioOutputInventory, IdeOutputTestSessionOwner, IdeOutputTestSnapshot,
+        IdeOutputTestState, IdePlaybackExtent, IdePlaybackSessionOwner,
+        OutputTestingDesktopIdeApplication, TestPlaybackSession,
     };
     use hyper_audio_source::DecodeLimits;
     use hyper_media_cache::CacheLimits;
@@ -2679,6 +2890,28 @@ mod tests {
             IdeAudioOutputInventory::try_new(&[("route-a", "Output A")]).unwrap(),
             IdeAudioInputInventory::try_new(&[("input-a", "Input A")]).unwrap(),
         )
+    }
+
+    fn output_testing_application(
+        stop_failure: Option<IdeNativeCloseFailure>,
+    ) -> OutputTestingDesktopIdeApplication {
+        OutputTestingDesktopIdeApplication {
+            application: closed_application(),
+            session: IdeOutputTestSessionOwner::Test {
+                snapshot: IdeOutputTestSnapshot {
+                    frequency_hz: 1_000.0,
+                    level_dbfs: -18.0,
+                    state: IdeOutputTestState::Running,
+                    output: OutputStreamSnapshot {
+                        callback_count: 7,
+                        rendered_callback_count: 7,
+                        rendered_frame_count: 1_024,
+                        ..OutputStreamSnapshot::default()
+                    },
+                },
+                stop_failure,
+            },
+        }
     }
 
     fn recv(worker: &DesktopIdeWorker) -> IdeWorkerEvent {
@@ -2758,6 +2991,78 @@ mod tests {
         ));
         worker.try_send(IdeWorkerCommand::Observe).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn output_diagnostic_observation_and_stop_retain_the_closed_application() {
+        let worker = DesktopIdeWorker::start_state(
+            WorkerState::OutputTesting(output_testing_application(None)),
+            2,
+            3,
+        )
+        .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::OutputTest(snapshot)
+                if snapshot.state() == IdeOutputTestState::Running
+                    && snapshot.output().rendered_frame_count == 1_024
+        ));
+
+        worker.try_send(IdeWorkerCommand::StopOutputTest).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::OutputTestStopped));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn output_diagnostic_start_failure_retains_the_closed_application() {
+        let mut application = closed_application();
+        application.output_selection = IdeOutputSelection::Routed("missing-route".to_owned());
+        let worker = DesktopIdeWorker::start_state(WorkerState::Closed(application), 2, 3).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+
+        worker.try_send(IdeWorkerCommand::StartOutputTest).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::StartOutputTest,
+                reason: IdeWorkerCommandFailure::OutputTest(
+                    IdeOutputTestError::SelectedOutputUnavailable
+                ),
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SelectSystemDefault)
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn output_diagnostic_stop_failure_closes_before_reporting_the_reason() {
+        let worker = DesktopIdeWorker::start_state(
+            WorkerState::OutputTesting(output_testing_application(Some(
+                IdeNativeCloseFailure::RuntimeFailed,
+            ))),
+            2,
+            3,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::OutputTest(_)));
+
+        worker.try_send(IdeWorkerCommand::StopOutputTest).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::StopOutputTest,
+                reason: IdeWorkerCommandFailure::OutputTest(IdeOutputTestError::OutputStop(
+                    hyper_desktop_audio::DesktopOutputStopError::RuntimeFailed
+                )),
+            }
+        ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
     }
 

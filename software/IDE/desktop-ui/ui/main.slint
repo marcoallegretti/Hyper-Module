@@ -5,6 +5,9 @@ export enum AppMode {
     closed,
     selecting,
     opening,
+    starting-output-test,
+    output-testing,
+    stopping-output-test,
     running,
     preparing-preview,
     previewing,
@@ -75,6 +78,8 @@ export global IdeActions {
     callback retry-discovery();
     callback refresh-outputs();
     callback select-output(int);
+    callback start-output-test();
+    callback stop-output-test();
     callback refresh-inputs();
     callback select-input(int);
     callback monitor-gain(float);
@@ -208,6 +213,9 @@ export component MainWindow inherits Window {
     in-out property <bool> loudness-wide-scale: false;
     in-out property <bool> loudness-relative: false;
     in-out property <bool> loudness-reset-confirming: false;
+    in-out property <bool> output-test-confirming: false;
+    in property <string> output-test-signal: "1 kHz · −18 dBFS · stereo";
+    in property <string> output-test-detail: "Digital output check; not physical calibration";
     in property <bool> loudness-available: false;
     in property <string> loudness-scale-name: "EBU +9";
     in property <string> loudness-state: "UNAVAILABLE";
@@ -256,8 +264,11 @@ export component MainWindow inherits Window {
     in property <string> error-text: "";
 
     VerticalLayout {
-        padding: 22px;
-        spacing: 16px;
+        padding-left: 22px;
+        padding-right: 22px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 10px;
 
         HorizontalLayout {
             height: 58px;
@@ -286,6 +297,7 @@ export component MainWindow inherits Window {
                 border-radius: 16px;
                 background: root.app-mode == AppMode.recording ? #542126
                     : root.app-mode == AppMode.previewing ? #173447
+                    : root.app-mode == AppMode.output-testing ? #4a3514
                     : root.app-mode == AppMode.running ? #173d31
                     : root.app-mode == AppMode.unavailable ? #492323 : #222b36;
                 Text {
@@ -294,6 +306,9 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.preparing-preview ? "◌  PREPARING"
                         : root.app-mode == AppMode.preparing-recording ? "◌  PREPARING"
                         : root.app-mode == AppMode.finalizing-recording ? "◌  FINALIZING"
+                        : root.app-mode == AppMode.starting-output-test ? "◌  STARTING TEST"
+                        : root.app-mode == AppMode.output-testing ? "●  OUTPUT TEST"
+                        : root.app-mode == AppMode.stopping-output-test ? "◌  STOPPING TEST"
                         : root.app-mode == AppMode.running ? "●  RUNNING"
                         : root.app-mode == AppMode.opening ? "◌  OPENING"
                         : root.app-mode == AppMode.saving ? "◌  SAVING"
@@ -304,6 +319,7 @@ export component MainWindow inherits Window {
                         : "◌  DISCOVERING";
                     color: root.app-mode == AppMode.recording ? #ff8b87
                         : root.app-mode == AppMode.previewing ? #7dcfff
+                        : root.app-mode == AppMode.output-testing ? #ffd166
                         : root.app-mode == AppMode.running ? #63e6b5
                         : root.app-mode == AppMode.unavailable ? #ff8b87 : #a9b5c4;
                     font-size: 11px;
@@ -334,19 +350,46 @@ export component MainWindow inherits Window {
                             model: root.output-names;
                             current-index <=> root.selected-output-index;
                             enabled: root.app-mode == AppMode.closed;
-                            selected(_) => { IdeActions.select-output(self.current-index); }
+                            selected(_) => {
+                                root.output-test-confirming = false;
+                                IdeActions.select-output(self.current-index);
+                            }
                         }
-                        HorizontalLayout {
+                        if root.app-mode == AppMode.unavailable : HorizontalLayout {
                             spacing: 8px;
                             Button {
-                                text: "Refresh output";
-                                enabled: root.app-mode == AppMode.closed;
-                                clicked => { IdeActions.refresh-outputs(); }
+                                text: "Retry discovery";
+                                clicked => { IdeActions.retry-discovery(); }
+                            }
+                        }
+
+                        if root.app-mode == AppMode.closed && !root.output-test-confirming : HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Refresh output"; clicked => { IdeActions.refresh-outputs(); } }
+                            Button {
+                                text: "Test output";
+                                clicked => { root.output-test-confirming = true; }
+                            }
+                        }
+
+                        if root.app-mode == AppMode.closed && root.output-test-confirming : HorizontalLayout {
+                            spacing: 6px;
+                            Text { horizontal-stretch: 1; text: "Lower monitors first · 1 kHz / −18 dBFS"; color: #ffbf9b; font-size: 9px; vertical-alignment: center; wrap: word-wrap; }
+                            Button { text: "Cancel"; clicked => { root.output-test-confirming = false; } }
+                            Button { text: "Start"; clicked => { IdeActions.start-output-test(); } }
+                        }
+
+                        if root.app-mode == AppMode.starting-output-test || root.app-mode == AppMode.output-testing || root.app-mode == AppMode.stopping-output-test : HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                Text { text: root.output-test-signal; color: #ffd166; font-size: 9px; font-weight: 600; }
+                                Text { text: root.output-test-detail; color: #8290a2; font-size: 8px; overflow: elide; }
                             }
                             Button {
-                                text: "Retry discovery";
-                                enabled: root.app-mode == AppMode.unavailable;
-                                clicked => { IdeActions.retry-discovery(); }
+                                text: root.app-mode == AppMode.stopping-output-test ? "Stopping…" : "Stop";
+                                enabled: root.app-mode == AppMode.output-testing;
+                                clicked => { IdeActions.stop-output-test(); }
                             }
                         }
 

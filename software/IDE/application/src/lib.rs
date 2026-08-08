@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use hyper_audio_engine::LoudnessMeasurementState as IdeLoudnessMeasurementState;
-use hyper_audio_engine::{LinearGain, LoudnessMeasurementCommand, Pan, ParameterError};
+use hyper_audio_engine::{
+    LinearGain, LoudnessMeasurementCommand, Pan, ParameterError, StereoSineTestToneConfigError,
+};
 use hyper_audio_source::{DecodeError, DecodeLimits};
 use hyper_desktop_audio::{
     CaptureStreamSnapshot, DesktopAudioPreviewCommandError, DesktopAudioPreviewControlError,
@@ -17,10 +19,12 @@ use hyper_desktop_audio::{
     DesktopInputConfigError, DesktopInputDiscoveryError, DesktopInputStopError,
     DesktopMonitoringConfig, DesktopMonitoringConfigError, DesktopMonitoringControlError,
     DesktopOutputConfig, DesktopOutputConfigError, DesktopOutputDiscoveryError,
-    DesktopOutputStopError, DesktopPlaybackRecovery, DesktopPlaybackRecoveryPendingStop,
-    DesktopPlaybackRecoveryPendingStopWait, DesktopPlaybackSession, DesktopProjectOpenError,
-    MonitoringSnapshot, OutputStreamSnapshot, OutputStreamState, StreamState,
-    discover_desktop_input_targets, discover_desktop_output_targets,
+    DesktopOutputStartError, DesktopOutputStopError, DesktopPlaybackRecovery,
+    DesktopPlaybackRecoveryPendingStop, DesktopPlaybackRecoveryPendingStopWait,
+    DesktopPlaybackSession, DesktopProjectOpenError, DesktopTestToneConfig, DesktopTestToneSession,
+    MonitoringSnapshot, OutputStreamSnapshot, OutputStreamState, PendingNativeShutdown,
+    PendingNativeShutdownWait, StreamState, discover_desktop_input_targets,
+    discover_desktop_output_targets,
 };
 pub use hyper_desktop_audio::{
     DesktopAudioPreviewState, DesktopSceneAvailability as IdeSceneAvailability,
@@ -81,6 +85,8 @@ const DESKTOP_MONITORING_TARGET_FRAMES: usize = 256;
 const DESKTOP_MONITORING_CHUNK_FRAMES: usize = 64;
 const MONITOR_GAIN_MILLIONTHS_MAXIMUM: u32 = 1_000_000;
 const PREVIEW_GAIN_MILLIONTHS_MAXIMUM: u32 = 1_000_000;
+pub const IDE_OUTPUT_TEST_FREQUENCY_HZ: f64 = 1_000.0;
+pub const IDE_OUTPUT_TEST_LEVEL_DBFS: f32 = -18.0;
 const DESKTOP_RECORDING_TRANSPORT_FRAMES: usize = DESKTOP_MAXIMUM_BLOCK_FRAMES * 4;
 const DESKTOP_RECORDING_DRAIN_FRAMES: usize = DESKTOP_MAXIMUM_BLOCK_FRAMES;
 const DESKTOP_RECORDING_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -860,6 +866,70 @@ impl DesktopIdeApplication {
         }
     }
 
+    /// Starts the fixed stereo output diagnostic through the selected route.
+    ///
+    /// The diagnostic owns the native output exclusively and uses the EBU
+    /// alignment-check signal parameters of 1 kHz at -18 dBFS. It is a digital
+    /// routing check, not evidence of physical calibration or acoustic level.
+    #[must_use]
+    pub fn start_output_test(self) -> IdeOutputTestStartOutcome {
+        let output = match self.output_test_config() {
+            Ok(output) => output,
+            Err(reason) => {
+                return IdeOutputTestStartOutcome::Failed {
+                    application: self,
+                    reason,
+                };
+            }
+        };
+        let config = match DesktopTestToneConfig::try_new(
+            output,
+            IDE_OUTPUT_TEST_FREQUENCY_HZ,
+            IDE_OUTPUT_TEST_LEVEL_DBFS,
+        ) {
+            Ok(config) => config,
+            Err(source) => {
+                return IdeOutputTestStartOutcome::Failed {
+                    application: self,
+                    reason: IdeOutputTestError::ToneConfig(source),
+                };
+            }
+        };
+        match DesktopTestToneSession::start(config) {
+            Ok(session) => IdeOutputTestStartOutcome::Started(OutputTestingDesktopIdeApplication {
+                application: self,
+                session: IdeOutputTestSessionOwner::Native(session),
+            }),
+            Err(DesktopOutputStartError::CancellationPending { shutdown }) => {
+                IdeOutputTestStartOutcome::Pending(IdePendingOutputTestShutdown {
+                    application: self,
+                    shutdown: *shutdown,
+                    origin: IdeOutputTestPendingOrigin::Start,
+                })
+            }
+            Err(source) => IdeOutputTestStartOutcome::Failed {
+                application: self,
+                reason: IdeOutputTestError::OutputStart(source),
+            },
+        }
+    }
+
+    fn output_test_config(&self) -> Result<DesktopOutputConfig, IdeOutputTestError> {
+        let output = DesktopOutputConfig::try_new(48_000, self.config.maximum_block_frames)
+            .map_err(IdeOutputTestError::OutputConfig)?;
+        match &self.output_selection {
+            IdeOutputSelection::SystemDefault => Ok(output),
+            IdeOutputSelection::Routed(routing_id) => {
+                if self.outputs.find(routing_id).is_none() {
+                    return Err(IdeOutputTestError::SelectedOutputUnavailable);
+                }
+                output
+                    .with_routing_id(routing_id)
+                    .map_err(IdeOutputTestError::OutputConfig)
+            }
+        }
+    }
+
     fn output_config(&self) -> Result<DesktopOutputConfig, IdeProjectOpenError> {
         let output = DesktopOutputConfig::try_new(48_000, self.config.maximum_block_frames)
             .map_err(IdeProjectOpenError::OutputConfig)?;
@@ -923,6 +993,252 @@ impl DesktopIdeApplication {
                     .map(Some)
                     .map_err(IdeProjectOpenError::InputConfig)
             }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeOutputTestError {
+    SelectedOutputUnavailable,
+    OutputConfig(DesktopOutputConfigError),
+    ToneConfig(StereoSineTestToneConfigError),
+    OutputStart(DesktopOutputStartError),
+    OutputStop(DesktopOutputStopError),
+    StartupCancellationCompleted,
+    PendingRuntimeFailed,
+    PendingThreadPanicked,
+}
+
+impl fmt::Display for IdeOutputTestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SelectedOutputUnavailable => {
+                formatter.write_str("selected audio output is no longer available")
+            }
+            Self::OutputConfig(source) => source.fmt(formatter),
+            Self::ToneConfig(source) => source.fmt(formatter),
+            Self::OutputStart(source) => source.fmt(formatter),
+            Self::OutputStop(source) => source.fmt(formatter),
+            Self::StartupCancellationCompleted => formatter.write_str(
+                "output diagnostic startup failed and its native cancellation completed",
+            ),
+            Self::PendingRuntimeFailed => {
+                formatter.write_str("output diagnostic failed while native shutdown was pending")
+            }
+            Self::PendingThreadPanicked => formatter
+                .write_str("output diagnostic thread panicked while native shutdown was pending"),
+        }
+    }
+}
+
+impl Error for IdeOutputTestError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::OutputConfig(source) => Some(source),
+            Self::ToneConfig(source) => Some(source),
+            Self::OutputStart(source) => Some(source),
+            Self::OutputStop(source) => Some(source),
+            Self::SelectedOutputUnavailable
+            | Self::StartupCancellationCompleted
+            | Self::PendingRuntimeFailed
+            | Self::PendingThreadPanicked => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeOutputTestStartOutcome {
+    Started(OutputTestingDesktopIdeApplication),
+    Failed {
+        application: DesktopIdeApplication,
+        reason: IdeOutputTestError,
+    },
+    Pending(IdePendingOutputTestShutdown),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeOutputTestState {
+    Starting,
+    Running,
+    StopRequested,
+    Stopped,
+    Failed,
+}
+
+impl From<StreamState> for IdeOutputTestState {
+    fn from(state: StreamState) -> Self {
+        match state {
+            StreamState::Starting => Self::Starting,
+            StreamState::Running => Self::Running,
+            StreamState::StopRequested => Self::StopRequested,
+            StreamState::Stopped => Self::Stopped,
+            StreamState::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct IdeOutputTestSnapshot {
+    frequency_hz: f64,
+    level_dbfs: f32,
+    state: IdeOutputTestState,
+    output: OutputStreamSnapshot,
+}
+
+impl IdeOutputTestSnapshot {
+    #[must_use]
+    pub const fn frequency_hz(&self) -> f64 {
+        self.frequency_hz
+    }
+
+    #[must_use]
+    pub const fn level_dbfs(&self) -> f32 {
+        self.level_dbfs
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> IdeOutputTestState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn output(&self) -> OutputStreamSnapshot {
+        self.output
+    }
+}
+
+#[derive(Debug)]
+pub struct OutputTestingDesktopIdeApplication {
+    application: DesktopIdeApplication,
+    session: IdeOutputTestSessionOwner,
+}
+
+#[derive(Debug)]
+enum IdeOutputTestSessionOwner {
+    Native(DesktopTestToneSession),
+    #[cfg(test)]
+    Test {
+        snapshot: IdeOutputTestSnapshot,
+        stop_failure: Option<IdeNativeCloseFailure>,
+    },
+}
+
+impl OutputTestingDesktopIdeApplication {
+    #[must_use]
+    pub fn snapshot(&self) -> IdeOutputTestSnapshot {
+        match &self.session {
+            IdeOutputTestSessionOwner::Native(session) => {
+                let tone = session.config().tone();
+                IdeOutputTestSnapshot {
+                    frequency_hz: tone.frequency_hz(),
+                    level_dbfs: tone.level_dbfs(),
+                    state: session.output_status().state().into(),
+                    output: session.counters().snapshot(),
+                }
+            }
+            #[cfg(test)]
+            IdeOutputTestSessionOwner::Test { snapshot, .. } => IdeOutputTestSnapshot {
+                frequency_hz: snapshot.frequency_hz,
+                level_dbfs: snapshot.level_dbfs,
+                state: snapshot.state,
+                output: snapshot.output,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn stop(self) -> IdeOutputTestStopOutcome {
+        let Self {
+            application,
+            session,
+        } = self;
+        match session {
+            IdeOutputTestSessionOwner::Native(session) => match session.stop() {
+                Ok(()) => IdeOutputTestStopOutcome::Closed {
+                    application,
+                    failure: None,
+                },
+                Err(DesktopOutputStopError::ShutdownPending { shutdown }) => {
+                    IdeOutputTestStopOutcome::Pending(IdePendingOutputTestShutdown {
+                        application,
+                        shutdown: *shutdown,
+                        origin: IdeOutputTestPendingOrigin::Stop,
+                    })
+                }
+                Err(source) => IdeOutputTestStopOutcome::Closed {
+                    application,
+                    failure: Some(IdeOutputTestError::OutputStop(source)),
+                },
+            },
+            #[cfg(test)]
+            IdeOutputTestSessionOwner::Test { stop_failure, .. } => {
+                IdeOutputTestStopOutcome::Closed {
+                    application,
+                    failure: stop_failure.map(|failure| {
+                        IdeOutputTestError::OutputStop(match failure {
+                            IdeNativeCloseFailure::RuntimeFailed => {
+                                DesktopOutputStopError::RuntimeFailed
+                            }
+                            IdeNativeCloseFailure::ThreadPanicked => {
+                                DesktopOutputStopError::ThreadPanicked
+                            }
+                        })
+                    }),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeOutputTestStopOutcome {
+    Closed {
+        application: DesktopIdeApplication,
+        failure: Option<IdeOutputTestError>,
+    },
+    Pending(IdePendingOutputTestShutdown),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdeOutputTestPendingOrigin {
+    Start,
+    Stop,
+}
+
+#[derive(Debug)]
+pub struct IdePendingOutputTestShutdown {
+    application: DesktopIdeApplication,
+    shutdown: PendingNativeShutdown,
+    origin: IdeOutputTestPendingOrigin,
+}
+
+#[derive(Debug)]
+pub enum IdePendingOutputTestShutdownWait {
+    Closed {
+        application: DesktopIdeApplication,
+        failure: Option<IdeOutputTestError>,
+    },
+    TimedOut(IdePendingOutputTestShutdown),
+}
+
+impl IdePendingOutputTestShutdown {
+    #[must_use]
+    pub fn wait(mut self, timeout: Duration) -> IdePendingOutputTestShutdownWait {
+        match self.shutdown.wait(timeout) {
+            PendingNativeShutdownWait::TimedOut => IdePendingOutputTestShutdownWait::TimedOut(self),
+            PendingNativeShutdownWait::Completed => IdePendingOutputTestShutdownWait::Closed {
+                application: self.application,
+                failure: (self.origin == IdeOutputTestPendingOrigin::Start)
+                    .then_some(IdeOutputTestError::StartupCancellationCompleted),
+            },
+            PendingNativeShutdownWait::Failed => IdePendingOutputTestShutdownWait::Closed {
+                application: self.application,
+                failure: Some(IdeOutputTestError::PendingRuntimeFailed),
+            },
+            PendingNativeShutdownWait::Panicked => IdePendingOutputTestShutdownWait::Closed {
+                application: self.application,
+                failure: Some(IdeOutputTestError::PendingThreadPanicked),
+            },
         }
     }
 }
@@ -2797,6 +3113,33 @@ mod tests {
             limits.session.media_cache.max_decoded_sample_bytes
                 >= limits.audio.max_decoded_sample_bytes()
         );
+    }
+
+    #[test]
+    fn output_diagnostic_uses_the_selected_route_and_fixed_ebu_alignment_signal() {
+        let mut application = DesktopIdeApplication::from_inventory(
+            config(256).unwrap(),
+            IdeAudioOutputInventory::try_new(&[("route-a", "Output A")]).unwrap(),
+        );
+        application.select_output("route-a").unwrap();
+        let output = application.output_test_config().unwrap();
+        let tone = DesktopTestToneConfig::try_new(
+            output,
+            IDE_OUTPUT_TEST_FREQUENCY_HZ,
+            IDE_OUTPUT_TEST_LEVEL_DBFS,
+        )
+        .unwrap();
+
+        assert_eq!(tone.output().routing_id(), Some("route-a"));
+        assert_eq!(tone.output().sample_rate_hz(), 48_000);
+        assert_eq!(tone.tone().frequency_hz().to_bits(), 1_000.0_f64.to_bits());
+        assert_eq!(tone.tone().level_dbfs().to_bits(), (-18.0_f32).to_bits());
+
+        application.output_selection = IdeOutputSelection::Routed("stale-route".to_owned());
+        assert!(matches!(
+            application.output_test_config(),
+            Err(IdeOutputTestError::SelectedOutputUnavailable)
+        ));
     }
 
     #[test]

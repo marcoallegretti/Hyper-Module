@@ -14,12 +14,13 @@ use hyper_desktop_ide::{
     IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState, IdeLoudnessPresentationConfig,
     IdeLoudnessScale, IdeLoudnessScaleRegion, IdeMaximumTruePeakDisplay, IdeMixerChannel,
     IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap, IdeMonitoringCommand,
-    IdeNativeCloseFailure, IdeOutputSelection, IdePlaybackArrangement, IdePlaybackExtent,
-    IdeRecordingAbortOutcome, IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake,
-    IdeRunningObservation, IdeScaledLoudnessValue, IdeScene, IdeSceneAvailability,
-    IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait,
-    IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState,
-    PlaybackRecoveryTransportState, TransportCommand, desktop_ide_application_config,
+    IdeNativeCloseFailure, IdeOutputSelection, IdeOutputTestState, IdePlaybackArrangement,
+    IdePlaybackExtent, IdeRecordingAbortOutcome, IdeRecordingCaptureKind,
+    IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation, IdeScaledLoudnessValue,
+    IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
+    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState, TransportCommand,
+    desktop_ide_application_config,
 };
 use slint::platform::PlatformError;
 use slint::{
@@ -214,6 +215,8 @@ fn bind_callbacks(
         submit(&weak, &worker_for_selection, command);
     });
 
+    bind_output_test_callbacks(ui, worker);
+
     bind_input_selection_callbacks(ui, worker, input_routes);
 
     let weak = ui.as_weak();
@@ -266,6 +269,34 @@ fn bind_callbacks(
     bind_monitoring_callbacks(ui, worker);
     bind_recording_callbacks(ui, worker, recording_routes);
     bind_audio_preview_callbacks(ui, worker, take_routes);
+}
+
+fn bind_output_test_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_start = Rc::clone(worker);
+    actions.on_start_output_test(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Closed || !ui.get_output_test_confirming() {
+            return;
+        }
+        ui.set_output_test_confirming(false);
+        submit_to_ui(&ui, &worker_for_start, IdeWorkerCommand::StartOutputTest);
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_stop = Rc::clone(worker);
+    actions.on_stop_output_test(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::OutputTesting {
+            return;
+        }
+        submit_to_ui(&ui, &worker_for_stop, IdeWorkerCommand::StopOutputTest);
+    });
 }
 
 fn bind_input_selection_callbacks(
@@ -847,7 +878,7 @@ fn start_event_pump(
         }
         if !matches!(
             ui.get_app_mode(),
-            AppMode::Running | AppMode::Previewing | AppMode::Recording
+            AppMode::Running | AppMode::Previewing | AppMode::Recording | AppMode::OutputTesting
         ) {
             observation_pending = false;
         } else if !observation_pending {
@@ -869,6 +900,7 @@ fn completes_observation(event: &IdeWorkerEvent) -> bool {
         event,
         IdeWorkerEvent::Running(_)
             | IdeWorkerEvent::Recording(_)
+            | IdeWorkerEvent::OutputTest(_)
             | IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::Observe,
                 ..
@@ -902,6 +934,12 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
     match worker.try_send(command) {
         Ok(()) => {
             match command_kind {
+                IdeWorkerCommandKind::StartOutputTest => {
+                    ui.set_app_mode(AppMode::StartingOutputTest);
+                }
+                IdeWorkerCommandKind::StopOutputTest => {
+                    ui.set_app_mode(AppMode::StoppingOutputTest);
+                }
                 IdeWorkerCommandKind::SaveProject => ui.set_app_mode(AppMode::Saving),
                 IdeWorkerCommandKind::StartRecording => {
                     ui.set_app_mode(AppMode::PreparingRecording);
@@ -944,6 +982,8 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::DisableInputMonitoring
         | IdeWorkerCommandKind::SelectSystemDefaultInput
         | IdeWorkerCommandKind::SelectInput => "Applying input cue selection…",
+        IdeWorkerCommandKind::StartOutputTest => "Starting exclusive output diagnostic…",
+        IdeWorkerCommandKind::StopOutputTest => "Stopping output diagnostic…",
         IdeWorkerCommandKind::OpenProject => "Recovering and verifying project…",
         IdeWorkerCommandKind::Transport => "Transport command queued…",
         IdeWorkerCommandKind::Seek => "Bounded transport locate queued…",
@@ -991,6 +1031,7 @@ fn apply_event(
                 snapshot.input_selection(),
             );
             reset_project(ui, recording_routes, take_routes, project_state);
+            ui.set_output_test_confirming(false);
             let mode = mode_after_closed_event(ui.get_app_mode());
             ui.set_app_mode(mode);
             if mode == AppMode::Closed {
@@ -1008,6 +1049,9 @@ fn apply_event(
             project_state,
             &observation,
         ),
+        event @ (IdeWorkerEvent::OutputTest(_)
+        | IdeWorkerEvent::OutputTestStopping
+        | IdeWorkerEvent::OutputTestStopped) => apply_output_test_event(ui, &event),
         IdeWorkerEvent::TransportQueued(command) => {
             ui.set_status_text(
                 match command {
@@ -1070,6 +1114,81 @@ fn apply_event(
         IdeWorkerEvent::CommandFailed { command, reason } => {
             ui.set_app_mode(mode_after_failure(ui.get_app_mode(), command));
             ui.set_error_text(format!("{}: {reason}", command_status(command)).into());
+        }
+    }
+}
+
+fn apply_output_test_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::OutputTest(snapshot) => {
+            ui.set_app_mode(AppMode::OutputTesting);
+            ui.set_output_test_confirming(false);
+            ui.set_output_test_signal(
+                format!(
+                    "{:.0} Hz · {:.1} dBFS · stereo",
+                    snapshot.frequency_hz(),
+                    snapshot.level_dbfs()
+                )
+                .into(),
+            );
+            ui.set_output_test_detail(
+                format!(
+                    "{} · {} callbacks · {} rendered frames",
+                    output_test_state_label(snapshot.state()),
+                    snapshot.output().rendered_callback_count,
+                    snapshot.output().rendered_frame_count,
+                )
+                .into(),
+            );
+            apply_output_test_status(ui, snapshot.state());
+        }
+        IdeWorkerEvent::OutputTestStopping => {
+            ui.set_app_mode(AppMode::StoppingOutputTest);
+            ui.set_status_text("Waiting for exclusive output diagnostic to stop…".into());
+        }
+        IdeWorkerEvent::OutputTestStopped => {
+            ui.set_app_mode(AppMode::Closed);
+            ui.set_output_test_detail("Digital output check; not physical calibration".into());
+            ui.set_status_text("Output diagnostic stopped".into());
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("only output-test events are routed to this handler"),
+    }
+}
+
+fn output_test_state_label(state: IdeOutputTestState) -> &'static str {
+    match state {
+        IdeOutputTestState::Starting => "Starting",
+        IdeOutputTestState::Running => "Running",
+        IdeOutputTestState::StopRequested => "Stop requested",
+        IdeOutputTestState::Stopped => "Stopped",
+        IdeOutputTestState::Failed => "Failed",
+    }
+}
+
+fn apply_output_test_status(ui: &MainWindow, state: IdeOutputTestState) {
+    match state {
+        IdeOutputTestState::Starting => {
+            ui.set_status_text("Digital output diagnostic starting…".into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeOutputTestState::Running => {
+            ui.set_status_text(
+                "Digital output diagnostic active · not physical calibration".into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeOutputTestState::StopRequested => {
+            ui.set_status_text("Digital output diagnostic stop requested…".into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeOutputTestState::Stopped => {
+            ui.set_status_text("Output diagnostic stream stopped; release the route".into());
+            ui.set_error_text("Stop the diagnostic before continuing".into());
+        }
+        IdeOutputTestState::Failed => {
+            ui.set_status_text("Output diagnostic stream failed; release the route".into());
+            ui.set_error_text("Native output is no longer rendering; stop the diagnostic".into());
         }
     }
 }
@@ -1861,6 +1980,12 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::StartAudioPreview if current == AppMode::PreparingPreview => {
             AppMode::Running
         }
+        IdeWorkerCommandKind::StartOutputTest if current == AppMode::StartingOutputTest => {
+            AppMode::Closed
+        }
+        IdeWorkerCommandKind::StopOutputTest if current == AppMode::StoppingOutputTest => {
+            AppMode::OutputTesting
+        }
         _ => current,
     }
 }
@@ -2236,6 +2361,18 @@ fn mode_after_submission_failure(
             if current == AppMode::Opening && command == IdeWorkerCommandKind::OpenProject =>
         {
             AppMode::Closed
+        }
+        UiSubmissionFailure::Full
+            if current == AppMode::StartingOutputTest
+                && command == IdeWorkerCommandKind::StartOutputTest =>
+        {
+            AppMode::Closed
+        }
+        UiSubmissionFailure::Full
+            if current == AppMode::StoppingOutputTest
+                && command == IdeWorkerCommandKind::StopOutputTest =>
+        {
+            AppMode::OutputTesting
         }
         UiSubmissionFailure::Full => current,
     }
@@ -2691,6 +2828,20 @@ mod tests {
             mode_after_failure(AppMode::Opening, IdeWorkerCommandKind::Observe),
             AppMode::Running
         );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::StartingOutputTest,
+                IdeWorkerCommandKind::StartOutputTest,
+            ),
+            AppMode::Closed
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::StoppingOutputTest,
+                IdeWorkerCommandKind::StopOutputTest,
+            ),
+            AppMode::OutputTesting
+        );
     }
 
     #[test]
@@ -2718,6 +2869,22 @@ mod tests {
                 UiSubmissionFailure::Disconnected,
             ),
             AppMode::Unavailable
+        );
+        assert_eq!(
+            mode_after_submission_failure(
+                AppMode::StartingOutputTest,
+                IdeWorkerCommandKind::StartOutputTest,
+                UiSubmissionFailure::Full,
+            ),
+            AppMode::Closed
+        );
+        assert_eq!(
+            mode_after_submission_failure(
+                AppMode::StoppingOutputTest,
+                IdeWorkerCommandKind::StopOutputTest,
+                UiSubmissionFailure::Full,
+            ),
+            AppMode::OutputTesting
         );
     }
 
