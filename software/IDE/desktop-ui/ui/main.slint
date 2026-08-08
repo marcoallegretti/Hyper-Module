@@ -11,6 +11,7 @@ export enum AppMode {
     stopping-output-test,
     running,
     adding-track,
+    renaming-track,
     preparing-preview,
     previewing,
     saving,
@@ -31,6 +32,7 @@ export struct SceneRow {
 
 export struct MixerChannelRow {
     index: int,
+    track-id: string,
     name: string,
     display-name: string,
     kind: string,
@@ -40,6 +42,7 @@ export struct MixerChannelRow {
     muted: bool,
     solo: bool,
     solo-available: bool,
+    renameable: bool,
 }
 
 export struct MixerSendRow {
@@ -108,6 +111,7 @@ export global IdeActions {
     callback mixer-send-enabled(int);
     callback save-project();
     callback add-audio-track(string);
+    callback rename-audio-track(int, string);
     callback start-recording();
     callback stop-recording();
     callback abort-recording();
@@ -215,6 +219,10 @@ export component MainWindow inherits Window {
     in-out property <bool> mixer-visible: false;
     in-out property <bool> new-track-visible: false;
     in-out property <string> new-track-name: "Audio 2";
+    in-out property <bool> rename-track-visible: false;
+    in-out property <int> rename-track-index: -1;
+    in-out property <string> rename-track-original-name: "";
+    in-out property <string> rename-track-name: "";
     in-out property <bool> mixer-sends-visible: false;
     in-out property <bool> takes-visible: false;
     in-out property <bool> arrangement-visible: false;
@@ -787,7 +795,49 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && root.rename-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.loudness-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 14px;
+                        Text { text: "RENAME AUDIO TRACK"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.rename-track-original-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                        Rectangle { height: 1px; background: #27313d; }
+                        Text { text: "New display name"; color: #aebccc; font-size: 12px; }
+                        LineEdit {
+                            text <=> root.rename-track-name;
+                            enabled: root.app-mode == AppMode.running;
+                            accessible-label: "New audio track name";
+                        }
+                        Text {
+                            text: "The committed live mixer is preserved first. The structural track is then replaced through a recoverable project transaction.";
+                            color: #728196;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button {
+                                text: "Cancel";
+                                enabled: root.app-mode == AppMode.running;
+                                clicked => { root.rename-track-visible = false; }
+                            }
+                            Button {
+                                horizontal-stretch: 1;
+                                text: root.app-mode == AppMode.renaming-track ? "Renaming track..." : "Rename audio track";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.rename-track-index >= 0
+                                    && root.rename-track-name != ""
+                                    && root.rename-track-name != root.rename-track-original-name;
+                                clicked => { IdeActions.rename-audio-track(root.rename-track-index, root.rename-track-name); }
+                            }
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                    }
+                }
+
+                if root.mixer-visible && !root.rename-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -824,6 +874,16 @@ export component MainWindow inherits Window {
                                 spacing: 5px;
                                 Text { text: channel.display-name; accessible-label: channel.name; color: #dce5ef; font-size: 10px; font-weight: 600; horizontal-alignment: center; overflow: elide; }
                                 Text { text: channel.kind; color: #65758a; font-size: 8px; horizontal-alignment: center; }
+                                Button {
+                                    text: "Rename";
+                                    enabled: root.app-mode == AppMode.running && channel.renameable;
+                                    clicked => {
+                                        root.rename-track-index = channel.index;
+                                        root.rename-track-original-name = channel.name;
+                                        root.rename-track-name = channel.name;
+                                        root.rename-track-visible = true;
+                                    }
+                                }
                                 Slider {
                                     min-width: 28px;
                                     max-width: 28px;

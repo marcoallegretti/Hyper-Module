@@ -46,9 +46,10 @@ use hyper_mixer_runtime::{
 #[cfg(test)]
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
 use hyper_playback_json::{
-    AudioTrackAdditionSerializationError, CompiledMixerTap, CompiledMixerTrackKind, LoaderLimits,
-    MixerBaseState, MixerChannelBaseState, MixerSendBaseState, MixerStateSerializationError,
-    serialize_audio_track_addition, serialize_mixer_base_state,
+    AudioTrackAdditionSerializationError, AudioTrackRenameSerializationError, CompiledMixerTap,
+    CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
+    MixerSendBaseState, MixerStateSerializationError, serialize_audio_track_addition,
+    serialize_audio_track_rename, serialize_mixer_base_state,
 };
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 pub use hyper_playback_session::{
@@ -1845,6 +1846,146 @@ impl Error for IdeAudioTrackAdditionError {
 }
 
 #[derive(Debug)]
+pub enum IdeAudioTrackRenamePublicationError {
+    Mixer(Box<ProjectResourcePublicationError>),
+    Track {
+        mixer: Box<ProjectResourcePublicationOutcome>,
+        source: Box<ProjectResourcePublicationError>,
+    },
+}
+
+impl fmt::Display for IdeAudioTrackRenamePublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mixer(source) => {
+                write!(
+                    formatter,
+                    "live mixer could not be preserved before rename: {source}"
+                )
+            }
+            Self::Track { mixer, source } if mixer.changed() => write!(
+                formatter,
+                "live mixer was preserved in project revision {} but the audio-track rename failed: {source}",
+                mixer.project_revision()
+            ),
+            Self::Track { source, .. } => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeAudioTrackRenamePublicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Mixer(source) | Self::Track { source, .. } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeAudioTrackRenameError {
+    InvalidName,
+    MixerSave(Box<IdeProjectSaveError>),
+    TrackResourceMissing,
+    TrackResourceRoleMismatch,
+    Storage(StorageError),
+    Serialization(AudioTrackRenameSerializationError),
+    CapacityUnavailable,
+    Publication(Box<IdeAudioTrackRenamePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeAudioTrackRenameError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: ProjectResourcePublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<IdeAudioTrackRenamePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl fmt::Display for IdeAudioTrackRenameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidName => {
+                formatter.write_str("audio-track name must contain 1 through 120 characters")
+            }
+            Self::MixerSave(source) => {
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
+            }
+            Self::TrackResourceMissing => {
+                formatter.write_str("the selected audio-track resource is no longer present")
+            }
+            Self::TrackResourceRoleMismatch => {
+                formatter.write_str("the selected project resource is not a structural track")
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("audio-track rename capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before renaming the audio track: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before renaming the audio track ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-track rename preparation failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "audio track was renamed in project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-track rename publication failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAudioTrackRenameError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidName
+            | Self::TrackResourceMissing
+            | Self::TrackResourceRoleMismatch
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct IdeMixerSavePlan {
     project_path: PathBuf,
     expected_project_sha256: [u8; 32],
@@ -1860,6 +2001,37 @@ struct IdeAudioTrackAdditionPlan {
     track_bytes: Vec<u8>,
     mixer_id: String,
     mixer_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct IdeAudioTrackRenamePlan {
+    mixer: IdeMixerSavePlan,
+    track_id: String,
+    track_bytes: Vec<u8>,
+}
+
+impl IdeAudioTrackRenamePlan {
+    fn publish(
+        &self,
+    ) -> Result<ProjectResourcePublicationOutcome, IdeAudioTrackRenamePublicationError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeAudioTrackRenamePublicationError::Mixer(Box::new(source)))?;
+        publish_project_resource(
+            &self.mixer.project_path,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                resource_id: &self.track_id,
+                expected_role: ResourceRole::Track,
+                resource_bytes: &self.track_bytes,
+            },
+        )
+        .map_err(|source| IdeAudioTrackRenamePublicationError::Track {
+            mixer: Box::new(mixer),
+            source: Box::new(source),
+        })
+    }
 }
 
 impl IdeAudioTrackAdditionPlan {
@@ -2200,6 +2372,57 @@ impl RunningDesktopIdeApplication {
             track_bytes,
             mixer_id: mixer_plan.resource_id,
             mixer_bytes,
+        })
+    }
+
+    fn prepare_audio_track_rename(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        track_id: &str,
+        track_name: &str,
+    ) -> Result<IdeAudioTrackRenamePlan, IdeAudioTrackRenameError> {
+        let name_length = track_name.chars().count();
+        if track_name.trim() != track_name || !(1..=120).contains(&name_length) {
+            return Err(IdeAudioTrackRenameError::InvalidName);
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAudioTrackRenameError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAudioTrackRenameError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == track_id)
+            .ok_or(IdeAudioTrackRenameError::TrackResourceMissing)?;
+        if descriptor.role() != ResourceRole::Track {
+            return Err(IdeAudioTrackRenameError::TrackResourceRoleMismatch);
+        }
+        let source = package
+            .read_resource(track_id)
+            .map_err(IdeAudioTrackRenameError::Storage)?;
+        let (project, _, _, _) = prepared.session().parts();
+        let track_bytes = serialize_audio_track_rename(
+            project,
+            &source,
+            track_id,
+            track_name,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeAudioTrackRenameError::Serialization)?;
+        let mut owned_track_id = String::new();
+        owned_track_id
+            .try_reserve_exact(track_id.len())
+            .map_err(|_| IdeAudioTrackRenameError::CapacityUnavailable)?;
+        owned_track_id.push_str(track_id);
+        Ok(IdeAudioTrackRenamePlan {
+            mixer,
+            track_id: owned_track_id,
+            track_bytes,
         })
     }
 
@@ -3110,6 +3333,25 @@ mod tests {
     use hyper_playback_json::LoaderLimits;
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
 
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "hyper-desktop-ide-track-rename-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
     fn config(
         maximum_block_frames: usize,
     ) -> Result<IdeApplicationConfig, IdeApplicationConfigError> {
@@ -3275,6 +3517,127 @@ mod tests {
         assert!(
             limits.session.media_cache.max_decoded_sample_bytes
                 >= limits.audio.max_decoded_sample_bytes()
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the end-to-end test keeps both durable publication stages and retry evidence visible"
+    )]
+    fn audio_track_rename_preserves_a_changed_live_mixer_before_replacing_the_track() {
+        let parent = TestDirectory::new();
+        let created = hyper_storage_engine::create_project(
+            &parent.0,
+            hyper_storage_engine::ProjectCreationRequest {
+                directory_name: "Project",
+                project_name: "Rename Test",
+            },
+        )
+        .unwrap();
+        let project_path = created.project().root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let track = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Track)
+            .unwrap();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let source_track = package.read_resource(track.id()).unwrap();
+        let source_mixer = package.read_resource(mixer.id()).unwrap();
+        let changed_mixer = serialize_mixer_base_state(
+            &source_mixer,
+            package.manifest().project_id(),
+            mixer.id(),
+            &MixerBaseState {
+                channels: vec![MixerChannelBaseState {
+                    track_id: track.id().to_owned(),
+                    gain: LinearGain::UNITY,
+                    pan: Pan::CENTER,
+                    muted: false,
+                    solo: false,
+                    sends: Vec::new(),
+                }],
+                main_gain: LinearGain::from_millionths(750_000).unwrap(),
+                main_muted: false,
+            },
+            limits.session.documents,
+        )
+        .unwrap();
+        let (loaded, _, _, _) = prepared.session().parts();
+        let renamed_track = serialize_audio_track_rename(
+            loaded,
+            &source_track,
+            track.id(),
+            "Lead Vocal",
+            limits.session.documents,
+        )
+        .unwrap();
+        let track_id = track.id().to_owned();
+        let mixer_id = mixer.id().to_owned();
+        let initial_identity = *package.manifest_sha256();
+        drop(prepared);
+
+        let failed = IdeAudioTrackRenamePlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: initial_identity,
+                resource_id: mixer_id.clone(),
+                resource_bytes: changed_mixer.clone(),
+            },
+            track_id: track_id.clone(),
+            track_bytes: b"not-json".to_vec(),
+        };
+        let error = failed.publish().unwrap_err();
+        let IdeAudioTrackRenamePublicationError::Track { mixer, source } = error else {
+            panic!("rename must fail after the mixer publication");
+        };
+        assert!(mixer.changed());
+        assert_eq!(mixer.project_revision(), 2);
+        assert_eq!(
+            source.kind(),
+            hyper_storage_engine::ProjectResourcePublicationErrorKind::InvalidResource
+        );
+
+        let verified = hyper_storage_engine::verify_project_package(&project_path).unwrap();
+        assert_eq!(verified.manifest().revision(), 2);
+        assert_eq!(verified.read_resource(&mixer_id).unwrap(), changed_mixer);
+        assert_eq!(verified.read_resource(&track_id).unwrap(), source_track);
+        let retry_identity = *verified.manifest_sha256();
+        drop(verified);
+
+        let retry = IdeAudioTrackRenamePlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: retry_identity,
+                resource_id: mixer_id.clone(),
+                resource_bytes: changed_mixer.clone(),
+            },
+            track_id: track_id.clone(),
+            track_bytes: renamed_track,
+        };
+
+        let outcome = retry.publish().unwrap();
+
+        assert!(outcome.changed());
+        assert_eq!(outcome.project_revision(), 3);
+        let verified = hyper_storage_engine::verify_project_package(&project_path).unwrap();
+        assert_eq!(verified.read_resource(&mixer_id).unwrap(), changed_mixer);
+        drop(verified);
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert_eq!(
+            reopened.session().parts().0.track_name(&track_id),
+            Some("Lead Vocal")
         );
     }
 

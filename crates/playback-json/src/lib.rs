@@ -530,6 +530,59 @@ pub enum AudioTrackAdditionSerializationError {
     Serialization(serde_json::Error),
 }
 
+#[derive(Debug)]
+pub enum AudioTrackRenameSerializationError {
+    Source(LoadError),
+    NonCanonicalSource,
+    TrackMissing,
+    TrackNotAudio,
+    SourceTrackMismatch,
+    InvalidTrackName,
+    InvalidDocumentShape,
+    Serialization(serde_json::Error),
+}
+
+impl fmt::Display for AudioTrackRenameSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => source.fmt(formatter),
+            Self::NonCanonicalSource => {
+                formatter.write_str("source audio track is not canonical RFC 8785 JSON")
+            }
+            Self::TrackMissing => {
+                formatter.write_str("the selected audio track is not present in the project")
+            }
+            Self::TrackNotAudio => {
+                formatter.write_str("the selected structural track is not an audio track")
+            }
+            Self::SourceTrackMismatch => formatter
+                .write_str("source audio-track bytes do not match the loaded project structure"),
+            Self::InvalidTrackName => {
+                formatter.write_str("the audio-track name is outside the version-1 domain")
+            }
+            Self::InvalidDocumentShape => {
+                formatter.write_str("source audio-track shape changed after typed validation")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioTrackRenameSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::NonCanonicalSource
+            | Self::TrackMissing
+            | Self::TrackNotAudio
+            | Self::SourceTrackMismatch
+            | Self::InvalidTrackName
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
 impl fmt::Display for AudioTrackAdditionSerializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1063,6 +1116,89 @@ pub fn serialize_audio_track_addition(
         .load_mixer(&mixer, assets, limits)
         .map_err(AudioTrackAdditionSerializationError::Source)?;
     Ok(AudioTrackAdditionDocuments { track, mixer })
+}
+
+/// Replaces only the display name in one validated canonical audio-track
+/// document while preserving its identity, structure, clip ownership, and
+/// namespaced extensions.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the selected track is absent or not
+/// audio, the supplied bytes disagree with the loaded project, the new name is
+/// outside the version-1 domain, or the resulting project structure fails
+/// validation.
+pub fn serialize_audio_track_rename(
+    project: &LoadedPlaybackProject,
+    source_track: &[u8],
+    track_id: &str,
+    track_name: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AudioTrackRenameSerializationError> {
+    let name_length = track_name.chars().count();
+    if track_name.trim() != track_name
+        || !(1..=MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length)
+    {
+        return Err(AudioTrackRenameSerializationError::InvalidTrackName);
+    }
+    let track_index = project
+        .track_index(track_id)
+        .ok_or(AudioTrackRenameSerializationError::TrackMissing)?;
+    if !project.is_audio_track(track_id) {
+        return Err(AudioTrackRenameSerializationError::TrackNotAudio);
+    }
+
+    let source = load_track(
+        source_track,
+        track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(AudioTrackRenameSerializationError::Source)?;
+    let current = project
+        .tracks
+        .get(track_index)
+        .ok_or(AudioTrackRenameSerializationError::TrackMissing)?;
+    if source.id != current.id
+        || source.name != current.name
+        || source.kind != current.kind
+        || source.order != current.order
+        || source.active != current.active
+        || source.parent_track_id != current.parent_track_id
+        || source.clip_ids != current.clip_ids
+    {
+        return Err(AudioTrackRenameSerializationError::SourceTrackMismatch);
+    }
+
+    let mut value: Value = serde_json::from_slice(source_track)
+        .map_err(AudioTrackRenameSerializationError::Serialization)?;
+    let canonical_source = serde_json_canonicalizer::to_vec(&value)
+        .map_err(AudioTrackRenameSerializationError::Serialization)?;
+    if canonical_source != source_track {
+        return Err(AudioTrackRenameSerializationError::NonCanonicalSource);
+    }
+    value
+        .as_object_mut()
+        .ok_or(AudioTrackRenameSerializationError::InvalidDocumentShape)?
+        .insert("name".to_owned(), track_name.into());
+    let output = serde_json_canonicalizer::to_vec(&value)
+        .map_err(AudioTrackRenameSerializationError::Serialization)?;
+    let renamed = load_track(
+        &output,
+        track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(AudioTrackRenameSerializationError::Source)?;
+    let mut renamed_project = project.clone();
+    renamed_project.tracks[track_index] = renamed;
+    validate_track_hierarchy(&renamed_project.tracks)
+        .map_err(AudioTrackRenameSerializationError::Source)?;
+    validate_loaded_identities(&renamed_project)
+        .map_err(AudioTrackRenameSerializationError::Source)?;
+    Ok(output)
 }
 
 impl LoadedMixer {
@@ -4091,6 +4227,108 @@ mod tests {
                 LoaderLimits::VERSION_1,
             ),
             Err(AudioTrackAdditionSerializationError::MixerIdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn renames_only_the_selected_canonical_audio_track() {
+        let mut source: Value = serde_json::from_slice(TRACK).unwrap();
+        source["extensions"]["org.example.track"] = json!({"opaque": [1, 2, 3]});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [&source];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let renamed = serialize_audio_track_rename(
+            &loaded,
+            &source,
+            "018f47a2-6b2d-7c11-8a44-001122334456",
+            "Lead Vocal",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut expected: Value = serde_json::from_slice(&source).unwrap();
+        expected["name"] = "Lead Vocal".into();
+
+        assert_eq!(
+            renamed,
+            serde_json_canonicalizer::to_vec(&expected).unwrap()
+        );
+        assert_eq!(
+            expected["extensions"]["org.example.track"],
+            json!({"opaque": [1, 2, 3]})
+        );
+    }
+
+    #[test]
+    fn audio_track_rename_refuses_stale_non_audio_and_invalid_inputs() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            serialize_audio_track_rename(
+                &loaded,
+                TRACK,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                "Vocal",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioTrackRenameSerializationError::TrackMissing)
+        ));
+        assert!(matches!(
+            serialize_audio_track_rename(
+                &loaded,
+                TRACK,
+                "018f47a2-6b2d-7c11-8a44-001122334456",
+                " Vocal ",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioTrackRenameSerializationError::InvalidTrackName)
+        ));
+
+        let mut stale: Value = serde_json::from_slice(TRACK).unwrap();
+        stale["active"] = false.into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_audio_track_rename(
+                &loaded,
+                &stale,
+                "018f47a2-6b2d-7c11-8a44-001122334456",
+                "Vocal",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioTrackRenameSerializationError::SourceTrackMismatch)
+        ));
+
+        let mut non_audio: Value = serde_json::from_slice(TRACK).unwrap();
+        non_audio["kind"] = "midi".into();
+        non_audio["clip_ids"] = json!([]);
+        let non_audio = serde_json_canonicalizer::to_vec(&non_audio).unwrap();
+        let non_audio_tracks: [&[u8]; 1] = [&non_audio];
+        let no_clips: [&[u8]; 0] = [];
+        let non_audio_project = load(
+            input(TIMELINE, &non_audio_tracks, &no_clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_audio_track_rename(
+                &non_audio_project,
+                &non_audio,
+                "018f47a2-6b2d-7c11-8a44-001122334456",
+                "MIDI",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioTrackRenameSerializationError::TrackNotAudio)
         ));
     }
 

@@ -704,6 +704,41 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
             },
         );
     });
+
+    let weak = ui.as_weak();
+    let worker_for_rename = Rc::clone(worker);
+    actions.on_rename_audio_track(move |index, name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text("Audio-track rename is not available in the current state".into());
+            return;
+        }
+        let Ok((_, row)) =
+            validate_mixer_channel(ui.get_app_mode(), index, &ui.get_mixer_channels())
+        else {
+            ui.set_error_text("The selected audio track is no longer available".into());
+            return;
+        };
+        if !row.renameable {
+            ui.set_error_text("Only audio tracks can be renamed in this workflow".into());
+            return;
+        }
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 120 {
+            ui.set_error_text("Audio-track name must contain 1 through 120 characters".into());
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_rename,
+            IdeWorkerCommand::RenameAudioTrack {
+                track_id: row.track_id.to_string(),
+                name: name.to_owned(),
+            },
+        );
+    });
 }
 
 fn bind_loudness_callbacks(ui: &MainWindow, worker: &WorkerCell) {
@@ -1044,6 +1079,9 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 IdeWorkerCommandKind::CreateProject => ui.set_app_mode(AppMode::Creating),
                 IdeWorkerCommandKind::SaveProject => ui.set_app_mode(AppMode::Saving),
                 IdeWorkerCommandKind::AddAudioTrack => ui.set_app_mode(AppMode::AddingTrack),
+                IdeWorkerCommandKind::RenameAudioTrack => {
+                    ui.set_app_mode(AppMode::RenamingTrack);
+                }
                 IdeWorkerCommandKind::StartRecording => {
                     ui.set_app_mode(AppMode::PreparingRecording);
                 }
@@ -1098,6 +1136,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
         IdeWorkerCommandKind::AddAudioTrack => {
             "Saving mixer state, adding the audio track, and reopening project…"
+        }
+        IdeWorkerCommandKind::RenameAudioTrack => {
+            "Preserving mixer state, renaming the audio track, and reopening project…"
         }
         IdeWorkerCommandKind::StartRecording => {
             "Stopping playback and preparing an exclusive monitored capture…"
@@ -1186,6 +1227,9 @@ fn apply_event(
         event @ (IdeWorkerEvent::AudioTrackAdded { .. } | IdeWorkerEvent::AudioTrackAdding) => {
             apply_audio_track_event(ui, &event);
         }
+        event @ (IdeWorkerEvent::AudioTrackRenamed { .. } | IdeWorkerEvent::AudioTrackRenaming) => {
+            apply_audio_track_rename_event(ui, &event);
+        }
         IdeWorkerEvent::RecordingPreparing => {
             ui.set_app_mode(AppMode::PreparingRecording);
             ui.set_transport_state("Stopped for capture".into());
@@ -1246,6 +1290,31 @@ fn apply_audio_track_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_status_text("Waiting for native output before adding the audio track…".into());
         }
         _ => unreachable!("audio-track event dispatcher received another event"),
+    }
+}
+
+fn apply_audio_track_rename_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioTrackRenamed { revision, changed } => {
+            ui.set_rename_track_visible(false);
+            ui.set_rename_track_index(-1);
+            ui.set_rename_track_original_name(SharedString::default());
+            ui.set_rename_track_name(SharedString::default());
+            ui.set_status_text(
+                if *changed {
+                    format!("Audio track renamed in project revision {revision}")
+                } else {
+                    format!("Audio track already had that name in project revision {revision}")
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioTrackRenaming => {
+            ui.set_app_mode(AppMode::RenamingTrack);
+            ui.set_status_text("Waiting for native output before renaming the audio track…".into());
+        }
+        _ => unreachable!("audio-track rename event dispatcher received another event"),
     }
 }
 
@@ -2045,6 +2114,10 @@ fn reset_project(
     ui.set_track_count(0);
     ui.set_new_track_visible(false);
     ui.set_new_track_name("Audio 2".into());
+    ui.set_rename_track_visible(false);
+    ui.set_rename_track_index(-1);
+    ui.set_rename_track_original_name(SharedString::default());
+    ui.set_rename_track_name(SharedString::default());
     ui.set_scenes(ModelRc::default());
     ui.set_mixer_visible(false);
     ui.set_mixer_sends_visible(false);
@@ -2114,6 +2187,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
         IdeWorkerCommandKind::SaveProject if current == AppMode::Saving => AppMode::Running,
         IdeWorkerCommandKind::AddAudioTrack if current == AppMode::AddingTrack => AppMode::Running,
+        IdeWorkerCommandKind::RenameAudioTrack if current == AppMode::RenamingTrack => {
+            AppMode::Running
+        }
         IdeWorkerCommandKind::StartRecording if current == AppMode::PreparingRecording => {
             AppMode::Running
         }
@@ -2348,6 +2424,7 @@ fn mixer_rows(channels: &[IdeMixerChannel]) -> Vec<MixerChannelRow> {
             let state = channel.state();
             MixerChannelRow {
                 index: i32::try_from(index).unwrap_or(-1),
+                track_id: channel.id().into(),
                 name: channel.name().into(),
                 display_name: compact_name(channel.name(), MAX_VISIBLE_MIXER_NAME_CHARS).into(),
                 kind: mixer_kind_name(channel.kind()).into(),
@@ -2357,6 +2434,7 @@ fn mixer_rows(channels: &[IdeMixerChannel]) -> Vec<MixerChannelRow> {
                 muted: state.is_some_and(|state| state.muted),
                 solo: state.is_some_and(|state| state.solo),
                 solo_available: channel.kind() == IdeMixerChannelKind::Audio,
+                renameable: channel.kind() == IdeMixerChannelKind::Audio,
             }
         })
         .collect()
@@ -2423,6 +2501,7 @@ fn set_mixer(ui: &MainWindow, channels: &[IdeMixerChannel]) {
             current.row_data(index).is_some_and(|actual| {
                 let state = expected.state();
                 actual.index == i32::try_from(index).unwrap_or(-1)
+                    && actual.track_id.as_str() == expected.id()
                     && actual.name.as_str() == expected.name()
                     && actual.kind.as_str() == mixer_kind_name(expected.kind())
                     && actual.state_available == state.is_some()
@@ -2433,6 +2512,7 @@ fn set_mixer(ui: &MainWindow, channels: &[IdeMixerChannel]) {
                     && actual.muted == state.is_some_and(|state| state.muted)
                     && actual.solo == state.is_some_and(|state| state.solo)
                     && actual.solo_available == (expected.kind() == IdeMixerChannelKind::Audio)
+                    && actual.renameable == (expected.kind() == IdeMixerChannelKind::Audio)
             })
         });
     if !unchanged {
@@ -2843,6 +2923,7 @@ mod tests {
     fn mixer_controls_require_current_observed_rows_and_bounded_values() {
         let channels = ModelRc::from(Rc::new(VecModel::from(vec![MixerChannelRow {
             index: 0,
+            track_id: "018f47a2-6b2d-7c11-8a44-001122334456".into(),
             name: "Audio channel".into(),
             display_name: "Audio".into(),
             kind: "AUDIO".into(),
@@ -2852,6 +2933,7 @@ mod tests {
             muted: false,
             solo: false,
             solo_available: true,
+            renameable: true,
         }])));
         assert!(validate_mixer_channel(AppMode::Running, 0, &channels).is_ok());
         assert_eq!(
@@ -2965,6 +3047,13 @@ mod tests {
         );
         assert_eq!(
             mode_after_failure(AppMode::AddingTrack, IdeWorkerCommandKind::AddAudioTrack,),
+            AppMode::Running
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::RenamingTrack,
+                IdeWorkerCommandKind::RenameAudioTrack,
+            ),
             AppMode::Running
         );
         assert_eq!(
