@@ -85,6 +85,9 @@ export global IdeActions {
     callback transport-return-start();
     callback transport-seek(float);
     callback locate-placement(int);
+    callback loudness-run();
+    callback loudness-standby();
+    callback loudness-reset();
     callback launch-scene(int);
     callback mixer-channel-gain(int, float);
     callback mixer-channel-pan(int, float);
@@ -152,6 +155,26 @@ component Meter inherits Rectangle {
     }
 }
 
+component LoudnessCard inherits Rectangle {
+    in property <string> label;
+    in property <string> value: "—";
+    in property <string> detail;
+    in property <bool> primary: false;
+
+    background: root.primary ? #102536 : #0e141b;
+    border-color: root.primary ? #37769a : #27313d;
+    border-width: 1px;
+    border-radius: 6px;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 4px;
+        Text { text: root.label; color: #65758a; font-size: 9px; font-weight: 700; letter-spacing: 0.6px; }
+        Text { text: root.value; color: root.primary ? #edf2f8 : #dce5ef; font-size: root.primary ? 23px : 18px; font-weight: 600; overflow: elide; }
+        Text { text: root.detail; color: #8290a2; font-size: 9px; overflow: elide; }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "Hyper Module — Desktop IDE";
     width: 1180px;
@@ -181,6 +204,22 @@ export component MainWindow inherits Window {
     in-out property <bool> mixer-sends-visible: false;
     in-out property <bool> takes-visible: false;
     in-out property <bool> arrangement-visible: false;
+    in-out property <bool> loudness-visible: false;
+    in-out property <bool> loudness-wide-scale: false;
+    in-out property <bool> loudness-relative: false;
+    in-out property <bool> loudness-reset-confirming: false;
+    in property <bool> loudness-available: false;
+    in property <string> loudness-scale-name: "EBU +9";
+    in property <string> loudness-state: "UNAVAILABLE";
+    in property <string> loudness-momentary: "— LUFS";
+    in property <string> loudness-short-term: "— LUFS";
+    in property <string> loudness-integrated: "— LUFS";
+    in property <string> loudness-maximum-momentary: "— LUFS";
+    in property <string> loudness-maximum-short-term: "— LUFS";
+    in property <string> loudness-range: "— LU";
+    in property <string> loudness-maximum-true-peak: "— dBTP";
+    in property <string> loudness-programme-time: "00:00:00.000";
+    in property <string> loudness-lra-status: "Waiting for final-output meter evidence";
     in property <[MixerChannelRow]> mixer-channels: [];
     in property <[MixerSendRow]> mixer-sends: [];
     in property <bool> mixer-main-state-available: false;
@@ -434,7 +473,7 @@ export component MainWindow inherits Window {
                 vertical-stretch: 1;
                 background: transparent;
 
-                if !root.mixer-visible && !root.takes-visible && !root.arrangement-visible : Panel {
+                if !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -451,17 +490,22 @@ export component MainWindow inherits Window {
                         Button {
                             text: "Arrangement (" + root.arrangement-placements.length + ")";
                             enabled: root.app-mode == AppMode.running;
-                            clicked => { root.arrangement-visible = true; }
+                            clicked => { root.loudness-visible = false; root.arrangement-visible = true; }
+                        }
+                        Button {
+                            text: "Loudness";
+                            enabled: root.app-mode == AppMode.running;
+                            clicked => { root.arrangement-visible = false; root.loudness-visible = true; }
                         }
                         Button {
                             text: "Takes (" + root.recording-takes.length + ")";
                             enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing;
-                            clicked => { root.arrangement-visible = false; root.takes-visible = true; }
+                            clicked => { root.arrangement-visible = false; root.loudness-visible = false; root.takes-visible = true; }
                         }
                         Button {
                             text: "Mixer";
                             enabled: root.app-mode == AppMode.running;
-                            clicked => { root.arrangement-visible = false; root.mixer-visible = true; }
+                            clicked => { root.arrangement-visible = false; root.loudness-visible = false; root.mixer-visible = true; }
                         }
                         Text { text: root.stream-state; color: #8fa0b4; font-size: 12px; vertical-alignment: center; }
                     }
@@ -594,7 +638,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible : Panel {
+                if root.mixer-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -696,7 +740,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible : Panel {
+                if root.mixer-visible && root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -761,7 +805,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.takes-visible && !root.arrangement-visible : Panel {
+                if root.takes-visible && !root.arrangement-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -884,7 +928,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.arrangement-visible : Panel {
+                if root.arrangement-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -985,6 +1029,127 @@ export component MainWindow inherits Window {
                             text: "Navigation only: placement editing, trimming, dragging, and waveform claims are not implemented.";
                             color: #65758a;
                             font-size: 9px;
+                        }
+                    }
+                }
+
+                if root.loudness-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 10px;
+
+                        HorizontalLayout {
+                            height: 48px;
+                            VerticalLayout {
+                                Text { text: "LIVE LOUDNESS"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                                Text { text: "Final stereo output · programme " + root.loudness-programme-time; color: #aebccc; font-size: 12px; }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Text {
+                                width: 82px;
+                                text: root.loudness-state;
+                                color: root.loudness-state == "RUNNING" ? #63e6b5 : root.loudness-state == "STANDBY" ? #f5b83d : #8fa0b4;
+                                font-size: 10px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            Button {
+                                text: "Performance";
+                                clicked => { root.loudness-reset-confirming = false; root.loudness-visible = false; root.arrangement-visible = false; root.mixer-visible = false; root.mixer-sends-visible = false; root.takes-visible = false; }
+                            }
+                            Button {
+                                text: "Mixer";
+                                enabled: root.app-mode == AppMode.running;
+                                clicked => { root.loudness-reset-confirming = false; root.loudness-visible = false; root.arrangement-visible = false; root.mixer-visible = true; root.mixer-sends-visible = false; root.takes-visible = false; }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: #27313d; }
+
+                        HorizontalLayout {
+                            height: 34px;
+                            spacing: 6px;
+                            Text { width: 104px; text: "PRESENTATION"; color: #65758a; font-size: 9px; font-weight: 700; vertical-alignment: center; }
+                            Button {
+                                text: root.loudness-wide-scale ? "EBU +9" : "✓ EBU +9";
+                                clicked => { root.loudness-wide-scale = false; }
+                            }
+                            Button {
+                                text: root.loudness-wide-scale ? "✓ EBU +18" : "EBU +18";
+                                clicked => { root.loudness-wide-scale = true; }
+                            }
+                            Button {
+                                text: root.loudness-relative ? "LUFS" : "✓ LUFS";
+                                clicked => { root.loudness-relative = false; }
+                            }
+                            Button {
+                                text: root.loudness-relative ? "✓ LU" : "LU";
+                                clicked => { root.loudness-relative = true; }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Text { text: root.loudness-scale-name; color: #8290a2; font-size: 10px; vertical-alignment: center; }
+                        }
+
+                        GridLayout {
+                            spacing: 8px;
+                            LoudnessCard { row: 0; col: 0; height: 128px; label: "M · MOMENTARY"; value: root.loudness-momentary; detail: "400 ms · live in run and standby"; }
+                            LoudnessCard { row: 0; col: 1; height: 128px; label: "S · SHORT-TERM"; value: root.loudness-short-term; detail: "3 s · live in run and standby"; }
+                            LoudnessCard { row: 0; col: 2; height: 128px; label: "I · INTEGRATED"; value: root.loudness-integrated; detail: "Gated programme measurement"; primary: true; }
+                        }
+
+                        GridLayout {
+                            spacing: 8px;
+                            LoudnessCard { row: 0; col: 0; height: 96px; label: "MAX M"; value: root.loudness-maximum-momentary; detail: "Since reset"; }
+                            LoudnessCard { row: 0; col: 1; height: 96px; label: "MAX S"; value: root.loudness-maximum-short-term; detail: "Since reset"; }
+                            LoudnessCard { row: 0; col: 2; height: 96px; label: "LOUDNESS RANGE"; value: root.loudness-range; detail: root.loudness-lra-status; }
+                            LoudnessCard { row: 0; col: 3; height: 96px; label: "MAX TRUE PEAK"; value: root.loudness-maximum-true-peak; detail: "Final output · since reset"; }
+                        }
+
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+
+                        if !root.loudness-reset-confirming : HorizontalLayout {
+                            height: 42px;
+                            spacing: 8px;
+                            Text { width: 104px; text: "MEASUREMENT"; color: #65758a; font-size: 9px; font-weight: 700; vertical-alignment: center; }
+                            Button {
+                                text: "Run";
+                                enabled: root.app-mode == AppMode.running && root.loudness-available && root.loudness-state != "RUNNING";
+                                clicked => { IdeActions.loudness-run(); }
+                            }
+                            Button {
+                                text: "Standby";
+                                enabled: root.app-mode == AppMode.running && root.loudness-available && root.loudness-state != "STANDBY";
+                                clicked => { IdeActions.loudness-standby(); }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: "Reset measurement";
+                                enabled: root.app-mode == AppMode.running && root.loudness-available;
+                                clicked => { root.loudness-reset-confirming = true; }
+                            }
+                        }
+
+                        if root.loudness-reset-confirming : HorizontalLayout {
+                            height: 42px;
+                            spacing: 8px;
+                            Text { horizontal-stretch: 1; text: "Reset I, LRA, maximum M/S and maximum true peak?"; color: #ffbf9b; font-size: 11px; vertical-alignment: center; }
+                            Button { text: "Cancel"; clicked => { root.loudness-reset-confirming = false; } }
+                            Button {
+                                text: "Confirm reset";
+                                enabled: root.app-mode == AppMode.running && root.loudness-available;
+                                clicked => { IdeActions.loudness-reset(); }
+                            }
+                        }
+
+                        Text {
+                            height: 26px;
+                            text: "Measurement only · standby keeps M/S live · no normalization, limiting, or certified EBU Mode claim.";
+                            color: #65758a;
+                            font-size: 9px;
+                            wrap: word-wrap;
                         }
                     }
                 }

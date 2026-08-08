@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyper_audio_engine::{LinearGain, Pan, ParameterError};
+pub use hyper_audio_engine::LoudnessMeasurementState as IdeLoudnessMeasurementState;
+use hyper_audio_engine::{LinearGain, LoudnessMeasurementCommand, Pan, ParameterError};
 use hyper_audio_source::{DecodeError, DecodeLimits};
 use hyper_desktop_audio::{
     CaptureStreamSnapshot, DesktopAudioPreviewCommandError, DesktopAudioPreviewControlError,
@@ -25,11 +26,19 @@ pub use hyper_desktop_audio::{
     DesktopAudioPreviewState, DesktopSceneAvailability as IdeSceneAvailability,
 };
 use hyper_media_cache::CacheLimits;
-use hyper_mixer_runtime::{
-    LatestOutputMeterSnapshot, MixerParameterCommand, MixerParameterResolveError,
-    PlaybackRecoverySnapshot,
+pub use hyper_mixer_runtime::{
+    EbuLoudnessPresentationConfig as IdeLoudnessPresentationConfig,
+    EbuLoudnessScale as IdeLoudnessScale, LocateState,
+    LoudnessDisplayUnit as IdeLoudnessDisplayUnit,
+    LoudnessPresentationSnapshot as IdeLoudnessPresentationSnapshot,
+    LoudnessScaleRegion as IdeLoudnessScaleRegion,
+    MaximumTruePeakDisplay as IdeMaximumTruePeakDisplay, PlaybackRecoveryTransportState,
+    ScaledLoudnessValue as IdeScaledLoudnessValue, TransportCommand,
 };
-pub use hyper_mixer_runtime::{LocateState, PlaybackRecoveryTransportState, TransportCommand};
+use hyper_mixer_runtime::{
+    LatestOutputMeterSnapshot, LoudnessCommandSendError, MixerParameterCommand,
+    MixerParameterResolveError, PlaybackRecoverySnapshot,
+};
 #[cfg(test)]
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
 use hyper_playback_json::{
@@ -1172,6 +1181,47 @@ pub enum IdeArrangementLocateError {
     Send(DesktopDirectControlError),
 }
 
+/// Programme-loudness controls applied at the next audio process boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeLoudnessCommand {
+    Run,
+    Standby,
+    Reset,
+}
+
+impl IdeLoudnessCommand {
+    const fn runtime(self) -> LoudnessMeasurementCommand {
+        match self {
+            Self::Run => LoudnessMeasurementCommand::SetState(IdeLoudnessMeasurementState::Running),
+            Self::Standby => {
+                LoudnessMeasurementCommand::SetState(IdeLoudnessMeasurementState::Standby)
+            }
+            Self::Reset => LoudnessMeasurementCommand::Reset,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeLoudnessCommandError {
+    Send(LoudnessCommandSendError),
+}
+
+impl fmt::Display for IdeLoudnessCommandError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeLoudnessCommandError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Send(source) => Some(source),
+        }
+    }
+}
+
 impl fmt::Display for IdeArrangementLocateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1508,6 +1558,7 @@ enum IdePlaybackSessionOwner {
 #[derive(Debug)]
 struct TestPlaybackSession {
     commands: Vec<TransportCommand>,
+    loudness_commands: Vec<IdeLoudnessCommand>,
     mixer_commands: Vec<IdeMixerCommand>,
     meters: OutputMeterReceiver,
     close_failure: Option<IdeNativeCloseFailure>,
@@ -1525,6 +1576,7 @@ impl Default for TestPlaybackSession {
     fn default() -> Self {
         Self {
             commands: Vec::new(),
+            loudness_commands: Vec::new(),
             mixer_commands: Vec::new(),
             meters: output_meter_channel().1,
             close_failure: None,
@@ -1812,6 +1864,30 @@ impl RunningDesktopIdeApplication {
             #[cfg(test)]
             IdePlaybackSessionOwner::Test(session) => {
                 session.commands.push(command);
+                Ok(())
+            }
+        }
+    }
+
+    /// Sends one bounded programme-loudness command through the live output
+    /// owner. Momentary and short-term measurement remain live in standby;
+    /// reset clears programme and maximum measurements together.
+    ///
+    /// # Errors
+    ///
+    /// Returns queue saturation or disconnection without changing UI state.
+    pub fn try_send_loudness(
+        &mut self,
+        command: IdeLoudnessCommand,
+    ) -> Result<(), IdeLoudnessCommandError> {
+        match &mut self.session {
+            IdePlaybackSessionOwner::Native(session) => session
+                .loudness_command_sender()
+                .try_send(command.runtime())
+                .map_err(IdeLoudnessCommandError::Send),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => {
+                session.loudness_commands.push(command);
                 Ok(())
             }
         }
@@ -2877,6 +2953,49 @@ mod tests {
                 frame: 480,
                 state: LocateState::Preserve,
             }]
+        );
+    }
+
+    #[test]
+    fn loudness_controls_preserve_typed_run_standby_and_reset_order() {
+        assert_eq!(
+            IdeLoudnessCommand::Run.runtime(),
+            LoudnessMeasurementCommand::SetState(IdeLoudnessMeasurementState::Running)
+        );
+        assert_eq!(
+            IdeLoudnessCommand::Standby.runtime(),
+            LoudnessMeasurementCommand::SetState(IdeLoudnessMeasurementState::Standby)
+        );
+        assert_eq!(
+            IdeLoudnessCommand::Reset.runtime(),
+            LoudnessMeasurementCommand::Reset
+        );
+
+        let application = DesktopIdeApplication::from_inventory(
+            config(256).unwrap(),
+            IdeAudioOutputInventory::default(),
+        );
+        let mut running = RunningDesktopIdeApplication {
+            application,
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        for command in [
+            IdeLoudnessCommand::Standby,
+            IdeLoudnessCommand::Reset,
+            IdeLoudnessCommand::Run,
+        ] {
+            running.try_send_loudness(command).unwrap();
+        }
+        let IdePlaybackSessionOwner::Test(session) = &running.session else {
+            unreachable!("test constructed the deterministic session owner");
+        };
+        assert_eq!(
+            session.loudness_commands,
+            [
+                IdeLoudnessCommand::Standby,
+                IdeLoudnessCommand::Reset,
+                IdeLoudnessCommand::Run,
+            ]
         );
     }
 

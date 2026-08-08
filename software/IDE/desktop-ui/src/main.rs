@@ -10,14 +10,16 @@ use std::time::Duration;
 
 use hyper_desktop_ide::{
     DesktopAudioPreviewState, DesktopIdeWorker, IdeApplicationConfig, IdeAudioInputInventory,
-    IdeAudioOutputInventory, IdeAudioPreviewControlCommand, IdeInputSelection, IdeMixerChannel,
+    IdeAudioOutputInventory, IdeAudioPreviewControlCommand, IdeInputSelection, IdeLoudnessCommand,
+    IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState, IdeLoudnessPresentationConfig,
+    IdeLoudnessScale, IdeLoudnessScaleRegion, IdeMaximumTruePeakDisplay, IdeMixerChannel,
     IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap, IdeMonitoringCommand,
     IdeNativeCloseFailure, IdeOutputSelection, IdePlaybackArrangement, IdePlaybackExtent,
     IdeRecordingAbortOutcome, IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake,
-    IdeRunningObservation, IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind,
-    IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
-    IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState, TransportCommand,
-    desktop_ide_application_config,
+    IdeRunningObservation, IdeScaledLoudnessValue, IdeScene, IdeSceneAvailability,
+    IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait,
+    IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState,
+    PlaybackRecoveryTransportState, TransportCommand, desktop_ide_application_config,
 };
 use slint::platform::PlatformError;
 use slint::{
@@ -528,6 +530,7 @@ fn bind_playback_callbacks(
     });
 
     bind_arrangement_callback(ui, worker, project_state);
+    bind_loudness_callbacks(ui, worker);
 
     let weak = ui.as_weak();
     let worker_for_scene = Rc::clone(worker);
@@ -569,6 +572,49 @@ fn bind_playback_callbacks(
     });
 
     bind_mixer_callbacks(ui, worker);
+}
+
+fn bind_loudness_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+
+    let weak = ui.as_weak();
+    let worker_for_run = Rc::clone(worker);
+    actions.on_loudness_run(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        submit_to_ui(
+            &ui,
+            &worker_for_run,
+            IdeWorkerCommand::Loudness(IdeLoudnessCommand::Run),
+        );
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_standby = Rc::clone(worker);
+    actions.on_loudness_standby(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        submit_to_ui(
+            &ui,
+            &worker_for_standby,
+            IdeWorkerCommand::Loudness(IdeLoudnessCommand::Standby),
+        );
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_reset = Rc::clone(worker);
+    actions.on_loudness_reset(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        submit_to_ui(
+            &ui,
+            &worker_for_reset,
+            IdeWorkerCommand::Loudness(IdeLoudnessCommand::Reset),
+        );
+    });
 }
 
 fn bind_mixer_callbacks(ui: &MainWindow, worker: &WorkerCell) {
@@ -902,6 +948,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::Transport => "Transport command queued…",
         IdeWorkerCommandKind::Seek => "Bounded transport locate queued…",
         IdeWorkerCommandKind::LocatePlacement => "Arrangement placement locate queued…",
+        IdeWorkerCommandKind::Loudness => "Loudness measurement command queued…",
         IdeWorkerCommandKind::Mixer => "Mixer command queued…",
         IdeWorkerCommandKind::Monitoring => "Applying input cue control…",
         IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
@@ -975,6 +1022,7 @@ fn apply_event(
             );
             ui.set_error_text(SharedString::default());
         }
+        IdeWorkerEvent::LoudnessQueued(command) => apply_loudness_queued(ui, command),
         IdeWorkerEvent::MixerQueued(_) => {
             ui.set_status_text("Mixer base command queued for the audio runtime".into());
             ui.set_error_text(SharedString::default());
@@ -1024,6 +1072,21 @@ fn apply_event(
             ui.set_error_text(format!("{}: {reason}", command_status(command)).into());
         }
     }
+}
+
+fn apply_loudness_queued(ui: &MainWindow, command: IdeLoudnessCommand) {
+    ui.set_status_text(
+        match command {
+            IdeLoudnessCommand::Run => "Programme loudness resume queued",
+            IdeLoudnessCommand::Standby => "Programme loudness standby queued",
+            IdeLoudnessCommand::Reset => "Programme loudness reset queued",
+        }
+        .into(),
+    );
+    if command == IdeLoudnessCommand::Reset {
+        ui.set_loudness_reset_confirming(false);
+    }
+    ui.set_error_text(SharedString::default());
 }
 
 fn apply_audio_preview_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -1152,19 +1215,7 @@ fn apply_running_event(
         }
         .into(),
     );
-    let (left_level, left_reading, right_level, right_reading) = observation
-        .meter()
-        .snapshot()
-        .map_or((0.0, "—".to_owned(), 0.0, "—".to_owned()), |snapshot| {
-            let meter = snapshot.meter();
-            let (left_level, left_reading) = meter_presentation(meter.left().sample_peak());
-            let (right_level, right_reading) = meter_presentation(meter.right().sample_peak());
-            (left_level, left_reading, right_level, right_reading)
-        });
-    ui.set_left_meter(left_level);
-    ui.set_right_meter(right_level);
-    ui.set_left_reading(left_reading.into());
-    ui.set_right_reading(right_reading.into());
+    apply_output_meter_observation(ui, observation);
     match observation.preview().state() {
         DesktopAudioPreviewState::Starting
         | DesktopAudioPreviewState::Playing
@@ -1189,6 +1240,127 @@ fn apply_running_event(
             ui.set_error_text(SharedString::default());
         }
     }
+}
+
+fn apply_output_meter_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
+    let (left_level, left_reading, right_level, right_reading) = observation
+        .meter()
+        .snapshot()
+        .map_or((0.0, "—".to_owned(), 0.0, "—".to_owned()), |snapshot| {
+            let meter = snapshot.meter();
+            let (left_level, left_reading) = meter_presentation(meter.left().sample_peak());
+            let (right_level, right_reading) = meter_presentation(meter.right().sample_peak());
+            (left_level, left_reading, right_level, right_reading)
+        });
+    ui.set_left_meter(left_level);
+    ui.set_right_meter(right_level);
+    ui.set_left_reading(left_reading.into());
+    ui.set_right_reading(right_reading.into());
+    apply_loudness_observation(ui, observation);
+}
+
+fn apply_loudness_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
+    let config = IdeLoudnessPresentationConfig::new(
+        if ui.get_loudness_wide_scale() {
+            IdeLoudnessScale::Plus18
+        } else {
+            IdeLoudnessScale::Plus9
+        },
+        if ui.get_loudness_relative() {
+            IdeLoudnessDisplayUnit::RelativeLu
+        } else {
+            IdeLoudnessDisplayUnit::AbsoluteLufs
+        },
+    );
+    ui.set_loudness_scale_name(config.scale().name().into());
+    let Some(presentation) = observation.loudness(config) else {
+        reset_loudness_observation(ui);
+        return;
+    };
+    let unit = config.unit().symbol();
+    ui.set_loudness_available(true);
+    ui.set_loudness_state(
+        match presentation.state() {
+            IdeLoudnessMeasurementState::Running => "RUNNING",
+            IdeLoudnessMeasurementState::Standby => "STANDBY",
+        }
+        .into(),
+    );
+    ui.set_loudness_momentary(format_loudness(presentation.momentary(), unit).into());
+    ui.set_loudness_short_term(format_loudness(presentation.short_term(), unit).into());
+    ui.set_loudness_integrated(format_loudness(presentation.integrated(), unit).into());
+    ui.set_loudness_maximum_momentary(
+        format_loudness(presentation.maximum_momentary(), unit).into(),
+    );
+    ui.set_loudness_maximum_short_term(
+        format_loudness(presentation.maximum_short_term(), unit).into(),
+    );
+    ui.set_loudness_range(
+        presentation
+            .loudness_range_lu()
+            .map_or_else(|| "— LU".to_owned(), |value| format!("{value:.1} LU"))
+            .into(),
+    );
+    ui.set_loudness_maximum_true_peak(
+        format_maximum_true_peak(presentation.maximum_true_peak()).into(),
+    );
+    let programme_time = format_transport_clock(
+        presentation.programme_frame_count(),
+        observation.sample_rate_hz(),
+    );
+    ui.set_loudness_programme_time(programme_time.clone().into());
+    ui.set_loudness_lra_status(
+        if presentation.lra_stable() {
+            "Stable (60 s programme minimum)".to_owned()
+        } else {
+            format!("Stabilizing · {programme_time} / 00:01:00.000")
+        }
+        .into(),
+    );
+}
+
+fn reset_loudness_observation(ui: &MainWindow) {
+    let loudness_unit = if ui.get_loudness_relative() {
+        "LU"
+    } else {
+        "LUFS"
+    };
+    ui.set_loudness_available(false);
+    ui.set_loudness_state("UNAVAILABLE".into());
+    ui.set_loudness_momentary(format!("— {loudness_unit}").into());
+    ui.set_loudness_short_term(format!("— {loudness_unit}").into());
+    ui.set_loudness_integrated(format!("— {loudness_unit}").into());
+    ui.set_loudness_maximum_momentary(format!("— {loudness_unit}").into());
+    ui.set_loudness_maximum_short_term(format!("— {loudness_unit}").into());
+    ui.set_loudness_range("— LU".into());
+    ui.set_loudness_maximum_true_peak("— dBTP".into());
+    ui.set_loudness_programme_time("00:00:00.000".into());
+    ui.set_loudness_lra_status("Waiting for final-output meter evidence".into());
+}
+
+fn format_loudness(value: Option<IdeScaledLoudnessValue>, unit: &str) -> String {
+    value.map_or_else(
+        || format!("— {unit}"),
+        |value| {
+            let bound = match value.region() {
+                IdeLoudnessScaleRegion::Below => "<",
+                IdeLoudnessScaleRegion::OnScale => "",
+                IdeLoudnessScaleRegion::Above => ">",
+            };
+            format!("{bound}{:.1} {unit}", value.displayed())
+        },
+    )
+}
+
+fn format_maximum_true_peak(value: Option<IdeMaximumTruePeakDisplay>) -> String {
+    value.map_or_else(
+        || "— dBTP".to_owned(),
+        |value| {
+            value
+                .displayed_dbtp()
+                .map_or_else(|| "−∞ dBTP".to_owned(), |dbtp| format!("{dbtp:.1} dBTP"))
+        },
+    )
 }
 
 fn set_recording_takes(
@@ -1629,6 +1801,8 @@ fn reset_project(
     ui.set_recording_takes(ModelRc::default());
     ui.set_takes_visible(false);
     ui.set_arrangement_visible(false);
+    ui.set_loudness_visible(false);
+    ui.set_loudness_reset_confirming(false);
     ui.set_arrangement_placements(ModelRc::default());
     ui.set_arrangement_span_clock("—".into());
     ui.set_preview_active(false);
@@ -1653,6 +1827,7 @@ fn reset_project(
     ui.set_right_meter(0.0);
     ui.set_left_reading("—".into());
     ui.set_right_reading("—".into());
+    reset_loudness_observation(ui);
 }
 
 fn reset_monitoring(ui: &MainWindow) {
@@ -2250,6 +2425,13 @@ mod tests {
         assert_eq!(meter_presentation(Some(0.0)), (0.0, "-60.0 dB".to_owned()));
         assert_eq!(meter_presentation(Some(1.0)), (1.0, "0.0 dB".to_owned()));
         assert!((meter_presentation(Some(2.0)).0 - 1.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn unavailable_loudness_values_retain_their_units() {
+        assert_eq!(format_loudness(None, "LUFS"), "— LUFS");
+        assert_eq!(format_loudness(None, "LU"), "— LU");
+        assert_eq!(format_maximum_true_peak(None), "— dBTP");
     }
 
     #[test]

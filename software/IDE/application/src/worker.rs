@@ -20,14 +20,15 @@ use super::{
     DesktopPlaybackRecovery, IdeApplicationConfig, IdeArrangementLocateError,
     IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
     IdeAudioPreviewError, IdeCloseOutcome, IdeInputDiscoveryError, IdeInputSelection,
-    IdeInputSelectionError, IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand,
-    IdeMixerCommandError, IdeMixerMainState, IdeMonitoringCommand, IdeMonitoringCommandError,
-    IdeMonitoringState, IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection,
-    IdeOutputSelectionError, IdePendingCloseWait, IdePendingSaveCloseWait, IdeProjectOpenError,
-    IdeProjectSaveError, IdeRecordingAbortError, IdeRecordingAbortOutcome, IdeRecordingError,
-    IdeRecordingImportOutcome, IdeRecordingObservation, IdeSaveCloseOutcome, IdeSceneAvailability,
-    IdeTransportSeekError, InputInventoryError, LocateState, OutputInventoryError,
-    OutputStreamSnapshot, OutputStreamState, RunningDesktopIdeApplication,
+    IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError, IdeMixerChannelKind,
+    IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError, IdeMixerMainState,
+    IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure,
+    IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError, IdePendingCloseWait,
+    IdePendingSaveCloseWait, IdeProjectOpenError, IdeProjectSaveError, IdeRecordingAbortError,
+    IdeRecordingAbortOutcome, IdeRecordingError, IdeRecordingImportOutcome,
+    IdeRecordingObservation, IdeSaveCloseOutcome, IdeSceneAvailability, IdeTransportSeekError,
+    InputInventoryError, LocateState, OutputInventoryError, OutputStreamSnapshot,
+    OutputStreamState, RunningDesktopIdeApplication,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -104,6 +105,7 @@ pub enum IdeWorkerCommandKind {
     Transport,
     Seek,
     LocatePlacement,
+    Loudness,
     Mixer,
     Monitoring,
     SaveProject,
@@ -138,6 +140,7 @@ pub enum IdeWorkerCommand {
         index: usize,
         placement_id: String,
     },
+    Loudness(IdeLoudnessCommand),
     Mixer(IdeMixerCommand),
     Monitoring(IdeMonitoringCommand),
     SaveProject,
@@ -172,6 +175,7 @@ impl IdeWorkerCommand {
             Self::Transport(_) => IdeWorkerCommandKind::Transport,
             Self::Seek { .. } => IdeWorkerCommandKind::Seek,
             Self::LocatePlacement { .. } => IdeWorkerCommandKind::LocatePlacement,
+            Self::Loudness(_) => IdeWorkerCommandKind::Loudness,
             Self::Mixer(_) => IdeWorkerCommandKind::Mixer,
             Self::Monitoring(_) => IdeWorkerCommandKind::Monitoring,
             Self::SaveProject => IdeWorkerCommandKind::SaveProject,
@@ -582,6 +586,18 @@ impl IdeRunningObservation {
     pub const fn meter(&self) -> LatestOutputMeterSnapshot {
         self.meter
     }
+
+    /// Derives one display-ready loudness snapshot from the same newest meter
+    /// observation used by the sample-peak UI.
+    #[must_use]
+    pub fn loudness(
+        &self,
+        config: super::IdeLoudnessPresentationConfig,
+    ) -> Option<super::IdeLoudnessPresentationSnapshot> {
+        self.meter
+            .snapshot()
+            .map(|snapshot| snapshot.present_loudness(config))
+    }
 }
 
 #[derive(Debug)]
@@ -594,6 +610,7 @@ pub enum IdeWorkerCommandFailure {
     Transport(super::DesktopDirectControlError),
     Seek(IdeTransportSeekError),
     ArrangementLocate(IdeArrangementLocateError),
+    Loudness(IdeLoudnessCommandError),
     Mixer(IdeMixerCommandError),
     Monitoring(IdeMonitoringCommandError),
     ProjectSave(IdeProjectSaveError),
@@ -617,6 +634,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::Transport(source) => source.fmt(formatter),
             Self::Seek(source) => source.fmt(formatter),
             Self::ArrangementLocate(source) => source.fmt(formatter),
+            Self::Loudness(source) => source.fmt(formatter),
             Self::Mixer(source) => source.fmt(formatter),
             Self::Monitoring(source) => source.fmt(formatter),
             Self::ProjectSave(source) => source.fmt(formatter),
@@ -648,6 +666,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::Transport(source) => Some(source),
             Self::Seek(source) => Some(source),
             Self::ArrangementLocate(source) => Some(source),
+            Self::Loudness(source) => Some(source),
             Self::Mixer(source) => Some(source),
             Self::Monitoring(source) => Some(source),
             Self::ProjectSave(source) => Some(source),
@@ -675,6 +694,7 @@ pub enum IdeWorkerEvent {
     },
     Running(IdeRunningObservation),
     TransportQueued(TransportCommand),
+    LoudnessQueued(IdeLoudnessCommand),
     MixerQueued(IdeMixerCommand),
     MonitoringApplied(IdeMonitoringCommand),
     ProjectSaved {
@@ -1199,6 +1219,7 @@ fn process_command(
             index,
             placement_id,
         } => process_arrangement_locate_command(state, &project_id, index, &placement_id, events),
+        IdeWorkerCommand::Loudness(command) => process_loudness_command(state, command, events),
         IdeWorkerCommand::Mixer(command) => match state {
             WorkerState::Running(application) => match application.try_send_mixer(command) {
                 Ok(()) => send_event(events, IdeWorkerEvent::MixerQueued(command)),
@@ -1335,6 +1356,37 @@ fn process_arrangement_locate_command(
         _ => publish_failure(
             events,
             IdeWorkerCommandKind::LocatePlacement,
+            IdeWorkerCommandFailure::InvalidState,
+        ),
+    }
+}
+
+fn process_loudness_command(
+    state: &mut WorkerState,
+    command: IdeLoudnessCommand,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    match state {
+        WorkerState::Running(application) if application.audio_preview_is_active() => {
+            publish_failure(
+                events,
+                IdeWorkerCommandKind::Loudness,
+                IdeWorkerCommandFailure::AudioPreview(IdeAudioPreviewError::Command(
+                    hyper_desktop_audio::DesktopAudioPreviewCommandError::PreviewBusy,
+                )),
+            )
+        }
+        WorkerState::Running(application) => match application.try_send_loudness(command) {
+            Ok(()) => send_event(events, IdeWorkerEvent::LoudnessQueued(command)),
+            Err(reason) => publish_failure(
+                events,
+                IdeWorkerCommandKind::Loudness,
+                IdeWorkerCommandFailure::Loudness(reason),
+            ),
+        },
+        _ => publish_failure(
+            events,
+            IdeWorkerCommandKind::Loudness,
             IdeWorkerCommandFailure::InvalidState,
         ),
     }
@@ -2924,6 +2976,37 @@ mod tests {
                 state: LocateState::Preserve,
             })
         ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn running_worker_queues_typed_loudness_controls_in_order() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 3, 3).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        for command in [
+            IdeLoudnessCommand::Standby,
+            IdeLoudnessCommand::Reset,
+            IdeLoudnessCommand::Run,
+        ] {
+            worker
+                .try_send(IdeWorkerCommand::Loudness(command))
+                .unwrap();
+            assert!(matches!(
+                recv(&worker),
+                IdeWorkerEvent::LoudnessQueued(actual) if actual == command
+            ));
+        }
         assert_eq!(shutdown_report(worker).native_failure(), None);
     }
 
