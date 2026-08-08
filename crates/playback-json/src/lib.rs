@@ -12,7 +12,7 @@ pub use automation::{
 
 use core::error::Error;
 use core::fmt;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use hyper_audio_engine::{ChannelParameters, LinearGain, Pan};
 use hyper_playback_compiler::graph::{
@@ -253,6 +253,7 @@ struct LoadedTrack {
 #[derive(Clone, Debug)]
 struct LoadedClip {
     id: String,
+    name: String,
     track_id: String,
     asset_id: String,
     enabled: bool,
@@ -1230,6 +1231,20 @@ impl LoadedPlaybackProject {
         self.clips.len()
     }
 
+    /// Returns a validated audio-clip name by canonical project order.
+    #[must_use]
+    pub fn clip_name_at(&self, clip_index: usize) -> Option<&str> {
+        self.clips.get(clip_index).map(|clip| clip.name.as_str())
+    }
+
+    /// Returns a validated structural-track name by canonical project order.
+    #[must_use]
+    pub fn track_name_at(&self, track_index: usize) -> Option<&str> {
+        self.tracks
+            .get(track_index)
+            .map(|track| track.name.as_str())
+    }
+
     #[must_use]
     pub fn scene_count(&self) -> usize {
         self.scenes.len()
@@ -1346,7 +1361,9 @@ impl LoadedPlaybackProject {
 pub struct OwnedScheduleEntry {
     pub placement_id: String,
     pub track_id: String,
+    pub track_index: usize,
     pub clip_id: String,
+    pub clip_index: usize,
     pub asset_id: String,
     pub compiled: CompiledPlacement,
 }
@@ -1376,6 +1393,11 @@ impl OwnedCompiledSchedule {
             .max()
             .unwrap_or(0)
     }
+
+    #[must_use]
+    pub fn into_entries(self) -> Vec<OwnedScheduleEntry> {
+        self.entries
+    }
 }
 
 #[derive(Debug)]
@@ -1401,6 +1423,11 @@ impl<'project> CompiledPlaybackGraph<'project> {
     #[must_use]
     pub const fn scene_authority(&self) -> &CompiledScenePerformance<'project> {
         &self.scene_authority
+    }
+
+    #[must_use]
+    pub fn into_arrangement(self) -> OwnedCompiledSchedule {
+        self.arrangement
     }
 
     #[must_use]
@@ -1787,6 +1814,7 @@ fn load_clip(
     }
     Ok(LoadedClip {
         id: document.id,
+        name: document.name,
         track_id: document.track_id,
         asset_id: document.source.asset_id,
         enabled: document.enabled,
@@ -2855,7 +2883,7 @@ fn compile_loaded_arrangement(
         limits,
     )
     .map_err(AdapterCompileError::Graph)?;
-    own_schedule(&project.project_id, &compiled)
+    own_schedule(project, &compiled)
 }
 
 fn validate_single_track_authority(
@@ -3105,25 +3133,54 @@ fn compile_interactive_scene_audio_bindings<'project>(
     Ok(output)
 }
 
+fn build_schedule_identity_index<'a>(
+    ids: impl ExactSizeIterator<Item = &'a str>,
+) -> Result<HashMap<&'a str, usize>, AdapterCompileError> {
+    let mut index = HashMap::new();
+    index
+        .try_reserve(ids.len())
+        .map_err(|_| AdapterCompileError::CapacityUnavailable)?;
+    for (position, id) in ids.enumerate() {
+        if index.insert(id, position).is_some() {
+            return Err(AdapterCompileError::InconsistentCompiledGraph);
+        }
+    }
+    Ok(index)
+}
+
 fn own_schedule(
-    project_id: &str,
+    project: &LoadedPlaybackProject,
     compiled: &CompiledSchedule<'_>,
 ) -> Result<OwnedCompiledSchedule, AdapterCompileError> {
+    let track_indexes =
+        build_schedule_identity_index(project.tracks.iter().map(|track| track.id.as_str()))?;
+    let clip_indexes =
+        build_schedule_identity_index(project.clips.iter().map(|clip| clip.id.as_str()))?;
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(compiled.entries().len())
         .map_err(|_| AdapterCompileError::CapacityUnavailable)?;
     for entry in compiled.entries() {
+        let track_index = track_indexes
+            .get(entry.track_id)
+            .copied()
+            .ok_or(AdapterCompileError::InconsistentCompiledGraph)?;
+        let clip_index = clip_indexes
+            .get(entry.clip_id)
+            .copied()
+            .ok_or(AdapterCompileError::InconsistentCompiledGraph)?;
         entries.push(OwnedScheduleEntry {
             placement_id: try_owned(entry.placement_id)?,
             track_id: try_owned(entry.track_id)?,
+            track_index,
             clip_id: try_owned(entry.clip_id)?,
+            clip_index,
             asset_id: try_owned(entry.asset_id)?,
             compiled: entry.compiled,
         });
     }
     Ok(OwnedCompiledSchedule {
-        project_id: try_owned(project_id)?,
+        project_id: try_owned(&project.project_id)?,
         entries,
     })
 }
@@ -3596,6 +3653,18 @@ mod tests {
     }
 
     #[test]
+    fn schedule_identity_index_preserves_document_positions() {
+        let index = build_schedule_identity_index(["clip-b", "clip-a"].into_iter()).unwrap();
+        assert_eq!(index.get("clip-b"), Some(&0));
+        assert_eq!(index.get("clip-a"), Some(&1));
+        assert_eq!(index.get("missing"), None);
+        assert!(matches!(
+            build_schedule_identity_index(["duplicate", "duplicate"].into_iter()),
+            Err(AdapterCompileError::InconsistentCompiledGraph)
+        ));
+    }
+
+    #[test]
     fn loads_and_compiles_the_explicit_playback_documents() {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];
@@ -3612,6 +3681,8 @@ mod tests {
         );
         assert_eq!(loaded.track_name("missing"), None);
         assert_eq!(loaded.clip_count(), 1);
+        assert_eq!(loaded.clip_name_at(0), Some("Clip"));
+        assert_eq!(loaded.clip_name_at(1), None);
         assert_eq!(loaded.placement_count(), 1);
         let schedule = loaded
             .compile(
@@ -3623,6 +3694,8 @@ mod tests {
                 GraphLimits::VERSION_1,
             )
             .unwrap();
+        assert_eq!(schedule.entries()[0].track_index, 0);
+        assert_eq!(schedule.entries()[0].clip_index, 0);
         assert_eq!(schedule.project_id(), PROJECT_ID);
         assert_eq!(schedule.entries().len(), 1);
         assert_eq!(

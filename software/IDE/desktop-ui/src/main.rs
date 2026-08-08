@@ -5,21 +5,24 @@ use core::fmt;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use hyper_desktop_ide::{
     DesktopAudioPreviewState, DesktopIdeWorker, IdeApplicationConfig, IdeAudioInputInventory,
     IdeAudioOutputInventory, IdeAudioPreviewControlCommand, IdeInputSelection, IdeMixerChannel,
     IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap, IdeMonitoringCommand,
-    IdeNativeCloseFailure, IdeOutputSelection, IdePlaybackExtent, IdeRecordingAbortOutcome,
-    IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation,
-    IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
-    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeNativeCloseFailure, IdeOutputSelection, IdePlaybackArrangement, IdePlaybackExtent,
+    IdeRecordingAbortOutcome, IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake,
+    IdeRunningObservation, IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind,
+    IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
     IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState, TransportCommand,
     desktop_ide_application_config,
 };
 use slint::platform::PlatformError;
-use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
+use slint::{
+    ComponentHandle, Model, ModelRc, ModelTracker, SharedString, Timer, TimerMode, VecModel,
+};
 
 slint::include_modules!();
 
@@ -36,7 +39,19 @@ type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
 type InputRoutes = Rc<RefCell<Vec<InputRoute>>>;
 type RecordingRoutes = Rc<RefCell<Vec<usize>>>;
 type TakeRoutes = Rc<RefCell<Vec<String>>>;
-type PlaybackExtentCell = Rc<RefCell<Option<usize>>>;
+type ProjectUiStateCell = Rc<ProjectUiState>;
+
+#[derive(Default)]
+struct ProjectUiState {
+    playback_end_frame: RefCell<Option<usize>>,
+    arrangement: RefCell<Option<ArrangementBinding>>,
+}
+
+struct ArrangementBinding {
+    project_id: String,
+    owner: Arc<IdePlaybackArrangement>,
+    sample_rate_hz: u32,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum InputRoute {
@@ -122,7 +137,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let input_routes = Rc::new(RefCell::new(Vec::new()));
     let recording_routes = Rc::new(RefCell::new(Vec::new()));
     let take_routes = Rc::new(RefCell::new(Vec::new()));
-    let playback_extent = Rc::new(RefCell::new(None));
+    let project_state = Rc::new(ProjectUiState::default());
 
     bind_callbacks(
         &ui,
@@ -131,7 +146,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         &input_routes,
         &recording_routes,
         &take_routes,
-        &playback_extent,
+        &project_state,
     );
     let timer = start_event_pump(
         &ui,
@@ -140,7 +155,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         &input_routes,
         &recording_routes,
         &take_routes,
-        &playback_extent,
+        &project_state,
     );
     let run_result = ui.run();
     timer.stop();
@@ -161,7 +176,7 @@ fn bind_callbacks(
     input_routes: &InputRoutes,
     recording_routes: &RecordingRoutes,
     take_routes: &TakeRoutes,
-    playback_extent: &PlaybackExtentCell,
+    project_state: &ProjectUiStateCell,
 ) {
     let actions = ui.global::<IdeActions>();
 
@@ -245,7 +260,7 @@ fn bind_callbacks(
         }
     });
 
-    bind_playback_callbacks(ui, worker, playback_extent);
+    bind_playback_callbacks(ui, worker, project_state);
     bind_monitoring_callbacks(ui, worker);
     bind_recording_callbacks(ui, worker, recording_routes);
     bind_audio_preview_callbacks(ui, worker, take_routes);
@@ -458,7 +473,7 @@ fn bind_audio_preview_callbacks(ui: &MainWindow, worker: &WorkerCell, take_route
 fn bind_playback_callbacks(
     ui: &MainWindow,
     worker: &WorkerCell,
-    playback_extent: &PlaybackExtentCell,
+    project_state: &ProjectUiStateCell,
 ) {
     let actions = ui.global::<IdeActions>();
 
@@ -494,7 +509,7 @@ fn bind_playback_callbacks(
 
     let weak = ui.as_weak();
     let worker_for_seek = Rc::clone(worker);
-    let extent_for_seek = Rc::clone(playback_extent);
+    let state_for_seek = Rc::clone(project_state);
     actions.on_transport_seek(move |percent| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -502,7 +517,7 @@ fn bind_playback_callbacks(
         if ui.get_app_mode() != AppMode::Running {
             return;
         }
-        let Some(end_frame) = *extent_for_seek.borrow() else {
+        let Some(end_frame) = *state_for_seek.playback_end_frame.borrow() else {
             ui.set_error_text("Finite playback extent is no longer available".into());
             return;
         };
@@ -511,6 +526,8 @@ fn bind_playback_callbacks(
             Err(message) => ui.set_error_text(message.into()),
         }
     });
+
+    bind_arrangement_callback(ui, worker, project_state);
 
     let weak = ui.as_weak();
     let worker_for_scene = Rc::clone(worker);
@@ -692,6 +709,46 @@ fn bind_send_callbacks(ui: &MainWindow, worker: &WorkerCell) {
     });
 }
 
+fn bind_arrangement_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    let project_state = Rc::clone(project_state);
+    ui.global::<IdeActions>().on_locate_placement(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        let Ok(index) = usize::try_from(index) else {
+            ui.set_error_text("Arrangement placement selection is invalid".into());
+            return;
+        };
+        let state = project_state.arrangement.borrow();
+        let Some(binding) = state.as_ref() else {
+            ui.set_error_text("Arrangement placement authority is no longer available".into());
+            return;
+        };
+        let Some(placement) = binding.owner.placements().get(index) else {
+            ui.set_error_text("Arrangement placement selection is no longer current".into());
+            return;
+        };
+        submit_to_ui(
+            &ui,
+            &worker,
+            IdeWorkerCommand::LocatePlacement {
+                project_id: binding.project_id.clone(),
+                index,
+                placement_id: placement.id().to_owned(),
+            },
+        );
+    });
+}
+
 fn start_event_pump(
     ui: &MainWindow,
     worker: &WorkerCell,
@@ -699,7 +756,7 @@ fn start_event_pump(
     input_routes: &InputRoutes,
     recording_routes: &RecordingRoutes,
     take_routes: &TakeRoutes,
-    playback_extent: &PlaybackExtentCell,
+    project_state: &ProjectUiStateCell,
 ) -> Timer {
     let timer = Timer::default();
     let weak = ui.as_weak();
@@ -708,7 +765,7 @@ fn start_event_pump(
     let input_routes = Rc::clone(input_routes);
     let recording_routes = Rc::clone(recording_routes);
     let take_routes = Rc::clone(take_routes);
-    let playback_extent = Rc::clone(playback_extent);
+    let project_state = Rc::clone(project_state);
     let mut observation_pending = false;
     timer.start(TimerMode::Repeated, UI_POLL_INTERVAL, move || {
         let Some(ui) = weak.upgrade() else {
@@ -730,7 +787,7 @@ fn start_event_pump(
                         &input_routes,
                         &recording_routes,
                         &take_routes,
-                        &playback_extent,
+                        &project_state,
                         event,
                     );
                 }
@@ -844,6 +901,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::OpenProject => "Recovering and verifying project…",
         IdeWorkerCommandKind::Transport => "Transport command queued…",
         IdeWorkerCommandKind::Seek => "Bounded transport locate queued…",
+        IdeWorkerCommandKind::LocatePlacement => "Arrangement placement locate queued…",
         IdeWorkerCommandKind::Mixer => "Mixer command queued…",
         IdeWorkerCommandKind::Monitoring => "Applying input cue control…",
         IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
@@ -869,7 +927,7 @@ fn apply_event(
     input_routes: &InputRoutes,
     recording_routes: &RecordingRoutes,
     take_routes: &TakeRoutes,
-    playback_extent: &PlaybackExtentCell,
+    project_state: &ProjectUiStateCell,
     event: IdeWorkerEvent,
 ) {
     match event {
@@ -885,7 +943,7 @@ fn apply_event(
                 snapshot.inputs(),
                 snapshot.input_selection(),
             );
-            reset_project(ui, recording_routes, take_routes, playback_extent);
+            reset_project(ui, recording_routes, take_routes, project_state);
             let mode = mode_after_closed_event(ui.get_app_mode());
             ui.set_app_mode(mode);
             if mode == AppMode::Closed {
@@ -900,7 +958,7 @@ fn apply_event(
             ui,
             recording_routes,
             take_routes,
-            playback_extent,
+            project_state,
             &observation,
         ),
         IdeWorkerEvent::TransportQueued(command) => {
@@ -1028,7 +1086,7 @@ fn apply_running_event(
     ui: &MainWindow,
     recording_routes: &RecordingRoutes,
     take_routes: &TakeRoutes,
-    playback_extent: &PlaybackExtentCell,
+    project_state: &ProjectUiStateCell,
     observation: &IdeRunningObservation,
 ) {
     ui.set_project_name(observation.project_name().into());
@@ -1039,7 +1097,8 @@ fn apply_running_event(
     apply_mixer_observation(ui, observation);
     set_recording_targets(ui, recording_routes, observation.mixer_channels());
     set_recording_takes(ui, take_routes, observation);
-    set_playback_extent(ui, playback_extent, observation);
+    set_playback_extent(ui, project_state, observation);
+    set_arrangement(ui, project_state, observation);
     ui.set_stream_state(format!("{:?}", observation.output_state()).into());
     ui.set_callback_count(observation.output().callback_count.to_string().into());
     if let Some(monitoring) = observation.monitoring() {
@@ -1212,12 +1271,12 @@ fn format_take_detail(take: &IdeRecordingTake) -> String {
 
 fn set_playback_extent(
     ui: &MainWindow,
-    playback_extent: &PlaybackExtentCell,
+    project_state: &ProjectUiStateCell,
     observation: &IdeRunningObservation,
 ) {
     match observation.playback_extent() {
         IdePlaybackExtent::Bounded { end_frame } => {
-            *playback_extent.borrow_mut() = Some(end_frame);
+            *project_state.playback_end_frame.borrow_mut() = Some(end_frame);
             ui.set_transport_extent_bounded(true);
             ui.set_transport_seek_available(end_frame > 0);
             ui.set_transport_end_clock(
@@ -1233,13 +1292,84 @@ fn set_playback_extent(
             ));
         }
         IdePlaybackExtent::Unbounded => {
-            *playback_extent.borrow_mut() = None;
+            *project_state.playback_end_frame.borrow_mut() = None;
             ui.set_transport_extent_bounded(false);
             ui.set_transport_seek_available(false);
             ui.set_transport_end_clock("—".into());
             ui.set_transport_progress_percent(0.0);
         }
     }
+}
+
+struct ArrangementListModel {
+    owner: Arc<IdePlaybackArrangement>,
+    sample_rate_hz: u32,
+}
+
+impl Model for ArrangementListModel {
+    type Data = ArrangementRow;
+
+    fn row_count(&self) -> usize {
+        self.owner.placements().len()
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        let placement = self.owner.placements().get(row)?;
+        let track_name = self.owner.track_name(placement.track_index())?;
+        let clip_name = self.owner.clip_name(placement.clip_index())?;
+        let start_percent = frame_progress_percent(placement.start_frame(), self.owner.end_frame());
+        let end_percent = frame_progress_percent(placement.end_frame(), self.owner.end_frame());
+        Some(ArrangementRow {
+            index: i32::try_from(row).ok()?,
+            track_name: track_name.into(),
+            clip_name: clip_name.into(),
+            start_clock: format_frame_clock(placement.start_frame(), self.sample_rate_hz).into(),
+            end_clock: format_frame_clock(placement.end_frame(), self.sample_rate_hz).into(),
+            start_percent,
+            width_percent: (end_percent - start_percent).max(0.0),
+            active: placement.active(),
+        })
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &()
+    }
+}
+
+fn set_arrangement(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    observation: &IdeRunningObservation,
+) {
+    let owner = observation.arrangement();
+    let unchanged = project_state
+        .arrangement
+        .borrow()
+        .as_ref()
+        .is_some_and(|current| {
+            current.project_id == observation.project_id()
+                && current.sample_rate_hz == observation.sample_rate_hz()
+                && Arc::ptr_eq(&current.owner, owner)
+        });
+    if unchanged {
+        return;
+    }
+    ui.set_arrangement_placements(ModelRc::new(ArrangementListModel {
+        owner: Arc::clone(owner),
+        sample_rate_hz: observation.sample_rate_hz(),
+    }));
+    ui.set_arrangement_span_clock(
+        format_frame_clock(owner.end_frame(), observation.sample_rate_hz()).into(),
+    );
+    *project_state.arrangement.borrow_mut() = Some(ArrangementBinding {
+        project_id: observation.project_id().to_owned(),
+        owner: Arc::clone(owner),
+        sample_rate_hz: observation.sample_rate_hz(),
+    });
+}
+
+fn format_frame_clock(frame: usize, sample_rate_hz: u32) -> String {
+    format_transport_clock(u64::try_from(frame).unwrap_or(u64::MAX), sample_rate_hz)
 }
 
 #[allow(
@@ -1475,7 +1605,7 @@ fn reset_project(
     ui: &MainWindow,
     recording_routes: &RecordingRoutes,
     take_routes: &TakeRoutes,
-    playback_extent: &PlaybackExtentCell,
+    project_state: &ProjectUiStateCell,
 ) {
     ui.set_project_name("No project open".into());
     ui.set_project_id("—".into());
@@ -1498,12 +1628,16 @@ fn reset_project(
     take_routes.borrow_mut().clear();
     ui.set_recording_takes(ModelRc::default());
     ui.set_takes_visible(false);
+    ui.set_arrangement_visible(false);
+    ui.set_arrangement_placements(ModelRc::default());
+    ui.set_arrangement_span_clock("—".into());
     ui.set_preview_active(false);
     ui.set_preview_gain_percent(25.0);
     ui.set_preview_muted(false);
     ui.set_preview_state("Idle".into());
     ui.set_preview_progress("—".into());
-    *playback_extent.borrow_mut() = None;
+    *project_state.playback_end_frame.borrow_mut() = None;
+    *project_state.arrangement.borrow_mut() = None;
     ui.set_transport_extent_bounded(false);
     ui.set_transport_seek_available(false);
     ui.set_transport_progress_percent(0.0);

@@ -5,6 +5,7 @@ use core::error::Error;
 use core::fmt;
 use core::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use hyper_audio_engine::{LinearGain, Pan, ParameterError};
@@ -35,8 +36,10 @@ use hyper_playback_json::{
     CompiledMixerTap, CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
     MixerSendBaseState, MixerStateSerializationError, serialize_mixer_base_state,
 };
-pub use hyper_playback_session::PlaybackExtent as IdePlaybackExtent;
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
+pub use hyper_playback_session::{
+    PlaybackArrangement as IdePlaybackArrangement, PlaybackExtent as IdePlaybackExtent,
+};
 use hyper_project_loader::ProjectPlaybackLimits;
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
@@ -1161,6 +1164,41 @@ pub enum IdeTransportSeekError {
     Send(DesktopDirectControlError),
 }
 
+#[derive(Debug)]
+pub enum IdeArrangementLocateError {
+    Unavailable,
+    StaleProject,
+    StalePlacement { requested_index: usize },
+    Send(DesktopDirectControlError),
+}
+
+impl fmt::Display for IdeArrangementLocateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => {
+                formatter.write_str("verified playback arrangement is unavailable")
+            }
+            Self::StaleProject => {
+                formatter.write_str("arrangement project authority is no longer current")
+            }
+            Self::StalePlacement { requested_index } => write!(
+                formatter,
+                "arrangement placement {requested_index} is no longer current"
+            ),
+            Self::Send(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeArrangementLocateError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Send(source) => Some(source),
+            Self::Unavailable | Self::StaleProject | Self::StalePlacement { .. } => None,
+        }
+    }
+}
+
 impl fmt::Display for IdeTransportSeekError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1415,7 +1453,7 @@ pub struct IdeMonitoringState {
     pub bridge: MonitoringSnapshot,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RunningIdeSnapshot<'a> {
     pub(crate) loaded: &'a hyper_playback_json::LoadedPlaybackProject,
     pub project_path: &'a Path,
@@ -1423,6 +1461,7 @@ pub struct RunningIdeSnapshot<'a> {
     pub project_name: &'a str,
     pub sample_rate_hz: u32,
     pub playback_extent: IdePlaybackExtent,
+    pub arrangement: Arc<IdePlaybackArrangement>,
     pub recording_metadata: &'a [hyper_recording_metadata::RecordingMetadataDocument],
     pub scene_count: usize,
     pub scene_names: [&'a str; MAX_IDE_SCENES],
@@ -1477,6 +1516,8 @@ struct TestPlaybackSession {
     committed_mixer_fence: u64,
     next_mixer_fence: u64,
     extent: IdePlaybackExtent,
+    arrangement_project_id: String,
+    arrangement_placements: Vec<(String, usize)>,
 }
 
 #[cfg(test)]
@@ -1492,6 +1533,8 @@ impl Default for TestPlaybackSession {
             committed_mixer_fence: 0,
             next_mixer_fence: 1,
             extent: IdePlaybackExtent::Bounded { end_frame: 0 },
+            arrangement_project_id: String::new(),
+            arrangement_placements: Vec::new(),
         }
     }
 }
@@ -1732,6 +1775,7 @@ impl RunningDesktopIdeApplication {
             project_name: project.package().manifest().name(),
             sample_rate_hz: project.session().sample_rate_hz(),
             playback_extent: project.session().extent(),
+            arrangement: project.session().shared_arrangement(),
             recording_metadata: project.recording_metadata(),
             scene_count,
             scene_names,
@@ -1803,6 +1847,66 @@ impl RunningDesktopIdeApplication {
             state: LocateState::Preserve,
         })
         .map_err(IdeTransportSeekError::Send)
+    }
+
+    /// Locates to one exact compiled placement start after validating the
+    /// immutable placement identity published to the UI.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unavailable project authority, stale project or placement
+    /// identities, and command delivery failures without queueing a locate.
+    pub fn try_locate_arrangement_placement(
+        &mut self,
+        project_id: &str,
+        index: usize,
+        placement_id: &str,
+    ) -> Result<usize, IdeArrangementLocateError> {
+        let frame = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => {
+                let prepared = session
+                    .prepared_project()
+                    .ok_or(IdeArrangementLocateError::Unavailable)?;
+                if prepared.session().project_id() != project_id {
+                    return Err(IdeArrangementLocateError::StaleProject);
+                }
+                let arrangement = prepared.session().arrangement();
+                let placement = arrangement.placements().get(index).ok_or(
+                    IdeArrangementLocateError::StalePlacement {
+                        requested_index: index,
+                    },
+                )?;
+                if placement.id() != placement_id {
+                    return Err(IdeArrangementLocateError::StalePlacement {
+                        requested_index: index,
+                    });
+                }
+                placement.start_frame()
+            }
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => {
+                if session.arrangement_project_id != project_id {
+                    return Err(IdeArrangementLocateError::StaleProject);
+                }
+                let (current_id, frame) = session.arrangement_placements.get(index).ok_or(
+                    IdeArrangementLocateError::StalePlacement {
+                        requested_index: index,
+                    },
+                )?;
+                if current_id != placement_id {
+                    return Err(IdeArrangementLocateError::StalePlacement {
+                        requested_index: index,
+                    });
+                }
+                *frame
+            }
+        };
+        self.try_send_transport(TransportCommand::Locate {
+            frame,
+            state: LocateState::Preserve,
+        })
+        .map_err(IdeArrangementLocateError::Send)?;
+        Ok(frame)
     }
 
     /// Sends one validated base-mixer command through the only live owner.
@@ -2733,6 +2837,47 @@ mod tests {
             unreachable!("test constructed the deterministic session owner");
         };
         assert_eq!(session.commands.len(), 1);
+    }
+
+    #[test]
+    fn arrangement_locate_validates_identity_and_works_with_unbounded_scene_authority() {
+        let application = DesktopIdeApplication::from_inventory(
+            config(256).unwrap(),
+            IdeAudioOutputInventory::default(),
+        );
+        let mut running = RunningDesktopIdeApplication {
+            application,
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                extent: IdePlaybackExtent::Unbounded,
+                arrangement_project_id: "project-a".to_owned(),
+                arrangement_placements: vec![("placement-a".to_owned(), 480)],
+                ..TestPlaybackSession::default()
+            }),
+        };
+        assert!(matches!(
+            running.try_locate_arrangement_placement("project-b", 0, "placement-a"),
+            Err(IdeArrangementLocateError::StaleProject)
+        ));
+        assert!(matches!(
+            running.try_locate_arrangement_placement("project-a", 0, "stale-placement"),
+            Err(IdeArrangementLocateError::StalePlacement { requested_index: 0 })
+        ));
+        assert_eq!(
+            running
+                .try_locate_arrangement_placement("project-a", 0, "placement-a")
+                .unwrap(),
+            480
+        );
+        let IdePlaybackSessionOwner::Test(session) = &running.session else {
+            unreachable!("test constructed the deterministic session owner");
+        };
+        assert_eq!(
+            session.commands,
+            [TransportCommand::Locate {
+                frame: 480,
+                state: LocateState::Preserve,
+            }]
+        );
     }
 
     #[test]

@@ -2,10 +2,10 @@ use core::error::Error;
 use core::fmt;
 use std::io;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::mpsc::{
     Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -17,16 +17,17 @@ use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSn
 use super::recording::{IdeRecordingPlan, IdeRecordingTarget, RecordingDesktopIdeApplication};
 use super::{
     DesktopIdeApplication, DesktopIdePendingClose, DesktopIdePendingSaveClose,
-    DesktopPlaybackRecovery, IdeApplicationConfig, IdeAudioInputInventory, IdeAudioOutputInventory,
-    IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeCloseOutcome, IdeInputDiscoveryError,
-    IdeInputSelection, IdeInputSelectionError, IdeMixerChannelKind, IdeMixerChannelState,
-    IdeMixerCommand, IdeMixerCommandError, IdeMixerMainState, IdeMonitoringCommand,
-    IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure, IdeOutputDiscoveryError,
-    IdeOutputSelection, IdeOutputSelectionError, IdePendingCloseWait, IdePendingSaveCloseWait,
-    IdeProjectOpenError, IdeProjectSaveError, IdeRecordingAbortError, IdeRecordingAbortOutcome,
-    IdeRecordingError, IdeRecordingImportOutcome, IdeRecordingObservation, IdeSaveCloseOutcome,
-    IdeSceneAvailability, IdeTransportSeekError, InputInventoryError, LocateState,
-    OutputInventoryError, OutputStreamSnapshot, OutputStreamState, RunningDesktopIdeApplication,
+    DesktopPlaybackRecovery, IdeApplicationConfig, IdeArrangementLocateError,
+    IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
+    IdeAudioPreviewError, IdeCloseOutcome, IdeInputDiscoveryError, IdeInputSelection,
+    IdeInputSelectionError, IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand,
+    IdeMixerCommandError, IdeMixerMainState, IdeMonitoringCommand, IdeMonitoringCommandError,
+    IdeMonitoringState, IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection,
+    IdeOutputSelectionError, IdePendingCloseWait, IdePendingSaveCloseWait, IdeProjectOpenError,
+    IdeProjectSaveError, IdeRecordingAbortError, IdeRecordingAbortOutcome, IdeRecordingError,
+    IdeRecordingImportOutcome, IdeRecordingObservation, IdeSaveCloseOutcome, IdeSceneAvailability,
+    IdeTransportSeekError, InputInventoryError, LocateState, OutputInventoryError,
+    OutputStreamSnapshot, OutputStreamState, RunningDesktopIdeApplication,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -102,6 +103,7 @@ pub enum IdeWorkerCommandKind {
     OpenProject,
     Transport,
     Seek,
+    LocatePlacement,
     Mixer,
     Monitoring,
     SaveProject,
@@ -128,14 +130,25 @@ pub enum IdeWorkerCommand {
     SelectInput(String),
     OpenProject(PathBuf),
     Transport(TransportCommand),
-    Seek { frame: usize },
+    Seek {
+        frame: usize,
+    },
+    LocatePlacement {
+        project_id: String,
+        index: usize,
+        placement_id: String,
+    },
     Mixer(IdeMixerCommand),
     Monitoring(IdeMonitoringCommand),
     SaveProject,
-    StartRecording { channel_index: usize },
+    StartRecording {
+        channel_index: usize,
+    },
     StopRecording,
     AbortRecording,
-    StartAudioPreview { asset_id: String },
+    StartAudioPreview {
+        asset_id: String,
+    },
     StopAudioPreview,
     AudioPreviewControl(IdeAudioPreviewControlCommand),
     Observe,
@@ -158,6 +171,7 @@ impl IdeWorkerCommand {
             Self::OpenProject(_) => IdeWorkerCommandKind::OpenProject,
             Self::Transport(_) => IdeWorkerCommandKind::Transport,
             Self::Seek { .. } => IdeWorkerCommandKind::Seek,
+            Self::LocatePlacement { .. } => IdeWorkerCommandKind::LocatePlacement,
             Self::Mixer(_) => IdeWorkerCommandKind::Mixer,
             Self::Monitoring(_) => IdeWorkerCommandKind::Monitoring,
             Self::SaveProject => IdeWorkerCommandKind::SaveProject,
@@ -334,6 +348,7 @@ pub struct IdeRunningObservation {
     project_name: String,
     sample_rate_hz: u32,
     playback_extent: super::IdePlaybackExtent,
+    arrangement: Arc<super::IdePlaybackArrangement>,
     recording_takes: Vec<IdeRecordingTake>,
     preview: IdeAudioPreviewObservation,
     scenes: Vec<IdeScene>,
@@ -509,6 +524,11 @@ impl IdeRunningObservation {
     }
 
     #[must_use]
+    pub fn arrangement(&self) -> &Arc<super::IdePlaybackArrangement> {
+        &self.arrangement
+    }
+
+    #[must_use]
     pub fn recording_takes(&self) -> &[IdeRecordingTake] {
         &self.recording_takes
     }
@@ -573,6 +593,7 @@ pub enum IdeWorkerCommandFailure {
     ProjectOpen(IdeProjectOpenError),
     Transport(super::DesktopDirectControlError),
     Seek(IdeTransportSeekError),
+    ArrangementLocate(IdeArrangementLocateError),
     Mixer(IdeMixerCommandError),
     Monitoring(IdeMonitoringCommandError),
     ProjectSave(IdeProjectSaveError),
@@ -595,6 +616,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::ProjectOpen(source) => source.fmt(formatter),
             Self::Transport(source) => source.fmt(formatter),
             Self::Seek(source) => source.fmt(formatter),
+            Self::ArrangementLocate(source) => source.fmt(formatter),
             Self::Mixer(source) => source.fmt(formatter),
             Self::Monitoring(source) => source.fmt(formatter),
             Self::ProjectSave(source) => source.fmt(formatter),
@@ -625,6 +647,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::ProjectOpen(source) => Some(source),
             Self::Transport(source) => Some(source),
             Self::Seek(source) => Some(source),
+            Self::ArrangementLocate(source) => Some(source),
             Self::Mixer(source) => Some(source),
             Self::Monitoring(source) => Some(source),
             Self::ProjectSave(source) => Some(source),
@@ -1171,6 +1194,11 @@ fn process_command(
         }
         IdeWorkerCommand::Transport(command) => process_transport_command(state, command, events),
         IdeWorkerCommand::Seek { frame } => process_seek_command(state, frame, events),
+        IdeWorkerCommand::LocatePlacement {
+            project_id,
+            index,
+            placement_id,
+        } => process_arrangement_locate_command(state, &project_id, index, &placement_id, events),
         IdeWorkerCommand::Mixer(command) => match state {
             WorkerState::Running(application) => match application.try_send_mixer(command) {
                 Ok(()) => send_event(events, IdeWorkerEvent::MixerQueued(command)),
@@ -1266,6 +1294,47 @@ fn process_seek_command(
         _ => publish_failure(
             events,
             IdeWorkerCommandKind::Seek,
+            IdeWorkerCommandFailure::InvalidState,
+        ),
+    }
+}
+
+fn process_arrangement_locate_command(
+    state: &mut WorkerState,
+    project_id: &str,
+    index: usize,
+    placement_id: &str,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    match state {
+        WorkerState::Running(application) if application.audio_preview_is_active() => {
+            publish_failure(
+                events,
+                IdeWorkerCommandKind::LocatePlacement,
+                IdeWorkerCommandFailure::AudioPreview(IdeAudioPreviewError::Command(
+                    hyper_desktop_audio::DesktopAudioPreviewCommandError::PreviewBusy,
+                )),
+            )
+        }
+        WorkerState::Running(application) => {
+            match application.try_locate_arrangement_placement(project_id, index, placement_id) {
+                Ok(frame) => send_event(
+                    events,
+                    IdeWorkerEvent::TransportQueued(TransportCommand::Locate {
+                        frame,
+                        state: LocateState::Preserve,
+                    }),
+                ),
+                Err(reason) => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::LocatePlacement,
+                    IdeWorkerCommandFailure::ArrangementLocate(reason),
+                ),
+            }
+        }
+        _ => publish_failure(
+            events,
+            IdeWorkerCommandKind::LocatePlacement,
             IdeWorkerCommandFailure::InvalidState,
         ),
     }
@@ -2385,6 +2454,7 @@ fn running_observation(
         project_name,
         sample_rate_hz: snapshot.sample_rate_hz,
         playback_extent: snapshot.playback_extent,
+        arrangement: snapshot.arrangement,
         recording_takes,
         preview: IdeAudioPreviewObservation {
             snapshot: snapshot.preview,
@@ -2784,6 +2854,75 @@ mod tests {
                     end_frame: 2_000,
                 }),
             }
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn running_worker_locates_only_the_current_arrangement_placement_identity() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                extent: IdePlaybackExtent::Unbounded,
+                arrangement_project_id: "project-a".to_owned(),
+                arrangement_placements: vec![("placement-a".to_owned(), 1_250)],
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 3, 3).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::LocatePlacement {
+                project_id: "project-b".to_owned(),
+                index: 0,
+                placement_id: "placement-a".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::LocatePlacement,
+                reason: IdeWorkerCommandFailure::ArrangementLocate(
+                    IdeArrangementLocateError::StaleProject
+                ),
+            }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::LocatePlacement {
+                project_id: "project-a".to_owned(),
+                index: 0,
+                placement_id: "stale".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::LocatePlacement,
+                reason: IdeWorkerCommandFailure::ArrangementLocate(
+                    IdeArrangementLocateError::StalePlacement { requested_index: 0 }
+                ),
+            }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::LocatePlacement {
+                project_id: "project-a".to_owned(),
+                index: 0,
+                placement_id: "placement-a".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::TransportQueued(TransportCommand::Locate {
+                frame: 1_250,
+                state: LocateState::Preserve,
+            })
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
     }

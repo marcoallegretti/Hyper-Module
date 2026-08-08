@@ -3,6 +3,7 @@
 
 use core::error::Error;
 use core::fmt;
+use std::sync::Arc;
 
 use hyper_audio_source::DecodedAudio;
 use hyper_media_cache::{
@@ -11,9 +12,9 @@ use hyper_media_cache::{
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::{RecordedSceneExtent, SceneLimits};
 use hyper_playback_json::{
-    AdapterCompileError, AutomationCompileError, CompiledAutomation, CompiledMixerGraph, LoadError,
-    LoadedPlaybackProject, LoaderLimits, MediaAssetFact, MixerCompileError, PlaybackJsonInput,
-    load,
+    AdapterCompileError, AutomationCompileError, CompiledAutomation, CompiledMixerGraph,
+    CompiledPlaybackGraph, LoadError, LoadedPlaybackProject, LoaderLimits, MediaAssetFact,
+    MixerCompileError, PlaybackJsonInput, load,
 };
 
 /// Canonical resource bytes supplied to playback-session assembly.
@@ -82,12 +83,86 @@ pub struct PreparedPlaybackSession {
     automation: Option<CompiledAutomation>,
     media: DecodedMediaCache,
     extent: PlaybackExtent,
+    arrangement: Arc<PlaybackArrangement>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlaybackExtent {
     Bounded { end_frame: usize },
     Unbounded,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct PlaybackArrangementPlacement {
+    id: String,
+    track_index: usize,
+    clip_index: usize,
+    start_frame: usize,
+    end_frame: usize,
+    active: bool,
+}
+
+impl PlaybackArrangementPlacement {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn track_index(&self) -> usize {
+        self.track_index
+    }
+
+    #[must_use]
+    pub const fn clip_index(&self) -> usize {
+        self.clip_index
+    }
+
+    #[must_use]
+    pub const fn start_frame(&self) -> usize {
+        self.start_frame
+    }
+
+    #[must_use]
+    pub const fn end_frame(&self) -> usize {
+        self.end_frame
+    }
+
+    /// Whether the compiled placement contributes audio before mixer control.
+    #[must_use]
+    pub const fn active(&self) -> bool {
+        self.active
+    }
+}
+
+#[derive(Debug)]
+pub struct PlaybackArrangement {
+    track_names: Vec<String>,
+    clip_names: Vec<String>,
+    placements: Vec<PlaybackArrangementPlacement>,
+    end_frame: usize,
+}
+
+impl PlaybackArrangement {
+    #[must_use]
+    pub fn track_name(&self, index: usize) -> Option<&str> {
+        self.track_names.get(index).map(String::as_str)
+    }
+
+    #[must_use]
+    pub fn clip_name(&self, index: usize) -> Option<&str> {
+        self.clip_names.get(index).map(String::as_str)
+    }
+
+    #[must_use]
+    pub fn placements(&self) -> &[PlaybackArrangementPlacement] {
+        &self.placements
+    }
+
+    #[must_use]
+    pub const fn end_frame(&self) -> usize {
+        self.end_frame
+    }
 }
 
 fn playback_extent(
@@ -129,6 +204,16 @@ impl PreparedPlaybackSession {
     #[must_use]
     pub const fn extent(&self) -> PlaybackExtent {
         self.extent
+    }
+
+    #[must_use]
+    pub fn arrangement(&self) -> &PlaybackArrangement {
+        &self.arrangement
+    }
+
+    #[must_use]
+    pub fn shared_arrangement(&self) -> Arc<PlaybackArrangement> {
+        Arc::clone(&self.arrangement)
     }
 
     #[must_use]
@@ -182,6 +267,8 @@ pub enum PlaybackSessionAssemblyError {
     },
     Playback(AdapterCompileError),
     MediaBinding(PreparePlaybackError),
+    ArrangementCapacityUnavailable,
+    ArrangementMetadataMismatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,6 +326,12 @@ impl fmt::Display for PlaybackSessionAssemblyError {
             Self::MediaBinding(source) => {
                 write!(formatter, "playback media binding failed: {source}")
             }
+            Self::ArrangementCapacityUnavailable => {
+                formatter.write_str("playback arrangement capacity is unavailable")
+            }
+            Self::ArrangementMetadataMismatch => {
+                formatter.write_str("loaded project arrangement metadata is inconsistent")
+            }
         }
     }
 }
@@ -254,9 +347,88 @@ impl Error for PlaybackSessionAssemblyError {
             Self::MediaBinding(source) => Some(source),
             Self::DocumentCountLimit { .. }
             | Self::DocumentReferenceCapacityUnavailable
-            | Self::MediaFactCapacityUnavailable => None,
+            | Self::MediaFactCapacityUnavailable
+            | Self::ArrangementCapacityUnavailable
+            | Self::ArrangementMetadataMismatch => None,
         }
     }
+}
+
+fn try_arrangement_owned(value: &str) -> Result<String, PlaybackSessionAssemblyError> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| PlaybackSessionAssemblyError::ArrangementCapacityUnavailable)?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
+fn build_playback_arrangement(
+    project: &LoadedPlaybackProject,
+    schedule: hyper_playback_json::OwnedCompiledSchedule,
+) -> Result<PlaybackArrangement, PlaybackSessionAssemblyError> {
+    let mut track_names = Vec::new();
+    track_names
+        .try_reserve_exact(project.track_count())
+        .map_err(|_| PlaybackSessionAssemblyError::ArrangementCapacityUnavailable)?;
+    for track_index in 0..project.track_count() {
+        let name = project
+            .track_name_at(track_index)
+            .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?;
+        track_names.push(try_arrangement_owned(name)?);
+    }
+
+    let mut clip_names = Vec::new();
+    clip_names
+        .try_reserve_exact(project.clip_count())
+        .map_err(|_| PlaybackSessionAssemblyError::ArrangementCapacityUnavailable)?;
+    for clip_index in 0..project.clip_count() {
+        let name = project
+            .clip_name_at(clip_index)
+            .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?;
+        clip_names.push(try_arrangement_owned(name)?);
+    }
+
+    let entries = schedule.into_entries();
+    let mut placements = Vec::new();
+    placements
+        .try_reserve_exact(entries.len())
+        .map_err(|_| PlaybackSessionAssemblyError::ArrangementCapacityUnavailable)?;
+    let mut end_frame = 0;
+    for entry in entries {
+        let start_frame = entry.compiled.arrangement_start_frame();
+        let placement_end_frame = entry.compiled.arrangement_end_frame();
+        end_frame = end_frame.max(placement_end_frame);
+        placements.push(PlaybackArrangementPlacement {
+            id: entry.placement_id,
+            track_index: entry.track_index,
+            clip_index: entry.clip_index,
+            start_frame,
+            end_frame: placement_end_frame,
+            active: entry.compiled.clip_spec().enabled,
+        });
+    }
+    Ok(PlaybackArrangement {
+        track_names,
+        clip_names,
+        placements,
+        end_frame,
+    })
+}
+
+fn bind_and_retain_arrangement(
+    project: &LoadedPlaybackProject,
+    media: &DecodedMediaCache,
+    graph: CompiledPlaybackGraph<'_>,
+) -> Result<Arc<PlaybackArrangement>, PlaybackSessionAssemblyError> {
+    let prepared = media
+        .prepare_playback(&graph)
+        .map_err(PlaybackSessionAssemblyError::MediaBinding)?;
+    drop(prepared);
+    Ok(Arc::new(build_playback_arrangement(
+        project,
+        graph.into_arrangement(),
+    )?))
 }
 
 /// Converts caller-supplied canonical documents and decoded media into owned
@@ -362,9 +534,7 @@ pub fn assemble_playback_session(
         graph.arrangement().end_frame(),
         graph.scene_authority().recorded_extent(),
     );
-    let _prepared = media
-        .prepare_playback(&graph)
-        .map_err(PlaybackSessionAssemblyError::MediaBinding)?;
+    let arrangement = bind_and_retain_arrangement(&project, &media, graph)?;
 
     Ok(PreparedPlaybackSession {
         project,
@@ -372,6 +542,7 @@ pub fn assemble_playback_session(
         automation,
         media,
         extent,
+        arrangement,
     })
 }
 
@@ -504,6 +675,25 @@ mod tests {
         assert_eq!(session.media_asset_count(), 1);
         assert!(session.has_automation());
         assert_eq!(session.extent(), PlaybackExtent::Bounded { end_frame: 100 });
+        let arrangement = session.arrangement();
+        assert_eq!(arrangement.track_name(0), Some("Audio"));
+        assert_eq!(arrangement.clip_name(0), Some("Clip"));
+        assert_eq!(arrangement.end_frame(), 100);
+        assert_eq!(arrangement.placements().len(), 1);
+        assert_eq!(
+            arrangement.placements()[0],
+            PlaybackArrangementPlacement {
+                id: "018f47a2-6b2d-7c11-8a44-001122337506".to_owned(),
+                track_index: 0,
+                clip_index: 0,
+                start_frame: 0,
+                end_frame: 100,
+                active: true,
+            }
+        );
+        let first_owner = session.shared_arrangement();
+        let second_owner = session.shared_arrangement();
+        assert!(Arc::ptr_eq(&first_owner, &second_owner));
         let (project, mixer, automation, media) = session.parts();
         assert_eq!(project.project_id(), mixer.project_id());
         assert_eq!(
@@ -538,6 +728,19 @@ mod tests {
             playback_extent(100, RecordedSceneExtent::Unbounded),
             PlaybackExtent::Unbounded
         );
+    }
+
+    #[test]
+    fn arrangement_navigation_preserves_compiled_inactive_placement_state() {
+        let mut input = input(vec![asset("018f47a2-6b2d-7c11-8a44-001122337504")]);
+        input.documents.clips[0] = String::from_utf8(input.documents.clips[0].clone())
+            .unwrap()
+            .replace(r#""enabled":true"#, r#""enabled":false"#)
+            .into_bytes();
+        let session = assemble_playback_session(input).unwrap();
+        assert_eq!(session.arrangement().placements().len(), 1);
+        assert!(!session.arrangement().placements()[0].active());
+        assert_eq!(session.arrangement().end_frame(), 100);
     }
 
     #[test]
