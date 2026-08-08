@@ -1,7 +1,7 @@
 use core::error::Error;
 use core::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{
     Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 use hyper_desktop_audio::{DesktopAudioPreviewSnapshot, DesktopAudioPreviewState};
 use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, TransportCommand};
 use hyper_recording_metadata::RecordingCaptureKind;
+use hyper_storage_engine::{
+    ProjectCreationError, ProjectCreationRequest, create_project as create_project_package,
+};
 use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSnapshot};
 
 use super::recording::{IdeRecordingPlan, IdeRecordingTarget, RecordingDesktopIdeApplication};
@@ -105,6 +108,7 @@ pub enum IdeWorkerCommandKind {
     SelectInput,
     StartOutputTest,
     StopOutputTest,
+    CreateProject,
     OpenProject,
     Transport,
     Seek,
@@ -136,6 +140,11 @@ pub enum IdeWorkerCommand {
     SelectInput(String),
     StartOutputTest,
     StopOutputTest,
+    CreateProject {
+        parent: PathBuf,
+        directory_name: String,
+        project_name: String,
+    },
     OpenProject(PathBuf),
     Transport(TransportCommand),
     Seek {
@@ -179,6 +188,7 @@ impl IdeWorkerCommand {
             Self::SelectInput(_) => IdeWorkerCommandKind::SelectInput,
             Self::StartOutputTest => IdeWorkerCommandKind::StartOutputTest,
             Self::StopOutputTest => IdeWorkerCommandKind::StopOutputTest,
+            Self::CreateProject { .. } => IdeWorkerCommandKind::CreateProject,
             Self::OpenProject(_) => IdeWorkerCommandKind::OpenProject,
             Self::Transport(_) => IdeWorkerCommandKind::Transport,
             Self::Seek { .. } => IdeWorkerCommandKind::Seek,
@@ -609,11 +619,56 @@ impl IdeRunningObservation {
 }
 
 #[derive(Debug)]
+pub enum IdeProjectCreationError {
+    Creation(ProjectCreationError),
+    CreatedButNotOpened {
+        project_path: PathBuf,
+        source: IdeProjectOpenError,
+    },
+}
+
+impl IdeProjectCreationError {
+    #[must_use]
+    pub fn created_project(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Creation(_) => None,
+            Self::CreatedButNotOpened { project_path, .. } => Some(project_path),
+        }
+    }
+}
+
+impl fmt::Display for IdeProjectCreationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Creation(source) => write!(formatter, "project creation failed: {source}"),
+            Self::CreatedButNotOpened {
+                project_path,
+                source,
+            } => write!(
+                formatter,
+                "project was safely created at {} but could not be opened: {source}",
+                project_path.display()
+            ),
+        }
+    }
+}
+
+impl Error for IdeProjectCreationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Creation(source) => Some(source),
+            Self::CreatedButNotOpened { source, .. } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum IdeWorkerCommandFailure {
     Discovery(IdeOutputDiscoveryError),
     InputDiscovery(IdeInputDiscoveryError),
     OutputSelection(IdeOutputSelectionError),
     InputSelection(IdeInputSelectionError),
+    ProjectCreation(IdeProjectCreationError),
     ProjectOpen(IdeProjectOpenError),
     Transport(super::DesktopDirectControlError),
     Seek(IdeTransportSeekError),
@@ -639,6 +694,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::InputDiscovery(source) => source.fmt(formatter),
             Self::OutputSelection(source) => source.fmt(formatter),
             Self::InputSelection(source) => source.fmt(formatter),
+            Self::ProjectCreation(source) => source.fmt(formatter),
             Self::ProjectOpen(source) => source.fmt(formatter),
             Self::Transport(source) => source.fmt(formatter),
             Self::Seek(source) => source.fmt(formatter),
@@ -672,6 +728,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::InputDiscovery(source) => Some(source),
             Self::OutputSelection(source) => Some(source),
             Self::InputSelection(source) => Some(source),
+            Self::ProjectCreation(source) => Some(source),
             Self::ProjectOpen(source) => Some(source),
             Self::Transport(source) => Some(source),
             Self::Seek(source) => Some(source),
@@ -1216,6 +1273,18 @@ fn process_command(
         IdeWorkerCommand::StopOutputTest => {
             stop_output_test(state, events, unpublished_native_failure)
         }
+        IdeWorkerCommand::CreateProject {
+            parent,
+            directory_name,
+            project_name,
+        } => create_project(
+            state,
+            &parent,
+            &directory_name,
+            &project_name,
+            events,
+            unpublished_native_failure,
+        ),
         IdeWorkerCommand::OpenProject(path) => {
             open_project(state, path, events, unpublished_native_failure)
         }
@@ -1256,6 +1325,65 @@ fn process_command(
             IdeWorkerCommandKind::CloseProject,
         ),
         IdeWorkerCommand::Shutdown => unreachable!("shutdown is handled by the worker loop"),
+    }
+}
+
+fn create_project(
+    state: &mut WorkerState,
+    parent: &Path,
+    directory_name: &str,
+    project_name: &str,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+) -> bool {
+    if !matches!(state, WorkerState::Closed(_)) {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CreateProject,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    }
+    let WorkerState::Closed(application) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("closed state was checked before project-creation ownership transfer");
+    };
+    let creation = match create_project_package(
+        parent,
+        ProjectCreationRequest {
+            directory_name,
+            project_name,
+        },
+    ) {
+        Ok(creation) => creation,
+        Err(source) => {
+            *state = WorkerState::Closed(application);
+            return publish_failure(
+                events,
+                IdeWorkerCommandKind::CreateProject,
+                IdeWorkerCommandFailure::ProjectCreation(IdeProjectCreationError::Creation(source)),
+            );
+        }
+    };
+    let project_path = creation.project().root().to_path_buf();
+    drop(creation);
+    match application.open_project(&project_path) {
+        Ok(running) => {
+            *state = WorkerState::Running(running);
+            publish_state(state, events, unpublished_native_failure)
+        }
+        Err(failure) => {
+            let (application, source) = failure.into_parts();
+            *state = WorkerState::Closed(application);
+            publish_failure(
+                events,
+                IdeWorkerCommandKind::CreateProject,
+                IdeWorkerCommandFailure::ProjectCreation(
+                    IdeProjectCreationError::CreatedButNotOpened {
+                        project_path,
+                        source,
+                    },
+                ),
+            )
+        }
     }
 }
 
@@ -2862,6 +2990,7 @@ mod tests {
     use hyper_playback_json::LoaderLimits;
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
     use hyper_project_loader::ProjectPlaybackLimits;
+    use hyper_storage_engine::{ProjectCreationErrorKind, verify_project_package};
 
     const WAIT: Duration = Duration::from_secs(2);
 
@@ -2992,6 +3121,83 @@ mod tests {
         worker.try_send(IdeWorkerCommand::Observe).unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn closed_worker_rejects_invalid_project_creation_without_losing_ownership() {
+        let parent = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-worker-invalid-creation-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 3, 3).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+
+        worker
+            .try_send(IdeWorkerCommand::CreateProject {
+                parent: parent.clone(),
+                directory_name: "..".to_owned(),
+                project_name: "Daily Session".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::CreateProject,
+                reason: IdeWorkerCommandFailure::ProjectCreation(
+                    IdeProjectCreationError::Creation(source)
+                ),
+            } if source.kind() == ProjectCreationErrorKind::InvalidRequest
+        ));
+        worker.try_send(IdeWorkerCommand::Observe).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn project_created_before_open_failure_is_preserved_and_reported() {
+        let parent = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-worker-created-project-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let project_path = parent.join("Daily Session");
+        let mut application = closed_application();
+        application.output_selection = IdeOutputSelection::Routed("missing-route".to_owned());
+        let worker = DesktopIdeWorker::start_state(WorkerState::Closed(application), 3, 3).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+
+        worker
+            .try_send(IdeWorkerCommand::CreateProject {
+                parent: parent.clone(),
+                directory_name: "Daily Session".to_owned(),
+                project_name: "Daily Session".to_owned(),
+            })
+            .unwrap();
+        let IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::CreateProject,
+            reason:
+                IdeWorkerCommandFailure::ProjectCreation(IdeProjectCreationError::CreatedButNotOpened {
+                    project_path: failed_path,
+                    source: IdeProjectOpenError::SelectedOutputUnavailable,
+                }),
+        } = recv(&worker)
+        else {
+            panic!("creation must report a preserved project after open failure");
+        };
+        assert_eq!(
+            failed_path,
+            std::fs::canonicalize(&project_path).unwrap(),
+            "the reported project must be the verified created directory"
+        );
+        verify_project_package(&project_path).unwrap();
+        worker.try_send(IdeWorkerCommand::Observe).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]

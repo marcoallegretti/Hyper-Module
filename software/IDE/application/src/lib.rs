@@ -71,12 +71,12 @@ pub use recording::{
 
 pub use worker::{
     DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeAudioPreviewObservation,
-    IdeClosedSnapshot, IdeMixerChannel, IdeMixerSend, IdeRecordingCaptureKind, IdeRecordingState,
-    IdeRecordingTake, IdeRunningObservation, IdeScene, IdeWorkerCommand, IdeWorkerCommandFailure,
-    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
-    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
-    IdeWorkerShutdownReport, IdeWorkerStartError, MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS,
-    desktop_ide_worker_supervisor_snapshot,
+    IdeClosedSnapshot, IdeMixerChannel, IdeMixerSend, IdeProjectCreationError,
+    IdeRecordingCaptureKind, IdeRecordingState, IdeRecordingTake, IdeRunningObservation, IdeScene,
+    IdeWorkerCommand, IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent,
+    IdeWorkerEventReceiveError, IdeWorkerJoinError, IdeWorkerPendingShutdownWait,
+    IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, IdeWorkerStartError,
+    MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS, desktop_ide_worker_supervisor_snapshot,
 };
 
 const DESKTOP_MAXIMUM_BLOCK_FRAMES: usize = 4_096;

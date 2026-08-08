@@ -17,7 +17,8 @@ use hyper_project_loader::{
 };
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
-    ProjectResourcePublicationRequest, publish_project_resource, verify_project_package,
+    ProjectCreationRequest, ProjectResourcePublicationRequest, create_project,
+    publish_project_resource, verify_project_package,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -358,6 +359,41 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.root).unwrap();
     }
+}
+
+#[test]
+fn newly_created_project_prepares_as_an_empty_recordable_session() {
+    let parent = std::env::temp_dir().join(format!(
+        "hyper-project-creation-loader-{}-{}",
+        std::process::id(),
+        NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&parent).unwrap();
+    let creation = create_project(
+        &parent,
+        ProjectCreationRequest {
+            directory_name: "Daily Session",
+            project_name: "Daily Session",
+        },
+    )
+    .unwrap();
+
+    let prepared = prepare_project_playback(creation.project().root(), limits()).unwrap();
+    let (project, mixer, automation, media) = prepared.session().parts();
+
+    assert_eq!(project.track_count(), 1);
+    assert_eq!(project.track_name_at(0), Some("Audio 1"));
+    assert_eq!(project.clip_count(), 0);
+    assert_eq!(mixer.slots().len(), 1);
+    assert!(automation.is_none());
+    assert_eq!(media.asset_count(), 0);
+    assert_eq!(prepared.session().sample_rate_hz(), 48_000);
+    assert_eq!(prepared.session().media_asset_count(), 0);
+    prepared.package().confirm_unchanged().unwrap();
+
+    drop(prepared);
+    drop(creation);
+    fs::remove_dir_all(parent).unwrap();
 }
 
 #[test]

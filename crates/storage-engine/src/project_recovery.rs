@@ -171,7 +171,7 @@ pub fn recover_project_transactions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recording_import::ProjectLock;
+    use crate::project_lock::ProjectLock;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 

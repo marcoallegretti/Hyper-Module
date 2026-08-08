@@ -1,7 +1,7 @@
 use core::error::Error;
 use core::fmt;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use cap_fs_ext::OpenOptionsMaybeDirExt;
@@ -17,12 +17,12 @@ use super::{
     MANIFEST_NAME, StructurallyVerifiedProject, open_stable_project_root, same_directory,
     verify_project_candidate, verify_project_package,
 };
+use crate::project_lock::ProjectLock;
 
 const MAX_RECORDING_BYTES: u64 = u32::MAX as u64;
 const MAX_MANIFEST_BYTES: usize = 1_048_576;
 const MAX_HANDOFF_BYTES: usize = 2 * 1_048_576;
 const MAX_HANDOFF_PATH_BYTES: usize = 4_096;
-const LOCK_NAME: &str = "project-storage.lock";
 const TRANSACTION_PREFIX: &str = ".recording-import-";
 const TRANSACTION_INTENT_NAME: &str = "intent.json";
 const TRANSACTION_INTENT_STAGING_NAME: &str = ".intent.json.tmp";
@@ -241,7 +241,8 @@ pub fn recover_recording_imports(
     let Some(backups) = open_optional_dir(&root_dir, "backups")? else {
         return Ok(Vec::new());
     };
-    let _lock = ProjectLock::acquire(&backups)?;
+    let _lock = ProjectLock::acquire(&backups)
+        .map_err(|error| caused("acquire project storage lock", error))?;
     let mut transaction_names = Vec::new();
     let entries = backups
         .entries()
@@ -320,7 +321,8 @@ fn import_recording_observed(
     )?;
 
     let backups = open_or_create_dir(&verified.root_dir, "backups")?;
-    let _lock = ProjectLock::acquire(&backups)?;
+    let _lock = ProjectLock::acquire(&backups)
+        .map_err(|error| caused("acquire project storage lock", error))?;
     verified
         .confirm_unchanged()
         .map_err(|error| caused("project changed before import", error))?;
@@ -1222,40 +1224,6 @@ fn hex_digest(digest: [u8; 32]) -> String {
         write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
     }
     output
-}
-
-pub(crate) struct ProjectLock {
-    _file: File,
-}
-
-impl ProjectLock {
-    pub(crate) fn acquire(backups: &Dir) -> Result<Self, RecordingImportError> {
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        let capability_file = backups
-            .open_with(LOCK_NAME, &options)
-            .map_err(|error| caused("acquire project storage lock", error))?;
-        let mut file = capability_file.into_std();
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(failure("another project storage transaction is active"));
-            }
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(caused("lock project storage transaction", error));
-            }
-        }
-        file.set_len(0)
-            .map_err(|error| caused("reset project storage lock", error))?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|error| caused("position project storage lock", error))?;
-        file.write_all(b"hyper-project-storage-lock-v2\n")
-            .map_err(|error| caused("write project storage lock", error))?;
-        file.sync_all()
-            .map_err(|error| caused("sync project storage lock", error))?;
-        sync_dir(backups)?;
-        Ok(Self { _file: file })
-    }
 }
 
 #[cfg(test)]

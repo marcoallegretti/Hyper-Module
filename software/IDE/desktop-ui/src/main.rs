@@ -219,6 +219,83 @@ fn bind_callbacks(
 
     bind_input_selection_callbacks(ui, worker, input_routes);
 
+    bind_project_callbacks(ui, worker);
+
+    bind_playback_callbacks(ui, worker, project_state);
+    bind_monitoring_callbacks(ui, worker);
+    bind_recording_callbacks(ui, worker, recording_routes);
+    bind_audio_preview_callbacks(ui, worker, take_routes);
+}
+
+fn bind_project_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    bind_project_creation_callback(ui, worker);
+    bind_project_open_callback(ui, worker);
+}
+
+fn bind_project_creation_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+
+    let weak = ui.as_weak();
+    let worker_for_creation = Rc::clone(worker);
+    actions.on_create_project(move |project_name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Closed || !ui.get_new_project_visible() {
+            return;
+        }
+        let project_name = project_name.to_string();
+        if project_name.is_empty() {
+            ui.set_error_text("Enter a project name before choosing its location".into());
+            return;
+        }
+        ui.set_app_mode(AppMode::Selecting);
+        ui.set_error_text(SharedString::default());
+        ui.set_status_text("Waiting for the new project parent folder…".into());
+        let weak_for_dialog = weak.clone();
+        let weak_for_error = weak.clone();
+        let worker = Rc::clone(&worker_for_creation);
+        let spawn_result = slint::spawn_local(async move {
+            let selection = rfd::AsyncFileDialog::new()
+                .set_title("Choose parent folder for the new Hyper Module project")
+                .pick_folder()
+                .await;
+            let Some(ui) = weak_for_dialog.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::Selecting || !ui.get_new_project_visible() {
+                return;
+            }
+            let Some(selection) = selection else {
+                ui.set_app_mode(AppMode::Closed);
+                ui.set_status_text("New project creation cancelled".into());
+                return;
+            };
+            let parent = selection.path().to_path_buf();
+            let project_path = parent.join(&project_name);
+            ui.set_project_location(project_path.to_string_lossy().into_owned().into());
+            submit_to_ui(
+                &ui,
+                &worker,
+                IdeWorkerCommand::CreateProject {
+                    parent,
+                    directory_name: project_name.clone(),
+                    project_name,
+                },
+            );
+        });
+        if let Err(error) = spawn_result
+            && let Some(ui) = weak_for_error.upgrade()
+            && ui.get_app_mode() == AppMode::Selecting
+        {
+            ui.set_app_mode(AppMode::Closed);
+            ui.set_error_text(format!("Project location dialog could not start: {error}").into());
+        }
+    });
+}
+
+fn bind_project_open_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_project = Rc::clone(worker);
     actions.on_choose_project(move || {
@@ -264,11 +341,6 @@ fn bind_callbacks(
             ui.set_error_text(format!("Project dialog could not start: {error}").into());
         }
     });
-
-    bind_playback_callbacks(ui, worker, project_state);
-    bind_monitoring_callbacks(ui, worker);
-    bind_recording_callbacks(ui, worker, recording_routes);
-    bind_audio_preview_callbacks(ui, worker, take_routes);
 }
 
 fn bind_output_test_callbacks(ui: &MainWindow, worker: &WorkerCell) {
@@ -940,6 +1012,7 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 IdeWorkerCommandKind::StopOutputTest => {
                     ui.set_app_mode(AppMode::StoppingOutputTest);
                 }
+                IdeWorkerCommandKind::CreateProject => ui.set_app_mode(AppMode::Creating),
                 IdeWorkerCommandKind::SaveProject => ui.set_app_mode(AppMode::Saving),
                 IdeWorkerCommandKind::StartRecording => {
                     ui.set_app_mode(AppMode::PreparingRecording);
@@ -984,6 +1057,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::SelectInput => "Applying input cue selection…",
         IdeWorkerCommandKind::StartOutputTest => "Starting exclusive output diagnostic…",
         IdeWorkerCommandKind::StopOutputTest => "Stopping output diagnostic…",
+        IdeWorkerCommandKind::CreateProject => "Creating, verifying, and opening the new project…",
         IdeWorkerCommandKind::OpenProject => "Recovering and verifying project…",
         IdeWorkerCommandKind::Transport => "Transport command queued…",
         IdeWorkerCommandKind::Seek => "Bounded transport locate queued…",
@@ -1271,6 +1345,7 @@ fn apply_running_event(
     project_state: &ProjectUiStateCell,
     observation: &IdeRunningObservation,
 ) {
+    ui.set_new_project_visible(false);
     ui.set_project_name(observation.project_name().into());
     ui.set_project_id(observation.project_id().into());
     ui.set_sample_rate(format!("{} Hz", observation.sample_rate_hz()).into());
@@ -1965,6 +2040,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::RetryDiscovery if current == AppMode::Unavailable => {
             AppMode::Unavailable
         }
+        IdeWorkerCommandKind::CreateProject if current == AppMode::Creating => AppMode::Closed,
         IdeWorkerCommandKind::OpenProject if current == AppMode::Opening => AppMode::Closed,
         IdeWorkerCommandKind::Observe if current == AppMode::Opening => AppMode::Running,
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
@@ -2357,6 +2433,11 @@ fn mode_after_submission_failure(
 ) -> AppMode {
     match failure {
         UiSubmissionFailure::Disconnected => AppMode::Unavailable,
+        UiSubmissionFailure::Full
+            if current == AppMode::Creating && command == IdeWorkerCommandKind::CreateProject =>
+        {
+            AppMode::Closed
+        }
         UiSubmissionFailure::Full
             if current == AppMode::Opening && command == IdeWorkerCommandKind::OpenProject =>
         {
@@ -2780,6 +2861,10 @@ mod tests {
             AppMode::Closed
         );
         assert_eq!(
+            mode_after_failure(AppMode::Creating, IdeWorkerCommandKind::CreateProject),
+            AppMode::Closed
+        );
+        assert_eq!(
             mode_after_failure(AppMode::Closing, IdeWorkerCommandKind::CloseProject),
             AppMode::Running
         );
@@ -2856,6 +2941,14 @@ mod tests {
         );
         assert_eq!(
             mode_after_submission_failure(
+                AppMode::Creating,
+                IdeWorkerCommandKind::CreateProject,
+                UiSubmissionFailure::Full,
+            ),
+            AppMode::Closed
+        );
+        assert_eq!(
+            mode_after_submission_failure(
                 AppMode::Running,
                 IdeWorkerCommandKind::Transport,
                 UiSubmissionFailure::Full,
@@ -2866,6 +2959,14 @@ mod tests {
             mode_after_submission_failure(
                 AppMode::Opening,
                 IdeWorkerCommandKind::OpenProject,
+                UiSubmissionFailure::Disconnected,
+            ),
+            AppMode::Unavailable
+        );
+        assert_eq!(
+            mode_after_submission_failure(
+                AppMode::Creating,
+                IdeWorkerCommandKind::CreateProject,
                 UiSubmissionFailure::Disconnected,
             ),
             AppMode::Unavailable

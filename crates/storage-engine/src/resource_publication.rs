@@ -12,7 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::recording_import::ProjectLock;
+use super::project_lock::ProjectLock;
 use super::stable_file::read_open_stable;
 use super::{
     MANIFEST_NAME, MAX_JSON_BYTES, MAX_JSON_FILE_BYTES, StructurallyVerifiedProject,

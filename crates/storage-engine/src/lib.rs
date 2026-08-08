@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 
 mod mapping_publication;
+mod project_creation;
+mod project_lock;
 mod project_recovery;
 mod recording_import;
 mod resource_publication;
@@ -12,6 +14,10 @@ pub use mapping_publication::{
     ControlMappingPublicationOutcome, ControlMappingPublicationRecovery,
     ControlMappingPublicationRecoveryDisposition, ControlMappingPublicationRequest,
     publish_control_mapping, recover_control_mapping_publications,
+};
+pub use project_creation::{
+    ProjectCreationError, ProjectCreationErrorKind, ProjectCreationOutcome, ProjectCreationRequest,
+    create_project,
 };
 pub use project_recovery::{
     ProjectTransactionRecoveryError, ProjectTransactionRecoveryErrorSource,
@@ -656,7 +662,7 @@ fn directory_handle(directory: &Dir) -> Result<Handle, StorageError> {
     Handle::from_file(file).map_err(|error| io_error(".", "inspect project root handle", error))
 }
 
-fn same_directory(left: &Dir, right: &Dir) -> Result<bool, StorageError> {
+pub(crate) fn same_directory(left: &Dir, right: &Dir) -> Result<bool, StorageError> {
     Ok(directory_handle(left)? == directory_handle(right)?)
 }
 

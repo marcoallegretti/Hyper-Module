@@ -1,9 +1,10 @@
-import { Button, ComboBox, ListView, Slider } from "std-widgets.slint";
+import { Button, ComboBox, LineEdit, ListView, Slider } from "std-widgets.slint";
 
 export enum AppMode {
     discovering,
     closed,
     selecting,
+    creating,
     opening,
     starting-output-test,
     output-testing,
@@ -84,6 +85,7 @@ export global IdeActions {
     callback select-input(int);
     callback monitor-gain(float);
     callback monitor-mute();
+    callback create-project(string);
     callback choose-project();
     callback transport-start();
     callback transport-stop();
@@ -201,6 +203,8 @@ export component MainWindow inherits Window {
     in property <string> monitoring-underflow-count: "0";
     in property <string> project-location: "No project selected";
     in property <string> project-name: "No project open";
+    in-out property <bool> new-project-visible: false;
+    in-out property <string> new-project-name: "Untitled Project";
     in property <string> project-id: "—";
     in property <string> sample-rate: "—";
     in property <string> scene-count: "—";
@@ -310,6 +314,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.output-testing ? "●  OUTPUT TEST"
                         : root.app-mode == AppMode.stopping-output-test ? "◌  STOPPING TEST"
                         : root.app-mode == AppMode.running ? "●  RUNNING"
+                        : root.app-mode == AppMode.creating ? "◌  CREATING"
                         : root.app-mode == AppMode.opening ? "◌  OPENING"
                         : root.app-mode == AppMode.saving ? "◌  SAVING"
                         : root.app-mode == AppMode.selecting ? "◌  SELECTING"
@@ -456,15 +461,60 @@ export component MainWindow inherits Window {
                         padding: 14px;
                         spacing: 8px;
                         Text { text: "PROJECT"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                        Text { text: root.project-name; color: #edf2f8; font-size: 18px; font-weight: 600; overflow: elide; }
-                        Text { text: root.project-location; color: #8290a2; font-size: 11px; wrap: word-wrap; vertical-stretch: 1; }
-                        Button {
-                            text: root.app-mode == AppMode.selecting ? "Selecting project…"
-                                : root.app-mode == AppMode.opening ? "Opening project…" : "Choose project folder";
-                            enabled: root.app-mode == AppMode.closed;
-                            clicked => { IdeActions.choose-project(); }
+                        if root.new-project-visible : VerticalLayout {
+                            vertical-stretch: 1;
+                            spacing: 6px;
+                            Text { text: "NEW PROJECT NAME"; color: #65758a; font-size: 9px; font-weight: 700; letter-spacing: 0.6px; }
+                            LineEdit {
+                                text <=> root.new-project-name;
+                                enabled: root.app-mode == AppMode.closed;
+                                accessible-label: "New project name";
+                            }
+                            Text {
+                                text: "48 kHz · 120 BPM · 4/4 · one audio track";
+                                color: #728196;
+                                font-size: 9px;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Button {
+                                    text: "Cancel";
+                                    enabled: root.app-mode == AppMode.closed;
+                                    clicked => { root.new-project-visible = false; }
+                                }
+                                Button {
+                                    horizontal-stretch: 1;
+                                    text: root.app-mode == AppMode.selecting ? "Selecting location…"
+                                        : root.app-mode == AppMode.creating ? "Creating project…"
+                                        : "Choose location & create";
+                                    enabled: root.app-mode == AppMode.closed && root.new-project-name != "";
+                                    clicked => { IdeActions.create-project(root.new-project-name); }
+                                }
+                            }
                         }
-                        HorizontalLayout {
+                        if !root.new-project-visible : VerticalLayout {
+                            vertical-stretch: 1;
+                            spacing: 8px;
+                            Text { text: root.project-name; color: #edf2f8; font-size: 18px; font-weight: 600; overflow: elide; }
+                            Text { text: root.project-location; color: #8290a2; font-size: 11px; wrap: word-wrap; vertical-stretch: 1; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Button {
+                                    text: "New project";
+                                    enabled: root.app-mode == AppMode.closed;
+                                    clicked => { root.new-project-visible = true; }
+                                }
+                                Button {
+                                    horizontal-stretch: 1;
+                                    text: root.app-mode == AppMode.selecting ? "Selecting project…"
+                                        : root.app-mode == AppMode.opening ? "Opening project…" : "Open project folder";
+                                    enabled: root.app-mode == AppMode.closed;
+                                    clicked => { IdeActions.choose-project(); }
+                                }
+                            }
+                        }
+                        if !root.new-project-visible : HorizontalLayout {
                             spacing: 8px;
                             Button {
                                 text: root.app-mode == AppMode.saving ? "Saving…" : "Save project";
@@ -477,8 +527,8 @@ export component MainWindow inherits Window {
                                 clicked => { IdeActions.close-project(); }
                             }
                         }
-                        Text { text: "Verified identity"; color: #65758a; font-size: 10px; }
-                        Text { text: root.project-id; color: #b9c5d3; font-size: 11px; overflow: elide; }
+                        if !root.new-project-visible : Text { text: "Verified identity"; color: #65758a; font-size: 10px; }
+                        if !root.new-project-visible : Text { text: root.project-id; color: #b9c5d3; font-size: 11px; overflow: elide; }
                         Rectangle { height: 1px; background: #27313d; }
                         Text { text: "CAPTURE TAKE"; color: #6f8197; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
                         ComboBox {
