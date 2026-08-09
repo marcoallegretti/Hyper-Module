@@ -48,17 +48,18 @@ use hyper_mixer_runtime::{
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
 pub use hyper_playback_json::is_native_audio_clip_gain_decibels as ide_audio_clip_gain_is_supported;
 use hyper_playback_json::{
-    ArrangementPlacementDocumentSerializationError, AudioClipDocumentSerializationError,
-    AudioClipGainSerializationError, AudioTrackAdditionSerializationError,
-    AudioTrackDocumentSerializationError, AudioTrackRemovalBlockers,
-    AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError, CompiledMixerTap,
-    CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
-    MixerSendBaseState, MixerStateSerializationError, serialize_arrangement_placement_activation,
-    serialize_arrangement_placement_addition, serialize_arrangement_placement_duration,
-    serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
-    serialize_arrangement_placement_removal, serialize_audio_clip_activation,
-    serialize_audio_clip_gain, serialize_audio_track_activation, serialize_audio_track_addition,
-    serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
+    ArrangementPlacementDocumentSerializationError, AudioClipAdditionSerializationError,
+    AudioClipDocumentSerializationError, AudioClipGainSerializationError,
+    AudioTrackAdditionSerializationError, AudioTrackDocumentSerializationError,
+    AudioTrackRemovalBlockers, AudioTrackRemovalSerializationError,
+    AudioTrackRenameSerializationError, CompiledMixerTap, CompiledMixerTrackKind, LoaderLimits,
+    MixerBaseState, MixerChannelBaseState, MixerSendBaseState, MixerStateSerializationError,
+    serialize_arrangement_placement_activation, serialize_arrangement_placement_addition,
+    serialize_arrangement_placement_duration, serialize_arrangement_placement_front_trim,
+    serialize_arrangement_placement_move, serialize_arrangement_placement_removal,
+    serialize_audio_clip_activation, serialize_audio_clip_gain, serialize_audio_track_activation,
+    serialize_audio_track_addition, serialize_audio_track_removal, serialize_audio_track_rename,
+    serialize_mixer_base_state, serialize_recording_audio_clip_addition,
 };
 use hyper_playback_session::{AudioClipGainValidationError, PlaybackSessionAssemblyLimits};
 pub use hyper_playback_session::{
@@ -67,10 +68,11 @@ pub use hyper_playback_session::{
 use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackLimits};
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
-    ArrangementPublicationRequest, AudioTrackPublicationOutcome, AudioTrackPublicationRequest,
-    AudioTrackRemovalOutcome, AudioTrackRemovalRequest, ProjectResourcePublicationError,
-    ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest, StorageError,
-    publish_arrangement, publish_audio_track, publish_project_resource, remove_audio_track,
+    ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
+    AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
+    AudioTrackRemovalRequest, ProjectResourcePublicationError, ProjectResourcePublicationOutcome,
+    ProjectResourcePublicationRequest, StorageError, publish_arrangement, publish_audio_clip,
+    publish_audio_track, publish_project_resource, remove_audio_track,
 };
 
 mod recording;
@@ -2125,6 +2127,168 @@ impl Error for IdeAudioTrackEditError {
 }
 
 #[derive(Debug)]
+pub enum IdeRecordingClipCreationPublicationError {
+    Mixer(Box<ProjectResourcePublicationError>),
+    Clip {
+        mixer: Box<ProjectResourcePublicationOutcome>,
+        source: Box<ProjectResourcePublicationError>,
+    },
+}
+
+impl fmt::Display for IdeRecordingClipCreationPublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mixer(source) if source.published() => write!(
+                formatter,
+                "live mixer was preserved, but its project transaction cleanup is incomplete: {source}"
+            ),
+            Self::Mixer(source) => write!(
+                formatter,
+                "live mixer could not be preserved before creating the audio clip: {source}"
+            ),
+            Self::Clip { source, .. } if source.published() => write!(
+                formatter,
+                "audio clip was created, but its project transaction cleanup is incomplete: {source}"
+            ),
+            Self::Clip { mixer, source } if mixer.changed() => write!(
+                formatter,
+                "live mixer was preserved in project revision {} but audio-clip creation failed: {source}",
+                mixer.project_revision()
+            ),
+            Self::Clip { source, .. } => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeRecordingClipCreationPublicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Mixer(source) | Self::Clip { source, .. } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeRecordingClipCreationError {
+    InvalidRecordingIdentity,
+    InvalidClipName,
+    MixerSave(Box<IdeProjectSaveError>),
+    RecordingMetadataMissing,
+    RecordingMetadataAmbiguous,
+    TrackResourceMissing,
+    TrackResourceRoleMismatch,
+    Storage(StorageError),
+    Serialization(AudioClipAdditionSerializationError),
+    CapacityUnavailable,
+    Publication(Box<IdeRecordingClipCreationPublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeRecordingClipCreationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: AudioClipPublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<IdeRecordingClipCreationPublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl fmt::Display for IdeRecordingClipCreationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRecordingIdentity => {
+                formatter.write_str("audio-clip creation requires a recorded-take identity")
+            }
+            Self::InvalidClipName => {
+                formatter.write_str("audio-clip name must contain 1 through 120 characters")
+            }
+            Self::MixerSave(source) => {
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
+            }
+            Self::RecordingMetadataMissing => {
+                formatter.write_str("the selected recorded take is no longer present")
+            }
+            Self::RecordingMetadataAmbiguous => {
+                formatter.write_str("the selected recorded-take identity is ambiguous")
+            }
+            Self::TrackResourceMissing => {
+                formatter.write_str("the recorded take's owning track is no longer present")
+            }
+            Self::TrackResourceRoleMismatch => {
+                formatter.write_str("the recorded take's owner is not a structural track")
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("recorded-take audio-clip creation capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before creating the audio clip: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before creating the audio clip ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-clip creation preparation failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "audio clip {} was created in project revision {} but the project could not be reopened: {source}",
+                outcome.clip_id(),
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-clip creation failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeRecordingClipCreationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidRecordingIdentity
+            | Self::InvalidClipName
+            | Self::RecordingMetadataMissing
+            | Self::RecordingMetadataAmbiguous
+            | Self::TrackResourceMissing
+            | Self::TrackResourceRoleMismatch
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum IdeArrangementPlacementEditPublicationError {
     Mixer(Box<ProjectResourcePublicationError>),
     Arrangement {
@@ -2536,6 +2700,16 @@ struct IdeMixerSavePlan {
 }
 
 #[derive(Debug)]
+struct IdeRecordingClipCreationPlan {
+    mixer: IdeMixerSavePlan,
+    clip_id: String,
+    clip_bytes: Vec<u8>,
+    track_id: String,
+    track_bytes: Vec<u8>,
+    asset_id: String,
+}
+
+#[derive(Debug)]
 struct IdeAudioTrackAdditionPlan {
     project_path: PathBuf,
     expected_project_sha256: [u8; 32],
@@ -2672,6 +2846,32 @@ impl IdeAudioClipEditPlan {
             },
         )
         .map_err(|source| IdeAudioClipEditPublicationError::Clip {
+            mixer: Box::new(mixer),
+            source: Box::new(source),
+        })
+    }
+}
+
+impl IdeRecordingClipCreationPlan {
+    fn publish(
+        &self,
+    ) -> Result<AudioClipPublicationOutcome, IdeRecordingClipCreationPublicationError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeRecordingClipCreationPublicationError::Mixer(Box::new(source)))?;
+        publish_audio_clip(
+            &self.mixer.project_path,
+            AudioClipPublicationRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                clip_id: &self.clip_id,
+                clip_bytes: &self.clip_bytes,
+                track_id: &self.track_id,
+                track_bytes: &self.track_bytes,
+                asset_id: &self.asset_id,
+            },
+        )
+        .map_err(|source| IdeRecordingClipCreationPublicationError::Clip {
             mixer: Box::new(mixer),
             source: Box::new(source),
         })
@@ -3268,6 +3468,88 @@ impl RunningDesktopIdeApplication {
                 )
             },
         )
+    }
+
+    fn prepare_recording_clip_creation(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        recording_id: &str,
+        clip_name: &str,
+    ) -> Result<IdeRecordingClipCreationPlan, IdeRecordingClipCreationError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeRecordingClipCreationError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeRecordingClipCreationError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let mut recordings = prepared
+            .recording_metadata()
+            .iter()
+            .filter(|metadata| metadata.id() == recording_id);
+        let metadata = recordings
+            .next()
+            .ok_or(IdeRecordingClipCreationError::RecordingMetadataMissing)?;
+        if recordings.next().is_some() {
+            return Err(IdeRecordingClipCreationError::RecordingMetadataAmbiguous);
+        }
+        let package = prepared.package();
+        let track_descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == metadata.track_id())
+            .ok_or(IdeRecordingClipCreationError::TrackResourceMissing)?;
+        if track_descriptor.role() != ResourceRole::Track {
+            return Err(IdeRecordingClipCreationError::TrackResourceRoleMismatch);
+        }
+        let source_track = package
+            .read_resource(metadata.track_id())
+            .map_err(IdeRecordingClipCreationError::Storage)?;
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeRecordingClipCreationError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let clip_id = uuid::Uuid::new_v4().to_string();
+        let documents = serialize_recording_audio_clip_addition(
+            project,
+            &assets,
+            &source_track,
+            metadata.track_id(),
+            metadata.asset_id(),
+            metadata.timeline_start_tick(),
+            metadata.frame_count(),
+            &clip_id,
+            clip_name,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(|source| match source {
+            AudioClipAdditionSerializationError::InvalidClipName => {
+                IdeRecordingClipCreationError::InvalidClipName
+            }
+            source => IdeRecordingClipCreationError::Serialization(source),
+        })?;
+        let (track_bytes, clip_bytes, _duration_ticks) = documents.into_parts();
+        let mut track_id = String::new();
+        let mut asset_id = String::new();
+        track_id
+            .try_reserve_exact(metadata.track_id().len())
+            .map_err(|_| IdeRecordingClipCreationError::CapacityUnavailable)?;
+        asset_id
+            .try_reserve_exact(metadata.asset_id().len())
+            .map_err(|_| IdeRecordingClipCreationError::CapacityUnavailable)?;
+        track_id.push_str(metadata.track_id());
+        asset_id.push_str(metadata.asset_id());
+        Ok(IdeRecordingClipCreationPlan {
+            mixer,
+            clip_id,
+            clip_bytes,
+            track_id,
+            track_bytes,
+            asset_id,
+        })
     }
 
     fn prepare_arrangement_placement_addition(
@@ -5405,6 +5687,120 @@ mod tests {
             reopened.package().read_resource(&arrangement_id).unwrap(),
             removed_arrangement
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the end-to-end test keeps recording import, clip publication, reopen, and non-placement evidence together"
+    )]
+    fn recorded_take_clip_plan_publishes_and_reopens_without_arrangement_placement() {
+        const METADATA_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338520";
+        const ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338521";
+        const CLIP_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338522";
+        let parent = TestDirectory::new();
+        let created = hyper_storage_engine::create_project(
+            &parent.0,
+            hyper_storage_engine::ProjectCreationRequest {
+                directory_name: "Project",
+                project_name: "Recorded Take Clip Test",
+            },
+        )
+        .unwrap();
+        let project_path = created.project().root().to_path_buf();
+        let project_id = created.project().manifest().project_id().to_owned();
+        let track_id = created
+            .project()
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Track)
+            .unwrap()
+            .id()
+            .to_owned();
+        drop(created);
+        let recording = arrangement_test_wav(&[0; 63]);
+        let recording_path = parent.0.join("capture.wav");
+        std::fs::write(&recording_path, &recording).unwrap();
+        let metadata = arrangement_test_canonical(&json!({
+            "format":"hyper-recording-metadata", "format_version":1,
+            "id":METADATA_ID, "project_id":project_id, "asset_id":ASSET_ID,
+            "track_id":track_id, "capture_kind":"new",
+            "captured_at_utc":"2026-08-09T12:00:00.000Z",
+            "timeline_start_tick":0, "source_input_indices":[0],
+            "sample_rate_hz":48_000, "channels":1, "frame_count":63,
+            "extensions":{}
+        }));
+        hyper_storage_engine::import_recording(
+            &project_path,
+            hyper_storage_engine::RecordingImportRequest {
+                recording_path: &recording_path,
+                recording_byte_length: recording.len() as u64,
+                recording_sha256: Sha256::digest(&recording).into(),
+                metadata_bytes: &metadata,
+            },
+        )
+        .unwrap();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let source_mixer = package.read_resource(mixer.id()).unwrap();
+        let source_track = package.read_resource(&track_id).unwrap();
+        let (project, _, _, media) = prepared.session().parts();
+        let assets: Vec<_> = media.media_asset_facts().collect();
+        let documents = serialize_recording_audio_clip_addition(
+            project,
+            &assets,
+            &source_track,
+            &track_id,
+            ASSET_ID,
+            0,
+            63,
+            CLIP_ID,
+            "Vocal take",
+            limits.session.documents,
+        )
+        .unwrap();
+        let (track_bytes, clip_bytes, duration_ticks) = documents.into_parts();
+        let plan = IdeRecordingClipCreationPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: *package.manifest_sha256(),
+                resource_id: mixer.id().to_owned(),
+                resource_bytes: source_mixer,
+            },
+            clip_id: CLIP_ID.to_owned(),
+            clip_bytes,
+            track_id: track_id.clone(),
+            track_bytes,
+            asset_id: ASSET_ID.to_owned(),
+        };
+        drop(prepared);
+
+        let outcome = plan.publish().unwrap();
+
+        assert_eq!(outcome.project_revision(), 3);
+        assert_eq!(outcome.clip_id(), CLIP_ID);
+        assert_eq!(duration_ticks, 6);
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let (project, _, _, _) = reopened.session().parts();
+        assert_eq!(project.clip_count(), 1);
+        assert_eq!(project.placement_count(), 0);
+        let track: Value =
+            serde_json::from_slice(&reopened.package().read_resource(&track_id).unwrap()).unwrap();
+        assert_eq!(track["clip_ids"], json!([CLIP_ID]));
+        let clip: Value =
+            serde_json::from_slice(&reopened.package().read_resource(CLIP_ID).unwrap()).unwrap();
+        assert_eq!(clip["source"]["asset_id"], ASSET_ID);
+        assert_eq!(clip["duration_ticks"], duration_ticks);
     }
 
     #[test]
