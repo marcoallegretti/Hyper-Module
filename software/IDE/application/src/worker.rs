@@ -538,6 +538,7 @@ pub struct IdeAudioClip {
     name: String,
     track_id: String,
     track_name: String,
+    duration_ticks: u64,
     active: bool,
     gain_decibels: f64,
 }
@@ -561,6 +562,11 @@ impl IdeAudioClip {
     #[must_use]
     pub fn track_name(&self) -> &str {
         &self.track_name
+    }
+
+    #[must_use]
+    pub const fn duration_ticks(&self) -> u64 {
+        self.duration_ticks
     }
 
     #[must_use]
@@ -4731,6 +4737,10 @@ fn running_observation(
             )?,
             track_id: try_project_owned(track_id)?,
             track_name: try_project_owned(track_name)?,
+            duration_ticks: snapshot
+                .loaded
+                .clip_duration_ticks_at(clip_index)
+                .ok_or(IdeWorkerCommandFailure::ProjectSnapshotUnavailable)?,
             active: snapshot
                 .loaded
                 .clip_active_at(clip_index)

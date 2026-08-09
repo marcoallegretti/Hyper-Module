@@ -2647,6 +2647,12 @@ impl LoadedPlaybackProject {
             .map(|clip| clip.track_id.as_str())
     }
 
+    /// Returns the complete reusable clip duration in project ticks.
+    #[must_use]
+    pub fn clip_duration_ticks_at(&self, clip_index: usize) -> Option<u64> {
+        self.clips.get(clip_index).map(|clip| clip.duration_ticks)
+    }
+
     /// Returns the persisted global activation state for one audio clip.
     #[must_use]
     pub fn clip_active_at(&self, clip_index: usize) -> Option<bool> {

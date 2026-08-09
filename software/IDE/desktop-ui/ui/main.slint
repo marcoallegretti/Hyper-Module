@@ -14,6 +14,7 @@ export enum AppMode {
     removing-track,
     renaming-track,
     changing-track-activation,
+    adding-arrangement-placement,
     changing-arrangement-activation,
     moving-arrangement-placement,
     trimming-arrangement-placement,
@@ -99,6 +100,7 @@ export struct ClipRow {
     id: string,
     name: string,
     track-name: string,
+    duration-ticks: string,
     active: bool,
     gain-label: string,
     gain-edit: string,
@@ -126,6 +128,7 @@ export global IdeActions {
     callback set-arrangement-placement-duration(string, string);
     callback trim-arrangement-placement-front(string, string);
     callback remove-arrangement-placement(string);
+    callback add-arrangement-placement(string, string);
     callback set-audio-clip-active(string, bool);
     callback set-audio-clip-gain(string, string);
     callback loudness-run();
@@ -273,6 +276,12 @@ export component MainWindow inherits Window {
     in-out property <string> clip-gain-name: "";
     in-out property <string> clip-gain-original: "";
     in-out property <string> clip-gain-value: "";
+    in-out property <bool> add-arrangement-placement-visible: false;
+    in-out property <string> add-arrangement-placement-clip-id: "";
+    in-out property <string> add-arrangement-placement-clip-name: "";
+    in-out property <string> add-arrangement-placement-track-name: "";
+    in-out property <string> add-arrangement-placement-duration-ticks: "";
+    in-out property <string> add-arrangement-placement-start-tick: "0";
     in-out property <bool> loudness-visible: false;
     in-out property <bool> loudness-wide-scale: false;
     in-out property <bool> loudness-relative: false;
@@ -382,6 +391,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.removing-track ? "◌  REMOVING TRACK"
                         : root.app-mode == AppMode.renaming-track ? "◌  RENAMING TRACK"
                         : root.app-mode == AppMode.changing-track-activation ? "◌  UPDATING TRACK"
+                        : root.app-mode == AppMode.adding-arrangement-placement ? "◌  PLACING CLIP"
                         : root.app-mode == AppMode.changing-arrangement-activation ? "◌  UPDATING CLIP"
                         : root.app-mode == AppMode.moving-arrangement-placement ? "◌  MOVING CLIP"
                         : root.app-mode == AppMode.trimming-arrangement-placement ? "◌  TRIMMING CLIP"
@@ -1487,7 +1497,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && !root.clip-gain-visible : Panel {
+                if root.clips-visible && !root.clip-gain-visible && !root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1498,17 +1508,17 @@ export component MainWindow inherits Window {
                             height: 48px;
                             VerticalLayout {
                                 Text { text: "AUDIO CLIPS"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: "Reusable verified source views · global activation · constant non-destructive gain"; color: #aebccc; font-size: 12px; }
+                                Text { text: "Reusable verified source views · exact arrangement placement · global activation · constant gain"; color: #aebccc; font-size: 12px; }
                             }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Button {
                                 text: "Performance";
-                                clicked => { root.clips-visible = false; root.clip-gain-visible = false; }
+                                clicked => { root.clips-visible = false; root.clip-gain-visible = false; root.add-arrangement-placement-visible = false; }
                             }
                             Button {
                                 text: "Mixer";
                                 enabled: root.app-mode == AppMode.running;
-                                clicked => { root.clips-visible = false; root.clip-gain-visible = false; root.mixer-visible = true; }
+                                clicked => { root.clips-visible = false; root.clip-gain-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
                             }
                         }
 
@@ -1540,12 +1550,27 @@ export component MainWindow inherits Window {
                                         spacing: 2px;
                                         Text { text: clip.name; color: #edf2f8; font-size: 13px; font-weight: 600; overflow: elide; }
                                         Text { text: clip.track-name; color: #8290a2; font-size: 9px; overflow: elide; }
+                                        Text { text: clip.duration-ticks + " ticks · full reusable clip"; color: #65758a; font-size: 8px; overflow: elide; }
                                     }
                                     VerticalLayout {
                                         width: 118px;
                                         alignment: center;
                                         Text { text: "CLIP GAIN"; color: #65758a; font-size: 8px; horizontal-alignment: center; }
                                         Text { text: clip.gain-label; color: #b9c5d3; font-size: 13px; font-weight: 600; horizontal-alignment: center; }
+                                    }
+                                    Button {
+                                        width: 72px;
+                                        text: "Place";
+                                        accessible-label: "Place the full " + clip.name + " clip at an exact project tick";
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => {
+                                            root.add-arrangement-placement-clip-id = clip.id;
+                                            root.add-arrangement-placement-clip-name = clip.name;
+                                            root.add-arrangement-placement-track-name = clip.track-name;
+                                            root.add-arrangement-placement-duration-ticks = clip.duration-ticks;
+                                            root.add-arrangement-placement-start-tick = "0";
+                                            root.add-arrangement-placement-visible = true;
+                                        }
                                     }
                                     Button {
                                         width: 82px;
@@ -1572,7 +1597,7 @@ export component MainWindow inherits Window {
                         }
 
                         Text {
-                            text: "Activation and gain affect every arrangement placement and scene slot that references the clip. Track and mixer state remain unchanged.";
+                            text: "Place creates one full-length non-ripple arrangement reference. Activation and gain affect every existing reference. Track, mixer, and source media remain unchanged.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;
@@ -1580,7 +1605,59 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && root.clip-gain-visible : Panel {
+                if root.clips-visible && root.add-arrangement-placement-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 16px;
+                        Text { text: "PLACE CLIP IN ARRANGEMENT"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.add-arrangement-placement-clip-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                        Text {
+                            text: root.add-arrangement-placement-track-name + " · " + root.add-arrangement-placement-duration-ticks + " ticks";
+                            color: #aebccc;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: "Enter the exact project start tick. This creates one new, enabled placement of the complete reusable clip on its owning track.";
+                            color: #aebccc;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        LineEdit {
+                            text <=> root.add-arrangement-placement-start-tick;
+                            placeholder-text: "0";
+                            accessible-label: "Arrangement placement start tick";
+                        }
+                        Text {
+                            text: "The edit is non-ripple: existing placements keep their exact ticks. The reusable clip and immutable source audio are unchanged. Overlap and conflicting scene authority are rejected.";
+                            color: #65758a;
+                            font-size: 9px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Cancel"; clicked => { root.add-arrangement-placement-visible = false; } }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: "Place full clip";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.add-arrangement-placement-clip-id != ""
+                                    && root.add-arrangement-placement-start-tick != "";
+                                clicked => {
+                                    IdeActions.add-arrangement-placement(
+                                        root.add-arrangement-placement-clip-id,
+                                        root.add-arrangement-placement-start-tick
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.clips-visible && root.clip-gain-visible && !root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {

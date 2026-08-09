@@ -1377,6 +1377,53 @@ fn bind_audio_clip_callback(
             },
         );
     });
+
+    bind_arrangement_placement_addition_callback(ui, worker, project_state);
+}
+
+fn bind_arrangement_placement_addition_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_placement = Rc::clone(worker);
+    let project_state_for_placement = Rc::clone(project_state);
+    actions.on_add_arrangement_placement(move |clip_id, start_tick| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_add_arrangement_placement_visible()
+            || ui.get_add_arrangement_placement_clip_id() != clip_id
+        {
+            ui.set_error_text("Audio-clip placement selection is no longer current".into());
+            return;
+        }
+        let start_tick = match parse_arrangement_start_tick(start_tick.as_str()) {
+            Ok(start_tick) => start_tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let clips = project_state_for_placement.audio_clips.borrow();
+        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+            ui.set_error_text("The selected audio clip is no longer available".into());
+            return;
+        };
+        let owned_clip_id = clip.id().to_owned();
+        drop(clips);
+        submit_to_ui(
+            &ui,
+            &worker_for_placement,
+            IdeWorkerCommand::AddArrangementPlacement {
+                clip_id: owned_clip_id,
+                start_tick,
+            },
+        );
+    });
 }
 
 fn parse_audio_clip_gain(value: &str) -> Result<f64, &'static str> {
@@ -1568,6 +1615,10 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 IdeWorkerCommandKind::RemoveArrangementPlacement => {
                     ui.set_app_mode(AppMode::RemovingArrangementPlacement);
                 }
+                IdeWorkerCommandKind::AddArrangementPlacement => {
+                    ui.set_app_mode(AppMode::AddingArrangementPlacement);
+                    ui.set_add_arrangement_placement_visible(false);
+                }
                 IdeWorkerCommandKind::SetAudioClipActive => {
                     ui.set_app_mode(AppMode::ChangingClipActivation);
                 }
@@ -1652,6 +1703,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::RemoveArrangementPlacement => {
             "Preserving mixer state, removing the arrangement placement, and reopening project…"
+        }
+        IdeWorkerCommandKind::AddArrangementPlacement => {
+            "Preserving mixer state, placing the full audio clip, and reopening project…"
         }
         IdeWorkerCommandKind::SetAudioClipActive => {
             "Preserving mixer state, updating audio-clip activation, and reopening project…"
@@ -1779,6 +1833,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementPlacementRemoved { .. }
         | IdeWorkerEvent::ArrangementPlacementRemoving) => {
             apply_arrangement_placement_removal_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ArrangementPlacementAdded { .. }
+        | IdeWorkerEvent::ArrangementPlacementAdding { .. }) => {
+            apply_arrangement_placement_addition_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipActivationChanged { .. }
         | IdeWorkerEvent::AudioClipActivationChanging { .. }) => {
@@ -2084,6 +2142,39 @@ fn apply_arrangement_placement_removal_event(ui: &MainWindow, event: &IdeWorkerE
             );
         }
         _ => unreachable!("arrangement removal event dispatcher received another event"),
+    }
+}
+
+fn apply_arrangement_placement_addition_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ArrangementPlacementAdded {
+            revision,
+            start_tick,
+        } => {
+            ui.set_add_arrangement_placement_visible(false);
+            ui.set_add_arrangement_placement_clip_id(SharedString::default());
+            ui.set_add_arrangement_placement_clip_name(SharedString::default());
+            ui.set_add_arrangement_placement_track_name(SharedString::default());
+            ui.set_add_arrangement_placement_duration_ticks(SharedString::default());
+            ui.set_add_arrangement_placement_start_tick("0".into());
+            ui.set_status_text(
+                format!(
+                    "Placed the full audio clip at tick {start_tick} in project revision {revision}"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementPlacementAdding { start_tick } => {
+            ui.set_app_mode(AppMode::AddingArrangementPlacement);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before placing the full audio clip at tick {start_tick}…"
+                )
+                .into(),
+            );
+        }
+        _ => unreachable!("arrangement addition event dispatcher received another event"),
     }
 }
 
@@ -2728,6 +2819,7 @@ fn set_audio_clips(ui: &MainWindow, project_state: &ProjectUiStateCell, clips: &
             active: clip.active(),
             gain_label: format!("{:+.2} dB", clip.gain_decibels()).into(),
             gain_edit: format_audio_clip_gain(clip.gain_decibels()).into(),
+            duration_ticks: clip.duration_ticks().to_string().into(),
         })
         .collect();
     ui.set_audio_clips(ModelRc::from(Rc::new(VecModel::from(rows))));
@@ -3017,6 +3109,12 @@ fn reset_project(
     ui.set_remove_arrangement_placement_id(SharedString::default());
     ui.set_remove_arrangement_placement_clip_name(SharedString::default());
     ui.set_remove_arrangement_placement_track_name(SharedString::default());
+    ui.set_add_arrangement_placement_visible(false);
+    ui.set_add_arrangement_placement_clip_id(SharedString::default());
+    ui.set_add_arrangement_placement_clip_name(SharedString::default());
+    ui.set_add_arrangement_placement_track_name(SharedString::default());
+    ui.set_add_arrangement_placement_duration_ticks(SharedString::default());
+    ui.set_add_arrangement_placement_start_tick("0".into());
     ui.set_clips_visible(false);
     ui.set_clip_gain_visible(false);
     ui.set_clip_gain_id(SharedString::default());
@@ -3105,6 +3203,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         }
         IdeWorkerCommandKind::RemoveArrangementPlacement
             if current == AppMode::RemovingArrangementPlacement =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::AddArrangementPlacement
+            if current == AppMode::AddingArrangementPlacement =>
         {
             AppMode::Running
         }
@@ -4195,6 +4298,17 @@ mod tests {
             mode_after_failure(
                 AppMode::RemovingArrangementPlacement,
                 IdeWorkerCommandKind::RemoveArrangementPlacement,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn arrangement_addition_failure_restores_running_mode() {
+        assert_eq!(
+            mode_after_failure(
+                AppMode::AddingArrangementPlacement,
+                IdeWorkerCommandKind::AddArrangementPlacement,
             ),
             AppMode::Running
         );
