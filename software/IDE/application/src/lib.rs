@@ -47,10 +47,11 @@ use hyper_mixer_runtime::{
 #[cfg(test)]
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
 use hyper_playback_json::{
-    AudioTrackAdditionSerializationError, AudioTrackDocumentSerializationError,
-    AudioTrackRemovalBlockers, AudioTrackRemovalSerializationError,
-    AudioTrackRenameSerializationError, CompiledMixerTap, CompiledMixerTrackKind, LoaderLimits,
-    MixerBaseState, MixerChannelBaseState, MixerSendBaseState, MixerStateSerializationError,
+    ArrangementPlacementActivationSerializationError, AudioTrackAdditionSerializationError,
+    AudioTrackDocumentSerializationError, AudioTrackRemovalBlockers,
+    AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError, CompiledMixerTap,
+    CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
+    MixerSendBaseState, MixerStateSerializationError, serialize_arrangement_placement_activation,
     serialize_audio_track_activation, serialize_audio_track_addition,
     serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
 };
@@ -2119,6 +2120,152 @@ impl Error for IdeAudioTrackEditError {
 }
 
 #[derive(Debug)]
+pub enum IdeArrangementPlacementEditPublicationError {
+    Mixer(Box<ProjectResourcePublicationError>),
+    Arrangement {
+        mixer: Box<ProjectResourcePublicationOutcome>,
+        source: Box<ProjectResourcePublicationError>,
+    },
+}
+
+impl fmt::Display for IdeArrangementPlacementEditPublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mixer(source) if source.published() => write!(
+                formatter,
+                "live mixer was preserved, but its project transaction cleanup is incomplete: {source}"
+            ),
+            Self::Mixer(source) => write!(
+                formatter,
+                "live mixer could not be preserved before the arrangement edit: {source}"
+            ),
+            Self::Arrangement { source, .. } if source.published() => write!(
+                formatter,
+                "arrangement edit was published, but its project transaction cleanup is incomplete: {source}"
+            ),
+            Self::Arrangement { mixer, source } if mixer.changed() => write!(
+                formatter,
+                "live mixer was preserved in project revision {} but the arrangement edit failed: {source}",
+                mixer.project_revision()
+            ),
+            Self::Arrangement { source, .. } => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeArrangementPlacementEditPublicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Mixer(source) | Self::Arrangement { source, .. } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeArrangementPlacementEditError {
+    InvalidPlacementIdentity,
+    MixerSave(Box<IdeProjectSaveError>),
+    ArrangementResourceMissing,
+    ArrangementResourceAmbiguous,
+    Storage(StorageError),
+    Serialization(ArrangementPlacementActivationSerializationError),
+    CapacityUnavailable,
+    Publication(Box<IdeArrangementPlacementEditPublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeArrangementPlacementEditError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: ProjectResourcePublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<IdeArrangementPlacementEditPublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl fmt::Display for IdeArrangementPlacementEditError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPlacementIdentity => {
+                formatter.write_str("arrangement edit requires a placement identity")
+            }
+            Self::MixerSave(source) => {
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
+            }
+            Self::ArrangementResourceMissing => {
+                formatter.write_str("the verified project has no arrangement resource")
+            }
+            Self::ArrangementResourceAmbiguous => {
+                formatter.write_str("the verified project has multiple arrangement resources")
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("arrangement edit capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before editing the arrangement: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before editing the arrangement ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "arrangement edit preparation failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "arrangement was edited in project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "arrangement edit publication failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeArrangementPlacementEditError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidPlacementIdentity
+            | Self::ArrangementResourceMissing
+            | Self::ArrangementResourceAmbiguous
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct IdeMixerSavePlan {
     project_path: PathBuf,
     expected_project_sha256: [u8; 32],
@@ -2164,6 +2311,39 @@ struct IdeAudioTrackEditPlan {
     mixer: IdeMixerSavePlan,
     track_id: String,
     track_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct IdeArrangementPlacementEditPlan {
+    mixer: IdeMixerSavePlan,
+    arrangement_id: String,
+    arrangement_bytes: Vec<u8>,
+}
+
+impl IdeArrangementPlacementEditPlan {
+    fn publish(
+        &self,
+    ) -> Result<ProjectResourcePublicationOutcome, IdeArrangementPlacementEditPublicationError>
+    {
+        let mixer = self.mixer.publish().map_err(|source| {
+            IdeArrangementPlacementEditPublicationError::Mixer(Box::new(source))
+        })?;
+        publish_project_resource(
+            &self.mixer.project_path,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                resource_id: &self.arrangement_id,
+                expected_role: ResourceRole::Arrangement,
+                resource_bytes: &self.arrangement_bytes,
+            },
+        )
+        .map_err(
+            |source| IdeArrangementPlacementEditPublicationError::Arrangement {
+                mixer: Box::new(mixer),
+                source: Box::new(source),
+            },
+        )
+    }
 }
 
 impl IdeAudioTrackEditPlan {
@@ -2696,6 +2876,55 @@ impl RunningDesktopIdeApplication {
             mixer,
             track_id: owned_track_id,
             track_bytes,
+        })
+    }
+
+    fn prepare_arrangement_placement_activation(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        placement_id: &str,
+        active: bool,
+    ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeArrangementPlacementEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeArrangementPlacementEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let mut descriptors = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::Arrangement);
+        let descriptor = descriptors
+            .next()
+            .ok_or(IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
+        if descriptors.next().is_some() {
+            return Err(IdeArrangementPlacementEditError::ArrangementResourceAmbiguous);
+        }
+        let source = package
+            .read_resource(descriptor.id())
+            .map_err(IdeArrangementPlacementEditError::Storage)?;
+        let (project, _, _, _) = prepared.session().parts();
+        let arrangement_bytes = serialize_arrangement_placement_activation(
+            project,
+            &source,
+            placement_id,
+            active,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeArrangementPlacementEditError::Serialization)?;
+        let mut arrangement_id = String::new();
+        arrangement_id
+            .try_reserve_exact(descriptor.id().len())
+            .map_err(|_| IdeArrangementPlacementEditError::CapacityUnavailable)?;
+        arrangement_id.push_str(descriptor.id());
+        Ok(IdeArrangementPlacementEditPlan {
+            mixer,
+            arrangement_id,
+            arrangement_bytes,
         })
     }
 
