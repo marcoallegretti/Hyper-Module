@@ -1344,6 +1344,7 @@ fn bind_audio_clip_callback(
     project_state: &ProjectUiStateCell,
 ) {
     bind_audio_clip_rename_callback(ui, worker, project_state);
+    bind_audio_clip_duplication_callback(ui, worker, project_state);
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_activation = Rc::clone(worker);
@@ -1464,6 +1465,43 @@ fn bind_audio_clip_rename_callback(
     });
 }
 
+fn bind_audio_clip_duplication_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_duplication = Rc::clone(worker);
+    let project_state_for_duplication = Rc::clone(project_state);
+    actions.on_duplicate_audio_clip(move |clip_id, name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_clip_duplicate_visible()
+            || ui.get_clip_duplicate_id() != clip_id
+        {
+            ui.set_error_text("Audio-clip duplication selection is no longer current".into());
+            return;
+        }
+        let clips = project_state_for_duplication.audio_clips.borrow();
+        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+            ui.set_error_text("The selected audio clip is no longer available".into());
+            return;
+        };
+        let command = match audio_clip_duplication_command(clip.id(), name.as_str()) {
+            Ok(command) => command,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        drop(clips);
+        submit_to_ui(&ui, &worker_for_duplication, command);
+    });
+}
+
 fn bind_arrangement_placement_addition_callback(
     ui: &MainWindow,
     worker: &WorkerCell,
@@ -1530,6 +1568,17 @@ fn audio_clip_rename_command(
         clip_id: clip_id.to_owned(),
         name: name.to_owned(),
     }))
+}
+
+fn audio_clip_duplication_command(
+    source_clip_id: &str,
+    proposed_name: &str,
+) -> Result<IdeWorkerCommand, &'static str> {
+    let name = normalize_audio_clip_name(proposed_name)?;
+    Ok(IdeWorkerCommand::DuplicateAudioClip {
+        clip_id: source_clip_id.to_owned(),
+        name: name.to_owned(),
+    })
 }
 
 fn parse_audio_clip_gain(value: &str) -> Result<f64, &'static str> {
@@ -1822,6 +1871,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::RenameAudioClip => {
             "Preserving mixer state, renaming the audio clip, and reopening project…"
         }
+        IdeWorkerCommandKind::DuplicateAudioClip => {
+            "Preserving mixer state, duplicating the audio clip, and reopening project…"
+        }
         IdeWorkerCommandKind::SetAudioClipActive => {
             "Preserving mixer state, updating audio-clip activation, and reopening project…"
         }
@@ -1958,6 +2010,10 @@ fn apply_event(
         }
         event @ (IdeWorkerEvent::AudioClipRenamed { .. } | IdeWorkerEvent::AudioClipRenaming) => {
             apply_audio_clip_rename_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioClipDuplicated { .. }
+        | IdeWorkerEvent::AudioClipDuplicating) => {
+            apply_audio_clip_duplication_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipActivationChanged { .. }
         | IdeWorkerEvent::AudioClipActivationChanging { .. }) => {
@@ -2330,6 +2386,36 @@ fn apply_audio_clip_rename_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_error_text(SharedString::default());
         }
         _ => unreachable!("audio-clip rename event dispatcher received another event"),
+    }
+}
+
+fn apply_audio_clip_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioClipDuplicated {
+            revision,
+            clip_id,
+            name,
+        } => {
+            ui.set_clip_duplicate_visible(false);
+            ui.set_clip_duplicate_id(SharedString::default());
+            ui.set_clip_duplicate_source_name(SharedString::default());
+            ui.set_clip_duplicate_name(SharedString::default());
+            ui.set_status_text(
+                format!(
+                    "Reusable audio clip {name} ({clip_id}) duplicated in project revision {revision}; no media or arrangement placement was created"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipDuplicating => {
+            ui.set_app_mode(AppMode::DuplicatingClip);
+            ui.set_status_text(
+                "Waiting for native output before duplicating the reusable audio clip…".into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("audio-clip duplication event dispatcher received another event"),
     }
 }
 
@@ -3404,6 +3490,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::RenameAudioClip if current == AppMode::RenamingClip => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::DuplicateAudioClip if current == AppMode::DuplicatingClip => {
             AppMode::Running
         }
         IdeWorkerCommandKind::SetAudioClipActive if current == AppMode::ChangingClipActivation => {
@@ -4548,9 +4637,38 @@ mod tests {
     }
 
     #[test]
+    fn audio_clip_duplication_command_normalizes_name_and_preserves_source_identity() {
+        assert!(matches!(
+            audio_clip_duplication_command("clip-a", " Verse copy "),
+            Ok(IdeWorkerCommand::DuplicateAudioClip { clip_id, name })
+                if clip_id == "clip-a" && name == "Verse copy"
+        ));
+        assert!(audio_clip_duplication_command("clip-a", "").is_err());
+        assert!(audio_clip_duplication_command("clip-a", "   ").is_err());
+        assert!(audio_clip_duplication_command("clip-a", &"x".repeat(121)).is_err());
+        let unicode_boundary = "\u{00e9}".repeat(120);
+        assert!(matches!(
+            audio_clip_duplication_command("clip-a", &unicode_boundary),
+            Ok(IdeWorkerCommand::DuplicateAudioClip { clip_id, name })
+                if clip_id == "clip-a" && name == unicode_boundary
+        ));
+    }
+
+    #[test]
     fn audio_clip_rename_failure_restores_running_mode() {
         assert_eq!(
             mode_after_failure(AppMode::RenamingClip, IdeWorkerCommandKind::RenameAudioClip),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn audio_clip_duplication_failure_keeps_the_form_recoverable() {
+        assert_eq!(
+            mode_after_failure(
+                AppMode::DuplicatingClip,
+                IdeWorkerCommandKind::DuplicateAudioClip,
+            ),
             AppMode::Running
         );
     }

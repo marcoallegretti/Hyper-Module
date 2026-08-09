@@ -20,6 +20,7 @@ export enum AppMode {
     trimming-arrangement-placement,
     removing-arrangement-placement,
     renaming-clip,
+    duplicating-clip,
     changing-clip-activation,
     changing-clip-gain,
     creating-clip,
@@ -132,6 +133,7 @@ export global IdeActions {
     callback remove-arrangement-placement(string);
     callback add-arrangement-placement(string, string);
     callback rename-audio-clip(string, string);
+    callback duplicate-audio-clip(string, string);
     callback set-audio-clip-active(string, bool);
     callback set-audio-clip-gain(string, string);
     callback loudness-run();
@@ -283,6 +285,10 @@ export component MainWindow inherits Window {
     in-out property <string> clip-rename-id: "";
     in-out property <string> clip-rename-original: "";
     in-out property <string> clip-rename-name: "";
+    in-out property <bool> clip-duplicate-visible: false;
+    in-out property <string> clip-duplicate-id: "";
+    in-out property <string> clip-duplicate-source-name: "";
+    in-out property <string> clip-duplicate-name: "";
     in-out property <bool> clip-gain-visible: false;
     in-out property <string> clip-gain-id: "";
     in-out property <string> clip-gain-name: "";
@@ -1564,7 +1570,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && !root.clip-rename-visible && !root.clip-gain-visible && !root.add-arrangement-placement-visible : Panel {
+                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-gain-visible && !root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1580,12 +1586,12 @@ export component MainWindow inherits Window {
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Button {
                                 text: "Performance";
-                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-gain-visible = false; root.add-arrangement-placement-visible = false; }
+                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.add-arrangement-placement-visible = false; }
                             }
                             Button {
                                 text: "Mixer";
                                 enabled: root.app-mode == AppMode.running;
-                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-gain-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
+                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
                             }
                         }
 
@@ -1638,6 +1644,18 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                     Button {
+                                        width: 82px;
+                                        text: "Duplicate";
+                                        accessible-label: "Duplicate " + clip.name + " as an independent reusable clip";
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => {
+                                            root.clip-duplicate-id = clip.id;
+                                            root.clip-duplicate-source-name = clip.name;
+                                            root.clip-duplicate-name = "";
+                                            root.clip-duplicate-visible = true;
+                                        }
+                                    }
+                                    Button {
                                         width: 72px;
                                         text: "Place";
                                         accessible-label: "Place the full " + clip.name + " clip at an exact project tick";
@@ -1676,7 +1694,7 @@ export component MainWindow inherits Window {
                         }
 
                         Text {
-                            text: "Rename changes clip metadata only. Place creates one full-length non-ripple arrangement reference. Activation and gain affect every existing reference. Track, mixer, and source media remain unchanged.";
+                            text: "Rename changes clip metadata only. Duplicate creates a new reusable identity sharing the same immutable source audio; it creates no placement. Place creates one full-length non-ripple arrangement reference. Activation and gain affect every existing reference.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;
@@ -1726,7 +1744,48 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && !root.clip-rename-visible && root.add-arrangement-placement-visible : Panel {
+                if root.clips-visible && root.clip-duplicate-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 16px;
+                        Text { text: "DUPLICATE AUDIO CLIP"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.clip-duplicate-source-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                        Text {
+                            text: "Enter a name from 1 to 120 characters for the new reusable clip. Leading and trailing whitespace is removed before validation.";
+                            color: #aebccc;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        LineEdit {
+                            text <=> root.clip-duplicate-name;
+                            placeholder-text: "New audio clip name";
+                            accessible-label: "Duplicated audio clip name";
+                        }
+                        Text {
+                            text: "The duplicate receives a new identity and independent clip metadata. It keeps the same verified source view and owning track. No audio media or arrangement placement is created.";
+                            color: #65758a;
+                            font-size: 9px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Cancel"; clicked => { root.clip-duplicate-visible = false; } }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: root.app-mode == AppMode.duplicating-clip ? "Duplicating clip..." : "Duplicate clip";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.clip-duplicate-id != ""
+                                    && root.clip-duplicate-name != "";
+                                clicked => { IdeActions.duplicate-audio-clip(root.clip-duplicate-id, root.clip-duplicate-name); }
+                            }
+                        }
+                    }
+                }
+
+                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1778,7 +1837,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && !root.clip-rename-visible && root.clip-gain-visible && !root.add-arrangement-placement-visible : Panel {
+                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && root.clip-gain-visible && !root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
