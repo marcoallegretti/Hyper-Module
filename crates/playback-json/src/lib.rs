@@ -535,6 +535,36 @@ pub struct AudioClipAdditionDocuments {
     duration_ticks: u64,
 }
 
+/// Canonical version-1 resources required to duplicate one reusable audio clip.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioClipDuplicationDocuments {
+    track: Vec<u8>,
+    clip: Vec<u8>,
+    asset_id: String,
+}
+
+impl AudioClipDuplicationDocuments {
+    #[must_use]
+    pub fn track(&self) -> &[u8] {
+        &self.track
+    }
+
+    #[must_use]
+    pub fn clip(&self) -> &[u8] {
+        &self.clip
+    }
+
+    #[must_use]
+    pub fn asset_id(&self) -> &str {
+        &self.asset_id
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, Vec<u8>, String) {
+        (self.track, self.clip, self.asset_id)
+    }
+}
+
 impl AudioClipAdditionDocuments {
     #[must_use]
     pub fn track(&self) -> &[u8] {
@@ -599,6 +629,19 @@ pub enum AudioClipAdditionSerializationError {
     InvalidClipName,
     NonCanonicalTrack,
     SourceTrackMismatch,
+    InvalidDocumentShape,
+    Serialization(serde_json::Error),
+    ProjectCompilation(AdapterCompileError),
+}
+
+#[derive(Debug)]
+pub enum AudioClipDuplicationSerializationError {
+    ClipCapacity,
+    TrackReferenceCapacity,
+    InvalidClipIdentity,
+    InvalidClipName,
+    Clip(AudioClipDocumentSerializationError),
+    Track(AudioTrackDocumentSerializationError),
     InvalidDocumentShape,
     Serialization(serde_json::Error),
     ProjectCompilation(AdapterCompileError),
@@ -1024,6 +1067,45 @@ impl Error for AudioClipAdditionSerializationError {
             | Self::InvalidClipName
             | Self::NonCanonicalTrack
             | Self::SourceTrackMismatch
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
+impl fmt::Display for AudioClipDuplicationSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClipCapacity => {
+                formatter.write_str("the version-1 project cannot append another audio clip")
+            }
+            Self::TrackReferenceCapacity => {
+                formatter.write_str("the owning audio track cannot reference another reusable clip")
+            }
+            Self::InvalidClipIdentity => formatter
+                .write_str("the duplicated audio-clip identity is invalid or already in use"),
+            Self::InvalidClipName => formatter
+                .write_str("the duplicated audio-clip name is outside the version-1 domain"),
+            Self::Clip(source) => source.fmt(formatter),
+            Self::Track(source) => source.fmt(formatter),
+            Self::InvalidDocumentShape => formatter
+                .write_str("source clip or owning track changed shape after typed validation"),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::ProjectCompilation(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioClipDuplicationSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Clip(source) => Some(source),
+            Self::Track(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
+            Self::ClipCapacity
+            | Self::TrackReferenceCapacity
+            | Self::InvalidClipIdentity
+            | Self::InvalidClipName
             | Self::InvalidDocumentShape => None,
         }
     }
@@ -1715,6 +1797,149 @@ pub fn serialize_recording_audio_clip_addition(
         track,
         clip,
         duration_ticks,
+    })
+}
+
+/// Creates an independent reusable audio-clip document from an existing clip.
+///
+/// The duplicate receives a new stable identity and caller-supplied name while
+/// retaining the source asset view, timing, loop, fades, playback parameters,
+/// and namespaced extensions. The owning track gains exactly one reference;
+/// arrangements and scenes remain unchanged and no media file is copied.
+///
+/// # Errors
+///
+/// Returns a classified rejection for stale or noncanonical source bytes,
+/// invalid new identity or name input, exhausted capacity, or a duplicated
+/// candidate that cannot compile with the verified project assets.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the duplication boundary validates both source documents, preserves every clip-local field, and compiles the complete candidate project"
+)]
+pub fn serialize_audio_clip_duplication(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_clip: &[u8],
+    source_track: &[u8],
+    source_clip_id: &str,
+    duplicated_clip_id: &str,
+    duplicated_clip_name: &str,
+    limits: LoaderLimits,
+) -> Result<AudioClipDuplicationDocuments, AudioClipDuplicationSerializationError> {
+    if project.clips.len() >= limits.max_clip_documents {
+        return Err(AudioClipDuplicationSerializationError::ClipCapacity);
+    }
+    if !is_valid_entity_id(duplicated_clip_id)
+        || duplicated_clip_id == project.project_id
+        || project_contains_identity(project, duplicated_clip_id)
+        || assets.iter().any(|asset| asset.id == duplicated_clip_id)
+    {
+        return Err(AudioClipDuplicationSerializationError::InvalidClipIdentity);
+    }
+    let name_length = duplicated_clip_name.chars().count();
+    if duplicated_clip_name.trim() != duplicated_clip_name
+        || !(1..=MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length)
+    {
+        return Err(AudioClipDuplicationSerializationError::InvalidClipName);
+    }
+
+    let source_clip_index = project
+        .clips
+        .iter()
+        .position(|clip| clip.id == source_clip_id)
+        .ok_or(AudioClipDuplicationSerializationError::Clip(
+            AudioClipDocumentSerializationError::ClipMissing,
+        ))?;
+    let source = &project.clips[source_clip_index];
+    let track_id = source.track_id.clone();
+    let asset_id = source.asset_id.clone();
+    let track_index =
+        project
+            .track_index(&track_id)
+            .ok_or(AudioClipDuplicationSerializationError::Track(
+                AudioTrackDocumentSerializationError::TrackMissing,
+            ))?;
+    if project.tracks[track_index].clip_ids.len() >= limits.max_track_clip_references {
+        return Err(AudioClipDuplicationSerializationError::TrackReferenceCapacity);
+    }
+
+    let canonical_clip = serialize_audio_clip_document_edit(
+        project,
+        source_clip,
+        source_clip_id,
+        limits,
+        |_| Ok(()),
+    )
+    .map_err(AudioClipDuplicationSerializationError::Clip)?;
+    let canonical_track =
+        serialize_audio_track_document_edit(project, source_track, &track_id, limits, |_| {})
+            .map_err(AudioClipDuplicationSerializationError::Track)?;
+
+    let mut clip_value: Value = serde_json::from_slice(&canonical_clip)
+        .map_err(AudioClipDuplicationSerializationError::Serialization)?;
+    let clip_document = clip_value
+        .as_object_mut()
+        .ok_or(AudioClipDuplicationSerializationError::InvalidDocumentShape)?;
+    clip_document.insert("id".to_owned(), duplicated_clip_id.into());
+    clip_document.insert("name".to_owned(), duplicated_clip_name.into());
+    let clip = serde_json_canonicalizer::to_vec(&clip_value)
+        .map_err(AudioClipDuplicationSerializationError::Serialization)?;
+
+    let mut track_value: Value = serde_json::from_slice(&canonical_track)
+        .map_err(AudioClipDuplicationSerializationError::Serialization)?;
+    track_value
+        .get_mut("clip_ids")
+        .and_then(Value::as_array_mut)
+        .ok_or(AudioClipDuplicationSerializationError::InvalidDocumentShape)?
+        .push(duplicated_clip_id.into());
+    let track = serde_json_canonicalizer::to_vec(&track_value)
+        .map_err(AudioClipDuplicationSerializationError::Serialization)?;
+
+    let duplicated = load_clip(
+        &clip,
+        project.clips.len(),
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_warp_markers,
+    )
+    .map_err(|source| {
+        AudioClipDuplicationSerializationError::Clip(AudioClipDocumentSerializationError::Source(
+            source,
+        ))
+    })?;
+    let owning_track = load_track(
+        &track,
+        track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(|source| {
+        AudioClipDuplicationSerializationError::Track(AudioTrackDocumentSerializationError::Source(
+            source,
+        ))
+    })?;
+    let mut duplicated_project = project.clone();
+    duplicated_project.clips.try_reserve(1).map_err(|_| {
+        AudioClipDuplicationSerializationError::Clip(AudioClipDocumentSerializationError::Source(
+            capacity_error(),
+        ))
+    })?;
+    duplicated_project.clips.push(duplicated);
+    duplicated_project.tracks[track_index] = owning_track;
+    validate_loaded_identities(&duplicated_project).map_err(|source| {
+        AudioClipDuplicationSerializationError::Clip(AudioClipDocumentSerializationError::Source(
+            source,
+        ))
+    })?;
+    duplicated_project
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(AudioClipDuplicationSerializationError::ProjectCompilation)?;
+    Ok(AudioClipDuplicationDocuments {
+        track,
+        clip,
+        asset_id,
     })
 }
 
@@ -5857,6 +6082,199 @@ mod tests {
                 },
             ),
             Err(AudioClipAdditionSerializationError::ClipCapacity)
+        ));
+    }
+
+    #[test]
+    fn audio_clip_duplication_preserves_source_view_and_appends_one_track_reference() {
+        let mut source_clip: Value = serde_json::from_slice(CLIP).unwrap();
+        source_clip["extensions"]["org.example.clip"] = json!({"opaque": [1, 2, 3]});
+        let source_clip = serde_json_canonicalizer::to_vec(&source_clip).unwrap();
+        let mut source_track: Value = serde_json::from_slice(TRACK).unwrap();
+        source_track["extensions"]["org.example.track"] = json!({"opaque": true});
+        let source_track = serde_json_canonicalizer::to_vec(&source_track).unwrap();
+        let tracks: [&[u8]; 1] = [&source_track];
+        let clips: [&[u8]; 1] = [&source_clip];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let duplicated_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let duplicated_name = "\u{00e9}".repeat(MAX_VERSION_1_NAME_CHARACTERS);
+
+        let documents = serialize_audio_clip_duplication(
+            &loaded,
+            &asset_facts(),
+            &source_clip,
+            &source_track,
+            "018f47a2-6b2d-7c11-8a44-001122334460",
+            duplicated_id,
+            &duplicated_name,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(documents.asset_id(), "018f47a2-6b2d-7c11-8a44-001122334457");
+
+        let mut expected_clip: Value = serde_json::from_slice(&source_clip).unwrap();
+        expected_clip["id"] = duplicated_id.into();
+        expected_clip["name"] = duplicated_name.into();
+        assert_eq!(
+            documents.clip(),
+            serde_json_canonicalizer::to_vec(&expected_clip).unwrap()
+        );
+        let mut expected_track: Value = serde_json::from_slice(&source_track).unwrap();
+        expected_track["clip_ids"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicated_id.into());
+        assert_eq!(
+            documents.track(),
+            serde_json_canonicalizer::to_vec(&expected_track).unwrap()
+        );
+
+        let duplicated_clips: [&[u8]; 2] = [&source_clip, documents.clip()];
+        let duplicated_tracks: [&[u8]; 1] = [documents.track()];
+        let reopened = load(
+            input(
+                TIMELINE,
+                &duplicated_tracks,
+                &duplicated_clips,
+                Some(ARRANGEMENT),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.clip_count(), 2);
+        assert_eq!(
+            reopened.clip_id_at(0),
+            Some("018f47a2-6b2d-7c11-8a44-001122334460")
+        );
+        assert_eq!(reopened.clip_id_at(1), Some(duplicated_id));
+        assert_eq!(reopened.placement_count(), 1);
+        reopened
+            .compile_playback(
+                &asset_facts(),
+                GraphLimits::VERSION_1,
+                SceneLimits::VERSION_1,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn audio_clip_duplication_rejects_stale_colliding_and_exhausted_requests() {
+        let canonical_clip =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(CLIP).unwrap())
+                .unwrap();
+        let canonical_track =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(TRACK).unwrap())
+                .unwrap();
+        let tracks: [&[u8]; 1] = [&canonical_track];
+        let clips: [&[u8]; 1] = [&canonical_clip];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let duplicate = |clip: &[u8], track: &[u8], id: &str, name: &str, limits| {
+            serialize_audio_clip_duplication(
+                &loaded,
+                &asset_facts(),
+                clip,
+                track,
+                "018f47a2-6b2d-7c11-8a44-001122334460",
+                id,
+                name,
+                limits,
+            )
+        };
+        assert!(matches!(
+            duplicate(
+                &canonical_clip,
+                &canonical_track,
+                "018f47a2-6b2d-7c11-8a44-001122334460",
+                "Copy",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipDuplicationSerializationError::InvalidClipIdentity)
+        ));
+        assert!(matches!(
+            duplicate(
+                &canonical_clip,
+                &canonical_track,
+                "018f47a2-6b2d-7c11-8a44-001122334469",
+                &"\u{00e9}".repeat(MAX_VERSION_1_NAME_CHARACTERS + 1),
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipDuplicationSerializationError::InvalidClipName)
+        ));
+
+        let mut stale_clip: Value = serde_json::from_slice(&canonical_clip).unwrap();
+        stale_clip["enabled"] = false.into();
+        let stale_clip = serde_json_canonicalizer::to_vec(&stale_clip).unwrap();
+        assert!(matches!(
+            duplicate(
+                &stale_clip,
+                &canonical_track,
+                "018f47a2-6b2d-7c11-8a44-001122334469",
+                "Copy",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipDuplicationSerializationError::Clip(
+                AudioClipDocumentSerializationError::SourceClipMismatch
+            ))
+        ));
+        let mut stale_track: Value = serde_json::from_slice(&canonical_track).unwrap();
+        stale_track["active"] = false.into();
+        let stale_track = serde_json_canonicalizer::to_vec(&stale_track).unwrap();
+        assert!(matches!(
+            duplicate(
+                &canonical_clip,
+                &stale_track,
+                "018f47a2-6b2d-7c11-8a44-001122334469",
+                "Copy",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipDuplicationSerializationError::Track(
+                AudioTrackDocumentSerializationError::SourceTrackMismatch
+            ))
+        ));
+    }
+
+    #[test]
+    fn audio_clip_duplication_enforces_clip_and_track_capacity() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let duplicate = |limits| {
+            serialize_audio_clip_duplication(
+                &loaded,
+                &asset_facts(),
+                CLIP,
+                TRACK,
+                "018f47a2-6b2d-7c11-8a44-001122334460",
+                "018f47a2-6b2d-7c11-8a44-001122334469",
+                "Copy",
+                limits,
+            )
+        };
+        assert!(matches!(
+            duplicate(LoaderLimits {
+                max_clip_documents: 1,
+                ..LoaderLimits::VERSION_1
+            }),
+            Err(AudioClipDuplicationSerializationError::ClipCapacity)
+        ));
+        assert!(matches!(
+            duplicate(LoaderLimits {
+                max_track_clip_references: 1,
+                ..LoaderLimits::VERSION_1
+            }),
+            Err(AudioClipDuplicationSerializationError::TrackReferenceCapacity)
         ));
     }
 
