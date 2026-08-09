@@ -48,15 +48,15 @@ use hyper_mixer_runtime::{
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
 pub use hyper_playback_json::is_native_audio_clip_gain_decibels as ide_audio_clip_gain_is_supported;
 use hyper_playback_json::{
-    ArrangementPlacementActivationSerializationError, AudioClipDocumentSerializationError,
+    ArrangementPlacementDocumentSerializationError, AudioClipDocumentSerializationError,
     AudioClipGainSerializationError, AudioTrackAdditionSerializationError,
     AudioTrackDocumentSerializationError, AudioTrackRemovalBlockers,
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError, CompiledMixerTap,
     CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
     MixerSendBaseState, MixerStateSerializationError, serialize_arrangement_placement_activation,
-    serialize_audio_clip_activation, serialize_audio_clip_gain, serialize_audio_track_activation,
-    serialize_audio_track_addition, serialize_audio_track_removal, serialize_audio_track_rename,
-    serialize_mixer_base_state,
+    serialize_arrangement_placement_move, serialize_audio_clip_activation,
+    serialize_audio_clip_gain, serialize_audio_track_activation, serialize_audio_track_addition,
+    serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
 };
 use hyper_playback_session::{AudioClipGainValidationError, PlaybackSessionAssemblyLimits};
 pub use hyper_playback_session::{
@@ -2171,7 +2171,7 @@ pub enum IdeArrangementPlacementEditError {
     ArrangementResourceMissing,
     ArrangementResourceAmbiguous,
     Storage(StorageError),
-    Serialization(ArrangementPlacementActivationSerializationError),
+    Serialization(ArrangementPlacementDocumentSerializationError),
     CapacityUnavailable,
     Publication(Box<IdeArrangementPlacementEditPublicationError>),
     NativeClose(IdeNativeCloseFailure),
@@ -3236,6 +3236,54 @@ impl RunningDesktopIdeApplication {
         placement_id: &str,
         active: bool,
     ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        Self::prepare_arrangement_placement_edit(
+            application,
+            recovery,
+            |prepared, source, limits| {
+                let (project, _, _, _) = prepared.session().parts();
+                serialize_arrangement_placement_activation(
+                    project,
+                    source,
+                    placement_id,
+                    active,
+                    limits,
+                )
+            },
+        )
+    }
+
+    fn prepare_arrangement_placement_move(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        placement_id: &str,
+        start_tick: u64,
+    ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        Self::prepare_arrangement_placement_edit(
+            application,
+            recovery,
+            |prepared, source, limits| {
+                let (project, _, _, _) = prepared.session().parts();
+                serialize_arrangement_placement_move(
+                    project,
+                    source,
+                    placement_id,
+                    start_tick,
+                    limits,
+                )
+            },
+        )
+    }
+
+    fn prepare_arrangement_placement_edit(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        serialize: impl FnOnce(
+            &PreparedProjectPlayback,
+            &[u8],
+            LoaderLimits,
+        )
+            -> Result<Vec<u8>, ArrangementPlacementDocumentSerializationError>,
+    ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
         let mixer = Self::prepare_mixer_save(application, recovery)
             .map_err(|source| IdeArrangementPlacementEditError::MixerSave(Box::new(source)))?;
         let prepared = recovery.prepared_project().ok_or_else(|| {
@@ -3258,12 +3306,9 @@ impl RunningDesktopIdeApplication {
         let source = package
             .read_resource(descriptor.id())
             .map_err(IdeArrangementPlacementEditError::Storage)?;
-        let (project, _, _, _) = prepared.session().parts();
-        let arrangement_bytes = serialize_arrangement_placement_activation(
-            project,
+        let arrangement_bytes = serialize(
+            prepared,
             &source,
-            placement_id,
-            active,
             application.config.project_limits.session.documents,
         )
         .map_err(IdeArrangementPlacementEditError::Serialization)?;
@@ -5027,23 +5072,58 @@ mod tests {
             reopened.package().read_resource(&arrangement_id).unwrap(),
             disabled_arrangement
         );
+        let (loaded, _, _, _) = reopened.session().parts();
+        let moved_arrangement = serialize_arrangement_placement_move(
+            loaded,
+            &disabled_arrangement,
+            ARRANGEMENT_TEST_PLACEMENT_ID,
+            8,
+            limits.session.documents,
+        )
+        .unwrap();
         let disabled_identity = *reopened.package().manifest_sha256();
+        drop(reopened);
+
+        let moved = IdeArrangementPlacementEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: disabled_identity,
+                resource_id: mixer_id.clone(),
+                resource_bytes: changed_mixer.clone(),
+            },
+            arrangement_id: arrangement_id.clone(),
+            arrangement_bytes: moved_arrangement.clone(),
+        }
+        .publish()
+        .unwrap();
+        assert!(moved.changed());
+        assert_eq!(moved.project_revision(), 4);
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert_eq!(
+            reopened.package().read_resource(&arrangement_id).unwrap(),
+            moved_arrangement
+        );
+        let arrangement: serde_json::Value = serde_json::from_slice(&moved_arrangement).unwrap();
+        assert_eq!(arrangement["placements"][0]["start_tick"], 8);
+        let moved_identity = *reopened.package().manifest_sha256();
         drop(reopened);
 
         let unchanged = IdeArrangementPlacementEditPlan {
             mixer: IdeMixerSavePlan {
                 project_path,
-                expected_project_sha256: disabled_identity,
+                expected_project_sha256: moved_identity,
                 resource_id: mixer_id,
                 resource_bytes: changed_mixer,
             },
             arrangement_id,
-            arrangement_bytes: disabled_arrangement,
+            arrangement_bytes: moved_arrangement,
         }
         .publish()
         .unwrap();
         assert!(!unchanged.changed());
-        assert_eq!(unchanged.project_revision(), 3);
+        assert_eq!(unchanged.project_revision(), 4);
     }
 
     #[test]

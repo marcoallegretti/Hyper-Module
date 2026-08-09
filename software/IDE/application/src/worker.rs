@@ -124,6 +124,7 @@ pub enum IdeWorkerCommandKind {
     RenameAudioTrack,
     SetAudioTrackActive,
     SetArrangementPlacementActive,
+    MoveArrangementPlacement,
     SetAudioClipActive,
     SetAudioClipGain,
     StartRecording,
@@ -186,6 +187,10 @@ pub enum IdeWorkerCommand {
         placement_id: String,
         active: bool,
     },
+    MoveArrangementPlacement {
+        placement_id: String,
+        start_tick: u64,
+    },
     SetAudioClipActive {
         clip_id: String,
         active: bool,
@@ -239,6 +244,7 @@ impl IdeWorkerCommand {
             Self::SetArrangementPlacementActive { .. } => {
                 IdeWorkerCommandKind::SetArrangementPlacementActive
             }
+            Self::MoveArrangementPlacement { .. } => IdeWorkerCommandKind::MoveArrangementPlacement,
             Self::SetAudioClipActive { .. } => IdeWorkerCommandKind::SetAudioClipActive,
             Self::SetAudioClipGain { .. } => IdeWorkerCommandKind::SetAudioClipGain,
             Self::StartRecording { .. } => IdeWorkerCommandKind::StartRecording,
@@ -788,6 +794,7 @@ pub enum IdeWorkerCommandFailure {
     AudioTrackRename(Box<super::IdeAudioTrackEditError>),
     AudioTrackActivation(Box<super::IdeAudioTrackEditError>),
     ArrangementPlacementActivation(Box<IdeArrangementPlacementEditError>),
+    ArrangementPlacementMove(Box<IdeArrangementPlacementEditError>),
     AudioClipActivation(Box<IdeAudioClipActivationEditError>),
     AudioClipGain(Box<IdeAudioClipGainEditError>),
     Recording(IdeRecordingError),
@@ -821,7 +828,8 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioTrackRename(source) | Self::AudioTrackActivation(source) => {
                 source.fmt(formatter)
             }
-            Self::ArrangementPlacementActivation(source) => source.fmt(formatter),
+            Self::ArrangementPlacementActivation(source)
+            | Self::ArrangementPlacementMove(source) => source.fmt(formatter),
             Self::AudioClipActivation(source) => source.fmt(formatter),
             Self::AudioClipGain(source) => source.fmt(formatter),
             Self::Recording(source) => source.fmt(formatter),
@@ -861,7 +869,8 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioTrackAddition(source) => Some(source),
             Self::AudioTrackRemoval(source) => Some(source),
             Self::AudioTrackRename(source) | Self::AudioTrackActivation(source) => Some(source),
-            Self::ArrangementPlacementActivation(source) => Some(source),
+            Self::ArrangementPlacementActivation(source)
+            | Self::ArrangementPlacementMove(source) => Some(source),
             Self::AudioClipActivation(source) => Some(source),
             Self::AudioClipGain(source) => Some(source),
             Self::Recording(source) => Some(source),
@@ -918,6 +927,11 @@ pub enum IdeWorkerEvent {
         changed: bool,
         active: bool,
     },
+    ArrangementPlacementMoved {
+        revision: u64,
+        changed: bool,
+        start_tick: u64,
+    },
     AudioClipActivationChanged {
         revision: u64,
         changed: bool,
@@ -945,6 +959,9 @@ pub enum IdeWorkerEvent {
     },
     ArrangementPlacementActivationChanging {
         active: bool,
+    },
+    ArrangementPlacementMoving {
+        start_tick: u64,
     },
     AudioClipActivationChanging {
         active: bool,
@@ -1273,13 +1290,36 @@ enum WorkerState {
 #[derive(Debug)]
 enum ProjectMutation {
     SaveMixer,
-    AddAudioTrack { name: String },
-    RemoveAudioTrack { track_id: String },
-    RenameAudioTrack { track_id: String, name: String },
-    SetAudioTrackActive { track_id: String, active: bool },
-    SetArrangementPlacementActive { placement_id: String, active: bool },
-    SetAudioClipActive { clip_id: String, active: bool },
-    SetAudioClipGain { clip_id: String, gain_decibels: f64 },
+    AddAudioTrack {
+        name: String,
+    },
+    RemoveAudioTrack {
+        track_id: String,
+    },
+    RenameAudioTrack {
+        track_id: String,
+        name: String,
+    },
+    SetAudioTrackActive {
+        track_id: String,
+        active: bool,
+    },
+    SetArrangementPlacementActive {
+        placement_id: String,
+        active: bool,
+    },
+    MoveArrangementPlacement {
+        placement_id: String,
+        start_tick: u64,
+    },
+    SetAudioClipActive {
+        clip_id: String,
+        active: bool,
+    },
+    SetAudioClipGain {
+        clip_id: String,
+        gain_decibels: f64,
+    },
 }
 
 impl ProjectMutation {
@@ -1293,6 +1333,7 @@ impl ProjectMutation {
             Self::SetArrangementPlacementActive { .. } => {
                 IdeWorkerCommandKind::SetArrangementPlacementActive
             }
+            Self::MoveArrangementPlacement { .. } => IdeWorkerCommandKind::MoveArrangementPlacement,
             Self::SetAudioClipActive { .. } => IdeWorkerCommandKind::SetAudioClipActive,
             Self::SetAudioClipGain { .. } => IdeWorkerCommandKind::SetAudioClipGain,
         }
@@ -1309,6 +1350,11 @@ impl ProjectMutation {
             }
             Self::SetArrangementPlacementActive { active, .. } => {
                 IdeWorkerEvent::ArrangementPlacementActivationChanging { active: *active }
+            }
+            Self::MoveArrangementPlacement { start_tick, .. } => {
+                IdeWorkerEvent::ArrangementPlacementMoving {
+                    start_tick: *start_tick,
+                }
             }
             Self::SetAudioClipActive { active, .. } => {
                 IdeWorkerEvent::AudioClipActivationChanging { active: *active }
@@ -1509,6 +1555,7 @@ fn process_command(
         | IdeWorkerCommand::RenameAudioTrack { .. }
         | IdeWorkerCommand::SetAudioTrackActive { .. }
         | IdeWorkerCommand::SetArrangementPlacementActive { .. }
+        | IdeWorkerCommand::MoveArrangementPlacement { .. }
         | IdeWorkerCommand::SetAudioClipActive { .. }
         | IdeWorkerCommand::SetAudioClipGain { .. }) => {
             process_project_mutation_command(state, command, events)
@@ -1601,6 +1648,10 @@ fn process_project_mutation_command(
             placement_id,
             active,
         } => set_arrangement_placement_active(state, events, &placement_id, active),
+        IdeWorkerCommand::MoveArrangementPlacement {
+            placement_id,
+            start_tick,
+        } => move_arrangement_placement(state, events, &placement_id, start_tick),
         IdeWorkerCommand::SetAudioClipActive { clip_id, active } => {
             set_audio_clip_active(state, events, &clip_id, active)
         }
@@ -2747,6 +2798,45 @@ fn set_arrangement_placement_active(
     )
 }
 
+fn move_arrangement_placement(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    placement_id: &str,
+    start_tick: u64,
+) -> bool {
+    if placement_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::MoveArrangementPlacement,
+            IdeWorkerCommandFailure::ArrangementPlacementMove(Box::new(
+                IdeArrangementPlacementEditError::InvalidPlacementIdentity,
+            )),
+        );
+    }
+    let mut owned_placement_id = String::new();
+    if owned_placement_id
+        .try_reserve_exact(placement_id.len())
+        .is_err()
+    {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::MoveArrangementPlacement,
+            IdeWorkerCommandFailure::ArrangementPlacementMove(Box::new(
+                IdeArrangementPlacementEditError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_placement_id.push_str(placement_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::MoveArrangementPlacement {
+            placement_id: owned_placement_id,
+            start_tick,
+        },
+    )
+}
+
 fn set_audio_clip_active(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -2907,6 +2997,11 @@ fn project_mutation_save_failure(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::MoveArrangementPlacement { .. } => {
+            IdeWorkerCommandFailure::ArrangementPlacementMove(Box::new(
+                IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
+            ))
+        }
         ProjectMutation::SetAudioClipActive { .. } => IdeWorkerCommandFailure::AudioClipActivation(
             Box::new(IdeAudioClipActivationEditError::MixerSave(Box::new(reason))),
         ),
@@ -2999,6 +3094,11 @@ fn project_mutation_native_close_failure(
                 IdeArrangementPlacementEditError::NativeClose(failure),
             ))
         }
+        ProjectMutation::MoveArrangementPlacement { .. } => {
+            IdeWorkerCommandFailure::ArrangementPlacementMove(Box::new(
+                IdeArrangementPlacementEditError::NativeClose(failure),
+            ))
+        }
         ProjectMutation::SetAudioClipActive { .. } => IdeWorkerCommandFailure::AudioClipActivation(
             Box::new(IdeAudioClipActivationEditError::NativeClose(failure)),
         ),
@@ -3026,6 +3126,13 @@ enum ProjectMutationAttempt {
     },
     SetArrangementPlacementActive {
         active: bool,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeArrangementPlacementEditError,
+        >,
+    },
+    MoveArrangementPlacement {
+        start_tick: u64,
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeArrangementPlacementEditError,
@@ -3168,6 +3275,25 @@ fn complete_project_mutation(
                     events,
                     IdeWorkerCommandKind::SetArrangementPlacementActive,
                     IdeWorkerCommandFailure::ArrangementPlacementActivation(Box::new(reason)),
+                ),
+                ProjectMutationAttempt::MoveArrangementPlacement {
+                    start_tick,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::ArrangementPlacementMoved {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                        start_tick,
+                    },
+                ),
+                ProjectMutationAttempt::MoveArrangementPlacement {
+                    result: Err(reason),
+                    ..
+                } => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::MoveArrangementPlacement,
+                    IdeWorkerCommandFailure::ArrangementPlacementMove(Box::new(reason)),
                 ),
                 ProjectMutationAttempt::SetAudioClipActive {
                     active,
@@ -3323,6 +3449,19 @@ fn attempt_project_mutation(
                 native_failure,
             ),
         },
+        ProjectMutation::MoveArrangementPlacement {
+            placement_id,
+            start_tick,
+        } => ProjectMutationAttempt::MoveArrangementPlacement {
+            start_tick,
+            result: attempt_arrangement_placement_move(
+                application,
+                recovery,
+                &placement_id,
+                start_tick,
+                native_failure,
+            ),
+        },
         ProjectMutation::SetAudioClipActive { clip_id, active } => {
             ProjectMutationAttempt::SetAudioClipActive {
                 active,
@@ -3390,6 +3529,29 @@ fn attempt_arrangement_placement_activation(
         recovery,
         placement_id,
         active,
+    )
+    .and_then(|plan| {
+        plan.publish()
+            .map_err(|source| IdeArrangementPlacementEditError::Publication(Box::new(source)))
+    })
+}
+
+fn attempt_arrangement_placement_move(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    placement_id: &str,
+    start_tick: u64,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeArrangementPlacementEditError>
+{
+    if let Some(failure) = native_failure {
+        return Err(IdeArrangementPlacementEditError::NativeClose(failure));
+    }
+    RunningDesktopIdeApplication::prepare_arrangement_placement_move(
+        application,
+        recovery,
+        placement_id,
+        start_tick,
     )
     .and_then(|plan| {
         plan.publish()
@@ -3529,7 +3691,18 @@ fn project_mutation_reopen_failure(
             )
         }
         ProjectMutationAttempt::SetArrangementPlacementActive { result, .. } => {
-            arrangement_placement_edit_reopen_failure(result, reopen)
+            arrangement_placement_edit_reopen_failure(
+                result,
+                reopen,
+                IdeWorkerCommandFailure::ArrangementPlacementActivation,
+            )
+        }
+        ProjectMutationAttempt::MoveArrangementPlacement { result, .. } => {
+            arrangement_placement_edit_reopen_failure(
+                result,
+                reopen,
+                IdeWorkerCommandFailure::ArrangementPlacementMove,
+            )
         }
         ProjectMutationAttempt::SetAudioClipActive { result, .. } => {
             audio_clip_activation_edit_reopen_failure(result, reopen)
@@ -3610,6 +3783,7 @@ fn arrangement_placement_edit_reopen_failure(
         IdeArrangementPlacementEditError,
     >,
     reopen: IdeProjectOpenError,
+    wrap: fn(Box<IdeArrangementPlacementEditError>) -> IdeWorkerCommandFailure,
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeArrangementPlacementEditError::ReopenAfterPublication {
@@ -3633,7 +3807,7 @@ fn arrangement_placement_edit_reopen_failure(
             reopen: Box::new(reopen),
         },
     };
-    IdeWorkerCommandFailure::ArrangementPlacementActivation(Box::new(reason))
+    wrap(Box::new(reason))
 }
 
 fn audio_track_edit_reopen_failure(
@@ -5304,6 +5478,64 @@ mod tests {
             IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::SetArrangementPlacementActive,
                 reason: IdeWorkerCommandFailure::ArrangementPlacementActivation(reason),
+            } if matches!(reason.as_ref(), IdeArrangementPlacementEditError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn arrangement_move_validates_identity_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::MoveArrangementPlacement {
+                placement_id: String::new(),
+                start_tick: 1_920,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::MoveArrangementPlacement,
+                reason: IdeWorkerCommandFailure::ArrangementPlacementMove(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeArrangementPlacementEditError::InvalidPlacementIdentity
+            )
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::MoveArrangementPlacement {
+                placement_id: "018f47a2-6b2d-7c11-8a44-001122334464".to_owned(),
+                start_tick: 1_920,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ArrangementPlacementMoving { start_tick: 1_920 }
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::MoveArrangementPlacement,
+                reason: IdeWorkerCommandFailure::ArrangementPlacementMove(reason),
             } if matches!(reason.as_ref(), IdeArrangementPlacementEditError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
