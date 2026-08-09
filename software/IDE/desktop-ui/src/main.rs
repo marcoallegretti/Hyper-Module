@@ -354,6 +354,64 @@ fn bind_arrangement_duration_callback(
     });
 }
 
+fn bind_arrangement_front_trim_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_trim = Rc::clone(worker);
+    let project_state_for_trim = Rc::clone(project_state);
+    actions.on_trim_arrangement_placement_front(move |placement_id, start_tick| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text(
+                "Arrangement placement front trimming is not available in the current state".into(),
+            );
+            return;
+        }
+        let start_tick = match parse_arrangement_start_tick(start_tick.as_str()) {
+            Ok(start_tick) => start_tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let state = project_state_for_trim.arrangement.borrow();
+        let Some(binding) = state.as_ref() else {
+            ui.set_error_text("Arrangement placement authority is no longer available".into());
+            return;
+        };
+        let Some(placement) = binding
+            .owner
+            .placements()
+            .iter()
+            .find(|placement| placement.id() == placement_id.as_str())
+        else {
+            ui.set_error_text("The selected arrangement placement is no longer available".into());
+            return;
+        };
+        if placement.start_tick() == start_tick {
+            ui.set_status_text("Arrangement placement already starts at that tick".into());
+            ui.set_error_text(SharedString::default());
+            return;
+        }
+        let owned_placement_id = placement.id().to_owned();
+        drop(state);
+        submit_to_ui(
+            &ui,
+            &worker_for_trim,
+            IdeWorkerCommand::TrimArrangementPlacementFront {
+                placement_id: owned_placement_id,
+                start_tick,
+            },
+        );
+    });
+}
+
 fn bind_project_open_callback(ui: &MainWindow, worker: &WorkerCell) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
@@ -1117,6 +1175,7 @@ fn bind_arrangement_callback(
 
     bind_arrangement_move_callback(ui, worker, project_state);
     bind_arrangement_duration_callback(ui, worker, project_state);
+    bind_arrangement_front_trim_callback(ui, worker, project_state);
 }
 
 fn bind_arrangement_move_callback(
@@ -1439,7 +1498,8 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 IdeWorkerCommandKind::MoveArrangementPlacement => {
                     ui.set_app_mode(AppMode::MovingArrangementPlacement);
                 }
-                IdeWorkerCommandKind::SetArrangementPlacementDuration => {
+                IdeWorkerCommandKind::SetArrangementPlacementDuration
+                | IdeWorkerCommandKind::TrimArrangementPlacementFront => {
                     ui.set_app_mode(AppMode::TrimmingArrangementPlacement);
                 }
                 IdeWorkerCommandKind::SetAudioClipActive => {
@@ -1520,6 +1580,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetArrangementPlacementDuration => {
             "Preserving mixer state, trimming the arrangement placement, and reopening project…"
+        }
+        IdeWorkerCommandKind::TrimArrangementPlacementFront => {
+            "Preserving mixer state, trimming the arrangement front, and reopening project..."
         }
         IdeWorkerCommandKind::SetAudioClipActive => {
             "Preserving mixer state, updating audio-clip activation, and reopening project…"
@@ -1639,6 +1702,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementPlacementDurationChanged { .. }
         | IdeWorkerEvent::ArrangementPlacementDurationChanging { .. }) => {
             apply_arrangement_placement_duration_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ArrangementPlacementFrontTrimmed { .. }
+        | IdeWorkerEvent::ArrangementPlacementFrontTrimming { .. }) => {
+            apply_arrangement_placement_front_trim_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipActivationChanged { .. }
         | IdeWorkerEvent::AudioClipActivationChanging { .. }) => {
@@ -1888,6 +1955,40 @@ fn apply_arrangement_placement_duration_event(ui: &MainWindow, event: &IdeWorker
             );
         }
         _ => unreachable!("arrangement duration event dispatcher received another event"),
+    }
+}
+
+fn apply_arrangement_placement_front_trim_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ArrangementPlacementFrontTrimmed {
+            revision,
+            changed,
+            start_tick,
+        } => {
+            ui.set_status_text(
+                if *changed {
+                    format!(
+                        "Arrangement placement front trimmed to tick {start_tick} in project revision {revision}"
+                    )
+                } else {
+                    format!(
+                        "Arrangement placement already started at tick {start_tick} in project revision {revision}"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementPlacementFrontTrimming { start_tick } => {
+            ui.set_app_mode(AppMode::TrimmingArrangementPlacement);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before trimming the arrangement front to tick {start_tick}..."
+                )
+                .into(),
+            );
+        }
+        _ => unreachable!("arrangement front-trim event dispatcher received another event"),
     }
 }
 
@@ -2471,6 +2572,7 @@ impl Model for ArrangementListModel {
             track_name: track_name.into(),
             clip_name: clip_name.into(),
             start_tick: placement.start_tick().to_string().into(),
+            clip_start_tick: placement.clip_start_tick().to_string().into(),
             duration_ticks: placement.duration_ticks().to_string().into(),
             start_clock: format_frame_clock(placement.start_frame(), self.sample_rate_hz).into(),
             end_clock: format_frame_clock(placement.end_frame(), self.sample_rate_hz).into(),
@@ -2897,6 +2999,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::SetArrangementPlacementDuration
+        | IdeWorkerCommandKind::TrimArrangementPlacementFront
             if current == AppMode::TrimmingArrangementPlacement =>
         {
             AppMode::Running
@@ -3932,6 +4035,17 @@ mod tests {
             mode_after_failure(
                 AppMode::TrimmingArrangementPlacement,
                 IdeWorkerCommandKind::SetArrangementPlacementDuration,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn arrangement_front_trim_failure_restores_running_mode() {
+        assert_eq!(
+            mode_after_failure(
+                AppMode::TrimmingArrangementPlacement,
+                IdeWorkerCommandKind::TrimArrangementPlacementFront,
             ),
             AppMode::Running
         );
