@@ -12,6 +12,14 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod audio_clip_publication;
+
+pub use audio_clip_publication::{
+    AudioClipPublicationOutcome, AudioClipPublicationRecovery,
+    AudioClipPublicationRecoveryDisposition, AudioClipPublicationRequest, publish_audio_clip,
+    recover_audio_clip_publications,
+};
+
 use super::project_lock::{
     AUDIO_TRACK_TRANSACTION_PREFIX, PROJECT_RESOURCE_TRANSACTION_PREFIX as TRANSACTION_PREFIX,
     ProjectLock, ProjectTransactionFamily, find_unhandled_project_transaction,

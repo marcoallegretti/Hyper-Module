@@ -10,6 +10,7 @@ const LOCK_NAME: &str = "project-storage.lock";
 
 pub(crate) const PROJECT_RESOURCE_TRANSACTION_PREFIX: &str = ".project-resource-publication-";
 pub(crate) const AUDIO_TRACK_TRANSACTION_PREFIX: &str = ".audio-track-publication-";
+pub(crate) const AUDIO_CLIP_TRANSACTION_PREFIX: &str = ".audio-clip-publication-";
 pub(crate) const CONTROL_MAPPING_TRANSACTION_PREFIX: &str = ".control-mapping-publication-";
 pub(crate) const RECORDING_IMPORT_TRANSACTION_PREFIX: &str = ".recording-import-";
 
@@ -17,14 +18,16 @@ pub(crate) const RECORDING_IMPORT_TRANSACTION_PREFIX: &str = ".recording-import-
 pub(crate) enum ProjectTransactionFamily {
     ProjectResource,
     AudioTrack,
+    AudioClip,
     ControlMapping,
     RecordingImport,
 }
 
 impl ProjectTransactionFamily {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::ProjectResource,
         Self::AudioTrack,
+        Self::AudioClip,
         Self::ControlMapping,
         Self::RecordingImport,
     ];
@@ -33,6 +36,7 @@ impl ProjectTransactionFamily {
         match self {
             Self::ProjectResource => PROJECT_RESOURCE_TRANSACTION_PREFIX,
             Self::AudioTrack => AUDIO_TRACK_TRANSACTION_PREFIX,
+            Self::AudioClip => AUDIO_CLIP_TRANSACTION_PREFIX,
             Self::ControlMapping => CONTROL_MAPPING_TRANSACTION_PREFIX,
             Self::RecordingImport => RECORDING_IMPORT_TRANSACTION_PREFIX,
         }

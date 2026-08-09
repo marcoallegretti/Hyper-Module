@@ -3,50 +3,81 @@ use core::fmt;
 use std::path::Path;
 
 use super::{
-    AudioTrackPublicationRecovery, ControlMappingPublicationError,
+    AudioClipPublicationRecovery, AudioTrackPublicationRecovery, ControlMappingPublicationError,
     ControlMappingPublicationRecovery, ProjectResourcePublicationError,
     ProjectResourcePublicationRecovery, RecordingImportError, RecordingImportRecovery,
-    recover_audio_track_publications, recover_control_mapping_publications,
-    recover_project_resource_publications, recover_recording_imports,
+    recover_audio_clip_publications, recover_audio_track_publications,
+    recover_control_mapping_publications, recover_project_resource_publications,
+    recover_recording_imports,
 };
 
 /// Complete transaction-recovery evidence produced before an editable project
 /// is loaded by the desktop IDE.
 #[derive(Debug, Default)]
 pub struct ProjectTransactionRecoveryReport {
+    families: Box<ProjectTransactionRecoveryFamilies>,
+}
+
+#[derive(Debug, Default)]
+struct ProjectTransactionRecoveryFamilies {
     resources: Vec<ProjectResourcePublicationRecovery>,
     audio_tracks: Vec<AudioTrackPublicationRecovery>,
+    audio_clips: Vec<AudioClipPublicationRecovery>,
     control_mappings: Vec<ControlMappingPublicationRecovery>,
     recordings: Vec<RecordingImportRecovery>,
 }
 
 impl ProjectTransactionRecoveryReport {
+    fn from_parts(
+        resources: Vec<ProjectResourcePublicationRecovery>,
+        audio_tracks: Vec<AudioTrackPublicationRecovery>,
+        audio_clips: Vec<AudioClipPublicationRecovery>,
+        control_mappings: Vec<ControlMappingPublicationRecovery>,
+        recordings: Vec<RecordingImportRecovery>,
+    ) -> Self {
+        Self {
+            families: Box::new(ProjectTransactionRecoveryFamilies {
+                resources,
+                audio_tracks,
+                audio_clips,
+                control_mappings,
+                recordings,
+            }),
+        }
+    }
+
     #[must_use]
     pub fn resources(&self) -> &[ProjectResourcePublicationRecovery] {
-        &self.resources
+        &self.families.resources
     }
 
     #[must_use]
     pub fn audio_tracks(&self) -> &[AudioTrackPublicationRecovery] {
-        &self.audio_tracks
+        &self.families.audio_tracks
+    }
+
+    #[must_use]
+    pub fn audio_clips(&self) -> &[AudioClipPublicationRecovery] {
+        &self.families.audio_clips
     }
 
     #[must_use]
     pub fn control_mappings(&self) -> &[ControlMappingPublicationRecovery] {
-        &self.control_mappings
+        &self.families.control_mappings
     }
 
     #[must_use]
     pub fn recordings(&self) -> &[RecordingImportRecovery] {
-        &self.recordings
+        &self.families.recordings
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.resources.is_empty()
-            && self.audio_tracks.is_empty()
-            && self.control_mappings.is_empty()
-            && self.recordings.is_empty()
+        self.families.resources.is_empty()
+            && self.families.audio_tracks.is_empty()
+            && self.families.audio_clips.is_empty()
+            && self.families.control_mappings.is_empty()
+            && self.families.recordings.is_empty()
     }
 }
 
@@ -54,6 +85,7 @@ impl ProjectTransactionRecoveryReport {
 pub enum ProjectTransactionRecoveryErrorSource {
     Resource(ProjectResourcePublicationError),
     AudioTrack(ProjectResourcePublicationError),
+    AudioClip(ProjectResourcePublicationError),
     ControlMapping(ControlMappingPublicationError),
     Recording(RecordingImportError),
 }
@@ -63,6 +95,7 @@ impl fmt::Display for ProjectTransactionRecoveryErrorSource {
         match self {
             Self::Resource(source) => write!(formatter, "resource recovery failed: {source}"),
             Self::AudioTrack(source) => write!(formatter, "audio-track recovery failed: {source}"),
+            Self::AudioClip(source) => write!(formatter, "audio-clip recovery failed: {source}"),
             Self::ControlMapping(source) => {
                 write!(formatter, "control-mapping recovery failed: {source}")
             }
@@ -74,7 +107,9 @@ impl fmt::Display for ProjectTransactionRecoveryErrorSource {
 impl Error for ProjectTransactionRecoveryErrorSource {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Resource(source) | Self::AudioTrack(source) => Some(source),
+            Self::Resource(source) | Self::AudioTrack(source) | Self::AudioClip(source) => {
+                Some(source)
+            }
             Self::ControlMapping(source) => Some(source),
             Self::Recording(source) => Some(source),
         }
@@ -128,8 +163,8 @@ impl Error for ProjectTransactionRecoveryError {
 ///
 /// Existing-resource publication is recovered first because it may repair a
 /// manifest/resource pair needed by later package verification. Audio-track,
-/// mapping, and recording transactions then follow in that order through the
-/// same shared lock.
+/// audio-clip, mapping, and recording transactions then follow in that order
+/// through the same shared lock.
 ///
 /// Recovery is fail-closed when another project storage transaction owns that
 /// lock. Callers may retry after the competing transaction has completed; this
@@ -153,11 +188,29 @@ pub fn recover_project_transactions(
         Ok(audio_tracks) => audio_tracks,
         Err(source) => {
             return Err(ProjectTransactionRecoveryError {
-                completed: ProjectTransactionRecoveryReport {
+                completed: ProjectTransactionRecoveryReport::from_parts(
                     resources,
-                    ..ProjectTransactionRecoveryReport::default()
-                },
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
                 source: Box::new(ProjectTransactionRecoveryErrorSource::AudioTrack(source)),
+            });
+        }
+    };
+    let audio_clips = match recover_audio_clip_publications(project_path) {
+        Ok(audio_clips) => audio_clips,
+        Err(source) => {
+            return Err(ProjectTransactionRecoveryError {
+                completed: ProjectTransactionRecoveryReport::from_parts(
+                    resources,
+                    audio_tracks,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                source: Box::new(ProjectTransactionRecoveryErrorSource::AudioClip(source)),
             });
         }
     };
@@ -165,30 +218,37 @@ pub fn recover_project_transactions(
         Ok(control_mappings) => control_mappings,
         Err(source) => {
             return Err(ProjectTransactionRecoveryError {
-                completed: ProjectTransactionRecoveryReport {
+                completed: ProjectTransactionRecoveryReport::from_parts(
                     resources,
                     audio_tracks,
-                    ..ProjectTransactionRecoveryReport::default()
-                },
+                    audio_clips,
+                    Vec::new(),
+                    Vec::new(),
+                ),
                 source: Box::new(ProjectTransactionRecoveryErrorSource::ControlMapping(
                     source,
                 )),
             });
         }
     };
-    let report = ProjectTransactionRecoveryReport {
+    let report = ProjectTransactionRecoveryReport::from_parts(
         resources,
         audio_tracks,
+        audio_clips,
         control_mappings,
-        recordings: Vec::new(),
-    };
+        Vec::new(),
+    );
     match recover_recording_imports(project_path) {
-        Ok(recordings) => Ok(ProjectTransactionRecoveryReport {
-            resources: report.resources,
-            audio_tracks: report.audio_tracks,
-            control_mappings: report.control_mappings,
-            recordings,
-        }),
+        Ok(recordings) => {
+            let families = *report.families;
+            Ok(ProjectTransactionRecoveryReport::from_parts(
+                families.resources,
+                families.audio_tracks,
+                families.audio_clips,
+                families.control_mappings,
+                recordings,
+            ))
+        }
         Err(source) => Err(ProjectTransactionRecoveryError {
             completed: report,
             source: Box::new(ProjectTransactionRecoveryErrorSource::Recording(source)),
