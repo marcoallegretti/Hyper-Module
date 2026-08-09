@@ -1343,6 +1343,7 @@ fn bind_audio_clip_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    bind_audio_clip_rename_callback(ui, worker, project_state);
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_activation = Rc::clone(worker);
@@ -1420,6 +1421,49 @@ fn bind_audio_clip_callback(
     bind_arrangement_placement_addition_callback(ui, worker, project_state);
 }
 
+fn bind_audio_clip_rename_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_rename = Rc::clone(worker);
+    let project_state_for_rename = Rc::clone(project_state);
+    actions.on_rename_audio_clip(move |clip_id, name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_clip_rename_visible()
+            || ui.get_clip_rename_id() != clip_id
+        {
+            ui.set_error_text("Audio-clip rename selection is no longer current".into());
+            return;
+        }
+        let clips = project_state_for_rename.audio_clips.borrow();
+        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+            ui.set_error_text("The selected audio clip is no longer available".into());
+            return;
+        };
+        let command = match audio_clip_rename_command(clip.id(), clip.name(), name.as_str()) {
+            Ok(Some(command)) => command,
+            Ok(None) => {
+                ui.set_clip_rename_visible(false);
+                ui.set_status_text("Audio-clip name already matches the committed value".into());
+                ui.set_error_text(SharedString::default());
+                return;
+            }
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        drop(clips);
+        submit_to_ui(&ui, &worker_for_rename, command);
+    });
+}
+
 fn bind_arrangement_placement_addition_callback(
     ui: &MainWindow,
     worker: &WorkerCell,
@@ -1463,6 +1507,29 @@ fn bind_arrangement_placement_addition_callback(
             },
         );
     });
+}
+
+fn normalize_audio_clip_name(value: &str) -> Result<&str, &'static str> {
+    let name = value.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err("Audio-clip name must contain 1 to 120 characters");
+    }
+    Ok(name)
+}
+
+fn audio_clip_rename_command(
+    clip_id: &str,
+    current_name: &str,
+    proposed_name: &str,
+) -> Result<Option<IdeWorkerCommand>, &'static str> {
+    let name = normalize_audio_clip_name(proposed_name)?;
+    if name == current_name {
+        return Ok(None);
+    }
+    Ok(Some(IdeWorkerCommand::RenameAudioClip {
+        clip_id: clip_id.to_owned(),
+        name: name.to_owned(),
+    }))
 }
 
 fn parse_audio_clip_gain(value: &str) -> Result<f64, &'static str> {
@@ -1658,6 +1725,9 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                     ui.set_app_mode(AppMode::AddingArrangementPlacement);
                     ui.set_add_arrangement_placement_visible(false);
                 }
+                IdeWorkerCommandKind::RenameAudioClip => {
+                    ui.set_app_mode(AppMode::RenamingClip);
+                }
                 IdeWorkerCommandKind::SetAudioClipActive => {
                     ui.set_app_mode(AppMode::ChangingClipActivation);
                 }
@@ -1748,6 +1818,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::AddArrangementPlacement => {
             "Preserving mixer state, placing the full audio clip, and reopening project…"
+        }
+        IdeWorkerCommandKind::RenameAudioClip => {
+            "Preserving mixer state, renaming the audio clip, and reopening project…"
         }
         IdeWorkerCommandKind::SetAudioClipActive => {
             "Preserving mixer state, updating audio-clip activation, and reopening project…"
@@ -1882,6 +1955,9 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementPlacementAdded { .. }
         | IdeWorkerEvent::ArrangementPlacementAdding { .. }) => {
             apply_arrangement_placement_addition_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioClipRenamed { .. } | IdeWorkerEvent::AudioClipRenaming) => {
+            apply_audio_clip_rename_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipActivationChanged { .. }
         | IdeWorkerEvent::AudioClipActivationChanging { .. }) => {
@@ -2224,6 +2300,36 @@ fn apply_arrangement_placement_addition_event(ui: &MainWindow, event: &IdeWorker
             );
         }
         _ => unreachable!("arrangement addition event dispatcher received another event"),
+    }
+}
+
+fn apply_audio_clip_rename_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioClipRenamed {
+            revision,
+            changed,
+            name,
+        } => {
+            ui.set_clip_rename_visible(false);
+            ui.set_clip_rename_id(SharedString::default());
+            ui.set_clip_rename_original(SharedString::default());
+            ui.set_clip_rename_name(SharedString::default());
+            ui.set_status_text(
+                if *changed {
+                    format!("Audio clip renamed to {name} in project revision {revision}")
+                } else {
+                    format!("Audio clip was already named {name} in project revision {revision}")
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipRenaming => {
+            ui.set_app_mode(AppMode::RenamingClip);
+            ui.set_status_text("Waiting for native output before renaming the audio clip…".into());
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("audio-clip rename event dispatcher received another event"),
     }
 }
 
@@ -3198,6 +3304,10 @@ fn reset_project(
     ui.set_add_arrangement_placement_duration_ticks(SharedString::default());
     ui.set_add_arrangement_placement_start_tick("0".into());
     ui.set_clips_visible(false);
+    ui.set_clip_rename_visible(false);
+    ui.set_clip_rename_id(SharedString::default());
+    ui.set_clip_rename_original(SharedString::default());
+    ui.set_clip_rename_name(SharedString::default());
     ui.set_clip_gain_visible(false);
     ui.set_clip_gain_id(SharedString::default());
     ui.set_clip_gain_name(SharedString::default());
@@ -3291,6 +3401,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::AddArrangementPlacement
             if current == AppMode::AddingArrangementPlacement =>
         {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::RenameAudioClip if current == AppMode::RenamingClip => {
             AppMode::Running
         }
         IdeWorkerCommandKind::SetAudioClipActive if current == AppMode::ChangingClipActivation => {
@@ -4409,6 +4522,30 @@ mod tests {
         assert!(parse_audio_clip_gain("inf").is_err());
         assert!(parse_audio_clip_gain("").is_err());
         assert!(parse_audio_clip_gain("not gain").is_err());
+    }
+
+    #[test]
+    fn audio_clip_rename_command_normalizes_name_and_preserves_identity() {
+        assert!(matches!(
+            audio_clip_rename_command("clip-a", "Verse", " Lead vocal "),
+            Ok(Some(IdeWorkerCommand::RenameAudioClip { clip_id, name }))
+                if clip_id == "clip-a" && name == "Lead vocal"
+        ));
+        assert!(matches!(
+            audio_clip_rename_command("clip-a", "Verse", " Verse "),
+            Ok(None)
+        ));
+        assert!(audio_clip_rename_command("clip-a", "Verse", "").is_err());
+        assert!(audio_clip_rename_command("clip-a", "Verse", "   ").is_err());
+        assert!(audio_clip_rename_command("clip-a", "Verse", &"x".repeat(121)).is_err());
+    }
+
+    #[test]
+    fn audio_clip_rename_failure_restores_running_mode() {
+        assert_eq!(
+            mode_after_failure(AppMode::RenamingClip, IdeWorkerCommandKind::RenameAudioClip),
+            AppMode::Running
+        );
     }
 
     #[test]

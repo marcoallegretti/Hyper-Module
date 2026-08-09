@@ -19,6 +19,7 @@ export enum AppMode {
     moving-arrangement-placement,
     trimming-arrangement-placement,
     removing-arrangement-placement,
+    renaming-clip,
     changing-clip-activation,
     changing-clip-gain,
     creating-clip,
@@ -130,6 +131,7 @@ export global IdeActions {
     callback trim-arrangement-placement-front(string, string);
     callback remove-arrangement-placement(string);
     callback add-arrangement-placement(string, string);
+    callback rename-audio-clip(string, string);
     callback set-audio-clip-active(string, bool);
     callback set-audio-clip-gain(string, string);
     callback loudness-run();
@@ -277,6 +279,10 @@ export component MainWindow inherits Window {
     in-out property <string> remove-arrangement-placement-clip-name: "";
     in-out property <string> remove-arrangement-placement-track-name: "";
     in-out property <bool> clips-visible: false;
+    in-out property <bool> clip-rename-visible: false;
+    in-out property <string> clip-rename-id: "";
+    in-out property <string> clip-rename-original: "";
+    in-out property <string> clip-rename-name: "";
     in-out property <bool> clip-gain-visible: false;
     in-out property <string> clip-gain-id: "";
     in-out property <string> clip-gain-name: "";
@@ -1558,7 +1564,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && !root.clip-gain-visible && !root.add-arrangement-placement-visible : Panel {
+                if root.clips-visible && !root.clip-rename-visible && !root.clip-gain-visible && !root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1569,17 +1575,17 @@ export component MainWindow inherits Window {
                             height: 48px;
                             VerticalLayout {
                                 Text { text: "AUDIO CLIPS"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: "Reusable verified source views · exact arrangement placement · global activation · constant gain"; color: #aebccc; font-size: 12px; }
+                                Text { text: "Reusable verified source views · editable names · exact arrangement placement · global activation · constant gain"; color: #aebccc; font-size: 12px; }
                             }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Button {
                                 text: "Performance";
-                                clicked => { root.clips-visible = false; root.clip-gain-visible = false; root.add-arrangement-placement-visible = false; }
+                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-gain-visible = false; root.add-arrangement-placement-visible = false; }
                             }
                             Button {
                                 text: "Mixer";
                                 enabled: root.app-mode == AppMode.running;
-                                clicked => { root.clips-visible = false; root.clip-gain-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
+                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-gain-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
                             }
                         }
 
@@ -1621,6 +1627,18 @@ export component MainWindow inherits Window {
                                     }
                                     Button {
                                         width: 72px;
+                                        text: "Rename";
+                                        accessible-label: "Rename " + clip.name;
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => {
+                                            root.clip-rename-id = clip.id;
+                                            root.clip-rename-original = clip.name;
+                                            root.clip-rename-name = clip.name;
+                                            root.clip-rename-visible = true;
+                                        }
+                                    }
+                                    Button {
+                                        width: 72px;
                                         text: "Place";
                                         accessible-label: "Place the full " + clip.name + " clip at an exact project tick";
                                         enabled: root.app-mode == AppMode.running;
@@ -1658,7 +1676,7 @@ export component MainWindow inherits Window {
                         }
 
                         Text {
-                            text: "Place creates one full-length non-ripple arrangement reference. Activation and gain affect every existing reference. Track, mixer, and source media remain unchanged.";
+                            text: "Rename changes clip metadata only. Place creates one full-length non-ripple arrangement reference. Activation and gain affect every existing reference. Track, mixer, and source media remain unchanged.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;
@@ -1666,7 +1684,49 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && root.add-arrangement-placement-visible : Panel {
+                if root.clips-visible && root.clip-rename-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 16px;
+                        Text { text: "RENAME AUDIO CLIP"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.clip-rename-original; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                        Text {
+                            text: "Enter a display name from 1 to 120 characters. Leading and trailing whitespace is removed before validation.";
+                            color: #aebccc;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        LineEdit {
+                            text <=> root.clip-rename-name;
+                            placeholder-text: "Audio clip name";
+                            accessible-label: "New audio clip name";
+                        }
+                        Text {
+                            text: "Clip identity, arrangement placements, owning track, playback settings, and immutable source audio remain unchanged.";
+                            color: #65758a;
+                            font-size: 9px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Cancel"; clicked => { root.clip-rename-visible = false; } }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: "Rename clip";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.clip-rename-id != ""
+                                    && root.clip-rename-name != ""
+                                    && root.clip-rename-name != root.clip-rename-original;
+                                clicked => { IdeActions.rename-audio-clip(root.clip-rename-id, root.clip-rename-name); }
+                            }
+                        }
+                    }
+                }
+
+                if root.clips-visible && !root.clip-rename-visible && root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1718,7 +1778,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && root.clip-gain-visible && !root.add-arrangement-placement-visible : Panel {
+                if root.clips-visible && !root.clip-rename-visible && root.clip-gain-visible && !root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
