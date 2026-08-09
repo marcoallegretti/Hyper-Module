@@ -54,10 +54,10 @@ use hyper_playback_json::{
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError, CompiledMixerTap,
     CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
     MixerSendBaseState, MixerStateSerializationError, serialize_arrangement_placement_activation,
-    serialize_arrangement_placement_duration, serialize_arrangement_placement_move,
-    serialize_audio_clip_activation, serialize_audio_clip_gain, serialize_audio_track_activation,
-    serialize_audio_track_addition, serialize_audio_track_removal, serialize_audio_track_rename,
-    serialize_mixer_base_state,
+    serialize_arrangement_placement_duration, serialize_arrangement_placement_front_trim,
+    serialize_arrangement_placement_move, serialize_audio_clip_activation,
+    serialize_audio_clip_gain, serialize_audio_track_activation, serialize_audio_track_addition,
+    serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
 };
 use hyper_playback_session::{AudioClipGainValidationError, PlaybackSessionAssemblyLimits};
 pub use hyper_playback_session::{
@@ -3297,6 +3297,28 @@ impl RunningDesktopIdeApplication {
         )
     }
 
+    fn prepare_arrangement_placement_front_trim(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        placement_id: &str,
+        start_tick: u64,
+    ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        Self::prepare_arrangement_placement_edit(
+            application,
+            recovery,
+            |prepared, source, limits| {
+                let (project, _, _, _) = prepared.session().parts();
+                serialize_arrangement_placement_front_trim(
+                    project,
+                    source,
+                    placement_id,
+                    start_tick,
+                    limits,
+                )
+            },
+        )
+    }
+
     fn prepare_arrangement_placement_edit(
         application: &DesktopIdeApplication,
         recovery: &DesktopPlaybackRecovery,
@@ -5173,23 +5195,64 @@ mod tests {
         let arrangement: serde_json::Value = serde_json::from_slice(&resized_arrangement).unwrap();
         assert_eq!(arrangement["placements"][0]["start_tick"], 8);
         assert_eq!(arrangement["placements"][0]["duration_ticks"], 2);
+        let (loaded, _, _, _) = reopened.session().parts();
+        let front_trimmed_arrangement = serialize_arrangement_placement_front_trim(
+            loaded,
+            &resized_arrangement,
+            ARRANGEMENT_TEST_PLACEMENT_ID,
+            9,
+            limits.session.documents,
+        )
+        .unwrap();
         let resized_identity = *reopened.package().manifest_sha256();
+        drop(reopened);
+
+        let front_trimmed = IdeArrangementPlacementEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: resized_identity,
+                resource_id: mixer_id.clone(),
+                resource_bytes: changed_mixer.clone(),
+            },
+            arrangement_id: arrangement_id.clone(),
+            arrangement_bytes: front_trimmed_arrangement.clone(),
+        }
+        .publish()
+        .unwrap();
+        assert!(front_trimmed.changed());
+        assert_eq!(front_trimmed.project_revision(), 6);
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let placement = &reopened.session().arrangement().placements()[0];
+        assert_eq!(placement.start_tick(), 9);
+        assert_eq!(placement.duration_ticks(), 1);
+        assert_eq!(
+            reopened.package().read_resource(&arrangement_id).unwrap(),
+            front_trimmed_arrangement
+        );
+        let arrangement: serde_json::Value =
+            serde_json::from_slice(&front_trimmed_arrangement).unwrap();
+        assert_eq!(arrangement["placements"][0]["start_tick"], 9);
+        assert_eq!(arrangement["placements"][0]["clip_start_tick"], 1);
+        assert_eq!(arrangement["placements"][0]["duration_ticks"], 1);
+        let front_trimmed_identity = *reopened.package().manifest_sha256();
         drop(reopened);
 
         let unchanged = IdeArrangementPlacementEditPlan {
             mixer: IdeMixerSavePlan {
                 project_path,
-                expected_project_sha256: resized_identity,
+                expected_project_sha256: front_trimmed_identity,
                 resource_id: mixer_id,
                 resource_bytes: changed_mixer,
             },
             arrangement_id,
-            arrangement_bytes: resized_arrangement,
+            arrangement_bytes: front_trimmed_arrangement,
         }
         .publish()
         .unwrap();
         assert!(!unchanged.changed());
-        assert_eq!(unchanged.project_revision(), 5);
+        assert_eq!(unchanged.project_revision(), 6);
     }
 
     #[test]
