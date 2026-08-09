@@ -372,12 +372,20 @@ fn publish_audio_clip_observed(
                     })?;
                     Ok(outcome)
                 }
-                Err(recovery_error) => Err(ProjectResourcePublicationError {
-                    kind: ProjectResourcePublicationErrorKind::Recovery,
-                    message: "audio-clip publication and recovery both failed".to_owned(),
-                    published: false,
-                    source: Some(Box::new(recovery_error)),
-                }),
+                Err(recovery_error) => {
+                    let published = recovery_error.published();
+                    Err(ProjectResourcePublicationError {
+                        kind: ProjectResourcePublicationErrorKind::Recovery,
+                        message: if published {
+                            "audio clip was published but verification or transaction recovery is incomplete"
+                        } else {
+                            "audio-clip publication and recovery both failed"
+                        }
+                        .to_owned(),
+                        published,
+                        source: Some(Box::new(recovery_error)),
+                    })
+                }
             }
         }
     }
@@ -876,8 +884,16 @@ fn recover_audio_clip_transaction(
         Err(error) => return Err(error),
     };
     if active == after {
-        cleanup_audio_clip_temporaries(root, backups, transaction, tx)?;
-        verify_committed(root_path, root, after)?;
+        cleanup_audio_clip_temporaries(root, backups, transaction, tx)
+            .and_then(|()| verify_committed(root_path, root, after))
+            .map_err(|source| ProjectResourcePublicationError {
+                kind: ProjectResourcePublicationErrorKind::Recovery,
+                message:
+                    "committed audio-clip publication could not be verified or fully recovered"
+                        .to_owned(),
+                published: true,
+                source: Some(Box::new(source)),
+            })?;
         return Ok(AudioClipPublicationRecoveryDisposition::Committed);
     }
     if active != before {
@@ -1516,8 +1532,8 @@ mod tests {
             }
         }
 
-        fn transaction_count(&self) -> usize {
-            fs::read_dir(self.root.join("backups"))
+        fn transaction_names(&self) -> Vec<String> {
+            let mut names: Vec<_> = fs::read_dir(self.root.join("backups"))
                 .unwrap()
                 .filter_map(Result::ok)
                 .filter(|entry| {
@@ -1526,7 +1542,14 @@ mod tests {
                         .to_string_lossy()
                         .starts_with(AUDIO_CLIP_TRANSACTION_PREFIX)
                 })
-                .count()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        fn transaction_count(&self) -> usize {
+            self.transaction_names().len()
         }
     }
 
@@ -1673,6 +1696,165 @@ mod tests {
                 .revision(),
             2
         );
+    }
+
+    #[test]
+    fn committed_manifest_retains_publication_authority_when_recovery_is_incomplete() {
+        let fixture = Fixture::new();
+        let error = publish_audio_clip_observed(&fixture.root, fixture.request(), |phase, _| {
+            if phase != AudioClipPublicationPhase::Manifest {
+                return Ok(());
+            }
+            let name = fixture.transaction_names().pop().unwrap();
+            let id = name.strip_prefix(AUDIO_CLIP_TRANSACTION_PREFIX).unwrap();
+            fs::write(
+                fixture
+                    .root
+                    .join("backups")
+                    .join(format!(".audio-clip-project-{id}.json")),
+                b"unrelated cleanup residue",
+            )
+            .unwrap();
+            Err(failure(
+                ProjectResourcePublicationErrorKind::Io,
+                "simulated post-manifest failure",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
+        assert!(error.published());
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            2
+        );
+        let name = fixture.transaction_names().pop().unwrap();
+        let id = name.strip_prefix(AUDIO_CLIP_TRANSACTION_PREFIX).unwrap();
+        fs::remove_file(
+            fixture
+                .root
+                .join("backups")
+                .join(format!(".audio-clip-project-{id}.json")),
+        )
+        .unwrap();
+        let recovered = recover_audio_clip_publications(&fixture.root).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].disposition(),
+            AudioClipPublicationRecoveryDisposition::Committed
+        );
+        assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
+    fn prepublication_residue_is_discarded_only_for_owned_allowed_states() {
+        for residue in ["empty", "intent", "partial"] {
+            let fixture = Fixture::new();
+            let id = Uuid::new_v4().to_string();
+            let name = format!("{AUDIO_CLIP_TRANSACTION_PREFIX}{id}");
+            fs::create_dir(fixture.root.join("backups")).unwrap();
+            let path = fixture.root.join("backups").join(&name);
+            fs::create_dir(&path).unwrap();
+            if residue != "empty" {
+                fs::write(
+                    path.join(INTENT_NAME),
+                    serde_json_canonicalizer::to_vec(&json!({
+                        "format":"hyper-audio-clip-publication-intent",
+                        "format_version":1,
+                        "id":id,
+                        "extensions":{}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+            if residue == "partial" {
+                fs::write(path.join(CLIP_STAGING_NAME), b"partial staging bytes").unwrap();
+            }
+
+            let recovered = recover_audio_clip_publications(&fixture.root).unwrap();
+
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(
+                recovered[0].disposition(),
+                AudioClipPublicationRecoveryDisposition::RolledBack
+            );
+            assert_eq!(recovered[0].transaction_id(), id);
+            assert_eq!(fixture.transaction_count(), 0);
+            assert!(!fixture.root.join("clips").exists());
+            assert_eq!(
+                fs::read(fixture.root.join(format!("tracks/{TRACK_ID}.json"))).unwrap(),
+                fixture.original_track
+            );
+            assert_eq!(
+                verify_project_package(&fixture.root)
+                    .unwrap()
+                    .manifest()
+                    .revision(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_prepublication_residue_fails_closed_and_retains_evidence() {
+        for residue in ["invalid-intent", "corrupt-record", "unknown-entry"] {
+            let fixture = Fixture::new();
+            let id = Uuid::new_v4().to_string();
+            let name = format!("{AUDIO_CLIP_TRANSACTION_PREFIX}{id}");
+            fs::create_dir(fixture.root.join("backups")).unwrap();
+            let path = fixture.root.join("backups").join(&name);
+            fs::create_dir(&path).unwrap();
+            match residue {
+                "invalid-intent" => fs::write(
+                    path.join(INTENT_NAME),
+                    serde_json_canonicalizer::to_vec(&json!({
+                        "format":"hyper-audio-clip-publication-intent",
+                        "format_version":1,
+                        "id":Uuid::new_v4().to_string(),
+                        "extensions":{}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap(),
+                "corrupt-record" => {
+                    fs::write(
+                        path.join(INTENT_NAME),
+                        serde_json_canonicalizer::to_vec(&json!({
+                            "format":"hyper-audio-clip-publication-intent",
+                            "format_version":1,
+                            "id":id,
+                            "extensions":{}
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    fs::write(path.join(TRANSACTION_NAME), b"{").unwrap();
+                }
+                "unknown-entry" => fs::write(path.join("unknown"), b"unowned").unwrap(),
+                _ => unreachable!(),
+            }
+
+            let error = recover_audio_clip_publications(&fixture.root).unwrap_err();
+
+            assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
+            assert_eq!(fixture.transaction_names(), [name]);
+            assert!(!fixture.root.join("clips").exists());
+            assert_eq!(
+                fs::read(fixture.root.join(format!("tracks/{TRACK_ID}.json"))).unwrap(),
+                fixture.original_track
+            );
+            assert_eq!(
+                verify_project_package(&fixture.root)
+                    .unwrap()
+                    .manifest()
+                    .revision(),
+                1
+            );
+        }
     }
 
     #[test]

@@ -706,19 +706,12 @@ fn bind_audio_preview_callbacks(ui: &MainWindow, worker: &WorkerCell, take_route
         if ui.get_app_mode() != AppMode::Running || !ui.get_take_clip_visible() {
             return;
         }
-        let recording_id = take_route(&routes_for_creation, index).map(|route| route.recording_id);
-        let Some(recording_id) = recording_id else {
+        let Some(command) = take_clip_creation_command(&routes_for_creation, index, name.as_str())
+        else {
             ui.set_error_text("Recorded take selection is no longer available".into());
             return;
         };
-        submit_to_ui(
-            &ui,
-            &worker_for_creation,
-            IdeWorkerCommand::CreateAudioClipFromTake {
-                recording_id,
-                name: name.to_string(),
-            },
-        );
+        submit_to_ui(&ui, &worker_for_creation, command);
     });
 }
 
@@ -726,6 +719,17 @@ fn take_route(routes: &TakeRoutes, index: i32) -> Option<TakeRoute> {
     usize::try_from(index)
         .ok()
         .and_then(|index| routes.borrow().get(index).cloned())
+}
+
+fn take_clip_creation_command(
+    routes: &TakeRoutes,
+    index: i32,
+    name: &str,
+) -> Option<IdeWorkerCommand> {
+    take_route(routes, index).map(|route| IdeWorkerCommand::CreateAudioClipFromTake {
+        recording_id: route.recording_id,
+        name: name.to_owned(),
+    })
 }
 
 fn bind_playback_callbacks(
@@ -4445,6 +4449,13 @@ mod tests {
         );
         assert_eq!(take_route(&routes, -1), None);
         assert_eq!(take_route(&routes, 1), None);
+        assert!(matches!(
+            take_clip_creation_command(&routes, 0, "Lead take"),
+            Some(IdeWorkerCommand::CreateAudioClipFromTake {
+                recording_id,
+                name,
+            }) if recording_id == "recording-a" && name == "Lead take"
+        ));
     }
 
     #[test]

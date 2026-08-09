@@ -2148,7 +2148,7 @@ impl fmt::Display for IdeRecordingClipCreationPublicationError {
             ),
             Self::Clip { source, .. } if source.published() => write!(
                 formatter,
-                "audio clip was created, but its project transaction cleanup is incomplete: {source}"
+                "audio clip was created, but project verification or transaction recovery is incomplete: {source}"
             ),
             Self::Clip { mixer, source } if mixer.changed() => write!(
                 formatter,
@@ -3483,6 +3483,22 @@ impl RunningDesktopIdeApplication {
                 IdeProjectSaveError::ProjectSnapshotUnavailable,
             ))
         })?;
+        Self::prepare_recording_clip_creation_from_project(
+            application,
+            mixer,
+            prepared,
+            recording_id,
+            clip_name,
+        )
+    }
+
+    fn prepare_recording_clip_creation_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        recording_id: &str,
+        clip_name: &str,
+    ) -> Result<IdeRecordingClipCreationPlan, IdeRecordingClipCreationError> {
         let mut recordings = prepared
             .recording_metadata()
             .iter()
@@ -5697,7 +5713,6 @@ mod tests {
     fn recorded_take_clip_plan_publishes_and_reopens_without_arrangement_placement() {
         const METADATA_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338520";
         const ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338521";
-        const CLIP_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338522";
         let parent = TestDirectory::new();
         let created = hyper_storage_engine::create_project(
             &parent.0,
@@ -5751,54 +5766,69 @@ mod tests {
             .iter()
             .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
             .unwrap();
-        let source_mixer = package.read_resource(mixer.id()).unwrap();
-        let source_track = package.read_resource(&track_id).unwrap();
-        let (project, _, _, media) = prepared.session().parts();
-        let assets: Vec<_> = media.media_asset_facts().collect();
-        let documents = serialize_recording_audio_clip_addition(
-            project,
-            &assets,
-            &source_track,
-            &track_id,
-            ASSET_ID,
-            0,
-            63,
-            CLIP_ID,
+        let mixer_id = mixer.id().to_owned();
+        let source_mixer = package.read_resource(&mixer_id).unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        let application = DesktopIdeApplication::from_inventories(
+            desktop_ide_application_config().unwrap(),
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let wrong_identity =
+            RunningDesktopIdeApplication::prepare_recording_clip_creation_from_project(
+                &application,
+                IdeMixerSavePlan {
+                    project_path: project_path.clone(),
+                    expected_project_sha256,
+                    resource_id: mixer_id.clone(),
+                    resource_bytes: source_mixer.clone(),
+                },
+                &prepared,
+                ASSET_ID,
+                "Vocal take",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            wrong_identity,
+            IdeRecordingClipCreationError::RecordingMetadataMissing
+        ));
+        let plan = RunningDesktopIdeApplication::prepare_recording_clip_creation_from_project(
+            &application,
+            IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256,
+                resource_id: mixer_id.clone(),
+                resource_bytes: source_mixer.clone(),
+            },
+            &prepared,
+            METADATA_ID,
             "Vocal take",
-            limits.session.documents,
         )
         .unwrap();
-        let (track_bytes, clip_bytes, duration_ticks) = documents.into_parts();
-        let plan = IdeRecordingClipCreationPlan {
-            mixer: IdeMixerSavePlan {
-                project_path: project_path.clone(),
-                expected_project_sha256: *package.manifest_sha256(),
-                resource_id: mixer.id().to_owned(),
-                resource_bytes: source_mixer,
-            },
-            clip_id: CLIP_ID.to_owned(),
-            clip_bytes,
-            track_id: track_id.clone(),
-            track_bytes,
-            asset_id: ASSET_ID.to_owned(),
-        };
+        let clip_id = plan.clip_id.clone();
+        let serialized_clip: Value = serde_json::from_slice(&plan.clip_bytes).unwrap();
+        let duration_ticks = serialized_clip["duration_ticks"].as_u64().unwrap();
         drop(prepared);
 
         let outcome = plan.publish().unwrap();
 
         assert_eq!(outcome.project_revision(), 3);
-        assert_eq!(outcome.clip_id(), CLIP_ID);
+        assert_eq!(outcome.clip_id(), clip_id);
         assert_eq!(duration_ticks, 6);
         let reopened =
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
         let (project, _, _, _) = reopened.session().parts();
         assert_eq!(project.clip_count(), 1);
         assert_eq!(project.placement_count(), 0);
+        assert_eq!(
+            reopened.package().read_resource(&mixer_id).unwrap(),
+            source_mixer
+        );
         let track: Value =
             serde_json::from_slice(&reopened.package().read_resource(&track_id).unwrap()).unwrap();
-        assert_eq!(track["clip_ids"], json!([CLIP_ID]));
+        assert_eq!(track["clip_ids"], json!([clip_id]));
         let clip: Value =
-            serde_json::from_slice(&reopened.package().read_resource(CLIP_ID).unwrap()).unwrap();
+            serde_json::from_slice(&reopened.package().read_resource(&clip_id).unwrap()).unwrap();
         assert_eq!(clip["source"]["asset_id"], ASSET_ID);
         assert_eq!(clip["duration_ticks"], duration_ticks);
     }
