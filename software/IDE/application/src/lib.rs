@@ -54,11 +54,11 @@ use hyper_playback_json::{
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError, CompiledMixerTap,
     CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
     MixerSendBaseState, MixerStateSerializationError, serialize_arrangement_placement_activation,
-    serialize_arrangement_placement_duration, serialize_arrangement_placement_front_trim,
-    serialize_arrangement_placement_move, serialize_arrangement_placement_removal,
-    serialize_audio_clip_activation, serialize_audio_clip_gain, serialize_audio_track_activation,
-    serialize_audio_track_addition, serialize_audio_track_removal, serialize_audio_track_rename,
-    serialize_mixer_base_state,
+    serialize_arrangement_placement_addition, serialize_arrangement_placement_duration,
+    serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
+    serialize_arrangement_placement_removal, serialize_audio_clip_activation,
+    serialize_audio_clip_gain, serialize_audio_track_activation, serialize_audio_track_addition,
+    serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
 };
 use hyper_playback_session::{AudioClipGainValidationError, PlaybackSessionAssemblyLimits};
 pub use hyper_playback_session::{
@@ -67,10 +67,10 @@ pub use hyper_playback_session::{
 use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackLimits};
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
-    AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
-    AudioTrackRemovalRequest, ProjectResourcePublicationError, ProjectResourcePublicationOutcome,
-    ProjectResourcePublicationRequest, StorageError, publish_audio_track, publish_project_resource,
-    remove_audio_track,
+    ArrangementPublicationRequest, AudioTrackPublicationOutcome, AudioTrackPublicationRequest,
+    AudioTrackRemovalOutcome, AudioTrackRemovalRequest, ProjectResourcePublicationError,
+    ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest, StorageError,
+    publish_arrangement, publish_audio_track, publish_project_resource, remove_audio_track,
 };
 
 mod recording;
@@ -2169,6 +2169,7 @@ impl Error for IdeArrangementPlacementEditPublicationError {
 #[derive(Debug)]
 pub enum IdeArrangementPlacementEditError {
     InvalidPlacementIdentity,
+    InvalidClipIdentity,
     MixerSave(Box<IdeProjectSaveError>),
     ArrangementResourceMissing,
     ArrangementResourceAmbiguous,
@@ -2201,6 +2202,8 @@ impl fmt::Display for IdeArrangementPlacementEditError {
             Self::InvalidPlacementIdentity => {
                 formatter.write_str("arrangement edit requires a placement identity")
             }
+            Self::InvalidClipIdentity => formatter
+                .write_str("arrangement placement addition requires an audio-clip identity"),
             Self::MixerSave(source) => {
                 write!(
                     formatter,
@@ -2262,6 +2265,7 @@ impl Error for IdeArrangementPlacementEditError {
             Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
             Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
             Self::InvalidPlacementIdentity
+            | Self::InvalidClipIdentity
             | Self::ArrangementResourceMissing
             | Self::ArrangementResourceAmbiguous
             | Self::CapacityUnavailable
@@ -2576,6 +2580,7 @@ struct IdeArrangementPlacementEditPlan {
     mixer: IdeMixerSavePlan,
     arrangement_id: String,
     arrangement_bytes: Vec<u8>,
+    addition: bool,
 }
 
 #[derive(Debug)]
@@ -2681,16 +2686,27 @@ impl IdeArrangementPlacementEditPlan {
         let mixer = self.mixer.publish().map_err(|source| {
             IdeArrangementPlacementEditPublicationError::Mixer(Box::new(source))
         })?;
-        publish_project_resource(
-            &self.mixer.project_path,
-            ProjectResourcePublicationRequest {
-                expected_project_sha256: *mixer.project_identity(),
-                resource_id: &self.arrangement_id,
-                expected_role: ResourceRole::Arrangement,
-                resource_bytes: &self.arrangement_bytes,
-            },
-        )
-        .map_err(
+        let publication = if self.addition {
+            publish_arrangement(
+                &self.mixer.project_path,
+                ArrangementPublicationRequest {
+                    expected_project_sha256: *mixer.project_identity(),
+                    arrangement_id: &self.arrangement_id,
+                    arrangement_bytes: &self.arrangement_bytes,
+                },
+            )
+        } else {
+            publish_project_resource(
+                &self.mixer.project_path,
+                ProjectResourcePublicationRequest {
+                    expected_project_sha256: *mixer.project_identity(),
+                    resource_id: &self.arrangement_id,
+                    expected_role: ResourceRole::Arrangement,
+                    resource_bytes: &self.arrangement_bytes,
+                },
+            )
+        };
+        publication.map_err(
             |source| IdeArrangementPlacementEditPublicationError::Arrangement {
                 mixer: Box::new(mixer),
                 source: Box::new(source),
@@ -3254,6 +3270,64 @@ impl RunningDesktopIdeApplication {
         )
     }
 
+    fn prepare_arrangement_placement_addition(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        clip_id: &str,
+        start_tick: u64,
+    ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeArrangementPlacementEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeArrangementPlacementEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let mut descriptors = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::Arrangement);
+        let descriptor = descriptors.next();
+        if descriptors.next().is_some() {
+            return Err(IdeArrangementPlacementEditError::ArrangementResourceAmbiguous);
+        }
+        let addition = descriptor.is_none();
+        let arrangement_id = descriptor.map_or_else(
+            || uuid::Uuid::new_v4().to_string(),
+            |descriptor| descriptor.id().to_owned(),
+        );
+        let source = descriptor
+            .map(|descriptor| package.read_resource(descriptor.id()))
+            .transpose()
+            .map_err(IdeArrangementPlacementEditError::Storage)?;
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeArrangementPlacementEditError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let placement_id = uuid::Uuid::new_v4().to_string();
+        let arrangement_bytes = serialize_arrangement_placement_addition(
+            project,
+            &assets,
+            source.as_deref(),
+            &arrangement_id,
+            &placement_id,
+            clip_id,
+            start_tick,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeArrangementPlacementEditError::Serialization)?;
+        Ok(IdeArrangementPlacementEditPlan {
+            mixer,
+            arrangement_id,
+            arrangement_bytes,
+            addition,
+        })
+    }
+
     fn prepare_arrangement_placement_move(
         application: &DesktopIdeApplication,
         recovery: &DesktopPlaybackRecovery,
@@ -3382,6 +3456,7 @@ impl RunningDesktopIdeApplication {
             mixer,
             arrangement_id,
             arrangement_bytes,
+            addition: false,
         })
     }
 
@@ -4405,6 +4480,29 @@ mod tests {
             Self::with_audio(&arrangement_test_wav(&[0; 100]))
         }
 
+        fn without_arrangement() -> Self {
+            let fixture = Self::new();
+            let manifest_path = fixture.directory.0.join("project.json");
+            let mut manifest: Value =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            let resources = manifest["resources"].as_array_mut().unwrap();
+            let index = resources
+                .iter()
+                .position(|descriptor| descriptor["role"] == "arrangement")
+                .unwrap();
+            let path = resources[index]["path"].as_str().unwrap().to_owned();
+            resources.remove(index);
+            std::fs::write(
+                manifest_path,
+                serde_json_canonicalizer::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::remove_file(fixture.directory.0.join(path)).unwrap();
+            std::fs::remove_dir(fixture.directory.0.join("arrangement")).unwrap();
+            hyper_storage_engine::verify_project_package(&fixture.directory.0).unwrap();
+            fixture
+        }
+
         #[allow(
             clippy::too_many_lines,
             reason = "one fixture keeps the complete verified arrangement package graph visible"
@@ -5087,6 +5185,7 @@ mod tests {
             },
             arrangement_id: arrangement_id.clone(),
             arrangement_bytes: b"not-json".to_vec(),
+            addition: false,
         };
         let error = failed.publish().unwrap_err();
         let IdeArrangementPlacementEditPublicationError::Arrangement { mixer, source } = error
@@ -5119,6 +5218,7 @@ mod tests {
             },
             arrangement_id: arrangement_id.clone(),
             arrangement_bytes: disabled_arrangement.clone(),
+            addition: false,
         };
         let outcome = retry.publish().unwrap();
         assert!(outcome.changed());
@@ -5154,6 +5254,7 @@ mod tests {
             },
             arrangement_id: arrangement_id.clone(),
             arrangement_bytes: moved_arrangement.clone(),
+            addition: false,
         }
         .publish()
         .unwrap();
@@ -5193,6 +5294,7 @@ mod tests {
             },
             arrangement_id: arrangement_id.clone(),
             arrangement_bytes: resized_arrangement.clone(),
+            addition: false,
         }
         .publish()
         .unwrap();
@@ -5232,6 +5334,7 @@ mod tests {
             },
             arrangement_id: arrangement_id.clone(),
             arrangement_bytes: front_trimmed_arrangement.clone(),
+            addition: false,
         }
         .publish()
         .unwrap();
@@ -5272,6 +5375,7 @@ mod tests {
             },
             arrangement_id: arrangement_id.clone(),
             arrangement_bytes: front_trimmed_arrangement.clone(),
+            addition: false,
         }
         .publish()
         .unwrap();
@@ -5287,6 +5391,7 @@ mod tests {
             },
             arrangement_id: arrangement_id.clone(),
             arrangement_bytes: removed_arrangement.clone(),
+            addition: false,
         }
         .publish()
         .unwrap();
@@ -5299,6 +5404,91 @@ mod tests {
         assert_eq!(
             reopened.package().read_resource(&arrangement_id).unwrap(),
             removed_arrangement
+        );
+    }
+
+    #[test]
+    fn first_arrangement_placement_publishes_and_reopens() {
+        let fixture = ArrangementProjectFixture::without_arrangement();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert!(prepared.session().arrangement().placements().is_empty());
+        let package = prepared.package();
+        assert!(
+            !package
+                .manifest()
+                .resources()
+                .iter()
+                .any(|descriptor| descriptor.role() == ResourceRole::Arrangement)
+        );
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        let arrangement_id = "018f47a2-6b2d-7c11-8a44-001122338508";
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122338509";
+        let (project, _, _, media) = prepared.session().parts();
+        let assets: Vec<_> = media.media_asset_facts().collect();
+        let arrangement_bytes = serialize_arrangement_placement_addition(
+            project,
+            &assets,
+            None,
+            arrangement_id,
+            placement_id,
+            ARRANGEMENT_TEST_CLIP_ID,
+            7,
+            limits.session.documents,
+        )
+        .unwrap();
+        drop(prepared);
+
+        let outcome = IdeArrangementPlacementEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256,
+                resource_id: mixer_id,
+                resource_bytes: mixer_bytes,
+            },
+            arrangement_id: arrangement_id.to_owned(),
+            arrangement_bytes: arrangement_bytes.clone(),
+            addition: true,
+        }
+        .publish()
+        .unwrap();
+
+        assert!(outcome.changed());
+        assert_eq!(outcome.project_revision(), 2);
+        assert_eq!(
+            outcome.resource_path(),
+            format!("arrangement/{arrangement_id}.json")
+        );
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let arrangement = reopened.session().arrangement();
+        let placements = arrangement.placements();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].id(), placement_id);
+        assert_eq!(
+            arrangement.clip_name(placements[0].clip_index()),
+            Some("Disabled Clip")
+        );
+        assert_eq!(
+            arrangement.track_name(placements[0].track_index()),
+            Some("Audio")
+        );
+        assert_eq!(placements[0].start_tick(), 7);
+        assert_eq!(placements[0].clip_start_tick(), 0);
+        assert_eq!(placements[0].duration_ticks(), 4);
+        assert_eq!(
+            reopened.package().read_resource(arrangement_id).unwrap(),
+            arrangement_bytes
         );
     }
 
