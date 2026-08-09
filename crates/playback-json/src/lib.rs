@@ -7393,6 +7393,28 @@ mod tests {
             ),
             Err(AudioClipRenameSerializationError::InvalidClipName)
         ));
+        let unicode_boundary = "\u{00e9}".repeat(MAX_VERSION_1_NAME_CHARACTERS);
+        let renamed = serialize_audio_clip_rename(
+            &loaded,
+            &canonical,
+            clip_id,
+            &unicode_boundary,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let renamed: Value = serde_json::from_slice(&renamed).unwrap();
+        assert_eq!(renamed["name"], unicode_boundary);
+        let unicode_oversized = "\u{00e9}".repeat(MAX_VERSION_1_NAME_CHARACTERS + 1);
+        assert!(matches!(
+            serialize_audio_clip_rename(
+                &loaded,
+                &canonical,
+                clip_id,
+                &unicode_oversized,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipRenameSerializationError::InvalidClipName)
+        ));
         assert!(matches!(
             serialize_audio_clip_rename(
                 &loaded,

@@ -5120,6 +5120,35 @@ mod tests {
         serde_json_canonicalizer::to_vec(value).unwrap()
     }
 
+    fn assert_audio_clip_rename_success_event(
+        outcome: &ProjectResourcePublicationOutcome,
+        expected_changed: bool,
+    ) {
+        assert!(matches!(
+            worker::audio_clip_rename_success_event("Lead vocal".to_owned(), outcome),
+            IdeWorkerEvent::AudioClipRenamed {
+                revision: 2,
+                changed,
+                name,
+            } if changed == expected_changed && name == "Lead vocal"
+        ));
+    }
+
+    fn assert_audio_clip_rename_reopen_authority(outcome: ProjectResourcePublicationOutcome) {
+        assert!(matches!(
+            worker::audio_clip_rename_edit_reopen_failure(
+                Ok(outcome),
+                IdeProjectOpenError::SelectedOutputUnavailable,
+            ),
+            IdeWorkerCommandFailure::AudioClipRename(reason)
+                if matches!(reason.as_ref(),
+                    IdeAudioClipRenameEditError::ReopenAfterPublication { outcome, source }
+                        if outcome.changed()
+                            && outcome.project_revision() == 2
+                            && matches!(source.as_ref(), IdeProjectOpenError::SelectedOutputUnavailable))
+        ));
+    }
+
     fn arrangement_test_sha256(bytes: &[u8]) -> String {
         let mut output = String::with_capacity(64);
         for byte in Sha256::digest(bytes) {
@@ -6246,16 +6275,17 @@ mod tests {
             mixer: IdeMixerSavePlan {
                 project_path: project_path.clone(),
                 expected_project_sha256: identity,
-                resource_id: mixer_id,
-                resource_bytes: mixer_bytes,
+                resource_id: mixer_id.clone(),
+                resource_bytes: mixer_bytes.clone(),
             },
-            clip_id,
-            clip_bytes,
+            clip_id: clip_id.clone(),
+            clip_bytes: clip_bytes.clone(),
         }
         .publish()
         .unwrap();
         assert!(outcome.changed());
         assert_eq!(outcome.project_revision(), 2);
+        assert_audio_clip_rename_success_event(&outcome, true);
 
         let reopened =
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
@@ -6276,6 +6306,25 @@ mod tests {
             std::fs::read(project_path.join("assets/samples/sample.wav")).unwrap(),
             source_audio
         );
+        let reopened_identity = *reopened.package().manifest_sha256();
+        drop(reopened);
+
+        let unchanged = IdeAudioClipEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path,
+                expected_project_sha256: reopened_identity,
+                resource_id: mixer_id,
+                resource_bytes: mixer_bytes,
+            },
+            clip_id,
+            clip_bytes,
+        }
+        .publish()
+        .unwrap();
+        assert!(!unchanged.changed());
+        assert_eq!(unchanged.project_revision(), 2);
+        assert_audio_clip_rename_success_event(&unchanged, false);
+        assert_audio_clip_rename_reopen_authority(outcome);
     }
 
     #[test]

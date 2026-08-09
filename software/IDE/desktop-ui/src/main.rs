@@ -4538,6 +4538,13 @@ mod tests {
         assert!(audio_clip_rename_command("clip-a", "Verse", "").is_err());
         assert!(audio_clip_rename_command("clip-a", "Verse", "   ").is_err());
         assert!(audio_clip_rename_command("clip-a", "Verse", &"x".repeat(121)).is_err());
+        let unicode_boundary = "\u{00e9}".repeat(120);
+        assert!(matches!(
+            audio_clip_rename_command("clip-a", "Verse", &unicode_boundary),
+            Ok(Some(IdeWorkerCommand::RenameAudioClip { clip_id, name }))
+                if clip_id == "clip-a" && name == unicode_boundary
+        ));
+        assert!(audio_clip_rename_command("clip-a", "Verse", &"\u{00e9}".repeat(121)).is_err());
     }
 
     #[test]

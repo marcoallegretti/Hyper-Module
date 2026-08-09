@@ -3907,14 +3907,7 @@ fn complete_project_mutation(
                 ProjectMutationAttempt::RenameAudioClip {
                     name,
                     result: Ok(outcome),
-                } => send_event(
-                    events,
-                    IdeWorkerEvent::AudioClipRenamed {
-                        revision: outcome.project_revision(),
-                        changed: outcome.changed(),
-                        name,
-                    },
-                ),
+                } => send_event(events, audio_clip_rename_success_event(name, &outcome)),
                 ProjectMutationAttempt::RenameAudioClip {
                     result: Err(reason),
                     ..
@@ -4592,7 +4585,18 @@ fn recording_clip_creation_reopen_failure(
     IdeWorkerCommandFailure::RecordingClipCreation(Box::new(reason))
 }
 
-fn audio_clip_rename_edit_reopen_failure(
+pub(super) fn audio_clip_rename_success_event(
+    name: String,
+    outcome: &hyper_storage_engine::ProjectResourcePublicationOutcome,
+) -> IdeWorkerEvent {
+    IdeWorkerEvent::AudioClipRenamed {
+        revision: outcome.project_revision(),
+        changed: outcome.changed(),
+        name,
+    }
+}
+
+pub(super) fn audio_clip_rename_edit_reopen_failure(
     result: Result<
         hyper_storage_engine::ProjectResourcePublicationOutcome,
         IdeAudioClipRenameEditError,
@@ -6803,11 +6807,24 @@ mod tests {
                 reason: IdeWorkerCommandFailure::AudioClipRename(reason),
             } if matches!(reason.as_ref(), IdeAudioClipRenameEditError::InvalidClipIdentity)
         ));
+        worker
+            .try_send(IdeWorkerCommand::RenameAudioClip {
+                clip_id: "018f47a2-6b2d-7c11-8a44-001122334460".to_owned(),
+                name: "\u{00e9}".repeat(121),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RenameAudioClip,
+                reason: IdeWorkerCommandFailure::AudioClipRename(reason),
+            } if matches!(reason.as_ref(), IdeAudioClipRenameEditError::InvalidName)
+        ));
 
         worker
             .try_send(IdeWorkerCommand::RenameAudioClip {
                 clip_id: "018f47a2-6b2d-7c11-8a44-001122334460".to_owned(),
-                name: " Lead vocal ".to_owned(),
+                name: format!(" {} ", "\u{00e9}".repeat(120)),
             })
             .unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::AudioClipRenaming));
