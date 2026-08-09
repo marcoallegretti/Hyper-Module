@@ -979,10 +979,11 @@ fn bind_arrangement_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    let worker = Rc::clone(worker);
-    let project_state = Rc::clone(project_state);
-    ui.global::<IdeActions>().on_locate_placement(move |index| {
+    let worker_for_locate = Rc::clone(worker);
+    let project_state_for_locate = Rc::clone(project_state);
+    actions.on_locate_placement(move |index| {
         let Some(ui) = weak.upgrade() else {
             return;
         };
@@ -993,7 +994,7 @@ fn bind_arrangement_callback(
             ui.set_error_text("Arrangement placement selection is invalid".into());
             return;
         };
-        let state = project_state.arrangement.borrow();
+        let state = project_state_for_locate.arrangement.borrow();
         let Some(binding) = state.as_ref() else {
             ui.set_error_text("Arrangement placement authority is no longer available".into());
             return;
@@ -1004,11 +1005,51 @@ fn bind_arrangement_callback(
         };
         submit_to_ui(
             &ui,
-            &worker,
+            &worker_for_locate,
             IdeWorkerCommand::LocatePlacement {
                 project_id: binding.project_id.clone(),
                 index,
                 placement_id: placement.id().to_owned(),
+            },
+        );
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_activation = Rc::clone(worker);
+    let project_state_for_activation = Rc::clone(project_state);
+    actions.on_set_arrangement_placement_active(move |index, active| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text(
+                "Arrangement placement activation is not available in the current state".into(),
+            );
+            return;
+        }
+        let Ok(index) = usize::try_from(index) else {
+            ui.set_error_text("Arrangement placement selection is invalid".into());
+            return;
+        };
+        let state = project_state_for_activation.arrangement.borrow();
+        let Some(binding) = state.as_ref() else {
+            ui.set_error_text("Arrangement placement authority is no longer available".into());
+            return;
+        };
+        let Some(placement) = binding.owner.placements().get(index) else {
+            ui.set_error_text("Arrangement placement selection is no longer current".into());
+            return;
+        };
+        if active == placement.active() {
+            ui.set_error_text("Arrangement placement state is no longer current".into());
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_activation,
+            IdeWorkerCommand::SetArrangementPlacementActive {
+                placement_id: placement.id().to_owned(),
+                active,
             },
         );
     });
@@ -1140,6 +1181,9 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 IdeWorkerCommandKind::SetAudioTrackActive => {
                     ui.set_app_mode(AppMode::ChangingTrackActivation);
                 }
+                IdeWorkerCommandKind::SetArrangementPlacementActive => {
+                    ui.set_app_mode(AppMode::ChangingArrangementActivation);
+                }
                 IdeWorkerCommandKind::StartRecording => {
                     ui.set_app_mode(AppMode::PreparingRecording);
                 }
@@ -1203,6 +1247,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetAudioTrackActive => {
             "Preserving mixer state, updating the audio track, and reopening project…"
+        }
+        IdeWorkerCommandKind::SetArrangementPlacementActive => {
+            "Preserving mixer state, updating the arrangement placement, and reopening project…"
         }
         IdeWorkerCommandKind::StartRecording => {
             "Stopping playback and preparing an exclusive monitored capture…"
@@ -1304,6 +1351,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::AudioTrackActivationChanged { .. }
         | IdeWorkerEvent::AudioTrackActivationChanging { .. }) => {
             apply_audio_track_activation_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ArrangementPlacementActivationChanged { .. }
+        | IdeWorkerEvent::ArrangementPlacementActivationChanging { .. }) => {
+            apply_arrangement_placement_activation_event(ui, &event);
         }
         IdeWorkerEvent::RecordingPreparing => {
             ui.set_app_mode(AppMode::PreparingRecording);
@@ -1442,6 +1493,41 @@ fn apply_audio_track_activation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             );
         }
         _ => unreachable!("audio-track activation event dispatcher received another event"),
+    }
+}
+
+fn apply_arrangement_placement_activation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ArrangementPlacementActivationChanged {
+            revision,
+            changed,
+            active,
+        } => {
+            let state = if *active { "enabled" } else { "disabled" };
+            ui.set_status_text(
+                if *changed {
+                    format!("Arrangement placement {state} in project revision {revision}")
+                } else {
+                    format!(
+                        "Arrangement placement was already {state} in project revision {revision}"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementPlacementActivationChanging { active } => {
+            ui.set_app_mode(AppMode::ChangingArrangementActivation);
+            ui.set_status_text(
+                if *active {
+                    "Waiting for native output before enabling the arrangement placement…"
+                } else {
+                    "Waiting for native output before disabling the arrangement placement…"
+                }
+                .into(),
+            );
+        }
+        _ => unreachable!("arrangement activation event dispatcher received another event"),
     }
 }
 
@@ -2325,6 +2411,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         }
         IdeWorkerCommandKind::SetAudioTrackActive
             if current == AppMode::ChangingTrackActivation =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::SetArrangementPlacementActive
+            if current == AppMode::ChangingArrangementActivation =>
         {
             AppMode::Running
         }
@@ -3252,6 +3343,13 @@ mod tests {
             mode_after_failure(
                 AppMode::ChangingTrackActivation,
                 IdeWorkerCommandKind::SetAudioTrackActive,
+            ),
+            AppMode::Running
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ChangingArrangementActivation,
+                IdeWorkerCommandKind::SetArrangementPlacementActive,
             ),
             AppMode::Running
         );
