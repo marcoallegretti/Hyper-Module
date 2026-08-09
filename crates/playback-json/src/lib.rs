@@ -576,9 +576,14 @@ pub enum AudioTrackDocumentSerializationError {
 pub enum ArrangementPlacementDocumentSerializationError {
     Source(LoadError),
     Compilation(CompileError),
+    ProjectCompilation(AdapterCompileError),
     NonCanonicalSource,
     ArrangementMissing,
     SourceArrangementMismatch,
+    PlacementCapacity,
+    ClipMissing,
+    InvalidArrangementIdentity,
+    InvalidPlacementIdentity,
     PlacementMissing,
     InvalidDocumentShape,
     Serialization(serde_json::Error),
@@ -593,6 +598,8 @@ pub type ArrangementPlacementDurationSerializationError =
 pub type ArrangementPlacementFrontTrimSerializationError =
     ArrangementPlacementDocumentSerializationError;
 pub type ArrangementPlacementRemovalSerializationError =
+    ArrangementPlacementDocumentSerializationError;
+pub type ArrangementPlacementAdditionSerializationError =
     ArrangementPlacementDocumentSerializationError;
 
 #[derive(Debug)]
@@ -741,6 +748,7 @@ impl fmt::Display for ArrangementPlacementDocumentSerializationError {
         match self {
             Self::Source(source) => source.fmt(formatter),
             Self::Compilation(source) => source.fmt(formatter),
+            Self::ProjectCompilation(source) => source.fmt(formatter),
             Self::NonCanonicalSource => {
                 formatter.write_str("source arrangement is not canonical RFC 8785 JSON")
             }
@@ -749,6 +757,18 @@ impl fmt::Display for ArrangementPlacementDocumentSerializationError {
             }
             Self::SourceArrangementMismatch => formatter
                 .write_str("source arrangement bytes do not match the loaded project structure"),
+            Self::PlacementCapacity => {
+                formatter.write_str("the arrangement placement capacity is exhausted")
+            }
+            Self::ClipMissing => {
+                formatter.write_str("the selected reusable audio clip is not present")
+            }
+            Self::InvalidArrangementIdentity => {
+                formatter.write_str("the new arrangement identity is invalid or collides")
+            }
+            Self::InvalidPlacementIdentity => {
+                formatter.write_str("the new placement identity is invalid or collides")
+            }
             Self::PlacementMissing => {
                 formatter.write_str("the selected arrangement placement is not present")
             }
@@ -765,10 +785,15 @@ impl Error for ArrangementPlacementDocumentSerializationError {
         match self {
             Self::Source(source) => Some(source),
             Self::Compilation(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
             Self::Serialization(source) => Some(source),
             Self::NonCanonicalSource
             | Self::ArrangementMissing
             | Self::SourceArrangementMismatch
+            | Self::PlacementCapacity
+            | Self::ClipMissing
+            | Self::InvalidArrangementIdentity
+            | Self::InvalidPlacementIdentity
             | Self::PlacementMissing
             | Self::InvalidDocumentShape => None,
         }
@@ -1483,6 +1508,168 @@ pub fn serialize_audio_track_activation(
     serialize_audio_track_document_edit(project, source_track, track_id, limits, |document| {
         document.insert("active".to_owned(), active.into());
     })
+}
+
+/// Places one complete reusable audio clip at an exact project tick.
+///
+/// The new placement owns no media: it references the selected clip, derives
+/// the clip's structural track, starts at clip-local tick zero, and spans the
+/// clip's complete duration. Existing placements, scene launches, arrangement
+/// metadata, and namespaced extensions are preserved. If the project has no
+/// arrangement, this creates its single version-1 `Main` arrangement.
+///
+/// This is a non-ripple edit. The resulting project is compiled through the
+/// complete playback boundary before canonical bytes are returned.
+///
+/// # Errors
+///
+/// Returns a classified rejection for stale or unexpected source bytes,
+/// missing clips, invalid or colliding identities, exhausted capacity, or any
+/// arrangement, ownership, scene-authority, or native-playback failure.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the edit boundary explicitly binds project, assets, source authority, new identities, and exact placement time"
+)]
+pub fn serialize_arrangement_placement_addition(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_arrangement: Option<&[u8]>,
+    arrangement_id: &str,
+    placement_id: &str,
+    clip_id: &str,
+    start_tick: u64,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, ArrangementPlacementAdditionSerializationError> {
+    let clip = project
+        .clips
+        .iter()
+        .find(|clip| clip.id == clip_id)
+        .ok_or(ArrangementPlacementDocumentSerializationError::ClipMissing)?;
+    let placement_count = project
+        .arrangement
+        .as_ref()
+        .map_or(0, |arrangement| arrangement.placements.len());
+    if placement_count >= limits.max_placements {
+        return Err(ArrangementPlacementDocumentSerializationError::PlacementCapacity);
+    }
+    if !is_valid_entity_id(placement_id)
+        || placement_id == project.project_id
+        || placement_id == arrangement_id
+        || project_contains_identity(project, placement_id)
+        || assets.iter().any(|asset| asset.id == placement_id)
+    {
+        return Err(ArrangementPlacementDocumentSerializationError::InvalidPlacementIdentity);
+    }
+    if project.arrangement.is_none()
+        && (!is_valid_entity_id(arrangement_id)
+            || arrangement_id == project.project_id
+            || project_contains_identity(project, arrangement_id)
+            || assets.iter().any(|asset| asset.id == arrangement_id))
+    {
+        return Err(ArrangementPlacementDocumentSerializationError::InvalidArrangementIdentity);
+    }
+
+    let placement = json!({
+        "id": placement_id,
+        "track_id": clip.track_id,
+        "clip_id": clip.id,
+        "start_tick": start_tick,
+        "clip_start_tick": 0,
+        "duration_ticks": clip.duration_ticks,
+        "enabled": true
+    });
+    let mut value = prepare_arrangement_placement_addition_document(
+        project,
+        source_arrangement,
+        arrangement_id,
+        limits,
+    )?;
+    let placements = value
+        .get_mut("placements")
+        .and_then(Value::as_array_mut)
+        .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
+    placements.push(placement);
+    if placements
+        .iter()
+        .any(|placement| placement_sort_key(placement).is_none())
+    {
+        return Err(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape);
+    }
+    placements.sort_unstable_by(|left, right| {
+        match (placement_sort_key(left), placement_sort_key(right)) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            _ => core::cmp::Ordering::Equal,
+        }
+    });
+
+    let output = serde_json_canonicalizer::to_vec(&value)
+        .map_err(ArrangementPlacementDocumentSerializationError::Serialization)?;
+    let edited = load_arrangement(
+        &output,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_placements,
+        limits.max_scene_launches,
+    )
+    .map_err(ArrangementPlacementDocumentSerializationError::Source)?;
+    let mut edited_project = project.clone();
+    edited_project.arrangement = Some(edited);
+    validate_loaded_identities(&edited_project)
+        .map_err(ArrangementPlacementDocumentSerializationError::Source)?;
+    edited_project
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(ArrangementPlacementDocumentSerializationError::ProjectCompilation)?;
+    Ok(output)
+}
+
+fn prepare_arrangement_placement_addition_document(
+    project: &LoadedPlaybackProject,
+    source_arrangement: Option<&[u8]>,
+    arrangement_id: &str,
+    limits: LoaderLimits,
+) -> Result<Value, ArrangementPlacementAdditionSerializationError> {
+    match (&project.arrangement, source_arrangement) {
+        (Some(current), Some(source_arrangement)) => {
+            if current.id != arrangement_id {
+                return Err(
+                    ArrangementPlacementDocumentSerializationError::SourceArrangementMismatch,
+                );
+            }
+            let source = load_arrangement(
+                source_arrangement,
+                project.project_id(),
+                limits.max_document_bytes,
+                limits.max_placements,
+                limits.max_scene_launches,
+            )
+            .map_err(ArrangementPlacementDocumentSerializationError::Source)?;
+            if &source != current {
+                return Err(
+                    ArrangementPlacementDocumentSerializationError::SourceArrangementMismatch,
+                );
+            }
+            let value: Value = serde_json::from_slice(source_arrangement)
+                .map_err(ArrangementPlacementDocumentSerializationError::Serialization)?;
+            let canonical_source = serde_json_canonicalizer::to_vec(&value)
+                .map_err(ArrangementPlacementDocumentSerializationError::Serialization)?;
+            if canonical_source != source_arrangement {
+                return Err(ArrangementPlacementDocumentSerializationError::NonCanonicalSource);
+            }
+            Ok(value)
+        }
+        (None, None) => Ok(json!({
+            "format": "hyper-arrangement",
+            "format_version": 1,
+            "id": arrangement_id,
+            "project_id": project.project_id,
+            "name": "Main",
+            "enabled": true,
+            "placements": [],
+            "scene_launches": [],
+            "extensions": {}
+        })),
+        _ => Err(ArrangementPlacementDocumentSerializationError::SourceArrangementMismatch),
+    }
 }
 
 /// Replaces only the activation state of one placement in a validated
@@ -6148,6 +6335,279 @@ mod tests {
                 .to_string()
                 .contains("placements overlap on one track")
         );
+    }
+
+    #[test]
+    fn arrangement_placement_addition_preserves_existing_canonical_content() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["extensions"]["org.example.arrangement"] = json!({"opaque": [1, 2, 3]});
+        let retained = source["placements"][0].clone();
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334466";
+
+        let added = serialize_arrangement_placement_addition(
+            &loaded,
+            &asset_facts(),
+            Some(&source),
+            "018f47a2-6b2d-7c11-8a44-001122334463",
+            placement_id,
+            "018f47a2-6b2d-7c11-8a44-001122334460",
+            4,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&added).unwrap();
+
+        assert_eq!(value["placements"][0], retained);
+        assert_eq!(
+            value["placements"][1],
+            json!({
+                "id": placement_id,
+                "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
+                "clip_id": "018f47a2-6b2d-7c11-8a44-001122334460",
+                "start_tick": 4,
+                "clip_start_tick": 0,
+                "duration_ticks": 4,
+                "enabled": true
+            })
+        );
+        assert_eq!(
+            value["extensions"]["org.example.arrangement"],
+            json!({"opaque": [1, 2, 3]})
+        );
+        assert_eq!(serde_json_canonicalizer::to_vec(&value).unwrap(), added);
+
+        let reopened = load(
+            input(TIMELINE, &tracks, &clips, Some(&added)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.placement_count(), 2);
+        reopened
+            .compile_playback(
+                &asset_facts(),
+                GraphLimits::VERSION_1,
+                SceneLimits::VERSION_1,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn arrangement_placement_addition_creates_the_first_arrangement() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let arrangement_id = "018f47a2-6b2d-7c11-8a44-001122334466";
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334467";
+
+        let added = serialize_arrangement_placement_addition(
+            &loaded,
+            &asset_facts(),
+            None,
+            arrangement_id,
+            placement_id,
+            "018f47a2-6b2d-7c11-8a44-001122334460",
+            7,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&added).unwrap();
+
+        assert_eq!(value["id"], arrangement_id);
+        assert_eq!(value["name"], "Main");
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["scene_launches"], json!([]));
+        assert_eq!(value["extensions"], json!({}));
+        assert_eq!(
+            value["placements"],
+            json!([{
+                "id": placement_id,
+                "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
+                "clip_id": "018f47a2-6b2d-7c11-8a44-001122334460",
+                "start_tick": 7,
+                "clip_start_tick": 0,
+                "duration_ticks": 4,
+                "enabled": true
+            }])
+        );
+        assert_eq!(serde_json_canonicalizer::to_vec(&value).unwrap(), added);
+
+        let reopened = load(
+            input(TIMELINE, &tracks, &clips, Some(&added)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.placement_count(), 1);
+        reopened
+            .compile_playback(
+                &asset_facts(),
+                GraphLimits::VERSION_1,
+                SceneLimits::VERSION_1,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn arrangement_placement_addition_rejects_invalid_inputs_and_overlap() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let source = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(ARRANGEMENT).unwrap(),
+        )
+        .unwrap();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let arrangement_id = "018f47a2-6b2d-7c11-8a44-001122334463";
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334466";
+
+        assert!(matches!(
+            serialize_arrangement_placement_addition(
+                &loaded,
+                &asset_facts(),
+                Some(&source),
+                arrangement_id,
+                placement_id,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                4,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementAdditionSerializationError::ClipMissing)
+        ));
+        assert!(matches!(
+            serialize_arrangement_placement_addition(
+                &loaded,
+                &asset_facts(),
+                Some(&source),
+                arrangement_id,
+                "018f47a2-6b2d-7c11-8a44-001122334457",
+                "018f47a2-6b2d-7c11-8a44-001122334460",
+                4,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementAdditionSerializationError::InvalidPlacementIdentity)
+        ));
+        assert!(matches!(
+            serialize_arrangement_placement_addition(
+                &loaded,
+                &asset_facts(),
+                Some(&source),
+                arrangement_id,
+                placement_id,
+                "018f47a2-6b2d-7c11-8a44-001122334460",
+                4,
+                LoaderLimits {
+                    max_placements: 1,
+                    ..LoaderLimits::VERSION_1
+                },
+            ),
+            Err(ArrangementPlacementAdditionSerializationError::PlacementCapacity)
+        ));
+        let overlap = serialize_arrangement_placement_addition(
+            &loaded,
+            &asset_facts(),
+            Some(&source),
+            arrangement_id,
+            placement_id,
+            "018f47a2-6b2d-7c11-8a44-001122334460",
+            3,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            overlap,
+            ArrangementPlacementAdditionSerializationError::Source(_)
+        ));
+        assert!(
+            overlap
+                .to_string()
+                .contains("placements overlap on one track")
+        );
+
+        let noncanonical =
+            serde_json::to_vec_pretty(&serde_json::from_slice::<Value>(&source).unwrap()).unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_addition(
+                &loaded,
+                &asset_facts(),
+                Some(&noncanonical),
+                arrangement_id,
+                placement_id,
+                "018f47a2-6b2d-7c11-8a44-001122334460",
+                4,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementAdditionSerializationError::NonCanonicalSource)
+        ));
+    }
+
+    #[test]
+    fn arrangement_placement_addition_rejects_new_arrangement_collisions_and_scene_authority() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let empty = load(
+            input(TIMELINE, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_addition(
+                &empty,
+                &asset_facts(),
+                None,
+                "018f47a2-6b2d-7c11-8a44-001122334457",
+                "018f47a2-6b2d-7c11-8a44-001122334467",
+                "018f47a2-6b2d-7c11-8a44-001122334460",
+                4,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementAdditionSerializationError::InvalidArrangementIdentity)
+        ));
+
+        let scenes: [&[u8]; 1] = [SCENE];
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["placements"] = json!([]);
+        source["scene_launches"] = json!([{
+            "id": "018f47a2-6b2d-7c11-8a44-001122334465",
+            "tick": 0,
+            "scene_id": "018f47a2-6b2d-7c11-8a44-001122334461"
+        }]);
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let scene_controlled = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_addition(
+                &scene_controlled,
+                &asset_facts(),
+                Some(&source),
+                "018f47a2-6b2d-7c11-8a44-001122334463",
+                "018f47a2-6b2d-7c11-8a44-001122334466",
+                "018f47a2-6b2d-7c11-8a44-001122334460",
+                4,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(
+                ArrangementPlacementAdditionSerializationError::ProjectCompilation(
+                    AdapterCompileError::MixedTrackAuthority { .. }
+                )
+            )
+        ));
     }
 
     #[test]
