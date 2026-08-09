@@ -296,6 +296,64 @@ fn bind_project_creation_callback(ui: &MainWindow, worker: &WorkerCell) {
     });
 }
 
+fn bind_arrangement_duration_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_duration = Rc::clone(worker);
+    let project_state_for_duration = Rc::clone(project_state);
+    actions.on_set_arrangement_placement_duration(move |placement_id, duration_ticks| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text(
+                "Arrangement placement trimming is not available in the current state".into(),
+            );
+            return;
+        }
+        let duration_ticks = match parse_arrangement_duration_ticks(duration_ticks.as_str()) {
+            Ok(duration_ticks) => duration_ticks,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let state = project_state_for_duration.arrangement.borrow();
+        let Some(binding) = state.as_ref() else {
+            ui.set_error_text("Arrangement placement authority is no longer available".into());
+            return;
+        };
+        let Some(placement) = binding
+            .owner
+            .placements()
+            .iter()
+            .find(|placement| placement.id() == placement_id.as_str())
+        else {
+            ui.set_error_text("The selected arrangement placement is no longer available".into());
+            return;
+        };
+        if placement.duration_ticks() == duration_ticks {
+            ui.set_status_text("Arrangement placement already has that duration".into());
+            ui.set_error_text(SharedString::default());
+            return;
+        }
+        let owned_placement_id = placement.id().to_owned();
+        drop(state);
+        submit_to_ui(
+            &ui,
+            &worker_for_duration,
+            IdeWorkerCommand::SetArrangementPlacementDuration {
+                placement_id: owned_placement_id,
+                duration_ticks,
+            },
+        );
+    });
+}
+
 fn bind_project_open_callback(ui: &MainWindow, worker: &WorkerCell) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
@@ -1058,6 +1116,7 @@ fn bind_arrangement_callback(
     });
 
     bind_arrangement_move_callback(ui, worker, project_state);
+    bind_arrangement_duration_callback(ui, worker, project_state);
 }
 
 fn bind_arrangement_move_callback(
@@ -1210,17 +1269,42 @@ fn parse_audio_clip_gain(value: &str) -> Result<f64, &'static str> {
 }
 
 fn parse_arrangement_start_tick(value: &str) -> Result<u64, &'static str> {
+    parse_exact_arrangement_tick(
+        value,
+        "Arrangement start tick must be a non-negative whole number",
+        "Arrangement start tick is outside the supported range",
+        "Arrangement start tick exceeds the exact project range",
+    )
+}
+
+fn parse_arrangement_duration_ticks(value: &str) -> Result<u64, &'static str> {
+    let duration_ticks = parse_exact_arrangement_tick(
+        value,
+        "Arrangement duration must be a positive whole number of ticks",
+        "Arrangement duration is outside the supported range",
+        "Arrangement duration exceeds the exact project range",
+    )?;
+    if duration_ticks == 0 {
+        return Err("Arrangement duration must be greater than zero");
+    }
+    Ok(duration_ticks)
+}
+
+fn parse_exact_arrangement_tick(
+    value: &str,
+    invalid_message: &'static str,
+    overflow_message: &'static str,
+    exact_range_message: &'static str,
+) -> Result<u64, &'static str> {
     let value = value.trim();
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("Arrangement start tick must be a non-negative whole number");
+        return Err(invalid_message);
     }
-    let start_tick = value
-        .parse::<u64>()
-        .map_err(|_| "Arrangement start tick is outside the supported range")?;
-    if start_tick > MAX_SAFE_TIMELINE_TICK {
-        return Err("Arrangement start tick exceeds the exact project range");
+    let tick = value.parse::<u64>().map_err(|_| overflow_message)?;
+    if tick > MAX_SAFE_TIMELINE_TICK {
+        return Err(exact_range_message);
     }
-    Ok(start_tick)
+    Ok(tick)
 }
 
 fn start_event_pump(
@@ -1355,6 +1439,9 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 IdeWorkerCommandKind::MoveArrangementPlacement => {
                     ui.set_app_mode(AppMode::MovingArrangementPlacement);
                 }
+                IdeWorkerCommandKind::SetArrangementPlacementDuration => {
+                    ui.set_app_mode(AppMode::TrimmingArrangementPlacement);
+                }
                 IdeWorkerCommandKind::SetAudioClipActive => {
                     ui.set_app_mode(AppMode::ChangingClipActivation);
                 }
@@ -1430,6 +1517,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::MoveArrangementPlacement => {
             "Preserving mixer state, moving the arrangement placement, and reopening project…"
+        }
+        IdeWorkerCommandKind::SetArrangementPlacementDuration => {
+            "Preserving mixer state, trimming the arrangement placement, and reopening project…"
         }
         IdeWorkerCommandKind::SetAudioClipActive => {
             "Preserving mixer state, updating audio-clip activation, and reopening project…"
@@ -1545,6 +1635,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementPlacementMoved { .. }
         | IdeWorkerEvent::ArrangementPlacementMoving { .. }) => {
             apply_arrangement_placement_move_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ArrangementPlacementDurationChanged { .. }
+        | IdeWorkerEvent::ArrangementPlacementDurationChanging { .. }) => {
+            apply_arrangement_placement_duration_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipActivationChanged { .. }
         | IdeWorkerEvent::AudioClipActivationChanging { .. }) => {
@@ -1760,6 +1854,40 @@ fn apply_arrangement_placement_move_event(ui: &MainWindow, event: &IdeWorkerEven
             );
         }
         _ => unreachable!("arrangement move event dispatcher received another event"),
+    }
+}
+
+fn apply_arrangement_placement_duration_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ArrangementPlacementDurationChanged {
+            revision,
+            changed,
+            duration_ticks,
+        } => {
+            ui.set_status_text(
+                if *changed {
+                    format!(
+                        "Arrangement placement trimmed to {duration_ticks} ticks in project revision {revision}"
+                    )
+                } else {
+                    format!(
+                        "Arrangement placement already had a duration of {duration_ticks} ticks in project revision {revision}"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementPlacementDurationChanging { duration_ticks } => {
+            ui.set_app_mode(AppMode::TrimmingArrangementPlacement);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before trimming the arrangement placement to {duration_ticks} ticks…"
+                )
+                .into(),
+            );
+        }
+        _ => unreachable!("arrangement duration event dispatcher received another event"),
     }
 }
 
@@ -2343,6 +2471,7 @@ impl Model for ArrangementListModel {
             track_name: track_name.into(),
             clip_name: clip_name.into(),
             start_tick: placement.start_tick().to_string().into(),
+            duration_ticks: placement.duration_ticks().to_string().into(),
             start_clock: format_frame_clock(placement.start_frame(), self.sample_rate_hz).into(),
             end_clock: format_frame_clock(placement.end_frame(), self.sample_rate_hz).into(),
             start_percent,
@@ -2764,6 +2893,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         }
         IdeWorkerCommandKind::MoveArrangementPlacement
             if current == AppMode::MovingArrangementPlacement =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::SetArrangementPlacementDuration
+            if current == AppMode::TrimmingArrangementPlacement =>
         {
             AppMode::Running
         }
@@ -3772,6 +3906,32 @@ mod tests {
             mode_after_failure(
                 AppMode::MovingArrangementPlacement,
                 IdeWorkerCommandKind::MoveArrangementPlacement,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn arrangement_duration_input_preserves_the_exact_positive_project_tick_domain() {
+        assert_eq!(parse_arrangement_duration_ticks(" 1920 "), Ok(1_920));
+        assert_eq!(
+            parse_arrangement_duration_ticks("9007199254740991"),
+            Ok(MAX_SAFE_TIMELINE_TICK)
+        );
+        assert!(parse_arrangement_duration_ticks("").is_err());
+        assert!(parse_arrangement_duration_ticks("0").is_err());
+        assert!(parse_arrangement_duration_ticks("-1").is_err());
+        assert!(parse_arrangement_duration_ticks("1.5").is_err());
+        assert!(parse_arrangement_duration_ticks("9007199254740992").is_err());
+        assert!(parse_arrangement_duration_ticks("18446744073709551616").is_err());
+    }
+
+    #[test]
+    fn arrangement_duration_failure_restores_running_mode() {
+        assert_eq!(
+            mode_after_failure(
+                AppMode::TrimmingArrangementPlacement,
+                IdeWorkerCommandKind::SetArrangementPlacementDuration,
             ),
             AppMode::Running
         );

@@ -16,6 +16,7 @@ export enum AppMode {
     changing-track-activation,
     changing-arrangement-activation,
     moving-arrangement-placement,
+    trimming-arrangement-placement,
     changing-clip-activation,
     changing-clip-gain,
     preparing-preview,
@@ -83,6 +84,7 @@ export struct ArrangementRow {
     track-name: string,
     clip-name: string,
     start-tick: string,
+    duration-ticks: string,
     start-clock: string,
     end-clock: string,
     start-percent: float,
@@ -119,6 +121,7 @@ export global IdeActions {
     callback locate-placement(int);
     callback set-arrangement-placement-active(int, bool);
     callback move-arrangement-placement(string, string);
+    callback set-arrangement-placement-duration(string, string);
     callback set-audio-clip-active(string, bool);
     callback set-audio-clip-gain(string, string);
     callback loudness-run();
@@ -373,6 +376,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.changing-track-activation ? "◌  UPDATING TRACK"
                         : root.app-mode == AppMode.changing-arrangement-activation ? "◌  UPDATING CLIP"
                         : root.app-mode == AppMode.moving-arrangement-placement ? "◌  MOVING CLIP"
+                        : root.app-mode == AppMode.trimming-arrangement-placement ? "◌  TRIMMING CLIP"
                         : root.app-mode == AppMode.changing-clip-activation ? "◌  UPDATING CLIP"
                         : root.app-mode == AppMode.changing-clip-gain ? "◌  UPDATING GAIN"
                         : root.app-mode == AppMode.selecting ? "◌  SELECTING"
@@ -1272,7 +1276,7 @@ export component MainWindow inherits Window {
                         if root.arrangement-placements.length > 0 : ListView {
                             vertical-stretch: 1;
                             for placement in root.arrangement-placements : Rectangle {
-                                height: 70px;
+                                height: 112px;
                                 width: parent.width;
                                 background: placement.enabled ? #0e141b : #11151a;
                                 border-color: placement.enabled ? #27313d : #3a3330;
@@ -1328,27 +1332,62 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                     VerticalLayout {
-                                        width: 82px;
-                                        spacing: 3px;
-                                        Text {
-                                            text: "START TICK";
-                                            color: #6f8197;
-                                            font-size: 8px;
+                                        width: 142px;
+                                        spacing: 4px;
+                                        HorizontalLayout {
+                                            height: 44px;
+                                            spacing: 6px;
+                                            VerticalLayout {
+                                                width: 82px;
+                                                spacing: 2px;
+                                                Text {
+                                                    text: "START TICK";
+                                                    color: #6f8197;
+                                                    font-size: 8px;
+                                                }
+                                                start-tick-input := LineEdit {
+                                                    width: 82px;
+                                                    horizontal-stretch: 0;
+                                                    text: placement.start-tick;
+                                                    accessible-label: "Start tick for " + placement.clip-name + " on " + placement.track-name;
+                                                    accepted => { IdeActions.move-arrangement-placement(placement.id, self.text); }
+                                                }
+                                            }
+                                            Button {
+                                                width: 54px;
+                                                text: "Move";
+                                                accessible-label: "Move " + placement.clip-name + " on " + placement.track-name + " to entered start tick";
+                                                enabled: root.app-mode == AppMode.running && start-tick-input.text != placement.start-tick;
+                                                clicked => { IdeActions.move-arrangement-placement(placement.id, start-tick-input.text); }
+                                            }
                                         }
-                                        start-tick-input := LineEdit {
-                                            width: 82px;
-                                            horizontal-stretch: 0;
-                                            text: placement.start-tick;
-                                            accessible-label: "Start tick for " + placement.clip-name + " on " + placement.track-name;
-                                            accepted => { IdeActions.move-arrangement-placement(placement.id, self.text); }
+                                        HorizontalLayout {
+                                            height: 44px;
+                                            spacing: 6px;
+                                            VerticalLayout {
+                                                width: 82px;
+                                                spacing: 2px;
+                                                Text {
+                                                    text: "DURATION TICKS";
+                                                    color: #6f8197;
+                                                    font-size: 8px;
+                                                }
+                                                duration-tick-input := LineEdit {
+                                                    width: 82px;
+                                                    horizontal-stretch: 0;
+                                                    text: placement.duration-ticks;
+                                                    accessible-label: "Duration ticks for " + placement.clip-name + " on " + placement.track-name;
+                                                    accepted => { IdeActions.set-arrangement-placement-duration(placement.id, self.text); }
+                                                }
+                                            }
+                                            Button {
+                                                width: 54px;
+                                                text: "Trim";
+                                                accessible-label: "Set the right edge of " + placement.clip-name + " on " + placement.track-name + " from its entered duration";
+                                                enabled: root.app-mode == AppMode.running && duration-tick-input.text != placement.duration-ticks;
+                                                clicked => { IdeActions.set-arrangement-placement-duration(placement.id, duration-tick-input.text); }
+                                            }
                                         }
-                                    }
-                                    Button {
-                                        width: 54px;
-                                        text: "Move";
-                                        accessible-label: "Move " + placement.clip-name + " on " + placement.track-name + " to entered start tick";
-                                        enabled: root.app-mode == AppMode.running && start-tick-input.text != placement.start-tick;
-                                        clicked => { IdeActions.move-arrangement-placement(placement.id, start-tick-input.text); }
                                     }
                                     Button {
                                         width: 58px;
@@ -1369,7 +1408,7 @@ export component MainWindow inherits Window {
                         }
 
                         Text {
-                            text: "Placement activation and exact start-tick moves are persistent. Trimming, dragging, and waveform claims are not implemented.";
+                            text: "Placement activation, exact start moves, and exact right-edge duration trims are persistent. Left-edge trimming, dragging, snapping, and waveform claims are not implemented.";
                             color: #65758a;
                             font-size: 9px;
                         }
