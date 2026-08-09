@@ -250,7 +250,7 @@ struct LoadedTrack {
     clip_ids: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct LoadedClip {
     id: String,
     name: String,
@@ -558,6 +558,17 @@ pub enum ArrangementPlacementActivationSerializationError {
     Serialization(serde_json::Error),
 }
 
+#[derive(Debug)]
+pub enum AudioClipGainSerializationError {
+    Source(LoadError),
+    NonCanonicalSource,
+    ClipMissing,
+    SourceClipMismatch,
+    UnsupportedGain,
+    InvalidDocumentShape,
+    Serialization(serde_json::Error),
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AudioTrackRemovalBlockers {
     pub clip_references: usize,
@@ -715,6 +726,44 @@ impl Error for ArrangementPlacementActivationSerializationError {
             | Self::ArrangementMissing
             | Self::SourceArrangementMismatch
             | Self::PlacementMissing
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
+impl fmt::Display for AudioClipGainSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => source.fmt(formatter),
+            Self::NonCanonicalSource => {
+                formatter.write_str("source audio clip is not canonical RFC 8785 JSON")
+            }
+            Self::ClipMissing => {
+                formatter.write_str("the selected audio clip is not present in the project")
+            }
+            Self::SourceClipMismatch => {
+                formatter.write_str("source audio-clip bytes do not match the loaded project")
+            }
+            Self::UnsupportedGain => formatter.write_str(
+                "audio-clip gain must be finite and no greater than the native +6.0206 dB limit",
+            ),
+            Self::InvalidDocumentShape => {
+                formatter.write_str("source audio-clip shape changed after typed validation")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioClipGainSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::NonCanonicalSource
+            | Self::ClipMissing
+            | Self::SourceClipMismatch
+            | Self::UnsupportedGain
             | Self::InvalidDocumentShape => None,
         }
     }
@@ -1449,6 +1498,71 @@ pub fn serialize_arrangement_placement_activation(
     Ok(output)
 }
 
+/// Replaces only the constant playback gain in one validated canonical audio
+/// clip while preserving source, timing, looping, fades, pitch, identity, and
+/// namespaced extensions.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the clip is absent, the supplied bytes
+/// disagree with the loaded project, or the requested gain cannot execute in
+/// the native clip engine without consolidation.
+pub fn serialize_audio_clip_gain(
+    project: &LoadedPlaybackProject,
+    source_clip: &[u8],
+    clip_id: &str,
+    gain_decibels: f64,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AudioClipGainSerializationError> {
+    let linear_gain = 10.0_f64.powf(gain_decibels / 20.0);
+    if !gain_decibels.is_finite() || !linear_gain.is_finite() || linear_gain > f64::from(2.0_f32) {
+        return Err(AudioClipGainSerializationError::UnsupportedGain);
+    }
+    let clip_index = project
+        .clips
+        .iter()
+        .position(|clip| clip.id == clip_id)
+        .ok_or(AudioClipGainSerializationError::ClipMissing)?;
+    let source = load_clip(
+        source_clip,
+        clip_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_warp_markers,
+    )
+    .map_err(AudioClipGainSerializationError::Source)?;
+    if source != project.clips[clip_index] {
+        return Err(AudioClipGainSerializationError::SourceClipMismatch);
+    }
+
+    let mut value: Value = serde_json::from_slice(source_clip)
+        .map_err(AudioClipGainSerializationError::Serialization)?;
+    let canonical_source = serde_json_canonicalizer::to_vec(&value)
+        .map_err(AudioClipGainSerializationError::Serialization)?;
+    if canonical_source != source_clip {
+        return Err(AudioClipGainSerializationError::NonCanonicalSource);
+    }
+    let playback = value
+        .get_mut("playback")
+        .and_then(Value::as_object_mut)
+        .ok_or(AudioClipGainSerializationError::InvalidDocumentShape)?;
+    playback.insert("gain_decibels".to_owned(), gain_decibels.into());
+    let output = serde_json_canonicalizer::to_vec(&value)
+        .map_err(AudioClipGainSerializationError::Serialization)?;
+    let edited = load_clip(
+        &output,
+        clip_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_warp_markers,
+    )
+    .map_err(AudioClipGainSerializationError::Source)?;
+    let mut edited_project = project.clone();
+    edited_project.clips[clip_index] = edited;
+    validate_loaded_identities(&edited_project).map_err(AudioClipGainSerializationError::Source)?;
+    Ok(output)
+}
+
 fn serialize_audio_track_document_edit(
     project: &LoadedPlaybackProject,
     source_track: &[u8],
@@ -1912,6 +2026,26 @@ impl LoadedPlaybackProject {
     #[must_use]
     pub fn clip_name_at(&self, clip_index: usize) -> Option<&str> {
         self.clips.get(clip_index).map(|clip| clip.name.as_str())
+    }
+
+    /// Returns a validated audio-clip identity by canonical project order.
+    #[must_use]
+    pub fn clip_id_at(&self, clip_index: usize) -> Option<&str> {
+        self.clips.get(clip_index).map(|clip| clip.id.as_str())
+    }
+
+    /// Returns the owning structural-track identity for one audio clip.
+    #[must_use]
+    pub fn clip_track_id_at(&self, clip_index: usize) -> Option<&str> {
+        self.clips
+            .get(clip_index)
+            .map(|clip| clip.track_id.as_str())
+    }
+
+    /// Returns the persisted constant playback gain for one audio clip.
+    #[must_use]
+    pub fn clip_gain_decibels_at(&self, clip_index: usize) -> Option<f64> {
+        self.clips.get(clip_index).map(|clip| clip.gain_decibels)
     }
 
     /// Returns a validated structural-track name by canonical project order.
@@ -5005,6 +5139,103 @@ mod tests {
             ),
             Err(ArrangementPlacementActivationSerializationError::ArrangementMissing)
         ));
+    }
+
+    #[test]
+    fn audio_clip_gain_changes_only_the_selected_canonical_field() {
+        let mut source: Value = serde_json::from_slice(CLIP).unwrap();
+        source["extensions"]["org.example.clip"] = json!({"opaque": [1, 2, 3]});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [&source];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334460";
+
+        let edited =
+            serialize_audio_clip_gain(&loaded, &source, clip_id, -12.5, LoaderLimits::VERSION_1)
+                .unwrap();
+        let mut expected: Value = serde_json::from_slice(&source).unwrap();
+        expected["playback"]["gain_decibels"] = (-12.5).into();
+
+        assert_eq!(edited, serde_json_canonicalizer::to_vec(&expected).unwrap());
+        assert_eq!(
+            expected["extensions"]["org.example.clip"],
+            json!({"opaque": [1, 2, 3]})
+        );
+        assert_eq!(
+            serialize_audio_clip_gain(&loaded, &source, clip_id, 0.0, LoaderLimits::VERSION_1,)
+                .unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn audio_clip_gain_rejects_missing_stale_noncanonical_and_non_native_values() {
+        let source: Value = serde_json::from_slice(CLIP).unwrap();
+        let canonical = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [&canonical];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334460";
+
+        assert!(matches!(
+            serialize_audio_clip_gain(
+                &loaded,
+                &canonical,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                0.0,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipGainSerializationError::ClipMissing)
+        ));
+        let mut stale = source.clone();
+        stale["enabled"] = false.into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_audio_clip_gain(&loaded, &stale, clip_id, 0.0, LoaderLimits::VERSION_1,),
+            Err(AudioClipGainSerializationError::SourceClipMismatch)
+        ));
+        let noncanonical = serde_json::to_vec_pretty(&source).unwrap();
+        assert!(matches!(
+            serialize_audio_clip_gain(
+                &loaded,
+                &noncanonical,
+                clip_id,
+                0.0,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipGainSerializationError::NonCanonicalSource)
+        ));
+        for gain in [f64::NAN, f64::INFINITY, 6.1] {
+            assert!(matches!(
+                serialize_audio_clip_gain(
+                    &loaded,
+                    &canonical,
+                    clip_id,
+                    gain,
+                    LoaderLimits::VERSION_1,
+                ),
+                Err(AudioClipGainSerializationError::UnsupportedGain)
+            ));
+        }
+        assert!(
+            serialize_audio_clip_gain(
+                &loaded,
+                &canonical,
+                clip_id,
+                20.0 * 2.0_f64.log10(),
+                LoaderLimits::VERSION_1,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
