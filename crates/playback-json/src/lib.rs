@@ -2460,6 +2460,7 @@ impl LoadedPlaybackProject {
 pub struct OwnedScheduleEntry {
     pub placement_id: String,
     pub placement_start_tick: u64,
+    pub placement_duration_ticks: u64,
     pub placement_enabled: bool,
     pub track_id: String,
     pub track_index: usize,
@@ -4251,7 +4252,7 @@ fn build_schedule_identity_index<'a>(
 
 fn build_schedule_placement_metadata_index(
     project: &LoadedPlaybackProject,
-) -> Result<HashMap<&str, (u64, bool)>, AdapterCompileError> {
+) -> Result<HashMap<&str, (u64, u64, bool)>, AdapterCompileError> {
     let placements = project
         .arrangement
         .as_ref()
@@ -4264,7 +4265,11 @@ fn build_schedule_placement_metadata_index(
         if index
             .insert(
                 placement.id.as_str(),
-                (placement.start_tick, placement.enabled),
+                (
+                    placement.start_tick,
+                    placement.duration_ticks,
+                    placement.enabled,
+                ),
             )
             .is_some()
         {
@@ -4296,13 +4301,15 @@ fn own_schedule(
             .get(entry.clip_id)
             .copied()
             .ok_or(AdapterCompileError::InconsistentCompiledGraph)?;
-        let (placement_start_tick, placement_enabled) = placement_metadata
-            .get(entry.placement_id)
-            .copied()
-            .ok_or(AdapterCompileError::InconsistentCompiledGraph)?;
+        let (placement_start_tick, placement_duration_ticks, placement_enabled) =
+            placement_metadata
+                .get(entry.placement_id)
+                .copied()
+                .ok_or(AdapterCompileError::InconsistentCompiledGraph)?;
         entries.push(OwnedScheduleEntry {
             placement_id: try_owned(entry.placement_id)?,
             placement_start_tick,
+            placement_duration_ticks,
             placement_enabled,
             track_id: try_owned(entry.track_id)?,
             track_index,
@@ -4837,6 +4844,7 @@ mod tests {
         assert_eq!(schedule.entries()[0].track_index, 0);
         assert_eq!(schedule.entries()[0].clip_index, 0);
         assert_eq!(schedule.entries()[0].placement_start_tick, 8);
+        assert_eq!(schedule.entries()[0].placement_duration_ticks, 4);
         assert!(!schedule.entries()[0].placement_enabled);
         assert_eq!(schedule.project_id(), PROJECT_ID);
         assert_eq!(schedule.entries().len(), 1);

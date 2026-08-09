@@ -5165,6 +5165,7 @@ mod tests {
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
         let placement = &reopened.session().arrangement().placements()[0];
         assert_eq!(placement.start_tick(), 8);
+        assert_eq!(placement.duration_ticks(), 2);
         assert_eq!(
             reopened.package().read_resource(&arrangement_id).unwrap(),
             resized_arrangement
