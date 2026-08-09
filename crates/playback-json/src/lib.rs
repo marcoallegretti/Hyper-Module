@@ -590,6 +590,8 @@ pub type ArrangementPlacementMoveSerializationError =
     ArrangementPlacementDocumentSerializationError;
 pub type ArrangementPlacementDurationSerializationError =
     ArrangementPlacementDocumentSerializationError;
+pub type ArrangementPlacementFrontTrimSerializationError =
+    ArrangementPlacementDocumentSerializationError;
 
 #[derive(Debug)]
 pub enum AudioClipDocumentSerializationError {
@@ -1502,8 +1504,9 @@ pub fn serialize_arrangement_placement_activation(
         source_arrangement,
         placement_id,
         limits,
-        |document| {
+        |_, document| {
             document.insert("enabled".to_owned(), active.into());
+            Ok(())
         },
         |_| Ok(()),
     )
@@ -1534,8 +1537,9 @@ pub fn serialize_arrangement_placement_move(
         source_arrangement,
         placement_id,
         limits,
-        |document| {
+        |_, document| {
             document.insert("start_tick".to_owned(), start_tick.into());
+            Ok(())
         },
         |_| Ok(()),
     )
@@ -1566,16 +1570,77 @@ pub fn serialize_arrangement_placement_duration(
         source_arrangement,
         placement_id,
         limits,
-        |document| {
+        |_, document| {
             document.insert("duration_ticks".to_owned(), duration_ticks.into());
+            Ok(())
         },
-        |edited_project| {
-            validate_arrangement_placement_duration_execution(edited_project, placement_id)
-        },
+        |edited_project| validate_arrangement_placement_execution(edited_project, placement_id),
     )
 }
 
-fn validate_arrangement_placement_duration_execution(
+/// Trims or extends the front of one validated arrangement placement to an
+/// exact project tick while preserving its right edge and playback content.
+///
+/// The clip-local offset advances or retreats by the same tick distance as the
+/// parent-timeline start. Looped offsets remain unfolded so an extension can
+/// reverse an earlier trim without losing the pre-loop pass. Extending before
+/// clip-local tick zero is rejected.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the project has no arrangement, the
+/// placement is absent, the supplied bytes disagree with the loaded project,
+/// the requested start reaches or crosses the fixed right edge, or the edited
+/// placement cannot execute through the version-1 compiler.
+pub fn serialize_arrangement_placement_front_trim(
+    project: &LoadedPlaybackProject,
+    source_arrangement: &[u8],
+    placement_id: &str,
+    start_tick: u64,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, ArrangementPlacementFrontTrimSerializationError> {
+    serialize_arrangement_placement_document_edit(
+        project,
+        source_arrangement,
+        placement_id,
+        limits,
+        |placement, document| {
+            let end_tick = placement
+                .start_tick
+                .checked_add(placement.duration_ticks)
+                .ok_or(ArrangementPlacementDocumentSerializationError::Compilation(
+                    CompileError::ArithmeticOverflow,
+                ))?;
+            if start_tick >= end_tick {
+                return Err(ArrangementPlacementDocumentSerializationError::Compilation(
+                    CompileError::InvalidPlacement,
+                ));
+            }
+            let clip_start_tick = if start_tick >= placement.start_tick {
+                placement
+                    .clip_start_tick
+                    .checked_add(start_tick - placement.start_tick)
+                    .ok_or(ArrangementPlacementDocumentSerializationError::Compilation(
+                        CompileError::ArithmeticOverflow,
+                    ))?
+            } else {
+                placement
+                    .clip_start_tick
+                    .checked_sub(placement.start_tick - start_tick)
+                    .ok_or(ArrangementPlacementDocumentSerializationError::Compilation(
+                        CompileError::InvalidPlacement,
+                    ))?
+            };
+            document.insert("start_tick".to_owned(), start_tick.into());
+            document.insert("clip_start_tick".to_owned(), clip_start_tick.into());
+            document.insert("duration_ticks".to_owned(), (end_tick - start_tick).into());
+            Ok(())
+        },
+        |edited_project| validate_arrangement_placement_execution(edited_project, placement_id),
+    )
+}
+
+fn validate_arrangement_placement_execution(
     project: &LoadedPlaybackProject,
     placement_id: &str,
 ) -> Result<(), ArrangementPlacementDocumentSerializationError> {
@@ -1639,7 +1704,10 @@ fn serialize_arrangement_placement_document_edit(
     source_arrangement: &[u8],
     placement_id: &str,
     limits: LoaderLimits,
-    edit: impl FnOnce(&mut serde_json::Map<String, Value>),
+    edit: impl FnOnce(
+        &LoadedPlacement,
+        &mut serde_json::Map<String, Value>,
+    ) -> Result<(), ArrangementPlacementDocumentSerializationError>,
     validate_edit: impl FnOnce(
         &LoadedPlaybackProject,
     ) -> Result<(), ArrangementPlacementDocumentSerializationError>,
@@ -1648,13 +1716,11 @@ fn serialize_arrangement_placement_document_edit(
         .arrangement
         .as_ref()
         .ok_or(ArrangementPlacementDocumentSerializationError::ArrangementMissing)?;
-    if !current
+    let current_placement = current
         .placements
         .iter()
-        .any(|placement| placement.id == placement_id)
-    {
-        return Err(ArrangementPlacementDocumentSerializationError::PlacementMissing);
-    }
+        .find(|placement| placement.id == placement_id)
+        .ok_or(ArrangementPlacementDocumentSerializationError::PlacementMissing)?;
     let source = load_arrangement(
         source_arrangement,
         project.project_id(),
@@ -1684,7 +1750,7 @@ fn serialize_arrangement_placement_document_edit(
             .find(|placement| placement.get("id").and_then(Value::as_str) == Some(placement_id))
             .and_then(Value::as_object_mut)
             .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
-        edit(document);
+        edit(current_placement, document)?;
     }
     if placements
         .iter()
@@ -5756,6 +5822,242 @@ mod tests {
             )
             .unwrap(),
             source
+        );
+    }
+
+    #[test]
+    fn arrangement_placement_front_trim_preserves_right_edge_and_is_reversible() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
+
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["extensions"]["org.example.arrangement"] = json!({"opaque": true});
+        source["placements"][0]["start_tick"] = 4.into();
+        source["placements"][0]["clip_start_tick"] = 2.into();
+        source["placements"][0]["duration_ticks"] = 2.into();
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let extended = serialize_arrangement_placement_front_trim(
+            &loaded,
+            &source,
+            placement_id,
+            2,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let extended_value: Value = serde_json::from_slice(&extended).unwrap();
+        let placement = &extended_value["placements"][0];
+        assert_eq!(placement["start_tick"], 2);
+        assert_eq!(placement["clip_start_tick"], 0);
+        assert_eq!(placement["duration_ticks"], 4);
+        assert_eq!(placement["id"], placement_id);
+        assert_eq!(placement["enabled"], true);
+        assert_eq!(
+            extended_value["extensions"]["org.example.arrangement"],
+            json!({"opaque": true})
+        );
+
+        let extended_project = load(
+            input(TIMELINE, &tracks, &clips, Some(&extended)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(
+            serialize_arrangement_placement_front_trim(
+                &extended_project,
+                &extended,
+                placement_id,
+                4,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn arrangement_placement_front_trim_keeps_loop_offsets_unfolded() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
+        let mut looping_clip: Value = serde_json::from_slice(CLIP).unwrap();
+        looping_clip["loop"]["enabled"] = true.into();
+        let looping_clip = serde_json_canonicalizer::to_vec(&looping_clip).unwrap();
+        let clips: [&[u8]; 1] = [&looping_clip];
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["placements"][0]["duration_ticks"] = 12.into();
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let trimmed = serialize_arrangement_placement_front_trim(
+            &loaded,
+            &source,
+            placement_id,
+            5,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let trimmed_value: Value = serde_json::from_slice(&trimmed).unwrap();
+        let placement = &trimmed_value["placements"][0];
+        assert_eq!(placement["start_tick"], 5);
+        assert_eq!(placement["clip_start_tick"], 5);
+        assert_eq!(placement["duration_ticks"], 7);
+
+        let trimmed_project = load(
+            input(TIMELINE, &tracks, &clips, Some(&trimmed)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(
+            serialize_arrangement_placement_front_trim(
+                &trimmed_project,
+                &trimmed,
+                placement_id,
+                0,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn arrangement_placement_front_trim_rejects_stale_invalid_and_preserves_noop() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
+        let source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let mut stale: Value = serde_json::from_slice(&source).unwrap();
+        stale["enabled"] = false.into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_front_trim(
+                &loaded,
+                &stale,
+                placement_id,
+                4,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementFrontTrimSerializationError::SourceArrangementMismatch)
+        ));
+        assert!(matches!(
+            serialize_arrangement_placement_front_trim(
+                &loaded,
+                &source,
+                placement_id,
+                4,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(
+                ArrangementPlacementFrontTrimSerializationError::Compilation(
+                    CompileError::InvalidPlacement
+                )
+            )
+        ));
+        assert_eq!(
+            serialize_arrangement_placement_front_trim(
+                &loaded,
+                &source,
+                placement_id,
+                0,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn arrangement_placement_front_trim_rejects_extension_before_source_zero() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
+        let mut cannot_extend: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        cannot_extend["placements"][0]["start_tick"] = 4.into();
+        cannot_extend["placements"][0]["clip_start_tick"] = 2.into();
+        cannot_extend["placements"][0]["duration_ticks"] = 2.into();
+        let cannot_extend = serde_json_canonicalizer::to_vec(&cannot_extend).unwrap();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&cannot_extend)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_front_trim(
+                &loaded,
+                &cannot_extend,
+                placement_id,
+                1,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(
+                ArrangementPlacementFrontTrimSerializationError::Compilation(
+                    CompileError::InvalidPlacement
+                )
+            )
+        ));
+    }
+
+    #[test]
+    fn arrangement_placement_front_trim_rejects_same_track_overlap() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
+        let mut cannot_extend: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        cannot_extend["placements"][0]["start_tick"] = 4.into();
+        cannot_extend["placements"][0]["clip_start_tick"] = 2.into();
+        cannot_extend["placements"][0]["duration_ticks"] = 2.into();
+        let mut overlap = cannot_extend;
+        overlap["placements"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "id": "018f47a2-6b2d-7c11-8a44-001122334465",
+                "track_id": "018f47a2-6b2d-7c11-8a44-001122334456",
+                "clip_id": "018f47a2-6b2d-7c11-8a44-001122334460",
+                "start_tick": 0,
+                "clip_start_tick": 0,
+                "duration_ticks": 3,
+                "enabled": false
+            }),
+        );
+        let overlap = serde_json_canonicalizer::to_vec(&overlap).unwrap();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&overlap)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let error = serialize_arrangement_placement_front_trim(
+            &loaded,
+            &overlap,
+            placement_id,
+            2,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ArrangementPlacementFrontTrimSerializationError::Source(_)
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("placements overlap on one track")
         );
     }
 
