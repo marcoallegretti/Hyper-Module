@@ -36,6 +36,7 @@ const INITIAL_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const FINAL_SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 const MAX_VISIBLE_SCENE_NAME_CHARS: usize = 20;
 const MAX_VISIBLE_MIXER_NAME_CHARS: usize = 10;
+const MAX_SAFE_TIMELINE_TICK: u64 = 9_007_199_254_740_991;
 
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
 type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
@@ -1055,6 +1056,66 @@ fn bind_arrangement_callback(
             },
         );
     });
+
+    bind_arrangement_move_callback(ui, worker, project_state);
+}
+
+fn bind_arrangement_move_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_move = Rc::clone(worker);
+    let project_state_for_move = Rc::clone(project_state);
+    actions.on_move_arrangement_placement(move |placement_id, start_tick| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text(
+                "Arrangement placement movement is not available in the current state".into(),
+            );
+            return;
+        }
+        let start_tick = match parse_arrangement_start_tick(start_tick.as_str()) {
+            Ok(start_tick) => start_tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let state = project_state_for_move.arrangement.borrow();
+        let Some(binding) = state.as_ref() else {
+            ui.set_error_text("Arrangement placement authority is no longer available".into());
+            return;
+        };
+        let Some(placement) = binding
+            .owner
+            .placements()
+            .iter()
+            .find(|placement| placement.id() == placement_id.as_str())
+        else {
+            ui.set_error_text("The selected arrangement placement is no longer available".into());
+            return;
+        };
+        if placement.start_tick() == start_tick {
+            ui.set_status_text("Arrangement placement already starts at that tick".into());
+            ui.set_error_text(SharedString::default());
+            return;
+        }
+        let owned_placement_id = placement.id().to_owned();
+        drop(state);
+        submit_to_ui(
+            &ui,
+            &worker_for_move,
+            IdeWorkerCommand::MoveArrangementPlacement {
+                placement_id: owned_placement_id,
+                start_tick,
+            },
+        );
+    });
 }
 
 fn bind_audio_clip_callback(
@@ -1146,6 +1207,20 @@ fn parse_audio_clip_gain(value: &str) -> Result<f64, &'static str> {
         return Err("Clip gain must be finite and at or below +6.0206 dB");
     }
     Ok(gain_decibels)
+}
+
+fn parse_arrangement_start_tick(value: &str) -> Result<u64, &'static str> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("Arrangement start tick must be a non-negative whole number");
+    }
+    let start_tick = value
+        .parse::<u64>()
+        .map_err(|_| "Arrangement start tick is outside the supported range")?;
+    if start_tick > MAX_SAFE_TIMELINE_TICK {
+        return Err("Arrangement start tick exceeds the exact project range");
+    }
+    Ok(start_tick)
 }
 
 fn start_event_pump(
@@ -1277,6 +1352,9 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 IdeWorkerCommandKind::SetArrangementPlacementActive => {
                     ui.set_app_mode(AppMode::ChangingArrangementActivation);
                 }
+                IdeWorkerCommandKind::MoveArrangementPlacement => {
+                    ui.set_app_mode(AppMode::MovingArrangementPlacement);
+                }
                 IdeWorkerCommandKind::SetAudioClipActive => {
                     ui.set_app_mode(AppMode::ChangingClipActivation);
                 }
@@ -1349,6 +1427,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetArrangementPlacementActive => {
             "Preserving mixer state, updating the arrangement placement, and reopening project…"
+        }
+        IdeWorkerCommandKind::MoveArrangementPlacement => {
+            "Preserving mixer state, moving the arrangement placement, and reopening project…"
         }
         IdeWorkerCommandKind::SetAudioClipActive => {
             "Preserving mixer state, updating audio-clip activation, and reopening project…"
@@ -1460,6 +1541,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementPlacementActivationChanged { .. }
         | IdeWorkerEvent::ArrangementPlacementActivationChanging { .. }) => {
             apply_arrangement_placement_activation_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ArrangementPlacementMoved { .. }
+        | IdeWorkerEvent::ArrangementPlacementMoving { .. }) => {
+            apply_arrangement_placement_move_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipActivationChanged { .. }
         | IdeWorkerEvent::AudioClipActivationChanging { .. }) => {
@@ -1641,6 +1726,40 @@ fn apply_arrangement_placement_activation_event(ui: &MainWindow, event: &IdeWork
             );
         }
         _ => unreachable!("arrangement activation event dispatcher received another event"),
+    }
+}
+
+fn apply_arrangement_placement_move_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ArrangementPlacementMoved {
+            revision,
+            changed,
+            start_tick,
+        } => {
+            ui.set_status_text(
+                if *changed {
+                    format!(
+                        "Arrangement placement moved to tick {start_tick} in project revision {revision}"
+                    )
+                } else {
+                    format!(
+                        "Arrangement placement already started at tick {start_tick} in project revision {revision}"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementPlacementMoving { start_tick } => {
+            ui.set_app_mode(AppMode::MovingArrangementPlacement);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before moving the arrangement placement to tick {start_tick}…"
+                )
+                .into(),
+            );
+        }
+        _ => unreachable!("arrangement move event dispatcher received another event"),
     }
 }
 
@@ -2220,8 +2339,10 @@ impl Model for ArrangementListModel {
         let end_percent = frame_progress_percent(placement.end_frame(), self.owner.end_frame());
         Some(ArrangementRow {
             index: i32::try_from(row).ok()?,
+            id: placement.id().into(),
             track_name: track_name.into(),
             clip_name: clip_name.into(),
+            start_tick: placement.start_tick().to_string().into(),
             start_clock: format_frame_clock(placement.start_frame(), self.sample_rate_hz).into(),
             end_clock: format_frame_clock(placement.end_frame(), self.sample_rate_hz).into(),
             start_percent,
@@ -2638,6 +2759,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         }
         IdeWorkerCommandKind::SetArrangementPlacementActive
             if current == AppMode::ChangingArrangementActivation =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::MoveArrangementPlacement
+            if current == AppMode::MovingArrangementPlacement =>
         {
             AppMode::Running
         }
@@ -3621,6 +3747,31 @@ mod tests {
             mode_after_failure(
                 AppMode::ChangingArrangementActivation,
                 IdeWorkerCommandKind::SetArrangementPlacementActive,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn arrangement_move_input_preserves_the_exact_project_tick_domain() {
+        assert_eq!(parse_arrangement_start_tick(" 1920 "), Ok(1_920));
+        assert_eq!(
+            parse_arrangement_start_tick("9007199254740991"),
+            Ok(MAX_SAFE_TIMELINE_TICK)
+        );
+        assert!(parse_arrangement_start_tick("").is_err());
+        assert!(parse_arrangement_start_tick("-1").is_err());
+        assert!(parse_arrangement_start_tick("1.5").is_err());
+        assert!(parse_arrangement_start_tick("9007199254740992").is_err());
+        assert!(parse_arrangement_start_tick("18446744073709551616").is_err());
+    }
+
+    #[test]
+    fn arrangement_move_failure_restores_running_mode() {
+        assert_eq!(
+            mode_after_failure(
+                AppMode::MovingArrangementPlacement,
+                IdeWorkerCommandKind::MoveArrangementPlacement,
             ),
             AppMode::Running
         );

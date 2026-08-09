@@ -15,6 +15,7 @@ export enum AppMode {
     renaming-track,
     changing-track-activation,
     changing-arrangement-activation,
+    moving-arrangement-placement,
     changing-clip-activation,
     changing-clip-gain,
     preparing-preview,
@@ -78,8 +79,10 @@ export struct TakeRow {
 
 export struct ArrangementRow {
     index: int,
+    id: string,
     track-name: string,
     clip-name: string,
+    start-tick: string,
     start-clock: string,
     end-clock: string,
     start-percent: float,
@@ -115,6 +118,7 @@ export global IdeActions {
     callback transport-seek(float);
     callback locate-placement(int);
     callback set-arrangement-placement-active(int, bool);
+    callback move-arrangement-placement(string, string);
     callback set-audio-clip-active(string, bool);
     callback set-audio-clip-gain(string, string);
     callback loudness-run();
@@ -368,6 +372,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.renaming-track ? "◌  RENAMING TRACK"
                         : root.app-mode == AppMode.changing-track-activation ? "◌  UPDATING TRACK"
                         : root.app-mode == AppMode.changing-arrangement-activation ? "◌  UPDATING CLIP"
+                        : root.app-mode == AppMode.moving-arrangement-placement ? "◌  MOVING CLIP"
                         : root.app-mode == AppMode.changing-clip-activation ? "◌  UPDATING CLIP"
                         : root.app-mode == AppMode.changing-clip-gain ? "◌  UPDATING GAIN"
                         : root.app-mode == AppMode.selecting ? "◌  SELECTING"
@@ -1275,9 +1280,9 @@ export component MainWindow inherits Window {
                                 border-radius: 6px;
                                 HorizontalLayout {
                                     padding: 9px;
-                                    spacing: 12px;
+                                    spacing: 6px;
                                     VerticalLayout {
-                                        width: 170px;
+                                        width: 110px;
                                         spacing: 2px;
                                         Text { text: placement.clip-name; color: placement.enabled ? #edf2f8 : #8c929a; font-size: 13px; font-weight: 600; overflow: elide; }
                                         Text { text: placement.track-name; color: #8290a2; font-size: 9px; overflow: elide; }
@@ -1307,7 +1312,7 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                     VerticalLayout {
-                                        width: 82px;
+                                        width: 64px;
                                         alignment: center;
                                         Text {
                                             text: placement.enabled ? "ENABLED" : "DISABLED";
@@ -1322,15 +1327,38 @@ export component MainWindow inherits Window {
                                             horizontal-alignment: center;
                                         }
                                     }
+                                    VerticalLayout {
+                                        width: 82px;
+                                        spacing: 3px;
+                                        Text {
+                                            text: "START TICK";
+                                            color: #6f8197;
+                                            font-size: 8px;
+                                        }
+                                        start-tick-input := LineEdit {
+                                            width: 82px;
+                                            horizontal-stretch: 0;
+                                            text: placement.start-tick;
+                                            accessible-label: "Start tick for " + placement.clip-name + " on " + placement.track-name;
+                                            accepted => { IdeActions.move-arrangement-placement(placement.id, self.text); }
+                                        }
+                                    }
                                     Button {
-                                        width: 78px;
+                                        width: 54px;
+                                        text: "Move";
+                                        accessible-label: "Move " + placement.clip-name + " on " + placement.track-name + " to entered start tick";
+                                        enabled: root.app-mode == AppMode.running && start-tick-input.text != placement.start-tick;
+                                        clicked => { IdeActions.move-arrangement-placement(placement.id, start-tick-input.text); }
+                                    }
+                                    Button {
+                                        width: 58px;
                                         text: "Locate";
                                         accessible-label: "Locate to " + placement.clip-name + " on " + placement.track-name;
                                         enabled: root.app-mode == AppMode.running;
                                         clicked => { IdeActions.locate-placement(placement.index); }
                                     }
                                     Button {
-                                        width: 78px;
+                                        width: 58px;
                                         text: placement.enabled ? "Disable" : "Enable";
                                         accessible-label: (placement.enabled ? "Disable " : "Enable ") + placement.clip-name + " on " + placement.track-name;
                                         enabled: root.app-mode == AppMode.running;
@@ -1341,7 +1369,7 @@ export component MainWindow inherits Window {
                         }
 
                         Text {
-                            text: "Placement activation is persistent. Moving, trimming, dragging, and waveform claims are not implemented.";
+                            text: "Placement activation and exact start-tick moves are persistent. Trimming, dragging, and waveform claims are not implemented.";
                             color: #65758a;
                             font-size: 9px;
                         }

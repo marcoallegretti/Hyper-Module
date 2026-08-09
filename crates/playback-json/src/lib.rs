@@ -2289,6 +2289,18 @@ impl LoadedPlaybackProject {
         })
     }
 
+    /// Returns the exact persisted timeline start of one arrangement placement.
+    #[must_use]
+    pub fn arrangement_placement_start_tick(&self, placement_id: &str) -> Option<u64> {
+        self.arrangement.as_ref().and_then(|arrangement| {
+            arrangement
+                .placements
+                .iter()
+                .find(|placement| placement.id == placement_id)
+                .map(|placement| placement.start_tick)
+        })
+    }
+
     /// Loads and resolves one strict version 1 mixer resource against this
     /// project's structural tracks and complete verified asset inventory.
     /// `assets` must contain every asset declared by the enclosing package;

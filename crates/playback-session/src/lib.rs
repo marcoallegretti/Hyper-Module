@@ -132,6 +132,7 @@ pub struct PlaybackArrangementPlacement {
     id: String,
     track_index: usize,
     clip_index: usize,
+    start_tick: u64,
     start_frame: usize,
     end_frame: usize,
     enabled: bool,
@@ -152,6 +153,13 @@ impl PlaybackArrangementPlacement {
     #[must_use]
     pub const fn clip_index(&self) -> usize {
         self.clip_index
+    }
+
+    /// Exact persisted timeline start; unlike the compiled frame position,
+    /// this does not require a lossy inverse tempo conversion.
+    #[must_use]
+    pub const fn start_tick(&self) -> u64 {
+        self.start_tick
     }
 
     #[must_use]
@@ -479,6 +487,9 @@ fn build_playback_arrangement(
         let enabled = project
             .arrangement_placement_enabled(&entry.placement_id)
             .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?;
+        let start_tick = project
+            .arrangement_placement_start_tick(&entry.placement_id)
+            .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?;
         let start_frame = entry.compiled.arrangement_start_frame();
         let placement_end_frame = entry.compiled.arrangement_end_frame();
         end_frame = end_frame.max(placement_end_frame);
@@ -486,6 +497,7 @@ fn build_playback_arrangement(
             id: entry.placement_id,
             track_index: entry.track_index,
             clip_index: entry.clip_index,
+            start_tick,
             start_frame,
             end_frame: placement_end_frame,
             enabled,
@@ -770,6 +782,7 @@ mod tests {
                 id: "018f47a2-6b2d-7c11-8a44-001122337506".to_owned(),
                 track_index: 0,
                 clip_index: 0,
+                start_tick: 0,
                 start_frame: 0,
                 end_frame: 100,
                 enabled: true,
