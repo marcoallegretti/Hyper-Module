@@ -662,6 +662,12 @@ pub enum AudioClipDocumentSerializationError {
 }
 
 #[derive(Debug)]
+pub enum AudioClipRenameSerializationError {
+    InvalidClipName,
+    Document(AudioClipDocumentSerializationError),
+}
+
+#[derive(Debug)]
 pub enum AudioClipGainSerializationError {
     UnsupportedGain,
     Document(AudioClipDocumentSerializationError),
@@ -879,6 +885,26 @@ impl Error for AudioClipDocumentSerializationError {
             | Self::ClipMissing
             | Self::SourceClipMismatch
             | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
+impl fmt::Display for AudioClipRenameSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidClipName => {
+                formatter.write_str("the audio-clip name is outside the version-1 domain")
+            }
+            Self::Document(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioClipRenameSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Document(source) => Some(source),
+            Self::InvalidClipName => None,
         }
     }
 }
@@ -2356,6 +2382,34 @@ fn placement_sort_key(placement: &Value) -> Option<(u64, &str, &str)> {
         placement.get("track_id")?.as_str()?,
         placement.get("id")?.as_str()?,
     ))
+}
+
+/// Replaces only the display name in one validated canonical audio-clip
+/// document while preserving its identity, source, timing, looping, fades,
+/// playback parameters, and namespaced extensions.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the clip is absent, the supplied bytes
+/// disagree with the loaded project, the new name is outside the version-1
+/// domain, or the resulting document fails version-1 validation.
+pub fn serialize_audio_clip_rename(
+    project: &LoadedPlaybackProject,
+    source_clip: &[u8],
+    clip_id: &str,
+    clip_name: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AudioClipRenameSerializationError> {
+    let name_length = clip_name.chars().count();
+    if clip_name.trim() != clip_name || !(1..=MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length)
+    {
+        return Err(AudioClipRenameSerializationError::InvalidClipName);
+    }
+    serialize_audio_clip_document_edit(project, source_clip, clip_id, limits, |document| {
+        document.insert("name".to_owned(), clip_name.into());
+        Ok(())
+    })
+    .map_err(AudioClipRenameSerializationError::Document)
 }
 
 /// Replaces only the constant playback gain in one validated canonical audio
@@ -7255,6 +7309,130 @@ mod tests {
                 .unwrap(),
             source
         );
+    }
+
+    #[test]
+    fn audio_clip_rename_changes_only_the_selected_canonical_field() {
+        let mut source: Value = serde_json::from_slice(CLIP).unwrap();
+        source["extensions"]["org.example.clip"] = json!({"opaque": [1, 2, 3]});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [&source];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334460";
+
+        let renamed = serialize_audio_clip_rename(
+            &loaded,
+            &source,
+            clip_id,
+            "Lead vocal",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut expected: Value = serde_json::from_slice(&source).unwrap();
+        expected["name"] = "Lead vocal".into();
+
+        assert_eq!(
+            renamed,
+            serde_json_canonicalizer::to_vec(&expected).unwrap()
+        );
+        assert_eq!(
+            expected["extensions"]["org.example.clip"],
+            json!({"opaque": [1, 2, 3]})
+        );
+        assert_eq!(
+            serialize_audio_clip_rename(
+                &loaded,
+                &source,
+                clip_id,
+                "Clip",
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn audio_clip_rename_rejects_invalid_missing_stale_and_noncanonical_inputs() {
+        let source: Value = serde_json::from_slice(CLIP).unwrap();
+        let canonical = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [&canonical];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334460";
+
+        for name in ["", " Clip", "Clip "] {
+            assert!(matches!(
+                serialize_audio_clip_rename(
+                    &loaded,
+                    &canonical,
+                    clip_id,
+                    name,
+                    LoaderLimits::VERSION_1,
+                ),
+                Err(AudioClipRenameSerializationError::InvalidClipName)
+            ));
+        }
+        let oversized = "x".repeat(MAX_VERSION_1_NAME_CHARACTERS + 1);
+        assert!(matches!(
+            serialize_audio_clip_rename(
+                &loaded,
+                &canonical,
+                clip_id,
+                &oversized,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipRenameSerializationError::InvalidClipName)
+        ));
+        assert!(matches!(
+            serialize_audio_clip_rename(
+                &loaded,
+                &canonical,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                "Lead vocal",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipRenameSerializationError::Document(
+                AudioClipDocumentSerializationError::ClipMissing
+            ))
+        ));
+        let mut stale = source.clone();
+        stale["enabled"] = false.into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_audio_clip_rename(
+                &loaded,
+                &stale,
+                clip_id,
+                "Lead vocal",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipRenameSerializationError::Document(
+                AudioClipDocumentSerializationError::SourceClipMismatch
+            ))
+        ));
+        let noncanonical = serde_json::to_vec_pretty(&source).unwrap();
+        assert!(matches!(
+            serialize_audio_clip_rename(
+                &loaded,
+                &noncanonical,
+                clip_id,
+                "Lead vocal",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipRenameSerializationError::Document(
+                AudioClipDocumentSerializationError::NonCanonicalSource
+            ))
+        ));
     }
 
     #[test]
