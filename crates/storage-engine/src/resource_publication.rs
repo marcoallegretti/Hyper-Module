@@ -689,12 +689,11 @@ fn publish_audio_track_observed(
                     })?;
                     Ok(outcome)
                 }
-                Err(recovery_error) => Err(ProjectResourcePublicationError {
-                    kind: ProjectResourcePublicationErrorKind::Recovery,
-                    message: "audio-track publication and recovery both failed".to_owned(),
-                    published: false,
-                    source: Some(Box::new(recovery_error)),
-                }),
+                Err(recovery_error) => Err(publication_recovery_failure(
+                    "audio-track publication and recovery both failed",
+                    "audio track was published but verification or transaction recovery is incomplete",
+                    recovery_error,
+                )),
             }
         }
     }
@@ -898,12 +897,11 @@ fn remove_audio_track_observed(
                     })?;
                     Ok(outcome)
                 }
-                Err(recovery_error) => Err(ProjectResourcePublicationError {
-                    kind: ProjectResourcePublicationErrorKind::Recovery,
-                    message: "audio-track removal and recovery both failed".to_owned(),
-                    published: false,
-                    source: Some(Box::new(recovery_error)),
-                }),
+                Err(recovery_error) => Err(publication_recovery_failure(
+                    "audio-track removal and recovery both failed",
+                    "audio track was removed but verification or transaction recovery is incomplete",
+                    recovery_error,
+                )),
             }
         }
     }
@@ -1109,12 +1107,11 @@ fn publish_project_resource_observed(
                         })?;
                     Ok(outcome)
                 }
-                Err(recovery_error) => Err(ProjectResourcePublicationError {
-                    kind: ProjectResourcePublicationErrorKind::Recovery,
-                    message: "resource publication and recovery both failed".to_owned(),
-                    published: false,
-                    source: Some(Box::new(recovery_error)),
-                }),
+                Err(recovery_error) => Err(publication_recovery_failure(
+                    "resource publication and recovery both failed",
+                    "resource was published but verification or transaction recovery is incomplete",
+                    recovery_error,
+                )),
             }
         }
     }
@@ -2377,11 +2374,20 @@ fn recover_audio_track_transaction(
         Err(error) => return Err(error),
     };
     if active == after {
-        if tx.operation == AudioTrackTransactionOperation::Removal {
-            ensure_audio_track_absent(root, tx)?;
-        }
-        cleanup_audio_track_temporaries(root, backups, transaction, tx)?;
-        verify_committed(root_path, root, after)?;
+        (|| {
+            if tx.operation == AudioTrackTransactionOperation::Removal {
+                ensure_audio_track_absent(root, tx)?;
+            }
+            cleanup_audio_track_temporaries(root, backups, transaction, tx)?;
+            verify_committed(root_path, root, after)
+        })()
+        .map_err(|source| ProjectResourcePublicationError {
+            kind: ProjectResourcePublicationErrorKind::Recovery,
+            message: "committed audio-track transaction could not be verified or fully recovered"
+                .to_owned(),
+            published: true,
+            source: Some(Box::new(source)),
+        })?;
         return Ok(AudioTrackPublicationRecoveryDisposition::Committed);
     }
     if active != before {
@@ -2897,8 +2903,15 @@ fn recover_transaction(
         Err(error) => return Err(error),
     };
     if active == after {
-        cleanup_publication_temporaries(root, backups, transaction, tx)?;
-        verify_committed(root_path, root, after)?;
+        cleanup_publication_temporaries(root, backups, transaction, tx)
+            .and_then(|()| verify_committed(root_path, root, after))
+            .map_err(|source| ProjectResourcePublicationError {
+                kind: ProjectResourcePublicationErrorKind::Recovery,
+                message: "committed resource publication could not be verified or fully recovered"
+                    .to_owned(),
+                published: true,
+                source: Some(Box::new(source)),
+            })?;
         return Ok(ProjectResourcePublicationRecoveryDisposition::Committed);
     }
     if active != before {
@@ -3976,6 +3989,25 @@ fn decode_digest(value: &str) -> Result<[u8; 32], ProjectResourcePublicationErro
     Ok(output)
 }
 
+fn publication_recovery_failure(
+    unpublished_message: &str,
+    published_message: &str,
+    recovery_error: ProjectResourcePublicationError,
+) -> ProjectResourcePublicationError {
+    let published = recovery_error.published();
+    ProjectResourcePublicationError {
+        kind: ProjectResourcePublicationErrorKind::Recovery,
+        message: if published {
+            published_message
+        } else {
+            unpublished_message
+        }
+        .to_owned(),
+        published,
+        source: Some(Box::new(recovery_error)),
+    }
+}
+
 fn failure(
     kind: ProjectResourcePublicationErrorKind,
     message: impl Into<String>,
@@ -4125,6 +4157,16 @@ mod tests {
                 .unwrap()
                 .path()
         }
+
+        fn transaction_id(&self) -> String {
+            self.transaction_path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .strip_prefix(TRANSACTION_PREFIX)
+                .unwrap()
+                .to_owned()
+        }
     }
 
     impl Drop for Fixture {
@@ -4234,6 +4276,30 @@ mod tests {
                         .starts_with(AUDIO_TRACK_TRANSACTION_PREFIX)
                 })
                 .count()
+        }
+
+        fn transaction_path(&self) -> PathBuf {
+            fs::read_dir(self.root.join("backups"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(AUDIO_TRACK_TRANSACTION_PREFIX)
+                })
+                .unwrap()
+                .path()
+        }
+
+        fn transaction_id(&self) -> String {
+            self.transaction_path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .strip_prefix(AUDIO_TRACK_TRANSACTION_PREFIX)
+                .unwrap()
+                .to_owned()
         }
     }
 
@@ -4769,6 +4835,58 @@ mod tests {
     }
 
     #[test]
+    fn committed_resource_manifest_retains_publication_authority_during_recovery_failure() {
+        let fixture = Fixture::new();
+        let error = publish_project_resource_observed(
+            &fixture.root,
+            fixture.request(),
+            ProjectResourcePublicationMode::Replacement,
+            |phase, _| {
+                if phase != PublicationPhase::Manifest {
+                    return Ok(());
+                }
+                fs::write(
+                    fixture
+                        .root
+                        .join("backups")
+                        .join(format!(".project-{}.json", fixture.transaction_id())),
+                    b"unrelated cleanup residue",
+                )
+                .unwrap();
+                Err(failure(
+                    ProjectResourcePublicationErrorKind::Io,
+                    "simulated post-manifest failure",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
+        assert!(error.published());
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            2
+        );
+        fs::remove_file(
+            fixture
+                .root
+                .join("backups")
+                .join(format!(".project-{}.json", fixture.transaction_id())),
+        )
+        .unwrap();
+        let recovered = recover_project_resource_publications(&fixture.root).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].disposition(),
+            ProjectResourcePublicationRecoveryDisposition::Committed
+        );
+        assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
     fn publishes_a_new_audio_track_and_matching_mixer_atomically() {
         let fixture = AudioTrackFixture::new();
 
@@ -4995,6 +5113,53 @@ mod tests {
     }
 
     #[test]
+    fn committed_audio_track_removal_retains_publication_authority_during_recovery_failure() {
+        let fixture = AudioTrackFixture::new();
+        publish_audio_track(&fixture.root, fixture.request()).unwrap();
+        let error =
+            remove_audio_track_observed(&fixture.root, fixture.removal_request(), |phase, _| {
+                if phase != AudioTrackPublicationPhase::Manifest {
+                    return Ok(());
+                }
+                fs::write(
+                    fixture.root.join("backups").join(format!(
+                        ".audio-track-project-{}.json",
+                        fixture.transaction_id()
+                    )),
+                    b"unrelated cleanup residue",
+                )
+                .unwrap();
+                Err(failure(
+                    ProjectResourcePublicationErrorKind::Io,
+                    "simulated post-manifest failure",
+                ))
+            })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
+        assert!(error.published());
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            3
+        );
+        fs::remove_file(fixture.root.join("backups").join(format!(
+            ".audio-track-project-{}.json",
+            fixture.transaction_id()
+        )))
+        .unwrap();
+        let recovered = recover_audio_track_publications(&fixture.root).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].disposition(),
+            AudioTrackPublicationRecoveryDisposition::Committed
+        );
+        assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
     fn audio_track_publication_refuses_a_foreign_transaction_before_staging() {
         let fixture = AudioTrackFixture::new();
         let foreign_name = format!(
@@ -5197,6 +5362,51 @@ mod tests {
                 .revision(),
             2
         );
+    }
+
+    #[test]
+    fn committed_audio_track_manifest_retains_publication_authority_during_recovery_failure() {
+        let fixture = AudioTrackFixture::new();
+        let error = publish_audio_track_observed(&fixture.root, fixture.request(), |phase, _| {
+            if phase != AudioTrackPublicationPhase::Manifest {
+                return Ok(());
+            }
+            fs::write(
+                fixture.root.join("backups").join(format!(
+                    ".audio-track-project-{}.json",
+                    fixture.transaction_id()
+                )),
+                b"unrelated cleanup residue",
+            )
+            .unwrap();
+            Err(failure(
+                ProjectResourcePublicationErrorKind::Io,
+                "simulated post-manifest failure",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
+        assert!(error.published());
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            2
+        );
+        fs::remove_file(fixture.root.join("backups").join(format!(
+            ".audio-track-project-{}.json",
+            fixture.transaction_id()
+        )))
+        .unwrap();
+        let recovered = recover_audio_track_publications(&fixture.root).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].disposition(),
+            AudioTrackPublicationRecoveryDisposition::Committed
+        );
+        assert_eq!(fixture.transaction_count(), 0);
     }
 
     #[test]
