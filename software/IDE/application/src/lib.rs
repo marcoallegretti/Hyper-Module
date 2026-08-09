@@ -50,14 +50,15 @@ pub use hyper_playback_json::is_native_audio_clip_gain_decibels as ide_audio_cli
 use hyper_playback_json::{
     ArrangementPlacementDocumentSerializationError, AudioClipAdditionSerializationError,
     AudioClipDocumentSerializationError, AudioClipGainSerializationError,
-    AudioTrackAdditionSerializationError, AudioTrackDocumentSerializationError,
-    AudioTrackRemovalBlockers, AudioTrackRemovalSerializationError,
-    AudioTrackRenameSerializationError, CompiledMixerTap, CompiledMixerTrackKind, LoaderLimits,
-    MixerBaseState, MixerChannelBaseState, MixerSendBaseState, MixerStateSerializationError,
-    serialize_arrangement_placement_activation, serialize_arrangement_placement_addition,
-    serialize_arrangement_placement_duration, serialize_arrangement_placement_front_trim,
-    serialize_arrangement_placement_move, serialize_arrangement_placement_removal,
-    serialize_audio_clip_activation, serialize_audio_clip_gain, serialize_audio_track_activation,
+    AudioClipRenameSerializationError, AudioTrackAdditionSerializationError,
+    AudioTrackDocumentSerializationError, AudioTrackRemovalBlockers,
+    AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError, CompiledMixerTap,
+    CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
+    MixerSendBaseState, MixerStateSerializationError, serialize_arrangement_placement_activation,
+    serialize_arrangement_placement_addition, serialize_arrangement_placement_duration,
+    serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
+    serialize_arrangement_placement_removal, serialize_audio_clip_activation,
+    serialize_audio_clip_gain, serialize_audio_clip_rename, serialize_audio_track_activation,
     serialize_audio_track_addition, serialize_audio_track_removal, serialize_audio_track_rename,
     serialize_mixer_base_state, serialize_recording_audio_clip_addition,
 };
@@ -2481,6 +2482,115 @@ impl Error for IdeAudioClipEditPublicationError {
 }
 
 #[derive(Debug)]
+pub enum IdeAudioClipRenameEditError {
+    InvalidClipIdentity,
+    InvalidName,
+    MixerSave(Box<IdeProjectSaveError>),
+    ClipResourceMissing,
+    ClipResourceRoleMismatch,
+    Storage(StorageError),
+    Serialization(AudioClipRenameSerializationError),
+    CapacityUnavailable,
+    Publication(Box<IdeAudioClipEditPublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeAudioClipRenameEditError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: ProjectResourcePublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<IdeAudioClipEditPublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl fmt::Display for IdeAudioClipRenameEditError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidClipIdentity => {
+                formatter.write_str("audio-clip rename requires a clip identity")
+            }
+            Self::InvalidName => {
+                formatter.write_str("audio-clip rename requires a name of 1 to 120 characters")
+            }
+            Self::MixerSave(source) => {
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
+            }
+            Self::ClipResourceMissing => {
+                formatter.write_str("the selected audio-clip resource is missing")
+            }
+            Self::ClipResourceRoleMismatch => {
+                formatter.write_str("the selected identity is not an audio-clip resource")
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("audio-clip rename capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before renaming the audio clip: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before renaming the audio clip ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-clip rename preparation failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "audio clip was renamed in project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-clip rename publication failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAudioClipRenameEditError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidClipIdentity
+            | Self::InvalidName
+            | Self::ClipResourceMissing
+            | Self::ClipResourceRoleMismatch
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum IdeAudioClipGainEditError {
     InvalidClipIdentity,
     MixerSave(Box<IdeProjectSaveError>),
@@ -2762,6 +2872,36 @@ struct IdeAudioClipEditPlan {
     mixer: IdeMixerSavePlan,
     clip_id: String,
     clip_bytes: Vec<u8>,
+}
+
+fn prepare_audio_clip_rename_resource(
+    prepared: &PreparedProjectPlayback,
+    clip_id: &str,
+    clip_name: &str,
+    limits: LoaderLimits,
+) -> Result<(String, Vec<u8>), IdeAudioClipRenameEditError> {
+    let package = prepared.package();
+    let descriptor = package
+        .manifest()
+        .resources()
+        .iter()
+        .find(|descriptor| descriptor.id() == clip_id)
+        .ok_or(IdeAudioClipRenameEditError::ClipResourceMissing)?;
+    if descriptor.role() != ResourceRole::Clip {
+        return Err(IdeAudioClipRenameEditError::ClipResourceRoleMismatch);
+    }
+    let source = package
+        .read_resource(clip_id)
+        .map_err(IdeAudioClipRenameEditError::Storage)?;
+    let (project, _, _, _) = prepared.session().parts();
+    let clip_bytes = serialize_audio_clip_rename(project, &source, clip_id, clip_name, limits)
+        .map_err(IdeAudioClipRenameEditError::Serialization)?;
+    let mut owned_clip_id = String::new();
+    owned_clip_id
+        .try_reserve_exact(clip_id.len())
+        .map_err(|_| IdeAudioClipRenameEditError::CapacityUnavailable)?;
+    owned_clip_id.push_str(clip_id);
+    Ok((owned_clip_id, clip_bytes))
 }
 
 fn prepare_audio_clip_activation_resource(
@@ -3755,6 +3895,32 @@ impl RunningDesktopIdeApplication {
             arrangement_id,
             arrangement_bytes,
             addition: false,
+        })
+    }
+
+    fn prepare_audio_clip_rename(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        clip_id: &str,
+        clip_name: &str,
+    ) -> Result<IdeAudioClipEditPlan, IdeAudioClipRenameEditError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAudioClipRenameEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAudioClipRenameEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let (clip_id, clip_bytes) = prepare_audio_clip_rename_resource(
+            prepared,
+            clip_id,
+            clip_name,
+            application.config.project_limits.session.documents,
+        )?;
+        Ok(IdeAudioClipEditPlan {
+            mixer,
+            clip_id,
+            clip_bytes,
         })
     }
 
@@ -6046,6 +6212,70 @@ mod tests {
         .unwrap();
         assert!(!unchanged.changed());
         assert_eq!(unchanged.project_revision(), 3);
+    }
+
+    #[test]
+    fn audio_clip_rename_publishes_and_reopens_without_changing_audio_or_placement_identity() {
+        let fixture = ArrangementProjectFixture::new();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let mixer_bytes = package.read_resource(mixer.id()).unwrap();
+        let arrangement_bytes = package.read_resource(ARRANGEMENT_TEST_RESOURCE_ID).unwrap();
+        let source_audio = std::fs::read(project_path.join("assets/samples/sample.wav")).unwrap();
+        let identity = *package.manifest_sha256();
+        let (clip_id, clip_bytes) = prepare_audio_clip_rename_resource(
+            &prepared,
+            ARRANGEMENT_TEST_CLIP_ID,
+            "Lead vocal",
+            limits.session.documents,
+        )
+        .unwrap();
+        drop(prepared);
+
+        let outcome = IdeAudioClipEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: identity,
+                resource_id: mixer_id,
+                resource_bytes: mixer_bytes,
+            },
+            clip_id,
+            clip_bytes,
+        }
+        .publish()
+        .unwrap();
+        assert!(outcome.changed());
+        assert_eq!(outcome.project_revision(), 2);
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let (project, _, _, _) = reopened.session().parts();
+        assert_eq!(project.clip_name_at(0), Some("Lead vocal"));
+        assert_eq!(
+            reopened
+                .package()
+                .read_resource(ARRANGEMENT_TEST_RESOURCE_ID)
+                .unwrap(),
+            arrangement_bytes
+        );
+        assert_eq!(
+            reopened.session().arrangement().placements()[0].clip_index(),
+            0
+        );
+        assert_eq!(
+            std::fs::read(project_path.join("assets/samples/sample.wav")).unwrap(),
+            source_audio
+        );
     }
 
     #[test]
