@@ -143,6 +143,38 @@ pub struct AudioTrackPublicationRequest<'a> {
     pub mixer_bytes: &'a [u8],
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct AudioTrackRemovalRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub track_id: &'a str,
+    pub mixer_id: &'a str,
+    pub mixer_bytes: &'a [u8],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioTrackRemovalOutcome {
+    project_identity: [u8; 32],
+    project_revision: u64,
+    track_id: String,
+}
+
+impl AudioTrackRemovalOutcome {
+    #[must_use]
+    pub const fn project_identity(&self) -> &[u8; 32] {
+        &self.project_identity
+    }
+
+    #[must_use]
+    pub const fn project_revision(&self) -> u64 {
+        self.project_revision
+    }
+
+    #[must_use]
+    pub fn track_id(&self) -> &str {
+        &self.track_id
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioTrackPublicationOutcome {
     project_identity: [u8; 32],
@@ -258,7 +290,30 @@ struct AudioTrackTransactionRecord {
     track: TransactionFile,
     mixer: TransactionFile,
     previous_mixer: TransactionFile,
+    #[serde(
+        default,
+        skip_serializing_if = "AudioTrackTransactionOperation::is_publication"
+    )]
+    operation: AudioTrackTransactionOperation,
     extensions: serde_json::Map<String, Value>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AudioTrackTransactionOperation {
+    #[default]
+    Publication,
+    Removal,
+}
+
+impl AudioTrackTransactionOperation {
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde skip_serializing_if requires a shared-reference predicate"
+    )]
+    const fn is_publication(&self) -> bool {
+        matches!(self, Self::Publication)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -333,6 +388,22 @@ pub fn publish_audio_track(
     request: AudioTrackPublicationRequest<'_>,
 ) -> Result<AudioTrackPublicationOutcome, ProjectResourcePublicationError> {
     publish_audio_track_observed(project_path.as_ref(), request, |_, _| Ok(()))
+}
+
+/// Removes one empty audio-track resource and its mixer channel through the
+/// same serialized, recoverable manifest-last transaction family used for
+/// publication.
+///
+/// # Errors
+///
+/// Returns a classified validation, conflict, integrity, I/O, or recovery
+/// error. The request is rejected unless it removes exactly one empty audio
+/// track and preserves every unrelated mixer field.
+pub fn remove_audio_track(
+    project_path: impl AsRef<Path>,
+    request: AudioTrackRemovalRequest<'_>,
+) -> Result<AudioTrackRemovalOutcome, ProjectResourcePublicationError> {
+    remove_audio_track_observed(project_path.as_ref(), request, |_, _| Ok(()))
 }
 
 /// Recovers every durable audio-track publication in one project.
@@ -559,6 +630,215 @@ fn publish_audio_track_observed(
                 Err(recovery_error) => Err(ProjectResourcePublicationError {
                     kind: ProjectResourcePublicationErrorKind::Recovery,
                     message: "audio-track publication and recovery both failed".to_owned(),
+                    published: false,
+                    source: Some(Box::new(recovery_error)),
+                }),
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the coordinator keeps lock, recovery, staging, and disposition ordering visible as one fail-closed operation"
+)]
+fn remove_audio_track_observed(
+    project_path: &Path,
+    request: AudioTrackRemovalRequest<'_>,
+    mut observer: impl FnMut(
+        AudioTrackPublicationPhase,
+        &Path,
+    ) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<AudioTrackRemovalOutcome, ProjectResourcePublicationError> {
+    validate_canonical_resource(request.mixer_bytes)?;
+    if request.track_id.is_empty() || request.mixer_id.is_empty() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "audio-track and mixer identities must be present",
+        ));
+    }
+    let verified = verify_project_package(project_path).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "project verification failed before audio-track removal",
+            error,
+        )
+    })?;
+    if request.expected_project_sha256 != *verified.manifest_sha256() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "project changed after the audio-track removal began",
+        ));
+    }
+    let track_descriptor = unique_resource(&verified, request.track_id, ResourceRole::Track)?;
+    let mixer_descriptor = unique_resource(&verified, request.mixer_id, ResourceRole::Mixer)?;
+    let track = verified.read_resource(request.track_id).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "read current audio-track resource",
+            error,
+        )
+    })?;
+    let previous_mixer = verified.read_resource(request.mixer_id).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "read current mixer resource",
+            error,
+        )
+    })?;
+    validate_audio_track_removal_documents(request, &track, &previous_mixer)?;
+
+    let backups = open_or_create_dir(&verified.root_dir, "backups")?;
+    let _lock = ProjectLock::acquire(&backups).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::TransactionUnavailable,
+            "acquire project storage transaction lock",
+            error,
+        )
+    })?;
+    reject_unhandled_resource_transactions(&backups)?;
+    let recovered_resources =
+        recover_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
+    let recovered_tracks =
+        recover_audio_track_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
+    if !recovered_resources.is_empty() || !recovered_tracks.is_empty() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "a prior project transaction was recovered; reopen the current project revision",
+        ));
+    }
+    verified.confirm_unchanged().map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "project changed before audio-track removal",
+            error,
+        )
+    })?;
+    let active_project = read_bounded(&verified.root_dir, MANIFEST_NAME, MAX_JSON_BYTES)?;
+    if digest(&active_project) != request.expected_project_sha256 {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "active project identity changed before audio-track removal staging",
+        ));
+    }
+    let next_revision = verified
+        .manifest()
+        .revision()
+        .checked_add(1)
+        .filter(|revision| *revision <= MAX_SAFE_INTEGER)
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::ResourceConflict,
+                "project revision cannot be incremented",
+            )
+        })?;
+    let candidate_project = candidate_audio_track_removal_manifest(
+        &active_project,
+        request,
+        track_descriptor.path(),
+        next_revision,
+    )?;
+    let transaction_name = format!("{AUDIO_TRACK_TRANSACTION_PREFIX}{}", Uuid::new_v4());
+    backups.create_dir(&transaction_name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "create audio-track removal transaction",
+            error,
+        )
+    })?;
+    sync_dir(&backups)?;
+    let transaction = backups
+        .open_dir_nofollow(&transaction_name)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "open audio-track removal transaction",
+                error,
+            )
+        })?;
+    let result = run_audio_track_removal(
+        &verified,
+        &backups,
+        &transaction,
+        &transaction_name,
+        request,
+        mixer_descriptor.path(),
+        track_descriptor.path(),
+        &track,
+        &previous_mixer,
+        &active_project,
+        &candidate_project,
+        next_revision,
+        &mut observer,
+    );
+    match result {
+        Ok(outcome) => {
+            clear_and_remove_audio_track_transaction(&backups, transaction, &transaction_name)
+                .map_err(|error| ProjectResourcePublicationError {
+                    kind: ProjectResourcePublicationErrorKind::Recovery,
+                    message: "audio track was removed but transaction cleanup is incomplete"
+                        .to_owned(),
+                    published: true,
+                    source: Some(Box::new(error)),
+                })?;
+            Ok(outcome)
+        }
+        Err(operation_error) => {
+            let tx = match read_audio_track_transaction(&transaction, &transaction_name) {
+                Ok(tx) => tx,
+                Err(_) if missing_file(&transaction, TRANSACTION_NAME)? => {
+                    validate_audio_track_prepublication_residue(&transaction, &transaction_name)?;
+                    clear_and_remove_audio_track_transaction(
+                        &backups,
+                        transaction,
+                        &transaction_name,
+                    )?;
+                    return Err(operation_error);
+                }
+                Err(source) => {
+                    return Err(ProjectResourcePublicationError {
+                        kind: ProjectResourcePublicationErrorKind::Recovery,
+                        message: "audio-track removal failed and its durable transaction could not be read"
+                            .to_owned(),
+                        published: false,
+                        source: Some(Box::new(source)),
+                    });
+                }
+            };
+            match recover_audio_track_transaction(
+                verified.root(),
+                &verified.root_dir,
+                &backups,
+                &transaction,
+                &tx,
+            ) {
+                Ok(AudioTrackPublicationRecoveryDisposition::RolledBack) => {
+                    clear_and_remove_audio_track_transaction(
+                        &backups,
+                        transaction,
+                        &transaction_name,
+                    )?;
+                    Err(operation_error)
+                }
+                Ok(AudioTrackPublicationRecoveryDisposition::Committed) => {
+                    let outcome = audio_track_removal_outcome(&tx)?;
+                    clear_and_remove_audio_track_transaction(
+                        &backups,
+                        transaction,
+                        &transaction_name,
+                    )
+                    .map_err(|error| ProjectResourcePublicationError {
+                        kind: ProjectResourcePublicationErrorKind::Recovery,
+                        message: "audio track was removed but transaction cleanup is incomplete"
+                            .to_owned(),
+                        published: true,
+                        source: Some(Box::new(error)),
+                    })?;
+                    Ok(outcome)
+                }
+                Err(recovery_error) => Err(ProjectResourcePublicationError {
+                    kind: ProjectResourcePublicationErrorKind::Recovery,
+                    message: "audio-track removal and recovery both failed".to_owned(),
                     published: false,
                     source: Some(Box::new(recovery_error)),
                 }),
@@ -934,6 +1214,7 @@ fn run_audio_track_publication(
             byte_length: previous_mixer.len() as u64,
             sha256: hex_digest(digest(previous_mixer)),
         },
+        operation: AudioTrackTransactionOperation::Publication,
         extensions: serde_json::Map::new(),
     };
     let transaction_bytes = serde_json_canonicalizer::to_vec(&tx).map_err(|error| {
@@ -1009,6 +1290,127 @@ fn run_audio_track_publication(
         digest(candidate_project),
     )?;
     audio_track_outcome(&tx)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the durable write order and every crash observation point remain visible in one coordinator"
+)]
+fn run_audio_track_removal(
+    verified: &StructurallyVerifiedProject,
+    backups: &Dir,
+    transaction: &Dir,
+    transaction_name: &str,
+    request: AudioTrackRemovalRequest<'_>,
+    mixer_path: &str,
+    track_path: &str,
+    track: &[u8],
+    previous_mixer: &[u8],
+    previous_project: &[u8],
+    candidate_project: &[u8],
+    next_revision: u64,
+    observer: &mut impl FnMut(
+        AudioTrackPublicationPhase,
+        &Path,
+    ) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<AudioTrackRemovalOutcome, ProjectResourcePublicationError> {
+    write_audio_track_intent(transaction, transaction_name)?;
+    write_exclusive_synced(transaction, AUDIO_TRACK_STAGING_NAME, track)?;
+    write_exclusive_synced(
+        transaction,
+        AUDIO_TRACK_MIXER_STAGING_NAME,
+        request.mixer_bytes,
+    )?;
+    write_exclusive_synced(transaction, AUDIO_TRACK_PREVIOUS_MIXER_NAME, previous_mixer)?;
+    write_exclusive_synced(transaction, PROJECT_STAGING_NAME, candidate_project)?;
+    write_exclusive_synced(transaction, PREVIOUS_PROJECT_NAME, previous_project)?;
+    let tx = AudioTrackTransactionRecord {
+        format: "hyper-audio-track-removal-transaction".to_owned(),
+        format_version: 1,
+        id: audio_track_transaction_id(transaction_name)?,
+        before_project_sha256: hex_digest(*verified.manifest_sha256()),
+        after_project_sha256: hex_digest(digest(candidate_project)),
+        before_project_revision: verified.manifest().revision(),
+        after_project_revision: next_revision,
+        track_id: request.track_id.to_owned(),
+        mixer_id: request.mixer_id.to_owned(),
+        track: TransactionFile {
+            path: track_path.to_owned(),
+            byte_length: track.len() as u64,
+            sha256: hex_digest(digest(track)),
+        },
+        mixer: TransactionFile {
+            path: mixer_path.to_owned(),
+            byte_length: request.mixer_bytes.len() as u64,
+            sha256: hex_digest(digest(request.mixer_bytes)),
+        },
+        previous_mixer: TransactionFile {
+            path: mixer_path.to_owned(),
+            byte_length: previous_mixer.len() as u64,
+            sha256: hex_digest(digest(previous_mixer)),
+        },
+        operation: AudioTrackTransactionOperation::Removal,
+        extensions: serde_json::Map::new(),
+    };
+    let transaction_bytes = serde_json_canonicalizer::to_vec(&tx).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "serialize audio-track removal transaction",
+            error,
+        )
+    })?;
+    write_exclusive_synced(transaction, TRANSACTION_NAME, &transaction_bytes)?;
+    sync_dir(transaction)?;
+    sync_dir(backups)?;
+    observer(AudioTrackPublicationPhase::Transaction, verified.root())?;
+
+    let mixer_parent = open_relative_parent(&verified.root_dir, mixer_path)?;
+    publish_staged_file(
+        transaction,
+        AUDIO_TRACK_MIXER_STAGING_NAME,
+        &mixer_parent,
+        &mixer_parent,
+        file_name(mixer_path)?,
+        &format!(".audio-track-mixer-{}.json", tx.id),
+        "audio-track removal mixer",
+    )?;
+    observer(AudioTrackPublicationPhase::Mixer, verified.root())?;
+
+    remove_published_audio_track(&verified.root_dir, &tx)?;
+    observer(AudioTrackPublicationPhase::Track, verified.root())?;
+    let candidate =
+        verify_project_candidate(verified.root(), &verified.root_dir, candidate_project).map_err(
+            |error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "audio-track removal candidate does not verify",
+                    error,
+                )
+            },
+        )?;
+    if candidate.revision() != next_revision {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "audio-track removal candidate revision changed",
+        ));
+    }
+    publish_staged_file(
+        transaction,
+        PROJECT_STAGING_NAME,
+        backups,
+        &verified.root_dir,
+        MANIFEST_NAME,
+        &format!(".audio-track-project-{}.json", tx.id),
+        "audio-track removal project manifest",
+    )?;
+    observer(AudioTrackPublicationPhase::Manifest, verified.root())?;
+    verify_committed(
+        verified.root(),
+        &verified.root_dir,
+        digest(candidate_project),
+    )?;
+    audio_track_removal_outcome(&tx)
 }
 
 fn validate_audio_track_documents(
@@ -1126,6 +1528,119 @@ fn validate_audio_track_document_identity(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact track and mixer removal shape is validated together before any transaction staging"
+)]
+fn validate_audio_track_removal_documents(
+    request: AudioTrackRemovalRequest<'_>,
+    track_bytes: &[u8],
+    previous_mixer_bytes: &[u8],
+) -> Result<(), ProjectResourcePublicationError> {
+    validate_canonical_resource(track_bytes)?;
+    let track: Value = serde_json::from_slice(track_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse removed audio-track resource",
+            error,
+        )
+    })?;
+    let previous: Value = serde_json::from_slice(previous_mixer_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "parse current mixer resource",
+            error,
+        )
+    })?;
+    let candidate: Value = serde_json::from_slice(request.mixer_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse audio-track removal mixer",
+            error,
+        )
+    })?;
+    if track["format"].as_str() != Some("hyper-track")
+        || track["id"].as_str() != Some(request.track_id)
+        || track["kind"].as_str() != Some("audio")
+        || track["clip_ids"]
+            .as_array()
+            .is_none_or(|clips| !clips.is_empty())
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "audio-track removal requires the matching empty audio-track resource",
+        ));
+    }
+    if previous["format"].as_str() != Some("hyper-mixer")
+        || candidate["format"].as_str() != Some("hyper-mixer")
+        || previous["id"].as_str() != Some(request.mixer_id)
+        || candidate["id"].as_str() != Some(request.mixer_id)
+        || previous["project_id"] != candidate["project_id"]
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "audio-track removal mixer identity changed",
+        ));
+    }
+    let previous_channels = previous["channels"].as_array().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "current mixer channel collection is invalid",
+        )
+    })?;
+    let candidate_channels = candidate["channels"].as_array().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "candidate mixer channel collection is invalid",
+        )
+    })?;
+    let mut matching = previous_channels
+        .iter()
+        .enumerate()
+        .filter(|(_, channel)| channel["track_id"].as_str() == Some(request.track_id));
+    let Some((removed_index, _)) = matching.next() else {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "current mixer has no channel for the removed audio track",
+        ));
+    };
+    if matching.next().is_some()
+        || candidate_channels.len().checked_add(1) != Some(previous_channels.len())
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "audio-track removal must remove exactly one mixer channel",
+        ));
+    }
+    if previous_channels.iter().any(|channel| {
+        channel["track_id"].as_str() != Some(request.track_id)
+            && channel["destination"]["kind"].as_str() == Some("track")
+            && channel["destination"]["track_id"].as_str() == Some(request.track_id)
+    }) {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "audio track is still a mixer routing destination",
+        ));
+    }
+    let mut restored = candidate.clone();
+    restored["channels"]
+        .as_array_mut()
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "candidate mixer channel collection changed during validation",
+            )
+        })?
+        .insert(removed_index, previous_channels[removed_index].clone());
+    if restored != previous {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "audio-track removal must preserve every unrelated mixer field",
+        ));
+    }
+    Ok(())
+}
+
 fn reject_audio_track_collisions(
     verified: &StructurallyVerifiedProject,
     request: AudioTrackPublicationRequest<'_>,
@@ -1224,6 +1739,74 @@ fn candidate_audio_track_manifest(
         caused(
             ProjectResourcePublicationErrorKind::Integrity,
             "candidate audio-track project manifest is invalid",
+            error,
+        )
+    })?;
+    Ok(bytes)
+}
+
+fn candidate_audio_track_removal_manifest(
+    active: &[u8],
+    request: AudioTrackRemovalRequest<'_>,
+    track_path: &str,
+    revision: u64,
+) -> Result<Vec<u8>, ProjectResourcePublicationError> {
+    let mut value: Value = serde_json::from_slice(active).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "parse active project manifest",
+            error,
+        )
+    })?;
+    value["revision"] = revision.into();
+    let resources = value["resources"].as_array_mut().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "project resource declarations are invalid",
+        )
+    })?;
+    let track_index = resources
+        .iter()
+        .position(|resource| {
+            resource["id"].as_str() == Some(request.track_id)
+                && resource["role"].as_str() == Some("track")
+                && resource["path"].as_str() == Some(track_path)
+        })
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "removed audio-track descriptor disappeared",
+            )
+        })?;
+    resources.remove(track_index);
+    let mixer = resources
+        .iter_mut()
+        .find(|resource| resource["id"].as_str() == Some(request.mixer_id))
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "current mixer descriptor disappeared",
+            )
+        })?;
+    mixer["byte_length"] = request.mixer_bytes.len().into();
+    mixer["sha256"] = hex_digest(digest(request.mixer_bytes)).into();
+    let bytes = serde_json_canonicalizer::to_vec(&value).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "serialize audio-track removal manifest",
+            error,
+        )
+    })?;
+    if bytes.len() > MAX_JSON_BYTES {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "candidate project manifest exceeds its size limit",
+        ));
+    }
+    ProjectManifest::parse(&bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "candidate audio-track removal manifest is invalid",
             error,
         )
     })?;
@@ -1555,6 +2138,9 @@ fn recover_audio_track_transaction(
         Err(error) => return Err(error),
     };
     if active == after {
+        if tx.operation == AudioTrackTransactionOperation::Removal {
+            ensure_audio_track_absent(root, tx)?;
+        }
         cleanup_audio_track_temporaries(root, backups, transaction, tx)?;
         verify_committed(root_path, root, after)?;
         return Ok(AudioTrackPublicationRecoveryDisposition::Committed);
@@ -1566,7 +2152,12 @@ fn recover_audio_track_transaction(
         ));
     }
     rollback_audio_track_mixer(root, transaction, tx)?;
-    remove_published_audio_track(root, tx)?;
+    match tx.operation {
+        AudioTrackTransactionOperation::Publication => remove_published_audio_track(root, tx)?,
+        AudioTrackTransactionOperation::Removal => {
+            restore_removed_audio_track(root, transaction, tx)?;
+        }
+    }
     cleanup_audio_track_temporaries(root, backups, transaction, tx)?;
     let previous = read_bounded(transaction, PREVIOUS_PROJECT_NAME, MAX_JSON_BYTES)?;
     if digest(&previous) != before {
@@ -1583,6 +2174,49 @@ fn recover_audio_track_transaction(
         )
     })?;
     Ok(AudioTrackPublicationRecoveryDisposition::RolledBack)
+}
+
+fn ensure_audio_track_absent(
+    root: &Dir,
+    tx: &AudioTrackTransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    let parent = open_relative_parent(root, &tx.track.path)?;
+    if read_optional_file(&parent, file_name(&tx.track.path)?)?.is_some() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "committed audio-track removal still has an active track file",
+        ));
+    }
+    Ok(())
+}
+
+fn restore_removed_audio_track(
+    root: &Dir,
+    transaction: &Dir,
+    tx: &AudioTrackTransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    let parent = open_relative_parent(root, &tx.track.path)?;
+    let name = file_name(&tx.track.path)?;
+    let expected = decode_digest(&tx.track.sha256)?;
+    match read_optional_file(&parent, name)? {
+        Some(bytes) if digest(&bytes) == expected => return Ok(()),
+        Some(_) => {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "audio-track rollback refuses unrelated track content",
+            ));
+        }
+        None => {}
+    }
+    publish_staged_file(
+        transaction,
+        AUDIO_TRACK_STAGING_NAME,
+        &parent,
+        &parent,
+        name,
+        &format!(".audio-track-rollback-{}.json", tx.id),
+        "removed audio track",
+    )
 }
 
 fn rollback_audio_track_mixer(
@@ -1709,66 +2343,114 @@ fn validate_staged_audio_track_transaction(
             "audio-track transaction project revisions are inconsistent",
         ));
     }
-    if previous_manifest
-        .resources()
-        .iter()
-        .any(|descriptor| descriptor.id() == tx.track_id || descriptor.path() == tx.track.path)
-    {
-        return Err(failure(
-            ProjectResourcePublicationErrorKind::Recovery,
-            "previous project already declares the transaction audio track",
-        ));
-    }
     let previous_mixer_descriptor = manifest_resource(&previous_manifest, &tx.mixer_id)?;
     let candidate_mixer_descriptor = manifest_resource(&candidate_manifest, &tx.mixer_id)?;
-    let candidate_track_descriptor = manifest_resource(&candidate_manifest, &tx.track_id)?;
     if previous_mixer_descriptor.role() != ResourceRole::Mixer
         || candidate_mixer_descriptor.role() != ResourceRole::Mixer
-        || candidate_track_descriptor.role() != ResourceRole::Track
         || previous_mixer_descriptor.path() != tx.previous_mixer.path
         || previous_mixer_descriptor.byte_length() != previous_mixer.len() as u64
         || previous_mixer_descriptor.sha256() != hex_digest(digest(&previous_mixer))
         || candidate_mixer_descriptor.path() != tx.mixer.path
         || candidate_mixer_descriptor.byte_length() != mixer.len() as u64
         || candidate_mixer_descriptor.sha256() != hex_digest(digest(&mixer))
-        || candidate_track_descriptor.path() != tx.track.path
-        || candidate_track_descriptor.byte_length() != track.len() as u64
-        || candidate_track_descriptor.sha256() != hex_digest(digest(&track))
     {
         return Err(failure(
             ProjectResourcePublicationErrorKind::Recovery,
             "audio-track descriptors do not match the transaction",
         ));
     }
-    let expected = candidate_audio_track_manifest(
-        &previous_project,
-        AudioTrackPublicationRequest {
-            expected_project_sha256: digest(&previous_project),
-            track_id: &tx.track_id,
-            track_bytes: &track,
-            mixer_id: &tx.mixer_id,
-            mixer_bytes: &mixer,
-        },
-        &tx.track.path,
-        tx.after_project_revision,
-    )?;
+    let expected = match tx.operation {
+        AudioTrackTransactionOperation::Publication => {
+            if previous_manifest.resources().iter().any(|descriptor| {
+                descriptor.id() == tx.track_id || descriptor.path() == tx.track.path
+            }) {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "previous project already declares the transaction audio track",
+                ));
+            }
+            let candidate_track_descriptor = manifest_resource(&candidate_manifest, &tx.track_id)?;
+            if candidate_track_descriptor.role() != ResourceRole::Track
+                || candidate_track_descriptor.path() != tx.track.path
+                || candidate_track_descriptor.byte_length() != track.len() as u64
+                || candidate_track_descriptor.sha256() != hex_digest(digest(&track))
+            {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "published audio-track descriptor does not match the transaction",
+                ));
+            }
+            candidate_audio_track_manifest(
+                &previous_project,
+                AudioTrackPublicationRequest {
+                    expected_project_sha256: digest(&previous_project),
+                    track_id: &tx.track_id,
+                    track_bytes: &track,
+                    mixer_id: &tx.mixer_id,
+                    mixer_bytes: &mixer,
+                },
+                &tx.track.path,
+                tx.after_project_revision,
+            )?
+        }
+        AudioTrackTransactionOperation::Removal => {
+            let previous_track_descriptor = manifest_resource(&previous_manifest, &tx.track_id)?;
+            if previous_track_descriptor.role() != ResourceRole::Track
+                || previous_track_descriptor.path() != tx.track.path
+                || previous_track_descriptor.byte_length() != track.len() as u64
+                || previous_track_descriptor.sha256() != hex_digest(digest(&track))
+                || candidate_manifest
+                    .resources()
+                    .iter()
+                    .any(|descriptor| descriptor.id() == tx.track_id)
+            {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "removed audio-track descriptor does not match the transaction",
+                ));
+            }
+            candidate_audio_track_removal_manifest(
+                &previous_project,
+                AudioTrackRemovalRequest {
+                    expected_project_sha256: digest(&previous_project),
+                    track_id: &tx.track_id,
+                    mixer_id: &tx.mixer_id,
+                    mixer_bytes: &mixer,
+                },
+                &tx.track.path,
+                tx.after_project_revision,
+            )?
+        }
+    };
     if expected != candidate_project {
         return Err(failure(
             ProjectResourcePublicationErrorKind::Recovery,
             "audio-track candidate manifest contains unrelated changes",
         ));
     }
-    validate_audio_track_document_identity(
-        AudioTrackPublicationRequest {
-            expected_project_sha256: digest(&previous_project),
-            track_id: &tx.track_id,
-            track_bytes: &track,
-            mixer_id: &tx.mixer_id,
-            mixer_bytes: &mixer,
-        },
-        previous_manifest.project_id(),
-        &previous_mixer,
-    )
+    match tx.operation {
+        AudioTrackTransactionOperation::Publication => validate_audio_track_document_identity(
+            AudioTrackPublicationRequest {
+                expected_project_sha256: digest(&previous_project),
+                track_id: &tx.track_id,
+                track_bytes: &track,
+                mixer_id: &tx.mixer_id,
+                mixer_bytes: &mixer,
+            },
+            previous_manifest.project_id(),
+            &previous_mixer,
+        ),
+        AudioTrackTransactionOperation::Removal => validate_audio_track_removal_documents(
+            AudioTrackRemovalRequest {
+                expected_project_sha256: digest(&previous_project),
+                track_id: &tx.track_id,
+                mixer_id: &tx.mixer_id,
+                mixer_bytes: &mixer,
+            },
+            &track,
+            &previous_mixer,
+        ),
+    }
 }
 
 fn read_audio_track_transaction(
@@ -1798,7 +2480,14 @@ fn read_audio_track_transaction(
         || intent.format_version != 1
         || !intent.extensions.is_empty()
         || intent.id != expected_id
-        || tx.format != "hyper-audio-track-publication-transaction"
+        || match tx.operation {
+            AudioTrackTransactionOperation::Publication => {
+                tx.format != "hyper-audio-track-publication-transaction"
+            }
+            AudioTrackTransactionOperation::Removal => {
+                tx.format != "hyper-audio-track-removal-transaction"
+            }
+        }
         || tx.format_version != 1
         || !tx.extensions.is_empty()
         || tx.id != expected_id
@@ -1896,6 +2585,22 @@ fn audio_track_outcome(
     })
 }
 
+fn audio_track_removal_outcome(
+    tx: &AudioTrackTransactionRecord,
+) -> Result<AudioTrackRemovalOutcome, ProjectResourcePublicationError> {
+    if tx.operation != AudioTrackTransactionOperation::Removal {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "audio-track transaction is not a removal",
+        ));
+    }
+    Ok(AudioTrackRemovalOutcome {
+        project_identity: decode_digest(&tx.after_project_sha256)?,
+        project_revision: tx.after_project_revision,
+        track_id: tx.track_id.clone(),
+    })
+}
+
 fn cleanup_audio_track_temporaries(
     root: &Dir,
     backups: &Dir,
@@ -1912,6 +2617,13 @@ fn cleanup_audio_track_temporaries(
             &parent,
             &format!(".audio-track-mixer-rollback-{}.json", tx.id),
             decode_digest(&tx.previous_mixer.sha256)?,
+        )?;
+    }
+    if let Ok(parent) = open_relative_parent(root, &tx.track.path) {
+        remove_optional_matching_file(
+            &parent,
+            &format!(".audio-track-rollback-{}.json", tx.id),
+            decode_digest(&tx.track.sha256)?,
         )?;
     }
     remove_optional_matching_file(
@@ -3162,6 +3874,16 @@ mod tests {
             }
         }
 
+        fn removal_request(&self) -> AudioTrackRemovalRequest<'_> {
+            let package = verify_project_package(&self.root).unwrap();
+            AudioTrackRemovalRequest {
+                expected_project_sha256: *package.manifest_sha256(),
+                track_id: NEW_TRACK_ID,
+                mixer_id: &self.mixer_id,
+                mixer_bytes: &self.original_mixer,
+            }
+        }
+
         fn transaction_count(&self) -> usize {
             fs::read_dir(self.root.join("backups"))
                 .unwrap()
@@ -3435,6 +4157,169 @@ mod tests {
             .unwrap();
         assert_eq!(track.role(), ResourceRole::Track);
         assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
+    fn removes_an_empty_audio_track_and_matching_mixer_channel_atomically() {
+        let fixture = AudioTrackFixture::new();
+        publish_audio_track(&fixture.root, fixture.request()).unwrap();
+
+        let outcome = remove_audio_track(&fixture.root, fixture.removal_request()).unwrap();
+
+        assert_eq!(outcome.project_revision(), 3);
+        assert_eq!(outcome.track_id(), NEW_TRACK_ID);
+        assert!(
+            !fixture
+                .root
+                .join(format!("tracks/{NEW_TRACK_ID}.json"))
+                .exists()
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("mixer/main.json")).unwrap(),
+            fixture.original_mixer
+        );
+        let package = verify_project_package(&fixture.root).unwrap();
+        assert_eq!(package.manifest().revision(), 3);
+        assert_eq!(package.manifest_sha256(), outcome.project_identity());
+        assert!(
+            package
+                .manifest()
+                .resources()
+                .iter()
+                .all(|descriptor| descriptor.id() != NEW_TRACK_ID)
+        );
+        assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
+    fn audio_track_removal_rejects_content_and_unrelated_mixer_changes() {
+        let fixture = AudioTrackFixture::new();
+        publish_audio_track(&fixture.root, fixture.request()).unwrap();
+        let track_path = fixture.root.join(format!("tracks/{NEW_TRACK_ID}.json"));
+        let mut populated: Value = serde_json::from_slice(&fs::read(&track_path).unwrap()).unwrap();
+        populated["clip_ids"] = json!(["018f47a2-6b2d-7c11-8a44-00112233446a"]);
+        let populated = serde_json_canonicalizer::to_vec(&populated).unwrap();
+        fs::write(&track_path, &populated).unwrap();
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(fixture.root.join(MANIFEST_NAME)).unwrap()).unwrap();
+        let descriptor = manifest["resources"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|descriptor| descriptor["id"].as_str() == Some(NEW_TRACK_ID))
+            .unwrap();
+        descriptor["byte_length"] = populated.len().into();
+        descriptor["sha256"] = hex_digest(digest(&populated)).into();
+        fs::write(
+            fixture.root.join(MANIFEST_NAME),
+            serde_json_canonicalizer::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = remove_audio_track(&fixture.root, fixture.removal_request()).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::InvalidResource
+        );
+        assert!(track_path.exists());
+        assert_eq!(
+            fs::read(fixture.root.join("mixer/main.json")).unwrap(),
+            fixture.mixer
+        );
+        assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
+    fn audio_track_removal_crashes_before_manifest_roll_back_both_resources() {
+        for crash_phase in [
+            AudioTrackPublicationPhase::Transaction,
+            AudioTrackPublicationPhase::Mixer,
+            AudioTrackPublicationPhase::Track,
+        ] {
+            let fixture = AudioTrackFixture::new();
+            publish_audio_track(&fixture.root, fixture.request()).unwrap();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = remove_audio_track_observed(
+                    &fixture.root,
+                    fixture.removal_request(),
+                    |phase, _| {
+                        assert_ne!(phase, crash_phase, "simulated process crash");
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+
+            let recovered = recover_audio_track_publications(&fixture.root).unwrap();
+
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(
+                recovered[0].disposition(),
+                AudioTrackPublicationRecoveryDisposition::RolledBack
+            );
+            assert_eq!(
+                fs::read(fixture.root.join(format!("tracks/{NEW_TRACK_ID}.json"))).unwrap(),
+                fixture.track
+            );
+            assert_eq!(
+                fs::read(fixture.root.join("mixer/main.json")).unwrap(),
+                fixture.mixer
+            );
+            assert_eq!(
+                verify_project_package(&fixture.root)
+                    .unwrap()
+                    .manifest()
+                    .revision(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn audio_track_removal_crash_after_manifest_recovers_as_committed() {
+        let fixture = AudioTrackFixture::new();
+        publish_audio_track(&fixture.root, fixture.request()).unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = remove_audio_track_observed(
+                &fixture.root,
+                fixture.removal_request(),
+                |phase, _| {
+                    assert_ne!(
+                        phase,
+                        AudioTrackPublicationPhase::Manifest,
+                        "simulated process crash"
+                    );
+                    Ok(())
+                },
+            );
+        }));
+        assert!(result.is_err());
+
+        let recovered = recover_audio_track_publications(&fixture.root).unwrap();
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].disposition(),
+            AudioTrackPublicationRecoveryDisposition::Committed
+        );
+        assert!(
+            !fixture
+                .root
+                .join(format!("tracks/{NEW_TRACK_ID}.json"))
+                .exists()
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("mixer/main.json")).unwrap(),
+            fixture.original_mixer
+        );
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            3
+        );
     }
 
     #[test]

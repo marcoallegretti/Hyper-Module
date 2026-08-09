@@ -31,11 +31,11 @@ pub use recording_import::{
 pub use resource_publication::{
     AudioTrackPublicationOutcome, AudioTrackPublicationRecovery,
     AudioTrackPublicationRecoveryDisposition, AudioTrackPublicationRequest,
-    ProjectResourcePublicationError, ProjectResourcePublicationErrorKind,
-    ProjectResourcePublicationOutcome, ProjectResourcePublicationRecovery,
-    ProjectResourcePublicationRecoveryDisposition, ProjectResourcePublicationRequest,
-    publish_audio_track, publish_project_resource, recover_audio_track_publications,
-    recover_project_resource_publications,
+    AudioTrackRemovalOutcome, AudioTrackRemovalRequest, ProjectResourcePublicationError,
+    ProjectResourcePublicationErrorKind, ProjectResourcePublicationOutcome,
+    ProjectResourcePublicationRecovery, ProjectResourcePublicationRecoveryDisposition,
+    ProjectResourcePublicationRequest, publish_audio_track, publish_project_resource,
+    recover_audio_track_publications, recover_project_resource_publications, remove_audio_track,
 };
 
 use core::error::Error;
