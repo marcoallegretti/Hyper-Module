@@ -1505,6 +1505,7 @@ pub fn serialize_arrangement_placement_activation(
         |document| {
             document.insert("enabled".to_owned(), active.into());
         },
+        |_| Ok(()),
     )
 }
 
@@ -1536,6 +1537,7 @@ pub fn serialize_arrangement_placement_move(
         |document| {
             document.insert("start_tick".to_owned(), start_tick.into());
         },
+        |_| Ok(()),
     )
 }
 
@@ -1559,7 +1561,6 @@ pub fn serialize_arrangement_placement_duration(
     duration_ticks: u64,
     limits: LoaderLimits,
 ) -> Result<Vec<u8>, ArrangementPlacementDurationSerializationError> {
-    validate_arrangement_placement_duration_execution(project, placement_id, duration_ticks)?;
     serialize_arrangement_placement_document_edit(
         project,
         source_arrangement,
@@ -1568,22 +1569,26 @@ pub fn serialize_arrangement_placement_duration(
         |document| {
             document.insert("duration_ticks".to_owned(), duration_ticks.into());
         },
+        |edited_project| {
+            validate_arrangement_placement_duration_execution(edited_project, placement_id)
+        },
     )
 }
 
 fn validate_arrangement_placement_duration_execution(
     project: &LoadedPlaybackProject,
     placement_id: &str,
-    duration_ticks: u64,
 ) -> Result<(), ArrangementPlacementDocumentSerializationError> {
-    let Some(placement) = project.arrangement.as_ref().and_then(|arrangement| {
-        arrangement
-            .placements
-            .iter()
-            .find(|placement| placement.id == placement_id)
-    }) else {
-        return Ok(());
-    };
+    let placement = project
+        .arrangement
+        .as_ref()
+        .and_then(|arrangement| {
+            arrangement
+                .placements
+                .iter()
+                .find(|placement| placement.id == placement_id)
+        })
+        .ok_or(ArrangementPlacementDocumentSerializationError::PlacementMissing)?;
     let clip = project
         .clips
         .iter()
@@ -1622,7 +1627,7 @@ fn validate_arrangement_placement_duration_execution(
             enabled: placement.enabled,
             start_tick: placement.start_tick,
             clip_start_tick: placement.clip_start_tick,
-            duration_ticks,
+            duration_ticks: placement.duration_ticks,
         },
     )
     .map(|_| ())
@@ -1635,6 +1640,9 @@ fn serialize_arrangement_placement_document_edit(
     placement_id: &str,
     limits: LoaderLimits,
     edit: impl FnOnce(&mut serde_json::Map<String, Value>),
+    validate_edit: impl FnOnce(
+        &LoadedPlaybackProject,
+    ) -> Result<(), ArrangementPlacementDocumentSerializationError>,
 ) -> Result<Vec<u8>, ArrangementPlacementDocumentSerializationError> {
     let current = project
         .arrangement
@@ -1704,6 +1712,7 @@ fn serialize_arrangement_placement_document_edit(
     edited_project.arrangement = Some(edited);
     validate_loaded_identities(&edited_project)
         .map_err(ArrangementPlacementDocumentSerializationError::Source)?;
+    validate_edit(&edited_project)?;
     Ok(output)
 }
 
@@ -5643,22 +5652,52 @@ mod tests {
         .unwrap();
         let placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
 
-        for duration_ticks in [0, 5] {
-            let error = serialize_arrangement_placement_duration(
+        let mut stale: Value = serde_json::from_slice(&source).unwrap();
+        stale["enabled"] = false.into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_duration(
+                &loaded,
+                &stale,
+                placement_id,
+                0,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementDurationSerializationError::SourceArrangementMismatch)
+        ));
+        assert!(matches!(
+            serialize_arrangement_placement_duration(
+                &loaded,
+                &source,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                0,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementDurationSerializationError::PlacementMissing)
+        ));
+
+        assert!(matches!(
+            serialize_arrangement_placement_duration(
                 &loaded,
                 &source,
                 placement_id,
-                duration_ticks,
+                0,
                 LoaderLimits::VERSION_1,
-            )
-            .unwrap_err();
-            assert!(matches!(
-                error,
-                ArrangementPlacementDurationSerializationError::Compilation(
-                    CompileError::InvalidPlacement
-                )
-            ));
-        }
+            ),
+            Err(ArrangementPlacementDurationSerializationError::Source(_))
+        ));
+        assert!(matches!(
+            serialize_arrangement_placement_duration(
+                &loaded,
+                &source,
+                placement_id,
+                5,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementDurationSerializationError::Compilation(
+                CompileError::InvalidPlacement
+            ))
+        ));
 
         let mut looping_clip: Value = serde_json::from_slice(CLIP).unwrap();
         looping_clip["loop"]["enabled"] = true.into();
