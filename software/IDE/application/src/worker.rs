@@ -22,19 +22,19 @@ use super::{
     DesktopIdeApplication, DesktopIdePendingClose, DesktopIdePendingSaveClose,
     DesktopPlaybackRecovery, IdeApplicationConfig, IdeArrangementLocateError,
     IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
-    IdeAudioPreviewError, IdeAudioTrackAdditionError, IdeAudioTrackEditError, IdeCloseOutcome,
-    IdeInputDiscoveryError, IdeInputSelection, IdeInputSelectionError, IdeLoudnessCommand,
-    IdeLoudnessCommandError, IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand,
-    IdeMixerCommandError, IdeMixerMainState, IdeMonitoringCommand, IdeMonitoringCommandError,
-    IdeMonitoringState, IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection,
-    IdeOutputSelectionError, IdeOutputTestError, IdeOutputTestSnapshot, IdeOutputTestStartOutcome,
-    IdeOutputTestStopOutcome, IdePendingCloseWait, IdePendingOutputTestShutdown,
-    IdePendingOutputTestShutdownWait, IdePendingSaveCloseWait, IdeProjectOpenError,
-    IdeProjectSaveError, IdeRecordingAbortError, IdeRecordingAbortOutcome, IdeRecordingError,
-    IdeRecordingImportOutcome, IdeRecordingObservation, IdeSaveCloseOutcome, IdeSceneAvailability,
-    IdeTransportSeekError, InputInventoryError, LocateState, OutputInventoryError,
-    OutputStreamSnapshot, OutputStreamState, OutputTestingDesktopIdeApplication,
-    RunningDesktopIdeApplication,
+    IdeAudioPreviewError, IdeAudioTrackAdditionError, IdeAudioTrackEditError,
+    IdeAudioTrackRemovalError, IdeCloseOutcome, IdeInputDiscoveryError, IdeInputSelection,
+    IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError, IdeMixerChannelKind,
+    IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError, IdeMixerMainState,
+    IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure,
+    IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError, IdeOutputTestError,
+    IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
+    IdePendingCloseWait, IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait,
+    IdePendingSaveCloseWait, IdeProjectOpenError, IdeProjectSaveError, IdeRecordingAbortError,
+    IdeRecordingAbortOutcome, IdeRecordingError, IdeRecordingImportOutcome,
+    IdeRecordingObservation, IdeSaveCloseOutcome, IdeSceneAvailability, IdeTransportSeekError,
+    InputInventoryError, LocateState, OutputInventoryError, OutputStreamSnapshot,
+    OutputStreamState, OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -119,6 +119,7 @@ pub enum IdeWorkerCommandKind {
     Monitoring,
     SaveProject,
     AddAudioTrack,
+    RemoveAudioTrack,
     RenameAudioTrack,
     SetAudioTrackActive,
     StartRecording,
@@ -165,6 +166,9 @@ pub enum IdeWorkerCommand {
     SaveProject,
     AddAudioTrack {
         name: String,
+    },
+    RemoveAudioTrack {
+        track_id: String,
     },
     RenameAudioTrack {
         track_id: String,
@@ -213,6 +217,7 @@ impl IdeWorkerCommand {
             Self::Monitoring(_) => IdeWorkerCommandKind::Monitoring,
             Self::SaveProject => IdeWorkerCommandKind::SaveProject,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
+            Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
             Self::RenameAudioTrack { .. } => IdeWorkerCommandKind::RenameAudioTrack,
             Self::SetAudioTrackActive { .. } => IdeWorkerCommandKind::SetAudioTrackActive,
             Self::StartRecording { .. } => IdeWorkerCommandKind::StartRecording,
@@ -709,6 +714,7 @@ pub enum IdeWorkerCommandFailure {
     Monitoring(IdeMonitoringCommandError),
     ProjectSave(IdeProjectSaveError),
     AudioTrackAddition(Box<super::IdeAudioTrackAdditionError>),
+    AudioTrackRemoval(Box<super::IdeAudioTrackRemovalError>),
     AudioTrackRename(Box<super::IdeAudioTrackEditError>),
     AudioTrackActivation(Box<super::IdeAudioTrackEditError>),
     Recording(IdeRecordingError),
@@ -738,6 +744,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::Monitoring(source) => source.fmt(formatter),
             Self::ProjectSave(source) => source.fmt(formatter),
             Self::AudioTrackAddition(source) => source.fmt(formatter),
+            Self::AudioTrackRemoval(source) => source.fmt(formatter),
             Self::AudioTrackRename(source) | Self::AudioTrackActivation(source) => {
                 source.fmt(formatter)
             }
@@ -776,6 +783,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::Monitoring(source) => Some(source),
             Self::ProjectSave(source) => Some(source),
             Self::AudioTrackAddition(source) => Some(source),
+            Self::AudioTrackRemoval(source) => Some(source),
             Self::AudioTrackRename(source) | Self::AudioTrackActivation(source) => Some(source),
             Self::Recording(source) => Some(source),
             Self::AudioPreview(source) => Some(source),
@@ -814,6 +822,9 @@ pub enum IdeWorkerEvent {
     AudioTrackAdded {
         revision: u64,
     },
+    AudioTrackRemoved {
+        revision: u64,
+    },
     AudioTrackRenamed {
         revision: u64,
         changed: bool,
@@ -833,6 +844,7 @@ pub enum IdeWorkerEvent {
     AudioPreviewControlApplied(IdeAudioPreviewControlCommand),
     Saving,
     AudioTrackAdding,
+    AudioTrackRemoving,
     AudioTrackRenaming,
     AudioTrackActivationChanging {
         active: bool,
@@ -1159,6 +1171,7 @@ enum WorkerState {
 enum ProjectMutation {
     SaveMixer,
     AddAudioTrack { name: String },
+    RemoveAudioTrack { track_id: String },
     RenameAudioTrack { track_id: String, name: String },
     SetAudioTrackActive { track_id: String, active: bool },
 }
@@ -1168,6 +1181,7 @@ impl ProjectMutation {
         match self {
             Self::SaveMixer => IdeWorkerCommandKind::SaveProject,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
+            Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
             Self::RenameAudioTrack { .. } => IdeWorkerCommandKind::RenameAudioTrack,
             Self::SetAudioTrackActive { .. } => IdeWorkerCommandKind::SetAudioTrackActive,
         }
@@ -1177,6 +1191,7 @@ impl ProjectMutation {
         match self {
             Self::SaveMixer => IdeWorkerEvent::Saving,
             Self::AddAudioTrack { .. } => IdeWorkerEvent::AudioTrackAdding,
+            Self::RemoveAudioTrack { .. } => IdeWorkerEvent::AudioTrackRemoving,
             Self::RenameAudioTrack { .. } => IdeWorkerEvent::AudioTrackRenaming,
             Self::SetAudioTrackActive { active, .. } => {
                 IdeWorkerEvent::AudioTrackActivationChanging { active: *active }
@@ -1370,6 +1385,7 @@ fn process_command(
         IdeWorkerCommand::Monitoring(command) => process_monitoring_command(state, command, events),
         command @ (IdeWorkerCommand::SaveProject
         | IdeWorkerCommand::AddAudioTrack { .. }
+        | IdeWorkerCommand::RemoveAudioTrack { .. }
         | IdeWorkerCommand::RenameAudioTrack { .. }
         | IdeWorkerCommand::SetAudioTrackActive { .. }) => {
             process_project_mutation_command(state, command, events)
@@ -1449,6 +1465,9 @@ fn process_project_mutation_command(
     match command {
         IdeWorkerCommand::SaveProject => save_project(state, events),
         IdeWorkerCommand::AddAudioTrack { name } => add_audio_track(state, events, &name),
+        IdeWorkerCommand::RemoveAudioTrack { track_id } => {
+            remove_audio_track(state, events, &track_id)
+        }
         IdeWorkerCommand::RenameAudioTrack { track_id, name } => {
             rename_audio_track(state, events, &track_id, &name)
         }
@@ -2435,6 +2454,40 @@ fn add_audio_track(
     )
 }
 
+fn remove_audio_track(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    track_id: &str,
+) -> bool {
+    if track_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RemoveAudioTrack,
+            IdeWorkerCommandFailure::AudioTrackRemoval(Box::new(
+                IdeAudioTrackRemovalError::InvalidTrackIdentity,
+            )),
+        );
+    }
+    let mut owned_track_id = String::new();
+    if owned_track_id.try_reserve_exact(track_id.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RemoveAudioTrack,
+            IdeWorkerCommandFailure::AudioTrackRemoval(Box::new(
+                IdeAudioTrackRemovalError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_track_id.push_str(track_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::RemoveAudioTrack {
+            track_id: owned_track_id,
+        },
+    )
+}
+
 fn rename_audio_track(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -2593,6 +2646,9 @@ fn project_mutation_save_failure(
         ProjectMutation::AddAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackAddition(
             Box::new(IdeAudioTrackAdditionError::MixerSave(Box::new(reason))),
         ),
+        ProjectMutation::RemoveAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackRemoval(
+            Box::new(IdeAudioTrackRemovalError::MixerSave(Box::new(reason))),
+        ),
         ProjectMutation::RenameAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackRename(
             Box::new(IdeAudioTrackEditError::MixerSave(Box::new(reason))),
         ),
@@ -2671,6 +2727,9 @@ fn project_mutation_native_close_failure(
         ProjectMutation::AddAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackAddition(
             Box::new(IdeAudioTrackAdditionError::NativeClose(failure)),
         ),
+        ProjectMutation::RemoveAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackRemoval(
+            Box::new(IdeAudioTrackRemovalError::NativeClose(failure)),
+        ),
         ProjectMutation::RenameAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackRename(
             Box::new(IdeAudioTrackEditError::NativeClose(failure)),
         ),
@@ -2687,6 +2746,9 @@ enum ProjectMutationAttempt {
     AddAudioTrack(
         Result<hyper_storage_engine::AudioTrackPublicationOutcome, IdeAudioTrackAdditionError>,
     ),
+    RemoveAudioTrack(
+        Result<hyper_storage_engine::AudioTrackRemovalOutcome, IdeAudioTrackRemovalError>,
+    ),
     RenameAudioTrack(
         Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAudioTrackEditError>,
     ),
@@ -2697,6 +2759,10 @@ enum ProjectMutationAttempt {
     },
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "all mutation completion events remain exhaustively paired with reopen publication"
+)]
 fn complete_project_mutation(
     state: &mut WorkerState,
     application: DesktopIdeApplication,
@@ -2753,6 +2819,17 @@ fn complete_project_mutation(
                     events,
                     IdeWorkerCommandKind::AddAudioTrack,
                     IdeWorkerCommandFailure::AudioTrackAddition(Box::new(reason)),
+                ),
+                ProjectMutationAttempt::RemoveAudioTrack(Ok(outcome)) => send_event(
+                    events,
+                    IdeWorkerEvent::AudioTrackRemoved {
+                        revision: outcome.project_revision(),
+                    },
+                ),
+                ProjectMutationAttempt::RemoveAudioTrack(Err(reason)) => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::RemoveAudioTrack,
+                    IdeWorkerCommandFailure::AudioTrackRemoval(Box::new(reason)),
                 ),
                 ProjectMutationAttempt::RenameAudioTrack(Ok(outcome)) => send_event(
                     events,
@@ -2834,6 +2911,21 @@ fn attempt_project_mutation(
                 })
             })
         }
+        ProjectMutation::RemoveAudioTrack { track_id } => {
+            ProjectMutationAttempt::RemoveAudioTrack(if let Some(failure) = native_failure {
+                Err(IdeAudioTrackRemovalError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_audio_track_removal(
+                    application,
+                    recovery,
+                    &track_id,
+                )
+                .and_then(|plan| {
+                    plan.publish()
+                        .map_err(|source| IdeAudioTrackRemovalError::Publication(Box::new(source)))
+                })
+            })
+        }
         ProjectMutation::RenameAudioTrack { track_id, name } => {
             ProjectMutationAttempt::RenameAudioTrack(if let Some(failure) = native_failure {
                 Err(IdeAudioTrackEditError::NativeClose(failure))
@@ -2872,6 +2964,10 @@ fn attempt_project_mutation(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "every mutation outcome retains its command-specific recovery evidence"
+)]
 fn project_mutation_reopen_failure(
     attempt: ProjectMutationAttempt,
     reopen: IdeProjectOpenError,
@@ -2928,6 +3024,38 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::AddAudioTrack(Err(preparation)) => {
             IdeWorkerCommandFailure::AudioTrackAddition(Box::new(
                 IdeAudioTrackAdditionError::ReopenAfterPreparation {
+                    preparation: Box::new(preparation),
+                    reopen: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::RemoveAudioTrack(Ok(outcome)) => {
+            IdeWorkerCommandFailure::AudioTrackRemoval(Box::new(
+                IdeAudioTrackRemovalError::ReopenAfterPublication {
+                    outcome,
+                    source: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::RemoveAudioTrack(Err(IdeAudioTrackRemovalError::Publication(
+            publication,
+        ))) => IdeWorkerCommandFailure::AudioTrackRemoval(Box::new(
+            IdeAudioTrackRemovalError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::RemoveAudioTrack(Err(IdeAudioTrackRemovalError::NativeClose(
+            close,
+        ))) => IdeWorkerCommandFailure::AudioTrackRemoval(Box::new(
+            IdeAudioTrackRemovalError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::RemoveAudioTrack(Err(preparation)) => {
+            IdeWorkerCommandFailure::AudioTrackRemoval(Box::new(
+                IdeAudioTrackRemovalError::ReopenAfterPreparation {
                     preparation: Box::new(preparation),
                     reopen: Box::new(reopen),
                 },
@@ -4325,6 +4453,56 @@ mod tests {
                 command: IdeWorkerCommandKind::AddAudioTrack,
                 reason: IdeWorkerCommandFailure::AudioTrackAddition(reason),
             } if matches!(reason.as_ref(), IdeAudioTrackAdditionError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn audio_track_removal_validates_identity_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::RemoveAudioTrack {
+                track_id: String::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RemoveAudioTrack,
+                reason: IdeWorkerCommandFailure::AudioTrackRemoval(reason),
+            } if matches!(reason.as_ref(), IdeAudioTrackRemovalError::InvalidTrackIdentity)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::RemoveAudioTrack {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
+            })
+            .unwrap();
+
+        assert!(matches!(recv(&worker), IdeWorkerEvent::AudioTrackRemoving));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RemoveAudioTrack,
+                reason: IdeWorkerCommandFailure::AudioTrackRemoval(reason),
+            } if matches!(reason.as_ref(), IdeAudioTrackRemovalError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);

@@ -11,6 +11,7 @@ export enum AppMode {
     stopping-output-test,
     running,
     adding-track,
+    removing-track,
     renaming-track,
     changing-track-activation,
     preparing-preview,
@@ -44,6 +45,7 @@ export struct MixerChannelRow {
     solo: bool,
     solo-available: bool,
     renameable: bool,
+    removable: bool,
     active: bool,
     activation-toggleable: bool,
 }
@@ -114,6 +116,7 @@ export global IdeActions {
     callback mixer-send-enabled(int);
     callback save-project();
     callback add-audio-track(string);
+    callback remove-audio-track(int);
     callback rename-audio-track(int, string);
     callback set-audio-track-active(int, bool);
     callback start-recording();
@@ -227,6 +230,9 @@ export component MainWindow inherits Window {
     in-out property <int> rename-track-index: -1;
     in-out property <string> rename-track-original-name: "";
     in-out property <string> rename-track-name: "";
+    in-out property <bool> remove-track-visible: false;
+    in-out property <int> remove-track-index: -1;
+    in-out property <string> remove-track-name: "";
     in-out property <bool> mixer-sends-visible: false;
     in-out property <bool> takes-visible: false;
     in-out property <bool> arrangement-visible: false;
@@ -335,6 +341,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.opening ? "◌  OPENING"
                         : root.app-mode == AppMode.saving ? "◌  SAVING"
                         : root.app-mode == AppMode.adding-track ? "◌  ADDING TRACK"
+                        : root.app-mode == AppMode.removing-track ? "◌  REMOVING TRACK"
                         : root.app-mode == AppMode.renaming-track ? "◌  RENAMING TRACK"
                         : root.app-mode == AppMode.changing-track-activation ? "◌  UPDATING TRACK"
                         : root.app-mode == AppMode.selecting ? "◌  SELECTING"
@@ -801,7 +808,31 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && root.rename-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && root.remove-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.loudness-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 14px;
+                        Text { text: "REMOVE EMPTY AUDIO TRACK"; color: #ff9d76; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.remove-track-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                        Rectangle { height: 1px; background: #27313d; }
+                        Text { text: "This cannot be undone. Removal is accepted only when no clips, child tracks, scenes, arrangement placements, control mappings, recordings, or mixer routes reference this track, and while the project contains no automation."; color: #aebccc; font-size: 11px; wrap: word-wrap; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.remove-track-visible = false; } }
+                            Button {
+                                horizontal-stretch: 1;
+                                text: root.app-mode == AppMode.removing-track ? "Removing track..." : "Remove empty track";
+                                enabled: root.app-mode == AppMode.running && root.remove-track-index >= 0;
+                                clicked => { IdeActions.remove-audio-track(root.remove-track-index); }
+                            }
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                    }
+                }
+
+                if root.mixer-visible && root.rename-track-visible && !root.remove-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -843,7 +874,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && !root.rename-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && !root.rename-track-visible && !root.remove-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -895,6 +926,15 @@ export component MainWindow inherits Window {
                                     accessible-label: (channel.active ? "Disable " : "Enable ") + channel.name;
                                     enabled: root.app-mode == AppMode.running && channel.activation-toggleable;
                                     clicked => { IdeActions.set-audio-track-active(channel.index, !channel.active); }
+                                }
+                                Button {
+                                    text: "Remove";
+                                    enabled: root.app-mode == AppMode.running && channel.removable;
+                                    clicked => {
+                                        root.remove-track-index = channel.index;
+                                        root.remove-track-name = channel.name;
+                                        root.remove-track-visible = true;
+                                    }
                                 }
                                 Slider {
                                     min-width: 28px;

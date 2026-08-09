@@ -13,6 +13,7 @@ use hyper_audio_engine::{
     LinearGain, LoudnessMeasurementCommand, Pan, ParameterError, StereoSineTestToneConfigError,
 };
 use hyper_audio_source::{DecodeError, DecodeLimits};
+use hyper_control_mappings::{ControlScope, ControlTarget};
 use hyper_desktop_audio::{
     CaptureStreamSnapshot, DesktopAudioPreviewCommandError, DesktopAudioPreviewControlError,
     DesktopAudioPreviewSnapshot, DesktopDirectControlError, DesktopInputConfig,
@@ -47,10 +48,11 @@ use hyper_mixer_runtime::{
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
 use hyper_playback_json::{
     AudioTrackAdditionSerializationError, AudioTrackDocumentSerializationError,
+    AudioTrackRemovalBlockers, AudioTrackRemovalSerializationError,
     AudioTrackRenameSerializationError, CompiledMixerTap, CompiledMixerTrackKind, LoaderLimits,
     MixerBaseState, MixerChannelBaseState, MixerSendBaseState, MixerStateSerializationError,
-    serialize_audio_track_activation, serialize_audio_track_addition, serialize_audio_track_rename,
-    serialize_mixer_base_state,
+    serialize_audio_track_activation, serialize_audio_track_addition,
+    serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
 };
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 pub use hyper_playback_session::{
@@ -59,9 +61,10 @@ pub use hyper_playback_session::{
 use hyper_project_loader::ProjectPlaybackLimits;
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
-    AudioTrackPublicationOutcome, AudioTrackPublicationRequest, ProjectResourcePublicationError,
-    ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest, StorageError,
-    publish_audio_track, publish_project_resource,
+    AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
+    AudioTrackRemovalRequest, ProjectResourcePublicationError, ProjectResourcePublicationOutcome,
+    ProjectResourcePublicationRequest, StorageError, publish_audio_track, publish_project_resource,
+    remove_audio_track,
 };
 
 mod recording;
@@ -1846,6 +1849,127 @@ impl Error for IdeAudioTrackAdditionError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IdeAudioTrackRemovalBlockers {
+    pub playback: AudioTrackRemovalBlockers,
+    pub control_mappings: usize,
+    pub recording_metadata: usize,
+    pub has_automation: bool,
+}
+
+impl IdeAudioTrackRemovalBlockers {
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.playback.is_empty()
+            && self.control_mappings == 0
+            && self.recording_metadata == 0
+            && !self.has_automation
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeAudioTrackRemovalError {
+    InvalidTrackIdentity,
+    MixerSave(Box<IdeProjectSaveError>),
+    Blocked(IdeAudioTrackRemovalBlockers),
+    Serialization(AudioTrackRemovalSerializationError),
+    CapacityUnavailable,
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeAudioTrackRemovalError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: AudioTrackRemovalOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<ProjectResourcePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl fmt::Display for IdeAudioTrackRemovalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTrackIdentity => {
+                formatter.write_str("audio-track removal requires a track identity")
+            }
+            Self::MixerSave(source) => write!(
+                formatter,
+                "live mixer state could not be preserved: {source}"
+            ),
+            Self::Blocked(blockers) => write!(
+                formatter,
+                "audio track cannot be removed while referenced (clips: {}, child tracks: {}, scene slots: {}, placements: {}, mappings: {}, recordings: {}, automation: {})",
+                blockers.playback.clip_references,
+                blockers.playback.child_tracks,
+                blockers.playback.scene_slots,
+                blockers.playback.arrangement_placements,
+                blockers.control_mappings,
+                blockers.recording_metadata,
+                blockers.has_automation
+            ),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("audio-track removal capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before removing the audio track: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before removing the audio track ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-track removal preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "audio track {} was removed in project revision {} but the project could not be reopened: {source}",
+                outcome.track_id(),
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-track removal failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAudioTrackRemovalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidTrackIdentity
+            | Self::Blocked(_)
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum IdeAudioTrackEditPublicationError {
     Mixer(Box<ProjectResourcePublicationError>),
@@ -2010,6 +2134,29 @@ struct IdeAudioTrackAdditionPlan {
     track_bytes: Vec<u8>,
     mixer_id: String,
     mixer_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct IdeAudioTrackRemovalPlan {
+    project_path: PathBuf,
+    expected_project_sha256: [u8; 32],
+    track_id: String,
+    mixer_id: String,
+    mixer_bytes: Vec<u8>,
+}
+
+impl IdeAudioTrackRemovalPlan {
+    fn publish(&self) -> Result<AudioTrackRemovalOutcome, ProjectResourcePublicationError> {
+        remove_audio_track(
+            &self.project_path,
+            AudioTrackRemovalRequest {
+                expected_project_sha256: self.expected_project_sha256,
+                track_id: &self.track_id,
+                mixer_id: &self.mixer_id,
+                mixer_bytes: &self.mixer_bytes,
+            },
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -2380,6 +2527,72 @@ impl RunningDesktopIdeApplication {
             expected_project_sha256: mixer_plan.expected_project_sha256,
             track_id,
             track_bytes,
+            mixer_id: mixer_plan.resource_id,
+            mixer_bytes,
+        })
+    }
+
+    fn prepare_audio_track_removal(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        track_id: &str,
+    ) -> Result<IdeAudioTrackRemovalPlan, IdeAudioTrackRemovalError> {
+        let mixer_plan = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAudioTrackRemovalError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAudioTrackRemovalError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let (project, _, _, media) = prepared.session().parts();
+        let playback = project.audio_track_removal_blockers(track_id);
+        let control_mappings = prepared.control_mapping().map_or(0, |mapping| {
+            mapping
+                .bindings()
+                .iter()
+                .filter(|binding| {
+                    matches!(binding.scope(), ControlScope::Track { track_id: id } if id == track_id)
+                        || matches!(binding.target(), ControlTarget::MixerChannel { track_id: id, .. } if id == track_id)
+                })
+                .count()
+        });
+        let recording_metadata = prepared
+            .recording_metadata()
+            .iter()
+            .filter(|metadata| metadata.track_id() == track_id)
+            .count();
+        let blockers = IdeAudioTrackRemovalBlockers {
+            playback,
+            control_mappings,
+            recording_metadata,
+            has_automation: prepared.session().has_automation(),
+        };
+        if !blockers.is_empty() {
+            return Err(IdeAudioTrackRemovalError::Blocked(blockers));
+        }
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeAudioTrackRemovalError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let mixer_bytes = serialize_audio_track_removal(
+            project,
+            &assets,
+            &mixer_plan.resource_bytes,
+            &mixer_plan.resource_id,
+            track_id,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeAudioTrackRemovalError::Serialization)?;
+        let mut owned_track_id = String::new();
+        owned_track_id
+            .try_reserve_exact(track_id.len())
+            .map_err(|_| IdeAudioTrackRemovalError::CapacityUnavailable)?;
+        owned_track_id.push_str(track_id);
+        Ok(IdeAudioTrackRemovalPlan {
+            project_path: mixer_plan.project_path,
+            expected_project_sha256: mixer_plan.expected_project_sha256,
+            track_id: owned_track_id,
             mixer_id: mixer_plan.resource_id,
             mixer_bytes,
         })

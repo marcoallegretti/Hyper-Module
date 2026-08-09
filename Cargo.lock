@@ -2136,6 +2136,7 @@ dependencies = [
  "chrono",
  "hyper-audio-engine",
  "hyper-audio-source",
+ "hyper-control-mappings",
  "hyper-desktop-audio",
  "hyper-media-cache",
  "hyper-mixer-runtime",

@@ -547,6 +547,74 @@ pub enum AudioTrackDocumentSerializationError {
     Serialization(serde_json::Error),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AudioTrackRemovalBlockers {
+    pub clip_references: usize,
+    pub child_tracks: usize,
+    pub scene_slots: usize,
+    pub arrangement_placements: usize,
+}
+
+impl AudioTrackRemovalBlockers {
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.clip_references == 0
+            && self.child_tracks == 0
+            && self.scene_slots == 0
+            && self.arrangement_placements == 0
+    }
+}
+
+#[derive(Debug)]
+pub enum AudioTrackRemovalSerializationError {
+    TrackMissing,
+    TrackNotAudio,
+    Blocked(AudioTrackRemovalBlockers),
+    MixerIdentityMismatch,
+    InvalidDocumentShape,
+    Source(LoadError),
+    Serialization(serde_json::Error),
+}
+
+impl fmt::Display for AudioTrackRemovalSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TrackMissing => formatter.write_str("the audio track does not exist"),
+            Self::TrackNotAudio => formatter.write_str("the selected track is not an audio track"),
+            Self::Blocked(blockers) => write!(
+                formatter,
+                "the audio track is still referenced by {} clips, {} child tracks, {} scene slots, and {} arrangement placements",
+                blockers.clip_references,
+                blockers.child_tracks,
+                blockers.scene_slots,
+                blockers.arrangement_placements
+            ),
+            Self::MixerIdentityMismatch => {
+                formatter.write_str("source mixer identity does not match the removal request")
+            }
+            Self::InvalidDocumentShape => {
+                formatter.write_str("source mixer has an invalid document shape")
+            }
+            Self::Source(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioTrackRemovalSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::TrackMissing
+            | Self::TrackNotAudio
+            | Self::Blocked(_)
+            | Self::MixerIdentityMismatch
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
 impl fmt::Display for AudioTrackRenameSerializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1139,6 +1207,77 @@ pub fn serialize_audio_track_addition(
     Ok(AudioTrackAdditionDocuments { track, mixer })
 }
 
+/// Builds the canonical mixer document produced by removing one empty,
+/// structurally unreferenced audio track.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the track is missing, is not audio, is
+/// referenced by another playback document, or the source mixer cannot be
+/// validated and reduced by exactly one matching channel.
+pub fn serialize_audio_track_removal(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_mixer: &[u8],
+    mixer_id: &str,
+    track_id: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AudioTrackRemovalSerializationError> {
+    let track_index = project
+        .track_index(track_id)
+        .ok_or(AudioTrackRemovalSerializationError::TrackMissing)?;
+    if !project.is_audio_track(track_id) {
+        return Err(AudioTrackRemovalSerializationError::TrackNotAudio);
+    }
+    let blockers = project.audio_track_removal_blockers(track_id);
+    if !blockers.is_empty() {
+        return Err(AudioTrackRemovalSerializationError::Blocked(blockers));
+    }
+    let loaded_mixer = project
+        .load_mixer(source_mixer, assets, limits)
+        .map_err(AudioTrackRemovalSerializationError::Source)?;
+    if loaded_mixer.id() != mixer_id {
+        return Err(AudioTrackRemovalSerializationError::MixerIdentityMismatch);
+    }
+    let channel_index = loaded_mixer
+        .channels
+        .iter()
+        .position(|channel| channel.track_id == track_id)
+        .ok_or(AudioTrackRemovalSerializationError::InvalidDocumentShape)?;
+    if loaded_mixer.channels.iter().any(|channel| {
+        channel.track_id != track_id
+            && matches!(&channel.destination, MixerDestination::Track(id) if id == track_id)
+    }) {
+        return Err(AudioTrackRemovalSerializationError::InvalidDocumentShape);
+    }
+    let mut reduced = project.clone();
+    reduced.tracks.remove(track_index);
+    validate_track_hierarchy(&reduced.tracks)
+        .map_err(AudioTrackRemovalSerializationError::Source)?;
+    validate_loaded_identities(&reduced).map_err(AudioTrackRemovalSerializationError::Source)?;
+
+    let mut mixer_value: Value = serde_json::from_slice(source_mixer)
+        .map_err(AudioTrackRemovalSerializationError::Serialization)?;
+    let channels = mixer_value
+        .get_mut("channels")
+        .and_then(Value::as_array_mut)
+        .ok_or(AudioTrackRemovalSerializationError::InvalidDocumentShape)?;
+    if channels
+        .get(channel_index)
+        .and_then(|channel| channel["track_id"].as_str())
+        != Some(track_id)
+    {
+        return Err(AudioTrackRemovalSerializationError::InvalidDocumentShape);
+    }
+    channels.remove(channel_index);
+    let mixer = serde_json_canonicalizer::to_vec(&mixer_value)
+        .map_err(AudioTrackRemovalSerializationError::Serialization)?;
+    reduced
+        .load_mixer(&mixer, assets, limits)
+        .map_err(AudioTrackRemovalSerializationError::Source)?;
+    Ok(mixer)
+}
+
 /// Replaces only the display name in one validated canonical audio-track
 /// document while preserving its identity, structure, clip ownership, and
 /// namespaced extensions.
@@ -1608,6 +1747,39 @@ impl LoadedPlaybackProject {
         self.tracks
             .iter()
             .any(|track| track.id == track_id && track.kind == TrackKind::Audio)
+    }
+
+    #[must_use]
+    pub fn audio_track_removal_blockers(&self, track_id: &str) -> AudioTrackRemovalBlockers {
+        let clip_references = self
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map_or(0, |track| track.clip_ids.len());
+        let child_tracks = self
+            .tracks
+            .iter()
+            .filter(|track| track.parent_track_id.as_deref() == Some(track_id))
+            .count();
+        let scene_slots = self
+            .scenes
+            .iter()
+            .flat_map(|scene| &scene.slots)
+            .filter(|slot| slot.track_id == track_id)
+            .count();
+        let arrangement_placements = self.arrangement.as_ref().map_or(0, |arrangement| {
+            arrangement
+                .placements
+                .iter()
+                .filter(|placement| placement.track_id == track_id)
+                .count()
+        });
+        AudioTrackRemovalBlockers {
+            clip_references,
+            child_tracks,
+            scene_slots,
+            arrangement_placements,
+        }
     }
 
     #[must_use]
@@ -4240,6 +4412,79 @@ mod tests {
             serde_json_canonicalizer::to_vec(&mixer).unwrap(),
             documents.mixer()
         );
+    }
+
+    #[test]
+    fn serializes_removal_of_only_one_empty_unreferenced_audio_track() {
+        let track = serde_json_canonicalizer::to_vec(&json!({
+            "format":"hyper-track", "format_version":1,
+            "id":"018f47a2-6b2d-7c11-8a44-001122334469", "project_id":PROJECT_ID,
+            "name":"Vocal", "kind":"audio", "order":0, "active":true,
+            "clip_ids":[], "extensions":{"org.example.track":{"kept":true}}
+        }))
+        .unwrap();
+        let tracks: [&[u8]; 1] = [&track];
+        let loaded = load(input(TIMELINE, &tracks, &[], None), LoaderLimits::VERSION_1).unwrap();
+        let mixer = serde_json_canonicalizer::to_vec(&json!({
+            "format":"hyper-mixer", "format_version":1,
+            "id":"018f47a2-6b2d-7c11-8a44-001122334468", "project_id":PROJECT_ID,
+            "channels":[{
+                "track_id":"018f47a2-6b2d-7c11-8a44-001122334469",
+                "gain_millionths":750_000, "pan_millionths":125_000,
+                "mute":true, "solo":false, "destination":{"kind":"main"}, "sends":[]
+            }],
+            "return_buses":[], "main":{"gain_millionths":900_000,"mute":false},
+            "cue":{"source":"solo","gain_millionths":500_000,"mute":true},
+            "extensions":{"org.example.mixer":{"kept":true}}
+        }))
+        .unwrap();
+
+        let reduced = serialize_audio_track_removal(
+            &loaded,
+            &[],
+            &mixer,
+            "018f47a2-6b2d-7c11-8a44-001122334468",
+            "018f47a2-6b2d-7c11-8a44-001122334469",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&reduced).unwrap();
+
+        assert_eq!(value["channels"], json!([]));
+        assert_eq!(value["main"]["gain_millionths"], 900_000);
+        assert_eq!(value["cue"]["mute"], true);
+        assert_eq!(value["extensions"]["org.example.mixer"]["kept"], true);
+        assert_eq!(serde_json_canonicalizer::to_vec(&value).unwrap(), reduced);
+    }
+
+    #[test]
+    fn audio_track_removal_reports_structural_references() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let error = serialize_audio_track_removal(
+            &loaded,
+            &asset_facts(),
+            MIXER,
+            "018f47a2-6b2d-7c11-8a44-001122334468",
+            "018f47a2-6b2d-7c11-8a44-001122334456",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AudioTrackRemovalSerializationError::Blocked(AudioTrackRemovalBlockers {
+                clip_references: 1,
+                arrangement_placements: 1,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -765,6 +765,36 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
             },
         );
     });
+
+    bind_audio_track_removal_callback(ui, worker);
+}
+
+fn bind_audio_track_removal_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_removal = Rc::clone(worker);
+    actions.on_remove_audio_track(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let Ok((_, row)) =
+            validate_mixer_channel(ui.get_app_mode(), index, &ui.get_mixer_channels())
+        else {
+            ui.set_error_text("The selected audio track is no longer available".into());
+            return;
+        };
+        if !row.removable {
+            ui.set_error_text("Only audio tracks can be removed".into());
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_removal,
+            IdeWorkerCommand::RemoveAudioTrack {
+                track_id: row.track_id.to_string(),
+            },
+        );
+    });
 }
 
 fn bind_loudness_callbacks(ui: &MainWindow, worker: &WorkerCell) {
@@ -1105,6 +1135,9 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 IdeWorkerCommandKind::CreateProject => ui.set_app_mode(AppMode::Creating),
                 IdeWorkerCommandKind::SaveProject => ui.set_app_mode(AppMode::Saving),
                 IdeWorkerCommandKind::AddAudioTrack => ui.set_app_mode(AppMode::AddingTrack),
+                IdeWorkerCommandKind::RemoveAudioTrack => {
+                    ui.set_app_mode(AppMode::RemovingTrack);
+                }
                 IdeWorkerCommandKind::RenameAudioTrack => {
                     ui.set_app_mode(AppMode::RenamingTrack);
                 }
@@ -1166,6 +1199,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::AddAudioTrack => {
             "Saving mixer state, adding the audio track, and reopening project…"
         }
+        IdeWorkerCommandKind::RemoveAudioTrack => {
+            "Preserving mixer state, removing the empty audio track, and reopening project…"
+        }
         IdeWorkerCommandKind::RenameAudioTrack => {
             "Preserving mixer state, renaming the audio track, and reopening project…"
         }
@@ -1188,6 +1224,10 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the event dispatcher keeps exhaustive UI state transitions visible in one match"
+)]
 fn apply_event(
     ui: &MainWindow,
     output_routes: &OutputRoutes,
@@ -1259,6 +1299,9 @@ fn apply_event(
         event @ (IdeWorkerEvent::AudioTrackAdded { .. } | IdeWorkerEvent::AudioTrackAdding) => {
             apply_audio_track_event(ui, &event);
         }
+        event @ (IdeWorkerEvent::AudioTrackRemoved { .. } | IdeWorkerEvent::AudioTrackRemoving) => {
+            apply_audio_track_removal_event(ui, &event);
+        }
         event @ (IdeWorkerEvent::AudioTrackRenamed { .. } | IdeWorkerEvent::AudioTrackRenaming) => {
             apply_audio_track_rename_event(ui, &event);
         }
@@ -1326,6 +1369,25 @@ fn apply_audio_track_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_status_text("Waiting for native output before adding the audio track…".into());
         }
         _ => unreachable!("audio-track event dispatcher received another event"),
+    }
+}
+
+fn apply_audio_track_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioTrackRemoved { revision } => {
+            ui.set_remove_track_visible(false);
+            ui.set_remove_track_index(-1);
+            ui.set_remove_track_name(SharedString::default());
+            ui.set_status_text(
+                format!("Empty audio track removed in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioTrackRemoving => {
+            ui.set_app_mode(AppMode::RemovingTrack);
+            ui.set_status_text("Waiting for native output before removing the audio track…".into());
+        }
+        _ => unreachable!("audio-track removal event dispatcher received another event"),
     }
 }
 
@@ -2184,6 +2246,9 @@ fn reset_project(
     ui.set_new_track_visible(false);
     ui.set_new_track_name("Audio 2".into());
     ui.set_rename_track_visible(false);
+    ui.set_remove_track_visible(false);
+    ui.set_remove_track_index(-1);
+    ui.set_remove_track_name(SharedString::default());
     ui.set_rename_track_index(-1);
     ui.set_rename_track_original_name(SharedString::default());
     ui.set_rename_track_name(SharedString::default());
@@ -2256,6 +2321,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
         IdeWorkerCommandKind::SaveProject if current == AppMode::Saving => AppMode::Running,
         IdeWorkerCommandKind::AddAudioTrack if current == AppMode::AddingTrack => AppMode::Running,
+        IdeWorkerCommandKind::RemoveAudioTrack if current == AppMode::RemovingTrack => {
+            AppMode::Running
+        }
         IdeWorkerCommandKind::RenameAudioTrack if current == AppMode::RenamingTrack => {
             AppMode::Running
         }
@@ -2509,6 +2577,7 @@ fn mixer_rows(channels: &[IdeMixerChannel]) -> Vec<MixerChannelRow> {
                 solo: state.is_some_and(|state| state.solo),
                 solo_available: channel.kind() == IdeMixerChannelKind::Audio,
                 renameable: channel.kind() == IdeMixerChannelKind::Audio,
+                removable: channel.kind() == IdeMixerChannelKind::Audio,
                 active: channel.active(),
                 activation_toggleable: channel.kind() == IdeMixerChannelKind::Audio,
             }
@@ -2589,6 +2658,7 @@ fn set_mixer(ui: &MainWindow, channels: &[IdeMixerChannel]) {
                     && actual.solo == state.is_some_and(|state| state.solo)
                     && actual.solo_available == (expected.kind() == IdeMixerChannelKind::Audio)
                     && actual.renameable == (expected.kind() == IdeMixerChannelKind::Audio)
+                    && actual.removable == (expected.kind() == IdeMixerChannelKind::Audio)
                     && actual.active == expected.active()
                     && actual.activation_toggleable
                         == (expected.kind() == IdeMixerChannelKind::Audio)
@@ -3013,6 +3083,7 @@ mod tests {
             solo: false,
             solo_available: true,
             renameable: true,
+            removable: true,
             active: true,
             activation_toggleable: true,
         }])));
@@ -3128,6 +3199,13 @@ mod tests {
         );
         assert_eq!(
             mode_after_failure(AppMode::AddingTrack, IdeWorkerCommandKind::AddAudioTrack,),
+            AppMode::Running
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::RemovingTrack,
+                IdeWorkerCommandKind::RemoveAudioTrack,
+            ),
             AppMode::Running
         );
         assert_eq!(

@@ -12,6 +12,7 @@ workspace = true
 chrono = "=0.4.45"
 hyper-audio-engine = { path = "../../../crates/audio-engine" }
 hyper-audio-source = { path = "../../../crates/audio-source" }
+hyper-control-mappings = { path = "../../../crates/control-mappings" }
 hyper-desktop-audio = { path = "../audio-backend" }
 hyper-media-cache = { path = "../../../crates/media-cache" }
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
