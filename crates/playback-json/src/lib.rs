@@ -15,6 +15,7 @@ use core::fmt;
 use std::collections::{BTreeSet, HashMap};
 
 use hyper_audio_engine::{ChannelParameters, LinearGain, Pan};
+use hyper_clip_engine::compile_native_clip_gain;
 use hyper_playback_compiler::graph::{
     ArrangementResource, AssetResource, ClipResource, CompiledSchedule, GraphError, GraphInput,
     GraphLimits, PlacementResource, TrackKind, TrackResource, compile_arrangement,
@@ -237,6 +238,30 @@ pub struct MediaAssetFact<'a> {
     pub id: &'a str,
     pub sample_rate_hz: u32,
     pub frame_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioClipGainValidationView<'a> {
+    asset_id: &'a str,
+    source_start_frame: usize,
+    source_frame_count: usize,
+}
+
+impl AudioClipGainValidationView<'_> {
+    #[must_use]
+    pub const fn asset_id(&self) -> &str {
+        self.asset_id
+    }
+
+    #[must_use]
+    pub const fn source_start_frame(&self) -> usize {
+        self.source_start_frame
+    }
+
+    #[must_use]
+    pub const fn source_frame_count(&self) -> usize {
+        self.source_frame_count
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1566,8 +1591,7 @@ pub fn serialize_audio_clip_gain(
 /// without consolidation.
 #[must_use]
 pub fn is_native_audio_clip_gain_decibels(gain_decibels: f64) -> bool {
-    let linear_gain = 10.0_f64.powf(gain_decibels / 20.0);
-    gain_decibels.is_finite() && linear_gain.is_finite() && linear_gain <= f64::from(2.0_f32)
+    gain_decibels.is_finite() && compile_native_clip_gain(gain_decibels).is_ok()
 }
 
 fn serialize_audio_track_document_edit(
@@ -2053,6 +2077,23 @@ impl LoadedPlaybackProject {
     #[must_use]
     pub fn clip_gain_decibels_at(&self, clip_index: usize) -> Option<f64> {
         self.clips.get(clip_index).map(|clip| clip.gain_decibels)
+    }
+
+    /// Returns the immutable decoded-media view used to validate a candidate
+    /// gain for one stable audio-clip identity.
+    #[must_use]
+    pub fn audio_clip_gain_validation_view(
+        &self,
+        clip_id: &str,
+    ) -> Option<AudioClipGainValidationView<'_>> {
+        self.clips
+            .iter()
+            .find(|clip| clip.id == clip_id)
+            .map(|clip| AudioClipGainValidationView {
+                asset_id: &clip.asset_id,
+                source_start_frame: clip.source_start_frame,
+                source_frame_count: clip.source_frame_count,
+            })
     }
 
     /// Returns a validated structural-track name by canonical project order.

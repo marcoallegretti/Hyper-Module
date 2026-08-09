@@ -2136,6 +2136,7 @@ dependencies = [
  "chrono",
  "hyper-audio-engine",
  "hyper-audio-source",
+ "hyper-clip-engine",
  "hyper-control-mappings",
  "hyper-desktop-audio",
  "hyper-media-cache",
@@ -2258,6 +2259,7 @@ version = "0.1.0"
 dependencies = [
  "hyper-audio-engine",
  "hyper-audio-source",
+ "hyper-clip-engine",
  "hyper-playback-compiler",
  "hyper-project-model",
  "hyper-strict-json",
@@ -2271,6 +2273,7 @@ name = "hyper-playback-session"
 version = "0.1.0"
 dependencies = [
  "hyper-audio-source",
+ "hyper-clip-engine",
  "hyper-media-cache",
  "hyper-playback-compiler",
  "hyper-playback-json",

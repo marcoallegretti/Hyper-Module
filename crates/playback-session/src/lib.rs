@@ -6,6 +6,7 @@ use core::fmt;
 use std::sync::Arc;
 
 use hyper_audio_source::DecodedAudio;
+use hyper_clip_engine::{ClipPlanError, FrameRange, validate_native_clip_gain};
 use hyper_media_cache::{
     CacheBuildError, CacheLimits, DecodedMediaCache, DecodedMediaCacheBuilder, PreparePlaybackError,
 };
@@ -90,6 +91,40 @@ pub struct PreparedPlaybackSession {
 pub enum PlaybackExtent {
     Bounded { end_frame: usize },
     Unbounded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioClipGainValidationError {
+    ClipMissing,
+    MediaMissing,
+    SourceRangeOverflow,
+    Native(ClipPlanError),
+}
+
+impl fmt::Display for AudioClipGainValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClipMissing => formatter.write_str("audio clip is missing from the project"),
+            Self::MediaMissing => {
+                formatter.write_str("audio clip references unavailable decoded media")
+            }
+            Self::SourceRangeOverflow => {
+                formatter.write_str("audio-clip source range arithmetic overflowed")
+            }
+            Self::Native(source) => {
+                write!(formatter, "native audio-clip gain is invalid: {source}")
+            }
+        }
+    }
+}
+
+impl Error for AudioClipGainValidationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Native(source) => Some(source),
+            Self::ClipMissing | Self::MediaMissing | Self::SourceRangeOverflow => None,
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -222,6 +257,43 @@ impl PreparedPlaybackSession {
     #[must_use]
     pub fn shared_arrangement(&self) -> Arc<PlaybackArrangement> {
         Arc::clone(&self.arrangement)
+    }
+
+    /// Validates a candidate constant gain against the exact immutable decoded
+    /// source view retained by this prepared project.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified rejection when the clip/media binding is missing,
+    /// its source range overflows, or native `f32` gain would be unsupported or
+    /// overflow any selected decoded sample.
+    pub fn validate_audio_clip_gain(
+        &self,
+        clip_id: &str,
+        gain_decibels: f64,
+    ) -> Result<(), AudioClipGainValidationError> {
+        let view = self
+            .project
+            .audio_clip_gain_validation_view(clip_id)
+            .ok_or(AudioClipGainValidationError::ClipMissing)?;
+        let source_end = view
+            .source_start_frame()
+            .checked_add(view.source_frame_count())
+            .ok_or(AudioClipGainValidationError::SourceRangeOverflow)?;
+        let source = self
+            .media
+            .decoded_audio(view.asset_id())
+            .ok_or(AudioClipGainValidationError::MediaMissing)?;
+        validate_native_clip_gain(
+            source,
+            FrameRange {
+                start: view.source_start_frame(),
+                end: source_end,
+            },
+            gain_decibels,
+        )
+        .map(|_| ())
+        .map_err(AudioClipGainValidationError::Native)
     }
 
     #[must_use]
@@ -721,6 +793,30 @@ mod tests {
             Some(project.project_id())
         );
         assert!(media.contains("018f47a2-6b2d-7c11-8a44-001122337504"));
+    }
+
+    #[test]
+    fn candidate_clip_gain_is_validated_against_exact_decoded_samples() {
+        let loud = DecodedPlaybackAsset::new(
+            "018f47a2-6b2d-7c11-8a44-001122337504".to_owned(),
+            DecodedAudio::from_mono(48_000, vec![f32::MAX; 100]).unwrap(),
+        );
+        let session = assemble_playback_session(input(vec![loud])).unwrap();
+
+        assert!(matches!(
+            session.validate_audio_clip_gain(
+                "018f47a2-6b2d-7c11-8a44-001122337503",
+                20.0 * 2.0_f64.log10(),
+            ),
+            Err(AudioClipGainValidationError::Native(
+                ClipPlanError::SampleGainOverflow
+            ))
+        ));
+        assert!(
+            session
+                .validate_audio_clip_gain("018f47a2-6b2d-7c11-8a44-001122337503", -6.0,)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -107,6 +107,58 @@ pub enum ClipPlanError {
     CapacityUnavailable,
 }
 
+/// Compiles a decibel value into the exact native `f32` clip-gain domain.
+///
+/// # Errors
+///
+/// Returns [`ClipPlanError::InvalidGain`] for a non-finite conversion and
+/// [`ClipPlanError::ConsolidationRequired`] when the native gain ceiling is
+/// exceeded.
+pub fn compile_native_clip_gain(gain_decibels: f64) -> Result<f32, ClipPlanError> {
+    let linear_gain_f64 = 10.0_f64.powf(gain_decibels / 20.0);
+    if !linear_gain_f64.is_finite() || linear_gain_f64 < 0.0 {
+        return Err(ClipPlanError::InvalidGain);
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let linear_gain = linear_gain_f64 as f32;
+    if !linear_gain.is_finite() || linear_gain > MAX_NATIVE_CLIP_GAIN {
+        return Err(ClipPlanError::ConsolidationRequired(
+            ConsolidationReason::ClipGainOutsideNativeRange,
+        ));
+    }
+    Ok(linear_gain)
+}
+
+/// Validates the exact decoded source view against a candidate native gain.
+///
+/// # Errors
+///
+/// Returns a classified clip-plan rejection for an invalid source range,
+/// unsupported gain, or a finite decoded sample that would overflow after
+/// native `f32` gain multiplication.
+pub fn validate_native_clip_gain(
+    source: &DecodedAudio,
+    source_range: FrameRange,
+    gain_decibels: f64,
+) -> Result<f32, ClipPlanError> {
+    if source_range.is_empty() || source_range.end > source.frame_count() {
+        return Err(ClipPlanError::InvalidSourceRange);
+    }
+    let linear_gain = compile_native_clip_gain(gain_decibels)?;
+    for channel in 0..source.channels() {
+        let plane = source
+            .plane(channel)
+            .ok_or(ClipPlanError::InvalidSourceRange)?;
+        if plane[source_range.start..source_range.end]
+            .iter()
+            .any(|sample| !(*sample * linear_gain).is_finite())
+        {
+            return Err(ClipPlanError::SampleGainOverflow);
+        }
+    }
+    Ok(linear_gain)
+}
+
 impl fmt::Display for ClipPlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -212,28 +264,7 @@ impl<'a> ClipRenderPlan<'a> {
             return Err(ClipPlanError::InvalidFades);
         }
 
-        let linear_gain_f64 = 10.0_f64.powf(spec.gain_decibels / 20.0);
-        if !linear_gain_f64.is_finite() || linear_gain_f64 < 0.0 {
-            return Err(ClipPlanError::InvalidGain);
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        let linear_gain = linear_gain_f64 as f32;
-        if !linear_gain.is_finite() || linear_gain > MAX_NATIVE_CLIP_GAIN {
-            return Err(ClipPlanError::ConsolidationRequired(
-                ConsolidationReason::ClipGainOutsideNativeRange,
-            ));
-        }
-        for channel in 0..source.channels() {
-            let plane = source
-                .plane(channel)
-                .ok_or(ClipPlanError::InvalidSourceRange)?;
-            if plane[spec.source.start..spec.source.end]
-                .iter()
-                .any(|sample| !(*sample * linear_gain).is_finite())
-            {
-                return Err(ClipPlanError::SampleGainOverflow);
-            }
-        }
+        let linear_gain = validate_native_clip_gain(source, spec.source, spec.gain_decibels)?;
 
         Ok(Self {
             source,

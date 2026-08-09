@@ -57,11 +57,11 @@ use hyper_playback_json::{
     serialize_audio_track_activation, serialize_audio_track_addition,
     serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
 };
-use hyper_playback_session::PlaybackSessionAssemblyLimits;
+use hyper_playback_session::{AudioClipGainValidationError, PlaybackSessionAssemblyLimits};
 pub use hyper_playback_session::{
     PlaybackArrangement as IdePlaybackArrangement, PlaybackExtent as IdePlaybackExtent,
 };
-use hyper_project_loader::ProjectPlaybackLimits;
+use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackLimits};
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
     AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
@@ -2317,6 +2317,7 @@ pub enum IdeAudioClipGainEditError {
     ClipResourceRoleMismatch,
     Storage(StorageError),
     Serialization(AudioClipGainSerializationError),
+    NativeValidation(AudioClipGainValidationError),
     CapacityUnavailable,
     Publication(Box<IdeAudioClipGainEditPublicationError>),
     NativeClose(IdeNativeCloseFailure),
@@ -2358,6 +2359,7 @@ impl fmt::Display for IdeAudioClipGainEditError {
             }
             Self::Storage(source) => source.fmt(formatter),
             Self::Serialization(source) => source.fmt(formatter),
+            Self::NativeValidation(source) => source.fmt(formatter),
             Self::CapacityUnavailable => {
                 formatter.write_str("audio-clip gain edit capacity is unavailable")
             }
@@ -2399,6 +2401,7 @@ impl Error for IdeAudioClipGainEditError {
             Self::MixerSave(source) => Some(source.as_ref()),
             Self::Storage(source) => Some(source),
             Self::Serialization(source) => Some(source),
+            Self::NativeValidation(source) => Some(source),
             Self::Publication(source) => Some(source.as_ref()),
             Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
@@ -2473,6 +2476,40 @@ struct IdeAudioClipGainEditPlan {
     mixer: IdeMixerSavePlan,
     clip_id: String,
     clip_bytes: Vec<u8>,
+}
+
+fn prepare_audio_clip_gain_resource(
+    prepared: &PreparedProjectPlayback,
+    clip_id: &str,
+    gain_decibels: f64,
+    limits: LoaderLimits,
+) -> Result<(String, Vec<u8>), IdeAudioClipGainEditError> {
+    let package = prepared.package();
+    let descriptor = package
+        .manifest()
+        .resources()
+        .iter()
+        .find(|descriptor| descriptor.id() == clip_id)
+        .ok_or(IdeAudioClipGainEditError::ClipResourceMissing)?;
+    if descriptor.role() != ResourceRole::Clip {
+        return Err(IdeAudioClipGainEditError::ClipResourceRoleMismatch);
+    }
+    let source = package
+        .read_resource(clip_id)
+        .map_err(IdeAudioClipGainEditError::Storage)?;
+    let (project, _, _, _) = prepared.session().parts();
+    let clip_bytes = serialize_audio_clip_gain(project, &source, clip_id, gain_decibels, limits)
+        .map_err(IdeAudioClipGainEditError::Serialization)?;
+    prepared
+        .session()
+        .validate_audio_clip_gain(clip_id, gain_decibels)
+        .map_err(IdeAudioClipGainEditError::NativeValidation)?;
+    let mut owned_clip_id = String::new();
+    owned_clip_id
+        .try_reserve_exact(clip_id.len())
+        .map_err(|_| IdeAudioClipGainEditError::CapacityUnavailable)?;
+    owned_clip_id.push_str(clip_id);
+    Ok((owned_clip_id, clip_bytes))
 }
 
 impl IdeAudioClipGainEditPlan {
@@ -3120,36 +3157,15 @@ impl RunningDesktopIdeApplication {
                 IdeProjectSaveError::ProjectSnapshotUnavailable,
             ))
         })?;
-        let package = prepared.package();
-        let descriptor = package
-            .manifest()
-            .resources()
-            .iter()
-            .find(|descriptor| descriptor.id() == clip_id)
-            .ok_or(IdeAudioClipGainEditError::ClipResourceMissing)?;
-        if descriptor.role() != ResourceRole::Clip {
-            return Err(IdeAudioClipGainEditError::ClipResourceRoleMismatch);
-        }
-        let source = package
-            .read_resource(clip_id)
-            .map_err(IdeAudioClipGainEditError::Storage)?;
-        let (project, _, _, _) = prepared.session().parts();
-        let clip_bytes = serialize_audio_clip_gain(
-            project,
-            &source,
+        let (clip_id, clip_bytes) = prepare_audio_clip_gain_resource(
+            prepared,
             clip_id,
             gain_decibels,
             application.config.project_limits.session.documents,
-        )
-        .map_err(IdeAudioClipGainEditError::Serialization)?;
-        let mut owned_clip_id = String::new();
-        owned_clip_id
-            .try_reserve_exact(clip_id.len())
-            .map_err(|_| IdeAudioClipGainEditError::CapacityUnavailable)?;
-        owned_clip_id.push_str(clip_id);
+        )?;
         Ok(IdeAudioClipGainEditPlan {
             mixer,
-            clip_id: owned_clip_id,
+            clip_id,
             clip_bytes,
         })
     }
@@ -4118,11 +4134,15 @@ mod tests {
     }
 
     impl ArrangementProjectFixture {
+        fn new() -> Self {
+            Self::with_audio(&arrangement_test_wav(&[0; 100]))
+        }
+
         #[allow(
             clippy::too_many_lines,
             reason = "one fixture keeps the complete verified arrangement package graph visible"
         )]
-        fn new() -> Self {
+        fn with_audio(audio: &[u8]) -> Self {
             let directory = TestDirectory::new();
             let resources = [
                 (
@@ -4218,8 +4238,7 @@ mod tests {
                 arrangement_test_write(&directory.0, path, &bytes);
                 descriptors.push(arrangement_test_descriptor(id, role, path, &bytes));
             }
-            let audio = arrangement_test_wav(&[0; 100]);
-            arrangement_test_write(&directory.0, "assets/samples/sample.wav", &audio);
+            arrangement_test_write(&directory.0, "assets/samples/sample.wav", audio);
             let manifest = json!({
                 "format":"hyper-project", "format_version":1,
                 "project_id":ARRANGEMENT_TEST_PROJECT_ID, "revision":1,
@@ -4236,7 +4255,7 @@ mod tests {
                 "assets":[{
                     "id":ARRANGEMENT_TEST_ASSET_ID, "role":"sample",
                     "path":"assets/samples/sample.wav", "media_type":"audio/wav",
-                    "byte_length":audio.len(), "sha256":arrangement_test_sha256(&audio),
+                    "byte_length":audio.len(), "sha256":arrangement_test_sha256(audio),
                     "extensions":{}
                 }],
                 "extensions":{}
@@ -4294,6 +4313,27 @@ mod tests {
         bytes.extend_from_slice(&96_000_u32.to_le_bytes());
         bytes.extend_from_slice(&2_u16.to_le_bytes());
         bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn arrangement_test_float_wav(samples: &[f32]) -> Vec<u8> {
+        let data_bytes = u32::try_from(samples.len() * 4).unwrap();
+        let mut bytes = Vec::with_capacity(44 + samples.len() * 4);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&3_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&48_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&192_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&4_u16.to_le_bytes());
+        bytes.extend_from_slice(&32_u16.to_le_bytes());
         bytes.extend_from_slice(b"data");
         bytes.extend_from_slice(&data_bytes.to_le_bytes());
         for sample in samples {
@@ -4973,6 +5013,46 @@ mod tests {
         .unwrap();
         assert!(!unchanged.changed());
         assert_eq!(unchanged.project_revision(), 3);
+    }
+
+    #[test]
+    fn audio_clip_gain_rejects_native_sample_overflow_before_publication() {
+        let fixture =
+            ArrangementProjectFixture::with_audio(&arrangement_test_float_wav(&[f32::MAX; 100]));
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let original_identity = *prepared.package().manifest_sha256();
+        let original_clip = prepared
+            .package()
+            .read_resource(ARRANGEMENT_TEST_CLIP_ID)
+            .unwrap();
+
+        assert!(matches!(
+            prepare_audio_clip_gain_resource(
+                &prepared,
+                ARRANGEMENT_TEST_CLIP_ID,
+                20.0 * 2.0_f64.log10(),
+                limits.session.documents,
+            ),
+            Err(IdeAudioClipGainEditError::NativeValidation(
+                AudioClipGainValidationError::Native(
+                    hyper_clip_engine::ClipPlanError::SampleGainOverflow
+                )
+            ))
+        ));
+        drop(prepared);
+
+        let verified = hyper_storage_engine::verify_project_package(&project_path).unwrap();
+        assert_eq!(verified.manifest().revision(), 1);
+        assert_eq!(verified.manifest_sha256(), &original_identity);
+        assert_eq!(
+            verified.read_resource(ARRANGEMENT_TEST_CLIP_ID).unwrap(),
+            original_clip
+        );
+        drop(verified);
+        assert!(hyper_project_loader::prepare_project_playback(&project_path, limits).is_ok());
     }
 
     #[test]
