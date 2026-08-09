@@ -532,17 +532,42 @@ pub enum AudioTrackAdditionSerializationError {
 
 #[derive(Debug)]
 pub enum AudioTrackRenameSerializationError {
+    InvalidTrackName,
+    Document(AudioTrackDocumentSerializationError),
+}
+
+#[derive(Debug)]
+pub enum AudioTrackDocumentSerializationError {
     Source(LoadError),
     NonCanonicalSource,
     TrackMissing,
     TrackNotAudio,
     SourceTrackMismatch,
-    InvalidTrackName,
     InvalidDocumentShape,
     Serialization(serde_json::Error),
 }
 
 impl fmt::Display for AudioTrackRenameSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTrackName => {
+                formatter.write_str("the audio-track name is outside the version-1 domain")
+            }
+            Self::Document(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioTrackRenameSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Document(source) => Some(source),
+            Self::InvalidTrackName => None,
+        }
+    }
+}
+
+impl fmt::Display for AudioTrackDocumentSerializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Source(source) => source.fmt(formatter),
@@ -557,9 +582,6 @@ impl fmt::Display for AudioTrackRenameSerializationError {
             }
             Self::SourceTrackMismatch => formatter
                 .write_str("source audio-track bytes do not match the loaded project structure"),
-            Self::InvalidTrackName => {
-                formatter.write_str("the audio-track name is outside the version-1 domain")
-            }
             Self::InvalidDocumentShape => {
                 formatter.write_str("source audio-track shape changed after typed validation")
             }
@@ -568,7 +590,7 @@ impl fmt::Display for AudioTrackRenameSerializationError {
     }
 }
 
-impl Error for AudioTrackRenameSerializationError {
+impl Error for AudioTrackDocumentSerializationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Source(source) => Some(source),
@@ -577,7 +599,6 @@ impl Error for AudioTrackRenameSerializationError {
             | Self::TrackMissing
             | Self::TrackNotAudio
             | Self::SourceTrackMismatch
-            | Self::InvalidTrackName
             | Self::InvalidDocumentShape => None,
         }
     }
@@ -1141,11 +1162,45 @@ pub fn serialize_audio_track_rename(
     {
         return Err(AudioTrackRenameSerializationError::InvalidTrackName);
     }
+    serialize_audio_track_document_edit(project, source_track, track_id, limits, |document| {
+        document.insert("name".to_owned(), track_name.into());
+    })
+    .map_err(AudioTrackRenameSerializationError::Document)
+}
+
+/// Replaces only the activation state in one validated canonical audio-track
+/// document while preserving its identity, structure, clip ownership, and
+/// namespaced extensions.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the selected track is absent or not
+/// audio, the supplied bytes disagree with the loaded project, or the resulting
+/// project structure fails validation.
+pub fn serialize_audio_track_activation(
+    project: &LoadedPlaybackProject,
+    source_track: &[u8],
+    track_id: &str,
+    active: bool,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AudioTrackDocumentSerializationError> {
+    serialize_audio_track_document_edit(project, source_track, track_id, limits, |document| {
+        document.insert("active".to_owned(), active.into());
+    })
+}
+
+fn serialize_audio_track_document_edit(
+    project: &LoadedPlaybackProject,
+    source_track: &[u8],
+    track_id: &str,
+    limits: LoaderLimits,
+    edit: impl FnOnce(&mut serde_json::Map<String, Value>),
+) -> Result<Vec<u8>, AudioTrackDocumentSerializationError> {
     let track_index = project
         .track_index(track_id)
-        .ok_or(AudioTrackRenameSerializationError::TrackMissing)?;
+        .ok_or(AudioTrackDocumentSerializationError::TrackMissing)?;
     if !project.is_audio_track(track_id) {
-        return Err(AudioTrackRenameSerializationError::TrackNotAudio);
+        return Err(AudioTrackDocumentSerializationError::TrackNotAudio);
     }
 
     let source = load_track(
@@ -1155,11 +1210,11 @@ pub fn serialize_audio_track_rename(
         limits.max_document_bytes,
         limits.max_track_clip_references,
     )
-    .map_err(AudioTrackRenameSerializationError::Source)?;
+    .map_err(AudioTrackDocumentSerializationError::Source)?;
     let current = project
         .tracks
         .get(track_index)
-        .ok_or(AudioTrackRenameSerializationError::TrackMissing)?;
+        .ok_or(AudioTrackDocumentSerializationError::TrackMissing)?;
     if source.id != current.id
         || source.name != current.name
         || source.kind != current.kind
@@ -1168,36 +1223,36 @@ pub fn serialize_audio_track_rename(
         || source.parent_track_id != current.parent_track_id
         || source.clip_ids != current.clip_ids
     {
-        return Err(AudioTrackRenameSerializationError::SourceTrackMismatch);
+        return Err(AudioTrackDocumentSerializationError::SourceTrackMismatch);
     }
 
     let mut value: Value = serde_json::from_slice(source_track)
-        .map_err(AudioTrackRenameSerializationError::Serialization)?;
+        .map_err(AudioTrackDocumentSerializationError::Serialization)?;
     let canonical_source = serde_json_canonicalizer::to_vec(&value)
-        .map_err(AudioTrackRenameSerializationError::Serialization)?;
+        .map_err(AudioTrackDocumentSerializationError::Serialization)?;
     if canonical_source != source_track {
-        return Err(AudioTrackRenameSerializationError::NonCanonicalSource);
+        return Err(AudioTrackDocumentSerializationError::NonCanonicalSource);
     }
-    value
+    let document = value
         .as_object_mut()
-        .ok_or(AudioTrackRenameSerializationError::InvalidDocumentShape)?
-        .insert("name".to_owned(), track_name.into());
+        .ok_or(AudioTrackDocumentSerializationError::InvalidDocumentShape)?;
+    edit(document);
     let output = serde_json_canonicalizer::to_vec(&value)
-        .map_err(AudioTrackRenameSerializationError::Serialization)?;
-    let renamed = load_track(
+        .map_err(AudioTrackDocumentSerializationError::Serialization)?;
+    let edited = load_track(
         &output,
         track_index,
         project.project_id(),
         limits.max_document_bytes,
         limits.max_track_clip_references,
     )
-    .map_err(AudioTrackRenameSerializationError::Source)?;
+    .map_err(AudioTrackDocumentSerializationError::Source)?;
     let mut renamed_project = project.clone();
-    renamed_project.tracks[track_index] = renamed;
+    renamed_project.tracks[track_index] = edited;
     validate_track_hierarchy(&renamed_project.tracks)
-        .map_err(AudioTrackRenameSerializationError::Source)?;
+        .map_err(AudioTrackDocumentSerializationError::Source)?;
     validate_loaded_identities(&renamed_project)
-        .map_err(AudioTrackRenameSerializationError::Source)?;
+        .map_err(AudioTrackDocumentSerializationError::Source)?;
     Ok(output)
 }
 
@@ -1537,6 +1592,15 @@ impl LoadedPlaybackProject {
             .iter()
             .find(|track| track.id == track_id)
             .map(|track| track.name.as_str())
+    }
+
+    /// Returns the validated structural activation state by stable identity.
+    #[must_use]
+    pub fn track_active(&self, track_id: &str) -> Option<bool> {
+        self.tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map(|track| track.active)
     }
 
     #[must_use]
@@ -4282,7 +4346,9 @@ mod tests {
                 "Vocal",
                 LoaderLimits::VERSION_1,
             ),
-            Err(AudioTrackRenameSerializationError::TrackMissing)
+            Err(AudioTrackRenameSerializationError::Document(
+                AudioTrackDocumentSerializationError::TrackMissing
+            ))
         ));
         assert!(matches!(
             serialize_audio_track_rename(
@@ -4306,7 +4372,9 @@ mod tests {
                 "Vocal",
                 LoaderLimits::VERSION_1,
             ),
-            Err(AudioTrackRenameSerializationError::SourceTrackMismatch)
+            Err(AudioTrackRenameSerializationError::Document(
+                AudioTrackDocumentSerializationError::SourceTrackMismatch
+            ))
         ));
 
         let mut non_audio: Value = serde_json::from_slice(TRACK).unwrap();
@@ -4328,7 +4396,9 @@ mod tests {
                 "MIDI",
                 LoaderLimits::VERSION_1,
             ),
-            Err(AudioTrackRenameSerializationError::TrackNotAudio)
+            Err(AudioTrackRenameSerializationError::Document(
+                AudioTrackDocumentSerializationError::TrackNotAudio
+            ))
         ));
     }
 
@@ -4354,7 +4424,9 @@ mod tests {
                 "Vocal",
                 LoaderLimits::VERSION_1,
             ),
-            Err(AudioTrackRenameSerializationError::NonCanonicalSource)
+            Err(AudioTrackRenameSerializationError::Document(
+                AudioTrackDocumentSerializationError::NonCanonicalSource
+            ))
         ));
         for invalid in [String::new(), "é".repeat(121)] {
             assert!(matches!(
@@ -4381,6 +4453,62 @@ mod tests {
         let value: Value = serde_json::from_slice(&renamed).unwrap();
 
         assert_eq!(value["name"].as_str(), Some(maximum.as_str()));
+    }
+
+    #[test]
+    fn audio_track_activation_changes_only_the_selected_canonical_field() {
+        let mut source: Value = serde_json::from_slice(TRACK).unwrap();
+        source["extensions"]["org.example.track"] = json!({"opaque": true});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [&source];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
+
+        let inactive = serialize_audio_track_activation(
+            &loaded,
+            &source,
+            track_id,
+            false,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut expected: Value = serde_json::from_slice(&source).unwrap();
+        expected["active"] = false.into();
+
+        assert_eq!(
+            inactive,
+            serde_json_canonicalizer::to_vec(&expected).unwrap()
+        );
+        assert_eq!(loaded.track_active(track_id), Some(true));
+        let mut mismatched: Value = serde_json::from_slice(&source).unwrap();
+        mismatched["name"] = "Different source".into();
+        let mismatched = serde_json_canonicalizer::to_vec(&mismatched).unwrap();
+        assert!(matches!(
+            serialize_audio_track_activation(
+                &loaded,
+                &mismatched,
+                track_id,
+                false,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioTrackDocumentSerializationError::SourceTrackMismatch)
+        ));
+        assert_eq!(
+            serialize_audio_track_activation(
+                &loaded,
+                &source,
+                track_id,
+                true,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap(),
+            source
+        );
     }
 
     #[test]
