@@ -1064,6 +1064,38 @@ fn bind_audio_clip_callback(
 ) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
+    let worker_for_activation = Rc::clone(worker);
+    let project_state_for_activation = Rc::clone(project_state);
+    actions.on_set_audio_clip_active(move |clip_id, active| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text("Audio-clip activation is not available in the current state".into());
+            return;
+        }
+        let clips = project_state_for_activation.audio_clips.borrow();
+        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+            ui.set_error_text("The selected audio clip is no longer available".into());
+            return;
+        };
+        if active == clip.active() {
+            ui.set_error_text("Audio-clip activation is no longer current".into());
+            return;
+        }
+        let owned_clip_id = clip.id().to_owned();
+        drop(clips);
+        submit_to_ui(
+            &ui,
+            &worker_for_activation,
+            IdeWorkerCommand::SetAudioClipActive {
+                clip_id: owned_clip_id,
+                active,
+            },
+        );
+    });
+
+    let weak = ui.as_weak();
     let worker_for_gain = Rc::clone(worker);
     let project_state_for_gain = Rc::clone(project_state);
     actions.on_set_audio_clip_gain(move |clip_id, value| {
@@ -1245,6 +1277,9 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 IdeWorkerCommandKind::SetArrangementPlacementActive => {
                     ui.set_app_mode(AppMode::ChangingArrangementActivation);
                 }
+                IdeWorkerCommandKind::SetAudioClipActive => {
+                    ui.set_app_mode(AppMode::ChangingClipActivation);
+                }
                 IdeWorkerCommandKind::SetAudioClipGain => {
                     ui.set_app_mode(AppMode::ChangingClipGain);
                 }
@@ -1314,6 +1349,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetArrangementPlacementActive => {
             "Preserving mixer state, updating the arrangement placement, and reopening project…"
+        }
+        IdeWorkerCommandKind::SetAudioClipActive => {
+            "Preserving mixer state, updating audio-clip activation, and reopening project…"
         }
         IdeWorkerCommandKind::SetAudioClipGain => {
             "Preserving mixer state, updating the audio clip, and reopening project…"
@@ -1422,6 +1460,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementPlacementActivationChanged { .. }
         | IdeWorkerEvent::ArrangementPlacementActivationChanging { .. }) => {
             apply_arrangement_placement_activation_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioClipActivationChanged { .. }
+        | IdeWorkerEvent::AudioClipActivationChanging { .. }) => {
+            apply_audio_clip_activation_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipGainChanged { .. }
         | IdeWorkerEvent::AudioClipGainChanging { .. }) => {
@@ -1599,6 +1641,39 @@ fn apply_arrangement_placement_activation_event(ui: &MainWindow, event: &IdeWork
             );
         }
         _ => unreachable!("arrangement activation event dispatcher received another event"),
+    }
+}
+
+fn apply_audio_clip_activation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioClipActivationChanged {
+            revision,
+            changed,
+            active,
+        } => {
+            let state = if *active { "enabled" } else { "disabled" };
+            ui.set_status_text(
+                if *changed {
+                    format!("Audio clip {state} globally in project revision {revision}")
+                } else {
+                    format!("Audio clip was already {state} in project revision {revision}")
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipActivationChanging { active } => {
+            ui.set_app_mode(AppMode::ChangingClipActivation);
+            ui.set_status_text(
+                if *active {
+                    "Waiting for native output before enabling the audio clip globally…"
+                } else {
+                    "Waiting for native output before disabling the audio clip globally…"
+                }
+                .into(),
+            );
+        }
+        _ => unreachable!("audio-clip activation event dispatcher received another event"),
     }
 }
 
@@ -2203,6 +2278,7 @@ fn set_audio_clips(ui: &MainWindow, project_state: &ProjectUiStateCell, clips: &
             id: clip.id().into(),
             name: clip.name().into(),
             track_name: clip.track_name().into(),
+            active: clip.active(),
             gain_label: format!("{:+.2} dB", clip.gain_decibels()).into(),
             gain_edit: format_audio_clip_gain(clip.gain_decibels()).into(),
         })
@@ -2563,6 +2639,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::SetArrangementPlacementActive
             if current == AppMode::ChangingArrangementActivation =>
         {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::SetAudioClipActive if current == AppMode::ChangingClipActivation => {
             AppMode::Running
         }
         IdeWorkerCommandKind::SetAudioClipGain if current == AppMode::ChangingClipGain => {
@@ -3565,6 +3644,17 @@ mod tests {
             mode_after_failure(
                 AppMode::ChangingClipGain,
                 IdeWorkerCommandKind::SetAudioClipGain,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn audio_clip_activation_failure_restores_running_mode() {
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ChangingClipActivation,
+                IdeWorkerCommandKind::SetAudioClipActive,
             ),
             AppMode::Running
         );
