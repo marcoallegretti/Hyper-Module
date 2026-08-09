@@ -4626,6 +4626,12 @@ mod tests {
                 );
             }));
             assert!(result.is_err());
+            let transaction: Value = serde_json::from_slice(
+                &fs::read(fixture.transaction_path().join(TRANSACTION_NAME)).unwrap(),
+            )
+            .unwrap();
+            assert!(transaction["previous_resource"].is_object());
+            assert!(transaction.get("created_parent_directory").is_none());
 
             let recovered = recover_project_resource_publications(&fixture.root).unwrap();
 
