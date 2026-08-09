@@ -1947,6 +1947,21 @@ impl LoadedPlaybackProject {
             .map_or(0, |arrangement| arrangement.placements.len())
     }
 
+    /// Returns the persisted activation state of one arrangement placement.
+    ///
+    /// This is intentionally distinct from compiled playback activity, which
+    /// also depends on the arrangement, owning track, and clip being enabled.
+    #[must_use]
+    pub fn arrangement_placement_enabled(&self, placement_id: &str) -> Option<bool> {
+        self.arrangement.as_ref().and_then(|arrangement| {
+            arrangement
+                .placements
+                .iter()
+                .find(|placement| placement.id == placement_id)
+                .map(|placement| placement.enabled)
+        })
+    }
+
     /// Loads and resolves one strict version 1 mixer resource against this
     /// project's structural tracks and complete verified asset inventory.
     /// `assets` must contain every asset declared by the enclosing package;

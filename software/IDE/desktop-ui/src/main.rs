@@ -1040,7 +1040,7 @@ fn bind_arrangement_callback(
             ui.set_error_text("Arrangement placement selection is no longer current".into());
             return;
         };
-        if active == placement.active() {
+        if active == placement.enabled() {
             ui.set_error_text("Arrangement placement state is no longer current".into());
             return;
         }
@@ -2040,6 +2040,7 @@ impl Model for ArrangementListModel {
             end_clock: format_frame_clock(placement.end_frame(), self.sample_rate_hz).into(),
             start_percent,
             width_percent: (end_percent - start_percent).max(0.0),
+            enabled: placement.enabled(),
             active: placement.active(),
         })
     }
@@ -3348,13 +3349,6 @@ mod tests {
         );
         assert_eq!(
             mode_after_failure(
-                AppMode::ChangingArrangementActivation,
-                IdeWorkerCommandKind::SetArrangementPlacementActive,
-            ),
-            AppMode::Running
-        );
-        assert_eq!(
-            mode_after_failure(
                 AppMode::PreparingRecording,
                 IdeWorkerCommandKind::StartRecording,
             ),
@@ -3391,6 +3385,17 @@ mod tests {
                 IdeWorkerCommandKind::StopOutputTest,
             ),
             AppMode::OutputTesting
+        );
+    }
+
+    #[test]
+    fn arrangement_activation_failure_restores_running_mode() {
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ChangingArrangementActivation,
+                IdeWorkerCommandKind::SetArrangementPlacementActive,
+            ),
+            AppMode::Running
         );
     }
 

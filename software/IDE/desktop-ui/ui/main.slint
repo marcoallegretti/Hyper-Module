@@ -82,6 +82,7 @@ export struct ArrangementRow {
     end-clock: string,
     start-percent: float,
     width-percent: float,
+    enabled: bool,
     active: bool,
 }
 
@@ -1241,8 +1242,8 @@ export component MainWindow inherits Window {
                             for placement in root.arrangement-placements : Rectangle {
                                 height: 70px;
                                 width: parent.width;
-                                background: placement.active ? #0e141b : #11151a;
-                                border-color: placement.active ? #27313d : #3a3330;
+                                background: placement.enabled ? #0e141b : #11151a;
+                                border-color: placement.enabled ? #27313d : #3a3330;
                                 border-width: 1px;
                                 border-radius: 6px;
                                 HorizontalLayout {
@@ -1251,7 +1252,7 @@ export component MainWindow inherits Window {
                                     VerticalLayout {
                                         width: 170px;
                                         spacing: 2px;
-                                        Text { text: placement.clip-name; color: placement.active ? #edf2f8 : #8c929a; font-size: 13px; font-weight: 600; overflow: elide; }
+                                        Text { text: placement.clip-name; color: placement.enabled ? #edf2f8 : #8c929a; font-size: 13px; font-weight: 600; overflow: elide; }
                                         Text { text: placement.track-name; color: #8290a2; font-size: 9px; overflow: elide; }
                                     }
                                     VerticalLayout {
@@ -1273,18 +1274,26 @@ export component MainWindow inherits Window {
                                                 x: parent.width * placement.start-percent / 100;
                                                 width: Math.max(2px, parent.width * placement.width-percent / 100);
                                                 height: parent.height;
-                                                background: placement.active ? #245d78 : #4a3c34;
+                                                background: placement.active ? #245d78 : placement.enabled ? #34404d : #4a3c34;
                                                 border-radius: 3px;
                                             }
                                         }
                                     }
-                                    Text {
-                                        width: 64px;
-                                        text: placement.active ? "ACTIVE" : "INACTIVE";
-                                        color: placement.active ? #63e6b5 : #b58a67;
-                                        font-size: 9px;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
+                                    VerticalLayout {
+                                        width: 82px;
+                                        alignment: center;
+                                        Text {
+                                            text: placement.enabled ? "ENABLED" : "DISABLED";
+                                            color: placement.enabled ? #63e6b5 : #b58a67;
+                                            font-size: 9px;
+                                            horizontal-alignment: center;
+                                        }
+                                        Text {
+                                            text: placement.active ? "PLAYBACK ACTIVE" : "PLAYBACK BLOCKED";
+                                            color: placement.active ? #6f8197 : #65758a;
+                                            font-size: 7px;
+                                            horizontal-alignment: center;
+                                        }
                                     }
                                     Button {
                                         width: 78px;
@@ -1295,10 +1304,10 @@ export component MainWindow inherits Window {
                                     }
                                     Button {
                                         width: 78px;
-                                        text: placement.active ? "Disable" : "Enable";
-                                        accessible-label: (placement.active ? "Disable " : "Enable ") + placement.clip-name + " on " + placement.track-name;
+                                        text: placement.enabled ? "Disable" : "Enable";
+                                        accessible-label: (placement.enabled ? "Disable " : "Enable ") + placement.clip-name + " on " + placement.track-name;
                                         enabled: root.app-mode == AppMode.running;
-                                        clicked => { IdeActions.set-arrangement-placement-active(placement.index, !placement.active); }
+                                        clicked => { IdeActions.set-arrangement-placement-active(placement.index, !placement.enabled); }
                                     }
                                 }
                             }

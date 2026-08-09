@@ -3856,6 +3856,8 @@ mod tests {
     use hyper_media_cache::CacheLimits;
     use hyper_playback_json::LoaderLimits;
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
 
     struct TestDirectory(PathBuf);
 
@@ -3874,6 +3876,204 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    const ARRANGEMENT_TEST_PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338500";
+    const ARRANGEMENT_TEST_TIMELINE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338501";
+    const ARRANGEMENT_TEST_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338502";
+    const ARRANGEMENT_TEST_CLIP_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338503";
+    const ARRANGEMENT_TEST_ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338504";
+    const ARRANGEMENT_TEST_RESOURCE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338505";
+    const ARRANGEMENT_TEST_PLACEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338506";
+    const ARRANGEMENT_TEST_MIXER_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338507";
+
+    struct ArrangementProjectFixture {
+        directory: TestDirectory,
+    }
+
+    impl ArrangementProjectFixture {
+        #[allow(
+            clippy::too_many_lines,
+            reason = "one fixture keeps the complete verified arrangement package graph visible"
+        )]
+        fn new() -> Self {
+            let directory = TestDirectory::new();
+            let resources = [
+                (
+                    ARRANGEMENT_TEST_TIMELINE_ID,
+                    "timeline",
+                    "timeline/timeline.json",
+                    json!({
+                        "format":"hyper-timeline", "format_version":1,
+                        "id":ARRANGEMENT_TEST_TIMELINE_ID,
+                        "project_id":ARRANGEMENT_TEST_PROJECT_ID,
+                        "ticks_per_quarter":1920,
+                        "tempo_events":[{"tick":0,"microseconds_per_quarter":1_000_000}],
+                        "meter_events":[{"tick":0,"numerator":4,"denominator":4}],
+                        "extensions":{}
+                    }),
+                ),
+                (
+                    ARRANGEMENT_TEST_TRACK_ID,
+                    "track",
+                    "tracks/audio.json",
+                    json!({
+                        "format":"hyper-track", "format_version":1,
+                        "id":ARRANGEMENT_TEST_TRACK_ID,
+                        "project_id":ARRANGEMENT_TEST_PROJECT_ID,
+                        "name":"Audio", "kind":"audio", "order":0, "active":true,
+                        "clip_ids":[ARRANGEMENT_TEST_CLIP_ID], "extensions":{}
+                    }),
+                ),
+                (
+                    ARRANGEMENT_TEST_CLIP_ID,
+                    "clip",
+                    "clips/clip.json",
+                    json!({
+                        "format":"hyper-audio-clip", "format_version":1,
+                        "id":ARRANGEMENT_TEST_CLIP_ID,
+                        "project_id":ARRANGEMENT_TEST_PROJECT_ID,
+                        "track_id":ARRANGEMENT_TEST_TRACK_ID,
+                        "name":"Disabled Clip", "enabled":false, "duration_ticks":4,
+                        "source":{"asset_id":ARRANGEMENT_TEST_ASSET_ID,"start_frame":0,"frame_count":100},
+                        "loop":{"enabled":false,"start_tick":0,"end_tick":4},
+                        "playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},
+                        "fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},
+                        "warp_markers":[
+                            {"tick":0,"source_frame_offset":0},
+                            {"tick":4,"source_frame_offset":100}
+                        ],
+                        "extensions":{}
+                    }),
+                ),
+                (
+                    ARRANGEMENT_TEST_RESOURCE_ID,
+                    "arrangement",
+                    "arrangement/main.json",
+                    json!({
+                        "format":"hyper-arrangement", "format_version":1,
+                        "id":ARRANGEMENT_TEST_RESOURCE_ID,
+                        "project_id":ARRANGEMENT_TEST_PROJECT_ID,
+                        "name":"Main", "enabled":true,
+                        "placements":[{
+                            "id":ARRANGEMENT_TEST_PLACEMENT_ID,
+                            "track_id":ARRANGEMENT_TEST_TRACK_ID,
+                            "clip_id":ARRANGEMENT_TEST_CLIP_ID,
+                            "start_tick":0, "clip_start_tick":0,
+                            "duration_ticks":4, "enabled":true
+                        }],
+                        "scene_launches":[], "extensions":{}
+                    }),
+                ),
+                (
+                    ARRANGEMENT_TEST_MIXER_ID,
+                    "mixer",
+                    "mixer/main.json",
+                    json!({
+                        "format":"hyper-mixer", "format_version":1,
+                        "id":ARRANGEMENT_TEST_MIXER_ID,
+                        "project_id":ARRANGEMENT_TEST_PROJECT_ID,
+                        "channels":[{
+                            "track_id":ARRANGEMENT_TEST_TRACK_ID,
+                            "gain_millionths":1_000_000, "pan_millionths":0,
+                            "mute":false, "solo":false,
+                            "destination":{"kind":"main"}, "sends":[]
+                        }],
+                        "return_buses":[],
+                        "main":{"gain_millionths":1_000_000,"mute":false},
+                        "cue":{"source":"main","gain_millionths":1_000_000,"mute":false},
+                        "extensions":{}
+                    }),
+                ),
+            ];
+            let mut descriptors = Vec::new();
+            for (id, role, path, value) in resources {
+                let bytes = arrangement_test_canonical(&value);
+                arrangement_test_write(&directory.0, path, &bytes);
+                descriptors.push(arrangement_test_descriptor(id, role, path, &bytes));
+            }
+            let audio = arrangement_test_wav(&[0; 100]);
+            arrangement_test_write(&directory.0, "assets/samples/sample.wav", &audio);
+            let manifest = json!({
+                "format":"hyper-project", "format_version":1,
+                "project_id":ARRANGEMENT_TEST_PROJECT_ID, "revision":1,
+                "name":"Arrangement Edit Test", "sample_rate_hz":48_000,
+                "required_capabilities":{
+                    "format":"hyper-hardware-capabilities", "format_version":1,
+                    "audio_inputs":2, "audio_outputs":2,
+                    "cv_inputs":0, "cv_outputs":0, "gate_outputs":0,
+                    "has_clock_input":false, "has_reset_input":false,
+                    "has_clock_output":false, "usb_mode":"none",
+                    "has_ethernet":true, "extensions":{}
+                },
+                "resources":descriptors,
+                "assets":[{
+                    "id":ARRANGEMENT_TEST_ASSET_ID, "role":"sample",
+                    "path":"assets/samples/sample.wav", "media_type":"audio/wav",
+                    "byte_length":audio.len(), "sha256":arrangement_test_sha256(&audio),
+                    "extensions":{}
+                }],
+                "extensions":{}
+            });
+            std::fs::write(
+                directory.0.join("project.json"),
+                arrangement_test_canonical(&manifest),
+            )
+            .unwrap();
+            Self { directory }
+        }
+
+        fn root(&self) -> &Path {
+            &self.directory.0
+        }
+    }
+
+    fn arrangement_test_descriptor(id: &str, role: &str, path: &str, bytes: &[u8]) -> Value {
+        json!({
+            "id":id, "role":role, "path":path,
+            "media_type":"application/json", "byte_length":bytes.len(),
+            "sha256":arrangement_test_sha256(bytes), "extensions":{}
+        })
+    }
+
+    fn arrangement_test_write(root: &Path, relative: &str, bytes: &[u8]) {
+        let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn arrangement_test_canonical(value: &Value) -> Vec<u8> {
+        serde_json_canonicalizer::to_vec(value).unwrap()
+    }
+
+    fn arrangement_test_sha256(bytes: &[u8]) -> String {
+        let mut output = String::with_capacity(64);
+        for byte in Sha256::digest(bytes) {
+            use core::fmt::Write;
+            write!(&mut output, "{byte:02x}").unwrap();
+        }
+        output
+    }
+
+    fn arrangement_test_wav(samples: &[i16]) -> Vec<u8> {
+        let data_bytes = u32::try_from(samples.len() * 2).unwrap();
+        let mut bytes = Vec::with_capacity(44 + samples.len() * 2);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&48_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&96_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
     }
 
     fn config(
@@ -4281,6 +4481,142 @@ mod tests {
         .unwrap();
         assert!(!unchanged.changed());
         assert_eq!(unchanged.project_revision(), 4);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the integration test keeps partial publication, recovery, reopen, and no-op evidence together"
+    )]
+    fn arrangement_placement_edits_publish_reopen_and_preserve_partial_success() {
+        let fixture = ArrangementProjectFixture::new();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let placement = &prepared.session().arrangement().placements()[0];
+        assert!(placement.enabled());
+        assert!(!placement.active());
+        let package = prepared.package();
+        let arrangement = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Arrangement)
+            .unwrap();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let source_arrangement = package.read_resource(arrangement.id()).unwrap();
+        let source_mixer = package.read_resource(mixer.id()).unwrap();
+        let changed_mixer = serialize_mixer_base_state(
+            &source_mixer,
+            package.manifest().project_id(),
+            mixer.id(),
+            &MixerBaseState {
+                channels: vec![MixerChannelBaseState {
+                    track_id: ARRANGEMENT_TEST_TRACK_ID.to_owned(),
+                    gain: LinearGain::UNITY,
+                    pan: Pan::CENTER,
+                    muted: false,
+                    solo: false,
+                    sends: Vec::new(),
+                }],
+                main_gain: LinearGain::from_millionths(750_000).unwrap(),
+                main_muted: false,
+            },
+            limits.session.documents,
+        )
+        .unwrap();
+        let (loaded, _, _, _) = prepared.session().parts();
+        let disabled_arrangement = serialize_arrangement_placement_activation(
+            loaded,
+            &source_arrangement,
+            ARRANGEMENT_TEST_PLACEMENT_ID,
+            false,
+            limits.session.documents,
+        )
+        .unwrap();
+        let arrangement_id = arrangement.id().to_owned();
+        let mixer_id = mixer.id().to_owned();
+        let initial_identity = *package.manifest_sha256();
+        drop(prepared);
+
+        let failed = IdeArrangementPlacementEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: initial_identity,
+                resource_id: mixer_id.clone(),
+                resource_bytes: changed_mixer.clone(),
+            },
+            arrangement_id: arrangement_id.clone(),
+            arrangement_bytes: b"not-json".to_vec(),
+        };
+        let error = failed.publish().unwrap_err();
+        let IdeArrangementPlacementEditPublicationError::Arrangement { mixer, source } = error
+        else {
+            panic!("arrangement edit must fail after the mixer publication");
+        };
+        assert!(mixer.changed());
+        assert_eq!(mixer.project_revision(), 2);
+        assert_eq!(
+            source.kind(),
+            hyper_storage_engine::ProjectResourcePublicationErrorKind::InvalidResource
+        );
+
+        let verified = hyper_storage_engine::verify_project_package(&project_path).unwrap();
+        assert_eq!(verified.manifest().revision(), 2);
+        assert_eq!(verified.read_resource(&mixer_id).unwrap(), changed_mixer);
+        assert_eq!(
+            verified.read_resource(&arrangement_id).unwrap(),
+            source_arrangement
+        );
+        let retry_identity = *verified.manifest_sha256();
+        drop(verified);
+
+        let retry = IdeArrangementPlacementEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: retry_identity,
+                resource_id: mixer_id.clone(),
+                resource_bytes: changed_mixer.clone(),
+            },
+            arrangement_id: arrangement_id.clone(),
+            arrangement_bytes: disabled_arrangement.clone(),
+        };
+        let outcome = retry.publish().unwrap();
+        assert!(outcome.changed());
+        assert_eq!(outcome.project_revision(), 3);
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let placement = &reopened.session().arrangement().placements()[0];
+        assert!(!placement.enabled());
+        assert!(!placement.active());
+        assert_eq!(
+            reopened.package().read_resource(&arrangement_id).unwrap(),
+            disabled_arrangement
+        );
+        let disabled_identity = *reopened.package().manifest_sha256();
+        drop(reopened);
+
+        let unchanged = IdeArrangementPlacementEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path,
+                expected_project_sha256: disabled_identity,
+                resource_id: mixer_id,
+                resource_bytes: changed_mixer,
+            },
+            arrangement_id,
+            arrangement_bytes: disabled_arrangement,
+        }
+        .publish()
+        .unwrap();
+        assert!(!unchanged.changed());
+        assert_eq!(unchanged.project_revision(), 3);
     }
 
     #[test]

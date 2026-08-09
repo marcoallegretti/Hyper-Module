@@ -2150,6 +2150,9 @@ dependencies = [
  "hyper-recording-worker",
  "hyper-storage-engine",
  "hyper-thread-supervisor",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
  "uuid",
 ]
 

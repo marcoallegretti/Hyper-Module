@@ -99,6 +99,7 @@ pub struct PlaybackArrangementPlacement {
     clip_index: usize,
     start_frame: usize,
     end_frame: usize,
+    enabled: bool,
     active: bool,
 }
 
@@ -128,7 +129,14 @@ impl PlaybackArrangementPlacement {
         self.end_frame
     }
 
+    /// Whether this placement is enabled in the persisted arrangement.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Whether the compiled placement contributes audio before mixer control.
+    /// This also reflects arrangement, track, and clip activation.
     #[must_use]
     pub const fn active(&self) -> bool {
         self.active
@@ -396,6 +404,9 @@ fn build_playback_arrangement(
         .map_err(|_| PlaybackSessionAssemblyError::ArrangementCapacityUnavailable)?;
     let mut end_frame = 0;
     for entry in entries {
+        let enabled = project
+            .arrangement_placement_enabled(&entry.placement_id)
+            .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?;
         let start_frame = entry.compiled.arrangement_start_frame();
         let placement_end_frame = entry.compiled.arrangement_end_frame();
         end_frame = end_frame.max(placement_end_frame);
@@ -405,6 +416,7 @@ fn build_playback_arrangement(
             clip_index: entry.clip_index,
             start_frame,
             end_frame: placement_end_frame,
+            enabled,
             active: entry.compiled.clip_spec().enabled,
         });
     }
@@ -688,6 +700,7 @@ mod tests {
                 clip_index: 0,
                 start_frame: 0,
                 end_frame: 100,
+                enabled: true,
                 active: true,
             }
         );
@@ -731,16 +744,36 @@ mod tests {
     }
 
     #[test]
-    fn arrangement_navigation_preserves_compiled_inactive_placement_state() {
-        let mut input = input(vec![asset("018f47a2-6b2d-7c11-8a44-001122337504")]);
-        input.documents.clips[0] = String::from_utf8(input.documents.clips[0].clone())
-            .unwrap()
-            .replace(r#""enabled":true"#, r#""enabled":false"#)
-            .into_bytes();
-        let session = assemble_playback_session(input).unwrap();
-        assert_eq!(session.arrangement().placements().len(), 1);
-        assert!(!session.arrangement().placements()[0].active());
-        assert_eq!(session.arrangement().end_frame(), 100);
+    fn arrangement_navigation_separates_persisted_and_effective_activation() {
+        for (clip_enabled, placement_enabled) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let mut input = input(vec![asset("018f47a2-6b2d-7c11-8a44-001122337504")]);
+            if !clip_enabled {
+                input.documents.clips[0] = String::from_utf8(input.documents.clips[0].clone())
+                    .unwrap()
+                    .replace(r#""enabled":true"#, r#""enabled":false"#)
+                    .into_bytes();
+            }
+            if !placement_enabled {
+                input.documents.arrangement = input.documents.arrangement.map(|arrangement| {
+                    String::from_utf8(arrangement)
+                        .unwrap()
+                        .replace(
+                            r#""duration_ticks":4,"enabled":true"#,
+                            r#""duration_ticks":4,"enabled":false"#,
+                        )
+                        .into_bytes()
+                });
+            }
+
+            let session = assemble_playback_session(input).unwrap();
+            let placements = session.arrangement().placements();
+            assert_eq!(placements.len(), 1);
+            assert_eq!(placements[0].enabled(), placement_enabled);
+            assert_eq!(placements[0].active(), clip_enabled && placement_enabled);
+            assert_eq!(session.arrangement().end_frame(), 100);
+        }
     }
 
     #[test]
