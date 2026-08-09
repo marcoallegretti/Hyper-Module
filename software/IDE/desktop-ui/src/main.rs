@@ -1176,6 +1176,69 @@ fn bind_arrangement_callback(
     bind_arrangement_move_callback(ui, worker, project_state);
     bind_arrangement_duration_callback(ui, worker, project_state);
     bind_arrangement_front_trim_callback(ui, worker, project_state);
+    bind_arrangement_removal_callback(ui, worker, project_state);
+}
+
+fn bind_arrangement_removal_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_removal = Rc::clone(worker);
+    let project_state_for_removal = Rc::clone(project_state);
+    actions.on_remove_arrangement_placement(move |placement_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if !arrangement_removal_confirmation_is_current(
+            ui.get_app_mode(),
+            ui.get_remove_arrangement_placement_visible(),
+            ui.get_remove_arrangement_placement_id().as_str(),
+            placement_id.as_str(),
+        ) {
+            ui.set_error_text(
+                "Arrangement placement removal confirmation is no longer current".into(),
+            );
+            return;
+        }
+        let state = project_state_for_removal.arrangement.borrow();
+        let Some(binding) = state.as_ref() else {
+            ui.set_error_text("Arrangement placement authority is no longer available".into());
+            return;
+        };
+        let Some(placement) = binding
+            .owner
+            .placements()
+            .iter()
+            .find(|placement| placement.id() == placement_id.as_str())
+        else {
+            ui.set_error_text("The selected arrangement placement is no longer available".into());
+            return;
+        };
+        let owned_placement_id = placement.id().to_owned();
+        drop(state);
+        submit_to_ui(
+            &ui,
+            &worker_for_removal,
+            IdeWorkerCommand::RemoveArrangementPlacement {
+                placement_id: owned_placement_id,
+            },
+        );
+    });
+}
+
+fn arrangement_removal_confirmation_is_current(
+    app_mode: AppMode,
+    visible: bool,
+    confirmed_placement_id: &str,
+    requested_placement_id: &str,
+) -> bool {
+    app_mode == AppMode::Running
+        && visible
+        && !confirmed_placement_id.is_empty()
+        && confirmed_placement_id == requested_placement_id
 }
 
 fn bind_arrangement_move_callback(
@@ -1502,6 +1565,9 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 | IdeWorkerCommandKind::TrimArrangementPlacementFront => {
                     ui.set_app_mode(AppMode::TrimmingArrangementPlacement);
                 }
+                IdeWorkerCommandKind::RemoveArrangementPlacement => {
+                    ui.set_app_mode(AppMode::RemovingArrangementPlacement);
+                }
                 IdeWorkerCommandKind::SetAudioClipActive => {
                     ui.set_app_mode(AppMode::ChangingClipActivation);
                 }
@@ -1582,7 +1648,10 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
             "Preserving mixer state, trimming the arrangement placement, and reopening project…"
         }
         IdeWorkerCommandKind::TrimArrangementPlacementFront => {
-            "Preserving mixer state, trimming the arrangement front, and reopening project..."
+            "Preserving mixer state, trimming the arrangement front, and reopening project…"
+        }
+        IdeWorkerCommandKind::RemoveArrangementPlacement => {
+            "Preserving mixer state, removing the arrangement placement, and reopening project…"
         }
         IdeWorkerCommandKind::SetAudioClipActive => {
             "Preserving mixer state, updating audio-clip activation, and reopening project…"
@@ -1706,6 +1775,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementPlacementFrontTrimmed { .. }
         | IdeWorkerEvent::ArrangementPlacementFrontTrimming { .. }) => {
             apply_arrangement_placement_front_trim_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ArrangementPlacementRemoved { .. }
+        | IdeWorkerEvent::ArrangementPlacementRemoving) => {
+            apply_arrangement_placement_removal_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipActivationChanged { .. }
         | IdeWorkerEvent::AudioClipActivationChanging { .. }) => {
@@ -1989,6 +2062,28 @@ fn apply_arrangement_placement_front_trim_event(ui: &MainWindow, event: &IdeWork
             );
         }
         _ => unreachable!("arrangement front-trim event dispatcher received another event"),
+    }
+}
+
+fn apply_arrangement_placement_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ArrangementPlacementRemoved { revision } => {
+            ui.set_remove_arrangement_placement_visible(false);
+            ui.set_remove_arrangement_placement_id(SharedString::default());
+            ui.set_remove_arrangement_placement_clip_name(SharedString::default());
+            ui.set_remove_arrangement_placement_track_name(SharedString::default());
+            ui.set_status_text(
+                format!("Arrangement placement removed in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementPlacementRemoving => {
+            ui.set_app_mode(AppMode::RemovingArrangementPlacement);
+            ui.set_status_text(
+                "Waiting for native output before removing the arrangement placement…".into(),
+            );
+        }
+        _ => unreachable!("arrangement removal event dispatcher received another event"),
     }
 }
 
@@ -2918,6 +3013,10 @@ fn reset_project(
     ui.set_recording_takes(ModelRc::default());
     ui.set_takes_visible(false);
     ui.set_arrangement_visible(false);
+    ui.set_remove_arrangement_placement_visible(false);
+    ui.set_remove_arrangement_placement_id(SharedString::default());
+    ui.set_remove_arrangement_placement_clip_name(SharedString::default());
+    ui.set_remove_arrangement_placement_track_name(SharedString::default());
     ui.set_clips_visible(false);
     ui.set_clip_gain_visible(false);
     ui.set_clip_gain_id(SharedString::default());
@@ -3001,6 +3100,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::SetArrangementPlacementDuration
         | IdeWorkerCommandKind::TrimArrangementPlacementFront
             if current == AppMode::TrimmingArrangementPlacement =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::RemoveArrangementPlacement
+            if current == AppMode::RemovingArrangementPlacement =>
         {
             AppMode::Running
         }
@@ -4046,6 +4150,51 @@ mod tests {
             mode_after_failure(
                 AppMode::TrimmingArrangementPlacement,
                 IdeWorkerCommandKind::TrimArrangementPlacementFront,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn arrangement_removal_requires_the_current_explicit_confirmation() {
+        assert!(arrangement_removal_confirmation_is_current(
+            AppMode::Running,
+            true,
+            "placement-a",
+            "placement-a",
+        ));
+        assert!(!arrangement_removal_confirmation_is_current(
+            AppMode::RemovingArrangementPlacement,
+            true,
+            "placement-a",
+            "placement-a",
+        ));
+        assert!(!arrangement_removal_confirmation_is_current(
+            AppMode::Running,
+            false,
+            "placement-a",
+            "placement-a",
+        ));
+        assert!(!arrangement_removal_confirmation_is_current(
+            AppMode::Running,
+            true,
+            "placement-a",
+            "placement-b",
+        ));
+        assert!(!arrangement_removal_confirmation_is_current(
+            AppMode::Running,
+            true,
+            "",
+            "",
+        ));
+    }
+
+    #[test]
+    fn arrangement_removal_failure_restores_running_mode() {
+        assert_eq!(
+            mode_after_failure(
+                AppMode::RemovingArrangementPlacement,
+                IdeWorkerCommandKind::RemoveArrangementPlacement,
             ),
             AppMode::Running
         );

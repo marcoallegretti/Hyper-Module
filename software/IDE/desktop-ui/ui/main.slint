@@ -17,6 +17,7 @@ export enum AppMode {
     changing-arrangement-activation,
     moving-arrangement-placement,
     trimming-arrangement-placement,
+    removing-arrangement-placement,
     changing-clip-activation,
     changing-clip-gain,
     preparing-preview,
@@ -124,6 +125,7 @@ export global IdeActions {
     callback move-arrangement-placement(string, string);
     callback set-arrangement-placement-duration(string, string);
     callback trim-arrangement-placement-front(string, string);
+    callback remove-arrangement-placement(string);
     callback set-audio-clip-active(string, bool);
     callback set-audio-clip-gain(string, string);
     callback loudness-run();
@@ -261,6 +263,10 @@ export component MainWindow inherits Window {
     in-out property <bool> mixer-sends-visible: false;
     in-out property <bool> takes-visible: false;
     in-out property <bool> arrangement-visible: false;
+    in-out property <bool> remove-arrangement-placement-visible: false;
+    in-out property <string> remove-arrangement-placement-id: "";
+    in-out property <string> remove-arrangement-placement-clip-name: "";
+    in-out property <string> remove-arrangement-placement-track-name: "";
     in-out property <bool> clips-visible: false;
     in-out property <bool> clip-gain-visible: false;
     in-out property <string> clip-gain-id: "";
@@ -379,6 +385,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.changing-arrangement-activation ? "◌  UPDATING CLIP"
                         : root.app-mode == AppMode.moving-arrangement-placement ? "◌  MOVING CLIP"
                         : root.app-mode == AppMode.trimming-arrangement-placement ? "◌  TRIMMING CLIP"
+                        : root.app-mode == AppMode.removing-arrangement-placement ? "◌  REMOVING CLIP"
                         : root.app-mode == AppMode.changing-clip-activation ? "◌  UPDATING CLIP"
                         : root.app-mode == AppMode.changing-clip-gain ? "◌  UPDATING GAIN"
                         : root.app-mode == AppMode.selecting ? "◌  SELECTING"
@@ -1266,7 +1273,48 @@ export component MainWindow inherits Window {
 
                         Rectangle { height: 1px; background: #27313d; }
 
-                        if root.arrangement-placements.length == 0 : Text {
+                        if root.remove-arrangement-placement-visible : VerticalLayout {
+                            vertical-stretch: 1;
+                            spacing: 14px;
+                            Text { text: "REMOVE ARRANGEMENT PLACEMENT"; color: #ff9d76; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            Text { text: root.remove-arrangement-placement-clip-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                            Text { text: "Track: " + root.remove-arrangement-placement-track-name; color: #8fa0b4; font-size: 12px; overflow: elide; }
+                            Rectangle { height: 1px; background: #27313d; }
+                            Text {
+                                text: "This cannot be undone. Only this arrangement placement is removed. The reusable clip, source audio, track, mixer state, later placement positions, and recorded takes remain unchanged.";
+                                color: #aebccc;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "This is a non-ripple edit. The project is reopened and verified before the removal is reported as complete.";
+                                color: #728196;
+                                font-size: 10px;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Button {
+                                    text: "Cancel";
+                                    enabled: root.app-mode == AppMode.running;
+                                    clicked => {
+                                        root.remove-arrangement-placement-visible = false;
+                                        root.remove-arrangement-placement-id = "";
+                                        root.remove-arrangement-placement-clip-name = "";
+                                        root.remove-arrangement-placement-track-name = "";
+                                    }
+                                }
+                                Button {
+                                    horizontal-stretch: 1;
+                                    text: root.app-mode == AppMode.removing-arrangement-placement ? "Removing placement..." : "Remove placement";
+                                    enabled: root.app-mode == AppMode.running && root.remove-arrangement-placement-id != "";
+                                    clicked => { IdeActions.remove-arrangement-placement(root.remove-arrangement-placement-id); }
+                                }
+                            }
+                            Rectangle { vertical-stretch: 1; background: transparent; }
+                        }
+
+                        if !root.remove-arrangement-placement-visible && root.arrangement-placements.length == 0 : Text {
                             text: "This project has no linear arrangement placements.";
                             color: #8fa0b4;
                             font-size: 13px;
@@ -1275,7 +1323,7 @@ export component MainWindow inherits Window {
                             vertical-stretch: 1;
                         }
 
-                        if root.arrangement-placements.length > 0 : ListView {
+                        if !root.remove-arrangement-placement-visible && root.arrangement-placements.length > 0 : ListView {
                             vertical-stretch: 1;
                             for placement in root.arrangement-placements : Rectangle {
                                 height: 112px;
@@ -1399,12 +1447,26 @@ export component MainWindow inherits Window {
                                             }
                                         }
                                     }
-                                    Button {
+                                    VerticalLayout {
                                         width: 58px;
-                                        text: "Locate";
-                                        accessible-label: "Locate to " + placement.clip-name + " on " + placement.track-name;
-                                        enabled: root.app-mode == AppMode.running;
-                                        clicked => { IdeActions.locate-placement(placement.index); }
+                                        spacing: 4px;
+                                        Button {
+                                            text: "Locate";
+                                            accessible-label: "Locate to " + placement.clip-name + " on " + placement.track-name;
+                                            enabled: root.app-mode == AppMode.running;
+                                            clicked => { IdeActions.locate-placement(placement.index); }
+                                        }
+                                        Button {
+                                            text: "Remove";
+                                            accessible-label: "Review removal of " + placement.clip-name + " from " + placement.track-name;
+                                            enabled: root.app-mode == AppMode.running;
+                                            clicked => {
+                                                root.remove-arrangement-placement-id = placement.id;
+                                                root.remove-arrangement-placement-clip-name = placement.clip-name;
+                                                root.remove-arrangement-placement-track-name = placement.track-name;
+                                                root.remove-arrangement-placement-visible = true;
+                                            }
+                                        }
                                     }
                                     Button {
                                         width: 58px;
@@ -1417,8 +1479,8 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        Text {
-                            text: "Placement activation, exact start moves, and exact left/right edge trims are persistent. Dragging, snapping, and waveform claims are not implemented.";
+                        if !root.remove-arrangement-placement-visible : Text {
+                            text: "Placement activation, exact start moves, exact left/right edge trims, and confirmed non-ripple removal are persistent. Dragging, snapping, and waveform claims are not implemented.";
                             color: #65758a;
                             font-size: 9px;
                         }
