@@ -26,9 +26,9 @@ use hyper_playback_compiler::scene::{
     SceneSlotResource, SceneTrackResource, compile_scene_performance,
 };
 use hyper_playback_compiler::{
-    ClipCompileSpec, CompileError, CompiledPlacement, CompiledSceneAudioClip, PlacementCompileSpec,
-    TempoEvent, TickRange, Timeline, TimelineError, WarpMarker,
-    compile_interactive_scene_audio_clip, compile_placement, compile_scene_audio_clip,
+    ClipCompileSpec, CompileError, CompiledPlacement, CompiledSceneAudioClip, FrameTimeline,
+    FrameTimelineError, PlacementCompileSpec, TempoEvent, TickRange, Timeline, TimelineError,
+    WarpMarker, compile_interactive_scene_audio_clip, compile_placement, compile_scene_audio_clip,
 };
 use hyper_project_model::{is_valid_entity_id, is_valid_extension_key};
 use serde::de::{IgnoredAny, MapAccess, Visitor};
@@ -527,6 +527,36 @@ pub struct AudioTrackAdditionDocuments {
     mixer: Vec<u8>,
 }
 
+/// Canonical version-1 resources required to create one reusable audio clip.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioClipAdditionDocuments {
+    track: Vec<u8>,
+    clip: Vec<u8>,
+    duration_ticks: u64,
+}
+
+impl AudioClipAdditionDocuments {
+    #[must_use]
+    pub fn track(&self) -> &[u8] {
+        &self.track
+    }
+
+    #[must_use]
+    pub fn clip(&self) -> &[u8] {
+        &self.clip
+    }
+
+    #[must_use]
+    pub const fn duration_ticks(&self) -> u64 {
+        self.duration_ticks
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, Vec<u8>, u64) {
+        (self.track, self.clip, self.duration_ticks)
+    }
+}
+
 impl AudioTrackAdditionDocuments {
     #[must_use]
     pub fn track(&self) -> &[u8] {
@@ -553,6 +583,25 @@ pub enum AudioTrackAdditionSerializationError {
     InvalidTrackName,
     InvalidDocumentShape,
     Serialization(serde_json::Error),
+}
+
+#[derive(Debug)]
+pub enum AudioClipAdditionSerializationError {
+    Source(LoadError),
+    Timeline(FrameTimelineError),
+    ClipCapacity,
+    TrackReferenceCapacity,
+    TrackMissing,
+    TrackNotAudio,
+    AssetMissing,
+    AssetMismatch,
+    InvalidClipIdentity,
+    InvalidClipName,
+    NonCanonicalTrack,
+    SourceTrackMismatch,
+    InvalidDocumentShape,
+    Serialization(serde_json::Error),
+    ProjectCompilation(AdapterCompileError),
 }
 
 #[derive(Debug)]
@@ -887,6 +936,68 @@ impl Error for AudioTrackAdditionSerializationError {
             | Self::InvalidTrackIdentity
             | Self::MixerIdentityMismatch
             | Self::InvalidTrackName
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
+impl fmt::Display for AudioClipAdditionSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => source.fmt(formatter),
+            Self::Timeline(source) => source.fmt(formatter),
+            Self::ClipCapacity => {
+                formatter.write_str("the version-1 project cannot append another audio clip")
+            }
+            Self::TrackReferenceCapacity => {
+                formatter.write_str("the owning audio track cannot reference another reusable clip")
+            }
+            Self::TrackMissing => formatter.write_str("the recording track does not exist"),
+            Self::TrackNotAudio => {
+                formatter.write_str("the recording does not belong to an audio track")
+            }
+            Self::AssetMissing => formatter.write_str("the recorded audio asset does not exist"),
+            Self::AssetMismatch => {
+                formatter.write_str("the recorded audio facts do not match the project asset")
+            }
+            Self::InvalidClipIdentity => {
+                formatter.write_str("the new audio-clip identity is invalid or already in use")
+            }
+            Self::InvalidClipName => {
+                formatter.write_str("the audio-clip name is outside the version-1 domain")
+            }
+            Self::NonCanonicalTrack => {
+                formatter.write_str("source audio track is not canonical RFC 8785 JSON")
+            }
+            Self::SourceTrackMismatch => {
+                formatter.write_str("source audio-track bytes do not match the recording track")
+            }
+            Self::InvalidDocumentShape => {
+                formatter.write_str("source audio-track shape changed after typed validation")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::ProjectCompilation(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioClipAdditionSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Timeline(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
+            Self::ClipCapacity
+            | Self::TrackReferenceCapacity
+            | Self::TrackMissing
+            | Self::TrackNotAudio
+            | Self::AssetMissing
+            | Self::AssetMismatch
+            | Self::InvalidClipIdentity
+            | Self::InvalidClipName
+            | Self::NonCanonicalTrack
+            | Self::SourceTrackMismatch
             | Self::InvalidDocumentShape => None,
         }
     }
@@ -1387,6 +1498,198 @@ pub fn serialize_audio_track_addition(
         .load_mixer(&mixer, assets, limits)
         .map_err(AudioTrackAdditionSerializationError::Source)?;
     Ok(AudioTrackAdditionDocuments { track, mixer })
+}
+
+/// Creates one complete reusable audio-clip view from a verified recorded asset
+/// and appends its identity to the owning audio track.
+///
+/// The clip spans the whole asset, is enabled, has identity playback controls,
+/// and stores an explicit two-point warp from its integer musical duration to
+/// the exact captured frame count. The duration ends at the first project tick
+/// at or after the recorded frame end; no arrangement placement is created.
+///
+/// # Errors
+///
+/// Returns a classified rejection for stale track bytes, mismatched recorded
+/// asset facts, invalid identity or name input, exhausted capacity, timeline
+/// conversion failure, or a candidate project that cannot compile.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the creation boundary keeps track authority, exact frame-to-tick conversion, canonical clip construction, and candidate compilation in one reviewable transaction"
+)]
+pub fn serialize_recording_audio_clip_addition(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_track: &[u8],
+    track_id: &str,
+    asset_id: &str,
+    timeline_start_tick: u64,
+    frame_count: u64,
+    clip_id: &str,
+    clip_name: &str,
+    limits: LoaderLimits,
+) -> Result<AudioClipAdditionDocuments, AudioClipAdditionSerializationError> {
+    if project.clips.len() >= limits.max_clip_documents {
+        return Err(AudioClipAdditionSerializationError::ClipCapacity);
+    }
+    let track_index = project
+        .track_index(track_id)
+        .ok_or(AudioClipAdditionSerializationError::TrackMissing)?;
+    if !project.is_audio_track(track_id) {
+        return Err(AudioClipAdditionSerializationError::TrackNotAudio);
+    }
+    let current_track = project
+        .tracks
+        .get(track_index)
+        .ok_or(AudioClipAdditionSerializationError::TrackMissing)?;
+    if current_track.clip_ids.len() >= limits.max_track_clip_references {
+        return Err(AudioClipAdditionSerializationError::TrackReferenceCapacity);
+    }
+    let source_frame_count = usize::try_from(frame_count)
+        .map_err(|_| AudioClipAdditionSerializationError::AssetMismatch)?;
+    let asset = assets
+        .iter()
+        .find(|asset| asset.id == asset_id)
+        .ok_or(AudioClipAdditionSerializationError::AssetMissing)?;
+    if frame_count == 0
+        || asset.sample_rate_hz != project.sample_rate_hz
+        || asset.frame_count != source_frame_count
+    {
+        return Err(AudioClipAdditionSerializationError::AssetMismatch);
+    }
+    if !is_valid_entity_id(clip_id)
+        || clip_id == project.project_id
+        || project_contains_identity(project, clip_id)
+        || assets.iter().any(|asset| asset.id == clip_id)
+    {
+        return Err(AudioClipAdditionSerializationError::InvalidClipIdentity);
+    }
+    let name_length = clip_name.chars().count();
+    if clip_name.trim() != clip_name || !(1..=MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length)
+    {
+        return Err(AudioClipAdditionSerializationError::InvalidClipName);
+    }
+
+    let loaded_source = load_track(
+        source_track,
+        track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(AudioClipAdditionSerializationError::Source)?;
+    if loaded_source.id != current_track.id
+        || loaded_source.name != current_track.name
+        || loaded_source.kind != current_track.kind
+        || loaded_source.order != current_track.order
+        || loaded_source.active != current_track.active
+        || loaded_source.parent_track_id != current_track.parent_track_id
+        || loaded_source.clip_ids != current_track.clip_ids
+    {
+        return Err(AudioClipAdditionSerializationError::SourceTrackMismatch);
+    }
+    let mut track_value: Value = serde_json::from_slice(source_track)
+        .map_err(AudioClipAdditionSerializationError::Serialization)?;
+    let canonical_source = serde_json_canonicalizer::to_vec(&track_value)
+        .map_err(AudioClipAdditionSerializationError::Serialization)?;
+    if canonical_source != source_track {
+        return Err(AudioClipAdditionSerializationError::NonCanonicalTrack);
+    }
+    let clip_ids = track_value
+        .get_mut("clip_ids")
+        .and_then(Value::as_array_mut)
+        .ok_or(AudioClipAdditionSerializationError::InvalidDocumentShape)?;
+    clip_ids.push(clip_id.into());
+
+    let timeline = FrameTimeline::try_new(project.sample_rate_hz, &project.tempo_events)
+        .map_err(AudioClipAdditionSerializationError::Timeline)?;
+    let start_frame = timeline
+        .tick_to_frame_ceil(timeline_start_tick)
+        .map_err(AudioClipAdditionSerializationError::Timeline)?;
+    let end_frame = start_frame
+        .checked_add(source_frame_count)
+        .ok_or(AudioClipAdditionSerializationError::AssetMismatch)?;
+    let end_tick = timeline
+        .position_at_frame(end_frame)
+        .and_then(|position| position.quantize_forward(1))
+        .map_err(AudioClipAdditionSerializationError::Timeline)?;
+    let duration_ticks = end_tick
+        .checked_sub(timeline_start_tick)
+        .filter(|duration| *duration > 0)
+        .ok_or(AudioClipAdditionSerializationError::AssetMismatch)?;
+
+    let clip = serde_json_canonicalizer::to_vec(&json!({
+        "format": "hyper-audio-clip",
+        "format_version": 1,
+        "id": clip_id,
+        "project_id": project.project_id,
+        "track_id": track_id,
+        "name": clip_name,
+        "enabled": true,
+        "duration_ticks": duration_ticks,
+        "source": {
+            "asset_id": asset_id,
+            "start_frame": 0,
+            "frame_count": frame_count
+        },
+        "loop": {
+            "enabled": false,
+            "start_tick": 0,
+            "end_tick": duration_ticks
+        },
+        "playback": {
+            "gain_decibels": 0,
+            "reverse": false,
+            "transpose_cents": 0
+        },
+        "fades": {
+            "curve": "linear-amplitude",
+            "in_ticks": 0,
+            "out_ticks": 0
+        },
+        "warp_markers": [
+            {"tick": 0, "source_frame_offset": 0},
+            {"tick": duration_ticks, "source_frame_offset": frame_count}
+        ],
+        "extensions": {}
+    }))
+    .map_err(AudioClipAdditionSerializationError::Serialization)?;
+    let loaded_clip = load_clip(
+        &clip,
+        project.clips.len(),
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_warp_markers,
+    )
+    .map_err(AudioClipAdditionSerializationError::Source)?;
+    let track = serde_json_canonicalizer::to_vec(&track_value)
+        .map_err(AudioClipAdditionSerializationError::Serialization)?;
+    let loaded_track = load_track(
+        &track,
+        track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(AudioClipAdditionSerializationError::Source)?;
+
+    let mut extended = project.clone();
+    extended
+        .clips
+        .try_reserve(1)
+        .map_err(|_| AudioClipAdditionSerializationError::Source(capacity_error()))?;
+    extended.clips.push(loaded_clip);
+    extended.tracks[track_index] = loaded_track;
+    validate_loaded_identities(&extended).map_err(AudioClipAdditionSerializationError::Source)?;
+    extended
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(AudioClipAdditionSerializationError::ProjectCompilation)?;
+    Ok(AudioClipAdditionDocuments {
+        track,
+        clip,
+        duration_ticks,
+    })
 }
 
 /// Builds the canonical mixer document produced by removing one empty,
@@ -5362,6 +5665,190 @@ mod tests {
         assert_eq!(
             serde_json_canonicalizer::to_vec(&mixer).unwrap(),
             documents.mixer()
+        );
+    }
+
+    #[test]
+    fn recording_audio_clip_addition_preserves_track_and_exact_asset_frames() {
+        let mut source: Value = serde_json::from_slice(TRACK).unwrap();
+        source["clip_ids"] = json!([]);
+        source["extensions"]["org.example.track"] = json!({"opaque": true});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [&source];
+        let loaded = load(input(TIMELINE, &tracks, &[], None), LoaderLimits::VERSION_1).unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+
+        let documents = serialize_recording_audio_clip_addition(
+            &loaded,
+            &asset_facts(),
+            &source,
+            "018f47a2-6b2d-7c11-8a44-001122334456",
+            "018f47a2-6b2d-7c11-8a44-001122334457",
+            1_920,
+            100,
+            clip_id,
+            "Recorded Take",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(documents.duration_ticks(), 4);
+        let track: Value = serde_json::from_slice(documents.track()).unwrap();
+        let clip: Value = serde_json::from_slice(documents.clip()).unwrap();
+
+        assert_eq!(track["clip_ids"], json!([clip_id]));
+        assert_eq!(
+            track["extensions"]["org.example.track"],
+            json!({"opaque": true})
+        );
+        assert_eq!(clip["track_id"], track["id"]);
+        assert_eq!(clip["source"]["frame_count"], 100);
+        assert_eq!(clip["duration_ticks"], 4);
+        assert_eq!(
+            clip["warp_markers"],
+            json!([
+                {"tick": 0, "source_frame_offset": 0},
+                {"tick": 4, "source_frame_offset": 100}
+            ])
+        );
+        assert_eq!(clip["loop"]["enabled"], false);
+        assert_eq!(
+            serde_json_canonicalizer::to_vec(&track).unwrap(),
+            documents.track()
+        );
+        assert_eq!(
+            serde_json_canonicalizer::to_vec(&clip).unwrap(),
+            documents.clip()
+        );
+
+        let clips: [&[u8]; 1] = [documents.clip()];
+        let tracks: [&[u8]; 1] = [documents.track()];
+        let reopened = load(
+            input(TIMELINE, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        reopened
+            .compile_playback(
+                &asset_facts(),
+                GraphLimits::VERSION_1,
+                SceneLimits::VERSION_1,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn recording_audio_clip_addition_rejects_stale_and_mismatched_authority() {
+        let mut source: Value = serde_json::from_slice(TRACK).unwrap();
+        source["clip_ids"] = json!([]);
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [&source];
+        let loaded = load(input(TIMELINE, &tracks, &[], None), LoaderLimits::VERSION_1).unwrap();
+        let call = |track: &[u8], assets: &[MediaAssetFact<'_>], clip_id: &str, limits| {
+            serialize_recording_audio_clip_addition(
+                &loaded,
+                assets,
+                track,
+                "018f47a2-6b2d-7c11-8a44-001122334456",
+                "018f47a2-6b2d-7c11-8a44-001122334457",
+                0,
+                100,
+                clip_id,
+                "Recorded Take",
+                limits,
+            )
+        };
+
+        let pretty =
+            serde_json::to_vec_pretty(&serde_json::from_slice::<Value>(&source).unwrap()).unwrap();
+        assert!(matches!(
+            call(
+                &pretty,
+                &asset_facts(),
+                "018f47a2-6b2d-7c11-8a44-001122334469",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipAdditionSerializationError::NonCanonicalTrack)
+        ));
+        let mismatched = [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
+            sample_rate_hz: 48_000,
+            frame_count: 99,
+        }];
+        assert!(matches!(
+            call(
+                &source,
+                &mismatched,
+                "018f47a2-6b2d-7c11-8a44-001122334469",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipAdditionSerializationError::AssetMismatch)
+        ));
+        assert!(matches!(
+            call(
+                &source,
+                &asset_facts(),
+                "018f47a2-6b2d-7c11-8a44-001122334457",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipAdditionSerializationError::InvalidClipIdentity)
+        ));
+        assert!(matches!(
+            call(
+                &source,
+                &asset_facts(),
+                "018f47a2-6b2d-7c11-8a44-001122334469",
+                LoaderLimits {
+                    max_clip_documents: 0,
+                    ..LoaderLimits::VERSION_1
+                },
+            ),
+            Err(AudioClipAdditionSerializationError::ClipCapacity)
+        ));
+    }
+
+    #[test]
+    fn recording_audio_clip_duration_rounds_forward_across_tempo_boundaries() {
+        let timeline = br#"{
+            "format":"hyper-timeline","format_version":1,
+            "id":"018f47a2-6b2d-7c11-8a44-001122334458","project_id":"018f47a2-6b2d-7c11-8a44-001122334455",
+            "ticks_per_quarter":1920,
+            "tempo_events":[
+                {"tick":0,"microseconds_per_quarter":1000000},
+                {"tick":2,"microseconds_per_quarter":500000}
+            ],
+            "meter_events":[{"tick":0,"numerator":4,"denominator":4}],
+            "extensions":{}
+        }"#;
+        let mut source: Value = serde_json::from_slice(TRACK).unwrap();
+        source["clip_ids"] = json!([]);
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [&source];
+        let loaded = load(input(timeline, &tracks, &[], None), LoaderLimits::VERSION_1).unwrap();
+        let assets = [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
+            sample_rate_hz: 48_000,
+            frame_count: 63,
+        }];
+
+        let documents = serialize_recording_audio_clip_addition(
+            &loaded,
+            &assets,
+            &source,
+            "018f47a2-6b2d-7c11-8a44-001122334456",
+            "018f47a2-6b2d-7c11-8a44-001122334457",
+            0,
+            63,
+            "018f47a2-6b2d-7c11-8a44-001122334469",
+            "Tempo Crossing",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        assert_eq!(documents.duration_ticks(), 4);
+        let clip: Value = serde_json::from_slice(documents.clip()).unwrap();
+        assert_eq!(
+            clip["warp_markers"][1],
+            json!({"tick": 4, "source_frame_offset": 63})
         );
     }
 
