@@ -4228,6 +4228,43 @@ mod tests {
             fixture.mixer
         );
         assert_eq!(fixture.transaction_count(), 0);
+
+        let mixer_fixture = AudioTrackFixture::new();
+        publish_audio_track(&mixer_fixture.root, mixer_fixture.request()).unwrap();
+        let mut unrelated_mixer: Value =
+            serde_json::from_slice(&mixer_fixture.original_mixer).unwrap();
+        unrelated_mixer["main"]["gain_millionths"] = 750_000.into();
+        let unrelated_mixer = serde_json_canonicalizer::to_vec(&unrelated_mixer).unwrap();
+        let identity = *verify_project_package(&mixer_fixture.root)
+            .unwrap()
+            .manifest_sha256();
+
+        let error = remove_audio_track(
+            &mixer_fixture.root,
+            AudioTrackRemovalRequest {
+                expected_project_sha256: identity,
+                track_id: NEW_TRACK_ID,
+                mixer_id: &mixer_fixture.mixer_id,
+                mixer_bytes: &unrelated_mixer,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::InvalidResource
+        );
+        assert!(
+            mixer_fixture
+                .root
+                .join(format!("tracks/{NEW_TRACK_ID}.json"))
+                .exists()
+        );
+        assert_eq!(
+            fs::read(mixer_fixture.root.join("mixer/main.json")).unwrap(),
+            mixer_fixture.mixer
+        );
+        assert_eq!(mixer_fixture.transaction_count(), 0);
     }
 
     #[test]

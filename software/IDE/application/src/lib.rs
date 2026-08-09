@@ -13,7 +13,7 @@ use hyper_audio_engine::{
     LinearGain, LoudnessMeasurementCommand, Pan, ParameterError, StereoSineTestToneConfigError,
 };
 use hyper_audio_source::{DecodeError, DecodeLimits};
-use hyper_control_mappings::{ControlScope, ControlTarget};
+use hyper_control_mappings::{ControlBinding, ControlScope, ControlTarget};
 use hyper_desktop_audio::{
     CaptureStreamSnapshot, DesktopAudioPreviewCommandError, DesktopAudioPreviewControlError,
     DesktopAudioPreviewSnapshot, DesktopDirectControlError, DesktopInputConfig,
@@ -2544,15 +2544,22 @@ impl RunningDesktopIdeApplication {
                 IdeProjectSaveError::ProjectSnapshotUnavailable,
             ))
         })?;
-        let (project, _, _, media) = prepared.session().parts();
+        let (project, mixer, _, media) = prepared.session().parts();
         let playback = project.audio_track_removal_blockers(track_id);
+        let track_slot = mixer
+            .slots()
+            .iter()
+            .find(|slot| slot.track_id() == track_id);
         let control_mappings = prepared.control_mapping().map_or(0, |mapping| {
             mapping
                 .bindings()
                 .iter()
                 .filter(|binding| {
-                    matches!(binding.scope(), ControlScope::Track { track_id: id } if id == track_id)
-                        || matches!(binding.target(), ControlTarget::MixerChannel { track_id: id, .. } if id == track_id)
+                    control_binding_references_audio_track(binding, track_id, |send_id| {
+                        track_slot.is_some_and(|slot| {
+                            slot.sends().iter().any(|send| send.id() == send_id)
+                        })
+                    })
                 })
                 .count()
         });
@@ -3323,6 +3330,22 @@ impl RunningDesktopIdeApplication {
     }
 }
 
+fn control_binding_references_audio_track(
+    binding: &ControlBinding,
+    track_id: &str,
+    send_owned_by_track: impl Fn(&str) -> bool,
+) -> bool {
+    matches!(binding.scope(), ControlScope::Track { track_id: id } if id == track_id)
+        || match binding.target() {
+            ControlTarget::MixerChannel { track_id: id, .. } => id == track_id,
+            ControlTarget::MixerSend { send_id, .. } => send_owned_by_track(send_id),
+            ControlTarget::MixerMain { .. }
+            | ControlTarget::MixerCue { .. }
+            | ControlTarget::Scene { .. }
+            | ControlTarget::Transport { .. } => false,
+        }
+}
+
 fn ide_mixer_main_state(
     state: &hyper_mixer_runtime::MixerParameterStateSnapshot,
 ) -> IdeMixerMainState {
@@ -3598,6 +3621,9 @@ fn try_input_owned(value: &str) -> Result<String, InputInventoryError> {
 mod tests {
     use super::*;
     use hyper_audio_source::DecodeLimits;
+    use hyper_control_mappings::{
+        ChannelParameter, ControlSource, ControlTransform, SendParameter,
+    };
     use hyper_media_cache::CacheLimits;
     use hyper_playback_json::LoaderLimits;
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
@@ -3787,6 +3813,58 @@ mod tests {
             limits.session.media_cache.max_decoded_sample_bytes
                 >= limits.audio.max_decoded_sample_bytes()
         );
+    }
+
+    #[test]
+    fn audio_track_mapping_references_include_owned_mixer_sends() {
+        let transform = ControlTransform::Linear {
+            input_min: -1_000_000,
+            input_max: 1_000_000,
+            output_min: 0,
+            output_max: 1_000_000,
+        };
+        let track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
+        let send_id = "018f47a2-6b2d-7c11-8a44-001122334457";
+        let send = ControlBinding::try_new(
+            "018f47a2-6b2d-7c11-8a44-001122334458".to_owned(),
+            true,
+            ControlSource::CvInput { input_index: 0 },
+            ControlScope::MixerPage,
+            transform,
+            ControlTarget::MixerSend {
+                send_id: send_id.to_owned(),
+                parameter: SendParameter::Gain,
+            },
+        )
+        .unwrap();
+        let channel = ControlBinding::try_new(
+            "018f47a2-6b2d-7c11-8a44-001122334459".to_owned(),
+            true,
+            ControlSource::CvInput { input_index: 1 },
+            ControlScope::Global,
+            transform,
+            ControlTarget::MixerChannel {
+                track_id: track_id.to_owned(),
+                parameter: ChannelParameter::Gain,
+            },
+        )
+        .unwrap();
+
+        assert!(control_binding_references_audio_track(
+            &send,
+            track_id,
+            |candidate| candidate == send_id
+        ));
+        assert!(!control_binding_references_audio_track(
+            &send,
+            track_id,
+            |_| false
+        ));
+        assert!(control_binding_references_audio_track(
+            &channel,
+            track_id,
+            |_| false
+        ));
     }
 
     #[test]

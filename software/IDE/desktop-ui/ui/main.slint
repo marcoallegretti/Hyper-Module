@@ -116,7 +116,7 @@ export global IdeActions {
     callback mixer-send-enabled(int);
     callback save-project();
     callback add-audio-track(string);
-    callback remove-audio-track(int);
+    callback remove-audio-track(string);
     callback rename-audio-track(int, string);
     callback set-audio-track-active(int, bool);
     callback start-recording();
@@ -231,7 +231,7 @@ export component MainWindow inherits Window {
     in-out property <string> rename-track-original-name: "";
     in-out property <string> rename-track-name: "";
     in-out property <bool> remove-track-visible: false;
-    in-out property <int> remove-track-index: -1;
+    in-out property <string> remove-track-id: "";
     in-out property <string> remove-track-name: "";
     in-out property <bool> mixer-sends-visible: false;
     in-out property <bool> takes-visible: false;
@@ -820,12 +820,20 @@ export component MainWindow inherits Window {
                         Text { text: "This cannot be undone. Removal is accepted only when no clips, child tracks, scenes, arrangement placements, control mappings, recordings, or mixer routes reference this track, and while the project contains no automation."; color: #aebccc; font-size: 11px; wrap: word-wrap; }
                         HorizontalLayout {
                             spacing: 8px;
-                            Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.remove-track-visible = false; } }
+                            Button {
+                                text: "Cancel";
+                                enabled: root.app-mode == AppMode.running;
+                                clicked => {
+                                    root.remove-track-visible = false;
+                                    root.remove-track-id = "";
+                                    root.remove-track-name = "";
+                                }
+                            }
                             Button {
                                 horizontal-stretch: 1;
                                 text: root.app-mode == AppMode.removing-track ? "Removing track..." : "Remove empty track";
-                                enabled: root.app-mode == AppMode.running && root.remove-track-index >= 0;
-                                clicked => { IdeActions.remove-audio-track(root.remove-track-index); }
+                                enabled: root.app-mode == AppMode.running && root.remove-track-id != "";
+                                clicked => { IdeActions.remove-audio-track(root.remove-track-id); }
                             }
                         }
                         Rectangle { vertical-stretch: 1; background: transparent; }
@@ -931,7 +939,7 @@ export component MainWindow inherits Window {
                                     text: "Remove";
                                     enabled: root.app-mode == AppMode.running && channel.removable;
                                     clicked => {
-                                        root.remove-track-index = channel.index;
+                                        root.remove-track-id = channel.track-id;
                                         root.remove-track-name = channel.name;
                                         root.remove-track-visible = true;
                                     }

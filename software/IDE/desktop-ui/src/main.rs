@@ -773,26 +773,22 @@ fn bind_audio_track_removal_callback(ui: &MainWindow, worker: &WorkerCell) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_removal = Rc::clone(worker);
-    actions.on_remove_audio_track(move |index| {
+    actions.on_remove_audio_track(move |track_id| {
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        let Ok((_, row)) =
-            validate_mixer_channel(ui.get_app_mode(), index, &ui.get_mixer_channels())
-        else {
+        let Ok(track_id) = validate_audio_track_removal(
+            ui.get_app_mode(),
+            track_id.as_str(),
+            &ui.get_mixer_channels(),
+        ) else {
             ui.set_error_text("The selected audio track is no longer available".into());
             return;
         };
-        if !row.removable {
-            ui.set_error_text("Only audio tracks can be removed".into());
-            return;
-        }
         submit_to_ui(
             &ui,
             &worker_for_removal,
-            IdeWorkerCommand::RemoveAudioTrack {
-                track_id: row.track_id.to_string(),
-            },
+            IdeWorkerCommand::RemoveAudioTrack { track_id },
         );
     });
 }
@@ -1376,7 +1372,7 @@ fn apply_audio_track_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::AudioTrackRemoved { revision } => {
             ui.set_remove_track_visible(false);
-            ui.set_remove_track_index(-1);
+            ui.set_remove_track_id(SharedString::default());
             ui.set_remove_track_name(SharedString::default());
             ui.set_status_text(
                 format!("Empty audio track removed in project revision {revision}").into(),
@@ -2247,7 +2243,7 @@ fn reset_project(
     ui.set_new_track_name("Audio 2".into());
     ui.set_rename_track_visible(false);
     ui.set_remove_track_visible(false);
-    ui.set_remove_track_index(-1);
+    ui.set_remove_track_id(SharedString::default());
     ui.set_remove_track_name(SharedString::default());
     ui.set_rename_track_index(-1);
     ui.set_rename_track_original_name(SharedString::default());
@@ -2491,6 +2487,24 @@ fn validate_mixer_channel(
         return Err(MixerControlFailure::StateUnavailable);
     }
     Ok((channel_index, row))
+}
+
+fn validate_audio_track_removal(
+    mode: AppMode,
+    track_id: &str,
+    channels: &ModelRc<MixerChannelRow>,
+) -> Result<String, MixerControlFailure> {
+    if track_id.is_empty() {
+        return Err(MixerControlFailure::InvalidSelection);
+    }
+    let row = (0..channels.row_count())
+        .filter_map(|index| channels.row_data(index))
+        .find(|row| row.track_id.as_str() == track_id)
+        .ok_or(MixerControlFailure::StaleSelection)?;
+    if mode != AppMode::Running || !row.state_available || !row.removable {
+        return Err(MixerControlFailure::StateUnavailable);
+    }
+    Ok(row.track_id.to_string())
 }
 
 #[allow(
@@ -3070,9 +3084,9 @@ mod tests {
 
     #[test]
     fn mixer_controls_require_current_observed_rows_and_bounded_values() {
-        let channels = ModelRc::from(Rc::new(VecModel::from(vec![MixerChannelRow {
-            index: 0,
-            track_id: "018f47a2-6b2d-7c11-8a44-001122334456".into(),
+        let row = |index, track_id: &str| MixerChannelRow {
+            index,
+            track_id: track_id.into(),
             name: "Audio channel".into(),
             display_name: "Audio".into(),
             kind: "AUDIO".into(),
@@ -3086,7 +3100,10 @@ mod tests {
             removable: true,
             active: true,
             activation_toggleable: true,
-        }])));
+        };
+        let track_a = "018f47a2-6b2d-7c11-8a44-001122334456";
+        let track_b = "018f47a2-6b2d-7c11-8a44-001122334457";
+        let channels = ModelRc::from(Rc::new(VecModel::from(vec![row(0, track_a)])));
         assert!(validate_mixer_channel(AppMode::Running, 0, &channels).is_ok());
         assert_eq!(
             validate_mixer_channel(AppMode::Closed, 0, &channels).unwrap_err(),
@@ -3099,6 +3116,22 @@ mod tests {
         assert_eq!(
             validate_mixer_channel(AppMode::Running, -1, &channels).unwrap_err(),
             MixerControlFailure::InvalidSelection
+        );
+        let reordered = ModelRc::from(Rc::new(VecModel::from(vec![
+            row(0, track_b),
+            row(1, track_a),
+        ])));
+        assert_eq!(
+            validate_audio_track_removal(AppMode::Running, track_a, &reordered).unwrap(),
+            track_a
+        );
+        assert_eq!(
+            validate_audio_track_removal(
+                AppMode::Running,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                &reordered,
+            ),
+            Err(MixerControlFailure::StaleSelection)
         );
         assert_eq!(gain_percent_to_millionths(0.0), Ok(0));
         assert_eq!(gain_percent_to_millionths(125.5), Ok(1_255_000));

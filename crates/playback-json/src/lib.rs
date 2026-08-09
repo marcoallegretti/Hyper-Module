@@ -4461,8 +4461,9 @@ mod tests {
     fn audio_track_removal_reports_structural_references() {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [SCENE];
         let loaded = load(
-            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(ARRANGEMENT)),
             LoaderLimits::VERSION_1,
         )
         .unwrap();
@@ -4481,6 +4482,7 @@ mod tests {
             error,
             AudioTrackRemovalSerializationError::Blocked(AudioTrackRemovalBlockers {
                 clip_references: 1,
+                scene_slots: 1,
                 arrangement_placements: 1,
                 ..
             })
