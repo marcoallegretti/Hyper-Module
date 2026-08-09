@@ -56,4 +56,23 @@ fn compiled_tick_placement_renders_through_the_clip_engine() {
     assert_eq!(output.len(), 150);
     assert_eq!(&output[..100], &source.plane(0).unwrap()[2..102]);
     assert_eq!(&output[100..], &source.plane(0).unwrap()[27..77]);
+
+    let unfolded = compile_placement(
+        timeline,
+        clip,
+        PlacementCompileSpec {
+            enabled: true,
+            start_tick: 0,
+            clip_start_tick: 5,
+            duration_ticks: 6,
+        },
+    )
+    .unwrap();
+    let (plan, placement) = unfolded.prepare(&source).unwrap();
+    let rendered = plan.render_offline(placement).unwrap();
+    let output = rendered.plane(0).unwrap();
+
+    assert_eq!(&output[..50], &source.plane(0).unwrap()[52..102]);
+    assert_eq!(&output[50..125], &source.plane(0).unwrap()[27..102]);
+    assert_eq!(&output[125..], &source.plane(0).unwrap()[27..52]);
 }

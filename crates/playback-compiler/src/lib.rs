@@ -752,7 +752,7 @@ pub fn compile_placement(
         .source_start_frame
         .checked_add(clip.source_frame_count)
         .ok_or(CompileError::ArithmeticOverflow)?;
-    let clip_start_frame = clip_tick_to_frame(clip, placement.clip_start_tick)?;
+    let clip_start_frame = clip_unfolded_tick_to_frame(clip, placement.clip_start_tick)?;
     let frame_count = clip_tick_span_to_frames(clip, placement.duration_ticks)?;
     let arrangement_start_frame = timeline.tick_to_frame(placement.start_tick)?;
     let arrangement_end_frame = timeline.tick_to_frame(placement_end_tick)?;
@@ -986,11 +986,7 @@ fn validate_placement(
         .clip_start_tick
         .checked_add(placement.duration_ticks)
         .ok_or(CompileError::ArithmeticOverflow)?;
-    if clip.loop_enabled {
-        if placement.clip_start_tick >= clip.loop_range.end {
-            return Err(CompileError::InvalidPlacement);
-        }
-    } else if clip_requested_end > clip.duration_ticks {
+    if !clip.loop_enabled && clip_requested_end > clip.duration_ticks {
         return Err(CompileError::InvalidPlacement);
     }
     Ok(())
@@ -1020,6 +1016,13 @@ fn clip_tick_to_frame(clip: ClipCompileSpec<'_>, tick: u64) -> Result<usize, Com
     if tick > clip.duration_ticks {
         return Err(CompileError::InvalidPlacement);
     }
+    exact_clip_ratio_frames(clip, tick)
+}
+
+fn clip_unfolded_tick_to_frame(
+    clip: ClipCompileSpec<'_>,
+    tick: u64,
+) -> Result<usize, CompileError> {
     exact_clip_ratio_frames(clip, tick)
 }
 
@@ -1291,6 +1294,23 @@ mod tests {
                 frame_count: 250
             }
         );
+
+        let unfolded = compile_placement(
+            timeline(&tempos),
+            clip,
+            PlacementCompileSpec {
+                clip_start_tick: 10,
+                ..offset_placement
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            unfolded.placement_spec(),
+            PlacementSpec {
+                clip_start_frame: 250,
+                frame_count: 250
+            }
+        );
     }
 
     #[test]
@@ -1504,8 +1524,10 @@ mod tests {
 
         let mut invalid_placement = placement();
         invalid_placement.clip_start_tick = valid_clip.loop_range.end;
+        let mut non_looping_clip = valid_clip;
+        non_looping_clip.loop_enabled = false;
         assert_eq!(
-            compile_placement(timeline(&tempos), valid_clip, invalid_placement),
+            compile_placement(timeline(&tempos), non_looping_clip, invalid_placement),
             Err(CompileError::InvalidPlacement)
         );
 

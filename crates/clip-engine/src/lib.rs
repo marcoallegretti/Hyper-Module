@@ -290,6 +290,10 @@ impl<'a> ClipRenderPlan<'a> {
 
     /// Validates placement offset, length, and loop extension rules.
     ///
+    /// A looped placement keeps its offset unfolded. Rendering folds every
+    /// local frame into the loop range, so an offset beyond the first pass
+    /// remains reversible when an editor later extends the placement front.
+    ///
     /// # Errors
     ///
     /// Returns [`ClipPlanError::InvalidPlacement`] for an empty or out-of-range
@@ -302,14 +306,8 @@ impl<'a> ClipRenderPlan<'a> {
             .clip_start_frame
             .checked_add(spec.frame_count)
             .ok_or(ClipPlanError::ArithmeticOverflow)?;
-        match self.loop_range {
-            None if requested_end > self.duration_frames() => {
-                return Err(ClipPlanError::InvalidPlacement);
-            }
-            Some(loop_range) if spec.clip_start_frame >= loop_range.end => {
-                return Err(ClipPlanError::InvalidPlacement);
-            }
-            _ => {}
+        if self.loop_range.is_none() && requested_end > self.duration_frames() {
+            return Err(ClipPlanError::InvalidPlacement);
         }
         Ok(ClipPlacement {
             clip_start_frame: spec.clip_start_frame,
@@ -582,6 +580,14 @@ mod tests {
             })
             .unwrap();
         assert_samples(&render(&plan, offset), &[4.0, 2.0, 3.0, 4.0, 2.0]);
+
+        let unfolded_offset = plan
+            .place(PlacementSpec {
+                clip_start_frame: 8,
+                frame_count: 5,
+            })
+            .unwrap();
+        assert_samples(&render(&plan, unfolded_offset), &[2.0, 3.0, 4.0, 2.0, 3.0]);
     }
 
     #[test]
