@@ -484,12 +484,6 @@ fn build_playback_arrangement(
         .map_err(|_| PlaybackSessionAssemblyError::ArrangementCapacityUnavailable)?;
     let mut end_frame = 0;
     for entry in entries {
-        let enabled = project
-            .arrangement_placement_enabled(&entry.placement_id)
-            .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?;
-        let start_tick = project
-            .arrangement_placement_start_tick(&entry.placement_id)
-            .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?;
         let start_frame = entry.compiled.arrangement_start_frame();
         let placement_end_frame = entry.compiled.arrangement_end_frame();
         end_frame = end_frame.max(placement_end_frame);
@@ -497,10 +491,10 @@ fn build_playback_arrangement(
             id: entry.placement_id,
             track_index: entry.track_index,
             clip_index: entry.clip_index,
-            start_tick,
+            start_tick: entry.placement_start_tick,
             start_frame,
             end_frame: placement_end_frame,
-            enabled,
+            enabled: entry.placement_enabled,
             active: entry.compiled.clip_spec().enabled,
         });
     }

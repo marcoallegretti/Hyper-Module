@@ -2274,33 +2274,6 @@ impl LoadedPlaybackProject {
             .map_or(0, |arrangement| arrangement.placements.len())
     }
 
-    /// Returns the persisted activation state of one arrangement placement.
-    ///
-    /// This is intentionally distinct from compiled playback activity, which
-    /// also depends on the arrangement, owning track, and clip being enabled.
-    #[must_use]
-    pub fn arrangement_placement_enabled(&self, placement_id: &str) -> Option<bool> {
-        self.arrangement.as_ref().and_then(|arrangement| {
-            arrangement
-                .placements
-                .iter()
-                .find(|placement| placement.id == placement_id)
-                .map(|placement| placement.enabled)
-        })
-    }
-
-    /// Returns the exact persisted timeline start of one arrangement placement.
-    #[must_use]
-    pub fn arrangement_placement_start_tick(&self, placement_id: &str) -> Option<u64> {
-        self.arrangement.as_ref().and_then(|arrangement| {
-            arrangement
-                .placements
-                .iter()
-                .find(|placement| placement.id == placement_id)
-                .map(|placement| placement.start_tick)
-        })
-    }
-
     /// Loads and resolves one strict version 1 mixer resource against this
     /// project's structural tracks and complete verified asset inventory.
     /// `assets` must contain every asset declared by the enclosing package;
@@ -2391,6 +2364,8 @@ impl LoadedPlaybackProject {
 #[derive(Clone, Debug, PartialEq)]
 pub struct OwnedScheduleEntry {
     pub placement_id: String,
+    pub placement_start_tick: u64,
+    pub placement_enabled: bool,
     pub track_id: String,
     pub track_index: usize,
     pub clip_id: String,
@@ -4179,6 +4154,31 @@ fn build_schedule_identity_index<'a>(
     Ok(index)
 }
 
+fn build_schedule_placement_metadata_index(
+    project: &LoadedPlaybackProject,
+) -> Result<HashMap<&str, (u64, bool)>, AdapterCompileError> {
+    let placements = project
+        .arrangement
+        .as_ref()
+        .map_or(&[][..], |arrangement| arrangement.placements.as_slice());
+    let mut index = HashMap::new();
+    index
+        .try_reserve(placements.len())
+        .map_err(|_| AdapterCompileError::CapacityUnavailable)?;
+    for placement in placements {
+        if index
+            .insert(
+                placement.id.as_str(),
+                (placement.start_tick, placement.enabled),
+            )
+            .is_some()
+        {
+            return Err(AdapterCompileError::InconsistentCompiledGraph);
+        }
+    }
+    Ok(index)
+}
+
 fn own_schedule(
     project: &LoadedPlaybackProject,
     compiled: &CompiledSchedule<'_>,
@@ -4187,6 +4187,7 @@ fn own_schedule(
         build_schedule_identity_index(project.tracks.iter().map(|track| track.id.as_str()))?;
     let clip_indexes =
         build_schedule_identity_index(project.clips.iter().map(|clip| clip.id.as_str()))?;
+    let placement_metadata = build_schedule_placement_metadata_index(project)?;
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(compiled.entries().len())
@@ -4200,8 +4201,14 @@ fn own_schedule(
             .get(entry.clip_id)
             .copied()
             .ok_or(AdapterCompileError::InconsistentCompiledGraph)?;
+        let (placement_start_tick, placement_enabled) = placement_metadata
+            .get(entry.placement_id)
+            .copied()
+            .ok_or(AdapterCompileError::InconsistentCompiledGraph)?;
         entries.push(OwnedScheduleEntry {
             placement_id: try_owned(entry.placement_id)?,
+            placement_start_tick,
+            placement_enabled,
             track_id: try_owned(entry.track_id)?,
             track_index,
             clip_id: try_owned(entry.clip_id)?,
@@ -4699,8 +4706,15 @@ mod tests {
     fn loads_and_compiles_the_explicit_playback_documents() {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];
+        let arrangement = String::from_utf8(ARRANGEMENT.to_vec())
+            .unwrap()
+            .replace("\"start_tick\":0", "\"start_tick\":8")
+            .replace(
+                "\"duration_ticks\":4,\"enabled\":true",
+                "\"duration_ticks\":4,\"enabled\":false",
+            );
         let loaded = load(
-            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            input(TIMELINE, &tracks, &clips, Some(arrangement.as_bytes())),
             LoaderLimits::VERSION_1,
         )
         .unwrap();
@@ -4727,6 +4741,8 @@ mod tests {
             .unwrap();
         assert_eq!(schedule.entries()[0].track_index, 0);
         assert_eq!(schedule.entries()[0].clip_index, 0);
+        assert_eq!(schedule.entries()[0].placement_start_tick, 8);
+        assert!(!schedule.entries()[0].placement_enabled);
         assert_eq!(schedule.project_id(), PROJECT_ID);
         assert_eq!(schedule.entries().len(), 1);
         assert_eq!(
