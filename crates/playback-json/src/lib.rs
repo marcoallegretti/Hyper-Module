@@ -270,7 +270,7 @@ struct LoadedClip {
     warp_markers: Vec<WarpMarker>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LoadedPlacement {
     id: String,
     track_id: String,
@@ -303,14 +303,14 @@ struct LoadedScene {
     slots: Vec<LoadedSceneSlot>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LoadedSceneLaunch {
     id: String,
     tick: u64,
     scene_id: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LoadedArrangement {
     id: String,
     enabled: bool,
@@ -547,6 +547,17 @@ pub enum AudioTrackDocumentSerializationError {
     Serialization(serde_json::Error),
 }
 
+#[derive(Debug)]
+pub enum ArrangementPlacementActivationSerializationError {
+    Source(LoadError),
+    NonCanonicalSource,
+    ArrangementMissing,
+    SourceArrangementMismatch,
+    PlacementMissing,
+    InvalidDocumentShape,
+    Serialization(serde_json::Error),
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AudioTrackRemovalBlockers {
     pub clip_references: usize,
@@ -667,6 +678,43 @@ impl Error for AudioTrackDocumentSerializationError {
             | Self::TrackMissing
             | Self::TrackNotAudio
             | Self::SourceTrackMismatch
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
+impl fmt::Display for ArrangementPlacementActivationSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => source.fmt(formatter),
+            Self::NonCanonicalSource => {
+                formatter.write_str("source arrangement is not canonical RFC 8785 JSON")
+            }
+            Self::ArrangementMissing => {
+                formatter.write_str("the project has no arrangement resource")
+            }
+            Self::SourceArrangementMismatch => formatter
+                .write_str("source arrangement bytes do not match the loaded project structure"),
+            Self::PlacementMissing => {
+                formatter.write_str("the selected arrangement placement is not present")
+            }
+            Self::InvalidDocumentShape => {
+                formatter.write_str("source arrangement shape changed after typed validation")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ArrangementPlacementActivationSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::NonCanonicalSource
+            | Self::ArrangementMissing
+            | Self::SourceArrangementMismatch
+            | Self::PlacementMissing
             | Self::InvalidDocumentShape => None,
         }
     }
@@ -1326,6 +1374,79 @@ pub fn serialize_audio_track_activation(
     serialize_audio_track_document_edit(project, source_track, track_id, limits, |document| {
         document.insert("active".to_owned(), active.into());
     })
+}
+
+/// Replaces only the activation state of one placement in a validated
+/// canonical arrangement document while preserving timing, ownership, scene
+/// launches, and namespaced extensions.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the project has no arrangement, the
+/// placement is absent, the supplied bytes disagree with the loaded project,
+/// or the resulting document fails version-1 validation.
+pub fn serialize_arrangement_placement_activation(
+    project: &LoadedPlaybackProject,
+    source_arrangement: &[u8],
+    placement_id: &str,
+    active: bool,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, ArrangementPlacementActivationSerializationError> {
+    let current = project
+        .arrangement
+        .as_ref()
+        .ok_or(ArrangementPlacementActivationSerializationError::ArrangementMissing)?;
+    if !current
+        .placements
+        .iter()
+        .any(|placement| placement.id == placement_id)
+    {
+        return Err(ArrangementPlacementActivationSerializationError::PlacementMissing);
+    }
+    let source = load_arrangement(
+        source_arrangement,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_placements,
+        limits.max_scene_launches,
+    )
+    .map_err(ArrangementPlacementActivationSerializationError::Source)?;
+    if &source != current {
+        return Err(ArrangementPlacementActivationSerializationError::SourceArrangementMismatch);
+    }
+
+    let mut value: Value = serde_json::from_slice(source_arrangement)
+        .map_err(ArrangementPlacementActivationSerializationError::Serialization)?;
+    let canonical_source = serde_json_canonicalizer::to_vec(&value)
+        .map_err(ArrangementPlacementActivationSerializationError::Serialization)?;
+    if canonical_source != source_arrangement {
+        return Err(ArrangementPlacementActivationSerializationError::NonCanonicalSource);
+    }
+    let placements = value
+        .get_mut("placements")
+        .and_then(Value::as_array_mut)
+        .ok_or(ArrangementPlacementActivationSerializationError::InvalidDocumentShape)?;
+    let document = placements
+        .iter_mut()
+        .find(|placement| placement.get("id").and_then(Value::as_str) == Some(placement_id))
+        .and_then(Value::as_object_mut)
+        .ok_or(ArrangementPlacementActivationSerializationError::InvalidDocumentShape)?;
+    document.insert("enabled".to_owned(), active.into());
+    let output = serde_json_canonicalizer::to_vec(&value)
+        .map_err(ArrangementPlacementActivationSerializationError::Serialization)?;
+    let edited = load_arrangement(
+        &output,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_placements,
+        limits.max_scene_launches,
+    )
+    .map_err(ArrangementPlacementActivationSerializationError::Source)?;
+    let mut edited_project = project.clone();
+    edited_project.arrangement = Some(edited);
+    validate_loaded_identities(&edited_project)
+        .map_err(ArrangementPlacementActivationSerializationError::Source)?;
+    Ok(output)
 }
 
 fn serialize_audio_track_document_edit(
@@ -4756,6 +4877,119 @@ mod tests {
             .unwrap(),
             source
         );
+    }
+
+    #[test]
+    fn arrangement_placement_activation_changes_only_the_selected_field() {
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["extensions"]["org.example.arrangement"] = json!({"opaque": [1, 2, 3]});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
+
+        let inactive = serialize_arrangement_placement_activation(
+            &loaded,
+            &source,
+            placement_id,
+            false,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut expected: Value = serde_json::from_slice(&source).unwrap();
+        expected["placements"][0]["enabled"] = false.into();
+
+        assert_eq!(
+            inactive,
+            serde_json_canonicalizer::to_vec(&expected).unwrap()
+        );
+        assert_eq!(
+            expected["extensions"]["org.example.arrangement"],
+            json!({"opaque": [1, 2, 3]})
+        );
+        assert_eq!(
+            serialize_arrangement_placement_activation(
+                &loaded,
+                &source,
+                placement_id,
+                true,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn arrangement_placement_activation_rejects_missing_stale_and_noncanonical_inputs() {
+        let source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        let canonical = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&canonical)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let placement_id = "018f47a2-6b2d-7c11-8a44-001122334464";
+
+        assert!(matches!(
+            serialize_arrangement_placement_activation(
+                &loaded,
+                &canonical,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                false,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementActivationSerializationError::PlacementMissing)
+        ));
+
+        let mut stale = source.clone();
+        stale["enabled"] = false.into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_activation(
+                &loaded,
+                &stale,
+                placement_id,
+                false,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementActivationSerializationError::SourceArrangementMismatch)
+        ));
+
+        let noncanonical = serde_json::to_vec_pretty(&source).unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_activation(
+                &loaded,
+                &noncanonical,
+                placement_id,
+                false,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementActivationSerializationError::NonCanonicalSource)
+        ));
+
+        let project_without_arrangement = load(
+            input(TIMELINE, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_activation(
+                &project_without_arrangement,
+                &canonical,
+                placement_id,
+                false,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementActivationSerializationError::ArrangementMissing)
+        ));
     }
 
     #[test]
