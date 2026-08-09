@@ -29,13 +29,14 @@ pub use recording_import::{
     import_recording, recover_recording_imports,
 };
 pub use resource_publication::{
-    AudioTrackPublicationOutcome, AudioTrackPublicationRecovery,
+    ArrangementPublicationRequest, AudioTrackPublicationOutcome, AudioTrackPublicationRecovery,
     AudioTrackPublicationRecoveryDisposition, AudioTrackPublicationRequest,
     AudioTrackRemovalOutcome, AudioTrackRemovalRequest, ProjectResourcePublicationError,
     ProjectResourcePublicationErrorKind, ProjectResourcePublicationOutcome,
     ProjectResourcePublicationRecovery, ProjectResourcePublicationRecoveryDisposition,
-    ProjectResourcePublicationRequest, publish_audio_track, publish_project_resource,
-    recover_audio_track_publications, recover_project_resource_publications, remove_audio_track,
+    ProjectResourcePublicationRequest, publish_arrangement, publish_audio_track,
+    publish_project_resource, recover_audio_track_publications,
+    recover_project_resource_publications, remove_audio_track,
 };
 
 use core::error::Error;

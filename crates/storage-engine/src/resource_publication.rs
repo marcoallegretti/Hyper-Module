@@ -6,7 +6,7 @@ use std::path::Path;
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::fs::{Dir, OpenOptions};
-use hyper_project_model::{ProjectManifest, ResourceDescriptor, ResourceRole};
+use hyper_project_model::{ProjectManifest, ResourceDescriptor, ResourceRole, is_valid_entity_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -41,6 +41,13 @@ pub struct ProjectResourcePublicationRequest<'a> {
     pub resource_id: &'a str,
     pub expected_role: ResourceRole,
     pub resource_bytes: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ArrangementPublicationRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub arrangement_id: &'a str,
+    pub arrangement_bytes: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,8 +278,19 @@ struct TransactionRecord {
     resource_id: String,
     resource_role: String,
     resource: TransactionFile,
-    previous_resource: TransactionFile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_resource: Option<TransactionFile>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    created_parent_directory: bool,
     extensions: serde_json::Map<String, Value>,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a shared-reference predicate"
+)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -324,6 +342,12 @@ enum PublicationPhase {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectResourcePublicationMode {
+    Replacement,
+    ArrangementAddition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AudioTrackPublicationPhase {
     Transaction,
     Track,
@@ -343,7 +367,37 @@ pub fn publish_project_resource(
     project_path: impl AsRef<Path>,
     request: ProjectResourcePublicationRequest<'_>,
 ) -> Result<ProjectResourcePublicationOutcome, ProjectResourcePublicationError> {
-    publish_project_resource_observed(project_path.as_ref(), request, |_, _| Ok(()))
+    publish_project_resource_observed(
+        project_path.as_ref(),
+        request,
+        ProjectResourcePublicationMode::Replacement,
+        |_, _| Ok(()),
+    )
+}
+
+/// Publishes the first arrangement resource in a project through the existing
+/// serialized, recoverable manifest-last resource transaction family.
+///
+/// # Errors
+///
+/// Returns a classified validation, conflict, integrity, I/O, or recovery
+/// error. Publication is rejected if any arrangement is already declared or
+/// if the new stable identity or managed path collides with project content.
+pub fn publish_arrangement(
+    project_path: impl AsRef<Path>,
+    request: ArrangementPublicationRequest<'_>,
+) -> Result<ProjectResourcePublicationOutcome, ProjectResourcePublicationError> {
+    publish_project_resource_observed(
+        project_path.as_ref(),
+        ProjectResourcePublicationRequest {
+            expected_project_sha256: request.expected_project_sha256,
+            resource_id: request.arrangement_id,
+            expected_role: ResourceRole::Arrangement,
+            resource_bytes: request.arrangement_bytes,
+        },
+        ProjectResourcePublicationMode::ArrangementAddition,
+        |_, _| Ok(()),
+    )
 }
 
 /// Recovers every durable existing-resource publication in one project.
@@ -854,6 +908,7 @@ fn remove_audio_track_observed(
 fn publish_project_resource_observed(
     project_path: &Path,
     request: ProjectResourcePublicationRequest<'_>,
+    mode: ProjectResourcePublicationMode,
     mut observer: impl FnMut(PublicationPhase, &Path) -> Result<(), ProjectResourcePublicationError>,
 ) -> Result<ProjectResourcePublicationOutcome, ProjectResourcePublicationError> {
     validate_canonical_resource(request.resource_bytes)?;
@@ -869,6 +924,9 @@ fn publish_project_resource_observed(
             ProjectResourcePublicationErrorKind::ProjectChanged,
             "project changed after the resource edit began",
         ));
+    }
+    if mode == ProjectResourcePublicationMode::ArrangementAddition {
+        validate_arrangement_addition_request(&verified, request)?;
     }
     let backups = open_or_create_dir(&verified.root_dir, "backups")?;
     let _lock = ProjectLock::acquire(&backups).map_err(|error| {
@@ -902,25 +960,6 @@ fn publish_project_resource_observed(
             "active project identity changed before resource staging",
         ));
     }
-    let descriptor = unique_resource(&verified, request.resource_id, request.expected_role)?;
-    let previous = verified
-        .read_resource(request.resource_id)
-        .map_err(|error| {
-            caused(
-                ProjectResourcePublicationErrorKind::Integrity,
-                "read current project resource",
-                error,
-            )
-        })?;
-    if previous == request.resource_bytes {
-        return Ok(ProjectResourcePublicationOutcome {
-            project_identity: request.expected_project_sha256,
-            project_revision: verified.manifest().revision(),
-            resource_id: request.resource_id.to_owned(),
-            resource_path: descriptor.path().to_owned(),
-            changed: false,
-        });
-    }
     let next_revision = verified
         .manifest()
         .revision()
@@ -932,12 +971,50 @@ fn publish_project_resource_observed(
                 "project revision cannot be incremented",
             )
         })?;
-    let candidate_project = candidate_manifest(
-        &active_project,
-        request.resource_id,
-        request.resource_bytes,
-        next_revision,
-    )?;
+    let (resource_path, previous, created_parent_directory, candidate_project) = match mode {
+        ProjectResourcePublicationMode::Replacement => {
+            let descriptor =
+                unique_resource(&verified, request.resource_id, request.expected_role)?;
+            let previous = verified
+                .read_resource(request.resource_id)
+                .map_err(|error| {
+                    caused(
+                        ProjectResourcePublicationErrorKind::Integrity,
+                        "read current project resource",
+                        error,
+                    )
+                })?;
+            if previous == request.resource_bytes {
+                return Ok(ProjectResourcePublicationOutcome {
+                    project_identity: request.expected_project_sha256,
+                    project_revision: verified.manifest().revision(),
+                    resource_id: request.resource_id.to_owned(),
+                    resource_path: descriptor.path().to_owned(),
+                    changed: false,
+                });
+            }
+            let candidate = candidate_manifest(
+                &active_project,
+                request.resource_id,
+                request.resource_bytes,
+                next_revision,
+            )?;
+            (
+                descriptor.path().to_owned(),
+                Some(previous),
+                false,
+                candidate,
+            )
+        }
+        ProjectResourcePublicationMode::ArrangementAddition => {
+            let path = format!("arrangement/{}.json", request.resource_id);
+            let created_parent_directory =
+                inspect_arrangement_destination(&verified.root_dir, &path)?;
+            let candidate =
+                candidate_arrangement_manifest(&active_project, request, &path, next_revision)?;
+            (path, None, created_parent_directory, candidate)
+        }
+    };
     let transaction_name = format!("{TRANSACTION_PREFIX}{}", Uuid::new_v4());
     backups.create_dir(&transaction_name).map_err(|error| {
         caused(
@@ -962,7 +1039,9 @@ fn publish_project_resource_observed(
         &transaction,
         &transaction_name,
         request,
-        &previous,
+        &resource_path,
+        previous.as_deref(),
+        created_parent_directory,
         &active_project,
         &candidate_project,
         next_revision,
@@ -1066,7 +1145,9 @@ fn run_publication(
     transaction: &Dir,
     transaction_name: &str,
     request: ProjectResourcePublicationRequest<'_>,
-    previous_resource: &[u8],
+    resource_path: &str,
+    previous_resource: Option<&[u8]>,
+    created_parent_directory: bool,
     previous_project: &[u8],
     candidate_project: &[u8],
     next_revision: u64,
@@ -1074,10 +1155,11 @@ fn run_publication(
 ) -> Result<ProjectResourcePublicationOutcome, ProjectResourcePublicationError> {
     write_intent(transaction, transaction_name)?;
     write_exclusive_synced(transaction, RESOURCE_STAGING_NAME, request.resource_bytes)?;
-    write_exclusive_synced(transaction, PREVIOUS_RESOURCE_NAME, previous_resource)?;
+    if let Some(previous_resource) = previous_resource {
+        write_exclusive_synced(transaction, PREVIOUS_RESOURCE_NAME, previous_resource)?;
+    }
     write_exclusive_synced(transaction, PROJECT_STAGING_NAME, candidate_project)?;
     write_exclusive_synced(transaction, PREVIOUS_PROJECT_NAME, previous_project)?;
-    let descriptor = unique_resource(verified, request.resource_id, request.expected_role)?;
     let tx = TransactionRecord {
         format: "hyper-project-resource-publication-transaction".to_owned(),
         format_version: 1,
@@ -1089,15 +1171,16 @@ fn run_publication(
         resource_id: request.resource_id.to_owned(),
         resource_role: role_name(request.expected_role).to_owned(),
         resource: TransactionFile {
-            path: descriptor.path().to_owned(),
+            path: resource_path.to_owned(),
             byte_length: request.resource_bytes.len() as u64,
             sha256: hex_digest(digest(request.resource_bytes)),
         },
-        previous_resource: TransactionFile {
-            path: descriptor.path().to_owned(),
-            byte_length: previous_resource.len() as u64,
-            sha256: hex_digest(digest(previous_resource)),
-        },
+        previous_resource: previous_resource.map(|bytes| TransactionFile {
+            path: resource_path.to_owned(),
+            byte_length: bytes.len() as u64,
+            sha256: hex_digest(digest(bytes)),
+        }),
+        created_parent_directory,
         extensions: serde_json::Map::new(),
     };
     let transaction_bytes = serde_json_canonicalizer::to_vec(&tx).map_err(|error| {
@@ -1112,13 +1195,26 @@ fn run_publication(
     sync_dir(backups)?;
     observer(PublicationPhase::Transaction, verified.root())?;
 
-    let parent = open_relative_parent(&verified.root_dir, descriptor.path())?;
+    if created_parent_directory {
+        verified
+            .root_dir
+            .create_dir("arrangement")
+            .map_err(|error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Io,
+                    "create arrangement resource directory",
+                    error,
+                )
+            })?;
+        sync_dir(&verified.root_dir)?;
+    }
+    let parent = open_relative_parent(&verified.root_dir, resource_path)?;
     publish_staged_file(
         transaction,
         RESOURCE_STAGING_NAME,
         &parent,
         &parent,
-        file_name(descriptor.path())?,
+        file_name(resource_path)?,
         &format!(".resource-{}.json", tx.id),
         "project resource",
     )?;
@@ -1425,6 +1521,89 @@ fn validate_audio_track_documents(
         ));
     }
     Ok(())
+}
+
+fn validate_arrangement_addition_request(
+    verified: &StructurallyVerifiedProject,
+    request: ProjectResourcePublicationRequest<'_>,
+) -> Result<(), ProjectResourcePublicationError> {
+    if request.expected_role != ResourceRole::Arrangement
+        || !is_valid_entity_id(request.resource_id)
+        || request.resource_id == verified.manifest().project_id()
+        || verified.manifest().resources().iter().any(|descriptor| {
+            descriptor.role() == ResourceRole::Arrangement || descriptor.id() == request.resource_id
+        })
+        || verified
+            .manifest()
+            .assets()
+            .iter()
+            .any(|descriptor| descriptor.id() == request.resource_id)
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "arrangement identity conflicts with the active project",
+        ));
+    }
+    let arrangement: Value = serde_json::from_slice(request.resource_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse new arrangement resource",
+            error,
+        )
+    })?;
+    if arrangement["format"].as_str() != Some("hyper-arrangement")
+        || arrangement["format_version"].as_u64() != Some(1)
+        || arrangement["id"].as_str() != Some(request.resource_id)
+        || arrangement["project_id"].as_str() != Some(verified.manifest().project_id())
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "arrangement resource does not match the active project",
+        ));
+    }
+    Ok(())
+}
+
+fn inspect_arrangement_destination(
+    root: &Dir,
+    resource_path: &str,
+) -> Result<bool, ProjectResourcePublicationError> {
+    let directory = match root.symlink_metadata("arrangement") {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "inspect arrangement resource directory",
+                error,
+            ));
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "arrangement resource directory is not a real directory",
+            ));
+        }
+        Ok(_) => root.open_dir_nofollow("arrangement").map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "open arrangement resource directory",
+                error,
+            )
+        })?,
+    };
+    let name = file_name(resource_path)?;
+    match directory.symlink_metadata(name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Ok(_) => Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "arrangement resource path already exists",
+        )),
+        Err(error) => Err(caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "inspect arrangement resource destination",
+            error,
+        )),
+    }
 }
 
 fn validate_audio_track_document_identity(
@@ -1946,6 +2125,58 @@ fn candidate_manifest(
         caused(
             ProjectResourcePublicationErrorKind::Integrity,
             "candidate project manifest is invalid",
+            error,
+        )
+    })?;
+    Ok(bytes)
+}
+
+fn candidate_arrangement_manifest(
+    active: &[u8],
+    request: ProjectResourcePublicationRequest<'_>,
+    resource_path: &str,
+    revision: u64,
+) -> Result<Vec<u8>, ProjectResourcePublicationError> {
+    let mut value: Value = serde_json::from_slice(active).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "parse active project manifest",
+            error,
+        )
+    })?;
+    value["revision"] = revision.into();
+    let resources = value["resources"].as_array_mut().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "project resource declarations are invalid",
+        )
+    })?;
+    resources.push(serde_json::json!({
+        "id": request.resource_id,
+        "role": "arrangement",
+        "path": resource_path,
+        "media_type": "application/json",
+        "byte_length": request.resource_bytes.len(),
+        "sha256": hex_digest(digest(request.resource_bytes)),
+        "extensions": {}
+    }));
+    let bytes = serde_json_canonicalizer::to_vec(&value).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "serialize arrangement project manifest",
+            error,
+        )
+    })?;
+    if bytes.len() > MAX_JSON_BYTES {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "candidate project manifest exceeds its size limit",
+        ));
+    }
+    ProjectManifest::parse(&bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "candidate arrangement project manifest is invalid",
             error,
         )
     })?;
@@ -2670,6 +2901,7 @@ fn recover_transaction(
     }
     rollback_resource(root, transaction, tx)?;
     cleanup_publication_temporaries(root, backups, transaction, tx)?;
+    remove_created_resource_parent(root, tx)?;
     let previous = read_bounded(transaction, PREVIOUS_PROJECT_NAME, MAX_JSON_BYTES)?;
     if digest(&previous) != before {
         return Err(failure(
@@ -2692,11 +2924,36 @@ fn rollback_resource(
     transaction: &Dir,
     tx: &TransactionRecord,
 ) -> Result<(), ProjectResourcePublicationError> {
-    let parent = open_relative_parent(root, &tx.resource.path)?;
+    let parent = match open_relative_parent(root, &tx.resource.path) {
+        Ok(parent) => parent,
+        Err(error) if tx.previous_resource.is_none() && error_is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
     let current = read_optional_file(&parent, file_name(&tx.resource.path)?)?;
     let current_digest = current.as_deref().map(digest);
-    let before = decode_digest(&tx.previous_resource.sha256)?;
     let after = decode_digest(&tx.resource.sha256)?;
+    let Some(previous_resource) = &tx.previous_resource else {
+        return match current_digest {
+            None => Ok(()),
+            Some(found) if found != after => Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "resource rollback refuses unrelated published content",
+            )),
+            Some(_) => {
+                parent
+                    .remove_file(file_name(&tx.resource.path)?)
+                    .map_err(|error| {
+                        caused(
+                            ProjectResourcePublicationErrorKind::Recovery,
+                            "remove transaction-created project resource",
+                            error,
+                        )
+                    })?;
+                sync_dir(&parent)
+            }
+        };
+    };
+    let before = decode_digest(&previous_resource.sha256)?;
     match current_digest {
         Some(found) if found == before => return Ok(()),
         Some(found) if found != after => {
@@ -2712,10 +2969,28 @@ fn rollback_resource(
         PREVIOUS_RESOURCE_NAME,
         &parent,
         &parent,
-        file_name(&tx.previous_resource.path)?,
+        file_name(&previous_resource.path)?,
         &format!(".resource-rollback-{}.json", tx.id),
         "previous project resource",
     )
+}
+
+fn remove_created_resource_parent(
+    root: &Dir,
+    tx: &TransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    if !tx.created_parent_directory {
+        return Ok(());
+    }
+    match root.remove_dir("arrangement") {
+        Ok(()) => sync_dir(root),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "remove transaction-created arrangement directory",
+            error,
+        )),
+    }
 }
 
 fn validate_staged_transaction(
@@ -2730,19 +3005,38 @@ fn validate_staged_transaction(
             error,
         )
     })?;
-    let previous_resource = read_bounded(transaction, PREVIOUS_RESOURCE_NAME, MAX_JSON_BYTES)?;
-    validate_canonical_resource(&previous_resource).map_err(|error| {
-        caused(
+    let previous_resource = tx
+        .previous_resource
+        .as_ref()
+        .map(|previous| {
+            let bytes = read_bounded(transaction, PREVIOUS_RESOURCE_NAME, MAX_JSON_BYTES)?;
+            validate_canonical_resource(&bytes).map_err(|error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "staged previous project resource is not canonical",
+                    error,
+                )
+            })?;
+            if bytes.len() as u64 != previous.byte_length
+                || digest(&bytes) != decode_digest(&previous.sha256)?
+                || tx.resource.path != previous.path
+            {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "staged previous resource bytes do not match the transaction record",
+                ));
+            }
+            Ok(bytes)
+        })
+        .transpose()?;
+    if tx.previous_resource.is_none() && !missing_file(transaction, PREVIOUS_RESOURCE_NAME)? {
+        return Err(failure(
             ProjectResourcePublicationErrorKind::Recovery,
-            "staged previous project resource is not canonical",
-            error,
-        )
-    })?;
+            "resource addition transaction contains unexpected previous-resource evidence",
+        ));
+    }
     if resource.len() as u64 != tx.resource.byte_length
         || digest(&resource) != decode_digest(&tx.resource.sha256)?
-        || previous_resource.len() as u64 != tx.previous_resource.byte_length
-        || digest(&previous_resource) != decode_digest(&tx.previous_resource.sha256)?
-        || tx.resource.path != tx.previous_resource.path
     {
         return Err(failure(
             ProjectResourcePublicationErrorKind::Recovery,
@@ -2786,7 +3080,7 @@ fn validate_staged_transaction(
     validate_transaction_descriptors(
         &previous_manifest,
         &candidate_manifest,
-        &previous_resource,
+        previous_resource.as_deref(),
         &resource,
         tx,
     )
@@ -2795,24 +3089,53 @@ fn validate_staged_transaction(
 fn validate_transaction_descriptors(
     previous_manifest: &ProjectManifest,
     candidate_manifest: &ProjectManifest,
-    previous_bytes: &[u8],
+    previous_bytes: Option<&[u8]>,
     candidate_bytes: &[u8],
     tx: &TransactionRecord,
 ) -> Result<(), ProjectResourcePublicationError> {
-    let previous = manifest_resource(previous_manifest, &tx.resource_id)?;
     let candidate = manifest_resource(candidate_manifest, &tx.resource_id)?;
-    if role_name(previous.role()) != tx.resource_role
-        || candidate.role() != previous.role()
-        || previous.path() != tx.previous_resource.path
-        || candidate.path() != tx.resource.path
-        || previous.byte_length() != previous_bytes.len() as u64
-        || previous.sha256() != hex_digest(digest(previous_bytes))
+    if candidate.path() != tx.resource.path
         || candidate.byte_length() != candidate_bytes.len() as u64
         || candidate.sha256() != hex_digest(digest(candidate_bytes))
     {
         return Err(failure(
             ProjectResourcePublicationErrorKind::Recovery,
             "resource descriptors do not match the transaction",
+        ));
+    }
+    if let (Some(previous_bytes), Some(previous_file)) =
+        (previous_bytes, tx.previous_resource.as_ref())
+    {
+        let previous = manifest_resource(previous_manifest, &tx.resource_id)?;
+        if role_name(previous.role()) != tx.resource_role
+            || candidate.role() != previous.role()
+            || previous.path() != previous_file.path
+            || previous.byte_length() != previous_bytes.len() as u64
+            || previous.sha256() != hex_digest(digest(previous_bytes))
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "previous resource descriptor does not match the transaction",
+            ));
+        }
+    } else if previous_bytes.is_some() || tx.previous_resource.is_some() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "resource transaction previous-state evidence is inconsistent",
+        ));
+    } else if role_name(candidate.role()) != tx.resource_role
+        || previous_manifest
+            .resources()
+            .iter()
+            .any(|descriptor| descriptor.id() == tx.resource_id)
+        || previous_manifest.resources().len().checked_add(1)
+            != Some(candidate_manifest.resources().len())
+        || previous_manifest.resources()
+            != &candidate_manifest.resources()[..previous_manifest.resources().len()]
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "added resource descriptor does not match the transaction",
         ));
     }
     Ok(())
@@ -2873,13 +3196,18 @@ fn read_transaction(
         || !tx.extensions.is_empty()
         || tx.id != expected_id
         || tx.resource_id.is_empty()
-        || tx.resource.path != tx.previous_resource.path
         || tx.resource.byte_length == 0
         || tx.resource.byte_length > MAX_JSON_FILE_BYTES
-        || tx.previous_resource.byte_length == 0
-        || tx.previous_resource.byte_length > MAX_JSON_FILE_BYTES
         || decode_digest(&tx.resource.sha256).is_err()
-        || decode_digest(&tx.previous_resource.sha256).is_err()
+        || tx.previous_resource.as_ref().is_some_and(|previous| {
+            tx.resource.path != previous.path
+                || previous.byte_length == 0
+                || previous.byte_length > MAX_JSON_FILE_BYTES
+                || decode_digest(&previous.sha256).is_err()
+        })
+        || tx.created_parent_directory && tx.previous_resource.is_some()
+        || tx.previous_resource.is_none()
+            && (tx.resource_role != "arrangement" || !tx.resource.path.starts_with("arrangement/"))
         || decode_digest(&tx.before_project_sha256).is_err()
         || decode_digest(&tx.after_project_sha256).is_err()
         || tx.before_project_revision.checked_add(1) != Some(tx.after_project_revision)
@@ -3064,11 +3392,13 @@ fn cleanup_publication_temporaries(
             &format!(".resource-{}.json", tx.id),
             decode_digest(&tx.resource.sha256)?,
         )?;
-        remove_optional_matching_file(
-            &parent,
-            &format!(".resource-rollback-{}.json", tx.id),
-            decode_digest(&tx.previous_resource.sha256)?,
-        )?;
+        if let Some(previous) = &tx.previous_resource {
+            remove_optional_matching_file(
+                &parent,
+                &format!(".resource-rollback-{}.json", tx.id),
+                decode_digest(&previous.sha256)?,
+            )?;
+        }
     }
     remove_optional_matching_file(
         backups,
@@ -3677,6 +4007,7 @@ mod tests {
     const TIMELINE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334456";
     const MIXER_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334468";
     const NEW_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334469";
+    const ARRANGEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334470";
 
     struct Fixture {
         root: PathBuf,
@@ -3904,6 +4235,89 @@ mod tests {
         }
     }
 
+    struct ArrangementFixture {
+        parent: PathBuf,
+        root: PathBuf,
+        arrangement: Vec<u8>,
+    }
+
+    impl ArrangementFixture {
+        fn new() -> Self {
+            let parent = std::env::temp_dir().join(format!(
+                "hyper-arrangement-publication-{}-{}",
+                std::process::id(),
+                NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&parent).unwrap();
+            let created = crate::create_project(
+                &parent,
+                crate::ProjectCreationRequest {
+                    directory_name: "Session",
+                    project_name: "Session",
+                },
+            )
+            .unwrap();
+            let root = created.project().root().to_path_buf();
+            let project_id = created.project().manifest().project_id();
+            let arrangement = serde_json_canonicalizer::to_vec(&json!({
+                "format": "hyper-arrangement",
+                "format_version": 1,
+                "id": ARRANGEMENT_ID,
+                "project_id": project_id,
+                "name": "Main",
+                "enabled": true,
+                "placements": [],
+                "scene_launches": [],
+                "extensions": {}
+            }))
+            .unwrap();
+            Self {
+                parent,
+                root,
+                arrangement,
+            }
+        }
+
+        fn request(&self) -> ArrangementPublicationRequest<'_> {
+            ArrangementPublicationRequest {
+                expected_project_sha256: *verify_project_package(&self.root)
+                    .unwrap()
+                    .manifest_sha256(),
+                arrangement_id: ARRANGEMENT_ID,
+                arrangement_bytes: &self.arrangement,
+            }
+        }
+
+        fn resource_request(&self) -> ProjectResourcePublicationRequest<'_> {
+            let request = self.request();
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: request.expected_project_sha256,
+                resource_id: request.arrangement_id,
+                expected_role: ResourceRole::Arrangement,
+                resource_bytes: request.arrangement_bytes,
+            }
+        }
+
+        fn transaction_count(&self) -> usize {
+            fs::read_dir(self.root.join("backups"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(TRANSACTION_PREFIX)
+                })
+                .count()
+        }
+    }
+
+    impl Drop for ArrangementFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.parent);
+        }
+    }
+
     #[test]
     fn replaces_existing_resource_and_identical_save_is_a_no_op() {
         let fixture = Fixture::new();
@@ -3935,6 +4349,200 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn publishes_the_first_arrangement_resource() {
+        let fixture = ArrangementFixture::new();
+        assert!(!fixture.root.join("arrangement").exists());
+
+        let published = publish_arrangement(&fixture.root, fixture.request()).unwrap();
+
+        assert!(published.changed());
+        assert_eq!(published.project_revision(), 2);
+        assert_eq!(published.resource_id(), ARRANGEMENT_ID);
+        assert_eq!(
+            published.resource_path(),
+            format!("arrangement/{ARRANGEMENT_ID}.json")
+        );
+        assert_eq!(
+            fs::read(fixture.root.join(published.resource_path())).unwrap(),
+            fixture.arrangement
+        );
+        let verified = verify_project_package(&fixture.root).unwrap();
+        let arrangements: Vec<_> = verified
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::Arrangement)
+            .collect();
+        assert_eq!(arrangements.len(), 1);
+        assert_eq!(arrangements[0].id(), ARRANGEMENT_ID);
+        assert_eq!(fixture.transaction_count(), 0);
+
+        let error = publish_arrangement(
+            &fixture.root,
+            ArrangementPublicationRequest {
+                expected_project_sha256: *published.project_identity(),
+                arrangement_id: ARRANGEMENT_ID,
+                arrangement_bytes: &fixture.arrangement,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::ResourceConflict
+        );
+    }
+
+    #[test]
+    fn arrangement_publication_rejects_stale_and_mismatched_documents() {
+        let fixture = ArrangementFixture::new();
+        let mut stale = fixture.request();
+        stale.expected_project_sha256 = [0; 32];
+        assert_eq!(
+            publish_arrangement(&fixture.root, stale)
+                .unwrap_err()
+                .kind(),
+            ProjectResourcePublicationErrorKind::ProjectChanged
+        );
+
+        let mut wrong: Value = serde_json::from_slice(&fixture.arrangement).unwrap();
+        wrong["project_id"] = PROJECT_ID.into();
+        let wrong = serde_json_canonicalizer::to_vec(&wrong).unwrap();
+        let mut request = fixture.request();
+        request.arrangement_bytes = &wrong;
+        assert_eq!(
+            publish_arrangement(&fixture.root, request)
+                .unwrap_err()
+                .kind(),
+            ProjectResourcePublicationErrorKind::InvalidResource
+        );
+
+        let pretty = serde_json::to_vec_pretty(
+            &serde_json::from_slice::<Value>(&fixture.arrangement).unwrap(),
+        )
+        .unwrap();
+        let mut request = fixture.request();
+        request.arrangement_bytes = &pretty;
+        assert_eq!(
+            publish_arrangement(&fixture.root, request)
+                .unwrap_err()
+                .kind(),
+            ProjectResourcePublicationErrorKind::InvalidResource
+        );
+        assert!(!fixture.root.join("arrangement").exists());
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            1
+        );
+    }
+
+    #[test]
+    fn arrangement_crashes_before_manifest_roll_back_the_resource_and_directory() {
+        for crash_phase in [PublicationPhase::Transaction, PublicationPhase::Resource] {
+            let fixture = ArrangementFixture::new();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = publish_project_resource_observed(
+                    &fixture.root,
+                    fixture.resource_request(),
+                    ProjectResourcePublicationMode::ArrangementAddition,
+                    |phase, _| {
+                        assert_ne!(phase, crash_phase, "simulated process crash");
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+
+            let recovered = recover_project_resource_publications(&fixture.root).unwrap();
+
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(
+                recovered[0].disposition(),
+                ProjectResourcePublicationRecoveryDisposition::RolledBack
+            );
+            assert!(!fixture.root.join("arrangement").exists());
+            assert_eq!(
+                verify_project_package(&fixture.root)
+                    .unwrap()
+                    .manifest()
+                    .revision(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn arrangement_crash_after_manifest_recovers_as_committed() {
+        let fixture = ArrangementFixture::new();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = publish_project_resource_observed(
+                &fixture.root,
+                fixture.resource_request(),
+                ProjectResourcePublicationMode::ArrangementAddition,
+                |phase, _| {
+                    assert_ne!(phase, PublicationPhase::Manifest, "simulated process crash");
+                    Ok(())
+                },
+            );
+        }));
+        assert!(result.is_err());
+
+        let recovered = recover_project_resource_publications(&fixture.root).unwrap();
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].disposition(),
+            ProjectResourcePublicationRecoveryDisposition::Committed
+        );
+        assert_eq!(
+            fs::read(
+                fixture
+                    .root
+                    .join(format!("arrangement/{ARRANGEMENT_ID}.json"))
+            )
+            .unwrap(),
+            fixture.arrangement
+        );
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            2
+        );
+    }
+
+    #[test]
+    fn arrangement_recovery_refuses_unrelated_published_content() {
+        let fixture = ArrangementFixture::new();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = publish_project_resource_observed(
+                &fixture.root,
+                fixture.resource_request(),
+                ProjectResourcePublicationMode::ArrangementAddition,
+                |phase, _| {
+                    assert_ne!(phase, PublicationPhase::Resource, "simulated process crash");
+                    Ok(())
+                },
+            );
+        }));
+        assert!(result.is_err());
+        let path = fixture
+            .root
+            .join(format!("arrangement/{ARRANGEMENT_ID}.json"));
+        let unrelated = serde_json_canonicalizer::to_vec(&json!({"unrelated": true})).unwrap();
+        fs::write(&path, &unrelated).unwrap();
+
+        let error = recover_project_resource_publications(&fixture.root).unwrap_err();
+
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
+        assert_eq!(fs::read(path).unwrap(), unrelated);
+        assert_eq!(fixture.transaction_count(), 1);
     }
 
     #[test]
@@ -4010,6 +4618,7 @@ mod tests {
                 let _ = publish_project_resource_observed(
                     &fixture.root,
                     fixture.request(),
+                    ProjectResourcePublicationMode::Replacement,
                     |phase, _| {
                         assert_ne!(phase, crash_phase, "simulated process crash");
                         Ok(())
@@ -4043,15 +4652,19 @@ mod tests {
     fn identical_save_recovers_prepublication_residue_before_returning() {
         let fixture = Fixture::new();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let _ =
-                publish_project_resource_observed(&fixture.root, fixture.request(), |phase, _| {
+            let _ = publish_project_resource_observed(
+                &fixture.root,
+                fixture.request(),
+                ProjectResourcePublicationMode::Replacement,
+                |phase, _| {
                     assert_ne!(
                         phase,
                         PublicationPhase::Transaction,
                         "simulated process crash"
                     );
                     Ok(())
-                });
+                },
+            );
         }));
         assert!(result.is_err());
         assert_eq!(fixture.transaction_count(), 1);
@@ -4082,8 +4695,11 @@ mod tests {
     fn failed_publication_retains_a_present_but_unreadable_transaction() {
         let fixture = Fixture::new();
 
-        let error =
-            publish_project_resource_observed(&fixture.root, fixture.request(), |phase, _| {
+        let error = publish_project_resource_observed(
+            &fixture.root,
+            fixture.request(),
+            ProjectResourcePublicationMode::Replacement,
+            |phase, _| {
                 if phase == PublicationPhase::Resource {
                     fs::write(fixture.transaction_path().join(TRANSACTION_NAME), b"{}").unwrap();
                     return Err(failure(
@@ -4092,8 +4708,9 @@ mod tests {
                     ));
                 }
                 Ok(())
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
 
         assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
         assert_eq!(fixture.transaction_count(), 1);
@@ -4105,11 +4722,15 @@ mod tests {
     fn crash_after_manifest_publication_recovers_as_committed() {
         let fixture = Fixture::new();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let _ =
-                publish_project_resource_observed(&fixture.root, fixture.request(), |phase, _| {
+            let _ = publish_project_resource_observed(
+                &fixture.root,
+                fixture.request(),
+                ProjectResourcePublicationMode::Replacement,
+                |phase, _| {
                     assert_ne!(phase, PublicationPhase::Manifest, "simulated process crash");
                     Ok(())
-                });
+                },
+            );
         }));
         assert!(result.is_err());
 
