@@ -21,6 +21,7 @@ export enum AppMode {
     removing-arrangement-placement,
     changing-clip-activation,
     changing-clip-gain,
+    creating-clip,
     preparing-preview,
     previewing,
     saving,
@@ -153,6 +154,7 @@ export global IdeActions {
     callback stop-recording();
     callback abort-recording();
     callback toggle-take-preview(int);
+    callback create-audio-clip-from-take(int, string);
     callback preview-gain(float);
     callback preview-mute();
     callback close-project();
@@ -265,6 +267,10 @@ export component MainWindow inherits Window {
     in-out property <string> remove-track-name: "";
     in-out property <bool> mixer-sends-visible: false;
     in-out property <bool> takes-visible: false;
+    in-out property <bool> take-clip-visible: false;
+    in-out property <int> take-clip-index: -1;
+    in-out property <string> take-clip-track-name: "";
+    in-out property <string> take-clip-name: "";
     in-out property <bool> arrangement-visible: false;
     in-out property <bool> remove-arrangement-placement-visible: false;
     in-out property <string> remove-arrangement-placement-id: "";
@@ -398,6 +404,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.removing-arrangement-placement ? "◌  REMOVING CLIP"
                         : root.app-mode == AppMode.changing-clip-activation ? "◌  UPDATING CLIP"
                         : root.app-mode == AppMode.changing-clip-gain ? "◌  UPDATING GAIN"
+                        : root.app-mode == AppMode.creating-clip ? "◌  CREATING CLIP"
                         : root.app-mode == AppMode.selecting ? "◌  SELECTING"
                         : root.app-mode == AppMode.closing ? "◌  CLOSING"
                         : root.app-mode == AppMode.closed ? "●  READY"
@@ -1149,18 +1156,60 @@ export component MainWindow inherits Window {
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Button {
                                 text: "Performance";
-                                clicked => { root.takes-visible = false; root.mixer-visible = false; root.mixer-sends-visible = false; }
+                                clicked => { root.takes-visible = false; root.take-clip-visible = false; root.mixer-visible = false; root.mixer-sends-visible = false; }
                             }
                             Button {
                                 text: "Mixer";
                                 enabled: !root.preview-active;
-                                clicked => { root.takes-visible = false; root.mixer-visible = true; root.mixer-sends-visible = false; }
+                                clicked => { root.takes-visible = false; root.take-clip-visible = false; root.mixer-visible = true; root.mixer-sends-visible = false; }
                             }
                         }
 
                         Rectangle { height: 1px; background: #27313d; }
 
-                        if root.recording-takes.length == 0 : Text {
+                        if root.take-clip-visible : Rectangle {
+                            vertical-stretch: 1;
+                            background: #0e141b;
+                            border-color: #37769a;
+                            border-width: 1px;
+                            border-radius: 6px;
+                            VerticalLayout {
+                                padding: 18px;
+                                spacing: 12px;
+                                Text { text: "CREATE REUSABLE AUDIO CLIP"; color: #7dcfff; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                                Text { text: "Source take on " + root.take-clip-track-name; color: #edf2f8; font-size: 15px; font-weight: 600; overflow: elide; }
+                                Text {
+                                    text: "This preserves the verified whole recording and its exact frame-derived duration. The new clip belongs to the take's track; it is not placed in the arrangement.";
+                                    color: #aebccc;
+                                    font-size: 11px;
+                                    wrap: word-wrap;
+                                }
+                                Text { text: "CLIP NAME"; color: #65758a; font-size: 9px; }
+                                LineEdit {
+                                    text <=> root.take-clip-name;
+                                    accessible-label: "Reusable audio clip name";
+                                }
+                                Rectangle { vertical-stretch: 1; background: transparent; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    Button {
+                                        width: 86px;
+                                        text: "Cancel";
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => { root.take-clip-visible = false; }
+                                    }
+                                    Button {
+                                        width: 116px;
+                                        text: root.app-mode == AppMode.creating-clip ? "Creating…" : "Create clip";
+                                        enabled: root.app-mode == AppMode.running && root.take-clip-name != "";
+                                        clicked => { IdeActions.create-audio-clip-from-take(root.take-clip-index, root.take-clip-name); }
+                                    }
+                                }
+                            }
+                        }
+
+                        if !root.take-clip-visible && root.recording-takes.length == 0 : Text {
                             text: "No verified recorded takes are present in this project.";
                             color: #8fa0b4;
                             font-size: 13px;
@@ -1169,7 +1218,7 @@ export component MainWindow inherits Window {
                             vertical-stretch: 1;
                         }
 
-                        if root.recording-takes.length > 0 : ListView {
+                        if !root.take-clip-visible && root.recording-takes.length > 0 : ListView {
                             vertical-stretch: 1;
                             for take in root.recording-takes : Rectangle {
                                 height: 74px;
@@ -1208,12 +1257,24 @@ export component MainWindow inherits Window {
                                         enabled: root.app-mode == AppMode.running || (root.app-mode == AppMode.previewing && take.active);
                                         clicked => { IdeActions.toggle-take-preview(take.index); }
                                     }
+                                    Button {
+                                        width: 92px;
+                                        text: "Create clip";
+                                        accessible-label: "Create a reusable audio clip from the recorded take on " + take.track-name;
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => {
+                                            root.take-clip-index = take.index;
+                                            root.take-clip-track-name = take.track-name;
+                                            root.take-clip-name = take.track-name;
+                                            root.take-clip-visible = true;
+                                        }
+                                    }
                                 }
                             }
                         }
 
-                        Rectangle { height: 1px; background: #27313d; }
-                        HorizontalLayout {
+                        if !root.take-clip-visible : Rectangle { height: 1px; background: #27313d; }
+                        if !root.take-clip-visible : HorizontalLayout {
                             height: 58px;
                             spacing: 10px;
                             VerticalLayout {
@@ -1248,8 +1309,8 @@ export component MainWindow inherits Window {
                                 vertical-alignment: center;
                             }
                         }
-                        Text {
-                            text: "Audition does not insert, move, trim, or time-stretch arrangement clips.";
+                        if !root.take-clip-visible : Text {
+                            text: "Audition is dry. Creating a reusable clip still does not place it in the arrangement.";
                             color: #65758a;
                             font-size: 9px;
                         }

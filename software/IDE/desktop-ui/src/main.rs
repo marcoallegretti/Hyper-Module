@@ -42,7 +42,7 @@ type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
 type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
 type InputRoutes = Rc<RefCell<Vec<InputRoute>>>;
 type RecordingRoutes = Rc<RefCell<Vec<usize>>>;
-type TakeRoutes = Rc<RefCell<Vec<String>>>;
+type TakeRoutes = Rc<RefCell<Vec<TakeRoute>>>;
 type ProjectUiStateCell = Rc<ProjectUiState>;
 
 #[derive(Default)]
@@ -63,6 +63,12 @@ enum InputRoute {
     Disabled,
     SystemDefault,
     Routed(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TakeRoute {
+    recording_id: String,
+    asset_id: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -639,9 +645,7 @@ fn bind_audio_preview_callbacks(ui: &MainWindow, worker: &WorkerCell, take_route
         if ui.get_app_mode() != AppMode::Running {
             return;
         }
-        let asset_id = usize::try_from(index)
-            .ok()
-            .and_then(|index| routes_for_toggle.borrow().get(index).cloned());
+        let asset_id = take_route(&routes_for_toggle, index).map(|route| route.asset_id);
         let Some(asset_id) = asset_id else {
             ui.set_error_text("Recorded take selection is no longer available".into());
             return;
@@ -691,6 +695,37 @@ fn bind_audio_preview_callbacks(ui: &MainWindow, worker: &WorkerCell, take_route
             }),
         );
     });
+
+    let weak = ui.as_weak();
+    let worker_for_creation = Rc::clone(worker);
+    let routes_for_creation = Rc::clone(take_routes);
+    actions.on_create_audio_clip_from_take(move |index, name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_take_clip_visible() {
+            return;
+        }
+        let recording_id = take_route(&routes_for_creation, index).map(|route| route.recording_id);
+        let Some(recording_id) = recording_id else {
+            ui.set_error_text("Recorded take selection is no longer available".into());
+            return;
+        };
+        submit_to_ui(
+            &ui,
+            &worker_for_creation,
+            IdeWorkerCommand::CreateAudioClipFromTake {
+                recording_id,
+                name: name.to_string(),
+            },
+        );
+    });
+}
+
+fn take_route(routes: &TakeRoutes, index: i32) -> Option<TakeRoute> {
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| routes.borrow().get(index).cloned())
 }
 
 fn bind_playback_callbacks(
@@ -1625,6 +1660,9 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 IdeWorkerCommandKind::SetAudioClipGain => {
                     ui.set_app_mode(AppMode::ChangingClipGain);
                 }
+                IdeWorkerCommandKind::CreateAudioClipFromTake => {
+                    ui.set_app_mode(AppMode::CreatingClip);
+                }
                 IdeWorkerCommandKind::StartRecording => {
                     ui.set_app_mode(AppMode::PreparingRecording);
                 }
@@ -1712,6 +1750,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetAudioClipGain => {
             "Preserving mixer state, updating the audio clip, and reopening project…"
+        }
+        IdeWorkerCommandKind::CreateAudioClipFromTake => {
+            "Preserving mixer state, creating the reusable audio clip, and reopening project…"
         }
         IdeWorkerCommandKind::StartRecording => {
             "Stopping playback and preparing an exclusive monitored capture…"
@@ -1845,6 +1886,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::AudioClipGainChanged { .. }
         | IdeWorkerEvent::AudioClipGainChanging { .. }) => {
             apply_audio_clip_gain_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioClipCreatedFromTake { .. }
+        | IdeWorkerEvent::AudioClipCreatingFromTake) => {
+            apply_recording_clip_creation_event(ui, &event);
         }
         IdeWorkerEvent::RecordingPreparing => {
             ui.set_app_mode(AppMode::PreparingRecording);
@@ -2250,6 +2295,32 @@ fn apply_audio_clip_gain_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     }
 }
 
+fn apply_recording_clip_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioClipCreatedFromTake { revision, clip_id } => {
+            ui.set_take_clip_visible(false);
+            ui.set_take_clip_index(-1);
+            ui.set_take_clip_track_name(SharedString::default());
+            ui.set_take_clip_name(SharedString::default());
+            ui.set_status_text(
+                format!(
+                    "Reusable audio clip {clip_id} created in project revision {revision}; no arrangement placement was created"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipCreatingFromTake => {
+            ui.set_app_mode(AppMode::CreatingClip);
+            ui.set_status_text(
+                "Waiting for native output before creating the reusable audio clip…".into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("recording clip creation dispatcher received another event"),
+    }
+}
+
 fn apply_output_test_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::OutputTest(snapshot) => {
@@ -2635,7 +2706,10 @@ fn set_recording_takes(
     let mut routes = Vec::with_capacity(takes.len());
     let mut rows = Vec::with_capacity(takes.len());
     for (index, take) in takes.iter().enumerate() {
-        routes.push(take.asset_id().to_owned());
+        routes.push(TakeRoute {
+            recording_id: take.id().to_owned(),
+            asset_id: take.asset_id().to_owned(),
+        });
         let active = active_asset_id == Some(take.asset_id());
         rows.push(TakeRow {
             index: i32::try_from(index).unwrap_or(-1),
@@ -3103,6 +3177,10 @@ fn reset_project(
     ui.set_recording_drop_count("0".into());
     take_routes.borrow_mut().clear();
     ui.set_recording_takes(ModelRc::default());
+    ui.set_take_clip_visible(false);
+    ui.set_take_clip_index(-1);
+    ui.set_take_clip_track_name(SharedString::default());
+    ui.set_take_clip_name(SharedString::default());
     ui.set_takes_visible(false);
     ui.set_arrangement_visible(false);
     ui.set_remove_arrangement_placement_visible(false);
@@ -3215,6 +3293,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::SetAudioClipGain if current == AppMode::ChangingClipGain => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::CreateAudioClipFromTake if current == AppMode::CreatingClip => {
             AppMode::Running
         }
         IdeWorkerCommandKind::StartRecording if current == AppMode::PreparingRecording => {
@@ -4343,6 +4424,35 @@ mod tests {
             mode_after_failure(
                 AppMode::ChangingClipActivation,
                 IdeWorkerCommandKind::SetAudioClipActive,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn take_routes_keep_recording_creation_separate_from_asset_preview() {
+        let routes = Rc::new(RefCell::new(vec![TakeRoute {
+            recording_id: "recording-a".to_owned(),
+            asset_id: "asset-a".to_owned(),
+        }]));
+
+        assert_eq!(
+            take_route(&routes, 0),
+            Some(TakeRoute {
+                recording_id: "recording-a".to_owned(),
+                asset_id: "asset-a".to_owned(),
+            })
+        );
+        assert_eq!(take_route(&routes, -1), None);
+        assert_eq!(take_route(&routes, 1), None);
+    }
+
+    #[test]
+    fn recording_clip_creation_failure_keeps_the_form_recoverable() {
+        assert_eq!(
+            mode_after_failure(
+                AppMode::CreatingClip,
+                IdeWorkerCommandKind::CreateAudioClipFromTake,
             ),
             AppMode::Running
         );
