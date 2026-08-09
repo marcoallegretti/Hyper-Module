@@ -55,9 +55,10 @@ use hyper_playback_json::{
     CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
     MixerSendBaseState, MixerStateSerializationError, serialize_arrangement_placement_activation,
     serialize_arrangement_placement_duration, serialize_arrangement_placement_front_trim,
-    serialize_arrangement_placement_move, serialize_audio_clip_activation,
-    serialize_audio_clip_gain, serialize_audio_track_activation, serialize_audio_track_addition,
-    serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
+    serialize_arrangement_placement_move, serialize_arrangement_placement_removal,
+    serialize_audio_clip_activation, serialize_audio_clip_gain, serialize_audio_track_activation,
+    serialize_audio_track_addition, serialize_audio_track_removal, serialize_audio_track_rename,
+    serialize_mixer_base_state,
 };
 use hyper_playback_session::{AudioClipGainValidationError, PlaybackSessionAssemblyLimits};
 pub use hyper_playback_session::{
@@ -3319,6 +3320,21 @@ impl RunningDesktopIdeApplication {
         )
     }
 
+    fn prepare_arrangement_placement_removal(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        placement_id: &str,
+    ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        Self::prepare_arrangement_placement_edit(
+            application,
+            recovery,
+            |prepared, source, limits| {
+                let (project, _, _, _) = prepared.session().parts();
+                serialize_arrangement_placement_removal(project, source, placement_id, limits)
+            },
+        )
+    }
+
     fn prepare_arrangement_placement_edit(
         application: &DesktopIdeApplication,
         recovery: &DesktopPlaybackRecovery,
@@ -5236,23 +5252,54 @@ mod tests {
         assert_eq!(arrangement["placements"][0]["start_tick"], 9);
         assert_eq!(arrangement["placements"][0]["clip_start_tick"], 1);
         assert_eq!(arrangement["placements"][0]["duration_ticks"], 1);
+        let (loaded, _, _, _) = reopened.session().parts();
+        let removed_arrangement = serialize_arrangement_placement_removal(
+            loaded,
+            &front_trimmed_arrangement,
+            ARRANGEMENT_TEST_PLACEMENT_ID,
+            limits.session.documents,
+        )
+        .unwrap();
         let front_trimmed_identity = *reopened.package().manifest_sha256();
         drop(reopened);
 
         let unchanged = IdeArrangementPlacementEditPlan {
             mixer: IdeMixerSavePlan {
-                project_path,
+                project_path: project_path.clone(),
                 expected_project_sha256: front_trimmed_identity,
-                resource_id: mixer_id,
-                resource_bytes: changed_mixer,
+                resource_id: mixer_id.clone(),
+                resource_bytes: changed_mixer.clone(),
             },
-            arrangement_id,
-            arrangement_bytes: front_trimmed_arrangement,
+            arrangement_id: arrangement_id.clone(),
+            arrangement_bytes: front_trimmed_arrangement.clone(),
         }
         .publish()
         .unwrap();
         assert!(!unchanged.changed());
         assert_eq!(unchanged.project_revision(), 6);
+
+        let removed = IdeArrangementPlacementEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: front_trimmed_identity,
+                resource_id: mixer_id,
+                resource_bytes: changed_mixer,
+            },
+            arrangement_id: arrangement_id.clone(),
+            arrangement_bytes: removed_arrangement.clone(),
+        }
+        .publish()
+        .unwrap();
+        assert!(removed.changed());
+        assert_eq!(removed.project_revision(), 7);
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert!(reopened.session().arrangement().placements().is_empty());
+        assert_eq!(
+            reopened.package().read_resource(&arrangement_id).unwrap(),
+            removed_arrangement
+        );
     }
 
     #[test]
