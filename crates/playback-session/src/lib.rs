@@ -133,6 +133,7 @@ pub struct PlaybackArrangementPlacement {
     track_index: usize,
     clip_index: usize,
     start_tick: u64,
+    clip_start_tick: u64,
     duration_ticks: u64,
     start_frame: usize,
     end_frame: usize,
@@ -161,6 +162,13 @@ impl PlaybackArrangementPlacement {
     #[must_use]
     pub const fn start_tick(&self) -> u64 {
         self.start_tick
+    }
+
+    /// Exact persisted clip-local start. Looped placements retain the
+    /// unfolded offset so front-edge edits remain reversible.
+    #[must_use]
+    pub const fn clip_start_tick(&self) -> u64 {
+        self.clip_start_tick
     }
 
     /// Exact persisted timeline duration; unlike the compiled frame range,
@@ -500,6 +508,7 @@ fn build_playback_arrangement(
             track_index: entry.track_index,
             clip_index: entry.clip_index,
             start_tick: entry.placement_start_tick,
+            clip_start_tick: entry.placement_clip_start_tick,
             duration_ticks: entry.placement_duration_ticks,
             start_frame,
             end_frame: placement_end_frame,
@@ -786,6 +795,7 @@ mod tests {
                 track_index: 0,
                 clip_index: 0,
                 start_tick: 0,
+                clip_start_tick: 0,
                 duration_ticks: 4,
                 start_frame: 0,
                 end_frame: 100,
