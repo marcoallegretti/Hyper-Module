@@ -46,6 +46,7 @@ use hyper_mixer_runtime::{
 };
 #[cfg(test)]
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
+pub use hyper_playback_json::is_native_audio_clip_gain_decibels as ide_audio_clip_gain_is_supported;
 use hyper_playback_json::{
     ArrangementPlacementActivationSerializationError, AudioClipGainSerializationError,
     AudioTrackAdditionSerializationError, AudioTrackDocumentSerializationError,

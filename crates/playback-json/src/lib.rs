@@ -1514,8 +1514,7 @@ pub fn serialize_audio_clip_gain(
     gain_decibels: f64,
     limits: LoaderLimits,
 ) -> Result<Vec<u8>, AudioClipGainSerializationError> {
-    let linear_gain = 10.0_f64.powf(gain_decibels / 20.0);
-    if !gain_decibels.is_finite() || !linear_gain.is_finite() || linear_gain > f64::from(2.0_f32) {
+    if !is_native_audio_clip_gain_decibels(gain_decibels) {
         return Err(AudioClipGainSerializationError::UnsupportedGain);
     }
     let clip_index = project
@@ -1561,6 +1560,14 @@ pub fn serialize_audio_clip_gain(
     edited_project.clips[clip_index] = edited;
     validate_loaded_identities(&edited_project).map_err(AudioClipGainSerializationError::Source)?;
     Ok(output)
+}
+
+/// Returns whether a decibel gain can execute in the native clip engine
+/// without consolidation.
+#[must_use]
+pub fn is_native_audio_clip_gain_decibels(gain_decibels: f64) -> bool {
+    let linear_gain = 10.0_f64.powf(gain_decibels / 20.0);
+    gain_decibels.is_finite() && linear_gain.is_finite() && linear_gain <= f64::from(2.0_f32)
 }
 
 fn serialize_audio_track_document_edit(

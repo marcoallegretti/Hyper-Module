@@ -9,18 +9,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyper_desktop_ide::{
-    DesktopAudioPreviewState, DesktopIdeWorker, IdeApplicationConfig, IdeAudioInputInventory,
-    IdeAudioOutputInventory, IdeAudioPreviewControlCommand, IdeInputSelection, IdeLoudnessCommand,
-    IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState, IdeLoudnessPresentationConfig,
-    IdeLoudnessScale, IdeLoudnessScaleRegion, IdeMaximumTruePeakDisplay, IdeMixerChannel,
-    IdeMixerChannelKind, IdeMixerCommand, IdeMixerSendTap, IdeMonitoringCommand,
-    IdeNativeCloseFailure, IdeOutputSelection, IdeOutputTestState, IdePlaybackArrangement,
-    IdePlaybackExtent, IdeRecordingAbortOutcome, IdeRecordingCaptureKind,
-    IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation, IdeScaledLoudnessValue,
-    IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
-    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    DesktopAudioPreviewState, DesktopIdeWorker, IdeApplicationConfig, IdeAudioClip,
+    IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
+    IdeInputSelection, IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
+    IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
+    IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelKind, IdeMixerCommand,
+    IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeOutputSelection,
+    IdeOutputTestState, IdePlaybackArrangement, IdePlaybackExtent, IdeRecordingAbortOutcome,
+    IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation,
+    IdeScaledLoudnessValue, IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind,
+    IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
     IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState, TransportCommand,
-    desktop_ide_application_config,
+    desktop_ide_application_config, ide_audio_clip_gain_is_supported,
 };
 use slint::platform::PlatformError;
 use slint::{
@@ -48,6 +48,7 @@ type ProjectUiStateCell = Rc<ProjectUiState>;
 struct ProjectUiState {
     playback_end_frame: RefCell<Option<usize>>,
     arrangement: RefCell<Option<ArrangementBinding>>,
+    audio_clips: RefCell<Vec<IdeAudioClip>>,
 }
 
 struct ArrangementBinding {
@@ -633,6 +634,7 @@ fn bind_playback_callbacks(
     });
 
     bind_arrangement_callback(ui, worker, project_state);
+    bind_audio_clip_callback(ui, worker, project_state);
     bind_loudness_callbacks(ui, worker);
 
     let weak = ui.as_weak();
@@ -1055,6 +1057,65 @@ fn bind_arrangement_callback(
     });
 }
 
+fn bind_audio_clip_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_gain = Rc::clone(worker);
+    let project_state_for_gain = Rc::clone(project_state);
+    actions.on_set_audio_clip_gain(move |clip_id, value| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text("Audio-clip gain is not available in the current state".into());
+            return;
+        }
+        let gain_decibels = match parse_audio_clip_gain(value.as_str()) {
+            Ok(gain_decibels) => gain_decibels,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let clips = project_state_for_gain.audio_clips.borrow();
+        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+            ui.set_error_text("The selected audio clip is no longer available".into());
+            return;
+        };
+        if gain_decibels.to_bits() == clip.gain_decibels().to_bits() {
+            ui.set_clip_gain_visible(false);
+            ui.set_status_text("Audio-clip gain already matches the committed value".into());
+            ui.set_error_text(SharedString::default());
+            return;
+        }
+        let owned_clip_id = clip.id().to_owned();
+        drop(clips);
+        submit_to_ui(
+            &ui,
+            &worker_for_gain,
+            IdeWorkerCommand::SetAudioClipGain {
+                clip_id: owned_clip_id,
+                gain_decibels,
+            },
+        );
+    });
+}
+
+fn parse_audio_clip_gain(value: &str) -> Result<f64, &'static str> {
+    let gain_decibels = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| "Clip gain must be a decimal value in dB")?;
+    if !ide_audio_clip_gain_is_supported(gain_decibels) {
+        return Err("Clip gain must be finite and at or below +6.0206 dB");
+    }
+    Ok(gain_decibels)
+}
+
 fn start_event_pump(
     ui: &MainWindow,
     worker: &WorkerCell,
@@ -1184,6 +1245,9 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
                 IdeWorkerCommandKind::SetArrangementPlacementActive => {
                     ui.set_app_mode(AppMode::ChangingArrangementActivation);
                 }
+                IdeWorkerCommandKind::SetAudioClipGain => {
+                    ui.set_app_mode(AppMode::ChangingClipGain);
+                }
                 IdeWorkerCommandKind::StartRecording => {
                     ui.set_app_mode(AppMode::PreparingRecording);
                 }
@@ -1250,6 +1314,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetArrangementPlacementActive => {
             "Preserving mixer state, updating the arrangement placement, and reopening project…"
+        }
+        IdeWorkerCommandKind::SetAudioClipGain => {
+            "Preserving mixer state, updating the audio clip, and reopening project…"
         }
         IdeWorkerCommandKind::StartRecording => {
             "Stopping playback and preparing an exclusive monitored capture…"
@@ -1355,6 +1422,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementPlacementActivationChanged { .. }
         | IdeWorkerEvent::ArrangementPlacementActivationChanging { .. }) => {
             apply_arrangement_placement_activation_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioClipGainChanged { .. }
+        | IdeWorkerEvent::AudioClipGainChanging { .. }) => {
+            apply_audio_clip_gain_event(ui, &event);
         }
         IdeWorkerEvent::RecordingPreparing => {
             ui.set_app_mode(AppMode::PreparingRecording);
@@ -1531,6 +1602,45 @@ fn apply_arrangement_placement_activation_event(ui: &MainWindow, event: &IdeWork
     }
 }
 
+fn apply_audio_clip_gain_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioClipGainChanged {
+            revision,
+            changed,
+            gain_decibels,
+        } => {
+            ui.set_clip_gain_visible(false);
+            ui.set_clip_gain_id(SharedString::default());
+            ui.set_clip_gain_name(SharedString::default());
+            ui.set_clip_gain_original(SharedString::default());
+            ui.set_clip_gain_value(SharedString::default());
+            ui.set_status_text(
+                if *changed {
+                    format!(
+                        "Audio-clip gain set to {gain_decibels:.4} dB in project revision {revision}"
+                    )
+                } else {
+                    format!(
+                        "Audio-clip gain already matched {gain_decibels:.4} dB in project revision {revision}"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipGainChanging { gain_decibels } => {
+            ui.set_app_mode(AppMode::ChangingClipGain);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before setting audio-clip gain to {gain_decibels:.4} dB…"
+                )
+                .into(),
+            );
+        }
+        _ => unreachable!("audio-clip gain event dispatcher received another event"),
+    }
+}
+
 fn apply_output_test_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::OutputTest(snapshot) => {
@@ -1699,6 +1809,7 @@ fn apply_running_event(
     set_recording_takes(ui, take_routes, observation);
     set_playback_extent(ui, project_state, observation);
     set_arrangement(ui, project_state, observation);
+    set_audio_clips(ui, project_state, observation.audio_clips());
     ui.set_stream_state(format!("{:?}", observation.output_state()).into());
     ui.set_callback_count(observation.output().callback_count.to_string().into());
     if let Some(monitoring) = observation.monitoring() {
@@ -2082,6 +2193,32 @@ fn set_arrangement(
     });
 }
 
+fn set_audio_clips(ui: &MainWindow, project_state: &ProjectUiStateCell, clips: &[IdeAudioClip]) {
+    if project_state.audio_clips.borrow().as_slice() == clips {
+        return;
+    }
+    let rows: Vec<ClipRow> = clips
+        .iter()
+        .map(|clip| ClipRow {
+            id: clip.id().into(),
+            name: clip.name().into(),
+            track_name: clip.track_name().into(),
+            gain_label: format!("{:+.2} dB", clip.gain_decibels()).into(),
+            gain_edit: format_audio_clip_gain(clip.gain_decibels()).into(),
+        })
+        .collect();
+    ui.set_audio_clips(ModelRc::from(Rc::new(VecModel::from(rows))));
+    *project_state.audio_clips.borrow_mut() = clips.to_vec();
+}
+
+fn format_audio_clip_gain(gain_decibels: f64) -> String {
+    if gain_decibels == 0.0 {
+        "0".to_owned()
+    } else {
+        gain_decibels.to_string()
+    }
+}
+
 fn format_frame_clock(frame: usize, sample_rate_hz: u32) -> String {
     format_transport_clock(u64::try_from(frame).unwrap_or(u64::MAX), sample_rate_hz)
 }
@@ -2353,6 +2490,13 @@ fn reset_project(
     ui.set_recording_takes(ModelRc::default());
     ui.set_takes_visible(false);
     ui.set_arrangement_visible(false);
+    ui.set_clips_visible(false);
+    ui.set_clip_gain_visible(false);
+    ui.set_clip_gain_id(SharedString::default());
+    ui.set_clip_gain_name(SharedString::default());
+    ui.set_clip_gain_original(SharedString::default());
+    ui.set_clip_gain_value(SharedString::default());
+    ui.set_audio_clips(ModelRc::default());
     ui.set_loudness_visible(false);
     ui.set_loudness_reset_confirming(false);
     ui.set_arrangement_placements(ModelRc::default());
@@ -2364,6 +2508,7 @@ fn reset_project(
     ui.set_preview_progress("—".into());
     *project_state.playback_end_frame.borrow_mut() = None;
     *project_state.arrangement.borrow_mut() = None;
+    project_state.audio_clips.borrow_mut().clear();
     ui.set_transport_extent_bounded(false);
     ui.set_transport_seek_available(false);
     ui.set_transport_progress_percent(0.0);
@@ -2418,6 +2563,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::SetArrangementPlacementActive
             if current == AppMode::ChangingArrangementActivation =>
         {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::SetAudioClipGain if current == AppMode::ChangingClipGain => {
             AppMode::Running
         }
         IdeWorkerCommandKind::StartRecording if current == AppMode::PreparingRecording => {
@@ -3394,6 +3542,29 @@ mod tests {
             mode_after_failure(
                 AppMode::ChangingArrangementActivation,
                 IdeWorkerCommandKind::SetArrangementPlacementActive,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn audio_clip_gain_input_matches_native_execution_domain() {
+        assert_eq!(parse_audio_clip_gain(" -12.5 "), Ok(-12.5));
+        assert_eq!(parse_audio_clip_gain("0"), Ok(0.0));
+        assert!(parse_audio_clip_gain("6.020599913279624").is_ok());
+        assert!(parse_audio_clip_gain("6.1").is_err());
+        assert!(parse_audio_clip_gain("NaN").is_err());
+        assert!(parse_audio_clip_gain("inf").is_err());
+        assert!(parse_audio_clip_gain("").is_err());
+        assert!(parse_audio_clip_gain("not gain").is_err());
+    }
+
+    #[test]
+    fn audio_clip_gain_failure_restores_running_mode() {
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ChangingClipGain,
+                IdeWorkerCommandKind::SetAudioClipGain,
             ),
             AppMode::Running
         );
