@@ -722,6 +722,12 @@ pub enum AudioClipGainSerializationError {
     Document(AudioClipDocumentSerializationError),
 }
 
+#[derive(Debug)]
+pub enum AudioClipFadeSerializationError {
+    CombinedDurationExceedsClip,
+    Document(AudioClipDocumentSerializationError),
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AudioTrackRemovalBlockers {
     pub clip_references: usize,
@@ -974,6 +980,26 @@ impl Error for AudioClipGainSerializationError {
         match self {
             Self::Document(source) => Some(source),
             Self::UnsupportedGain => None,
+        }
+    }
+}
+
+impl fmt::Display for AudioClipFadeSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CombinedDurationExceedsClip => {
+                formatter.write_str("combined audio-clip fades exceed the clip duration")
+            }
+            Self::Document(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioClipFadeSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Document(source) => Some(source),
+            Self::CombinedDurationExceedsClip => None,
         }
     }
 }
@@ -2878,6 +2904,46 @@ pub fn serialize_audio_clip_gain(
     .map_err(AudioClipGainSerializationError::Document)
 }
 
+/// Replaces the exact linear-amplitude fade durations in one validated
+/// canonical audio clip while preserving source, timing, looping, playback
+/// parameters, identity, and namespaced extensions.
+///
+/// Fade durations use the clip's project-tick domain. Their sum may equal, but
+/// never exceed, the complete reusable clip duration. This edit does not
+/// introduce a new fade curve or an arrangement-placement crossfade.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the clip is absent, the supplied bytes
+/// disagree with the loaded project, the combined fades exceed the clip
+/// duration, or the resulting document fails version-1 validation.
+pub fn serialize_audio_clip_fades(
+    project: &LoadedPlaybackProject,
+    source_clip: &[u8],
+    clip_id: &str,
+    fade_in_ticks: u64,
+    fade_out_ticks: u64,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AudioClipFadeSerializationError> {
+    let clip = project.clips.iter().find(|clip| clip.id == clip_id).ok_or(
+        AudioClipFadeSerializationError::Document(AudioClipDocumentSerializationError::ClipMissing),
+    )?;
+    if fade_out_ticks > clip.duration_ticks || fade_in_ticks > clip.duration_ticks - fade_out_ticks
+    {
+        return Err(AudioClipFadeSerializationError::CombinedDurationExceedsClip);
+    }
+    serialize_audio_clip_document_edit(project, source_clip, clip_id, limits, |document| {
+        let fades = document
+            .get_mut("fades")
+            .and_then(Value::as_object_mut)
+            .ok_or(AudioClipDocumentSerializationError::InvalidDocumentShape)?;
+        fades.insert("in_ticks".to_owned(), fade_in_ticks.into());
+        fades.insert("out_ticks".to_owned(), fade_out_ticks.into());
+        Ok(())
+    })
+    .map_err(AudioClipFadeSerializationError::Document)
+}
+
 /// Replaces only the global activation state in one validated canonical audio
 /// clip while preserving source, timing, looping, fades, playback parameters,
 /// identity, and namespaced extensions.
@@ -3456,6 +3522,18 @@ impl LoadedPlaybackProject {
     #[must_use]
     pub fn clip_gain_decibels_at(&self, clip_index: usize) -> Option<f64> {
         self.clips.get(clip_index).map(|clip| clip.gain_decibels)
+    }
+
+    /// Returns the persisted linear-amplitude fade-in duration in project ticks.
+    #[must_use]
+    pub fn clip_fade_in_ticks_at(&self, clip_index: usize) -> Option<u64> {
+        self.clips.get(clip_index).map(|clip| clip.fade_in_ticks)
+    }
+
+    /// Returns the persisted linear-amplitude fade-out duration in project ticks.
+    #[must_use]
+    pub fn clip_fade_out_ticks_at(&self, clip_index: usize) -> Option<u64> {
+        self.clips.get(clip_index).map(|clip| clip.fade_out_ticks)
     }
 
     /// Returns the immutable decoded-media view used to validate a candidate
@@ -4789,10 +4867,8 @@ fn validate_clip_document(
     {
         return domain_error(location, "clip loop range is invalid");
     }
-    if document.fades.in_ticks
-        > document
-            .duration_ticks
-            .saturating_sub(document.fades.out_ticks)
+    if document.fades.out_ticks > document.duration_ticks
+        || document.fades.in_ticks > document.duration_ticks - document.fades.out_ticks
     {
         return domain_error(location, "combined clip fades exceed clip duration");
     }
@@ -8366,6 +8442,111 @@ mod tests {
     }
 
     #[test]
+    fn audio_clip_fades_change_only_the_selected_canonical_fields() {
+        let mut source: Value = serde_json::from_slice(CLIP).unwrap();
+        source["extensions"]["org.example.clip"] = json!({"opaque": [1, 2, 3]});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [&source];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334460";
+
+        let edited =
+            serialize_audio_clip_fades(&loaded, &source, clip_id, 1, 3, LoaderLimits::VERSION_1)
+                .unwrap();
+        let mut expected: Value = serde_json::from_slice(&source).unwrap();
+        expected["fades"]["in_ticks"] = 1.into();
+        expected["fades"]["out_ticks"] = 3.into();
+
+        assert_eq!(edited, serde_json_canonicalizer::to_vec(&expected).unwrap());
+        assert_eq!(
+            expected["extensions"]["org.example.clip"],
+            json!({"opaque": [1, 2, 3]})
+        );
+        let edited_clips: [&[u8]; 1] = [&edited];
+        let reopened = load(
+            input(TIMELINE, &tracks, &edited_clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.clip_fade_in_ticks_at(0), Some(1));
+        assert_eq!(reopened.clip_fade_out_ticks_at(0), Some(3));
+        assert_eq!(
+            serialize_audio_clip_fades(&loaded, &source, clip_id, 0, 0, LoaderLimits::VERSION_1,)
+                .unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn audio_clip_fades_reject_invalid_missing_stale_and_noncanonical_inputs() {
+        let source: Value = serde_json::from_slice(CLIP).unwrap();
+        let canonical = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [&canonical];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334460";
+
+        for (fade_in_ticks, fade_out_ticks) in [(3, 2), (0, 5), (u64::MAX, 0)] {
+            assert!(matches!(
+                serialize_audio_clip_fades(
+                    &loaded,
+                    &canonical,
+                    clip_id,
+                    fade_in_ticks,
+                    fade_out_ticks,
+                    LoaderLimits::VERSION_1,
+                ),
+                Err(AudioClipFadeSerializationError::CombinedDurationExceedsClip)
+            ));
+        }
+        assert!(matches!(
+            serialize_audio_clip_fades(
+                &loaded,
+                &canonical,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                0,
+                0,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipFadeSerializationError::Document(
+                AudioClipDocumentSerializationError::ClipMissing
+            ))
+        ));
+        let mut stale = source.clone();
+        stale["enabled"] = false.into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_audio_clip_fades(&loaded, &stale, clip_id, 1, 1, LoaderLimits::VERSION_1,),
+            Err(AudioClipFadeSerializationError::Document(
+                AudioClipDocumentSerializationError::SourceClipMismatch
+            ))
+        ));
+        let noncanonical = serde_json::to_vec_pretty(&source).unwrap();
+        assert!(matches!(
+            serialize_audio_clip_fades(
+                &loaded,
+                &noncanonical,
+                clip_id,
+                1,
+                1,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipFadeSerializationError::Document(
+                AudioClipDocumentSerializationError::NonCanonicalSource
+            ))
+        ));
+    }
+
+    #[test]
     fn audio_clip_rename_changes_only_the_selected_canonical_field() {
         let mut source: Value = serde_json::from_slice(CLIP).unwrap();
         source["extensions"]["org.example.clip"] = json!({"opaque": [1, 2, 3]});
@@ -9590,6 +9771,20 @@ mod tests {
             1,
         );
         let clips: [&[u8]; 1] = [invalid_clip.as_bytes()];
+        assert_eq!(
+            load(
+                input(TIMELINE, &tracks, &clips, None),
+                LoaderLimits::VERSION_1
+            )
+            .unwrap_err()
+            .kind,
+            LoadErrorKind::InvalidVersionOneDomain
+        );
+
+        let invalid_fade = String::from_utf8(CLIP.to_vec())
+            .unwrap()
+            .replace("\"out_ticks\":0", "\"out_ticks\":5");
+        let clips: [&[u8]; 1] = [invalid_fade.as_bytes()];
         assert_eq!(
             load(
                 input(TIMELINE, &tracks, &clips, None),

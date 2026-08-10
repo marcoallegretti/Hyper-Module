@@ -943,7 +943,9 @@ fn validate_clip(clip: ClipCompileSpec<'_>) -> Result<(), CompileError> {
     if clip.loop_range.start >= clip.loop_range.end || clip.loop_range.end > clip.duration_ticks {
         return Err(CompileError::InvalidLoopRange);
     }
-    if clip.fade_in_ticks > clip.duration_ticks.saturating_sub(clip.fade_out_ticks) {
+    if clip.fade_out_ticks > clip.duration_ticks
+        || clip.fade_in_ticks > clip.duration_ticks - clip.fade_out_ticks
+    {
         return Err(CompileError::InvalidFades);
     }
     if !clip.gain_decibels.is_finite() {
@@ -1510,6 +1512,13 @@ mod tests {
         clip = valid_clip;
         clip.fade_in_ticks = 5;
         clip.fade_out_ticks = 4;
+        assert_eq!(
+            compile_placement(timeline(&tempos), clip, placement()),
+            Err(CompileError::InvalidFades)
+        );
+
+        clip = valid_clip;
+        clip.fade_out_ticks = clip.duration_ticks + 1;
         assert_eq!(
             compile_placement(timeline(&tempos), clip, placement()),
             Err(CompileError::InvalidFades)

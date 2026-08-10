@@ -260,7 +260,8 @@ impl<'a> ClipRenderPlan<'a> {
         {
             return Err(ClipPlanError::InvalidLoopRange);
         }
-        if spec.fade_in_frames > duration.saturating_sub(spec.fade_out_frames) {
+        if spec.fade_out_frames > duration || spec.fade_in_frames > duration - spec.fade_out_frames
+        {
             return Err(ClipPlanError::InvalidFades);
         }
 
@@ -670,6 +671,13 @@ mod tests {
         clip = spec(4);
         clip.fade_in_frames = 3;
         clip.fade_out_frames = 2;
+        assert!(matches!(
+            ClipRenderPlan::try_new(&source, clip),
+            Err(ClipPlanError::InvalidFades)
+        ));
+
+        clip = spec(4);
+        clip.fade_out_frames = 5;
         assert!(matches!(
             ClipRenderPlan::try_new(&source, clip),
             Err(ClipPlanError::InvalidFades)
