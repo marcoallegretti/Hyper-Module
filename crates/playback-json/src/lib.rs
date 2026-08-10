@@ -2187,6 +2187,7 @@ pub fn serialize_arrangement_placement_duplication(
         return Err(ArrangementPlacementDocumentSerializationError::PlacementCapacity);
     }
     if !is_valid_entity_id(placement_id)
+        || placement_id == project.project_id
         || project_contains_identity(project, placement_id)
         || assets.iter().any(|asset| asset.id == placement_id)
     {
@@ -7833,6 +7834,33 @@ mod tests {
                 LoaderLimits::VERSION_1,
             ),
             Err(ArrangementPlacementDuplicationSerializationError::NonCanonicalSource)
+        ));
+    }
+
+    #[test]
+    fn arrangement_placement_duplication_rejects_the_project_identity() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let source = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(ARRANGEMENT).unwrap(),
+        )
+        .unwrap();
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_arrangement_placement_duplication(
+                &loaded,
+                &asset_facts(),
+                &source,
+                "018f47a2-6b2d-7c11-8a44-001122334464",
+                loaded.project_id(),
+                4,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementDuplicationSerializationError::InvalidPlacementIdentity)
         ));
     }
 
