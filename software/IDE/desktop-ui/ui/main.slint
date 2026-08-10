@@ -27,6 +27,7 @@ export enum AppMode {
     changing-clip-gain,
     changing-clip-fades,
     changing-clip-loop,
+    changing-clip-reverse,
     creating-clip,
     preparing-preview,
     previewing,
@@ -115,6 +116,8 @@ export struct ClipRow {
     loop-label: string,
     loop-start-edit: string,
     loop-end-edit: string,
+    reverse: bool,
+    direction-label: string,
     fade-label: string,
     fade-in-edit: string,
     fade-out-edit: string,
@@ -151,6 +154,7 @@ export global IdeActions {
     callback set-audio-clip-gain(string, string);
     callback set-audio-clip-fades(string, string, string);
     callback set-audio-clip-loop(string, bool, string, string);
+    callback set-audio-clip-reverse(string, bool);
     callback loudness-run();
     callback loudness-standby();
     callback loudness-reset();
@@ -452,6 +456,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.changing-clip-gain ? "◌  UPDATING GAIN"
                         : root.app-mode == AppMode.changing-clip-fades ? "◌  UPDATING FADES"
                         : root.app-mode == AppMode.changing-clip-loop ? "◌  UPDATING LOOP"
+                        : root.app-mode == AppMode.changing-clip-reverse ? "◌  UPDATING DIRECTION"
                         : root.app-mode == AppMode.creating-clip ? "◌  CREATING CLIP"
                         : root.app-mode == AppMode.selecting ? "◌  SELECTING"
                         : root.app-mode == AppMode.closing ? "◌  CLOSING"
@@ -1630,7 +1635,7 @@ export component MainWindow inherits Window {
                             height: 48px;
                             VerticalLayout {
                                 Text { text: "AUDIO CLIPS"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: "Reusable verified source views · exact placement · global activation, gain, loop, and linear fades"; color: #aebccc; font-size: 12px; }
+                                Text { text: "Reusable verified source views · exact placement · global activation, direction, gain, loop, and linear fades"; color: #aebccc; font-size: 12px; }
                             }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Button {
@@ -1680,6 +1685,7 @@ export component MainWindow inherits Window {
                                         Text { text: "CLIP GAIN"; color: #65758a; font-size: 8px; horizontal-alignment: center; }
                                         Text { text: clip.gain-label; color: #b9c5d3; font-size: 13px; font-weight: 600; horizontal-alignment: center; }
                                         Text { text: "LOOP  " + clip.loop-label; color: clip.loop-enabled ? #75d7b4 : #8290a2; font-size: 8px; horizontal-alignment: center; overflow: elide; }
+                                        Text { text: "DIRECTION  " + clip.direction-label; color: clip.reverse ? #e5b567 : #8290a2; font-size: 8px; horizontal-alignment: center; overflow: elide; }
                                         Text { text: "FADES  " + clip.fade-label; color: #8290a2; font-size: 8px; horizontal-alignment: center; overflow: elide; }
                                     }
                                     VerticalLayout {
@@ -1729,14 +1735,21 @@ export component MainWindow inherits Window {
                                         HorizontalLayout {
                                             spacing: 4px;
                                             Button {
-                                                width: 76px;
+                                                width: 55px;
                                                 text: clip.active ? "Disable" : "Enable";
                                                 accessible-label: (clip.active ? "Disable " : "Enable ") + clip.name + " everywhere";
                                                 enabled: root.app-mode == AppMode.running;
                                                 clicked => { IdeActions.set-audio-clip-active(clip.id, !clip.active); }
                                             }
                                             Button {
-                                                width: 76px;
+                                                width: 55px;
+                                                text: clip.reverse ? "Forward" : "Reverse";
+                                                accessible-label: (clip.reverse ? "Use forward playback for " : "Use reverse playback for ") + clip.name + " everywhere";
+                                                enabled: root.app-mode == AppMode.running;
+                                                clicked => { IdeActions.set-audio-clip-reverse(clip.id, !clip.reverse); }
+                                            }
+                                            Button {
+                                                width: 55px;
                                                 text: "Gain";
                                                 accessible-label: "Edit gain for " + clip.name;
                                                 enabled: root.app-mode == AppMode.running;
@@ -1749,7 +1762,7 @@ export component MainWindow inherits Window {
                                                 }
                                             }
                                             Button {
-                                                width: 64px;
+                                                width: 55px;
                                                 text: "Loop";
                                                 accessible-label: "Edit reusable loop for " + clip.name;
                                                 enabled: root.app-mode == AppMode.running;
@@ -1767,7 +1780,7 @@ export component MainWindow inherits Window {
                                                 }
                                             }
                                             Button {
-                                                width: 64px;
+                                                width: 55px;
                                                 text: "Fades";
                                                 accessible-label: "Edit linear fades for " + clip.name;
                                                 enabled: root.app-mode == AppMode.running;
@@ -1789,7 +1802,7 @@ export component MainWindow inherits Window {
                         }
 
                         Text {
-                            text: "Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Place creates one full-length non-ripple reference. Activation, gain, loop, and fades affect every existing reference.";
+                            text: "Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Place creates one full-length non-ripple reference. Activation, direction, gain, loop, and fades affect every existing reference; reverse does not reverse transport or rewrite media.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;

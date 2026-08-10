@@ -25,6 +25,7 @@ use hyper_desktop_ide::{
 #[cfg(test)]
 use hyper_desktop_ide::{
     IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError, IdeAudioClipLoopEditError,
+    IdeAudioClipReverseEditError,
 };
 use slint::platform::PlatformError;
 use slint::{
@@ -1557,8 +1558,50 @@ fn bind_audio_clip_callback(
 
     bind_audio_clip_fade_callback(ui, worker, project_state);
     bind_audio_clip_loop_callback(ui, worker, project_state);
+    bind_audio_clip_reverse_callback(ui, worker, project_state);
 
     bind_arrangement_placement_addition_callback(ui, worker, project_state);
+}
+
+fn bind_audio_clip_reverse_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    let project_state = Rc::clone(project_state);
+    actions.on_set_audio_clip_reverse(move |clip_id, reverse| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text(
+                "Audio-clip direction editing is not available in the current state".into(),
+            );
+            return;
+        }
+        let clips = project_state.audio_clips.borrow();
+        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+            ui.set_error_text("The selected audio clip is no longer available".into());
+            return;
+        };
+        if reverse == clip.reverse() {
+            ui.set_error_text("Audio-clip direction is no longer current".into());
+            return;
+        }
+        let owned_clip_id = clip.id().to_owned();
+        drop(clips);
+        submit_to_ui(
+            &ui,
+            &worker,
+            IdeWorkerCommand::SetAudioClipReverse {
+                clip_id: owned_clip_id,
+                reverse,
+            },
+        );
+    });
 }
 
 fn bind_audio_clip_fade_callback(
@@ -2090,6 +2133,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::SetAudioClipGain => AppMode::ChangingClipGain,
         IdeWorkerCommandKind::SetAudioClipFades => AppMode::ChangingClipFades,
         IdeWorkerCommandKind::SetAudioClipLoop => AppMode::ChangingClipLoop,
+        IdeWorkerCommandKind::SetAudioClipReverse => AppMode::ChangingClipReverse,
         IdeWorkerCommandKind::CreateAudioClipFromTake => AppMode::CreatingClip,
         IdeWorkerCommandKind::StartRecording => AppMode::PreparingRecording,
         IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording => {
@@ -2176,6 +2220,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetAudioClipLoop => {
             "Preserving mixer state, updating the audio-clip loop, and reopening project..."
+        }
+        IdeWorkerCommandKind::SetAudioClipReverse => {
+            "Preserving mixer state, updating audio-clip direction, and reopening project..."
         }
         IdeWorkerCommandKind::CreateAudioClipFromTake => {
             "Preserving mixer state, creating the reusable audio clip, and reopening project…"
@@ -2342,6 +2389,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::AudioClipLoopChanged { .. }
         | IdeWorkerEvent::AudioClipLoopChanging { .. }) => {
             apply_audio_clip_loop_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioClipReverseChanged { .. }
+        | IdeWorkerEvent::AudioClipReverseChanging { .. }) => {
+            apply_audio_clip_reverse_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipCreatedFromTake { .. }
         | IdeWorkerEvent::AudioClipCreatingFromTake) => {
@@ -2877,6 +2928,7 @@ enum AudioClipEditWarningForm {
     Gain,
     Fades,
     Loop,
+    Reverse,
 }
 
 fn audio_clip_edit_warning_presentation(
@@ -2898,6 +2950,10 @@ fn audio_clip_edit_warning_presentation(
         IdeWorkerCommandKind::SetAudioClipLoop => {
             Some((AudioClipEditWarningForm::Loop, "Audio-clip loop edit"))
         }
+        IdeWorkerCommandKind::SetAudioClipReverse => Some((
+            AudioClipEditWarningForm::Reverse,
+            "Audio-clip direction edit",
+        )),
         _ => None,
     }
 }
@@ -2910,7 +2966,7 @@ fn apply_audio_clip_edit_committed_warning(ui: &MainWindow, event: &IdeWorkerEve
         unreachable!("committed-warning event used an unrelated command");
     };
     match form {
-        AudioClipEditWarningForm::None => {}
+        AudioClipEditWarningForm::None | AudioClipEditWarningForm::Reverse => {}
         AudioClipEditWarningForm::Rename => reset_audio_clip_rename_form(ui),
         AudioClipEditWarningForm::Gain => reset_audio_clip_gain_form(ui),
         AudioClipEditWarningForm::Fades => reset_audio_clip_fade_form(ui),
@@ -3085,6 +3141,42 @@ fn apply_audio_clip_loop_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             );
         }
         _ => unreachable!("audio-clip loop event dispatcher received another event"),
+    }
+}
+
+fn apply_audio_clip_reverse_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioClipReverseChanged {
+            revision,
+            changed,
+            reverse,
+        } => {
+            let direction = if *reverse { "reverse" } else { "forward" };
+            ui.set_status_text(
+                if *changed {
+                    format!(
+                        "Audio-clip playback direction set to {direction} in project revision {revision}"
+                    )
+                } else {
+                    format!(
+                        "Audio-clip playback direction already matched {direction} in project revision {revision}"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipReverseChanging { reverse } => {
+            ui.set_app_mode(AppMode::ChangingClipReverse);
+            let direction = if *reverse { "reverse" } else { "forward" };
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before setting reusable audio-clip playback to {direction}..."
+                )
+                .into(),
+            );
+        }
+        _ => unreachable!("audio-clip reverse event dispatcher received another event"),
     }
 }
 
@@ -3696,6 +3788,8 @@ fn set_audio_clips(ui: &MainWindow, project_state: &ProjectUiStateCell, clips: &
             .into(),
             loop_start_edit: clip.loop_start_tick().to_string().into(),
             loop_end_edit: clip.loop_end_tick().to_string().into(),
+            reverse: clip.reverse(),
+            direction_label: if clip.reverse() { "REVERSE" } else { "FORWARD" }.into(),
             fade_label: format!(
                 "{} in / {} out",
                 clip.fade_in_ticks(),
@@ -4082,6 +4176,10 @@ fn reset_monitoring(ui: &MainWindow) {
     ui.set_monitoring_underflow_count("0".into());
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive command-to-pending-mode recovery table stays auditable in one match"
+)]
 fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMode {
     match command {
         IdeWorkerCommandKind::Initialize if current == AppMode::Discovering => AppMode::Unavailable,
@@ -4157,6 +4255,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::SetAudioClipLoop if current == AppMode::ChangingClipLoop => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::SetAudioClipReverse if current == AppMode::ChangingClipReverse => {
             AppMode::Running
         }
         IdeWorkerCommandKind::CreateAudioClipFromTake if current == AppMode::CreatingClip => {
@@ -5454,6 +5555,24 @@ mod tests {
     }
 
     #[test]
+    fn audio_clip_reverse_submission_and_failure_use_a_dedicated_mode() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::SetAudioClipReverse,
+            ),
+            AppMode::ChangingClipReverse
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ChangingClipReverse,
+                IdeWorkerCommandKind::SetAudioClipReverse,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
     fn committed_audio_clip_edit_warning_presentation_identifies_the_matching_form() {
         assert_eq!(
             audio_clip_edit_warning_presentation(IdeWorkerCommandKind::RenameAudioClip),
@@ -5474,6 +5593,13 @@ mod tests {
         assert_eq!(
             audio_clip_edit_warning_presentation(IdeWorkerCommandKind::SetAudioClipLoop),
             Some((AudioClipEditWarningForm::Loop, "Audio-clip loop edit"))
+        );
+        assert_eq!(
+            audio_clip_edit_warning_presentation(IdeWorkerCommandKind::SetAudioClipReverse),
+            Some((
+                AudioClipEditWarningForm::Reverse,
+                "Audio-clip direction edit"
+            ))
         );
         assert_eq!(
             audio_clip_edit_warning_presentation(IdeWorkerCommandKind::SaveProject),
@@ -5543,6 +5669,20 @@ mod tests {
             ui.get_status_text()
                 .contains("committed, but the project could not be reopened")
         );
+        assert!(!ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::Running);
+        apply_audio_clip_edit_committed_warning(
+            &ui,
+            &IdeWorkerEvent::AudioClipEditCommittedWithWarning {
+                command: IdeWorkerCommandKind::SetAudioClipReverse,
+                warning: IdeAudioClipEditCommittedWarning::Reverse(Box::new(
+                    IdeAudioClipReverseEditError::InvalidClipIdentity,
+                )),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(ui.get_status_text().contains("committed and reopened"));
         assert!(!ui.get_error_text().is_empty());
     }
 
