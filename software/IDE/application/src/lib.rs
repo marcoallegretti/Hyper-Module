@@ -56,10 +56,11 @@ use hyper_playback_json::{
     AudioTrackRenameSerializationError, CompiledMixerTap, CompiledMixerTrackKind, LoaderLimits,
     MixerBaseState, MixerChannelBaseState, MixerSendBaseState, MixerStateSerializationError,
     serialize_arrangement_placement_activation, serialize_arrangement_placement_addition,
-    serialize_arrangement_placement_duration, serialize_arrangement_placement_front_trim,
-    serialize_arrangement_placement_move, serialize_arrangement_placement_removal,
-    serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_gain,
-    serialize_audio_clip_rename, serialize_audio_track_activation, serialize_audio_track_addition,
+    serialize_arrangement_placement_duplication, serialize_arrangement_placement_duration,
+    serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
+    serialize_arrangement_placement_removal, serialize_audio_clip_activation,
+    serialize_audio_clip_duplication, serialize_audio_clip_gain, serialize_audio_clip_rename,
+    serialize_audio_track_activation, serialize_audio_track_addition,
     serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
     serialize_recording_audio_clip_addition,
 };
@@ -2475,6 +2476,16 @@ pub enum IdeArrangementPlacementEditPublicationError {
     },
 }
 
+impl IdeArrangementPlacementEditPublicationError {
+    #[must_use]
+    pub const fn arrangement_published(&self) -> bool {
+        match self {
+            Self::Mixer(_) => false,
+            Self::Arrangement { source, .. } => source.published(),
+        }
+    }
+}
+
 impl fmt::Display for IdeArrangementPlacementEditPublicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2518,7 +2529,10 @@ pub enum IdeArrangementPlacementEditError {
     Storage(StorageError),
     Serialization(ArrangementPlacementDocumentSerializationError),
     CapacityUnavailable,
-    Publication(Box<IdeArrangementPlacementEditPublicationError>),
+    Publication {
+        created_placement_id: Option<Box<str>>,
+        source: Box<IdeArrangementPlacementEditPublicationError>,
+    },
     NativeClose(IdeNativeCloseFailure),
     NativeCloseAndReopen {
         close: IdeNativeCloseFailure,
@@ -2530,12 +2544,46 @@ pub enum IdeArrangementPlacementEditError {
     },
     ReopenAfterPublication {
         outcome: ProjectResourcePublicationOutcome,
+        created_placement_id: Option<Box<str>>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
+        created_placement_id: Option<Box<str>>,
         publication: Box<IdeArrangementPlacementEditPublicationError>,
         reopen: Box<IdeProjectOpenError>,
     },
+}
+
+impl IdeArrangementPlacementEditError {
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication { source, .. } => source.arrangement_published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. } => publication.arrangement_published(),
+            _ => false,
+        }
+    }
+
+    #[must_use]
+    pub fn committed_created_placement_id(&self) -> Option<&str> {
+        match self {
+            Self::Publication {
+                created_placement_id: Some(placement_id),
+                source,
+            } if source.arrangement_published() => Some(placement_id),
+            Self::PublicationAndReopen {
+                created_placement_id: Some(placement_id),
+                publication,
+                ..
+            } if publication.arrangement_published() => Some(placement_id),
+            Self::ReopenAfterPublication {
+                created_placement_id: Some(placement_id),
+                ..
+            } => Some(placement_id),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for IdeArrangementPlacementEditError {
@@ -2563,7 +2611,14 @@ impl fmt::Display for IdeArrangementPlacementEditError {
             Self::CapacityUnavailable => {
                 formatter.write_str("arrangement edit capacity is unavailable")
             }
-            Self::Publication(source) => source.fmt(formatter),
+            Self::Publication {
+                created_placement_id: Some(placement_id),
+                source,
+            } if source.arrangement_published() => write!(
+                formatter,
+                "arrangement placement {placement_id} was committed, but project verification or transaction recovery is incomplete: {source}"
+            ),
+            Self::Publication { source, .. } => source.fmt(formatter),
             Self::NativeClose(source) => write!(
                 formatter,
                 "native playback did not close cleanly before editing the arrangement: {source:?}"
@@ -2579,18 +2634,49 @@ impl fmt::Display for IdeArrangementPlacementEditError {
                 formatter,
                 "arrangement edit preparation failed ({preparation}) and the project could not be reopened ({reopen})"
             ),
-            Self::ReopenAfterPublication { outcome, source } => write!(
-                formatter,
-                "arrangement was edited in project revision {} but the project could not be reopened: {source}",
-                outcome.project_revision()
-            ),
+            Self::ReopenAfterPublication {
+                outcome,
+                created_placement_id,
+                source,
+            } => {
+                if let Some(placement_id) = created_placement_id {
+                    write!(
+                        formatter,
+                        "arrangement placement {placement_id} was committed in project revision {} but the project could not be reopened: {source}",
+                        outcome.project_revision()
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "arrangement was edited in project revision {} but the project could not be reopened: {source}",
+                        outcome.project_revision()
+                    )
+                }
+            }
             Self::PublicationAndReopen {
+                created_placement_id,
                 publication,
                 reopen,
-            } => write!(
-                formatter,
-                "arrangement edit publication failed ({publication}) and the project could not be reopened ({reopen})"
-            ),
+            } => {
+                if publication.arrangement_published() {
+                    if let Some(placement_id) = created_placement_id {
+                        write!(
+                            formatter,
+                            "arrangement placement {placement_id} was committed, but project verification or transaction recovery is incomplete ({publication}) and the project could not be reopened ({reopen})"
+                        )
+                    } else {
+                        write!(
+                            formatter,
+                            "arrangement edit was committed with incomplete project verification or transaction recovery ({publication}) and the project could not be reopened ({reopen})"
+                        )
+                    }
+                } else {
+                    write!(
+                        formatter,
+                        "arrangement edit publication failed ({publication}) and the project could not be reopened ({reopen})"
+                    )
+                }
+            }
         }
     }
 }
@@ -2601,7 +2687,7 @@ impl Error for IdeArrangementPlacementEditError {
             Self::MixerSave(source) => Some(source.as_ref()),
             Self::Storage(source) => Some(source),
             Self::Serialization(source) => Some(source),
-            Self::Publication(source) => Some(source.as_ref()),
+            Self::Publication { source, .. } => Some(source.as_ref()),
             Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
             Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
@@ -3042,6 +3128,7 @@ struct IdeArrangementPlacementEditPlan {
     arrangement_id: String,
     arrangement_bytes: Vec<u8>,
     addition: bool,
+    created_placement_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -4037,6 +4124,66 @@ impl RunningDesktopIdeApplication {
             arrangement_id,
             arrangement_bytes,
             addition,
+            created_placement_id: Some(placement_id),
+        })
+    }
+
+    fn prepare_arrangement_placement_duplication(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        source_placement_id: &str,
+        start_tick: u64,
+    ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeArrangementPlacementEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeArrangementPlacementEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let mut descriptors = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::Arrangement);
+        let descriptor = descriptors
+            .next()
+            .ok_or(IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
+        if descriptors.next().is_some() {
+            return Err(IdeArrangementPlacementEditError::ArrangementResourceAmbiguous);
+        }
+        let source = package
+            .read_resource(descriptor.id())
+            .map_err(IdeArrangementPlacementEditError::Storage)?;
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeArrangementPlacementEditError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let placement_id = uuid::Uuid::new_v4().to_string();
+        let arrangement_bytes = serialize_arrangement_placement_duplication(
+            project,
+            &assets,
+            &source,
+            source_placement_id,
+            &placement_id,
+            start_tick,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeArrangementPlacementEditError::Serialization)?;
+        let mut arrangement_id = String::new();
+        arrangement_id
+            .try_reserve_exact(descriptor.id().len())
+            .map_err(|_| IdeArrangementPlacementEditError::CapacityUnavailable)?;
+        arrangement_id.push_str(descriptor.id());
+        Ok(IdeArrangementPlacementEditPlan {
+            mixer,
+            arrangement_id,
+            arrangement_bytes,
+            addition: false,
+            created_placement_id: Some(placement_id),
         })
     }
 
@@ -4169,6 +4316,7 @@ impl RunningDesktopIdeApplication {
             arrangement_id,
             arrangement_bytes,
             addition: false,
+            created_placement_id: None,
         })
     }
 
@@ -5953,6 +6101,7 @@ mod tests {
             arrangement_id: arrangement_id.clone(),
             arrangement_bytes: b"not-json".to_vec(),
             addition: false,
+            created_placement_id: None,
         };
         let error = failed.publish().unwrap_err();
         let IdeArrangementPlacementEditPublicationError::Arrangement { mixer, source } = error
@@ -5986,6 +6135,7 @@ mod tests {
             arrangement_id: arrangement_id.clone(),
             arrangement_bytes: disabled_arrangement.clone(),
             addition: false,
+            created_placement_id: None,
         };
         let outcome = retry.publish().unwrap();
         assert!(outcome.changed());
@@ -6022,6 +6172,7 @@ mod tests {
             arrangement_id: arrangement_id.clone(),
             arrangement_bytes: moved_arrangement.clone(),
             addition: false,
+            created_placement_id: None,
         }
         .publish()
         .unwrap();
@@ -6062,6 +6213,7 @@ mod tests {
             arrangement_id: arrangement_id.clone(),
             arrangement_bytes: resized_arrangement.clone(),
             addition: false,
+            created_placement_id: None,
         }
         .publish()
         .unwrap();
@@ -6102,6 +6254,7 @@ mod tests {
             arrangement_id: arrangement_id.clone(),
             arrangement_bytes: front_trimmed_arrangement.clone(),
             addition: false,
+            created_placement_id: None,
         }
         .publish()
         .unwrap();
@@ -6143,6 +6296,7 @@ mod tests {
             arrangement_id: arrangement_id.clone(),
             arrangement_bytes: front_trimmed_arrangement.clone(),
             addition: false,
+            created_placement_id: None,
         }
         .publish()
         .unwrap();
@@ -6159,6 +6313,7 @@ mod tests {
             arrangement_id: arrangement_id.clone(),
             arrangement_bytes: removed_arrangement.clone(),
             addition: false,
+            created_placement_id: None,
         }
         .publish()
         .unwrap();
@@ -6445,6 +6600,7 @@ mod tests {
             arrangement_id: arrangement_id.to_owned(),
             arrangement_bytes: arrangement_bytes.clone(),
             addition: true,
+            created_placement_id: Some(placement_id.to_owned()),
         }
         .publish()
         .unwrap();
