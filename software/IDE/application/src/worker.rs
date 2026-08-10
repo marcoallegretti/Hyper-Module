@@ -3780,9 +3780,9 @@ fn project_mutation_native_close_failure(
     }
 }
 
-struct ArrangementPlacementCreationPublication {
-    outcome: hyper_storage_engine::ProjectResourcePublicationOutcome,
-    placement_id: String,
+pub(super) struct ArrangementPlacementCreationPublication {
+    pub(super) outcome: hyper_storage_engine::ProjectResourcePublicationOutcome,
+    pub(super) placement_id: String,
 }
 
 enum ProjectMutationAttempt {
@@ -3880,16 +3880,27 @@ fn publish_arrangement_edit_failure(
     reason: IdeArrangementPlacementEditError,
     failure: fn(Box<IdeArrangementPlacementEditError>) -> IdeWorkerCommandFailure,
 ) -> bool {
+    send_event(
+        events,
+        arrangement_edit_failure_event(command, reason, failure),
+    )
+}
+
+pub(super) fn arrangement_edit_failure_event(
+    command: IdeWorkerCommandKind,
+    reason: IdeArrangementPlacementEditError,
+    failure: fn(Box<IdeArrangementPlacementEditError>) -> IdeWorkerCommandFailure,
+) -> IdeWorkerEvent {
     if reason.publication_committed() {
-        send_event(
-            events,
-            IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning {
-                command,
-                warning: Box::new(reason),
-            },
-        )
+        IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning {
+            command,
+            warning: Box::new(reason),
+        }
     } else {
-        publish_failure(events, command, failure(Box::new(reason)))
+        IdeWorkerEvent::CommandFailed {
+            command,
+            reason: failure(Box::new(reason)),
+        }
     }
 }
 
@@ -5106,7 +5117,7 @@ fn arrangement_placement_edit_reopen_failure(
     wrap(Box::new(reason))
 }
 
-fn arrangement_placement_creation_reopen_failure(
+pub(super) fn arrangement_placement_creation_reopen_failure(
     result: Result<ArrangementPlacementCreationPublication, IdeArrangementPlacementEditError>,
     reopen: IdeProjectOpenError,
     wrap: fn(Box<IdeArrangementPlacementEditError>) -> IdeWorkerCommandFailure,

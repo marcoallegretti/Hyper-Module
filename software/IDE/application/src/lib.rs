@@ -6330,6 +6330,109 @@ mod tests {
     }
 
     #[test]
+    fn arrangement_placement_duplication_retains_committed_identity_through_reopen_outcomes() {
+        const DUPLICATED_PLACEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338508";
+        let fixture = ArrangementProjectFixture::new();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let arrangement = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Arrangement)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let arrangement_id = arrangement.id().to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let source_arrangement = package.read_resource(&arrangement_id).unwrap();
+        let project_identity = *package.manifest_sha256();
+        let (project, _, _, media) = prepared.session().parts();
+        let assets: Vec<_> = media.media_asset_facts().collect();
+        let arrangement_bytes = serialize_arrangement_placement_duplication(
+            project,
+            &assets,
+            &source_arrangement,
+            ARRANGEMENT_TEST_PLACEMENT_ID,
+            DUPLICATED_PLACEMENT_ID,
+            4,
+            limits.session.documents,
+        )
+        .unwrap();
+        drop(prepared);
+
+        let outcome = IdeArrangementPlacementEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: project_identity,
+                resource_id: mixer_id,
+                resource_bytes: mixer_bytes,
+            },
+            arrangement_id,
+            arrangement_bytes,
+            addition: false,
+            created_placement_id: Some(DUPLICATED_PLACEMENT_ID.to_owned()),
+        }
+        .publish()
+        .unwrap();
+        assert!(outcome.changed());
+
+        let failure = worker::arrangement_placement_creation_reopen_failure(
+            Ok(worker::ArrangementPlacementCreationPublication {
+                outcome,
+                placement_id: DUPLICATED_PLACEMENT_ID.to_owned(),
+            }),
+            IdeProjectOpenError::SelectedOutputUnavailable,
+            IdeWorkerCommandFailure::ArrangementPlacementDuplication,
+        );
+        let IdeWorkerCommandFailure::ArrangementPlacementDuplication(reason) = failure else {
+            panic!("duplication reopen failure must retain its typed command boundary");
+        };
+        assert!(reason.publication_committed());
+        assert_eq!(
+            reason.committed_created_placement_id(),
+            Some(DUPLICATED_PLACEMENT_ID)
+        );
+        assert!(matches!(
+            reason.as_ref(),
+            IdeArrangementPlacementEditError::ReopenAfterPublication { source, .. }
+                if matches!(source.as_ref(), IdeProjectOpenError::SelectedOutputUnavailable)
+        ));
+        let warning_event = worker::arrangement_edit_failure_event(
+            IdeWorkerCommandKind::DuplicateArrangementPlacement,
+            *reason,
+            IdeWorkerCommandFailure::ArrangementPlacementDuplication,
+        );
+        assert!(matches!(
+            warning_event,
+            IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning {
+                command: IdeWorkerCommandKind::DuplicateArrangementPlacement,
+                warning,
+            } if warning.committed_created_placement_id() == Some(DUPLICATED_PLACEMENT_ID)
+        ));
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert_eq!(reopened.session().arrangement().placements().len(), 2);
+        assert!(
+            reopened
+                .session()
+                .arrangement()
+                .placements()
+                .iter()
+                .any(|placement| placement.id() == DUPLICATED_PLACEMENT_ID)
+        );
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "the end-to-end test keeps recording import, clip publication, reopen, and non-placement evidence together"
