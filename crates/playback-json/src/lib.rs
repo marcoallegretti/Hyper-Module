@@ -8007,7 +8007,7 @@ mod tests {
         source["placements"][0]["start_tick"] = 10.into();
         source["placements"][0]["clip_start_tick"] = 6.into();
         source["placements"][0]["duration_ticks"] = 8.into();
-        source["placements"][0]["enabled"] = false.into();
+        source["placements"][0]["enabled"] = true.into();
         source["extensions"]["org.example.arrangement"] = json!({"opaque": [1, 2, 3]});
         let source = serde_json_canonicalizer::to_vec(&source).unwrap();
         let loaded = load(
@@ -8038,7 +8038,7 @@ mod tests {
                     "start_tick": 10,
                     "clip_start_tick": 6,
                     "duration_ticks": 3,
-                    "enabled": false
+                    "enabled": true
                 },
                 {
                     "id": right_placement_id,
@@ -8047,7 +8047,7 @@ mod tests {
                     "start_tick": 13,
                     "clip_start_tick": 9,
                     "duration_ticks": 5,
-                    "enabled": false
+                    "enabled": true
                 }
             ])
         );
@@ -8062,13 +8062,26 @@ mod tests {
             LoaderLimits::VERSION_1,
         )
         .unwrap();
-        reopened
+        let compiled = reopened
             .compile_playback(
                 &asset_facts(),
                 GraphLimits::VERSION_1,
                 SceneLimits::VERSION_1,
             )
             .unwrap();
+        let entries = compiled.arrangement().entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.placement_enabled));
+        assert_eq!(
+            entries[0].compiled.arrangement_end_frame(),
+            entries[1].compiled.arrangement_start_frame()
+        );
+        let left = entries[0].compiled.placement_spec();
+        let right = entries[1].compiled.placement_spec();
+        assert_eq!(
+            left.clip_start_frame + left.frame_count,
+            right.clip_start_frame
+        );
     }
 
     #[test]
