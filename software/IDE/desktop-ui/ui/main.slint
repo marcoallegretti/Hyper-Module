@@ -25,6 +25,7 @@ export enum AppMode {
     duplicating-clip,
     changing-clip-activation,
     changing-clip-gain,
+    changing-clip-fades,
     creating-clip,
     preparing-preview,
     previewing,
@@ -109,6 +110,9 @@ export struct ClipRow {
     active: bool,
     gain-label: string,
     gain-edit: string,
+    fade-label: string,
+    fade-in-edit: string,
+    fade-out-edit: string,
 }
 
 export global IdeActions {
@@ -140,6 +144,7 @@ export global IdeActions {
     callback duplicate-audio-clip(string, string);
     callback set-audio-clip-active(string, bool);
     callback set-audio-clip-gain(string, string);
+    callback set-audio-clip-fades(string, string, string);
     callback loudness-run();
     callback loudness-standby();
     callback loudness-reset();
@@ -298,6 +303,14 @@ export component MainWindow inherits Window {
     in-out property <string> clip-gain-name: "";
     in-out property <string> clip-gain-original: "";
     in-out property <string> clip-gain-value: "";
+    in-out property <bool> clip-fades-visible: false;
+    in-out property <string> clip-fades-id: "";
+    in-out property <string> clip-fades-name: "";
+    in-out property <string> clip-fades-duration: "";
+    in-out property <string> clip-fades-original-in: "";
+    in-out property <string> clip-fades-original-out: "";
+    in-out property <string> clip-fades-in: "";
+    in-out property <string> clip-fades-out: "";
     in-out property <bool> add-arrangement-placement-visible: false;
     in-out property <string> add-arrangement-placement-clip-id: "";
     in-out property <string> add-arrangement-placement-clip-name: "";
@@ -421,6 +434,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.removing-arrangement-placement ? "◌  REMOVING CLIP"
                         : root.app-mode == AppMode.changing-clip-activation ? "◌  UPDATING CLIP"
                         : root.app-mode == AppMode.changing-clip-gain ? "◌  UPDATING GAIN"
+                        : root.app-mode == AppMode.changing-clip-fades ? "◌  UPDATING FADES"
                         : root.app-mode == AppMode.creating-clip ? "◌  CREATING CLIP"
                         : root.app-mode == AppMode.selecting ? "◌  SELECTING"
                         : root.app-mode == AppMode.closing ? "◌  CLOSING"
@@ -1588,7 +1602,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-gain-visible && !root.add-arrangement-placement-visible : Panel {
+                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1599,17 +1613,17 @@ export component MainWindow inherits Window {
                             height: 48px;
                             VerticalLayout {
                                 Text { text: "AUDIO CLIPS"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: "Reusable verified source views · editable names · exact arrangement placement · global activation · constant gain"; color: #aebccc; font-size: 12px; }
+                                Text { text: "Reusable verified source views · exact placement · global activation, gain, and linear fades"; color: #aebccc; font-size: 12px; }
                             }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Button {
                                 text: "Performance";
-                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.add-arrangement-placement-visible = false; }
+                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.add-arrangement-placement-visible = false; }
                             }
                             Button {
                                 text: "Mixer";
                                 enabled: root.app-mode == AppMode.running;
-                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
+                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
                             }
                         }
 
@@ -1627,7 +1641,7 @@ export component MainWindow inherits Window {
                         if root.audio-clips.length > 0 : ListView {
                             vertical-stretch: 1;
                             for clip in root.audio-clips : Rectangle {
-                                height: 70px;
+                                height: 78px;
                                 width: parent.width;
                                 background: #0e141b;
                                 border-color: #27313d;
@@ -1644,10 +1658,11 @@ export component MainWindow inherits Window {
                                         Text { text: clip.duration-ticks + " ticks · full reusable clip"; color: #65758a; font-size: 8px; overflow: elide; }
                                     }
                                     VerticalLayout {
-                                        width: 118px;
+                                        width: 126px;
                                         alignment: center;
                                         Text { text: "CLIP GAIN"; color: #65758a; font-size: 8px; horizontal-alignment: center; }
                                         Text { text: clip.gain-label; color: #b9c5d3; font-size: 13px; font-weight: 600; horizontal-alignment: center; }
+                                        Text { text: "FADES  " + clip.fade-label; color: #8290a2; font-size: 8px; horizontal-alignment: center; overflow: elide; }
                                     }
                                     Button {
                                         width: 72px;
@@ -1707,12 +1722,28 @@ export component MainWindow inherits Window {
                                             root.clip-gain-visible = true;
                                         }
                                     }
+                                    Button {
+                                        width: 72px;
+                                        text: "Fades";
+                                        accessible-label: "Edit linear fades for " + clip.name;
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => {
+                                            root.clip-fades-id = clip.id;
+                                            root.clip-fades-name = clip.name;
+                                            root.clip-fades-duration = clip.duration-ticks;
+                                            root.clip-fades-original-in = clip.fade-in-edit;
+                                            root.clip-fades-original-out = clip.fade-out-edit;
+                                            root.clip-fades-in = clip.fade-in-edit;
+                                            root.clip-fades-out = clip.fade-out-edit;
+                                            root.clip-fades-visible = true;
+                                        }
+                                    }
                                 }
                             }
                         }
 
                         Text {
-                            text: "Rename changes clip metadata only. Duplicate creates a new reusable identity sharing the same immutable source audio; it creates no placement. Place creates one full-length non-ripple arrangement reference. Activation and gain affect every existing reference.";
+                            text: "Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Place creates one full-length non-ripple reference. Activation, gain, and fades affect every existing reference.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;
@@ -1893,6 +1924,53 @@ export component MainWindow inherits Window {
                                     && root.clip-gain-value != ""
                                     && root.clip-gain-value != root.clip-gain-original;
                                 clicked => { IdeActions.set-audio-clip-gain(root.clip-gain-id, root.clip-gain-value); }
+                            }
+                        }
+                    }
+                }
+
+                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-gain-visible && root.clip-fades-visible && !root.add-arrangement-placement-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 16px;
+                        Text { text: "EDIT CLIP FADES"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.clip-fades-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                        Text {
+                            text: "Enter exact fade-in and fade-out durations in project ticks. Their combined duration may not exceed the clip's " + root.clip-fades-duration + " ticks.";
+                            color: #aebccc;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        GridLayout {
+                            spacing: 8px;
+                            Text { text: "Fade in"; color: #8fa0b4; vertical-alignment: center; }
+                            LineEdit { text <=> root.clip-fades-in; placeholder-text: "0"; accessible-label: "Audio clip fade-in ticks"; }
+                            Text { text: "Fade out"; color: #8fa0b4; vertical-alignment: center; }
+                            LineEdit { text <=> root.clip-fades-out; placeholder-text: "0"; accessible-label: "Audio clip fade-out ticks"; }
+                        }
+                        Text {
+                            text: "The fixed curve is linear amplitude. This edits the reusable clip everywhere it is referenced; it is not an arrangement crossfade and does not change source audio.";
+                            color: #65758a;
+                            font-size: 9px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Cancel"; clicked => { root.clip-fades-visible = false; } }
+                            Button { text: "Reset fades"; clicked => { root.clip-fades-in = "0"; root.clip-fades-out = "0"; } }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: "Apply fades";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.clip-fades-id != ""
+                                    && root.clip-fades-in != ""
+                                    && root.clip-fades-out != ""
+                                    && (root.clip-fades-in != root.clip-fades-original-in
+                                        || root.clip-fades-out != root.clip-fades-original-out);
+                                clicked => { IdeActions.set-audio-clip-fades(root.clip-fades-id, root.clip-fades-in, root.clip-fades-out); }
                             }
                         }
                     }

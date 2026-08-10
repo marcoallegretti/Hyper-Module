@@ -1551,7 +1551,62 @@ fn bind_audio_clip_callback(
         );
     });
 
+    bind_audio_clip_fade_callback(ui, worker, project_state);
+
     bind_arrangement_placement_addition_callback(ui, worker, project_state);
+}
+
+fn bind_audio_clip_fade_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    let project_state = Rc::clone(project_state);
+    actions.on_set_audio_clip_fades(move |clip_id, fade_in, fade_out| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text("Audio-clip fades are not available in the current state".into());
+            return;
+        }
+        let clips = project_state.audio_clips.borrow();
+        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+            ui.set_error_text("The selected audio clip is no longer available".into());
+            return;
+        };
+        let (fade_in_ticks, fade_out_ticks) = match parse_audio_clip_fades(
+            fade_in.as_str(),
+            fade_out.as_str(),
+            clip.duration_ticks(),
+        ) {
+            Ok(fades) => fades,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        if fade_in_ticks == clip.fade_in_ticks() && fade_out_ticks == clip.fade_out_ticks() {
+            ui.set_clip_fades_visible(false);
+            ui.set_status_text("Audio-clip fades already match the committed values".into());
+            ui.set_error_text(SharedString::default());
+            return;
+        }
+        let owned_clip_id = clip.id().to_owned();
+        drop(clips);
+        submit_to_ui(
+            &ui,
+            &worker,
+            IdeWorkerCommand::SetAudioClipFades {
+                clip_id: owned_clip_id,
+                fade_in_ticks,
+                fade_out_ticks,
+            },
+        );
+    });
 }
 
 fn bind_audio_clip_rename_callback(
@@ -1722,6 +1777,29 @@ fn parse_audio_clip_gain(value: &str) -> Result<f64, &'static str> {
         return Err("Clip gain must be finite and at or below +6.0206 dB");
     }
     Ok(gain_decibels)
+}
+
+fn parse_audio_clip_fades(
+    fade_in: &str,
+    fade_out: &str,
+    duration_ticks: u64,
+) -> Result<(u64, u64), &'static str> {
+    let fade_in_ticks = parse_exact_arrangement_tick(
+        fade_in,
+        "Fade-in duration must be a non-negative whole number of ticks",
+        "Fade-in duration is outside the supported range",
+        "Fade-in duration exceeds the exact project range",
+    )?;
+    let fade_out_ticks = parse_exact_arrangement_tick(
+        fade_out,
+        "Fade-out duration must be a non-negative whole number of ticks",
+        "Fade-out duration is outside the supported range",
+        "Fade-out duration exceeds the exact project range",
+    )?;
+    if fade_out_ticks > duration_ticks || fade_in_ticks > duration_ticks - fade_out_ticks {
+        return Err("Combined fades may not exceed the audio-clip duration");
+    }
+    Ok((fade_in_ticks, fade_out_ticks))
 }
 
 fn parse_arrangement_start_tick(value: &str) -> Result<u64, &'static str> {
@@ -1923,6 +2001,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::DuplicateAudioClip => AppMode::DuplicatingClip,
         IdeWorkerCommandKind::SetAudioClipActive => AppMode::ChangingClipActivation,
         IdeWorkerCommandKind::SetAudioClipGain => AppMode::ChangingClipGain,
+        IdeWorkerCommandKind::SetAudioClipFades => AppMode::ChangingClipFades,
         IdeWorkerCommandKind::CreateAudioClipFromTake => AppMode::CreatingClip,
         IdeWorkerCommandKind::StartRecording => AppMode::PreparingRecording,
         IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording => {
@@ -2003,6 +2082,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetAudioClipGain => {
             "Preserving mixer state, updating the audio clip, and reopening project…"
+        }
+        IdeWorkerCommandKind::SetAudioClipFades => {
+            "Preserving mixer state, updating audio-clip fades, and reopening project..."
         }
         IdeWorkerCommandKind::CreateAudioClipFromTake => {
             "Preserving mixer state, creating the reusable audio clip, and reopening project…"
@@ -2158,6 +2240,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::AudioClipGainChanged { .. }
         | IdeWorkerEvent::AudioClipGainChanging { .. }) => {
             apply_audio_clip_gain_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioClipFadesChanged { .. }
+        | IdeWorkerEvent::AudioClipFadesChanging { .. }) => {
+            apply_audio_clip_fade_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipCreatedFromTake { .. }
         | IdeWorkerEvent::AudioClipCreatingFromTake) => {
@@ -2763,6 +2849,45 @@ fn apply_audio_clip_gain_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     }
 }
 
+fn apply_audio_clip_fade_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioClipFadesChanged {
+            revision,
+            changed,
+            fade_in_ticks,
+            fade_out_ticks,
+        } => {
+            reset_audio_clip_fade_form(ui);
+            ui.set_status_text(
+                if *changed {
+                    format!(
+                        "Audio-clip fades set to {fade_in_ticks} in / {fade_out_ticks} out ticks in project revision {revision}"
+                    )
+                } else {
+                    format!(
+                        "Audio-clip fades already matched {fade_in_ticks} in / {fade_out_ticks} out ticks in project revision {revision}"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipFadesChanging {
+            fade_in_ticks,
+            fade_out_ticks,
+        } => {
+            ui.set_app_mode(AppMode::ChangingClipFades);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before setting audio-clip fades to {fade_in_ticks} in / {fade_out_ticks} out ticks..."
+                )
+                .into(),
+            );
+        }
+        _ => unreachable!("audio-clip fade event dispatcher received another event"),
+    }
+}
+
 fn apply_recording_clip_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::AudioClipCreatedFromTake { revision, clip_id } => {
@@ -3361,6 +3486,14 @@ fn set_audio_clips(ui: &MainWindow, project_state: &ProjectUiStateCell, clips: &
             active: clip.active(),
             gain_label: format!("{:+.2} dB", clip.gain_decibels()).into(),
             gain_edit: format_audio_clip_gain(clip.gain_decibels()).into(),
+            fade_label: format!(
+                "{} in / {} out",
+                clip.fade_in_ticks(),
+                clip.fade_out_ticks()
+            )
+            .into(),
+            fade_in_edit: clip.fade_in_ticks().to_string().into(),
+            fade_out_edit: clip.fade_out_ticks().to_string().into(),
             duration_ticks: clip.duration_ticks().to_string().into(),
         })
         .collect();
@@ -3374,6 +3507,17 @@ fn format_audio_clip_gain(gain_decibels: f64) -> String {
     } else {
         gain_decibels.to_string()
     }
+}
+
+fn reset_audio_clip_fade_form(ui: &MainWindow) {
+    ui.set_clip_fades_visible(false);
+    ui.set_clip_fades_id(SharedString::default());
+    ui.set_clip_fades_name(SharedString::default());
+    ui.set_clip_fades_duration(SharedString::default());
+    ui.set_clip_fades_original_in(SharedString::default());
+    ui.set_clip_fades_original_out(SharedString::default());
+    ui.set_clip_fades_in(SharedString::default());
+    ui.set_clip_fades_out(SharedString::default());
 }
 
 fn format_frame_clock(frame: usize, sample_rate_hz: u32) -> String {
@@ -3672,6 +3816,7 @@ fn reset_project(
     ui.set_clip_gain_name(SharedString::default());
     ui.set_clip_gain_original(SharedString::default());
     ui.set_clip_gain_value(SharedString::default());
+    reset_audio_clip_fade_form(ui);
     ui.set_audio_clips(ModelRc::default());
     ui.set_loudness_visible(false);
     ui.set_loudness_reset_confirming(false);
@@ -3782,6 +3927,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::SetAudioClipGain if current == AppMode::ChangingClipGain => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::SetAudioClipFades if current == AppMode::ChangingClipFades => {
             AppMode::Running
         }
         IdeWorkerCommandKind::CreateAudioClipFromTake if current == AppMode::CreatingClip => {
@@ -4933,6 +5081,17 @@ mod tests {
     }
 
     #[test]
+    fn audio_clip_fade_input_matches_the_exact_clip_domain() {
+        assert_eq!(parse_audio_clip_fades(" 1 ", "3", 4), Ok((1, 3)));
+        assert_eq!(parse_audio_clip_fades("0", "0", 4), Ok((0, 0)));
+        assert!(parse_audio_clip_fades("", "0", 4).is_err());
+        assert!(parse_audio_clip_fades("1.5", "0", 4).is_err());
+        assert!(parse_audio_clip_fades("0", "5", 4).is_err());
+        assert!(parse_audio_clip_fades("3", "2", 4).is_err());
+        assert!(parse_audio_clip_fades("9007199254740992", "0", u64::MAX).is_err());
+    }
+
+    #[test]
     fn audio_clip_rename_command_normalizes_name_and_preserves_identity() {
         assert!(matches!(
             audio_clip_rename_command("clip-a", "Verse", " Lead vocal "),
@@ -5013,6 +5172,24 @@ mod tests {
             mode_after_failure(
                 AppMode::ChangingClipGain,
                 IdeWorkerCommandKind::SetAudioClipGain,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn audio_clip_fade_submission_and_failure_use_a_dedicated_mode() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::SetAudioClipFades,
+            ),
+            AppMode::ChangingClipFades
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ChangingClipFades,
+                IdeWorkerCommandKind::SetAudioClipFades,
             ),
             AppMode::Running
         );
