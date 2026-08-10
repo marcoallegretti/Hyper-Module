@@ -22,7 +22,7 @@ fn strict_documents_resolve_compile_bind_and_render() {
         "duration_ticks":4,
         "source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122334457","start_frame":0,"frame_count":100},
         "loop":{"enabled":false,"start_tick":0,"end_tick":4},
-        "playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},
+        "playback":{"gain_decibels":0,"reverse":true,"transpose_cents":0},
         "fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},
         "warp_markers":[
             {"tick":0,"source_frame_offset":0},
@@ -77,5 +77,6 @@ fn strict_documents_resolve_compile_bind_and_render() {
     let rendered = plan.render_offline(placement).unwrap();
 
     assert_eq!(entry.compiled.arrangement_start_frame(), 100);
-    assert_eq!(rendered.plane(0), source.plane(0));
+    let expected: Vec<f32> = source.plane(0).unwrap().iter().rev().copied().collect();
+    assert_eq!(rendered.plane(0), Some(expected.as_slice()));
 }
