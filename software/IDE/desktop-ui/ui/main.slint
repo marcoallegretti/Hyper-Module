@@ -15,6 +15,7 @@ export enum AppMode {
     renaming-track,
     changing-track-activation,
     adding-arrangement-placement,
+    duplicating-arrangement-placement,
     changing-arrangement-activation,
     moving-arrangement-placement,
     trimming-arrangement-placement,
@@ -132,6 +133,7 @@ export global IdeActions {
     callback trim-arrangement-placement-front(string, string);
     callback remove-arrangement-placement(string);
     callback add-arrangement-placement(string, string);
+    callback duplicate-arrangement-placement(string, string);
     callback rename-audio-clip(string, string);
     callback duplicate-audio-clip(string, string);
     callback set-audio-clip-active(string, bool);
@@ -410,6 +412,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.renaming-track ? "◌  RENAMING TRACK"
                         : root.app-mode == AppMode.changing-track-activation ? "◌  UPDATING TRACK"
                         : root.app-mode == AppMode.adding-arrangement-placement ? "◌  PLACING CLIP"
+                        : root.app-mode == AppMode.duplicating-arrangement-placement ? "◌  COPYING PLACEMENT"
                         : root.app-mode == AppMode.changing-arrangement-activation ? "◌  UPDATING CLIP"
                         : root.app-mode == AppMode.moving-arrangement-placement ? "◌  MOVING CLIP"
                         : root.app-mode == AppMode.trimming-arrangement-placement ? "◌  TRIMMING CLIP"
@@ -1540,6 +1543,12 @@ export component MainWindow inherits Window {
                                             clicked => { IdeActions.locate-placement(placement.index); }
                                         }
                                         Button {
+                                            text: "Copy";
+                                            accessible-label: "Copy the exact source view of " + placement.clip-name + " on " + placement.track-name + " to the entered start tick without ripple";
+                                            enabled: root.app-mode == AppMode.running && start-tick-input.text != placement.start-tick;
+                                            clicked => { IdeActions.duplicate-arrangement-placement(placement.id, start-tick-input.text); }
+                                        }
+                                        Button {
                                             text: "Remove";
                                             accessible-label: "Review removal of " + placement.clip-name + " from " + placement.track-name;
                                             enabled: root.app-mode == AppMode.running;
@@ -1563,7 +1572,7 @@ export component MainWindow inherits Window {
                         }
 
                         if !root.remove-arrangement-placement-visible : Text {
-                            text: "Placement activation, exact start moves, exact left/right edge trims, and confirmed non-ripple removal are persistent. Dragging, snapping, and waveform claims are not implemented.";
+                            text: "Exact non-ripple copies and moves, edge trims, activation, and confirmed removal persist. Copies reuse the same clip/source view. No drag, snap, or waveform editing.";
                             color: #65758a;
                             font-size: 9px;
                         }

@@ -1213,9 +1213,69 @@ fn bind_arrangement_callback(
     });
 
     bind_arrangement_move_callback(ui, worker, project_state);
+    bind_arrangement_duplication_callback(ui, worker, project_state);
     bind_arrangement_duration_callback(ui, worker, project_state);
     bind_arrangement_front_trim_callback(ui, worker, project_state);
     bind_arrangement_removal_callback(ui, worker, project_state);
+}
+
+fn bind_arrangement_duplication_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_duplication = Rc::clone(worker);
+    let project_state_for_duplication = Rc::clone(project_state);
+    actions.on_duplicate_arrangement_placement(move |placement_id, start_tick| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text(
+                "Arrangement placement copying is not available in the current state".into(),
+            );
+            return;
+        }
+        let start_tick = match parse_arrangement_start_tick(start_tick.as_str()) {
+            Ok(start_tick) => start_tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let state = project_state_for_duplication.arrangement.borrow();
+        let Some(binding) = state.as_ref() else {
+            ui.set_error_text("Arrangement placement authority is no longer available".into());
+            return;
+        };
+        let Some(placement) = binding
+            .owner
+            .placements()
+            .iter()
+            .find(|placement| placement.id() == placement_id.as_str())
+        else {
+            ui.set_error_text("The selected arrangement placement is no longer available".into());
+            return;
+        };
+        if placement.start_tick() == start_tick {
+            ui.set_error_text(
+                "The copied placement would overlap its source at the same start tick".into(),
+            );
+            return;
+        }
+        let owned_placement_id = placement.id().to_owned();
+        drop(state);
+        submit_to_ui(
+            &ui,
+            &worker_for_duplication,
+            IdeWorkerCommand::DuplicateArrangementPlacement {
+                placement_id: owned_placement_id,
+                start_tick,
+            },
+        );
+    });
 }
 
 fn bind_arrangement_removal_callback(
@@ -1783,6 +1843,9 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         }
         IdeWorkerCommandKind::RemoveArrangementPlacement => AppMode::RemovingArrangementPlacement,
         IdeWorkerCommandKind::AddArrangementPlacement => AppMode::AddingArrangementPlacement,
+        IdeWorkerCommandKind::DuplicateArrangementPlacement => {
+            AppMode::DuplicatingArrangementPlacement
+        }
         IdeWorkerCommandKind::RenameAudioClip => AppMode::RenamingClip,
         IdeWorkerCommandKind::DuplicateAudioClip => AppMode::DuplicatingClip,
         IdeWorkerCommandKind::SetAudioClipActive => AppMode::ChangingClipActivation,
@@ -1849,6 +1912,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::AddArrangementPlacement => {
             "Preserving mixer state, placing the full audio clip, and reopening project…"
+        }
+        IdeWorkerCommandKind::DuplicateArrangementPlacement => {
+            "Preserving mixer state, copying the exact arrangement placement, and reopening project…"
         }
         IdeWorkerCommandKind::RenameAudioClip => {
             "Preserving mixer state, renaming the audio clip, and reopening project…"
@@ -1989,6 +2055,13 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementPlacementAdded { .. }
         | IdeWorkerEvent::ArrangementPlacementAdding { .. }) => {
             apply_arrangement_placement_addition_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ArrangementPlacementDuplicated { .. }
+        | IdeWorkerEvent::ArrangementPlacementDuplicating { .. }) => {
+            apply_arrangement_placement_duplication_event(ui, &event);
+        }
+        event @ IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning { .. } => {
+            apply_arrangement_placement_committed_warning(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipRenamed { .. } | IdeWorkerEvent::AudioClipRenaming) => {
             apply_audio_clip_rename_event(ui, &event);
@@ -2340,6 +2413,88 @@ fn apply_arrangement_placement_addition_event(ui: &MainWindow, event: &IdeWorker
         }
         _ => unreachable!("arrangement addition event dispatcher received another event"),
     }
+}
+
+fn apply_arrangement_placement_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ArrangementPlacementDuplicated {
+            revision,
+            placement_id,
+            start_tick,
+        } => {
+            ui.set_status_text(
+                format!(
+                    "Arrangement placement copied to tick {start_tick} as {placement_id} in project revision {revision}; the same clip and exact source view were reused"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementPlacementDuplicating { start_tick } => {
+            ui.set_app_mode(AppMode::DuplicatingArrangementPlacement);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before copying the exact arrangement placement to tick {start_tick}…"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("arrangement duplication event dispatcher received another event"),
+    }
+}
+
+fn apply_arrangement_placement_committed_warning(ui: &MainWindow, event: &IdeWorkerEvent) {
+    let IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning { command, warning } = event
+    else {
+        unreachable!("arrangement committed-warning dispatcher received another event");
+    };
+    let status = match command {
+        IdeWorkerCommandKind::AddArrangementPlacement => {
+            reset_arrangement_placement_addition_form(ui);
+            let placement_id = warning
+                .committed_created_placement_id()
+                .expect("committed placement addition warning must retain its identity");
+            format!(
+                "Arrangement placement {placement_id} committed and reopened with incomplete transaction cleanup"
+            )
+        }
+        IdeWorkerCommandKind::DuplicateArrangementPlacement => {
+            let placement_id = warning
+                .committed_created_placement_id()
+                .expect("committed placement duplication warning must retain its identity");
+            format!(
+                "Copied arrangement placement {placement_id} committed and reopened with incomplete transaction cleanup"
+            )
+        }
+        IdeWorkerCommandKind::RemoveArrangementPlacement => {
+            reset_arrangement_placement_removal_confirmation(ui);
+            "Arrangement placement removal committed and reopened with incomplete transaction cleanup"
+                .to_owned()
+        }
+        _ => {
+            "Arrangement placement edit committed and reopened with incomplete transaction cleanup"
+                .to_owned()
+        }
+    };
+    ui.set_status_text(status.into());
+    ui.set_error_text(warning.to_string().into());
+}
+
+fn reset_arrangement_placement_addition_form(ui: &MainWindow) {
+    ui.set_add_arrangement_placement_visible(false);
+    ui.set_add_arrangement_placement_clip_id(SharedString::default());
+    ui.set_add_arrangement_placement_clip_name(SharedString::default());
+    ui.set_add_arrangement_placement_track_name(SharedString::default());
+    ui.set_add_arrangement_placement_duration_ticks(SharedString::default());
+    ui.set_add_arrangement_placement_start_tick("0".into());
+}
+
+fn reset_arrangement_placement_removal_confirmation(ui: &MainWindow) {
+    ui.set_remove_arrangement_placement_visible(false);
+    ui.set_remove_arrangement_placement_id(SharedString::default());
+    ui.set_remove_arrangement_placement_clip_name(SharedString::default());
+    ui.set_remove_arrangement_placement_track_name(SharedString::default());
 }
 
 fn apply_audio_clip_rename_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -3490,6 +3645,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         {
             AppMode::Running
         }
+        IdeWorkerCommandKind::DuplicateArrangementPlacement
+            if current == AppMode::DuplicatingArrangementPlacement =>
+        {
+            AppMode::Running
+        }
         IdeWorkerCommandKind::RenameAudioClip if current == AppMode::RenamingClip => {
             AppMode::Running
         }
@@ -4597,6 +4757,24 @@ mod tests {
             mode_after_failure(
                 AppMode::AddingArrangementPlacement,
                 IdeWorkerCommandKind::AddArrangementPlacement,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn arrangement_duplication_submission_and_failure_use_a_dedicated_mode() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::DuplicateArrangementPlacement,
+            ),
+            AppMode::DuplicatingArrangementPlacement
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::DuplicatingArrangementPlacement,
+                IdeWorkerCommandKind::DuplicateArrangementPlacement,
             ),
             AppMode::Running
         );
