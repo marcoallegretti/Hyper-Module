@@ -2742,43 +2742,33 @@ fn apply_arrangement_placement_committed_warning(ui: &MainWindow, event: &IdeWor
     else {
         unreachable!("arrangement committed-warning dispatcher received another event");
     };
-    let status = match command {
+    let action = match command {
         IdeWorkerCommandKind::AddArrangementPlacement => {
             reset_arrangement_placement_addition_form(ui);
             let placement_id = warning
                 .committed_created_placement_id()
                 .expect("committed placement addition warning must retain its identity");
-            format!(
-                "Arrangement placement {placement_id} committed and reopened with incomplete transaction cleanup"
-            )
+            format!("Arrangement placement {placement_id}")
         }
         IdeWorkerCommandKind::DuplicateArrangementPlacement => {
             let placement_id = warning
                 .committed_created_placement_id()
                 .expect("committed placement duplication warning must retain its identity");
-            format!(
-                "Copied arrangement placement {placement_id} committed and reopened with incomplete transaction cleanup"
-            )
+            format!("Copied arrangement placement {placement_id}")
         }
         IdeWorkerCommandKind::SplitArrangementPlacement => {
             let placement_id = warning
                 .committed_created_placement_id()
                 .expect("committed placement split warning must retain its right-half identity");
-            format!(
-                "Split arrangement placement right half {placement_id} committed and reopened with incomplete transaction cleanup"
-            )
+            format!("Split arrangement placement right half {placement_id}")
         }
         IdeWorkerCommandKind::RemoveArrangementPlacement => {
             reset_arrangement_placement_removal_confirmation(ui);
-            "Arrangement placement removal committed and reopened with incomplete transaction cleanup"
-                .to_owned()
+            "Arrangement placement removal".to_owned()
         }
-        _ => {
-            "Arrangement placement edit committed and reopened with incomplete transaction cleanup"
-                .to_owned()
-        }
+        _ => "Arrangement placement edit".to_owned(),
     };
-    ui.set_status_text(status.into());
+    ui.set_status_text(committed_warning_status(ui.get_app_mode(), &action).into());
     ui.set_error_text(warning.to_string().into());
 }
 
@@ -2854,8 +2844,9 @@ fn apply_audio_clip_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
                 .expect("committed duplication warning must retain its clip identity");
             reset_audio_clip_duplication_form(ui);
             ui.set_status_text(
-                format!(
-                    "Reusable audio clip {name} ({clip_id}) committed and reopened with incomplete transaction cleanup"
+                committed_warning_status(
+                    ui.get_app_mode(),
+                    &format!("Reusable audio clip {name} ({clip_id})"),
                 )
                 .into(),
             );
@@ -2925,11 +2916,18 @@ fn apply_audio_clip_edit_committed_warning(ui: &MainWindow, event: &IdeWorkerEve
         AudioClipEditWarningForm::Fades => reset_audio_clip_fade_form(ui),
         AudioClipEditWarningForm::Loop => reset_audio_clip_loop_form(ui),
     }
-    ui.set_app_mode(AppMode::Running);
-    ui.set_status_text(
-        format!("{action} committed and reopened with a project recovery warning").into(),
-    );
+    ui.set_status_text(committed_warning_status(ui.get_app_mode(), action).into());
     ui.set_error_text(warning.to_string().into());
+}
+
+fn committed_warning_status(mode: AppMode, action: &str) -> String {
+    match mode {
+        AppMode::Running => {
+            format!("{action} committed and reopened with a project recovery warning")
+        }
+        AppMode::Closed => format!("{action} committed, but the project could not be reopened"),
+        _ => format!("{action} committed with a project recovery warning"),
+    }
 }
 
 fn apply_audio_clip_activation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -5484,9 +5482,9 @@ mod tests {
     }
 
     #[test]
-    fn committed_audio_clip_edit_warnings_restore_reopened_ui_authority() {
+    fn committed_audio_clip_edit_warnings_preserve_reopen_authority() {
         let ui = MainWindow::new().unwrap();
-        ui.set_app_mode(AppMode::ChangingClipFades);
+        ui.set_app_mode(AppMode::Running);
         ui.set_clip_fades_visible(true);
         ui.set_clip_fades_id("clip-a".into());
         ui.set_clip_fades_name("Clip A".into());
@@ -5514,7 +5512,7 @@ mod tests {
         assert!(ui.get_status_text().contains("committed and reopened"));
         assert!(!ui.get_error_text().is_empty());
 
-        ui.set_app_mode(AppMode::ChangingClipLoop);
+        ui.set_app_mode(AppMode::Closed);
         ui.set_clip_loop_visible(true);
         ui.set_clip_loop_id("clip-a".into());
         ui.set_clip_loop_name("Clip A".into());
@@ -5536,12 +5534,15 @@ mod tests {
             },
         );
 
-        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(ui.get_app_mode(), AppMode::Closed);
         assert!(!ui.get_clip_loop_visible());
         assert!(ui.get_clip_loop_id().is_empty());
         assert!(ui.get_clip_loop_start().is_empty());
         assert!(ui.get_clip_loop_end().is_empty());
-        assert!(ui.get_status_text().contains("committed and reopened"));
+        assert!(
+            ui.get_status_text()
+                .contains("committed, but the project could not be reopened")
+        );
         assert!(!ui.get_error_text().is_empty());
     }
 
