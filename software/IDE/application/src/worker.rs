@@ -129,6 +129,7 @@ pub enum IdeWorkerCommandKind {
     DuplicateAudioClip,
     AddArrangementPlacement,
     DuplicateArrangementPlacement,
+    SplitArrangementPlacement,
     SetArrangementPlacementActive,
     MoveArrangementPlacement,
     SetArrangementPlacementDuration,
@@ -209,6 +210,10 @@ pub enum IdeWorkerCommand {
         placement_id: String,
         start_tick: u64,
     },
+    SplitArrangementPlacement {
+        placement_id: String,
+        split_tick: u64,
+    },
     SetArrangementPlacementActive {
         placement_id: String,
         active: bool,
@@ -287,6 +292,9 @@ impl IdeWorkerCommand {
             Self::AddArrangementPlacement { .. } => IdeWorkerCommandKind::AddArrangementPlacement,
             Self::DuplicateArrangementPlacement { .. } => {
                 IdeWorkerCommandKind::DuplicateArrangementPlacement
+            }
+            Self::SplitArrangementPlacement { .. } => {
+                IdeWorkerCommandKind::SplitArrangementPlacement
             }
             Self::SetArrangementPlacementActive { .. } => {
                 IdeWorkerCommandKind::SetArrangementPlacementActive
@@ -860,6 +868,7 @@ pub enum IdeWorkerCommandFailure {
     AudioClipDuplication(Box<IdeAudioClipDuplicationError>),
     ArrangementPlacementAddition(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementDuplication(Box<IdeArrangementPlacementEditError>),
+    ArrangementPlacementSplit(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementActivation(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementMove(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementDuration(Box<IdeArrangementPlacementEditError>),
@@ -903,6 +912,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioClipDuplication(source) => source.fmt(formatter),
             Self::ArrangementPlacementAddition(source)
             | Self::ArrangementPlacementDuplication(source)
+            | Self::ArrangementPlacementSplit(source)
             | Self::ArrangementPlacementActivation(source)
             | Self::ArrangementPlacementMove(source)
             | Self::ArrangementPlacementDuration(source)
@@ -952,6 +962,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioClipDuplication(source) => Some(source),
             Self::ArrangementPlacementAddition(source)
             | Self::ArrangementPlacementDuplication(source)
+            | Self::ArrangementPlacementSplit(source)
             | Self::ArrangementPlacementActivation(source)
             | Self::ArrangementPlacementMove(source)
             | Self::ArrangementPlacementDuration(source)
@@ -1031,6 +1042,11 @@ pub enum IdeWorkerEvent {
         placement_id: String,
         start_tick: u64,
     },
+    ArrangementPlacementSplit {
+        revision: u64,
+        placement_id: String,
+        split_tick: u64,
+    },
     ArrangementPlacementEditCommittedWithWarning {
         command: IdeWorkerCommandKind,
         warning: Box<IdeArrangementPlacementEditError>,
@@ -1095,6 +1111,9 @@ pub enum IdeWorkerEvent {
     },
     ArrangementPlacementDuplicating {
         start_tick: u64,
+    },
+    ArrangementPlacementSplitting {
+        split_tick: u64,
     },
     ArrangementPlacementActivationChanging {
         active: bool,
@@ -1467,6 +1486,10 @@ enum ProjectMutation {
         placement_id: String,
         start_tick: u64,
     },
+    SplitArrangementPlacement {
+        placement_id: String,
+        split_tick: u64,
+    },
     SetArrangementPlacementActive {
         placement_id: String,
         active: bool,
@@ -1514,6 +1537,9 @@ impl ProjectMutation {
             Self::DuplicateArrangementPlacement { .. } => {
                 IdeWorkerCommandKind::DuplicateArrangementPlacement
             }
+            Self::SplitArrangementPlacement { .. } => {
+                IdeWorkerCommandKind::SplitArrangementPlacement
+            }
             Self::SetArrangementPlacementActive { .. } => {
                 IdeWorkerCommandKind::SetArrangementPlacementActive
             }
@@ -1552,6 +1578,11 @@ impl ProjectMutation {
             Self::DuplicateArrangementPlacement { start_tick, .. } => {
                 IdeWorkerEvent::ArrangementPlacementDuplicating {
                     start_tick: *start_tick,
+                }
+            }
+            Self::SplitArrangementPlacement { split_tick, .. } => {
+                IdeWorkerEvent::ArrangementPlacementSplitting {
+                    split_tick: *split_tick,
                 }
             }
             Self::SetArrangementPlacementActive { active, .. } => {
@@ -1776,6 +1807,7 @@ fn process_command(
         | IdeWorkerCommand::DuplicateAudioClip { .. }
         | IdeWorkerCommand::AddArrangementPlacement { .. }
         | IdeWorkerCommand::DuplicateArrangementPlacement { .. }
+        | IdeWorkerCommand::SplitArrangementPlacement { .. }
         | IdeWorkerCommand::SetArrangementPlacementActive { .. }
         | IdeWorkerCommand::MoveArrangementPlacement { .. }
         | IdeWorkerCommand::SetArrangementPlacementDuration { .. }
@@ -1884,6 +1916,10 @@ fn process_project_mutation_command(
             placement_id,
             start_tick,
         } => duplicate_arrangement_placement(state, events, &placement_id, start_tick),
+        IdeWorkerCommand::SplitArrangementPlacement {
+            placement_id,
+            split_tick,
+        } => split_arrangement_placement(state, events, &placement_id, split_tick),
         IdeWorkerCommand::SetArrangementPlacementActive {
             placement_id,
             active,
@@ -3229,6 +3265,45 @@ fn duplicate_arrangement_placement(
     )
 }
 
+fn split_arrangement_placement(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    placement_id: &str,
+    split_tick: u64,
+) -> bool {
+    if placement_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SplitArrangementPlacement,
+            IdeWorkerCommandFailure::ArrangementPlacementSplit(Box::new(
+                IdeArrangementPlacementEditError::InvalidPlacementIdentity,
+            )),
+        );
+    }
+    let mut owned_placement_id = String::new();
+    if owned_placement_id
+        .try_reserve_exact(placement_id.len())
+        .is_err()
+    {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SplitArrangementPlacement,
+            IdeWorkerCommandFailure::ArrangementPlacementSplit(Box::new(
+                IdeArrangementPlacementEditError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_placement_id.push_str(placement_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::SplitArrangementPlacement {
+            placement_id: owned_placement_id,
+            split_tick,
+        },
+    )
+}
+
 fn move_arrangement_placement(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -3608,6 +3683,11 @@ fn project_mutation_save_failure(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::SplitArrangementPlacement { .. } => {
+            IdeWorkerCommandFailure::ArrangementPlacementSplit(Box::new(
+                IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
+            ))
+        }
         ProjectMutation::SetArrangementPlacementActive { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementActivation(Box::new(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
@@ -3743,6 +3823,11 @@ fn project_mutation_native_close_failure(
                 IdeArrangementPlacementEditError::NativeClose(failure),
             ))
         }
+        ProjectMutation::SplitArrangementPlacement { .. } => {
+            IdeWorkerCommandFailure::ArrangementPlacementSplit(Box::new(
+                IdeArrangementPlacementEditError::NativeClose(failure),
+            ))
+        }
         ProjectMutation::SetArrangementPlacementActive { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementActivation(Box::new(
                 IdeArrangementPlacementEditError::NativeClose(failure),
@@ -3815,6 +3900,10 @@ enum ProjectMutationAttempt {
     },
     DuplicateArrangementPlacement {
         start_tick: u64,
+        result: Result<ArrangementPlacementCreationPublication, IdeArrangementPlacementEditError>,
+    },
+    SplitArrangementPlacement {
+        split_tick: u64,
         result: Result<ArrangementPlacementCreationPublication, IdeArrangementPlacementEditError>,
     },
     SetArrangementPlacementActive {
@@ -4086,6 +4175,26 @@ fn complete_project_mutation(
                     IdeWorkerCommandKind::DuplicateArrangementPlacement,
                     reason,
                     IdeWorkerCommandFailure::ArrangementPlacementDuplication,
+                ),
+                ProjectMutationAttempt::SplitArrangementPlacement {
+                    split_tick,
+                    result: Ok(publication),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::ArrangementPlacementSplit {
+                        revision: publication.outcome.project_revision(),
+                        placement_id: publication.placement_id,
+                        split_tick,
+                    },
+                ),
+                ProjectMutationAttempt::SplitArrangementPlacement {
+                    result: Err(reason),
+                    ..
+                } => publish_arrangement_edit_failure(
+                    events,
+                    IdeWorkerCommandKind::SplitArrangementPlacement,
+                    reason,
+                    IdeWorkerCommandFailure::ArrangementPlacementSplit,
                 ),
                 ProjectMutationAttempt::SetArrangementPlacementActive {
                     active,
@@ -4393,6 +4502,19 @@ fn attempt_project_mutation(
                 native_failure,
             ),
         },
+        ProjectMutation::SplitArrangementPlacement {
+            placement_id,
+            split_tick,
+        } => ProjectMutationAttempt::SplitArrangementPlacement {
+            split_tick,
+            result: attempt_arrangement_placement_split(
+                application,
+                recovery,
+                &placement_id,
+                split_tick,
+                native_failure,
+            ),
+        },
         ProjectMutation::SetArrangementPlacementActive {
             placement_id,
             active,
@@ -4601,6 +4723,25 @@ fn attempt_arrangement_placement_duplication(
         recovery,
         placement_id,
         start_tick,
+    )
+    .and_then(publish_arrangement_placement_creation_plan)
+}
+
+fn attempt_arrangement_placement_split(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    placement_id: &str,
+    split_tick: u64,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<ArrangementPlacementCreationPublication, IdeArrangementPlacementEditError> {
+    if let Some(failure) = native_failure {
+        return Err(IdeArrangementPlacementEditError::NativeClose(failure));
+    }
+    RunningDesktopIdeApplication::prepare_arrangement_placement_split(
+        application,
+        recovery,
+        placement_id,
+        split_tick,
     )
     .and_then(publish_arrangement_placement_creation_plan)
 }
@@ -4863,6 +5004,13 @@ fn project_mutation_reopen_failure(
                 result,
                 reopen,
                 IdeWorkerCommandFailure::ArrangementPlacementDuplication,
+            )
+        }
+        ProjectMutationAttempt::SplitArrangementPlacement { result, .. } => {
+            arrangement_placement_creation_reopen_failure(
+                result,
+                reopen,
+                IdeWorkerCommandFailure::ArrangementPlacementSplit,
             )
         }
         ProjectMutationAttempt::SetArrangementPlacementActive { result, .. } => {
@@ -7065,6 +7213,64 @@ mod tests {
             IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::DuplicateArrangementPlacement,
                 reason: IdeWorkerCommandFailure::ArrangementPlacementDuplication(reason),
+            } if matches!(reason.as_ref(), IdeArrangementPlacementEditError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn arrangement_split_validates_identity_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SplitArrangementPlacement {
+                placement_id: String::new(),
+                split_tick: 960,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SplitArrangementPlacement,
+                reason: IdeWorkerCommandFailure::ArrangementPlacementSplit(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeArrangementPlacementEditError::InvalidPlacementIdentity
+            )
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SplitArrangementPlacement {
+                placement_id: "018f47a2-6b2d-7c11-8a44-001122334464".to_owned(),
+                split_tick: 960,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ArrangementPlacementSplitting { split_tick: 960 }
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SplitArrangementPlacement,
+                reason: IdeWorkerCommandFailure::ArrangementPlacementSplit(reason),
             } if matches!(reason.as_ref(), IdeArrangementPlacementEditError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
