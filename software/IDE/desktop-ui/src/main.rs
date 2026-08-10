@@ -23,7 +23,9 @@ use hyper_desktop_ide::{
     desktop_ide_application_config, ide_audio_clip_gain_is_supported,
 };
 #[cfg(test)]
-use hyper_desktop_ide::{IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError};
+use hyper_desktop_ide::{
+    IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError, IdeAudioClipLoopEditError,
+};
 use slint::platform::PlatformError;
 use slint::{
     ComponentHandle, Model, ModelRc, ModelTracker, SharedString, Timer, TimerMode, VecModel,
@@ -1554,6 +1556,7 @@ fn bind_audio_clip_callback(
     });
 
     bind_audio_clip_fade_callback(ui, worker, project_state);
+    bind_audio_clip_loop_callback(ui, worker, project_state);
 
     bind_arrangement_placement_addition_callback(ui, worker, project_state);
 }
@@ -1606,6 +1609,62 @@ fn bind_audio_clip_fade_callback(
                 clip_id: owned_clip_id,
                 fade_in_ticks,
                 fade_out_ticks,
+            },
+        );
+    });
+}
+
+fn bind_audio_clip_loop_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    let project_state = Rc::clone(project_state);
+    actions.on_set_audio_clip_loop(move |clip_id, enabled, start, end| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text(
+                "Audio-clip loop editing is not available in the current state".into(),
+            );
+            return;
+        }
+        let clips = project_state.audio_clips.borrow();
+        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+            ui.set_error_text("The selected audio clip is no longer available".into());
+            return;
+        };
+        let (start_tick, end_tick) =
+            match parse_audio_clip_loop(start.as_str(), end.as_str(), clip.duration_ticks()) {
+                Ok(loop_range) => loop_range,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
+            };
+        if enabled == clip.loop_enabled()
+            && start_tick == clip.loop_start_tick()
+            && end_tick == clip.loop_end_tick()
+        {
+            ui.set_clip_loop_visible(false);
+            ui.set_status_text("Audio-clip loop already matches the committed values".into());
+            ui.set_error_text(SharedString::default());
+            return;
+        }
+        let owned_clip_id = clip.id().to_owned();
+        drop(clips);
+        submit_to_ui(
+            &ui,
+            &worker,
+            IdeWorkerCommand::SetAudioClipLoop {
+                clip_id: owned_clip_id,
+                enabled,
+                start_tick,
+                end_tick,
             },
         );
     });
@@ -1802,6 +1861,32 @@ fn parse_audio_clip_fades(
         return Err("Combined fades may not exceed the audio-clip duration");
     }
     Ok((fade_in_ticks, fade_out_ticks))
+}
+
+fn parse_audio_clip_loop(
+    start: &str,
+    end: &str,
+    duration_ticks: u64,
+) -> Result<(u64, u64), &'static str> {
+    let start_tick = parse_exact_arrangement_tick(
+        start,
+        "Loop start must be a non-negative whole number of ticks",
+        "Loop start is outside the supported range",
+        "Loop start exceeds the exact project range",
+    )?;
+    let end_tick = parse_exact_arrangement_tick(
+        end,
+        "Loop end must be a positive whole number of ticks",
+        "Loop end is outside the supported range",
+        "Loop end exceeds the exact project range",
+    )?;
+    if start_tick >= end_tick {
+        return Err("Loop start must be before loop end");
+    }
+    if end_tick > duration_ticks {
+        return Err("Loop end may not exceed the audio-clip duration");
+    }
+    Ok((start_tick, end_tick))
 }
 
 fn parse_arrangement_start_tick(value: &str) -> Result<u64, &'static str> {
@@ -2004,6 +2089,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::SetAudioClipActive => AppMode::ChangingClipActivation,
         IdeWorkerCommandKind::SetAudioClipGain => AppMode::ChangingClipGain,
         IdeWorkerCommandKind::SetAudioClipFades => AppMode::ChangingClipFades,
+        IdeWorkerCommandKind::SetAudioClipLoop => AppMode::ChangingClipLoop,
         IdeWorkerCommandKind::CreateAudioClipFromTake => AppMode::CreatingClip,
         IdeWorkerCommandKind::StartRecording => AppMode::PreparingRecording,
         IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording => {
@@ -2087,6 +2173,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetAudioClipFades => {
             "Preserving mixer state, updating audio-clip fades, and reopening project..."
+        }
+        IdeWorkerCommandKind::SetAudioClipLoop => {
+            "Preserving mixer state, updating the audio-clip loop, and reopening project..."
         }
         IdeWorkerCommandKind::CreateAudioClipFromTake => {
             "Preserving mixer state, creating the reusable audio clip, and reopening project…"
@@ -2249,6 +2338,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::AudioClipFadesChanged { .. }
         | IdeWorkerEvent::AudioClipFadesChanging { .. }) => {
             apply_audio_clip_fade_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioClipLoopChanged { .. }
+        | IdeWorkerEvent::AudioClipLoopChanging { .. }) => {
+            apply_audio_clip_loop_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipCreatedFromTake { .. }
         | IdeWorkerEvent::AudioClipCreatingFromTake) => {
@@ -2792,6 +2885,7 @@ enum AudioClipEditWarningForm {
     Rename,
     Gain,
     Fades,
+    Loop,
 }
 
 fn audio_clip_edit_warning_presentation(
@@ -2810,6 +2904,9 @@ fn audio_clip_edit_warning_presentation(
         IdeWorkerCommandKind::SetAudioClipFades => {
             Some((AudioClipEditWarningForm::Fades, "Audio-clip fade edit"))
         }
+        IdeWorkerCommandKind::SetAudioClipLoop => {
+            Some((AudioClipEditWarningForm::Loop, "Audio-clip loop edit"))
+        }
         _ => None,
     }
 }
@@ -2826,6 +2923,7 @@ fn apply_audio_clip_edit_committed_warning(ui: &MainWindow, event: &IdeWorkerEve
         AudioClipEditWarningForm::Rename => reset_audio_clip_rename_form(ui),
         AudioClipEditWarningForm::Gain => reset_audio_clip_gain_form(ui),
         AudioClipEditWarningForm::Fades => reset_audio_clip_fade_form(ui),
+        AudioClipEditWarningForm::Loop => reset_audio_clip_loop_form(ui),
     }
     ui.set_app_mode(AppMode::Running);
     ui.set_status_text(
@@ -2946,6 +3044,49 @@ fn apply_audio_clip_fade_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             );
         }
         _ => unreachable!("audio-clip fade event dispatcher received another event"),
+    }
+}
+
+fn apply_audio_clip_loop_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioClipLoopChanged {
+            revision,
+            changed,
+            enabled,
+            start_tick,
+            end_tick,
+        } => {
+            reset_audio_clip_loop_form(ui);
+            let state = if *enabled { "enabled" } else { "disabled" };
+            ui.set_status_text(
+                if *changed {
+                    format!(
+                        "Audio-clip loop {state} at {start_tick}–{end_tick} ticks in project revision {revision}"
+                    )
+                } else {
+                    format!(
+                        "Audio-clip loop already matched {state} at {start_tick}–{end_tick} ticks in project revision {revision}"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipLoopChanging {
+            enabled,
+            start_tick,
+            end_tick,
+        } => {
+            ui.set_app_mode(AppMode::ChangingClipLoop);
+            let state = if *enabled { "enabled" } else { "disabled" };
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before setting the audio-clip loop {state} at {start_tick}–{end_tick} ticks..."
+                )
+                .into(),
+            );
+        }
+        _ => unreachable!("audio-clip loop event dispatcher received another event"),
     }
 }
 
@@ -3547,6 +3688,16 @@ fn set_audio_clips(ui: &MainWindow, project_state: &ProjectUiStateCell, clips: &
             active: clip.active(),
             gain_label: format!("{:+.2} dB", clip.gain_decibels()).into(),
             gain_edit: format_audio_clip_gain(clip.gain_decibels()).into(),
+            loop_enabled: clip.loop_enabled(),
+            loop_label: format!(
+                "{} {}–{}",
+                if clip.loop_enabled() { "ON" } else { "OFF" },
+                clip.loop_start_tick(),
+                clip.loop_end_tick()
+            )
+            .into(),
+            loop_start_edit: clip.loop_start_tick().to_string().into(),
+            loop_end_edit: clip.loop_end_tick().to_string().into(),
             fade_label: format!(
                 "{} in / {} out",
                 clip.fade_in_ticks(),
@@ -3579,6 +3730,19 @@ fn reset_audio_clip_fade_form(ui: &MainWindow) {
     ui.set_clip_fades_original_out(SharedString::default());
     ui.set_clip_fades_in(SharedString::default());
     ui.set_clip_fades_out(SharedString::default());
+}
+
+fn reset_audio_clip_loop_form(ui: &MainWindow) {
+    ui.set_clip_loop_visible(false);
+    ui.set_clip_loop_id(SharedString::default());
+    ui.set_clip_loop_name(SharedString::default());
+    ui.set_clip_loop_duration(SharedString::default());
+    ui.set_clip_loop_original_enabled(false);
+    ui.set_clip_loop_original_start(SharedString::default());
+    ui.set_clip_loop_original_end(SharedString::default());
+    ui.set_clip_loop_enabled(false);
+    ui.set_clip_loop_start(SharedString::default());
+    ui.set_clip_loop_end(SharedString::default());
 }
 
 fn format_frame_clock(frame: usize, sample_rate_hz: u32) -> String {
@@ -3878,6 +4042,7 @@ fn reset_project(
     ui.set_clip_gain_original(SharedString::default());
     ui.set_clip_gain_value(SharedString::default());
     reset_audio_clip_fade_form(ui);
+    reset_audio_clip_loop_form(ui);
     ui.set_audio_clips(ModelRc::default());
     ui.set_loudness_visible(false);
     ui.set_loudness_reset_confirming(false);
@@ -3991,6 +4156,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::SetAudioClipFades if current == AppMode::ChangingClipFades => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::SetAudioClipLoop if current == AppMode::ChangingClipLoop => {
             AppMode::Running
         }
         IdeWorkerCommandKind::CreateAudioClipFromTake if current == AppMode::CreatingClip => {
@@ -5153,6 +5321,19 @@ mod tests {
     }
 
     #[test]
+    fn audio_clip_loop_input_matches_the_exact_clip_domain() {
+        assert_eq!(parse_audio_clip_loop(" 1 ", "3", 4), Ok((1, 3)));
+        assert_eq!(parse_audio_clip_loop("0", "4", 4), Ok((0, 4)));
+        assert!(parse_audio_clip_loop("", "4", 4).is_err());
+        assert!(parse_audio_clip_loop("1.5", "4", 4).is_err());
+        assert!(parse_audio_clip_loop("0", "0", 4).is_err());
+        assert!(parse_audio_clip_loop("3", "3", 4).is_err());
+        assert!(parse_audio_clip_loop("3", "2", 4).is_err());
+        assert!(parse_audio_clip_loop("0", "5", 4).is_err());
+        assert!(parse_audio_clip_loop("0", "9007199254740992", u64::MAX).is_err());
+    }
+
+    #[test]
     fn audio_clip_rename_command_normalizes_name_and_preserves_identity() {
         assert!(matches!(
             audio_clip_rename_command("clip-a", "Verse", " Lead vocal "),
@@ -5257,6 +5438,24 @@ mod tests {
     }
 
     #[test]
+    fn audio_clip_loop_submission_and_failure_use_a_dedicated_mode() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::SetAudioClipLoop,
+            ),
+            AppMode::ChangingClipLoop
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ChangingClipLoop,
+                IdeWorkerCommandKind::SetAudioClipLoop,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
     fn committed_audio_clip_edit_warning_presentation_identifies_the_matching_form() {
         assert_eq!(
             audio_clip_edit_warning_presentation(IdeWorkerCommandKind::RenameAudioClip),
@@ -5275,13 +5474,17 @@ mod tests {
             Some((AudioClipEditWarningForm::Fades, "Audio-clip fade edit"))
         );
         assert_eq!(
+            audio_clip_edit_warning_presentation(IdeWorkerCommandKind::SetAudioClipLoop),
+            Some((AudioClipEditWarningForm::Loop, "Audio-clip loop edit"))
+        );
+        assert_eq!(
             audio_clip_edit_warning_presentation(IdeWorkerCommandKind::SaveProject),
             None
         );
     }
 
     #[test]
-    fn committed_audio_clip_fade_warning_restores_reopened_ui_authority() {
+    fn committed_audio_clip_edit_warnings_restore_reopened_ui_authority() {
         let ui = MainWindow::new().unwrap();
         ui.set_app_mode(AppMode::ChangingClipFades);
         ui.set_clip_fades_visible(true);
@@ -5308,6 +5511,36 @@ mod tests {
         assert!(ui.get_clip_fades_id().is_empty());
         assert!(ui.get_clip_fades_in().is_empty());
         assert!(ui.get_clip_fades_out().is_empty());
+        assert!(ui.get_status_text().contains("committed and reopened"));
+        assert!(!ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::ChangingClipLoop);
+        ui.set_clip_loop_visible(true);
+        ui.set_clip_loop_id("clip-a".into());
+        ui.set_clip_loop_name("Clip A".into());
+        ui.set_clip_loop_duration("4".into());
+        ui.set_clip_loop_original_enabled(false);
+        ui.set_clip_loop_original_start("0".into());
+        ui.set_clip_loop_original_end("4".into());
+        ui.set_clip_loop_enabled(true);
+        ui.set_clip_loop_start("1".into());
+        ui.set_clip_loop_end("3".into());
+
+        apply_audio_clip_edit_committed_warning(
+            &ui,
+            &IdeWorkerEvent::AudioClipEditCommittedWithWarning {
+                command: IdeWorkerCommandKind::SetAudioClipLoop,
+                warning: IdeAudioClipEditCommittedWarning::Loop(Box::new(
+                    IdeAudioClipLoopEditError::InvalidClipIdentity,
+                )),
+            },
+        );
+
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(!ui.get_clip_loop_visible());
+        assert!(ui.get_clip_loop_id().is_empty());
+        assert!(ui.get_clip_loop_start().is_empty());
+        assert!(ui.get_clip_loop_end().is_empty());
         assert!(ui.get_status_text().contains("committed and reopened"));
         assert!(!ui.get_error_text().is_empty());
     }
