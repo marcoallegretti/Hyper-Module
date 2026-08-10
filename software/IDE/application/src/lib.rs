@@ -62,7 +62,7 @@ use hyper_playback_json::{
     serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
     serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
     serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_rename,
-    serialize_audio_track_activation, serialize_audio_track_addition,
+    serialize_audio_clip_reverse, serialize_audio_track_activation, serialize_audio_track_addition,
     serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
     serialize_recording_audio_clip_addition,
 };
@@ -3258,6 +3258,129 @@ impl Error for IdeAudioClipLoopEditError {
 }
 
 #[derive(Debug)]
+pub enum IdeAudioClipReverseEditError {
+    InvalidClipIdentity,
+    MixerSave(Box<IdeProjectSaveError>),
+    ClipResourceMissing,
+    ClipResourceRoleMismatch,
+    Storage(StorageError),
+    Serialization(AudioClipDocumentSerializationError),
+    CapacityUnavailable,
+    Publication(Box<IdeAudioClipEditPublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeAudioClipReverseEditError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: ProjectResourcePublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<IdeAudioClipEditPublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeAudioClipReverseEditError {
+    #[must_use]
+    pub const fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication(source) => source.clip_published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. } => publication.clip_published(),
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeAudioClipReverseEditError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidClipIdentity => {
+                formatter.write_str("audio-clip reverse edit requires a clip identity")
+            }
+            Self::MixerSave(source) => {
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
+            }
+            Self::ClipResourceMissing => {
+                formatter.write_str("the selected audio-clip resource is missing")
+            }
+            Self::ClipResourceRoleMismatch => {
+                formatter.write_str("the selected identity is not an audio-clip resource")
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("audio-clip reverse edit capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before editing audio-clip reverse playback: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before editing audio-clip reverse playback ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-clip reverse preparation failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "audio-clip reverse playback was edited in project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.clip_published() => write!(
+                formatter,
+                "audio-clip reverse playback was committed with incomplete project verification or transaction recovery ({publication}) and the project could not be reopened ({reopen})"
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-clip reverse publication failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAudioClipReverseEditError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidClipIdentity
+            | Self::ClipResourceMissing
+            | Self::ClipResourceRoleMismatch
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum IdeAudioClipActivationEditError {
     InvalidClipIdentity,
     MixerSave(Box<IdeProjectSaveError>),
@@ -3510,6 +3633,36 @@ fn prepare_audio_clip_activation_resource(
     owned_clip_id
         .try_reserve_exact(clip_id.len())
         .map_err(|_| IdeAudioClipActivationEditError::CapacityUnavailable)?;
+    owned_clip_id.push_str(clip_id);
+    Ok((owned_clip_id, clip_bytes))
+}
+
+fn prepare_audio_clip_reverse_resource(
+    prepared: &PreparedProjectPlayback,
+    clip_id: &str,
+    reverse: bool,
+    limits: LoaderLimits,
+) -> Result<(String, Vec<u8>), IdeAudioClipReverseEditError> {
+    let package = prepared.package();
+    let descriptor = package
+        .manifest()
+        .resources()
+        .iter()
+        .find(|descriptor| descriptor.id() == clip_id)
+        .ok_or(IdeAudioClipReverseEditError::ClipResourceMissing)?;
+    if descriptor.role() != ResourceRole::Clip {
+        return Err(IdeAudioClipReverseEditError::ClipResourceRoleMismatch);
+    }
+    let source = package
+        .read_resource(clip_id)
+        .map_err(IdeAudioClipReverseEditError::Storage)?;
+    let (project, _, _, _) = prepared.session().parts();
+    let clip_bytes = serialize_audio_clip_reverse(project, &source, clip_id, reverse, limits)
+        .map_err(IdeAudioClipReverseEditError::Serialization)?;
+    let mut owned_clip_id = String::new();
+    owned_clip_id
+        .try_reserve_exact(clip_id.len())
+        .map_err(|_| IdeAudioClipReverseEditError::CapacityUnavailable)?;
     owned_clip_id.push_str(clip_id);
     Ok((owned_clip_id, clip_bytes))
 }
@@ -4900,6 +5053,32 @@ impl RunningDesktopIdeApplication {
             prepared,
             clip_id,
             active,
+            application.config.project_limits.session.documents,
+        )?;
+        Ok(IdeAudioClipEditPlan {
+            mixer,
+            clip_id,
+            clip_bytes,
+        })
+    }
+
+    fn prepare_audio_clip_reverse(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        clip_id: &str,
+        reverse: bool,
+    ) -> Result<IdeAudioClipEditPlan, IdeAudioClipReverseEditError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAudioClipReverseEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAudioClipReverseEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let (clip_id, clip_bytes) = prepare_audio_clip_reverse_resource(
+            prepared,
+            clip_id,
+            reverse,
             application.config.project_limits.session.documents,
         )?;
         Ok(IdeAudioClipEditPlan {
@@ -7647,6 +7826,84 @@ mod tests {
         assert_eq!(loaded.clip_loop_enabled_at(0), Some(true));
         assert_eq!(loaded.clip_loop_start_tick_at(0), Some(1));
         assert_eq!(loaded.clip_loop_end_tick_at(0), Some(3));
+        assert_eq!(
+            reopened
+                .package()
+                .read_resource(outcome.resource_id())
+                .unwrap(),
+            clip_bytes
+        );
+    }
+
+    #[test]
+    fn audio_clip_reverse_publishes_and_reopens_with_native_direction() {
+        let fixture = ArrangementProjectFixture::new();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let clip = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Clip)
+            .unwrap();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let source_clip = package.read_resource(clip.id()).unwrap();
+        let clip_bytes = serialize_audio_clip_reverse(
+            prepared.session().parts().0,
+            &source_clip,
+            clip.id(),
+            true,
+            limits.session.documents,
+        )
+        .unwrap();
+        let plan = IdeAudioClipEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: *package.manifest_sha256(),
+                resource_id: mixer.id().to_owned(),
+                resource_bytes: package.read_resource(mixer.id()).unwrap(),
+            },
+            clip_id: clip.id().to_owned(),
+            clip_bytes: clip_bytes.clone(),
+        };
+        drop(prepared);
+
+        let outcome = plan.publish().unwrap();
+        assert!(outcome.changed());
+        assert_eq!(outcome.project_revision(), 2);
+        let committed_warning = IdeAudioClipReverseEditError::ReopenAfterPublication {
+            outcome: outcome.clone(),
+            source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
+        };
+        assert!(committed_warning.publication_committed());
+        assert!(matches!(
+            worker::audio_clip_reverse_edit_failure_event(committed_warning),
+            IdeWorkerEvent::AudioClipEditCommittedWithWarning {
+                command: IdeWorkerCommandKind::SetAudioClipReverse,
+                warning: IdeAudioClipEditCommittedWarning::Reverse(reason),
+            } if reason.publication_committed()
+        ));
+        assert!(matches!(
+            worker::audio_clip_reverse_edit_failure_event(
+                IdeAudioClipReverseEditError::InvalidClipIdentity
+            ),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetAudioClipReverse,
+                reason: IdeWorkerCommandFailure::AudioClipReverse(reason),
+            } if matches!(reason.as_ref(), IdeAudioClipReverseEditError::InvalidClipIdentity)
+        ));
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let loaded = reopened.session().parts().0;
+        assert_eq!(loaded.clip_reverse_at(0), Some(true));
         assert_eq!(
             reopened
                 .package()
