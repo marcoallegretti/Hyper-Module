@@ -22,15 +22,15 @@ use super::{
     DesktopIdeApplication, DesktopIdePendingClose, DesktopIdePendingSaveClose,
     DesktopPlaybackRecovery, IdeApplicationConfig, IdeArrangementLocateError,
     IdeArrangementPlacementEditError, IdeAudioClipActivationEditError,
-    IdeAudioClipDuplicationError, IdeAudioClipGainEditError, IdeAudioClipRenameEditError,
-    IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
-    IdeAudioPreviewError, IdeAudioTrackAdditionError, IdeAudioTrackEditError,
-    IdeAudioTrackRemovalError, IdeCloseOutcome, IdeInputDiscoveryError, IdeInputSelection,
-    IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError, IdeMixerChannelKind,
-    IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError, IdeMixerMainState,
-    IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure,
-    IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError, IdeOutputTestError,
-    IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
+    IdeAudioClipDuplicationError, IdeAudioClipFadeEditError, IdeAudioClipGainEditError,
+    IdeAudioClipRenameEditError, IdeAudioInputInventory, IdeAudioOutputInventory,
+    IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioTrackAdditionError,
+    IdeAudioTrackEditError, IdeAudioTrackRemovalError, IdeCloseOutcome, IdeInputDiscoveryError,
+    IdeInputSelection, IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError,
+    IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
+    IdeMixerMainState, IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState,
+    IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError,
+    IdeOutputTestError, IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
     IdePendingCloseWait, IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait,
     IdePendingSaveCloseWait, IdeProjectOpenError, IdeProjectSaveError, IdeRecordingAbortError,
     IdeRecordingAbortOutcome, IdeRecordingClipCreationError, IdeRecordingError,
@@ -138,6 +138,7 @@ pub enum IdeWorkerCommandKind {
     RenameAudioClip,
     SetAudioClipActive,
     SetAudioClipGain,
+    SetAudioClipFades,
     StartRecording,
     StopRecording,
     AbortRecording,
@@ -245,6 +246,11 @@ pub enum IdeWorkerCommand {
         clip_id: String,
         gain_decibels: f64,
     },
+    SetAudioClipFades {
+        clip_id: String,
+        fade_in_ticks: u64,
+        fade_out_ticks: u64,
+    },
     StartRecording {
         channel_index: usize,
     },
@@ -312,6 +318,7 @@ impl IdeWorkerCommand {
             Self::RenameAudioClip { .. } => IdeWorkerCommandKind::RenameAudioClip,
             Self::SetAudioClipActive { .. } => IdeWorkerCommandKind::SetAudioClipActive,
             Self::SetAudioClipGain { .. } => IdeWorkerCommandKind::SetAudioClipGain,
+            Self::SetAudioClipFades { .. } => IdeWorkerCommandKind::SetAudioClipFades,
             Self::StartRecording { .. } => IdeWorkerCommandKind::StartRecording,
             Self::StopRecording => IdeWorkerCommandKind::StopRecording,
             Self::AbortRecording => IdeWorkerCommandKind::AbortRecording,
@@ -577,6 +584,8 @@ pub struct IdeAudioClip {
     duration_ticks: u64,
     active: bool,
     gain_decibels: f64,
+    fade_in_ticks: u64,
+    fade_out_ticks: u64,
 }
 
 impl IdeAudioClip {
@@ -613,6 +622,16 @@ impl IdeAudioClip {
     #[must_use]
     pub const fn gain_decibels(&self) -> f64 {
         self.gain_decibels
+    }
+
+    #[must_use]
+    pub const fn fade_in_ticks(&self) -> u64 {
+        self.fade_in_ticks
+    }
+
+    #[must_use]
+    pub const fn fade_out_ticks(&self) -> u64 {
+        self.fade_out_ticks
     }
 }
 
@@ -877,6 +896,7 @@ pub enum IdeWorkerCommandFailure {
     AudioClipRename(Box<IdeAudioClipRenameEditError>),
     AudioClipActivation(Box<IdeAudioClipActivationEditError>),
     AudioClipGain(Box<IdeAudioClipGainEditError>),
+    AudioClipFades(Box<IdeAudioClipFadeEditError>),
     Recording(IdeRecordingError),
     AudioPreview(IdeAudioPreviewError),
     InvalidState,
@@ -921,6 +941,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioClipRename(source) => source.fmt(formatter),
             Self::AudioClipActivation(source) => source.fmt(formatter),
             Self::AudioClipGain(source) => source.fmt(formatter),
+            Self::AudioClipFades(source) => source.fmt(formatter),
             Self::Recording(source) => source.fmt(formatter),
             Self::AudioPreview(source) => source.fmt(formatter),
             Self::InvalidState => {
@@ -971,6 +992,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioClipRename(source) => Some(source),
             Self::AudioClipActivation(source) => Some(source),
             Self::AudioClipGain(source) => Some(source),
+            Self::AudioClipFades(source) => Some(source),
             Self::Recording(source) => Some(source),
             Self::AudioPreview(source) => Some(source),
             Self::Publication(source) => Some(source),
@@ -1089,6 +1111,12 @@ pub enum IdeWorkerEvent {
         changed: bool,
         gain_decibels: f64,
     },
+    AudioClipFadesChanged {
+        revision: u64,
+        changed: bool,
+        fade_in_ticks: u64,
+        fade_out_ticks: u64,
+    },
     RecordingPreparing,
     Recording(IdeRecordingState),
     RecordingFinalizing,
@@ -1134,6 +1162,10 @@ pub enum IdeWorkerEvent {
     },
     AudioClipGainChanging {
         gain_decibels: f64,
+    },
+    AudioClipFadesChanging {
+        fade_in_ticks: u64,
+        fade_out_ticks: u64,
     },
     Closing,
     CommandFailed {
@@ -1521,6 +1553,11 @@ enum ProjectMutation {
         clip_id: String,
         gain_decibels: f64,
     },
+    SetAudioClipFades {
+        clip_id: String,
+        fade_in_ticks: u64,
+        fade_out_ticks: u64,
+    },
 }
 
 impl ProjectMutation {
@@ -1556,6 +1593,7 @@ impl ProjectMutation {
             Self::RenameAudioClip { .. } => IdeWorkerCommandKind::RenameAudioClip,
             Self::SetAudioClipActive { .. } => IdeWorkerCommandKind::SetAudioClipActive,
             Self::SetAudioClipGain { .. } => IdeWorkerCommandKind::SetAudioClipGain,
+            Self::SetAudioClipFades { .. } => IdeWorkerCommandKind::SetAudioClipFades,
         }
     }
 
@@ -1610,6 +1648,14 @@ impl ProjectMutation {
             }
             Self::SetAudioClipGain { gain_decibels, .. } => IdeWorkerEvent::AudioClipGainChanging {
                 gain_decibels: *gain_decibels,
+            },
+            Self::SetAudioClipFades {
+                fade_in_ticks,
+                fade_out_ticks,
+                ..
+            } => IdeWorkerEvent::AudioClipFadesChanging {
+                fade_in_ticks: *fade_in_ticks,
+                fade_out_ticks: *fade_out_ticks,
             },
         }
     }
@@ -1815,7 +1861,8 @@ fn process_command(
         | IdeWorkerCommand::RemoveArrangementPlacement { .. }
         | IdeWorkerCommand::RenameAudioClip { .. }
         | IdeWorkerCommand::SetAudioClipActive { .. }
-        | IdeWorkerCommand::SetAudioClipGain { .. }) => {
+        | IdeWorkerCommand::SetAudioClipGain { .. }
+        | IdeWorkerCommand::SetAudioClipFades { .. }) => {
             process_project_mutation_command(state, command, events)
         }
         IdeWorkerCommand::StartRecording { channel_index } => {
@@ -1949,6 +1996,11 @@ fn process_project_mutation_command(
             clip_id,
             gain_decibels,
         } => set_audio_clip_gain(state, events, &clip_id, gain_decibels),
+        IdeWorkerCommand::SetAudioClipFades {
+            clip_id,
+            fade_in_ticks,
+            fade_out_ticks,
+        } => set_audio_clip_fades(state, events, &clip_id, fade_in_ticks, fade_out_ticks),
         _ => unreachable!("only project-mutation commands are routed to this handler"),
     }
 }
@@ -3580,6 +3632,44 @@ fn set_audio_clip_gain(
     )
 }
 
+fn set_audio_clip_fades(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    clip_id: &str,
+    fade_in_ticks: u64,
+    fade_out_ticks: u64,
+) -> bool {
+    if clip_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SetAudioClipFades,
+            IdeWorkerCommandFailure::AudioClipFades(Box::new(
+                IdeAudioClipFadeEditError::InvalidClipIdentity,
+            )),
+        );
+    }
+    let mut owned_clip_id = String::new();
+    if owned_clip_id.try_reserve_exact(clip_id.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SetAudioClipFades,
+            IdeWorkerCommandFailure::AudioClipFades(Box::new(
+                IdeAudioClipFadeEditError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_clip_id.push_str(clip_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::SetAudioClipFades {
+            clip_id: owned_clip_id,
+            fade_in_ticks,
+            fade_out_ticks,
+        },
+    )
+}
+
 fn begin_project_mutation_request(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -3722,6 +3812,9 @@ fn project_mutation_save_failure(
         ProjectMutation::SetAudioClipGain { .. } => IdeWorkerCommandFailure::AudioClipGain(
             Box::new(IdeAudioClipGainEditError::MixerSave(Box::new(reason))),
         ),
+        ProjectMutation::SetAudioClipFades { .. } => IdeWorkerCommandFailure::AudioClipFades(
+            Box::new(IdeAudioClipFadeEditError::MixerSave(Box::new(reason))),
+        ),
     }
 }
 
@@ -3862,6 +3955,9 @@ fn project_mutation_native_close_failure(
         ProjectMutation::SetAudioClipGain { .. } => IdeWorkerCommandFailure::AudioClipGain(
             Box::new(IdeAudioClipGainEditError::NativeClose(failure)),
         ),
+        ProjectMutation::SetAudioClipFades { .. } => IdeWorkerCommandFailure::AudioClipFades(
+            Box::new(IdeAudioClipFadeEditError::NativeClose(failure)),
+        ),
     }
 }
 
@@ -3959,6 +4055,14 @@ enum ProjectMutationAttempt {
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeAudioClipGainEditError,
+        >,
+    },
+    SetAudioClipFades {
+        fade_in_ticks: u64,
+        fade_out_ticks: u64,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeAudioClipFadeEditError,
         >,
     },
 }
@@ -4340,6 +4444,27 @@ fn complete_project_mutation(
                     IdeWorkerCommandKind::SetAudioClipGain,
                     IdeWorkerCommandFailure::AudioClipGain(Box::new(reason)),
                 ),
+                ProjectMutationAttempt::SetAudioClipFades {
+                    fade_in_ticks,
+                    fade_out_ticks,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::AudioClipFadesChanged {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                        fade_in_ticks,
+                        fade_out_ticks,
+                    },
+                ),
+                ProjectMutationAttempt::SetAudioClipFades {
+                    result: Err(reason),
+                    ..
+                } => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::SetAudioClipFades,
+                    IdeWorkerCommandFailure::AudioClipFades(Box::new(reason)),
+                ),
             }
         }
         Err(failure) => {
@@ -4614,6 +4739,22 @@ fn attempt_project_mutation(
                 native_failure,
             ),
         },
+        ProjectMutation::SetAudioClipFades {
+            clip_id,
+            fade_in_ticks,
+            fade_out_ticks,
+        } => ProjectMutationAttempt::SetAudioClipFades {
+            fade_in_ticks,
+            fade_out_ticks,
+            result: attempt_audio_clip_fades(
+                application,
+                recovery,
+                &clip_id,
+                fade_in_ticks,
+                fade_out_ticks,
+                native_failure,
+            ),
+        },
     }
 }
 
@@ -4877,6 +5018,30 @@ fn attempt_audio_clip_gain(
     })
 }
 
+fn attempt_audio_clip_fades(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    clip_id: &str,
+    fade_in_ticks: u64,
+    fade_out_ticks: u64,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAudioClipFadeEditError> {
+    if let Some(failure) = native_failure {
+        return Err(IdeAudioClipFadeEditError::NativeClose(failure));
+    }
+    RunningDesktopIdeApplication::prepare_audio_clip_fades(
+        application,
+        recovery,
+        clip_id,
+        fade_in_ticks,
+        fade_out_ticks,
+    )
+    .and_then(|plan| {
+        plan.publish()
+            .map_err(|source| IdeAudioClipFadeEditError::Publication(Box::new(source)))
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "every mutation outcome retains its command-specific recovery evidence"
@@ -5057,6 +5222,9 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::SetAudioClipGain { result, .. } => {
             audio_clip_gain_edit_reopen_failure(result, reopen)
         }
+        ProjectMutationAttempt::SetAudioClipFades { result, .. } => {
+            audio_clip_fade_edit_reopen_failure(result, reopen)
+        }
     }
 }
 
@@ -5227,6 +5395,38 @@ fn audio_clip_gain_edit_reopen_failure(
         },
     };
     IdeWorkerCommandFailure::AudioClipGain(Box::new(reason))
+}
+
+fn audio_clip_fade_edit_reopen_failure(
+    result: Result<
+        hyper_storage_engine::ProjectResourcePublicationOutcome,
+        IdeAudioClipFadeEditError,
+    >,
+    reopen: IdeProjectOpenError,
+) -> IdeWorkerCommandFailure {
+    let reason = match result {
+        Ok(outcome) => IdeAudioClipFadeEditError::ReopenAfterPublication {
+            outcome,
+            source: Box::new(reopen),
+        },
+        Err(IdeAudioClipFadeEditError::Publication(publication)) => {
+            IdeAudioClipFadeEditError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(IdeAudioClipFadeEditError::NativeClose(close)) => {
+            IdeAudioClipFadeEditError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(preparation) => IdeAudioClipFadeEditError::ReopenAfterPreparation {
+            preparation: Box::new(preparation),
+            reopen: Box::new(reopen),
+        },
+    };
+    IdeWorkerCommandFailure::AudioClipFades(Box::new(reason))
 }
 
 fn arrangement_placement_edit_reopen_failure(
@@ -5650,6 +5850,14 @@ fn running_observation(
             gain_decibels: snapshot
                 .loaded
                 .clip_gain_decibels_at(clip_index)
+                .ok_or(IdeWorkerCommandFailure::ProjectSnapshotUnavailable)?,
+            fade_in_ticks: snapshot
+                .loaded
+                .clip_fade_in_ticks_at(clip_index)
+                .ok_or(IdeWorkerCommandFailure::ProjectSnapshotUnavailable)?,
+            fade_out_ticks: snapshot
+                .loaded
+                .clip_fade_out_ticks_at(clip_index)
                 .ok_or(IdeWorkerCommandFailure::ProjectSnapshotUnavailable)?,
         });
     }
@@ -7745,6 +7953,66 @@ mod tests {
                 command: IdeWorkerCommandKind::SetAudioClipGain,
                 reason: IdeWorkerCommandFailure::AudioClipGain(reason),
             } if matches!(reason.as_ref(), IdeAudioClipGainEditError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn audio_clip_fades_validate_identity_and_wait_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SetAudioClipFades {
+                clip_id: String::new(),
+                fade_in_ticks: 1,
+                fade_out_ticks: 2,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetAudioClipFades,
+                reason: IdeWorkerCommandFailure::AudioClipFades(reason),
+            } if matches!(reason.as_ref(), IdeAudioClipFadeEditError::InvalidClipIdentity)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SetAudioClipFades {
+                clip_id: "018f47a2-6b2d-7c11-8a44-001122334460".to_owned(),
+                fade_in_ticks: 1,
+                fade_out_ticks: 2,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioClipFadesChanging {
+                fade_in_ticks: 1,
+                fade_out_ticks: 2,
+            }
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetAudioClipFades,
+                reason: IdeWorkerCommandFailure::AudioClipFades(reason),
+            } if matches!(reason.as_ref(), IdeAudioClipFadeEditError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
