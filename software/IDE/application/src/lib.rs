@@ -89,13 +89,14 @@ pub use recording::{
 };
 
 pub use worker::{
-    DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeAudioClip, IdeAudioPreviewObservation,
-    IdeClosedSnapshot, IdeMixerChannel, IdeMixerSend, IdeProjectCreationError,
-    IdeRecordingCaptureKind, IdeRecordingState, IdeRecordingTake, IdeRunningObservation, IdeScene,
-    IdeWorkerCommand, IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent,
-    IdeWorkerEventReceiveError, IdeWorkerJoinError, IdeWorkerPendingShutdownWait,
-    IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, IdeWorkerStartError,
-    MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS, desktop_ide_worker_supervisor_snapshot,
+    DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeAudioClip,
+    IdeAudioClipEditCommittedWarning, IdeAudioPreviewObservation, IdeClosedSnapshot,
+    IdeMixerChannel, IdeMixerSend, IdeProjectCreationError, IdeRecordingCaptureKind,
+    IdeRecordingState, IdeRecordingTake, IdeRunningObservation, IdeScene, IdeWorkerCommand,
+    IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError,
+    IdeWorkerJoinError, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeWorkerShutdownReport, IdeWorkerStartError, MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS,
+    desktop_ide_worker_supervisor_snapshot,
 };
 
 const DESKTOP_MAXIMUM_BLOCK_FRAMES: usize = 4_096;
@@ -2712,6 +2713,16 @@ pub enum IdeAudioClipEditPublicationError {
     },
 }
 
+impl IdeAudioClipEditPublicationError {
+    #[must_use]
+    pub const fn clip_published(&self) -> bool {
+        match self {
+            Self::Mixer(_) => false,
+            Self::Clip { source, .. } => source.published(),
+        }
+    }
+}
+
 impl fmt::Display for IdeAudioClipEditPublicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2725,7 +2736,7 @@ impl fmt::Display for IdeAudioClipEditPublicationError {
             ),
             Self::Clip { source, .. } if source.published() => write!(
                 formatter,
-                "audio-clip edit was published, but its project transaction cleanup is incomplete: {source}"
+                "audio-clip edit was published, but project verification or transaction recovery is incomplete: {source}"
             ),
             Self::Clip { mixer, source } if mixer.changed() => write!(
                 formatter,
@@ -2775,6 +2786,18 @@ pub enum IdeAudioClipRenameEditError {
     },
 }
 
+impl IdeAudioClipRenameEditError {
+    #[must_use]
+    pub const fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication(source) => source.clip_published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. } => publication.clip_published(),
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for IdeAudioClipRenameEditError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2821,6 +2844,13 @@ impl fmt::Display for IdeAudioClipRenameEditError {
                 formatter,
                 "audio clip was renamed in project revision {} but the project could not be reopened: {source}",
                 outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.clip_published() => write!(
+                formatter,
+                "audio-clip rename was committed with incomplete project verification or transaction recovery ({publication}) and the project could not be reopened ({reopen})"
             ),
             Self::PublicationAndReopen {
                 publication,
@@ -2884,6 +2914,18 @@ pub enum IdeAudioClipGainEditError {
     },
 }
 
+impl IdeAudioClipGainEditError {
+    #[must_use]
+    pub const fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication(source) => source.clip_published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. } => publication.clip_published(),
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for IdeAudioClipGainEditError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2928,6 +2970,13 @@ impl fmt::Display for IdeAudioClipGainEditError {
                 formatter,
                 "audio-clip gain was edited in project revision {} but the project could not be reopened: {source}",
                 outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.clip_published() => write!(
+                formatter,
+                "audio-clip gain was committed with incomplete project verification or transaction recovery ({publication}) and the project could not be reopened ({reopen})"
             ),
             Self::PublicationAndReopen {
                 publication,
@@ -2990,6 +3039,18 @@ pub enum IdeAudioClipFadeEditError {
     },
 }
 
+impl IdeAudioClipFadeEditError {
+    #[must_use]
+    pub const fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication(source) => source.clip_published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. } => publication.clip_published(),
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for IdeAudioClipFadeEditError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -3033,6 +3094,13 @@ impl fmt::Display for IdeAudioClipFadeEditError {
                 formatter,
                 "audio-clip fades were edited in project revision {} but the project could not be reopened: {source}",
                 outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.clip_published() => write!(
+                formatter,
+                "audio-clip fades were committed with incomplete project verification or transaction recovery ({publication}) and the project could not be reopened ({reopen})"
             ),
             Self::PublicationAndReopen {
                 publication,
@@ -3094,6 +3162,18 @@ pub enum IdeAudioClipActivationEditError {
     },
 }
 
+impl IdeAudioClipActivationEditError {
+    #[must_use]
+    pub const fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication(source) => source.clip_published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. } => publication.clip_published(),
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for IdeAudioClipActivationEditError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -3137,6 +3217,13 @@ impl fmt::Display for IdeAudioClipActivationEditError {
                 formatter,
                 "audio-clip activation was edited in project revision {} but the project could not be reopened: {source}",
                 outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.clip_published() => write!(
+                formatter,
+                "audio-clip activation was committed with incomplete project verification or transaction recovery ({publication}) and the project could not be reopened ({reopen})"
             ),
             Self::PublicationAndReopen {
                 publication,
@@ -7237,6 +7324,48 @@ mod tests {
         let outcome = plan.publish().unwrap();
         assert!(outcome.changed());
         assert_eq!(outcome.project_revision(), 2);
+        let committed_warning = IdeAudioClipFadeEditError::ReopenAfterPublication {
+            outcome: outcome.clone(),
+            source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
+        };
+        assert!(committed_warning.publication_committed());
+        assert!(matches!(
+            worker::audio_clip_fade_edit_failure_event(committed_warning),
+            IdeWorkerEvent::AudioClipEditCommittedWithWarning {
+                command: IdeWorkerCommandKind::SetAudioClipFades,
+                warning: IdeAudioClipEditCommittedWarning::Fades(reason),
+            } if reason.publication_committed()
+        ));
+        assert!(matches!(
+            worker::audio_clip_fade_edit_failure_event(
+                IdeAudioClipFadeEditError::InvalidClipIdentity
+            ),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetAudioClipFades,
+                reason: IdeWorkerCommandFailure::AudioClipFades(reason),
+            } if matches!(reason.as_ref(), IdeAudioClipFadeEditError::InvalidClipIdentity)
+        ));
+        assert!(
+            IdeAudioClipRenameEditError::ReopenAfterPublication {
+                outcome: outcome.clone(),
+                source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
+            }
+            .publication_committed()
+        );
+        assert!(
+            IdeAudioClipActivationEditError::ReopenAfterPublication {
+                outcome: outcome.clone(),
+                source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
+            }
+            .publication_committed()
+        );
+        assert!(
+            IdeAudioClipGainEditError::ReopenAfterPublication {
+                outcome: outcome.clone(),
+                source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
+            }
+            .publication_committed()
+        );
         let reopened =
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
         let loaded = reopened.session().parts().0;

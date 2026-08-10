@@ -1005,6 +1005,36 @@ impl Error for IdeWorkerCommandFailure {
 }
 
 #[derive(Debug)]
+pub enum IdeAudioClipEditCommittedWarning {
+    Rename(Box<IdeAudioClipRenameEditError>),
+    Activation(Box<IdeAudioClipActivationEditError>),
+    Gain(Box<IdeAudioClipGainEditError>),
+    Fades(Box<IdeAudioClipFadeEditError>),
+}
+
+impl fmt::Display for IdeAudioClipEditCommittedWarning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rename(source) => source.fmt(formatter),
+            Self::Activation(source) => source.fmt(formatter),
+            Self::Gain(source) => source.fmt(formatter),
+            Self::Fades(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeAudioClipEditCommittedWarning {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Rename(source) => Some(source),
+            Self::Activation(source) => Some(source),
+            Self::Gain(source) => Some(source),
+            Self::Fades(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
 #[allow(
     clippy::large_enum_variant,
     reason = "events transfer fixed-size owned observations without an additional infallible allocation"
@@ -1054,6 +1084,10 @@ pub enum IdeWorkerEvent {
     AudioClipDuplicationCommittedWithWarning {
         name: String,
         warning: Box<IdeAudioClipDuplicationError>,
+    },
+    AudioClipEditCommittedWithWarning {
+        command: IdeWorkerCommandKind,
+        warning: IdeAudioClipEditCommittedWarning,
     },
     ArrangementPlacementAdded {
         revision: u64,
@@ -4079,6 +4113,74 @@ fn publish_arrangement_edit_failure(
     )
 }
 
+fn audio_clip_edit_failure_event<E>(
+    command: IdeWorkerCommandKind,
+    reason: E,
+    publication_committed: fn(&E) -> bool,
+    warning: fn(Box<E>) -> IdeAudioClipEditCommittedWarning,
+    failure: fn(Box<E>) -> IdeWorkerCommandFailure,
+) -> IdeWorkerEvent {
+    if publication_committed(&reason) {
+        IdeWorkerEvent::AudioClipEditCommittedWithWarning {
+            command,
+            warning: warning(Box::new(reason)),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command,
+            reason: failure(Box::new(reason)),
+        }
+    }
+}
+
+pub(super) fn audio_clip_rename_edit_failure_event(
+    reason: IdeAudioClipRenameEditError,
+) -> IdeWorkerEvent {
+    audio_clip_edit_failure_event(
+        IdeWorkerCommandKind::RenameAudioClip,
+        reason,
+        IdeAudioClipRenameEditError::publication_committed,
+        IdeAudioClipEditCommittedWarning::Rename,
+        IdeWorkerCommandFailure::AudioClipRename,
+    )
+}
+
+pub(super) fn audio_clip_activation_edit_failure_event(
+    reason: IdeAudioClipActivationEditError,
+) -> IdeWorkerEvent {
+    audio_clip_edit_failure_event(
+        IdeWorkerCommandKind::SetAudioClipActive,
+        reason,
+        IdeAudioClipActivationEditError::publication_committed,
+        IdeAudioClipEditCommittedWarning::Activation,
+        IdeWorkerCommandFailure::AudioClipActivation,
+    )
+}
+
+pub(super) fn audio_clip_gain_edit_failure_event(
+    reason: IdeAudioClipGainEditError,
+) -> IdeWorkerEvent {
+    audio_clip_edit_failure_event(
+        IdeWorkerCommandKind::SetAudioClipGain,
+        reason,
+        IdeAudioClipGainEditError::publication_committed,
+        IdeAudioClipEditCommittedWarning::Gain,
+        IdeWorkerCommandFailure::AudioClipGain,
+    )
+}
+
+pub(super) fn audio_clip_fade_edit_failure_event(
+    reason: IdeAudioClipFadeEditError,
+) -> IdeWorkerEvent {
+    audio_clip_edit_failure_event(
+        IdeWorkerCommandKind::SetAudioClipFades,
+        reason,
+        IdeAudioClipFadeEditError::publication_committed,
+        IdeAudioClipEditCommittedWarning::Fades,
+        IdeWorkerCommandFailure::AudioClipFades,
+    )
+}
+
 pub(super) fn arrangement_edit_failure_event(
     command: IdeWorkerCommandKind,
     reason: IdeArrangementPlacementEditError,
@@ -4401,11 +4503,7 @@ fn complete_project_mutation(
                 ProjectMutationAttempt::RenameAudioClip {
                     result: Err(reason),
                     ..
-                } => publish_failure(
-                    events,
-                    IdeWorkerCommandKind::RenameAudioClip,
-                    IdeWorkerCommandFailure::AudioClipRename(Box::new(reason)),
-                ),
+                } => send_event(events, audio_clip_rename_edit_failure_event(reason)),
                 ProjectMutationAttempt::SetAudioClipActive {
                     active,
                     result: Ok(outcome),
@@ -4420,11 +4518,7 @@ fn complete_project_mutation(
                 ProjectMutationAttempt::SetAudioClipActive {
                     result: Err(reason),
                     ..
-                } => publish_failure(
-                    events,
-                    IdeWorkerCommandKind::SetAudioClipActive,
-                    IdeWorkerCommandFailure::AudioClipActivation(Box::new(reason)),
-                ),
+                } => send_event(events, audio_clip_activation_edit_failure_event(reason)),
                 ProjectMutationAttempt::SetAudioClipGain {
                     gain_decibels,
                     result: Ok(outcome),
@@ -4439,11 +4533,7 @@ fn complete_project_mutation(
                 ProjectMutationAttempt::SetAudioClipGain {
                     result: Err(reason),
                     ..
-                } => publish_failure(
-                    events,
-                    IdeWorkerCommandKind::SetAudioClipGain,
-                    IdeWorkerCommandFailure::AudioClipGain(Box::new(reason)),
-                ),
+                } => send_event(events, audio_clip_gain_edit_failure_event(reason)),
                 ProjectMutationAttempt::SetAudioClipFades {
                     fade_in_ticks,
                     fade_out_ticks,
@@ -4460,11 +4550,7 @@ fn complete_project_mutation(
                 ProjectMutationAttempt::SetAudioClipFades {
                     result: Err(reason),
                     ..
-                } => publish_failure(
-                    events,
-                    IdeWorkerCommandKind::SetAudioClipFades,
-                    IdeWorkerCommandFailure::AudioClipFades(Box::new(reason)),
-                ),
+                } => send_event(events, audio_clip_fade_edit_failure_event(reason)),
             }
         }
         Err(failure) => {

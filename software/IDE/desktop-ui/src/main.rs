@@ -22,6 +22,8 @@ use hyper_desktop_ide::{
     IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState, TransportCommand,
     desktop_ide_application_config, ide_audio_clip_gain_is_supported,
 };
+#[cfg(test)]
+use hyper_desktop_ide::{IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError};
 use slint::platform::PlatformError;
 use slint::{
     ComponentHandle, Model, ModelRc, ModelTracker, SharedString, Timer, TimerMode, VecModel,
@@ -2233,6 +2235,9 @@ fn apply_event(
         | IdeWorkerEvent::AudioClipDuplicating) => {
             apply_audio_clip_duplication_event(ui, &event);
         }
+        event @ IdeWorkerEvent::AudioClipEditCommittedWithWarning { .. } => {
+            apply_audio_clip_edit_committed_warning(ui, &event);
+        }
         event @ (IdeWorkerEvent::AudioClipActivationChanged { .. }
         | IdeWorkerEvent::AudioClipActivationChanging { .. }) => {
             apply_audio_clip_activation_event(ui, &event);
@@ -2707,10 +2712,7 @@ fn apply_audio_clip_rename_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             changed,
             name,
         } => {
-            ui.set_clip_rename_visible(false);
-            ui.set_clip_rename_id(SharedString::default());
-            ui.set_clip_rename_original(SharedString::default());
-            ui.set_clip_rename_name(SharedString::default());
+            reset_audio_clip_rename_form(ui);
             ui.set_status_text(
                 if *changed {
                     format!("Audio clip renamed to {name} in project revision {revision}")
@@ -2728,6 +2730,13 @@ fn apply_audio_clip_rename_event(ui: &MainWindow, event: &IdeWorkerEvent) {
         }
         _ => unreachable!("audio-clip rename event dispatcher received another event"),
     }
+}
+
+fn reset_audio_clip_rename_form(ui: &MainWindow) {
+    ui.set_clip_rename_visible(false);
+    ui.set_clip_rename_id(SharedString::default());
+    ui.set_clip_rename_original(SharedString::default());
+    ui.set_clip_rename_name(SharedString::default());
 }
 
 fn apply_audio_clip_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -2777,6 +2786,54 @@ fn reset_audio_clip_duplication_form(ui: &MainWindow) {
     ui.set_clip_duplicate_name(SharedString::default());
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AudioClipEditWarningForm {
+    None,
+    Rename,
+    Gain,
+    Fades,
+}
+
+fn audio_clip_edit_warning_presentation(
+    command: IdeWorkerCommandKind,
+) -> Option<(AudioClipEditWarningForm, &'static str)> {
+    match command {
+        IdeWorkerCommandKind::RenameAudioClip => {
+            Some((AudioClipEditWarningForm::Rename, "Audio-clip rename"))
+        }
+        IdeWorkerCommandKind::SetAudioClipActive => {
+            Some((AudioClipEditWarningForm::None, "Audio-clip activation edit"))
+        }
+        IdeWorkerCommandKind::SetAudioClipGain => {
+            Some((AudioClipEditWarningForm::Gain, "Audio-clip gain edit"))
+        }
+        IdeWorkerCommandKind::SetAudioClipFades => {
+            Some((AudioClipEditWarningForm::Fades, "Audio-clip fade edit"))
+        }
+        _ => None,
+    }
+}
+
+fn apply_audio_clip_edit_committed_warning(ui: &MainWindow, event: &IdeWorkerEvent) {
+    let IdeWorkerEvent::AudioClipEditCommittedWithWarning { command, warning } = event else {
+        unreachable!("audio-clip edit committed-warning dispatcher received another event");
+    };
+    let Some((form, action)) = audio_clip_edit_warning_presentation(*command) else {
+        unreachable!("committed-warning event used an unrelated command");
+    };
+    match form {
+        AudioClipEditWarningForm::None => {}
+        AudioClipEditWarningForm::Rename => reset_audio_clip_rename_form(ui),
+        AudioClipEditWarningForm::Gain => reset_audio_clip_gain_form(ui),
+        AudioClipEditWarningForm::Fades => reset_audio_clip_fade_form(ui),
+    }
+    ui.set_app_mode(AppMode::Running);
+    ui.set_status_text(
+        format!("{action} committed and reopened with a project recovery warning").into(),
+    );
+    ui.set_error_text(warning.to_string().into());
+}
+
 fn apply_audio_clip_activation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::AudioClipActivationChanged {
@@ -2817,11 +2874,7 @@ fn apply_audio_clip_gain_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             changed,
             gain_decibels,
         } => {
-            ui.set_clip_gain_visible(false);
-            ui.set_clip_gain_id(SharedString::default());
-            ui.set_clip_gain_name(SharedString::default());
-            ui.set_clip_gain_original(SharedString::default());
-            ui.set_clip_gain_value(SharedString::default());
+            reset_audio_clip_gain_form(ui);
             ui.set_status_text(
                 if *changed {
                     format!(
@@ -2847,6 +2900,14 @@ fn apply_audio_clip_gain_event(ui: &MainWindow, event: &IdeWorkerEvent) {
         }
         _ => unreachable!("audio-clip gain event dispatcher received another event"),
     }
+}
+
+fn reset_audio_clip_gain_form(ui: &MainWindow) {
+    ui.set_clip_gain_visible(false);
+    ui.set_clip_gain_id(SharedString::default());
+    ui.set_clip_gain_name(SharedString::default());
+    ui.set_clip_gain_original(SharedString::default());
+    ui.set_clip_gain_value(SharedString::default());
 }
 
 fn apply_audio_clip_fade_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -5193,6 +5254,62 @@ mod tests {
             ),
             AppMode::Running
         );
+    }
+
+    #[test]
+    fn committed_audio_clip_edit_warning_presentation_identifies_the_matching_form() {
+        assert_eq!(
+            audio_clip_edit_warning_presentation(IdeWorkerCommandKind::RenameAudioClip),
+            Some((AudioClipEditWarningForm::Rename, "Audio-clip rename"))
+        );
+        assert_eq!(
+            audio_clip_edit_warning_presentation(IdeWorkerCommandKind::SetAudioClipActive),
+            Some((AudioClipEditWarningForm::None, "Audio-clip activation edit"))
+        );
+        assert_eq!(
+            audio_clip_edit_warning_presentation(IdeWorkerCommandKind::SetAudioClipGain),
+            Some((AudioClipEditWarningForm::Gain, "Audio-clip gain edit"))
+        );
+        assert_eq!(
+            audio_clip_edit_warning_presentation(IdeWorkerCommandKind::SetAudioClipFades),
+            Some((AudioClipEditWarningForm::Fades, "Audio-clip fade edit"))
+        );
+        assert_eq!(
+            audio_clip_edit_warning_presentation(IdeWorkerCommandKind::SaveProject),
+            None
+        );
+    }
+
+    #[test]
+    fn committed_audio_clip_fade_warning_restores_reopened_ui_authority() {
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::ChangingClipFades);
+        ui.set_clip_fades_visible(true);
+        ui.set_clip_fades_id("clip-a".into());
+        ui.set_clip_fades_name("Clip A".into());
+        ui.set_clip_fades_duration("4".into());
+        ui.set_clip_fades_original_in("0".into());
+        ui.set_clip_fades_original_out("0".into());
+        ui.set_clip_fades_in("1".into());
+        ui.set_clip_fades_out("2".into());
+
+        apply_audio_clip_edit_committed_warning(
+            &ui,
+            &IdeWorkerEvent::AudioClipEditCommittedWithWarning {
+                command: IdeWorkerCommandKind::SetAudioClipFades,
+                warning: IdeAudioClipEditCommittedWarning::Fades(Box::new(
+                    IdeAudioClipFadeEditError::InvalidClipIdentity,
+                )),
+            },
+        );
+
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(!ui.get_clip_fades_visible());
+        assert!(ui.get_clip_fades_id().is_empty());
+        assert!(ui.get_clip_fades_in().is_empty());
+        assert!(ui.get_clip_fades_out().is_empty());
+        assert!(ui.get_status_text().contains("committed and reopened"));
+        assert!(!ui.get_error_text().is_empty());
     }
 
     #[test]
