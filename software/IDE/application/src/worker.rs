@@ -1007,6 +1007,10 @@ pub enum IdeWorkerEvent {
         clip_id: String,
         name: String,
     },
+    AudioClipDuplicationCommittedWithWarning {
+        name: String,
+        warning: Box<IdeAudioClipDuplicationError>,
+    },
     ArrangementPlacementAdded {
         revision: u64,
         start_tick: u64,
@@ -3902,6 +3906,16 @@ fn complete_project_mutation(
                     },
                 ),
                 ProjectMutationAttempt::DuplicateAudioClip {
+                    name,
+                    result: Err(reason),
+                } if reason.committed_clip_id().is_some() => send_event(
+                    events,
+                    IdeWorkerEvent::AudioClipDuplicationCommittedWithWarning {
+                        name,
+                        warning: Box::new(reason),
+                    },
+                ),
+                ProjectMutationAttempt::DuplicateAudioClip {
                     result: Err(reason),
                     ..
                 } => publish_failure(
@@ -4196,11 +4210,7 @@ fn attempt_project_mutation(
                         &clip_id,
                         &name,
                     )
-                    .and_then(|plan| {
-                        plan.publish().map_err(|source| {
-                            IdeAudioClipDuplicationError::Publication(Box::new(source))
-                        })
-                    })
+                    .and_then(publish_audio_clip_duplication_plan)
                 },
             }
         }
@@ -4316,6 +4326,18 @@ fn attempt_project_mutation(
                 native_failure,
             ),
         },
+    }
+}
+
+fn publish_audio_clip_duplication_plan(
+    plan: super::IdeAudioClipCreationPlan,
+) -> Result<hyper_storage_engine::AudioClipPublicationOutcome, IdeAudioClipDuplicationError> {
+    match plan.publish() {
+        Ok(outcome) => Ok(outcome),
+        Err(source) => Err(IdeAudioClipDuplicationError::Publication {
+            clip_id: plan.clip_id,
+            source: Box::new(source),
+        }),
     }
 }
 
@@ -4727,9 +4749,10 @@ fn audio_clip_duplication_reopen_failure(
             outcome,
             source: Box::new(reopen),
         },
-        Err(IdeAudioClipDuplicationError::Publication(publication)) => {
+        Err(IdeAudioClipDuplicationError::Publication { clip_id, source }) => {
             IdeAudioClipDuplicationError::PublicationAndReopen {
-                publication,
+                clip_id,
+                publication: source,
                 reopen: Box::new(reopen),
             }
         }
@@ -7081,6 +7104,47 @@ mod tests {
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn audio_clip_duplication_publication_and_reopen_errors_retain_the_planned_identity() {
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334461";
+        let plan = crate::IdeAudioClipCreationPlan {
+            mixer: crate::IdeMixerSavePlan {
+                project_path: std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
+                expected_project_sha256: [0; 32],
+                resource_id: "mixer".to_owned(),
+                resource_bytes: Vec::new(),
+            },
+            clip_id: clip_id.to_owned(),
+            clip_bytes: Vec::new(),
+            track_id: "track".to_owned(),
+            track_bytes: Vec::new(),
+            asset_id: "asset".to_owned(),
+        };
+        let publication = publish_audio_clip_duplication_plan(plan).unwrap_err();
+        assert!(matches!(
+            &publication,
+            IdeAudioClipDuplicationError::Publication {
+                clip_id: retained,
+                ..
+            } if retained == clip_id
+        ));
+
+        assert!(matches!(
+            audio_clip_duplication_reopen_failure(
+                Err(publication),
+                IdeProjectOpenError::SelectedOutputUnavailable,
+            ),
+            IdeWorkerCommandFailure::AudioClipDuplication(reason)
+                if matches!(reason.as_ref(),
+                    IdeAudioClipDuplicationError::PublicationAndReopen {
+                        clip_id: retained,
+                        reopen,
+                        ..
+                    } if retained == clip_id
+                        && matches!(reopen.as_ref(), IdeProjectOpenError::SelectedOutputUnavailable))
+        ));
     }
 
     #[test]

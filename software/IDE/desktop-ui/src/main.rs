@@ -1738,64 +1738,12 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
     };
     match worker.try_send(command) {
         Ok(()) => {
-            match command_kind {
-                IdeWorkerCommandKind::StartOutputTest => {
-                    ui.set_app_mode(AppMode::StartingOutputTest);
-                }
-                IdeWorkerCommandKind::StopOutputTest => {
-                    ui.set_app_mode(AppMode::StoppingOutputTest);
-                }
-                IdeWorkerCommandKind::CreateProject => ui.set_app_mode(AppMode::Creating),
-                IdeWorkerCommandKind::SaveProject => ui.set_app_mode(AppMode::Saving),
-                IdeWorkerCommandKind::AddAudioTrack => ui.set_app_mode(AppMode::AddingTrack),
-                IdeWorkerCommandKind::RemoveAudioTrack => {
-                    ui.set_app_mode(AppMode::RemovingTrack);
-                }
-                IdeWorkerCommandKind::RenameAudioTrack => {
-                    ui.set_app_mode(AppMode::RenamingTrack);
-                }
-                IdeWorkerCommandKind::SetAudioTrackActive => {
-                    ui.set_app_mode(AppMode::ChangingTrackActivation);
-                }
-                IdeWorkerCommandKind::SetArrangementPlacementActive => {
-                    ui.set_app_mode(AppMode::ChangingArrangementActivation);
-                }
-                IdeWorkerCommandKind::MoveArrangementPlacement => {
-                    ui.set_app_mode(AppMode::MovingArrangementPlacement);
-                }
-                IdeWorkerCommandKind::SetArrangementPlacementDuration
-                | IdeWorkerCommandKind::TrimArrangementPlacementFront => {
-                    ui.set_app_mode(AppMode::TrimmingArrangementPlacement);
-                }
-                IdeWorkerCommandKind::RemoveArrangementPlacement => {
-                    ui.set_app_mode(AppMode::RemovingArrangementPlacement);
-                }
-                IdeWorkerCommandKind::AddArrangementPlacement => {
-                    ui.set_app_mode(AppMode::AddingArrangementPlacement);
-                    ui.set_add_arrangement_placement_visible(false);
-                }
-                IdeWorkerCommandKind::RenameAudioClip => {
-                    ui.set_app_mode(AppMode::RenamingClip);
-                }
-                IdeWorkerCommandKind::SetAudioClipActive => {
-                    ui.set_app_mode(AppMode::ChangingClipActivation);
-                }
-                IdeWorkerCommandKind::SetAudioClipGain => {
-                    ui.set_app_mode(AppMode::ChangingClipGain);
-                }
-                IdeWorkerCommandKind::CreateAudioClipFromTake => {
-                    ui.set_app_mode(AppMode::CreatingClip);
-                }
-                IdeWorkerCommandKind::StartRecording => {
-                    ui.set_app_mode(AppMode::PreparingRecording);
-                }
-                IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording => {
-                    ui.set_app_mode(AppMode::FinalizingRecording);
-                }
-                IdeWorkerCommandKind::StartAudioPreview => {
-                    ui.set_app_mode(AppMode::PreparingPreview);
-                }
-                _ => {}
+            ui.set_app_mode(mode_after_successful_submission(
+                ui.get_app_mode(),
+                command_kind,
+            ));
+            if command_kind == IdeWorkerCommandKind::AddArrangementPlacement {
+                ui.set_add_arrangement_placement_visible(false);
             }
             ui.set_error_text(SharedString::default());
             ui.set_status_text(command_status(command_kind).into());
@@ -1812,6 +1760,40 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
             ));
             ui.set_error_text(error.to_string().into());
         }
+    }
+}
+
+fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandKind) -> AppMode {
+    match command {
+        IdeWorkerCommandKind::StartOutputTest => AppMode::StartingOutputTest,
+        IdeWorkerCommandKind::StopOutputTest => AppMode::StoppingOutputTest,
+        IdeWorkerCommandKind::CreateProject => AppMode::Creating,
+        IdeWorkerCommandKind::SaveProject => AppMode::Saving,
+        IdeWorkerCommandKind::AddAudioTrack => AppMode::AddingTrack,
+        IdeWorkerCommandKind::RemoveAudioTrack => AppMode::RemovingTrack,
+        IdeWorkerCommandKind::RenameAudioTrack => AppMode::RenamingTrack,
+        IdeWorkerCommandKind::SetAudioTrackActive => AppMode::ChangingTrackActivation,
+        IdeWorkerCommandKind::SetArrangementPlacementActive => {
+            AppMode::ChangingArrangementActivation
+        }
+        IdeWorkerCommandKind::MoveArrangementPlacement => AppMode::MovingArrangementPlacement,
+        IdeWorkerCommandKind::SetArrangementPlacementDuration
+        | IdeWorkerCommandKind::TrimArrangementPlacementFront => {
+            AppMode::TrimmingArrangementPlacement
+        }
+        IdeWorkerCommandKind::RemoveArrangementPlacement => AppMode::RemovingArrangementPlacement,
+        IdeWorkerCommandKind::AddArrangementPlacement => AppMode::AddingArrangementPlacement,
+        IdeWorkerCommandKind::RenameAudioClip => AppMode::RenamingClip,
+        IdeWorkerCommandKind::DuplicateAudioClip => AppMode::DuplicatingClip,
+        IdeWorkerCommandKind::SetAudioClipActive => AppMode::ChangingClipActivation,
+        IdeWorkerCommandKind::SetAudioClipGain => AppMode::ChangingClipGain,
+        IdeWorkerCommandKind::CreateAudioClipFromTake => AppMode::CreatingClip,
+        IdeWorkerCommandKind::StartRecording => AppMode::PreparingRecording,
+        IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording => {
+            AppMode::FinalizingRecording
+        }
+        IdeWorkerCommandKind::StartAudioPreview => AppMode::PreparingPreview,
+        _ => current,
     }
 }
 
@@ -2012,6 +1994,7 @@ fn apply_event(
             apply_audio_clip_rename_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipDuplicated { .. }
+        | IdeWorkerEvent::AudioClipDuplicationCommittedWithWarning { .. }
         | IdeWorkerEvent::AudioClipDuplicating) => {
             apply_audio_clip_duplication_event(ui, &event);
         }
@@ -2396,10 +2379,7 @@ fn apply_audio_clip_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             clip_id,
             name,
         } => {
-            ui.set_clip_duplicate_visible(false);
-            ui.set_clip_duplicate_id(SharedString::default());
-            ui.set_clip_duplicate_source_name(SharedString::default());
-            ui.set_clip_duplicate_name(SharedString::default());
+            reset_audio_clip_duplication_form(ui);
             ui.set_status_text(
                 format!(
                     "Reusable audio clip {name} ({clip_id}) duplicated in project revision {revision}; no media or arrangement placement was created"
@@ -2407,6 +2387,19 @@ fn apply_audio_clip_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
                 .into(),
             );
             ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipDuplicationCommittedWithWarning { name, warning } => {
+            let clip_id = warning
+                .committed_clip_id()
+                .expect("committed duplication warning must retain its clip identity");
+            reset_audio_clip_duplication_form(ui);
+            ui.set_status_text(
+                format!(
+                    "Reusable audio clip {name} ({clip_id}) committed and reopened with incomplete transaction cleanup"
+                )
+                .into(),
+            );
+            ui.set_error_text(warning.to_string().into());
         }
         IdeWorkerEvent::AudioClipDuplicating => {
             ui.set_app_mode(AppMode::DuplicatingClip);
@@ -2417,6 +2410,13 @@ fn apply_audio_clip_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
         }
         _ => unreachable!("audio-clip duplication event dispatcher received another event"),
     }
+}
+
+fn reset_audio_clip_duplication_form(ui: &MainWindow) {
+    ui.set_clip_duplicate_visible(false);
+    ui.set_clip_duplicate_id(SharedString::default());
+    ui.set_clip_duplicate_source_name(SharedString::default());
+    ui.set_clip_duplicate_name(SharedString::default());
 }
 
 fn apply_audio_clip_activation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -3394,6 +3394,7 @@ fn reset_project(
     ui.set_clip_rename_id(SharedString::default());
     ui.set_clip_rename_original(SharedString::default());
     ui.set_clip_rename_name(SharedString::default());
+    reset_audio_clip_duplication_form(ui);
     ui.set_clip_gain_visible(false);
     ui.set_clip_gain_id(SharedString::default());
     ui.set_clip_gain_name(SharedString::default());
@@ -4669,6 +4670,21 @@ mod tests {
                 AppMode::DuplicatingClip,
                 IdeWorkerCommandKind::DuplicateAudioClip,
             ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn audio_clip_duplication_submission_enters_pending_mode_immediately() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::DuplicateAudioClip,
+            ),
+            AppMode::DuplicatingClip
+        );
+        assert_eq!(
+            mode_after_successful_submission(AppMode::Running, IdeWorkerCommandKind::Transport),
             AppMode::Running
         );
     }

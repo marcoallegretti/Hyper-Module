@@ -2137,6 +2137,23 @@ pub enum IdeAudioClipCreationPublicationError {
     },
 }
 
+impl IdeAudioClipCreationPublicationError {
+    #[must_use]
+    pub const fn clip_published(&self) -> bool {
+        match self {
+            Self::Mixer(_) => false,
+            Self::Clip { source, .. } => source.published(),
+        }
+    }
+
+    const fn committed_clip_publication(&self) -> Option<&ProjectResourcePublicationError> {
+        match self {
+            Self::Clip { source, .. } if source.published() => Some(source),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for IdeAudioClipCreationPublicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2304,7 +2321,10 @@ pub enum IdeAudioClipDuplicationError {
     Storage(StorageError),
     Serialization(AudioClipDuplicationSerializationError),
     CapacityUnavailable,
-    Publication(Box<IdeAudioClipCreationPublicationError>),
+    Publication {
+        clip_id: String,
+        source: Box<IdeAudioClipCreationPublicationError>,
+    },
     NativeClose(IdeNativeCloseFailure),
     NativeCloseAndReopen {
         close: IdeNativeCloseFailure,
@@ -2319,9 +2339,25 @@ pub enum IdeAudioClipDuplicationError {
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
+        clip_id: String,
         publication: Box<IdeAudioClipCreationPublicationError>,
         reopen: Box<IdeProjectOpenError>,
     },
+}
+
+impl IdeAudioClipDuplicationError {
+    #[must_use]
+    pub fn committed_clip_id(&self) -> Option<&str> {
+        match self {
+            Self::Publication { clip_id, source } if source.clip_published() => Some(clip_id),
+            Self::PublicationAndReopen {
+                clip_id,
+                publication,
+                ..
+            } if publication.clip_published() => Some(clip_id),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for IdeAudioClipDuplicationError {
@@ -2355,7 +2391,16 @@ impl fmt::Display for IdeAudioClipDuplicationError {
             Self::CapacityUnavailable => {
                 formatter.write_str("audio-clip duplication capacity is unavailable")
             }
-            Self::Publication(source) => source.fmt(formatter),
+            Self::Publication { clip_id, source } => {
+                if let Some(publication) = source.committed_clip_publication() {
+                    write!(
+                        formatter,
+                        "audio clip {clip_id} was duplicated, but project verification or transaction recovery is incomplete: {publication}"
+                    )
+                } else {
+                    source.fmt(formatter)
+                }
+            }
             Self::NativeClose(source) => write!(
                 formatter,
                 "native playback did not close cleanly before duplicating the audio clip: {source:?}"
@@ -2378,12 +2423,22 @@ impl fmt::Display for IdeAudioClipDuplicationError {
                 outcome.project_revision()
             ),
             Self::PublicationAndReopen {
+                clip_id,
                 publication,
                 reopen,
-            } => write!(
-                formatter,
-                "audio-clip duplication failed ({publication}) and the project could not be reopened ({reopen})"
-            ),
+            } => {
+                if let Some(source) = publication.committed_clip_publication() {
+                    write!(
+                        formatter,
+                        "audio clip {clip_id} was duplicated, but project verification or transaction recovery is incomplete ({source}) and the project could not be reopened ({reopen})"
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "audio-clip duplication for {clip_id} failed ({publication}) and the project could not be reopened ({reopen})"
+                    )
+                }
+            }
         }
     }
 }
@@ -2394,7 +2449,7 @@ impl Error for IdeAudioClipDuplicationError {
             Self::MixerSave(source) => Some(source.as_ref()),
             Self::Storage(source) => Some(source),
             Self::Serialization(source) => Some(source),
-            Self::Publication(source) => Some(source.as_ref()),
+            Self::Publication { source, .. } => Some(source.as_ref()),
             Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
             Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
