@@ -1214,6 +1214,7 @@ fn bind_arrangement_callback(
 
     bind_arrangement_move_callback(ui, worker, project_state);
     bind_arrangement_duplication_callback(ui, worker, project_state);
+    bind_arrangement_split_callback(ui, worker, project_state);
     bind_arrangement_duration_callback(ui, worker, project_state);
     bind_arrangement_front_trim_callback(ui, worker, project_state);
     bind_arrangement_removal_callback(ui, worker, project_state);
@@ -1273,6 +1274,77 @@ fn bind_arrangement_duplication_callback(
             IdeWorkerCommand::DuplicateArrangementPlacement {
                 placement_id: owned_placement_id,
                 start_tick,
+            },
+        );
+    });
+}
+
+fn bind_arrangement_split_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_split = Rc::clone(worker);
+    let project_state_for_split = Rc::clone(project_state);
+    actions.on_split_arrangement_placement(move |placement_id, split_tick| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text(
+                "Arrangement placement splitting is not available in the current state".into(),
+            );
+            return;
+        }
+        let split_tick = match parse_arrangement_start_tick(split_tick.as_str()) {
+            Ok(split_tick) => split_tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let state = project_state_for_split.arrangement.borrow();
+        let Some(binding) = state.as_ref() else {
+            ui.set_error_text("Arrangement placement authority is no longer available".into());
+            return;
+        };
+        let Some(placement) = binding
+            .owner
+            .placements()
+            .iter()
+            .find(|placement| placement.id() == placement_id.as_str())
+        else {
+            ui.set_error_text("The selected arrangement placement is no longer available".into());
+            return;
+        };
+        let Some(end_tick) = placement
+            .start_tick()
+            .checked_add(placement.duration_ticks())
+        else {
+            ui.set_error_text("The selected placement end is outside the exact tick domain".into());
+            return;
+        };
+        if split_tick <= placement.start_tick() || split_tick >= end_tick {
+            ui.set_error_text(
+                format!(
+                    "Split tick must be strictly inside the placement ({} through {})",
+                    placement.start_tick() + 1,
+                    end_tick - 1
+                )
+                .into(),
+            );
+            return;
+        }
+        let owned_placement_id = placement.id().to_owned();
+        drop(state);
+        submit_to_ui(
+            &ui,
+            &worker_for_split,
+            IdeWorkerCommand::SplitArrangementPlacement {
+                placement_id: owned_placement_id,
+                split_tick,
             },
         );
     });
@@ -1846,6 +1918,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::DuplicateArrangementPlacement => {
             AppMode::DuplicatingArrangementPlacement
         }
+        IdeWorkerCommandKind::SplitArrangementPlacement => AppMode::SplittingArrangementPlacement,
         IdeWorkerCommandKind::RenameAudioClip => AppMode::RenamingClip,
         IdeWorkerCommandKind::DuplicateAudioClip => AppMode::DuplicatingClip,
         IdeWorkerCommandKind::SetAudioClipActive => AppMode::ChangingClipActivation,
@@ -1915,6 +1988,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::DuplicateArrangementPlacement => {
             "Preserving mixer state, copying the exact arrangement placement, and reopening project…"
+        }
+        IdeWorkerCommandKind::SplitArrangementPlacement => {
+            "Preserving mixer state, splitting the arrangement placement, and reopening project…"
         }
         IdeWorkerCommandKind::RenameAudioClip => {
             "Preserving mixer state, renaming the audio clip, and reopening project…"
@@ -2059,6 +2135,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementPlacementDuplicated { .. }
         | IdeWorkerEvent::ArrangementPlacementDuplicating { .. }) => {
             apply_arrangement_placement_duplication_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ArrangementPlacementSplit { .. }
+        | IdeWorkerEvent::ArrangementPlacementSplitting { .. }) => {
+            apply_arrangement_placement_split_event(ui, &event);
         }
         event @ IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning { .. } => {
             apply_arrangement_placement_committed_warning(ui, &event);
@@ -2444,6 +2524,35 @@ fn apply_arrangement_placement_duplication_event(ui: &MainWindow, event: &IdeWor
     }
 }
 
+fn apply_arrangement_placement_split_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ArrangementPlacementSplit {
+            revision,
+            placement_id,
+            split_tick,
+        } => {
+            ui.set_status_text(
+                format!(
+                    "Arrangement placement split at tick {split_tick}; right half {placement_id} committed in project revision {revision}"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementPlacementSplitting { split_tick } => {
+            ui.set_app_mode(AppMode::SplittingArrangementPlacement);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before splitting the arrangement placement at tick {split_tick}…"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("arrangement split event dispatcher received another event"),
+    }
+}
+
 fn apply_arrangement_placement_committed_warning(ui: &MainWindow, event: &IdeWorkerEvent) {
     let IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning { command, warning } = event
     else {
@@ -2465,6 +2574,14 @@ fn apply_arrangement_placement_committed_warning(ui: &MainWindow, event: &IdeWor
                 .expect("committed placement duplication warning must retain its identity");
             format!(
                 "Copied arrangement placement {placement_id} committed and reopened with incomplete transaction cleanup"
+            )
+        }
+        IdeWorkerCommandKind::SplitArrangementPlacement => {
+            let placement_id = warning
+                .committed_created_placement_id()
+                .expect("committed placement split warning must retain its right-half identity");
+            format!(
+                "Split arrangement placement right half {placement_id} committed and reopened with incomplete transaction cleanup"
             )
         }
         IdeWorkerCommandKind::RemoveArrangementPlacement => {
@@ -3650,6 +3767,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         {
             AppMode::Running
         }
+        IdeWorkerCommandKind::SplitArrangementPlacement
+            if current == AppMode::SplittingArrangementPlacement =>
+        {
+            AppMode::Running
+        }
         IdeWorkerCommandKind::RenameAudioClip if current == AppMode::RenamingClip => {
             AppMode::Running
         }
@@ -4775,6 +4897,24 @@ mod tests {
             mode_after_failure(
                 AppMode::DuplicatingArrangementPlacement,
                 IdeWorkerCommandKind::DuplicateArrangementPlacement,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn arrangement_split_submission_and_failure_use_a_dedicated_mode() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::SplitArrangementPlacement,
+            ),
+            AppMode::SplittingArrangementPlacement
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::SplittingArrangementPlacement,
+                IdeWorkerCommandKind::SplitArrangementPlacement,
             ),
             AppMode::Running
         );

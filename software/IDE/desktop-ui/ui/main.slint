@@ -16,6 +16,7 @@ export enum AppMode {
     changing-track-activation,
     adding-arrangement-placement,
     duplicating-arrangement-placement,
+    splitting-arrangement-placement,
     changing-arrangement-activation,
     moving-arrangement-placement,
     trimming-arrangement-placement,
@@ -134,6 +135,7 @@ export global IdeActions {
     callback remove-arrangement-placement(string);
     callback add-arrangement-placement(string, string);
     callback duplicate-arrangement-placement(string, string);
+    callback split-arrangement-placement(string, string);
     callback rename-audio-clip(string, string);
     callback duplicate-audio-clip(string, string);
     callback set-audio-clip-active(string, bool);
@@ -1469,7 +1471,7 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                     VerticalLayout {
-                                        width: 190px;
+                                        width: 244px;
                                         spacing: 4px;
                                         HorizontalLayout {
                                             height: 44px;
@@ -1503,6 +1505,13 @@ export component MainWindow inherits Window {
                                                 accessible-label: "Trim the left edge of " + placement.clip-name + " on " + placement.track-name + " to entered start tick while preserving its right edge";
                                                 enabled: root.app-mode == AppMode.running && start-tick-input.text != placement.start-tick;
                                                 clicked => { IdeActions.trim-arrangement-placement-front(placement.id, start-tick-input.text); }
+                                            }
+                                            Button {
+                                                width: 50px;
+                                                text: "Split";
+                                                accessible-label: "Split " + placement.clip-name + " on " + placement.track-name + " at the entered project tick without ripple";
+                                                enabled: root.app-mode == AppMode.running && start-tick-input.text != placement.start-tick;
+                                                clicked => { IdeActions.split-arrangement-placement(placement.id, start-tick-input.text); }
                                             }
                                         }
                                         HorizontalLayout {
@@ -1572,7 +1581,7 @@ export component MainWindow inherits Window {
                         }
 
                         if !root.remove-arrangement-placement-visible : Text {
-                            text: "Exact non-ripple copies and moves, edge trims, activation, and confirmed removal persist. Copies reuse the same clip/source view. No drag, snap, or waveform editing.";
+                            text: "Exact non-ripple copies, splits, moves, edge trims, activation, and confirmed removal persist. Splits preserve contiguous source playback. No drag, snap, or waveform editing.";
                             color: #65758a;
                             font-size: 9px;
                         }
