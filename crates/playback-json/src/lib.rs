@@ -728,6 +728,12 @@ pub enum AudioClipFadeSerializationError {
     Document(AudioClipDocumentSerializationError),
 }
 
+#[derive(Debug)]
+pub enum AudioClipLoopSerializationError {
+    InvalidLoopRange,
+    Document(AudioClipDocumentSerializationError),
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AudioTrackRemovalBlockers {
     pub clip_references: usize,
@@ -1000,6 +1006,26 @@ impl Error for AudioClipFadeSerializationError {
         match self {
             Self::Document(source) => Some(source),
             Self::CombinedDurationExceedsClip => None,
+        }
+    }
+}
+
+impl fmt::Display for AudioClipLoopSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLoopRange => formatter.write_str(
+                "audio-clip loop range must be non-empty and contained by the clip duration",
+            ),
+            Self::Document(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioClipLoopSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Document(source) => Some(source),
+            Self::InvalidLoopRange => None,
         }
     }
 }
@@ -2944,6 +2970,48 @@ pub fn serialize_audio_clip_fades(
     .map_err(AudioClipFadeSerializationError::Document)
 }
 
+/// Replaces the reusable loop state and exact loop bounds in one validated
+/// canonical audio clip while preserving source, duration, fades, playback
+/// parameters, identity, and namespaced extensions.
+///
+/// Loop bounds use the clip's project-tick domain and remain valid even while
+/// looping is disabled: `start_tick < end_tick <= clip duration`. This edit is
+/// independent from transport looping and arrangement-placement duration.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the clip is absent, the supplied bytes
+/// disagree with the loaded project, the requested bounds are empty or exceed
+/// the reusable clip duration, or the resulting document fails version-1
+/// validation.
+pub fn serialize_audio_clip_loop(
+    project: &LoadedPlaybackProject,
+    source_clip: &[u8],
+    clip_id: &str,
+    enabled: bool,
+    start_tick: u64,
+    end_tick: u64,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AudioClipLoopSerializationError> {
+    let clip = project.clips.iter().find(|clip| clip.id == clip_id).ok_or(
+        AudioClipLoopSerializationError::Document(AudioClipDocumentSerializationError::ClipMissing),
+    )?;
+    if start_tick >= end_tick || end_tick > clip.duration_ticks {
+        return Err(AudioClipLoopSerializationError::InvalidLoopRange);
+    }
+    serialize_audio_clip_document_edit(project, source_clip, clip_id, limits, |document| {
+        let loop_spec = document
+            .get_mut("loop")
+            .and_then(Value::as_object_mut)
+            .ok_or(AudioClipDocumentSerializationError::InvalidDocumentShape)?;
+        loop_spec.insert("enabled".to_owned(), enabled.into());
+        loop_spec.insert("start_tick".to_owned(), start_tick.into());
+        loop_spec.insert("end_tick".to_owned(), end_tick.into());
+        Ok(())
+    })
+    .map_err(AudioClipLoopSerializationError::Document)
+}
+
 /// Replaces only the global activation state in one validated canonical audio
 /// clip while preserving source, timing, looping, fades, playback parameters,
 /// identity, and namespaced extensions.
@@ -3522,6 +3590,24 @@ impl LoadedPlaybackProject {
     #[must_use]
     pub fn clip_gain_decibels_at(&self, clip_index: usize) -> Option<f64> {
         self.clips.get(clip_index).map(|clip| clip.gain_decibels)
+    }
+
+    /// Returns whether the reusable clip loops within its persisted loop range.
+    #[must_use]
+    pub fn clip_loop_enabled_at(&self, clip_index: usize) -> Option<bool> {
+        self.clips.get(clip_index).map(|clip| clip.loop_enabled)
+    }
+
+    /// Returns the persisted reusable loop start in project ticks.
+    #[must_use]
+    pub fn clip_loop_start_tick_at(&self, clip_index: usize) -> Option<u64> {
+        self.clips.get(clip_index).map(|clip| clip.loop_range.start)
+    }
+
+    /// Returns the persisted reusable loop end in project ticks.
+    #[must_use]
+    pub fn clip_loop_end_tick_at(&self, clip_index: usize) -> Option<u64> {
+        self.clips.get(clip_index).map(|clip| clip.loop_range.end)
     }
 
     /// Returns the persisted linear-amplitude fade-in duration in project ticks.
@@ -8541,6 +8627,139 @@ mod tests {
                 LoaderLimits::VERSION_1,
             ),
             Err(AudioClipFadeSerializationError::Document(
+                AudioClipDocumentSerializationError::NonCanonicalSource
+            ))
+        ));
+    }
+
+    #[test]
+    fn audio_clip_loop_changes_only_the_selected_canonical_fields() {
+        let mut source: Value = serde_json::from_slice(CLIP).unwrap();
+        source["extensions"]["org.example.clip"] = json!({"opaque": [1, 2, 3]});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [&source];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334460";
+
+        let edited = serialize_audio_clip_loop(
+            &loaded,
+            &source,
+            clip_id,
+            false,
+            1,
+            3,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut expected: Value = serde_json::from_slice(&source).unwrap();
+        expected["loop"]["enabled"] = false.into();
+        expected["loop"]["start_tick"] = 1.into();
+        expected["loop"]["end_tick"] = 3.into();
+
+        assert_eq!(edited, serde_json_canonicalizer::to_vec(&expected).unwrap());
+        assert_eq!(
+            expected["extensions"]["org.example.clip"],
+            json!({"opaque": [1, 2, 3]})
+        );
+        let edited_clips: [&[u8]; 1] = [&edited];
+        let reopened = load(
+            input(TIMELINE, &tracks, &edited_clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.clip_loop_enabled_at(0), Some(false));
+        assert_eq!(reopened.clip_loop_start_tick_at(0), Some(1));
+        assert_eq!(reopened.clip_loop_end_tick_at(0), Some(3));
+        assert_eq!(
+            serialize_audio_clip_loop(
+                &loaded,
+                &source,
+                clip_id,
+                false,
+                0,
+                4,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn audio_clip_loop_rejects_invalid_missing_stale_and_noncanonical_inputs() {
+        let source: Value = serde_json::from_slice(CLIP).unwrap();
+        let canonical = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [&canonical];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334460";
+
+        for (start_tick, end_tick) in [(0, 0), (3, 3), (3, 2), (0, 5)] {
+            assert!(matches!(
+                serialize_audio_clip_loop(
+                    &loaded,
+                    &canonical,
+                    clip_id,
+                    true,
+                    start_tick,
+                    end_tick,
+                    LoaderLimits::VERSION_1,
+                ),
+                Err(AudioClipLoopSerializationError::InvalidLoopRange)
+            ));
+        }
+        assert!(matches!(
+            serialize_audio_clip_loop(
+                &loaded,
+                &canonical,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                true,
+                0,
+                4,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipLoopSerializationError::Document(
+                AudioClipDocumentSerializationError::ClipMissing
+            ))
+        ));
+        let mut stale = source.clone();
+        stale["enabled"] = false.into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_audio_clip_loop(
+                &loaded,
+                &stale,
+                clip_id,
+                true,
+                0,
+                4,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipLoopSerializationError::Document(
+                AudioClipDocumentSerializationError::SourceClipMismatch
+            ))
+        ));
+        let noncanonical = serde_json::to_vec_pretty(&source).unwrap();
+        assert!(matches!(
+            serialize_audio_clip_loop(
+                &loaded,
+                &noncanonical,
+                clip_id,
+                true,
+                0,
+                4,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipLoopSerializationError::Document(
                 AudioClipDocumentSerializationError::NonCanonicalSource
             ))
         ));
