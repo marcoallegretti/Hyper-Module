@@ -685,6 +685,17 @@ pub enum SceneAdditionSerializationError {
     ProjectCompilation(AdapterCompileError),
 }
 
+#[derive(Debug)]
+pub enum SceneDuplicationSerializationError {
+    SceneCapacity,
+    InvalidSceneIdentity,
+    InvalidSceneName,
+    Document(SceneDocumentSerializationError),
+    InvalidDocumentShape,
+    Serialization(serde_json::Error),
+    ProjectCompilation(AdapterCompileError),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SceneSlotEdit<'a> {
     Continue,
@@ -968,6 +979,40 @@ impl Error for SceneAdditionSerializationError {
             Self::Serialization(source) => Some(source),
             Self::ProjectCompilation(source) => Some(source),
             Self::SceneCapacity | Self::InvalidSceneIdentity | Self::InvalidSceneName => None,
+        }
+    }
+}
+
+impl fmt::Display for SceneDuplicationSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SceneCapacity => formatter.write_str("the scene capacity is exhausted"),
+            Self::InvalidSceneIdentity => {
+                formatter.write_str("the duplicated scene identity is invalid or collides")
+            }
+            Self::InvalidSceneName => {
+                formatter.write_str("the duplicated scene name is outside the version-1 domain")
+            }
+            Self::Document(source) => source.fmt(formatter),
+            Self::InvalidDocumentShape => {
+                formatter.write_str("the scene document is not an object")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::ProjectCompilation(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for SceneDuplicationSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Document(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
+            Self::SceneCapacity
+            | Self::InvalidSceneIdentity
+            | Self::InvalidSceneName
+            | Self::InvalidDocumentShape => None,
         }
     }
 }
@@ -2368,14 +2413,8 @@ pub fn serialize_scene_addition(
     launch_quantization: LaunchQuantization,
     limits: LoaderLimits,
 ) -> Result<Vec<u8>, SceneAdditionSerializationError> {
-    let next_order = project
-        .scenes
-        .iter()
-        .map(|scene| scene.order)
-        .max()
-        .map_or(Some(0), |order| order.checked_add(1))
-        .filter(|order| *order <= 7)
-        .ok_or(SceneAdditionSerializationError::SceneCapacity)?;
+    let next_order =
+        next_scene_order(project).ok_or(SceneAdditionSerializationError::SceneCapacity)?;
     if project.scenes.len() >= limits.max_scene_documents {
         return Err(SceneAdditionSerializationError::SceneCapacity);
     }
@@ -2430,6 +2469,104 @@ pub fn serialize_scene_addition(
         .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
         .map_err(SceneAdditionSerializationError::ProjectCompilation)?;
     Ok(output)
+}
+
+/// Creates an independent scene document from one canonical loaded scene.
+///
+/// The duplicate receives a new stable identity, caller-supplied name, and the
+/// next scene order. Activation, launch quantization, sparse track actions, and
+/// namespaced extensions are retained exactly. Arrangement launch history is
+/// unchanged because it continues to reference the source scene identity.
+///
+/// # Errors
+///
+/// Returns a classified rejection for stale or noncanonical source bytes,
+/// exhausted scene capacity, invalid new identity or name, or a complete
+/// candidate project that cannot compile.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the duplication boundary explicitly binds source authority, new identity, assets, and loader limits"
+)]
+pub fn serialize_scene_duplication(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_scene: &[u8],
+    source_scene_id: &str,
+    duplicated_scene_id: &str,
+    duplicated_scene_name: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, SceneDuplicationSerializationError> {
+    if project.scenes.len() >= limits.max_scene_documents {
+        return Err(SceneDuplicationSerializationError::SceneCapacity);
+    }
+    let next_order =
+        next_scene_order(project).ok_or(SceneDuplicationSerializationError::SceneCapacity)?;
+    if !is_valid_entity_id(duplicated_scene_id)
+        || duplicated_scene_id == project.project_id
+        || project_contains_identity(project, duplicated_scene_id)
+        || assets.iter().any(|asset| asset.id == duplicated_scene_id)
+    {
+        return Err(SceneDuplicationSerializationError::InvalidSceneIdentity);
+    }
+    let name_length = duplicated_scene_name.chars().count();
+    if duplicated_scene_name.trim() != duplicated_scene_name
+        || !(1..=MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length)
+    {
+        return Err(SceneDuplicationSerializationError::InvalidSceneName);
+    }
+
+    let canonical_source =
+        serialize_scene_document_edit(project, source_scene, source_scene_id, limits, |_| Ok(()))
+            .map_err(SceneDuplicationSerializationError::Document)?;
+    let mut value: Value = serde_json::from_slice(&canonical_source)
+        .map_err(SceneDuplicationSerializationError::Serialization)?;
+    let document = value
+        .as_object_mut()
+        .ok_or(SceneDuplicationSerializationError::InvalidDocumentShape)?;
+    document.insert("id".to_owned(), duplicated_scene_id.into());
+    document.insert("name".to_owned(), duplicated_scene_name.into());
+    document.insert("order".to_owned(), next_order.into());
+    let output = serde_json_canonicalizer::to_vec(&value)
+        .map_err(SceneDuplicationSerializationError::Serialization)?;
+
+    let duplicated = load_scene(
+        &output,
+        project.scenes.len(),
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_scene_slots,
+    )
+    .map_err(|source| {
+        SceneDuplicationSerializationError::Document(SceneDocumentSerializationError::Source(
+            source,
+        ))
+    })?;
+    let mut duplicated_project = project.clone();
+    duplicated_project.scenes.try_reserve(1).map_err(|_| {
+        SceneDuplicationSerializationError::Document(SceneDocumentSerializationError::Source(
+            capacity_error(),
+        ))
+    })?;
+    duplicated_project.scenes.push(duplicated);
+    validate_loaded_identities(&duplicated_project).map_err(|source| {
+        SceneDuplicationSerializationError::Document(SceneDocumentSerializationError::Source(
+            source,
+        ))
+    })?;
+    duplicated_project
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(SceneDuplicationSerializationError::ProjectCompilation)?;
+    Ok(output)
+}
+
+fn next_scene_order(project: &LoadedPlaybackProject) -> Option<u8> {
+    project
+        .scenes
+        .iter()
+        .map(|scene| scene.order)
+        .max()
+        .map_or(Some(0), |order| order.checked_add(1))
+        .filter(|order| usize::from(*order) < SceneLimits::VERSION_1.max_scenes)
 }
 
 /// Replaces one scene's action for a structural track with explicit play,
@@ -8027,6 +8164,129 @@ mod tests {
                 LoaderLimits::VERSION_1,
             ),
             Err(SceneAdditionSerializationError::Source(_))
+        ));
+    }
+
+    #[test]
+    fn scene_duplication_preserves_scene_content_with_new_identity_name_and_order() {
+        let mut source: Value = serde_json::from_slice(SCENE).unwrap();
+        source["enabled"] = false.into();
+        source["launch_quantization"] = json!({"mode": "grid", "quantum_ticks": 3_840});
+        source["extensions"]["org.example.scene"] = json!({"opaque": [1, 2, 3]});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [&source];
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let duplicated_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let duplicated = serialize_scene_duplication(
+            &loaded,
+            &asset_facts(),
+            &source,
+            loaded.scene_id(0).unwrap(),
+            duplicated_id,
+            "Verse Copy",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let source_value: Value = serde_json::from_slice(&source).unwrap();
+        let duplicated_value: Value = serde_json::from_slice(&duplicated).unwrap();
+        assert_eq!(duplicated_value["id"], duplicated_id);
+        assert_eq!(duplicated_value["name"], "Verse Copy");
+        assert_eq!(duplicated_value["order"], 1);
+        for field in ["enabled", "launch_quantization", "slots", "extensions"] {
+            assert_eq!(duplicated_value[field], source_value[field]);
+        }
+
+        let reopened_scenes: [&[u8]; 2] = [&source, &duplicated];
+        let reopened = load(
+            input_with_scenes(
+                TIMELINE,
+                &tracks,
+                &clips,
+                &reopened_scenes,
+                Some(ARRANGEMENT),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.scene_count(), 2);
+        assert_eq!(reopened.scene_id(1), Some(duplicated_id));
+        assert_eq!(reopened.scene_enabled(1), Some(false));
+    }
+
+    #[test]
+    fn scene_duplication_rejects_stale_noncanonical_capacity_identity_and_name() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let source_id = loaded.scene_id(0).unwrap();
+        let duplicated_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let duplicate = |source: &[u8], id: &str, name: &str, limits| {
+            serialize_scene_duplication(
+                &loaded,
+                &asset_facts(),
+                source,
+                source_id,
+                id,
+                name,
+                limits,
+            )
+        };
+        assert!(matches!(
+            duplicate(
+                SCENE,
+                duplicated_id,
+                "Copy",
+                LoaderLimits {
+                    max_scene_documents: 1,
+                    ..LoaderLimits::VERSION_1
+                }
+            ),
+            Err(SceneDuplicationSerializationError::SceneCapacity)
+        ));
+        for invalid_id in [PROJECT_ID, source_id, asset_facts()[0].id] {
+            assert!(matches!(
+                duplicate(SCENE, invalid_id, "Copy", LoaderLimits::VERSION_1),
+                Err(SceneDuplicationSerializationError::InvalidSceneIdentity)
+            ));
+        }
+        for invalid_name in [String::new(), " padded ".to_owned(), "x".repeat(121)] {
+            assert!(matches!(
+                duplicate(SCENE, duplicated_id, &invalid_name, LoaderLimits::VERSION_1),
+                Err(SceneDuplicationSerializationError::InvalidSceneName)
+            ));
+        }
+        let mut stale: Value = serde_json::from_slice(SCENE).unwrap();
+        stale["name"] = "Stale".into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            duplicate(&stale, duplicated_id, "Copy", LoaderLimits::VERSION_1),
+            Err(SceneDuplicationSerializationError::Document(
+                SceneDocumentSerializationError::SourceSceneMismatch
+            ))
+        ));
+        let noncanonical =
+            serde_json::to_vec_pretty(&serde_json::from_slice::<Value>(SCENE).unwrap()).unwrap();
+        assert!(matches!(
+            duplicate(
+                &noncanonical,
+                duplicated_id,
+                "Copy",
+                LoaderLimits::VERSION_1
+            ),
+            Err(SceneDuplicationSerializationError::Document(
+                SceneDocumentSerializationError::NonCanonicalSource
+            ))
         ));
     }
 
