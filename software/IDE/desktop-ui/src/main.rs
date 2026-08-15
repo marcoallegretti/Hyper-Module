@@ -797,26 +797,7 @@ fn bind_playback_callbacks(
     bind_arrangement_callback(ui, worker, project_state);
     bind_audio_clip_callback(ui, worker, project_state);
     bind_loudness_callbacks(ui, worker);
-
-    let weak = ui.as_weak();
-    let worker_for_scene = Rc::clone(worker);
-    actions.on_launch_scene(move |index| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let scene_index = match validate_scene_launch(ui.get_app_mode(), index, &ui.get_scenes()) {
-            Ok(scene_index) => scene_index,
-            Err(reason) => {
-                ui.set_error_text(reason.message().into());
-                return;
-            }
-        };
-        submit_to_ui(
-            &ui,
-            &worker_for_scene,
-            IdeWorkerCommand::Transport(TransportCommand::LaunchScene { scene_index }),
-        );
-    });
+    bind_scene_callbacks(ui, worker);
 
     let weak = ui.as_weak();
     let worker_for_save = Rc::clone(worker);
@@ -840,6 +821,64 @@ fn bind_playback_callbacks(
     });
 
     bind_mixer_callbacks(ui, worker);
+}
+
+fn bind_scene_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_scene = Rc::clone(worker);
+    actions.on_launch_scene(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let scene_index = match validate_scene_launch(ui.get_app_mode(), index, &ui.get_scenes()) {
+            Ok(scene_index) => scene_index,
+            Err(reason) => {
+                ui.set_error_text(reason.message().into());
+                return;
+            }
+        };
+        submit_to_ui(
+            &ui,
+            &worker_for_scene,
+            IdeWorkerCommand::Transport(TransportCommand::LaunchScene { scene_index }),
+        );
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_scene_rename = Rc::clone(worker);
+    actions.on_rename_scene(move |scene_id, name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_scene_rename_visible()
+            || ui.get_scene_rename_id() != scene_id
+        {
+            ui.set_error_text("Scene rename selection is no longer current".into());
+            return;
+        }
+        let scenes = ui.get_scenes();
+        let Some(scene) = scenes.iter().find(|scene| scene.id == scene_id) else {
+            ui.set_error_text("The selected scene is no longer available".into());
+            return;
+        };
+        let command =
+            match scene_rename_command(scene.id.as_str(), scene.name.as_str(), name.as_str()) {
+                Ok(Some(command)) => command,
+                Ok(None) => {
+                    reset_scene_rename_form(&ui);
+                    ui.set_status_text("Scene name already matches the committed value".into());
+                    ui.set_error_text(SharedString::default());
+                    return;
+                }
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
+            };
+        submit_to_ui(&ui, &worker_for_scene_rename, command);
+    });
 }
 
 fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
@@ -2202,6 +2241,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::SetAudioClipLoop => AppMode::ChangingClipLoop,
         IdeWorkerCommandKind::SetAudioClipReverse => AppMode::ChangingClipReverse,
         IdeWorkerCommandKind::SetAudioClipSourceStart => AppMode::ChangingClipSource,
+        IdeWorkerCommandKind::RenameScene => AppMode::RenamingScene,
         IdeWorkerCommandKind::CreateAudioClipFromTake => AppMode::CreatingClip,
         IdeWorkerCommandKind::StartRecording => AppMode::PreparingRecording,
         IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording => {
@@ -2295,6 +2335,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SetAudioClipSourceStart => {
             "Preserving mixer state, slipping the reusable audio-clip source, and reopening project..."
         }
+        IdeWorkerCommandKind::RenameScene => "Renaming the scene and reopening project…",
         IdeWorkerCommandKind::CreateAudioClipFromTake => {
             "Preserving mixer state, creating the reusable audio clip, and reopening project…"
         }
@@ -2469,6 +2510,9 @@ fn apply_event(
         | IdeWorkerEvent::AudioClipSourceStartChanging { .. }) => {
             apply_audio_clip_source_slip_event(ui, &event);
         }
+        event @ (IdeWorkerEvent::SceneRenamed { .. }
+        | IdeWorkerEvent::SceneRenameCommittedWithWarning { .. }
+        | IdeWorkerEvent::SceneRenaming) => apply_scene_rename_event(ui, &event),
         event @ (IdeWorkerEvent::AudioClipCreatedFromTake { .. }
         | IdeWorkerEvent::AudioClipCreatingFromTake) => {
             apply_recording_clip_creation_event(ui, &event);
@@ -2946,6 +2990,48 @@ fn reset_audio_clip_rename_form(ui: &MainWindow) {
     ui.set_clip_rename_id(SharedString::default());
     ui.set_clip_rename_original(SharedString::default());
     ui.set_clip_rename_name(SharedString::default());
+}
+
+fn apply_scene_rename_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::SceneRenamed {
+            revision,
+            changed,
+            name,
+        } => {
+            reset_scene_rename_form(ui);
+            ui.set_status_text(
+                if *changed {
+                    format!("Scene renamed to {name} in project revision {revision}")
+                } else {
+                    format!("Scene was already named {name} in project revision {revision}")
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::SceneRenameCommittedWithWarning { name, warning } => {
+            reset_scene_rename_form(ui);
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), &format!("Scene rename to {name}"))
+                    .into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        IdeWorkerEvent::SceneRenaming => {
+            ui.set_app_mode(AppMode::RenamingScene);
+            ui.set_status_text("Waiting for native output before renaming the scene…".into());
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("scene rename event dispatcher received another event"),
+    }
+}
+
+fn reset_scene_rename_form(ui: &MainWindow) {
+    ui.set_scene_rename_visible(false);
+    ui.set_scene_rename_id(SharedString::default());
+    ui.set_scene_rename_original(SharedString::default());
+    ui.set_scene_rename_name(SharedString::default());
 }
 
 fn apply_audio_clip_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -4218,6 +4304,7 @@ fn reset_project(
     ui.set_rename_track_original_name(SharedString::default());
     ui.set_rename_track_name(SharedString::default());
     ui.set_scenes(ModelRc::default());
+    reset_scene_rename_form(ui);
     ui.set_mixer_visible(false);
     ui.set_mixer_sends_visible(false);
     ui.set_mixer_channels(ModelRc::default());
@@ -4391,6 +4478,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::SetAudioClipSourceStart if current == AppMode::ChangingClipSource => {
             AppMode::Running
         }
+        IdeWorkerCommandKind::RenameScene if current == AppMode::RenamingScene => AppMode::Running,
         IdeWorkerCommandKind::CreateAudioClipFromTake if current == AppMode::CreatingClip => {
             AppMode::Running
         }
@@ -4423,6 +4511,7 @@ fn scene_rows(scenes: &[IdeScene]) -> Vec<SceneRow> {
             let (availability, launchable) = scene_availability_presentation(scene.availability());
             SceneRow {
                 index: i32::try_from(index).unwrap_or(-1),
+                id: scene.id().into(),
                 name: scene.name().into(),
                 display_name: scene_display_name(scene.name()).into(),
                 availability: availability.into(),
@@ -4442,6 +4531,24 @@ fn scene_display_name(name: &str) -> String {
         .collect::<String>();
     display.push('…');
     display
+}
+
+fn scene_rename_command(
+    scene_id: &str,
+    current_name: &str,
+    proposed_name: &str,
+) -> Result<Option<IdeWorkerCommand>, &'static str> {
+    let name = proposed_name.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err("Scene name must contain 1 to 120 characters");
+    }
+    if name == current_name {
+        return Ok(None);
+    }
+    Ok(Some(IdeWorkerCommand::RenameScene {
+        scene_id: scene_id.to_owned(),
+        name: name.to_owned(),
+    }))
 }
 
 const fn scene_availability_presentation(
@@ -4628,6 +4735,7 @@ fn set_scenes(ui: &MainWindow, scenes: &[IdeScene]) {
                 let (availability, launchable) =
                     scene_availability_presentation(expected.availability());
                 actual.index == i32::try_from(index).unwrap_or(-1)
+                    && actual.id.as_str() == expected.id()
                     && actual.name.as_str() == expected.name()
                     && actual.availability.as_str() == availability
                     && actual.launchable == launchable
@@ -5115,6 +5223,7 @@ mod tests {
         let scenes = ModelRc::from(Rc::new(VecModel::from(vec![
             SceneRow {
                 index: 0,
+                id: "scene-a".into(),
                 name: "Verse".into(),
                 display_name: "Verse".into(),
                 availability: "Ready".into(),
@@ -5122,6 +5231,7 @@ mod tests {
             },
             SceneRow {
                 index: 1,
+                id: "scene-b".into(),
                 name: "Break".into(),
                 display_name: "Break".into(),
                 availability: "Disabled".into(),
@@ -5145,6 +5255,30 @@ mod tests {
         assert_eq!(
             validate_scene_launch(AppMode::Running, -1, &scenes),
             Err(SceneLaunchFailure::InvalidSelection)
+        );
+    }
+
+    #[test]
+    fn scene_rename_command_normalizes_name_and_preserves_identity() {
+        assert!(matches!(
+            scene_rename_command("scene-a", "Intro", " Verse A "),
+            Ok(Some(IdeWorkerCommand::RenameScene { scene_id, name }))
+                if scene_id == "scene-a" && name == "Verse A"
+        ));
+        assert!(matches!(
+            scene_rename_command("scene-a", "Intro", " Intro "),
+            Ok(None)
+        ));
+        assert!(scene_rename_command("scene-a", "Intro", "   ").is_err());
+        assert!(scene_rename_command("scene-a", "Intro", &"é".repeat(121)).is_err());
+        assert!(scene_rename_command("scene-a", "Intro", &"é".repeat(120)).is_ok());
+        assert_eq!(
+            mode_after_successful_submission(AppMode::Running, IdeWorkerCommandKind::RenameScene),
+            AppMode::RenamingScene
+        );
+        assert_eq!(
+            mode_after_failure(AppMode::RenamingScene, IdeWorkerCommandKind::RenameScene),
+            AppMode::Running
         );
     }
 
@@ -5880,6 +6014,28 @@ mod tests {
         assert!(ui.get_clip_source_slip_start().is_empty());
         assert!(ui.get_status_text().contains("committed and reopened"));
         assert!(!ui.get_error_text().is_empty());
+
+        assert_scene_rename_success_resets_form(&ui);
+    }
+
+    fn assert_scene_rename_success_resets_form(ui: &MainWindow) {
+        ui.set_scene_rename_visible(true);
+        ui.set_scene_rename_id("scene-a".into());
+        ui.set_scene_rename_original("Intro".into());
+        ui.set_scene_rename_name("Verse A".into());
+        apply_scene_rename_event(
+            ui,
+            &IdeWorkerEvent::SceneRenamed {
+                revision: 4,
+                changed: true,
+                name: "Verse A".to_owned(),
+            },
+        );
+        assert!(!ui.get_scene_rename_visible());
+        assert!(ui.get_scene_rename_id().is_empty());
+        assert!(ui.get_scene_rename_name().is_empty());
+        assert!(ui.get_status_text().contains("project revision 4"));
+        assert!(ui.get_error_text().is_empty());
     }
 
     #[test]

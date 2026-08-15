@@ -29,6 +29,7 @@ export enum AppMode {
     changing-clip-loop,
     changing-clip-reverse,
     changing-clip-source,
+    renaming-scene,
     creating-clip,
     preparing-preview,
     previewing,
@@ -42,6 +43,7 @@ export enum AppMode {
 
 export struct SceneRow {
     index: int,
+    id: string,
     name: string,
     display-name: string,
     availability: string,
@@ -163,6 +165,7 @@ export global IdeActions {
     callback loudness-standby();
     callback loudness-reset();
     callback launch-scene(int);
+    callback rename-scene(string, string);
     callback mixer-channel-gain(int, float);
     callback mixer-channel-pan(int, float);
     callback mixer-channel-mute(int);
@@ -282,6 +285,10 @@ export component MainWindow inherits Window {
     in property <string> scene-count: "—";
     in property <int> track-count: 0;
     in property <[SceneRow]> scenes: [];
+    in-out property <bool> scene-rename-visible: false;
+    in-out property <string> scene-rename-id: "";
+    in-out property <string> scene-rename-original: "";
+    in-out property <string> scene-rename-name: "";
     in-out property <bool> mixer-visible: false;
     in-out property <bool> new-track-visible: false;
     in-out property <string> new-track-name: "Audio 2";
@@ -768,7 +775,7 @@ export component MainWindow inherits Window {
                 vertical-stretch: 1;
                 background: transparent;
 
-                if !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-rename-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -877,13 +884,28 @@ export component MainWindow inherits Window {
                                 min-width: 170px;
                                 max-width: 170px;
                                 spacing: 2px;
-                                Button {
-                                    min-width: 0px;
-                                    max-width: 170px;
-                                    text: scene.display-name;
-                                    accessible-label: scene.name + ", " + scene.availability;
-                                    enabled: root.app-mode == AppMode.running && scene.launchable;
-                                    clicked => { IdeActions.launch-scene(scene.index); }
+                                HorizontalLayout {
+                                    spacing: 4px;
+                                    Button {
+                                        min-width: 0px;
+                                        horizontal-stretch: 1;
+                                        text: scene.display-name;
+                                        accessible-label: scene.name + ", " + scene.availability;
+                                        enabled: root.app-mode == AppMode.running && scene.launchable;
+                                        clicked => { IdeActions.launch-scene(scene.index); }
+                                    }
+                                    Button {
+                                        width: 34px;
+                                        text: "Edit";
+                                        accessible-label: "Rename scene " + scene.name;
+                                        enabled: root.app-mode == AppMode.running && scene.id != "";
+                                        clicked => {
+                                            root.scene-rename-id = scene.id;
+                                            root.scene-rename-original = scene.name;
+                                            root.scene-rename-name = scene.name;
+                                            root.scene-rename-visible = true;
+                                        }
+                                    }
                                 }
                                 Text {
                                     text: scene.availability;
@@ -935,6 +957,43 @@ export component MainWindow inherits Window {
                             VerticalLayout { padding: 10px; Text { text: "UNDERFLOWS"; color: #65758a; font-size: 9px; } Text { text: root.monitoring-underflow-count; color: root.monitoring-underflow-count == "0" ? #dce5ef : #ff9d76; font-size: 15px; } }
                         }
                     }
+                    }
+                }
+
+                if root.scene-rename-visible && !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 16px;
+                        Text { text: "RENAME SCENE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.scene-rename-original; color: #edf2f8; font-size: 24px; font-weight: 600; overflow: elide; }
+                        Text {
+                            text: "Change the scene label without changing its launch order, quantization, slots, activation, or recorded arrangement launches.";
+                            color: #aebccc;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        GridLayout {
+                            spacing: 8px;
+                            Text { text: "Scene name"; color: #8fa0b4; vertical-alignment: center; }
+                            LineEdit { text <=> root.scene-rename-name; placeholder-text: "Verse"; accessible-label: "Scene name"; }
+                        }
+                        Text { text: "1 to 120 characters. Leading and trailing whitespace is removed."; color: #65758a; font-size: 9px; }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Cancel"; clicked => { root.scene-rename-visible = false; } }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: "Rename scene";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.scene-rename-id != ""
+                                    && root.scene-rename-name != ""
+                                    && root.scene-rename-name != root.scene-rename-original;
+                                clicked => { IdeActions.rename-scene(root.scene-rename-id, root.scene-rename-name); }
+                            }
+                        }
                     }
                 }
 
