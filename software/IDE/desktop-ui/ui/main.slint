@@ -30,6 +30,7 @@ export enum AppMode {
     changing-clip-reverse,
     changing-clip-source,
     renaming-scene,
+    duplicating-scene,
     changing-scene-activation,
     creating-clip,
     preparing-preview,
@@ -180,6 +181,7 @@ export global IdeActions {
     callback select-scene-slot(int);
     callback set-scene-slot(string, string, int, int);
     callback rename-scene(string, string);
+    callback duplicate-scene(string, string);
     callback set-scene-active(string, bool);
     callback mixer-channel-gain(int, float);
     callback mixer-channel-pan(int, float);
@@ -309,6 +311,10 @@ export component MainWindow inherits Window {
     in-out property <string> scene-rename-id: "";
     in-out property <string> scene-rename-original: "";
     in-out property <string> scene-rename-name: "";
+    in-out property <bool> scene-duplicate-visible: false;
+    in-out property <string> scene-duplicate-id: "";
+    in-out property <string> scene-duplicate-source-name: "";
+    in-out property <string> scene-duplicate-name: "";
     in-out property <bool> scene-slots-visible: false;
     in-out property <string> scene-slots-scene-id: "";
     in-out property <string> scene-slots-scene-name: "";
@@ -805,7 +811,7 @@ export component MainWindow inherits Window {
                 vertical-stretch: 1;
                 background: transparent;
 
-                if !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-create-visible && !root.scene-rename-visible && !root.scene-slots-visible : Panel {
+                if !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-create-visible && !root.scene-rename-visible && !root.scene-duplicate-visible && !root.scene-slots-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1001,7 +1007,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.scene-create-visible && !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-rename-visible && !root.scene-slots-visible : Panel {
+                if root.scene-create-visible && !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-rename-visible && !root.scene-duplicate-visible && !root.scene-slots-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1059,7 +1065,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.scene-slots-visible && !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-create-visible && !root.scene-rename-visible : Panel {
+                if root.scene-slots-visible && !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-create-visible && !root.scene-rename-visible && !root.scene-duplicate-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1155,12 +1161,26 @@ export component MainWindow inherits Window {
                                     root.scene-rename-visible = true;
                                 }
                             }
+                            Button {
+                                text: "Duplicate scene";
+                                accessible-label: "Duplicate " + root.scene-slots-scene-name + " as an independent scene";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.scene-slots-scene-id != ""
+                                    && root.scenes.length < root.max-scene-count;
+                                clicked => {
+                                    root.scene-duplicate-id = root.scene-slots-scene-id;
+                                    root.scene-duplicate-source-name = root.scene-slots-scene-name;
+                                    root.scene-duplicate-name = "";
+                                    root.scene-slots-visible = false;
+                                    root.scene-duplicate-visible = true;
+                                }
+                            }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                         }
                     }
                 }
 
-                if root.scene-rename-visible && !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.scene-rename-visible && !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-duplicate-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1192,6 +1212,48 @@ export component MainWindow inherits Window {
                                     && root.scene-rename-name != ""
                                     && root.scene-rename-name != root.scene-rename-original;
                                 clicked => { IdeActions.rename-scene(root.scene-rename-id, root.scene-rename-name); }
+                            }
+                        }
+                    }
+                }
+
+                if root.scene-duplicate-visible && !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-create-visible && !root.scene-rename-visible && !root.scene-slots-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 16px;
+                        Text { text: "DUPLICATE SCENE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.scene-duplicate-source-name; color: #edf2f8; font-size: 24px; font-weight: 600; overflow: elide; }
+                        Text {
+                            text: "Enter a name from 1 to 120 characters for the new scene. Leading and trailing whitespace is removed before validation.";
+                            color: #aebccc;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        LineEdit {
+                            text <=> root.scene-duplicate-name;
+                            placeholder-text: "New scene name";
+                            accessible-label: "Duplicated scene name";
+                        }
+                        Text {
+                            text: "The duplicate receives a new identity and is appended after existing scenes. It independently preserves activation, launch timing, and track actions. Existing arrangement launch history remains unchanged.";
+                            color: #65758a;
+                            font-size: 9px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Cancel"; clicked => { root.scene-duplicate-visible = false; } }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: root.app-mode == AppMode.duplicating-scene ? "Duplicating scene..." : "Duplicate scene";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.scene-duplicate-id != ""
+                                    && root.scene-duplicate-name != ""
+                                    && root.scenes.length < root.max-scene-count;
+                                clicked => { IdeActions.duplicate-scene(root.scene-duplicate-id, root.scene-duplicate-name); }
                             }
                         }
                     }

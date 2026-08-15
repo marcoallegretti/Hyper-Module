@@ -27,7 +27,7 @@ use hyper_desktop_ide::{
 use hyper_desktop_ide::{
     IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError, IdeAudioClipLoopEditError,
     IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError, IdeSceneCreationError,
-    IdeSceneRenameError, IdeSceneSlotEditError,
+    IdeSceneDuplicationError, IdeSceneRenameError, IdeSceneSlotEditError,
 };
 use slint::platform::PlatformError;
 use slint::{
@@ -950,30 +950,8 @@ fn bind_scene_slot_callbacks(
     });
 }
 
-fn bind_scene_callbacks(ui: &MainWindow, worker: &WorkerCell, project_state: &ProjectUiStateCell) {
-    bind_scene_creation_callbacks(ui, worker, project_state);
-    bind_scene_slot_callbacks(ui, worker, project_state);
+fn bind_scene_rename_callback(ui: &MainWindow, worker: &WorkerCell) {
     let actions = ui.global::<IdeActions>();
-    let weak = ui.as_weak();
-    let worker_for_scene = Rc::clone(worker);
-    actions.on_launch_scene(move |index| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let scene_index = match validate_scene_launch(ui.get_app_mode(), index, &ui.get_scenes()) {
-            Ok(scene_index) => scene_index,
-            Err(reason) => {
-                ui.set_error_text(reason.message().into());
-                return;
-            }
-        };
-        submit_to_ui(
-            &ui,
-            &worker_for_scene,
-            IdeWorkerCommand::Transport(TransportCommand::LaunchScene { scene_index }),
-        );
-    });
-
     let weak = ui.as_weak();
     let worker_for_scene_rename = Rc::clone(worker);
     actions.on_rename_scene(move |scene_id, name| {
@@ -1007,6 +985,74 @@ fn bind_scene_callbacks(ui: &MainWindow, worker: &WorkerCell, project_state: &Pr
                 }
             };
         submit_to_ui(&ui, &worker_for_scene_rename, command);
+    });
+}
+
+fn bind_scene_duplication_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_scene_duplication = Rc::clone(worker);
+    let state_for_scene_duplication = Rc::clone(project_state);
+    actions.on_duplicate_scene(move |scene_id, name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_scene_duplicate_visible()
+            || ui.get_scene_duplicate_id() != scene_id
+        {
+            ui.set_error_text("Scene duplication selection is no longer current".into());
+            return;
+        }
+        let scenes = state_for_scene_duplication.scenes.borrow();
+        if !scene_capacity_available(scenes.len()) {
+            ui.set_error_text("The current project cannot add another scene".into());
+            return;
+        }
+        let Some(scene) = scenes.iter().find(|scene| scene.id() == scene_id.as_str()) else {
+            ui.set_error_text("The selected scene is no longer available".into());
+            return;
+        };
+        let command = match scene_duplication_command(scene.id(), name.as_str()) {
+            Ok(command) => command,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        drop(scenes);
+        submit_to_ui(&ui, &worker_for_scene_duplication, command);
+    });
+}
+
+fn bind_scene_callbacks(ui: &MainWindow, worker: &WorkerCell, project_state: &ProjectUiStateCell) {
+    bind_scene_creation_callbacks(ui, worker, project_state);
+    bind_scene_slot_callbacks(ui, worker, project_state);
+    bind_scene_rename_callback(ui, worker);
+    bind_scene_duplication_callback(ui, worker, project_state);
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_scene = Rc::clone(worker);
+    actions.on_launch_scene(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let scene_index = match validate_scene_launch(ui.get_app_mode(), index, &ui.get_scenes()) {
+            Ok(scene_index) => scene_index,
+            Err(reason) => {
+                ui.set_error_text(reason.message().into());
+                return;
+            }
+        };
+        submit_to_ui(
+            &ui,
+            &worker_for_scene,
+            IdeWorkerCommand::Transport(TransportCommand::LaunchScene { scene_index }),
+        );
     });
 
     let weak = ui.as_weak();
@@ -2403,6 +2449,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::SetAudioClipReverse => AppMode::ChangingClipReverse,
         IdeWorkerCommandKind::SetAudioClipSourceStart => AppMode::ChangingClipSource,
         IdeWorkerCommandKind::RenameScene => AppMode::RenamingScene,
+        IdeWorkerCommandKind::DuplicateScene => AppMode::DuplicatingScene,
         IdeWorkerCommandKind::SetSceneActive => AppMode::ChangingSceneActivation,
         IdeWorkerCommandKind::CreateAudioClipFromTake => AppMode::CreatingClip,
         IdeWorkerCommandKind::StartRecording => AppMode::PreparingRecording,
@@ -2500,6 +2547,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::AddScene => {
             "Preserving mixer state, creating the scene, and reopening project..."
+        }
+        IdeWorkerCommandKind::DuplicateScene => {
+            "Preserving mixer state, duplicating the scene, and reopening project..."
         }
         IdeWorkerCommandKind::SetSceneSlot => {
             "Preserving mixer state, updating the scene slot, and reopening project..."
@@ -2686,6 +2736,9 @@ fn apply_event(
         event @ (IdeWorkerEvent::SceneAdded { .. }
         | IdeWorkerEvent::SceneCreationCommittedWithWarning { .. }
         | IdeWorkerEvent::SceneAdding) => apply_scene_creation_event(ui, &event),
+        event @ (IdeWorkerEvent::SceneDuplicated { .. }
+        | IdeWorkerEvent::SceneDuplicationCommittedWithWarning { .. }
+        | IdeWorkerEvent::SceneDuplicating) => apply_scene_duplication_event(ui, &event),
         event @ (IdeWorkerEvent::SceneSlotChanged { .. }
         | IdeWorkerEvent::SceneSlotEditCommittedWithWarning { .. }
         | IdeWorkerEvent::SceneSlotChanging { .. }) => apply_scene_slot_event(ui, &event),
@@ -3206,6 +3259,42 @@ fn apply_scene_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     }
 }
 
+fn apply_scene_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::SceneDuplicated {
+            revision,
+            scene_id,
+            name,
+        } => {
+            reset_scene_duplication_form(ui);
+            ui.set_status_text(
+                format!(
+                    "Scene {name} ({scene_id}) duplicated in project revision {revision}; existing arrangement launches were unchanged"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::SceneDuplicationCommittedWithWarning { name, warning } => {
+            reset_scene_duplication_form(ui);
+            ui.set_status_text(
+                committed_warning_status(
+                    ui.get_app_mode(),
+                    &format!("Scene duplication for {name}"),
+                )
+                .into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        IdeWorkerEvent::SceneDuplicating => {
+            ui.set_app_mode(AppMode::DuplicatingScene);
+            ui.set_status_text("Waiting for native output before duplicating the scene...".into());
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("scene duplication event dispatcher received another event"),
+    }
+}
+
 fn scene_slot_action_label(edit: &IdeSceneSlotEdit) -> &'static str {
     match edit {
         IdeSceneSlotEdit::Continue => "continue",
@@ -3339,6 +3428,13 @@ fn reset_scene_rename_form(ui: &MainWindow) {
     ui.set_scene_rename_id(SharedString::default());
     ui.set_scene_rename_original(SharedString::default());
     ui.set_scene_rename_name(SharedString::default());
+}
+
+fn reset_scene_duplication_form(ui: &MainWindow) {
+    ui.set_scene_duplicate_visible(false);
+    ui.set_scene_duplicate_id(SharedString::default());
+    ui.set_scene_duplicate_source_name(SharedString::default());
+    ui.set_scene_duplicate_name(SharedString::default());
 }
 
 fn apply_audio_clip_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -4619,6 +4715,7 @@ fn reset_project(
     ui.set_rename_track_name(SharedString::default());
     ui.set_scenes(ModelRc::default());
     reset_scene_rename_form(ui);
+    reset_scene_duplication_form(ui);
     reset_scene_slots_form(ui);
     ui.set_mixer_visible(false);
     ui.set_mixer_sends_visible(false);
@@ -4801,6 +4898,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::RenameScene if current == AppMode::RenamingScene => AppMode::Running,
+        IdeWorkerCommandKind::DuplicateScene if current == AppMode::DuplicatingScene => {
+            AppMode::Running
+        }
         IdeWorkerCommandKind::SetSceneActive if current == AppMode::ChangingSceneActivation => {
             AppMode::Running
         }
@@ -4863,10 +4963,7 @@ fn scene_creation_command(
     quantization_index: i32,
     quantum_ticks: &str,
 ) -> Result<IdeWorkerCommand, &'static str> {
-    let name = proposed_name.trim();
-    if name.is_empty() || name.chars().count() > 120 {
-        return Err("Scene name must contain 1 to 120 characters");
-    }
+    let name = normalize_scene_name(proposed_name)?;
     let quantization = match quantization_index {
         0 => IdeSceneLaunchQuantization::Immediate,
         1 => {
@@ -5136,10 +5233,7 @@ fn scene_rename_command(
     current_name: &str,
     proposed_name: &str,
 ) -> Result<Option<IdeWorkerCommand>, &'static str> {
-    let name = proposed_name.trim();
-    if name.is_empty() || name.chars().count() > 120 {
-        return Err("Scene name must contain 1 to 120 characters");
-    }
+    let name = normalize_scene_name(proposed_name)?;
     if name == current_name {
         return Ok(None);
     }
@@ -5147,6 +5241,28 @@ fn scene_rename_command(
         scene_id: scene_id.to_owned(),
         name: name.to_owned(),
     }))
+}
+
+fn normalize_scene_name(value: &str) -> Result<&str, &'static str> {
+    let name = value.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err("Scene name must contain 1 to 120 characters");
+    }
+    Ok(name)
+}
+
+fn scene_duplication_command(
+    source_scene_id: &str,
+    proposed_name: &str,
+) -> Result<IdeWorkerCommand, &'static str> {
+    if source_scene_id.is_empty() {
+        return Err("Scene duplication requires a current scene identity");
+    }
+    let name = normalize_scene_name(proposed_name)?;
+    Ok(IdeWorkerCommand::DuplicateScene {
+        scene_id: source_scene_id.to_owned(),
+        name: name.to_owned(),
+    })
 }
 
 fn scene_activation_command(
@@ -5964,6 +6080,38 @@ mod tests {
     }
 
     #[test]
+    fn scene_duplication_command_normalizes_name_and_uses_a_dedicated_pending_mode() {
+        assert!(matches!(
+            scene_duplication_command("scene-a", " Verse copy "),
+            Ok(IdeWorkerCommand::DuplicateScene { scene_id, name })
+                if scene_id == "scene-a" && name == "Verse copy"
+        ));
+        assert!(scene_duplication_command("", "Copy").is_err());
+        assert!(scene_duplication_command("scene-a", "   ").is_err());
+        assert!(scene_duplication_command("scene-a", &"x".repeat(121)).is_err());
+        let unicode_boundary = "\u{00e9}".repeat(120);
+        assert!(matches!(
+            scene_duplication_command("scene-a", &unicode_boundary),
+            Ok(IdeWorkerCommand::DuplicateScene { scene_id, name })
+                if scene_id == "scene-a" && name == unicode_boundary
+        ));
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::DuplicateScene,
+            ),
+            AppMode::DuplicatingScene
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::DuplicatingScene,
+                IdeWorkerCommandKind::DuplicateScene,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
     fn scene_activation_command_preserves_identity_and_rejects_stale_requests() {
         assert!(matches!(
             scene_activation_command("scene-a", true, false),
@@ -6730,6 +6878,7 @@ mod tests {
         assert!(!ui.get_error_text().is_empty());
 
         assert_scene_authoring_forms(&ui);
+        assert_scene_duplication_events_reset_form(&ui);
         assert_scene_rename_success_resets_form(&ui);
         assert_scene_activation_events_preserve_state(&ui);
     }
@@ -6847,6 +6996,58 @@ mod tests {
         assert!(!ui.get_scene_rename_visible());
         assert!(ui.get_scene_rename_id().is_empty());
         assert!(ui.get_scene_rename_name().is_empty());
+        assert!(ui.get_status_text().contains("committed and reopened"));
+        assert!(!ui.get_error_text().is_empty());
+    }
+
+    fn assert_scene_duplication_events_reset_form(ui: &MainWindow) {
+        ui.set_app_mode(AppMode::Running);
+        ui.set_scene_duplicate_visible(true);
+        ui.set_scene_duplicate_id("scene-a".into());
+        ui.set_scene_duplicate_source_name("Intro".into());
+        ui.set_scene_duplicate_name("Intro copy".into());
+        apply_scene_duplication_event(ui, &IdeWorkerEvent::SceneDuplicating);
+        assert_eq!(ui.get_app_mode(), AppMode::DuplicatingScene);
+        assert!(ui.get_scene_duplicate_visible());
+        assert_eq!(ui.get_scene_duplicate_id().as_str(), "scene-a");
+        assert!(ui.get_status_text().contains("duplicating the scene"));
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::Running);
+        apply_scene_duplication_event(
+            ui,
+            &IdeWorkerEvent::SceneDuplicated {
+                revision: 5,
+                scene_id: "scene-copy".to_owned(),
+                name: "Intro copy".to_owned(),
+            },
+        );
+        assert!(!ui.get_scene_duplicate_visible());
+        assert!(ui.get_scene_duplicate_id().is_empty());
+        assert!(ui.get_scene_duplicate_source_name().is_empty());
+        assert!(ui.get_scene_duplicate_name().is_empty());
+        assert!(ui.get_status_text().contains("project revision 5"));
+        assert!(
+            ui.get_status_text()
+                .contains("arrangement launches were unchanged")
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_scene_duplicate_visible(true);
+        ui.set_scene_duplicate_id("scene-a".into());
+        ui.set_scene_duplicate_source_name("Intro".into());
+        ui.set_scene_duplicate_name("Intro copy".into());
+        apply_scene_duplication_event(
+            ui,
+            &IdeWorkerEvent::SceneDuplicationCommittedWithWarning {
+                name: "Intro copy".to_owned(),
+                warning: Box::new(IdeSceneDuplicationError::InvalidName),
+            },
+        );
+        assert!(!ui.get_scene_duplicate_visible());
+        assert!(ui.get_scene_duplicate_id().is_empty());
+        assert!(ui.get_scene_duplicate_source_name().is_empty());
+        assert!(ui.get_scene_duplicate_name().is_empty());
         assert!(ui.get_status_text().contains("committed and reopened"));
         assert!(!ui.get_error_text().is_empty());
     }
