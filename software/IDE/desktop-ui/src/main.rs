@@ -879,6 +879,36 @@ fn bind_scene_callbacks(ui: &MainWindow, worker: &WorkerCell) {
             };
         submit_to_ui(&ui, &worker_for_scene_rename, command);
     });
+
+    let weak = ui.as_weak();
+    let worker_for_scene_activation = Rc::clone(worker);
+    actions.on_set_scene_active(move |scene_id, active| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text("Scene activation is unavailable in the current state".into());
+            return;
+        }
+        let scenes = ui.get_scenes();
+        let Some(scene) = scenes.iter().find(|scene| scene.id == scene_id) else {
+            ui.set_error_text("The selected scene is no longer available".into());
+            return;
+        };
+        let command = match scene_activation_command(scene.id.as_str(), scene.active, active) {
+            Ok(Some(command)) => command,
+            Ok(None) => {
+                ui.set_status_text("Scene activation already matches the committed value".into());
+                ui.set_error_text(SharedString::default());
+                return;
+            }
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        submit_to_ui(&ui, &worker_for_scene_activation, command);
+    });
 }
 
 fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
@@ -2242,6 +2272,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::SetAudioClipReverse => AppMode::ChangingClipReverse,
         IdeWorkerCommandKind::SetAudioClipSourceStart => AppMode::ChangingClipSource,
         IdeWorkerCommandKind::RenameScene => AppMode::RenamingScene,
+        IdeWorkerCommandKind::SetSceneActive => AppMode::ChangingSceneActivation,
         IdeWorkerCommandKind::CreateAudioClipFromTake => AppMode::CreatingClip,
         IdeWorkerCommandKind::StartRecording => AppMode::PreparingRecording,
         IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording => {
@@ -2252,6 +2283,10 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive status mapping keeps every worker command user-visible"
+)]
 fn command_status(command: IdeWorkerCommandKind) -> &'static str {
     match command {
         IdeWorkerCommandKind::Initialize => "Discovering desktop audio outputs…",
@@ -2336,6 +2371,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
             "Preserving mixer state, slipping the reusable audio-clip source, and reopening project..."
         }
         IdeWorkerCommandKind::RenameScene => "Renaming the scene and reopening project…",
+        IdeWorkerCommandKind::SetSceneActive => "Updating scene activation and reopening project…",
         IdeWorkerCommandKind::CreateAudioClipFromTake => {
             "Preserving mixer state, creating the reusable audio clip, and reopening project…"
         }
@@ -2513,6 +2549,11 @@ fn apply_event(
         event @ (IdeWorkerEvent::SceneRenamed { .. }
         | IdeWorkerEvent::SceneRenameCommittedWithWarning { .. }
         | IdeWorkerEvent::SceneRenaming) => apply_scene_rename_event(ui, &event),
+        event @ (IdeWorkerEvent::SceneActivationChanged { .. }
+        | IdeWorkerEvent::SceneActivationCommittedWithWarning { .. }
+        | IdeWorkerEvent::SceneActivationChanging { .. }) => {
+            apply_scene_activation_event(ui, &event);
+        }
         event @ (IdeWorkerEvent::AudioClipCreatedFromTake { .. }
         | IdeWorkerEvent::AudioClipCreatingFromTake) => {
             apply_recording_clip_creation_event(ui, &event);
@@ -3024,6 +3065,47 @@ fn apply_scene_rename_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_error_text(SharedString::default());
         }
         _ => unreachable!("scene rename event dispatcher received another event"),
+    }
+}
+
+fn apply_scene_activation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::SceneActivationChanged {
+            revision,
+            changed,
+            active,
+        } => {
+            let state = if *active { "enabled" } else { "disabled" };
+            ui.set_status_text(
+                if *changed {
+                    format!("Scene {state} in project revision {revision}")
+                } else {
+                    format!("Scene was already {state} in project revision {revision}")
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::SceneActivationCommittedWithWarning { active, warning } => {
+            let state = if *active { "enable" } else { "disable" };
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), &format!("Scene {state}")).into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        IdeWorkerEvent::SceneActivationChanging { active } => {
+            ui.set_app_mode(AppMode::ChangingSceneActivation);
+            ui.set_status_text(
+                if *active {
+                    "Waiting for native output before enabling the scene…"
+                } else {
+                    "Waiting for native output before disabling the scene…"
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("scene activation event dispatcher received another event"),
     }
 }
 
@@ -4479,6 +4561,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::RenameScene if current == AppMode::RenamingScene => AppMode::Running,
+        IdeWorkerCommandKind::SetSceneActive if current == AppMode::ChangingSceneActivation => {
+            AppMode::Running
+        }
         IdeWorkerCommandKind::CreateAudioClipFromTake if current == AppMode::CreatingClip => {
             AppMode::Running
         }
@@ -4515,6 +4600,7 @@ fn scene_rows(scenes: &[IdeScene]) -> Vec<SceneRow> {
                 name: scene.name().into(),
                 display_name: scene_display_name(scene.name()).into(),
                 availability: availability.into(),
+                active: scene.active(),
                 launchable,
             }
         })
@@ -4548,6 +4634,23 @@ fn scene_rename_command(
     Ok(Some(IdeWorkerCommand::RenameScene {
         scene_id: scene_id.to_owned(),
         name: name.to_owned(),
+    }))
+}
+
+fn scene_activation_command(
+    scene_id: &str,
+    current: bool,
+    requested: bool,
+) -> Result<Option<IdeWorkerCommand>, &'static str> {
+    if scene_id.is_empty() {
+        return Err("Scene activation requires a current scene identity");
+    }
+    if current == requested {
+        return Ok(None);
+    }
+    Ok(Some(IdeWorkerCommand::SetSceneActive {
+        scene_id: scene_id.to_owned(),
+        active: requested,
     }))
 }
 
@@ -5227,6 +5330,7 @@ mod tests {
                 name: "Verse".into(),
                 display_name: "Verse".into(),
                 availability: "Ready".into(),
+                active: true,
                 launchable: true,
             },
             SceneRow {
@@ -5235,6 +5339,7 @@ mod tests {
                 name: "Break".into(),
                 display_name: "Break".into(),
                 availability: "Disabled".into(),
+                active: false,
                 launchable: false,
             },
         ])));
@@ -5278,6 +5383,34 @@ mod tests {
         );
         assert_eq!(
             mode_after_failure(AppMode::RenamingScene, IdeWorkerCommandKind::RenameScene),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn scene_activation_command_preserves_identity_and_rejects_stale_requests() {
+        assert!(matches!(
+            scene_activation_command("scene-a", true, false),
+            Ok(Some(IdeWorkerCommand::SetSceneActive { scene_id, active: false }))
+                if scene_id == "scene-a"
+        ));
+        assert!(matches!(
+            scene_activation_command("scene-a", false, false),
+            Ok(None)
+        ));
+        assert!(scene_activation_command("", true, false).is_err());
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::SetSceneActive,
+            ),
+            AppMode::ChangingSceneActivation
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ChangingSceneActivation,
+                IdeWorkerCommandKind::SetSceneActive,
+            ),
             AppMode::Running
         );
     }
@@ -6016,6 +6149,7 @@ mod tests {
         assert!(!ui.get_error_text().is_empty());
 
         assert_scene_rename_success_resets_form(&ui);
+        assert_scene_activation_events_preserve_state(&ui);
     }
 
     fn assert_scene_rename_success_resets_form(ui: &MainWindow) {
@@ -6051,6 +6185,40 @@ mod tests {
         assert!(!ui.get_scene_rename_visible());
         assert!(ui.get_scene_rename_id().is_empty());
         assert!(ui.get_scene_rename_name().is_empty());
+        assert!(ui.get_status_text().contains("committed and reopened"));
+        assert!(!ui.get_error_text().is_empty());
+    }
+
+    fn assert_scene_activation_events_preserve_state(ui: &MainWindow) {
+        apply_scene_activation_event(
+            ui,
+            &IdeWorkerEvent::SceneActivationChanging { active: false },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::ChangingSceneActivation);
+        assert!(ui.get_status_text().contains("disabling"));
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::Running);
+        apply_scene_activation_event(
+            ui,
+            &IdeWorkerEvent::SceneActivationChanged {
+                revision: 5,
+                changed: true,
+                active: false,
+            },
+        );
+        assert!(ui.get_status_text().contains("disabled"));
+        assert!(ui.get_status_text().contains("project revision 5"));
+        assert!(ui.get_error_text().is_empty());
+
+        apply_scene_activation_event(
+            ui,
+            &IdeWorkerEvent::SceneActivationCommittedWithWarning {
+                active: true,
+                warning: Box::new(IdeSceneRenameError::InvalidSceneIdentity),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
         assert!(ui.get_status_text().contains("committed and reopened"));
         assert!(!ui.get_error_text().is_empty());
     }

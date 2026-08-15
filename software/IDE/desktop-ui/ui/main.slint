@@ -30,6 +30,7 @@ export enum AppMode {
     changing-clip-reverse,
     changing-clip-source,
     renaming-scene,
+    changing-scene-activation,
     creating-clip,
     preparing-preview,
     previewing,
@@ -47,6 +48,7 @@ export struct SceneRow {
     name: string,
     display-name: string,
     availability: string,
+    active: bool,
     launchable: bool,
 }
 
@@ -166,6 +168,7 @@ export global IdeActions {
     callback loudness-reset();
     callback launch-scene(int);
     callback rename-scene(string, string);
+    callback set-scene-active(string, bool);
     callback mixer-channel-gain(int, float);
     callback mixer-channel-pan(int, float);
     callback mixer-channel-mute(int);
@@ -905,6 +908,13 @@ export component MainWindow inherits Window {
                                             root.scene-rename-name = scene.name;
                                             root.scene-rename-visible = true;
                                         }
+                                    }
+                                    Button {
+                                        width: 48px;
+                                        text: scene.active ? "On" : "Off";
+                                        accessible-label: (scene.active ? "Disable scene " : "Enable scene ") + scene.name;
+                                        enabled: root.app-mode == AppMode.running && scene.id != "";
+                                        clicked => { IdeActions.set-scene-active(scene.id, !scene.active); }
                                     }
                                 }
                                 Text {
