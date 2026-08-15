@@ -20,7 +20,7 @@ fn strict_documents_resolve_compile_bind_and_render() {
         "format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334460",
         "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","track_id":"018f47a2-6b2d-7c11-8a44-001122334456","name":"Clip","enabled":true,
         "duration_ticks":4,
-        "source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122334457","start_frame":0,"frame_count":100},
+        "source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122334457","start_frame":25,"frame_count":100},
         "loop":{"enabled":false,"start_tick":0,"end_tick":4},
         "playback":{"gain_decibels":0,"reverse":true,"transpose_cents":0},
         "fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},
@@ -59,7 +59,7 @@ fn strict_documents_resolve_compile_bind_and_render() {
             &[MediaAssetFact {
                 id: "018f47a2-6b2d-7c11-8a44-001122334457",
                 sample_rate_hz: 48_000,
-                frame_count: 100,
+                frame_count: 125,
             }],
             GraphLimits::VERSION_1,
         )
@@ -67,7 +67,7 @@ fn strict_documents_resolve_compile_bind_and_render() {
 
     let source = DecodedAudio::from_mono(
         48_000,
-        (0_u16..100)
+        (0_u16..125)
             .map(|sample| f32::from(sample) / 100.0)
             .collect(),
     )
@@ -77,6 +77,10 @@ fn strict_documents_resolve_compile_bind_and_render() {
     let rendered = plan.render_offline(placement).unwrap();
 
     assert_eq!(entry.compiled.arrangement_start_frame(), 100);
-    let expected: Vec<f32> = source.plane(0).unwrap().iter().rev().copied().collect();
+    let expected: Vec<f32> = source.plane(0).unwrap()[25..125]
+        .iter()
+        .rev()
+        .copied()
+        .collect();
     assert_eq!(rendered.plane(0), Some(expected.as_slice()));
 }
