@@ -17,15 +17,17 @@ use hyper_desktop_ide::{
     IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeOutputSelection,
     IdeOutputTestState, IdePlaybackArrangement, IdePlaybackExtent, IdeRecordingAbortOutcome,
     IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation,
-    IdeScaledLoudnessValue, IdeScene, IdeSceneAvailability, IdeSceneSlotEdit, IdeWorkerCommand,
-    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError,
-    IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState,
+    IdeScaledLoudnessValue, IdeScene, IdeSceneAvailability, IdeSceneLaunchQuantization,
+    IdeSceneSlotEdit, IdeSceneTrackAction, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
+    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeWorkerShutdownReport, LocateState, MAX_IDE_SCENES, PlaybackRecoveryTransportState,
     TransportCommand, desktop_ide_application_config, ide_audio_clip_gain_is_supported,
 };
 #[cfg(test)]
 use hyper_desktop_ide::{
     IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError, IdeAudioClipLoopEditError,
-    IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError, IdeSceneRenameError,
+    IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError, IdeSceneCreationError,
+    IdeSceneRenameError, IdeSceneSlotEditError,
 };
 use slint::platform::PlatformError;
 use slint::{
@@ -55,6 +57,7 @@ struct ProjectUiState {
     playback_end_frame: RefCell<Option<usize>>,
     arrangement: RefCell<Option<ArrangementBinding>>,
     audio_clips: RefCell<Vec<IdeAudioClip>>,
+    scenes: RefCell<Vec<IdeScene>>,
 }
 
 struct ArrangementBinding {
@@ -143,6 +146,7 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let ui = MainWindow::new()?;
+    configure_ui_contracts(&ui);
     let worker = DesktopIdeWorker::start(
         application_config()?,
         WORKER_COMMAND_CAPACITY,
@@ -179,6 +183,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let shutdown_result = worker.borrow_mut().take().map_or(Ok(()), shutdown_worker);
     finish_exit(run_result, shutdown_result)?;
     Ok(())
+}
+
+fn configure_ui_contracts(ui: &MainWindow) {
+    ui.set_max_scene_count(
+        i32::try_from(MAX_IDE_SCENES)
+            .expect("the project scene limit fits the Slint integer domain"),
+    );
 }
 
 fn application_config() -> Result<IdeApplicationConfig, Box<dyn Error>> {
@@ -797,7 +808,7 @@ fn bind_playback_callbacks(
     bind_arrangement_callback(ui, worker, project_state);
     bind_audio_clip_callback(ui, worker, project_state);
     bind_loudness_callbacks(ui, worker);
-    bind_scene_callbacks(ui, worker);
+    bind_scene_callbacks(ui, worker, project_state);
 
     let weak = ui.as_weak();
     let worker_for_save = Rc::clone(worker);
@@ -823,7 +834,125 @@ fn bind_playback_callbacks(
     bind_mixer_callbacks(ui, worker);
 }
 
-fn bind_scene_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+fn bind_scene_creation_callbacks(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let state_for_scene_creation = Rc::clone(project_state);
+    actions.on_begin_add_scene(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let scenes = state_for_scene_creation.scenes.borrow();
+        if ui.get_app_mode() != AppMode::Running || !scene_capacity_available(scenes.len()) {
+            ui.set_error_text("The current project cannot add another scene".into());
+            return;
+        }
+        ui.set_scene_create_name(next_scene_name(&scenes).into());
+        ui.set_scene_create_quantization_index(0);
+        ui.set_scene_create_quantum_ticks(SharedString::default());
+        ui.set_scene_create_visible(true);
+        ui.set_error_text(SharedString::default());
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_scene_creation = Rc::clone(worker);
+    let state_for_scene_creation = Rc::clone(project_state);
+    actions.on_add_scene(move |name, quantization_index, quantum_ticks| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_scene_create_visible() {
+            ui.set_error_text("Scene creation is no longer current".into());
+            return;
+        }
+        if !scene_capacity_available(state_for_scene_creation.scenes.borrow().len()) {
+            ui.set_error_text("The current project cannot add another scene".into());
+            return;
+        }
+        match scene_creation_command(name.as_str(), quantization_index, quantum_ticks.as_str()) {
+            Ok(command) => submit_to_ui(&ui, &worker_for_scene_creation, command),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+}
+
+fn bind_scene_slot_callbacks(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let state_for_scene_slots = Rc::clone(project_state);
+    actions.on_open_scene_slots(move |scene_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text("Scene track actions are unavailable in the current state".into());
+            return;
+        }
+        match open_scene_slots(&ui, &state_for_scene_slots, scene_id.as_str()) {
+            Ok(()) => ui.set_error_text(SharedString::default()),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+
+    let weak = ui.as_weak();
+    let state_for_scene_slot_selection = Rc::clone(project_state);
+    actions.on_select_scene_slot(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_scene_slots_visible() {
+            ui.set_error_text("Scene track-action selection is no longer current".into());
+            return;
+        }
+        match select_scene_slot(&ui, &state_for_scene_slot_selection, index) {
+            Ok(()) => ui.set_error_text(SharedString::default()),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_scene_slot = Rc::clone(worker);
+    let state_for_scene_slot = Rc::clone(project_state);
+    actions.on_set_scene_slot(move |scene_id, track_id, action_index, clip_index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_scene_slots_visible()
+            || ui.get_scene_slots_scene_id() != scene_id
+            || ui.get_selected_scene_slot_track_id() != track_id
+        {
+            ui.set_error_text("Scene track-action selection is no longer current".into());
+            return;
+        }
+        match scene_slot_command(
+            &state_for_scene_slot,
+            scene_id.as_str(),
+            track_id.as_str(),
+            action_index,
+            clip_index,
+        ) {
+            Ok(Some(command)) => submit_to_ui(&ui, &worker_for_scene_slot, command),
+            Ok(None) => {
+                ui.set_status_text("Scene track action already matches the committed value".into());
+                ui.set_error_text(SharedString::default());
+            }
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+}
+
+fn bind_scene_callbacks(ui: &MainWindow, worker: &WorkerCell, project_state: &ProjectUiStateCell) {
+    bind_scene_creation_callbacks(ui, worker, project_state);
+    bind_scene_slot_callbacks(ui, worker, project_state);
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_scene = Rc::clone(worker);
@@ -3054,12 +3183,14 @@ fn apply_scene_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             scene_id: _,
             name,
         } => {
+            reset_scene_creation_form(ui);
             ui.set_status_text(
                 format!("Scene {name} created in project revision {revision}").into(),
             );
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::SceneCreationCommittedWithWarning { name, warning } => {
+            reset_scene_creation_form(ui);
             ui.set_status_text(
                 committed_warning_status(ui.get_app_mode(), &format!("Scene creation for {name}"))
                     .into(),
@@ -3102,6 +3233,7 @@ fn apply_scene_slot_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::SceneSlotEditCommittedWithWarning { edit, warning } => {
+            reset_scene_slots_form(ui);
             ui.set_status_text(
                 committed_warning_status(
                     ui.get_app_mode(),
@@ -3754,13 +3886,14 @@ fn apply_running_event(
     if !ui.get_new_track_visible() {
         ui.set_new_track_name(next_audio_track_name(ui.get_track_count()));
     }
-    set_scenes(ui, observation.scenes());
+    let scenes_changed = set_scenes(ui, project_state, observation.scenes());
     apply_mixer_observation(ui, observation);
     set_recording_targets(ui, recording_routes, observation.mixer_channels());
     set_recording_takes(ui, take_routes, observation);
     set_playback_extent(ui, project_state, observation);
     set_arrangement(ui, project_state, observation);
-    set_audio_clips(ui, project_state, observation.audio_clips());
+    let clips_changed = set_audio_clips(ui, project_state, observation.audio_clips());
+    refresh_scene_slots_if_changed(ui, project_state, scenes_changed || clips_changed);
     ui.set_stream_state(format!("{:?}", observation.output_state()).into());
     ui.set_callback_count(observation.output().callback_count.to_string().into());
     if let Some(monitoring) = observation.monitoring() {
@@ -4151,9 +4284,13 @@ fn set_arrangement(
     });
 }
 
-fn set_audio_clips(ui: &MainWindow, project_state: &ProjectUiStateCell, clips: &[IdeAudioClip]) {
+fn set_audio_clips(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    clips: &[IdeAudioClip],
+) -> bool {
     if project_state.audio_clips.borrow().as_slice() == clips {
-        return;
+        return false;
     }
     let rows: Vec<ClipRow> = clips
         .iter()
@@ -4191,6 +4328,7 @@ fn set_audio_clips(ui: &MainWindow, project_state: &ProjectUiStateCell, clips: &
         .collect();
     ui.set_audio_clips(ModelRc::from(Rc::new(VecModel::from(rows))));
     *project_state.audio_clips.borrow_mut() = clips.to_vec();
+    true
 }
 
 fn format_audio_clip_gain(gain_decibels: f64) -> String {
@@ -4469,6 +4607,7 @@ fn reset_project(
     ui.set_sample_rate("—".into());
     ui.set_scene_count("—".into());
     ui.set_track_count(0);
+    reset_scene_creation_form(ui);
     ui.set_new_track_visible(false);
     ui.set_new_track_name("Audio 2".into());
     ui.set_rename_track_visible(false);
@@ -4480,6 +4619,7 @@ fn reset_project(
     ui.set_rename_track_name(SharedString::default());
     ui.set_scenes(ModelRc::default());
     reset_scene_rename_form(ui);
+    reset_scene_slots_form(ui);
     ui.set_mixer_visible(false);
     ui.set_mixer_sends_visible(false);
     ui.set_mixer_channels(ModelRc::default());
@@ -4538,6 +4678,7 @@ fn reset_project(
     *project_state.playback_end_frame.borrow_mut() = None;
     *project_state.arrangement.borrow_mut() = None;
     project_state.audio_clips.borrow_mut().clear();
+    project_state.scenes.borrow_mut().clear();
     ui.set_transport_extent_bounded(false);
     ui.set_transport_seek_available(false);
     ui.set_transport_progress_percent(0.0);
@@ -4704,6 +4845,278 @@ fn scene_rows(scenes: &[IdeScene]) -> Vec<SceneRow> {
             }
         })
         .collect()
+}
+
+fn next_scene_name(scenes: &[IdeScene]) -> String {
+    (1..=scenes.len().saturating_add(1))
+        .map(|index| format!("Scene {index}"))
+        .find(|candidate| scenes.iter().all(|scene| scene.name() != candidate))
+        .expect("one more candidate than existing scenes guarantees an unused name")
+}
+
+const fn scene_capacity_available(scene_count: usize) -> bool {
+    scene_count < MAX_IDE_SCENES
+}
+
+fn scene_creation_command(
+    proposed_name: &str,
+    quantization_index: i32,
+    quantum_ticks: &str,
+) -> Result<IdeWorkerCommand, &'static str> {
+    let name = proposed_name.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err("Scene name must contain 1 to 120 characters");
+    }
+    let quantization = match quantization_index {
+        0 => IdeSceneLaunchQuantization::Immediate,
+        1 => {
+            let quantum_ticks = parse_exact_arrangement_tick(
+                quantum_ticks,
+                "Scene grid quantum must be a positive whole number of ticks",
+                "Scene grid quantum is outside the supported range",
+                "Scene grid quantum exceeds the exact project range",
+            )?;
+            if quantum_ticks == 0 {
+                return Err("Scene grid quantum must be greater than zero");
+            }
+            IdeSceneLaunchQuantization::Grid { quantum_ticks }
+        }
+        _ => return Err("Scene launch timing selection is invalid"),
+    };
+    Ok(IdeWorkerCommand::AddScene {
+        name: name.to_owned(),
+        quantization,
+    })
+}
+
+fn scene_slot_rows(scene: &IdeScene, clips: &[IdeAudioClip]) -> Vec<SceneSlotRow> {
+    scene
+        .track_slots()
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            let (action, detail) = match slot.action() {
+                IdeSceneTrackAction::Continue => {
+                    ("CONTINUE", "Keep the current track state".to_owned())
+                }
+                IdeSceneTrackAction::Stop => ("STOP", "End launched material".to_owned()),
+                IdeSceneTrackAction::Play { clip_id } => (
+                    "PLAY",
+                    clips.iter().find(|clip| clip.id() == clip_id).map_or_else(
+                        || "Referenced clip unavailable".to_owned(),
+                        |clip| clip.name().to_owned(),
+                    ),
+                ),
+            };
+            SceneSlotRow {
+                index: i32::try_from(index).unwrap_or(-1),
+                track_name: slot.track_name().into(),
+                action: action.into(),
+                detail: detail.into(),
+            }
+        })
+        .collect()
+}
+
+fn refresh_scene_slots_if_changed(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    project_data_changed: bool,
+) {
+    if !project_data_changed || !ui.get_scene_slots_visible() {
+        return;
+    }
+    let scene_id = ui.get_scene_slots_scene_id();
+    let selected_track_id = ui.get_selected_scene_slot_track_id();
+    match open_scene_slots(ui, project_state, scene_id.as_str()) {
+        Ok(()) if !selected_track_id.is_empty() => {
+            let scenes = project_state.scenes.borrow();
+            let selected_index = scenes
+                .iter()
+                .find(|scene| scene.id() == scene_id.as_str())
+                .and_then(|scene| {
+                    scene
+                        .track_slots()
+                        .iter()
+                        .position(|slot| slot.track_id() == selected_track_id.as_str())
+                })
+                .and_then(|index| i32::try_from(index).ok());
+            drop(scenes);
+            if let Some(index) = selected_index {
+                let _ = select_scene_slot(ui, project_state, index);
+            }
+        }
+        Ok(()) => {}
+        Err(_) => reset_scene_slots_form(ui),
+    }
+}
+
+fn open_scene_slots(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    scene_id: &str,
+) -> Result<(), &'static str> {
+    let scenes = project_state.scenes.borrow();
+    let scene = scenes
+        .iter()
+        .find(|scene| scene.id() == scene_id)
+        .ok_or("The selected scene is no longer available")?;
+    let clips = project_state.audio_clips.borrow();
+    let rows = scene_slot_rows(scene, &clips);
+    let has_slots = !rows.is_empty();
+    ui.set_scene_slots_scene_id(scene.id().into());
+    ui.set_scene_slots_scene_name(scene.name().into());
+    ui.set_scene_slots(ModelRc::from(Rc::new(VecModel::from(rows))));
+    ui.set_scene_slots_visible(true);
+    drop(clips);
+    drop(scenes);
+    if has_slots {
+        select_scene_slot(ui, project_state, 0)
+    } else {
+        reset_scene_slot_selection(ui);
+        Ok(())
+    }
+}
+
+fn select_scene_slot(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    index: i32,
+) -> Result<(), &'static str> {
+    let index = usize::try_from(index).map_err(|_| "Scene track selection is invalid")?;
+    let scenes = project_state.scenes.borrow();
+    let scene = scenes
+        .iter()
+        .find(|scene| scene.id() == ui.get_scene_slots_scene_id().as_str())
+        .ok_or("The selected scene is no longer available")?;
+    let slot = scene
+        .track_slots()
+        .get(index)
+        .ok_or("The selected scene track is no longer available")?;
+    let clips = project_state.audio_clips.borrow();
+    let track_clips: Vec<&IdeAudioClip> = clips
+        .iter()
+        .filter(|clip| clip.track_id() == slot.track_id())
+        .collect();
+    let (action_index, selected_clip_index) = match slot.action() {
+        IdeSceneTrackAction::Continue => (0, -1),
+        IdeSceneTrackAction::Stop => (1, -1),
+        IdeSceneTrackAction::Play { clip_id } => {
+            let selected = track_clips
+                .iter()
+                .position(|clip| clip.id() == clip_id)
+                .and_then(|index| i32::try_from(index).ok())
+                .ok_or("The scene references a clip that is no longer available")?;
+            (2, selected)
+        }
+    };
+    let clip_names: Vec<SharedString> = track_clips
+        .iter()
+        .map(|clip| SharedString::from(clip.name()))
+        .collect();
+    ui.set_selected_scene_slot_index(i32::try_from(index).unwrap_or(-1));
+    ui.set_selected_scene_slot_track_id(slot.track_id().into());
+    ui.set_selected_scene_slot_track_name(slot.track_name().into());
+    ui.set_scene_slot_action_index(action_index);
+    ui.set_scene_slot_clip_names(ModelRc::from(Rc::new(VecModel::from(clip_names))));
+    ui.set_selected_scene_slot_clip_index(selected_clip_index);
+    Ok(())
+}
+
+fn scene_slot_command(
+    project_state: &ProjectUiStateCell,
+    scene_id: &str,
+    track_id: &str,
+    action_index: i32,
+    clip_index: i32,
+) -> Result<Option<IdeWorkerCommand>, &'static str> {
+    let scenes = project_state.scenes.borrow();
+    let scene = scenes
+        .iter()
+        .find(|scene| scene.id() == scene_id)
+        .ok_or("The selected scene is no longer available")?;
+    let slot = scene
+        .track_slots()
+        .iter()
+        .find(|slot| slot.track_id() == track_id)
+        .ok_or("The selected scene track is no longer available")?;
+    let clips = project_state.audio_clips.borrow();
+    let edit = selected_scene_slot_edit(
+        action_index,
+        clip_index,
+        clips
+            .iter()
+            .filter(|clip| clip.track_id() == track_id)
+            .map(IdeAudioClip::id),
+    )?;
+    if scene_slot_action_matches(slot.action(), &edit) {
+        return Ok(None);
+    }
+    Ok(Some(IdeWorkerCommand::SetSceneSlot {
+        scene_id: scene_id.to_owned(),
+        track_id: track_id.to_owned(),
+        edit,
+    }))
+}
+
+fn selected_scene_slot_edit<'a>(
+    action_index: i32,
+    clip_index: i32,
+    mut track_clip_ids: impl Iterator<Item = &'a str>,
+) -> Result<IdeSceneSlotEdit, &'static str> {
+    match action_index {
+        0 => Ok(IdeSceneSlotEdit::Continue),
+        1 => Ok(IdeSceneSlotEdit::Stop),
+        2 => {
+            let clip_index =
+                usize::try_from(clip_index).map_err(|_| "Select a reusable clip for the track")?;
+            let clip_id = track_clip_ids
+                .nth(clip_index)
+                .ok_or("The selected reusable clip is no longer available")?;
+            Ok(IdeSceneSlotEdit::Play {
+                clip_id: clip_id.to_owned(),
+            })
+        }
+        _ => Err("Scene track action selection is invalid"),
+    }
+}
+
+fn scene_slot_action_matches(current: &IdeSceneTrackAction, edit: &IdeSceneSlotEdit) -> bool {
+    matches!(
+        (current, edit),
+        (IdeSceneTrackAction::Continue, IdeSceneSlotEdit::Continue)
+            | (IdeSceneTrackAction::Stop, IdeSceneSlotEdit::Stop)
+    ) || matches!(
+        (current, edit),
+        (
+            IdeSceneTrackAction::Play { clip_id: current },
+            IdeSceneSlotEdit::Play { clip_id: requested },
+        ) if current == requested
+    )
+}
+
+fn reset_scene_creation_form(ui: &MainWindow) {
+    ui.set_scene_create_visible(false);
+    ui.set_scene_create_name(SharedString::default());
+    ui.set_scene_create_quantization_index(0);
+    ui.set_scene_create_quantum_ticks(SharedString::default());
+}
+
+fn reset_scene_slot_selection(ui: &MainWindow) {
+    ui.set_selected_scene_slot_index(-1);
+    ui.set_selected_scene_slot_track_id(SharedString::default());
+    ui.set_selected_scene_slot_track_name(SharedString::default());
+    ui.set_scene_slot_action_index(0);
+    ui.set_scene_slot_clip_names(ModelRc::default());
+    ui.set_selected_scene_slot_clip_index(-1);
+}
+
+fn reset_scene_slots_form(ui: &MainWindow) {
+    ui.set_scene_slots_visible(false);
+    ui.set_scene_slots_scene_id(SharedString::default());
+    ui.set_scene_slots_scene_name(SharedString::default());
+    ui.set_scene_slots(ModelRc::default());
+    reset_scene_slot_selection(ui);
 }
 
 fn scene_display_name(name: &str) -> String {
@@ -4929,23 +5342,13 @@ fn pan_percent_to_millionths(percent: f32) -> Result<i32, MixerControlFailure> {
     Ok((percent * 10_000.0).round() as i32)
 }
 
-fn set_scenes(ui: &MainWindow, scenes: &[IdeScene]) {
-    let current = ui.get_scenes();
-    let unchanged = current.row_count() == scenes.len()
-        && scenes.iter().enumerate().all(|(index, expected)| {
-            current.row_data(index).is_some_and(|actual| {
-                let (availability, launchable) =
-                    scene_availability_presentation(expected.availability());
-                actual.index == i32::try_from(index).unwrap_or(-1)
-                    && actual.id.as_str() == expected.id()
-                    && actual.name.as_str() == expected.name()
-                    && actual.availability.as_str() == availability
-                    && actual.launchable == launchable
-            })
-        });
+fn set_scenes(ui: &MainWindow, project_state: &ProjectUiStateCell, scenes: &[IdeScene]) -> bool {
+    let unchanged = project_state.scenes.borrow().as_slice() == scenes;
     if !unchanged {
         ui.set_scenes(ModelRc::from(Rc::new(VecModel::from(scene_rows(scenes)))));
+        *project_state.scenes.borrow_mut() = scenes.to_vec();
     }
+    !unchanged
 }
 
 fn mixer_rows(channels: &[IdeMixerChannel]) -> Vec<MixerChannelRow> {
@@ -5387,6 +5790,80 @@ mod tests {
                 state: LocateState::Preserve,
             }
         );
+    }
+
+    #[test]
+    fn scene_creation_requires_an_explicit_valid_launch_timing() {
+        assert!(scene_capacity_available(MAX_IDE_SCENES - 1));
+        assert!(!scene_capacity_available(MAX_IDE_SCENES));
+        assert!(matches!(
+            scene_creation_command(" Verse ", 0, "ignored"),
+            Ok(IdeWorkerCommand::AddScene {
+                name,
+                quantization: IdeSceneLaunchQuantization::Immediate,
+            }) if name == "Verse"
+        ));
+        assert!(matches!(
+            scene_creation_command("Grid", 1, " 960 "),
+            Ok(IdeWorkerCommand::AddScene {
+                name,
+                quantization: IdeSceneLaunchQuantization::Grid { quantum_ticks: 960 },
+            }) if name == "Grid"
+        ));
+        assert!(scene_creation_command("", 0, "").is_err());
+        assert!(scene_creation_command(&"s".repeat(121), 0, "").is_err());
+        assert!(scene_creation_command("Grid", 1, "0").is_err());
+        assert!(scene_creation_command("Grid", 1, "1.5").is_err());
+        assert!(scene_creation_command("Grid", 2, "960").is_err());
+    }
+
+    #[test]
+    fn scene_slot_selection_never_invents_a_clip() {
+        assert_eq!(
+            selected_scene_slot_edit(0, -1, ["clip-a"].into_iter()),
+            Ok(IdeSceneSlotEdit::Continue)
+        );
+        assert_eq!(
+            selected_scene_slot_edit(1, -1, ["clip-a"].into_iter()),
+            Ok(IdeSceneSlotEdit::Stop)
+        );
+        assert_eq!(
+            selected_scene_slot_edit(2, 1, ["clip-a", "clip-b"].into_iter()),
+            Ok(IdeSceneSlotEdit::Play {
+                clip_id: "clip-b".to_owned(),
+            })
+        );
+        assert!(selected_scene_slot_edit(2, -1, ["clip-a"].into_iter()).is_err());
+        assert!(selected_scene_slot_edit(2, 1, ["clip-a"].into_iter()).is_err());
+        assert!(selected_scene_slot_edit(3, 0, ["clip-a"].into_iter()).is_err());
+    }
+
+    #[test]
+    fn scene_slot_no_op_detection_compares_the_exact_action() {
+        assert!(scene_slot_action_matches(
+            &IdeSceneTrackAction::Continue,
+            &IdeSceneSlotEdit::Continue
+        ));
+        assert!(scene_slot_action_matches(
+            &IdeSceneTrackAction::Stop,
+            &IdeSceneSlotEdit::Stop
+        ));
+        assert!(scene_slot_action_matches(
+            &IdeSceneTrackAction::Play {
+                clip_id: "clip-a".to_owned(),
+            },
+            &IdeSceneSlotEdit::Play {
+                clip_id: "clip-a".to_owned(),
+            }
+        ));
+        assert!(!scene_slot_action_matches(
+            &IdeSceneTrackAction::Play {
+                clip_id: "clip-a".to_owned(),
+            },
+            &IdeSceneSlotEdit::Play {
+                clip_id: "clip-b".to_owned(),
+            }
+        ));
     }
 
     #[test]
@@ -6147,6 +6624,11 @@ mod tests {
     #[test]
     fn committed_audio_clip_edit_warnings_preserve_reopen_authority() {
         let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        assert_eq!(
+            usize::try_from(ui.get_max_scene_count()).unwrap(),
+            MAX_IDE_SCENES
+        );
         ui.set_app_mode(AppMode::Running);
         ui.set_clip_fades_visible(true);
         ui.set_clip_fades_id("clip-a".into());
@@ -6247,8 +6729,89 @@ mod tests {
         assert!(ui.get_status_text().contains("committed and reopened"));
         assert!(!ui.get_error_text().is_empty());
 
+        assert_scene_authoring_forms(&ui);
         assert_scene_rename_success_resets_form(&ui);
         assert_scene_activation_events_preserve_state(&ui);
+    }
+
+    fn assert_scene_authoring_forms(ui: &MainWindow) {
+        let worker = Rc::new(RefCell::new(None));
+        let project_state = Rc::new(ProjectUiState::default());
+        bind_scene_callbacks(ui, &worker, &project_state);
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>().invoke_begin_add_scene();
+        assert!(ui.get_scene_create_visible());
+        assert_eq!(ui.get_scene_create_name().as_str(), "Scene 1");
+        assert_eq!(ui.get_scene_create_quantization_index(), 0);
+        assert!(ui.get_scene_create_quantum_ticks().is_empty());
+
+        ui.set_scene_create_name("Verse".into());
+        ui.set_scene_create_quantization_index(1);
+        ui.set_scene_create_quantum_ticks("960".into());
+        apply_scene_creation_event(
+            ui,
+            &IdeWorkerEvent::SceneAdded {
+                revision: 2,
+                scene_id: "scene-verse".to_owned(),
+                name: "Verse".to_owned(),
+            },
+        );
+        assert!(!ui.get_scene_create_visible());
+        assert!(ui.get_scene_create_name().is_empty());
+        assert_eq!(ui.get_scene_create_quantization_index(), 0);
+        assert!(ui.get_scene_create_quantum_ticks().is_empty());
+
+        ui.set_scene_create_visible(true);
+        ui.set_scene_create_name("Bridge".into());
+        ui.set_scene_create_quantization_index(1);
+        ui.set_scene_create_quantum_ticks("1920".into());
+        apply_scene_creation_event(
+            ui,
+            &IdeWorkerEvent::SceneCreationCommittedWithWarning {
+                name: "Bridge".to_owned(),
+                warning: Box::new(IdeSceneCreationError::InvalidName),
+            },
+        );
+        assert!(!ui.get_scene_create_visible());
+        assert!(ui.get_scene_create_name().is_empty());
+        assert_eq!(ui.get_scene_create_quantization_index(), 0);
+        assert!(ui.get_scene_create_quantum_ticks().is_empty());
+        assert!(ui.get_status_text().contains("committed and reopened"));
+        assert!(!ui.get_error_text().is_empty());
+
+        ui.set_scene_slots_visible(true);
+        apply_scene_slot_event(
+            ui,
+            &IdeWorkerEvent::SceneSlotChanged {
+                revision: 3,
+                changed: true,
+                edit: IdeSceneSlotEdit::Stop,
+            },
+        );
+        assert!(ui.get_scene_slots_visible());
+        assert!(ui.get_status_text().contains("project revision 3"));
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_scene_slots_scene_id("scene-verse".into());
+        ui.set_scene_slots_scene_name("Verse".into());
+        ui.set_selected_scene_slot_index(0);
+        ui.set_selected_scene_slot_track_id("track-a".into());
+        ui.set_selected_scene_slot_track_name("Track A".into());
+        apply_scene_slot_event(
+            ui,
+            &IdeWorkerEvent::SceneSlotEditCommittedWithWarning {
+                edit: IdeSceneSlotEdit::Stop,
+                warning: Box::new(IdeSceneSlotEditError::InvalidSceneIdentity),
+            },
+        );
+        assert!(!ui.get_scene_slots_visible());
+        assert!(ui.get_scene_slots_scene_id().is_empty());
+        assert!(ui.get_scene_slots_scene_name().is_empty());
+        assert_eq!(ui.get_selected_scene_slot_index(), -1);
+        assert!(ui.get_selected_scene_slot_track_id().is_empty());
+        assert!(ui.get_selected_scene_slot_track_name().is_empty());
+        assert!(ui.get_status_text().contains("committed and reopened"));
+        assert!(!ui.get_error_text().is_empty());
     }
 
     fn assert_scene_rename_success_resets_form(ui: &MainWindow) {

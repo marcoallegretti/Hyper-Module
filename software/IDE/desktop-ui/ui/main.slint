@@ -52,6 +52,13 @@ export struct SceneRow {
     launchable: bool,
 }
 
+export struct SceneSlotRow {
+    index: int,
+    track-name: string,
+    action: string,
+    detail: string,
+}
+
 export struct MixerChannelRow {
     index: int,
     track-id: string,
@@ -167,6 +174,11 @@ export global IdeActions {
     callback loudness-standby();
     callback loudness-reset();
     callback launch-scene(int);
+    callback begin-add-scene();
+    callback add-scene(string, int, string);
+    callback open-scene-slots(string);
+    callback select-scene-slot(int);
+    callback set-scene-slot(string, string, int, int);
     callback rename-scene(string, string);
     callback set-scene-active(string, bool);
     callback mixer-channel-gain(int, float);
@@ -287,11 +299,26 @@ export component MainWindow inherits Window {
     in property <string> sample-rate: "—";
     in property <string> scene-count: "—";
     in property <int> track-count: 0;
+    in property <int> max-scene-count: 0;
     in property <[SceneRow]> scenes: [];
+    in-out property <bool> scene-create-visible: false;
+    in-out property <string> scene-create-name: "";
+    in-out property <int> scene-create-quantization-index: 0;
+    in-out property <string> scene-create-quantum-ticks: "";
     in-out property <bool> scene-rename-visible: false;
     in-out property <string> scene-rename-id: "";
     in-out property <string> scene-rename-original: "";
     in-out property <string> scene-rename-name: "";
+    in-out property <bool> scene-slots-visible: false;
+    in-out property <string> scene-slots-scene-id: "";
+    in-out property <string> scene-slots-scene-name: "";
+    in property <[SceneSlotRow]> scene-slots: [];
+    in-out property <int> selected-scene-slot-index: -1;
+    in-out property <string> selected-scene-slot-track-id: "";
+    in-out property <string> selected-scene-slot-track-name: "";
+    in-out property <int> scene-slot-action-index: 0;
+    in property <[string]> scene-slot-clip-names: [];
+    in-out property <int> selected-scene-slot-clip-index: -1;
     in-out property <bool> mixer-visible: false;
     in-out property <bool> new-track-visible: false;
     in-out property <string> new-track-name: "Audio 2";
@@ -778,7 +805,7 @@ export component MainWindow inherits Window {
                 vertical-stretch: 1;
                 background: transparent;
 
-                if !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-rename-visible : Panel {
+                if !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-create-visible && !root.scene-rename-visible && !root.scene-slots-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -823,12 +850,12 @@ export component MainWindow inherits Window {
                     Rectangle { height: 1px; background: #27313d; }
 
                     HorizontalLayout {
-                        height: 146px;
+                        height: 132px;
                         spacing: 18px;
                         VerticalLayout {
                             horizontal-stretch: 1;
                             alignment: center;
-                            spacing: 14px;
+                            spacing: 8px;
                             HorizontalLayout {
                                 alignment: center;
                                 spacing: 10px;
@@ -876,41 +903,45 @@ export component MainWindow inherits Window {
                     Rectangle { height: 1px; background: #27313d; }
 
                     VerticalLayout {
-                        height: 110px;
-                        spacing: 8px;
-                        Text { text: "SCENE LAUNCHER"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        height: 125px;
+                        spacing: 4px;
+                        HorizontalLayout {
+                            Text { text: "SCENE LAUNCHER"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; vertical-alignment: center; }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: "New scene";
+                                accessible-label: "Create a new scene";
+                                enabled: root.app-mode == AppMode.running && root.scenes.length < root.max-scene-count;
+                                clicked => { IdeActions.begin-add-scene(); }
+                            }
+                        }
                         GridLayout {
                             spacing: 6px;
                             for scene[index] in root.scenes : VerticalLayout {
                                 row: index / 4;
                                 col: Math.mod(index, 4);
-                                min-width: 170px;
-                                max-width: 170px;
+                                min-width: 180px;
+                                max-width: 180px;
                                 spacing: 2px;
                                 HorizontalLayout {
                                     spacing: 4px;
                                     Button {
                                         min-width: 0px;
-                                        horizontal-stretch: 1;
+                                        horizontal-stretch: 2;
                                         text: scene.display-name;
                                         accessible-label: scene.name + ", " + scene.availability;
                                         enabled: root.app-mode == AppMode.running && scene.launchable;
                                         clicked => { IdeActions.launch-scene(scene.index); }
                                     }
                                     Button {
-                                        width: 34px;
+                                        horizontal-stretch: 1;
                                         text: "Edit";
-                                        accessible-label: "Rename scene " + scene.name;
+                                        accessible-label: "Edit scene " + scene.name;
                                         enabled: root.app-mode == AppMode.running && scene.id != "";
-                                        clicked => {
-                                            root.scene-rename-id = scene.id;
-                                            root.scene-rename-original = scene.name;
-                                            root.scene-rename-name = scene.name;
-                                            root.scene-rename-visible = true;
-                                        }
+                                        clicked => { IdeActions.open-scene-slots(scene.id); }
                                     }
                                     Button {
-                                        width: 48px;
+                                        horizontal-stretch: 1;
                                         text: scene.active ? "On" : "Off";
                                         accessible-label: (scene.active ? "Disable scene " : "Enable scene ") + scene.name;
                                         enabled: root.app-mode == AppMode.running && scene.id != "";
@@ -967,6 +998,165 @@ export component MainWindow inherits Window {
                             VerticalLayout { padding: 10px; Text { text: "UNDERFLOWS"; color: #65758a; font-size: 9px; } Text { text: root.monitoring-underflow-count; color: root.monitoring-underflow-count == "0" ? #dce5ef : #ff9d76; font-size: 15px; } }
                         }
                     }
+                    }
+                }
+
+                if root.scene-create-visible && !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-rename-visible && !root.scene-slots-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 16px;
+                        Text { text: "CREATE SCENE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: "Add a durable scene"; color: #edf2f8; font-size: 24px; font-weight: 600; }
+                        Text {
+                            text: "A new scene starts with Continue on every track. Choose when a launch becomes effective; track actions can be authored after creation.";
+                            color: #aebccc;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        GridLayout {
+                            spacing: 8px;
+                            Text { row: 0; col: 0; text: "Scene name"; color: #8fa0b4; vertical-alignment: center; }
+                            LineEdit { row: 0; col: 1; text <=> root.scene-create-name; placeholder-text: "Verse"; accessible-label: "New scene name"; }
+                            Text { row: 1; col: 0; text: "Launch timing"; color: #8fa0b4; vertical-alignment: center; }
+                            ComboBox {
+                                row: 1;
+                                col: 1;
+                                model: ["Immediate", "Grid"];
+                                current-index <=> root.scene-create-quantization-index;
+                                accessible-label: "New scene launch timing";
+                            }
+                            if root.scene-create-quantization-index == 1 : Text { row: 2; col: 0; text: "Grid quantum"; color: #8fa0b4; vertical-alignment: center; }
+                            if root.scene-create-quantization-index == 1 : LineEdit {
+                                row: 2;
+                                col: 1;
+                                text <=> root.scene-create-quantum-ticks;
+                                placeholder-text: "Positive whole ticks";
+                                accessible-label: "Scene launch grid quantum in ticks";
+                            }
+                        }
+                        Text {
+                            text: root.scene-create-quantization-index == 0
+                                ? "Immediate launches apply on the next audio processing boundary."
+                                : "Grid launches wait for the next exact project-tick multiple.";
+                            color: #65758a;
+                            font-size: 9px;
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.scene-create-visible = false; } }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: "Create scene";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.scene-create-name != ""
+                                    && (root.scene-create-quantization-index == 0 || root.scene-create-quantum-ticks != "");
+                                clicked => { IdeActions.add-scene(root.scene-create-name, root.scene-create-quantization-index, root.scene-create-quantum-ticks); }
+                            }
+                        }
+                    }
+                }
+
+                if root.scene-slots-visible && !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-create-visible && !root.scene-rename-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 14px;
+                        Text { height: 16px; text: "SCENE TRACK ACTIONS"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { height: 32px; text: root.scene-slots-scene-name; color: #edf2f8; font-size: 24px; font-weight: 600; overflow: elide; }
+                        Text {
+                            height: 32px;
+                            text: "Continue leaves the track unchanged. Stop ends its launched material. Play replaces it with a reusable clip owned by that track.";
+                            color: #aebccc;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        if root.scene-slots.length == 0 : Text {
+                            text: "This scene has no editable track actions.";
+                            color: #8fa0b4;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            vertical-stretch: 1;
+                        }
+                        if root.scene-slots.length > 0 : HorizontalLayout {
+                            spacing: 14px;
+                            ListView {
+                                width: 330px;
+                                vertical-stretch: 1;
+                                for slot in root.scene-slots : Button {
+                                    height: 52px;
+                                    checkable: true;
+                                    checked: slot.index == root.selected-scene-slot-index;
+                                    text: slot.track-name + "  ·  " + slot.action + "\n" + slot.detail;
+                                    accessible-label: slot.track-name + ", " + slot.action + ", " + slot.detail;
+                                    clicked => { IdeActions.select-scene-slot(slot.index); }
+                                }
+                            }
+                            Rectangle { width: 1px; background: #27313d; }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 10px;
+                                Text { text: root.selected-scene-slot-track-name; color: #edf2f8; font-size: 18px; font-weight: 600; overflow: elide; }
+                                Text { text: "Track action"; color: #8fa0b4; font-size: 10px; }
+                                ComboBox {
+                                    height: 34px;
+                                    model: ["Continue", "Stop", "Play clip"];
+                                    current-index <=> root.scene-slot-action-index;
+                                    accessible-label: "Track action for " + root.selected-scene-slot-track-name;
+                                }
+                                if root.scene-slot-action-index == 2 : Text { text: "Reusable clip"; color: #8fa0b4; font-size: 10px; }
+                                if root.scene-slot-action-index == 2 : ComboBox {
+                                    height: 34px;
+                                    model: root.scene-slot-clip-names;
+                                    current-index <=> root.selected-scene-slot-clip-index;
+                                    enabled: root.scene-slot-clip-names.length > 0;
+                                    accessible-label: "Reusable clip for " + root.selected-scene-slot-track-name;
+                                }
+                                if root.scene-slot-action-index == 2 && root.scene-slot-clip-names.length == 0 : Text {
+                                    text: "No reusable audio clip belongs to this track.";
+                                    color: #ff9d76;
+                                    font-size: 10px;
+                                    wrap: word-wrap;
+                                }
+                                Rectangle { vertical-stretch: 1; background: transparent; }
+                                Button {
+                                    height: 34px;
+                                    text: "Apply track action";
+                                    enabled: root.app-mode == AppMode.running
+                                        && root.selected-scene-slot-index >= 0
+                                        && root.selected-scene-slot-track-id != ""
+                                        && (root.scene-slot-action-index != 2 || root.selected-scene-slot-clip-index >= 0);
+                                    clicked => {
+                                        IdeActions.set-scene-slot(
+                                            root.scene-slots-scene-id,
+                                            root.selected-scene-slot-track-id,
+                                            root.scene-slot-action-index,
+                                            root.selected-scene-slot-clip-index,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            height: 34px;
+                            spacing: 8px;
+                            Button { text: "Done"; enabled: root.app-mode == AppMode.running; clicked => { root.scene-slots-visible = false; } }
+                            Button {
+                                text: "Rename scene";
+                                enabled: root.app-mode == AppMode.running && root.scene-slots-scene-id != "";
+                                clicked => {
+                                    root.scene-rename-id = root.scene-slots-scene-id;
+                                    root.scene-rename-original = root.scene-slots-scene-name;
+                                    root.scene-rename-name = root.scene-slots-scene-name;
+                                    root.scene-slots-visible = false;
+                                    root.scene-rename-visible = true;
+                                }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                        }
                     }
                 }
 
