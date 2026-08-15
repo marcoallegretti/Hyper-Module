@@ -919,6 +919,55 @@ struct PendingSceneLaunch {
     frame: usize,
 }
 
+/// Committed interactive scene-launch state at one runtime position.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SceneLaunchState {
+    queued_scene_index: u8,
+    last_launched_scene_index: u8,
+    queued_launch_frame: usize,
+}
+
+impl SceneLaunchState {
+    const NO_SCENE: u8 = u8::MAX;
+
+    #[must_use]
+    pub const fn queued_scene_index(self) -> Option<usize> {
+        if self.queued_scene_index == Self::NO_SCENE {
+            None
+        } else {
+            Some(self.queued_scene_index as usize)
+        }
+    }
+
+    #[must_use]
+    pub const fn queued_launch_frame(self) -> Option<usize> {
+        if self.queued_scene_index == Self::NO_SCENE {
+            None
+        } else {
+            Some(self.queued_launch_frame)
+        }
+    }
+
+    #[must_use]
+    pub const fn last_launched_scene_index(self) -> Option<usize> {
+        if self.last_launched_scene_index == Self::NO_SCENE {
+            None
+        } else {
+            Some(self.last_launched_scene_index as usize)
+        }
+    }
+}
+
+impl Default for SceneLaunchState {
+    fn default() -> Self {
+        Self {
+            queued_scene_index: Self::NO_SCENE,
+            last_launched_scene_index: Self::NO_SCENE,
+            queued_launch_frame: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SceneRuntimeCheckpoint<'resource> {
     states: [Option<PlayingSceneClip<'resource>>; VERSION_1_MAX_SCENE_TRACKS],
@@ -927,6 +976,7 @@ pub struct SceneRuntimeCheckpoint<'resource> {
     track_count: usize,
     position: usize,
     pending: Option<PendingSceneLaunch>,
+    last_launched_scene_index: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -937,6 +987,7 @@ pub struct SceneRuntime<'plan, 'resource> {
     controlled: Vec<bool>,
     position: usize,
     pending: Option<PendingSceneLaunch>,
+    last_launched_scene_index: Option<usize>,
 }
 
 impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
@@ -966,6 +1017,7 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
             controlled,
             position: frame,
             pending: None,
+            last_launched_scene_index: None,
         };
         runtime.seek(frame);
         Ok(runtime)
@@ -991,6 +1043,35 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
         self.plan.scene_count()
     }
 
+    /// Returns the queued launch and the most recently applied interactive scene.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an internally compiled scene index exceeds the version-1
+    /// scene limit, which compilation rejects before runtime construction.
+    #[must_use]
+    pub fn launch_state(&self) -> SceneLaunchState {
+        let (queued_scene_index, queued_launch_frame) = match self.pending {
+            Some(pending) => (
+                u8::try_from(pending.scene_index)
+                    .expect("compiled scene indices fit the version-1 scene limit"),
+                pending.frame,
+            ),
+            None => (SceneLaunchState::NO_SCENE, 0),
+        };
+        SceneLaunchState {
+            queued_scene_index,
+            queued_launch_frame,
+            last_launched_scene_index: self.last_launched_scene_index.map_or(
+                SceneLaunchState::NO_SCENE,
+                |scene_index| {
+                    u8::try_from(scene_index)
+                        .expect("compiled scene indices fit the version-1 scene limit")
+                },
+            ),
+        }
+    }
+
     #[must_use]
     pub fn checkpoint(&self) -> SceneRuntimeCheckpoint<'resource> {
         let mut states = [None; VERSION_1_MAX_SCENE_TRACKS];
@@ -1006,6 +1087,7 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
             track_count: self.states.len(),
             position: self.position,
             pending: self.pending,
+            last_launched_scene_index: self.last_launched_scene_index,
         }
     }
 
@@ -1019,6 +1101,7 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
             .copy_from_slice(&checkpoint.controlled[..checkpoint.track_count]);
         self.position = checkpoint.position;
         self.pending = checkpoint.pending;
+        self.last_launched_scene_index = checkpoint.last_launched_scene_index;
     }
 
     /// Replaces any pending interactive launch with the latest request.
@@ -1085,6 +1168,7 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
     pub fn seek(&mut self, frame: usize) {
         self.position = frame;
         self.pending = None;
+        self.last_launched_scene_index = None;
         for (track_index, track) in self.plan.tracks.iter().enumerate() {
             self.controlled[track_index] = !track.actions.is_empty();
             let cursor = track
@@ -1156,6 +1240,7 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
             .ok_or(SceneProcessError::Runtime(SceneRuntimeError::FrameOverflow))?;
         let saved_position = self.position;
         let saved_pending = self.pending;
+        let saved_last_launched_scene_index = self.last_launched_scene_index;
         let track_count = self.states.len();
         let mut saved_states = [None; VERSION_1_MAX_SCENE_TRACKS];
         saved_states[..track_count].copy_from_slice(&self.states);
@@ -1179,6 +1264,7 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
                 self.controlled
                     .copy_from_slice(&saved_controlled[..track_count]);
                 self.pending = saved_pending;
+                self.last_launched_scene_index = saved_last_launched_scene_index;
                 return Err(SceneProcessError::Observer(error));
             }
             segment_count += 1;
@@ -1238,6 +1324,7 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
                     }),
                 };
             }
+            self.last_launched_scene_index = Some(pending.scene_index);
             self.pending = None;
         }
     }

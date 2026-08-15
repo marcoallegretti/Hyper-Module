@@ -1,7 +1,7 @@
 use hyper_playback_compiler::scene::{
     LaunchQuantization, PlayingSceneClip, RecordedSceneExtent, SceneClipResource,
-    SceneCompileError, SceneLimits, ScenePerformanceInput, SceneProcessError, SceneResource,
-    SceneRuntimeError, SceneSlotAction, SceneSlotResource, SceneTrackResource,
+    SceneCompileError, SceneLaunchState, SceneLimits, ScenePerformanceInput, SceneProcessError,
+    SceneResource, SceneRuntimeError, SceneSlotAction, SceneSlotResource, SceneTrackResource,
     compile_scene_performance,
 };
 use hyper_playback_compiler::{TempoEvent, Timeline};
@@ -529,6 +529,9 @@ fn interactive_launch_is_quantized_transactional_and_cleared_by_seek() {
 
     let mut runtime = compiled.runtime_at(1).unwrap();
     runtime.queue_scene_launch(0).unwrap();
+    assert_eq!(runtime.launch_state().queued_scene_index(), Some(0));
+    assert_eq!(runtime.launch_state().queued_launch_frame(), Some(50));
+    assert_eq!(runtime.launch_state().last_launched_scene_index(), None);
     let checkpoint = runtime.checkpoint();
     let mut segments = Vec::new();
     let failure = runtime.try_process_window(1, 60, |segment| {
@@ -543,6 +546,8 @@ fn interactive_launch_is_quantized_transactional_and_cleared_by_seek() {
         Err(SceneProcessError::Observer("render"))
     ));
     assert_eq!(runtime.checkpoint(), checkpoint);
+    assert_eq!(runtime.launch_state().queued_scene_index(), Some(0));
+    assert_eq!(runtime.launch_state().last_launched_scene_index(), None);
 
     let mut rendered_segments = Vec::new();
     runtime
@@ -558,11 +563,17 @@ fn interactive_launch_is_quantized_transactional_and_cleared_by_seek() {
         rendered_segments,
         [(0, 49, None), (49, 25, Some("one-shot")), (74, 56, None)]
     );
+    assert_eq!(runtime.launch_state().queued_scene_index(), None);
+    assert_eq!(runtime.launch_state().queued_launch_frame(), None);
+    assert_eq!(runtime.launch_state().last_launched_scene_index(), Some(0));
 
     runtime.seek(50);
     assert_eq!(runtime.track_states(), [None]);
+    assert_eq!(runtime.launch_state(), SceneLaunchState::default());
     runtime.queue_scene_launch(0).unwrap();
     runtime.queue_scene_launch(1).unwrap();
+    assert_eq!(runtime.launch_state().queued_scene_index(), Some(1));
     runtime.process_window(50, 1, |_| {}).unwrap();
     assert_eq!(runtime.track_states(), [None]);
+    assert_eq!(runtime.launch_state().last_launched_scene_index(), Some(1));
 }

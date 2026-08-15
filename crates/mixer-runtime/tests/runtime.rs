@@ -452,7 +452,7 @@ fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() 
     sender
         .try_send(TransportCommand::Locate {
             frame: 100,
-            state: LocateState::Rolling,
+            state: LocateState::Stopped,
         })
         .unwrap();
     sender
@@ -469,6 +469,26 @@ fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() 
     ];
     let mut output_left = [9.0_f32; 50];
     let mut output_right = [9.0_f32; 50];
+    let queued = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut output_left,
+                right: &mut output_right,
+            },
+        )
+        .unwrap();
+    assert_eq!(queued.applied_command_count(), 2);
+    assert_eq!(queued.scene_launch_state().queued_scene_index(), Some(0));
+    assert_eq!(queued.scene_launch_state().queued_launch_frame(), Some(100));
+    assert_eq!(
+        queued.scene_launch_state().last_launched_scene_index(),
+        None
+    );
+    assert_samples(&output_left, &[0.0; 50]);
+    assert_samples(&output_right, &[0.0; 50]);
+
+    sender.try_send(TransportCommand::Start).unwrap();
     let launched = transport
         .process_cycle(
             &mut scratch,
@@ -478,14 +498,19 @@ fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() 
             },
         )
         .unwrap();
-    assert_eq!(launched.applied_command_count(), 2);
+    assert_eq!(launched.applied_command_count(), 1);
+    assert_eq!(launched.scene_launch_state().queued_scene_index(), None);
+    assert_eq!(
+        launched.scene_launch_state().last_launched_scene_index(),
+        Some(0)
+    );
     assert_samples(&output_left, &[0.0; 50]);
     assert_samples(&output_right, &fixture.scene_samples[..50]);
 
     sender
         .try_send(TransportCommand::LaunchScene { scene_index: 1 })
         .unwrap();
-    transport
+    let stopped = transport
         .process_cycle(
             &mut scratch,
             StereoOutput {
@@ -494,6 +519,11 @@ fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() 
             },
         )
         .unwrap();
+    assert_eq!(stopped.scene_launch_state().queued_scene_index(), None);
+    assert_eq!(
+        stopped.scene_launch_state().last_launched_scene_index(),
+        Some(1)
+    );
     assert_samples(&output_left, &[0.0; 50]);
     assert_samples(&output_right, &[0.0; 50]);
 }
@@ -527,7 +557,7 @@ fn failed_cycle_restores_the_prior_interactive_scene_state() {
     ];
     let mut output_left = [0.0_f32; 25];
     let mut output_right = [0.0_f32; 25];
-    transport
+    let recovered = transport
         .process_cycle(
             &mut scratch,
             StereoOutput {
@@ -568,6 +598,11 @@ fn failed_cycle_restores_the_prior_interactive_scene_state() {
             },
         )
         .unwrap();
+    assert_eq!(recovered.scene_launch_state().queued_scene_index(), None);
+    assert_eq!(
+        recovered.scene_launch_state().last_launched_scene_index(),
+        Some(0)
+    );
     assert_samples(&output_right, &fixture.scene_samples[25..50]);
 }
 

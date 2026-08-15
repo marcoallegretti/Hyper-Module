@@ -11,7 +11,7 @@ use hyper_media_cache::{
     PreparedScheduleEntry,
 };
 use hyper_playback_compiler::scene::{
-    CompiledScenePerformance, PlayingSceneClip, SceneProcessError, SceneRuntime,
+    CompiledScenePerformance, PlayingSceneClip, SceneLaunchState, SceneProcessError, SceneRuntime,
     SceneRuntimeCheckpoint, SceneRuntimeError, SceneSegment,
 };
 
@@ -978,6 +978,11 @@ impl<'authority, 'resource, 'prepared, 'cache, 'binding>
         self.audio.scene_availability(scene_index)
     }
 
+    #[must_use]
+    pub fn scene_launch_state(&self) -> SceneLaunchState {
+        self.runtime.launch_state()
+    }
+
     /// Queues one prevalidated interactive scene for its launch boundary.
     ///
     /// # Errors
@@ -1425,6 +1430,11 @@ impl<'prepared, 'authority, 'cache, 'schedule, 'resource>
     #[must_use]
     pub fn scene_availability(&self, scene_index: usize) -> PreparedSceneAvailability {
         self.scene.scene_availability(scene_index)
+    }
+
+    #[must_use]
+    pub fn scene_launch_state(&self) -> SceneLaunchState {
+        self.scene.scene_launch_state()
     }
 
     /// Queues one prevalidated interactive scene for its launch boundary.

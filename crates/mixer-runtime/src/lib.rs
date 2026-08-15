@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 mod loudness_presentation;
 mod meter_ballistics;
 mod recovery;
+pub use hyper_playback_compiler::scene::SceneLaunchState;
 pub use loudness_presentation::{
     EBU_TARGET_LOUDNESS_LUFS, EbuLoudnessPresentationConfig, EbuLoudnessScale, LoudnessDisplayUnit,
     LoudnessPresentationSnapshot, LoudnessScaleRegion, MaximumTruePeakDisplay, ScaledLoudnessValue,
@@ -1089,6 +1090,7 @@ pub struct TransportCycle {
     start_frame: usize,
     frame_count: usize,
     active_slot_count: usize,
+    scene_launch_state: SceneLaunchState,
     applied_command_count: usize,
     command_sender_disconnected: bool,
     applied_mixer_parameter_command_count: usize,
@@ -1126,6 +1128,12 @@ impl TransportCycle {
     #[must_use]
     pub const fn active_slot_count(self) -> usize {
         self.active_slot_count
+    }
+
+    /// Returns the committed interactive scene state after this cycle.
+    #[must_use]
+    pub const fn scene_launch_state(self) -> SceneLaunchState {
+        self.scene_launch_state
     }
 
     #[must_use]
@@ -1861,6 +1869,8 @@ pub trait TrackWindowRenderer: sealed::TrackWindowRenderer {
 
     fn scene_availability(&self, scene_index: usize) -> PreparedSceneAvailability;
 
+    fn scene_launch_state(&self) -> SceneLaunchState;
+
     fn queue_scene_launch(&mut self, scene_index: usize) -> Result<(), SceneRuntimeError>;
 }
 
@@ -1891,6 +1901,10 @@ impl TrackWindowRenderer for ArrangementRenderer<'_, '_, '_> {
 
     fn scene_availability(&self, _scene_index: usize) -> PreparedSceneAvailability {
         PreparedSceneAvailability::NotPrepared
+    }
+
+    fn scene_launch_state(&self) -> SceneLaunchState {
+        SceneLaunchState::default()
     }
 
     fn queue_scene_launch(&mut self, scene_index: usize) -> Result<(), SceneRuntimeError> {
@@ -1931,6 +1945,10 @@ impl<'resource> TrackWindowRenderer for PlaybackRenderer<'_, '_, '_, '_, 'resour
 
     fn scene_availability(&self, scene_index: usize) -> PreparedSceneAvailability {
         PlaybackRenderer::scene_availability(self, scene_index)
+    }
+
+    fn scene_launch_state(&self) -> SceneLaunchState {
+        PlaybackRenderer::scene_launch_state(self)
     }
 
     fn queue_scene_launch(&mut self, scene_index: usize) -> Result<(), SceneRuntimeError> {
@@ -2287,6 +2305,10 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
 
     fn scene_availability(&self, scene_index: usize) -> PreparedSceneAvailability {
         self.renderer.scene_availability(scene_index)
+    }
+
+    fn scene_launch_state(&self) -> SceneLaunchState {
+        self.renderer.scene_launch_state()
     }
 
     fn queue_scene_launch(&mut self, scene_index: usize) -> Result<(), SceneRuntimeError> {
@@ -2963,6 +2985,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 start_frame,
                 frame_count,
                 active_slot_count: 0,
+                scene_launch_state: self.runtime.scene_launch_state(),
                 applied_command_count,
                 command_sender_disconnected,
                 applied_mixer_parameter_command_count,
@@ -2994,6 +3017,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             start_frame,
             frame_count,
             active_slot_count: rendered.active_slot_count,
+            scene_launch_state: self.runtime.scene_launch_state(),
             applied_command_count,
             command_sender_disconnected,
             applied_mixer_parameter_command_count,

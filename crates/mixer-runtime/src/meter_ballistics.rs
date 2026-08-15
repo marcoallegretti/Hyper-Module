@@ -330,7 +330,7 @@ mod tests {
     use hyper_audio_engine::InterleavedStereoCallback;
 
     use super::*;
-    use crate::{TransportCycle, TransportState};
+    use crate::{SceneLaunchState, TransportCycle, TransportState};
 
     const EPSILON: f32 = 1.0e-5;
 
@@ -356,6 +356,7 @@ mod tests {
                 start_frame: 0,
                 frame_count,
                 active_slot_count: 1,
+                scene_launch_state: SceneLaunchState::default(),
                 applied_command_count: 0,
                 command_sender_disconnected: false,
                 applied_mixer_parameter_command_count: 0,
