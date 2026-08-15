@@ -241,11 +241,12 @@ pub struct MediaAssetFact<'a> {
     pub frame_count: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AudioClipGainValidationView<'a> {
     asset_id: &'a str,
     source_start_frame: usize,
     source_frame_count: usize,
+    gain_decibels: f64,
 }
 
 impl AudioClipGainValidationView<'_> {
@@ -262,6 +263,11 @@ impl AudioClipGainValidationView<'_> {
     #[must_use]
     pub const fn source_frame_count(&self) -> usize {
         self.source_frame_count
+    }
+
+    #[must_use]
+    pub const fn gain_decibels(&self) -> f64 {
+        self.gain_decibels
     }
 }
 
@@ -3769,6 +3775,7 @@ impl LoadedPlaybackProject {
                 asset_id: &clip.asset_id,
                 source_start_frame: clip.source_start_frame,
                 source_frame_count: clip.source_frame_count,
+                gain_decibels: clip.gain_decibels,
             })
     }
 

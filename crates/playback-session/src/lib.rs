@@ -101,6 +101,15 @@ pub enum AudioClipGainValidationError {
     Native(ClipPlanError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioClipSourceSlipValidationError {
+    ClipMissing,
+    MediaMissing,
+    SourceRangeOverflow,
+    SourceOutsideMedia,
+    NativeGain(ClipPlanError),
+}
+
 impl fmt::Display for AudioClipGainValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -123,6 +132,41 @@ impl Error for AudioClipGainValidationError {
         match self {
             Self::Native(source) => Some(source),
             Self::ClipMissing | Self::MediaMissing | Self::SourceRangeOverflow => None,
+        }
+    }
+}
+
+impl fmt::Display for AudioClipSourceSlipValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClipMissing => formatter.write_str("audio clip is missing from the project"),
+            Self::MediaMissing => {
+                formatter.write_str("audio clip references unavailable decoded media")
+            }
+            Self::SourceRangeOverflow => {
+                formatter.write_str("audio-clip source range arithmetic overflowed")
+            }
+            Self::SourceOutsideMedia => {
+                formatter.write_str("audio-clip source view exceeds decoded media")
+            }
+            Self::NativeGain(source) => {
+                write!(
+                    formatter,
+                    "audio-clip source view is unsafe at persisted gain: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for AudioClipSourceSlipValidationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::NativeGain(source) => Some(source),
+            Self::ClipMissing
+            | Self::MediaMissing
+            | Self::SourceRangeOverflow
+            | Self::SourceOutsideMedia => None,
         }
     }
 }
@@ -318,6 +362,45 @@ impl PreparedPlaybackSession {
         )
         .map(|_| ())
         .map_err(AudioClipGainValidationError::Native)
+    }
+
+    /// Validates a candidate source-slip start against the exact decoded media
+    /// and the clip's persisted native gain.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified rejection when the clip/media binding is missing,
+    /// the retained frame count cannot fit at the requested start, or applying
+    /// the persisted gain to the candidate samples would overflow.
+    pub fn validate_audio_clip_source_start(
+        &self,
+        clip_id: &str,
+        source_start_frame: usize,
+    ) -> Result<(), AudioClipSourceSlipValidationError> {
+        let view = self
+            .project
+            .audio_clip_gain_validation_view(clip_id)
+            .ok_or(AudioClipSourceSlipValidationError::ClipMissing)?;
+        let source_end = source_start_frame
+            .checked_add(view.source_frame_count())
+            .ok_or(AudioClipSourceSlipValidationError::SourceRangeOverflow)?;
+        let source = self
+            .media
+            .decoded_audio(view.asset_id())
+            .ok_or(AudioClipSourceSlipValidationError::MediaMissing)?;
+        if source_end > source.frame_count() {
+            return Err(AudioClipSourceSlipValidationError::SourceOutsideMedia);
+        }
+        validate_native_clip_gain(
+            source,
+            FrameRange {
+                start: source_start_frame,
+                end: source_end,
+            },
+            view.gain_decibels(),
+        )
+        .map(|_| ())
+        .map_err(AudioClipSourceSlipValidationError::NativeGain)
     }
 
     #[must_use]
@@ -843,6 +926,43 @@ mod tests {
             session
                 .validate_audio_clip_gain("018f47a2-6b2d-7c11-8a44-001122337503", -6.0,)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn candidate_source_slip_is_validated_against_media_and_persisted_gain() {
+        let mut samples = vec![0.0; 100];
+        samples.extend([f32::MAX; 100]);
+        let loud_tail = DecodedPlaybackAsset::new(
+            "018f47a2-6b2d-7c11-8a44-001122337504".to_owned(),
+            DecodedAudio::from_mono(48_000, samples).unwrap(),
+        );
+        let mut input = input(vec![loud_tail]);
+        input.documents.clips[0] = String::from_utf8(input.documents.clips[0].clone())
+            .unwrap()
+            .replace(
+                r#""gain_decibels":0"#,
+                r#""gain_decibels":6.020599913279624"#,
+            )
+            .into_bytes();
+        input.limits.media_cache.max_frames_per_asset = 200;
+        input.limits.media_cache.max_decoded_sample_bytes = 1_600;
+        let session = assemble_playback_session(input).unwrap();
+
+        assert!(
+            session
+                .validate_audio_clip_source_start("018f47a2-6b2d-7c11-8a44-001122337503", 0,)
+                .is_ok()
+        );
+        assert!(matches!(
+            session.validate_audio_clip_source_start("018f47a2-6b2d-7c11-8a44-001122337503", 100,),
+            Err(AudioClipSourceSlipValidationError::NativeGain(
+                ClipPlanError::SampleGainOverflow
+            ))
+        ));
+        assert_eq!(
+            session.validate_audio_clip_source_start("018f47a2-6b2d-7c11-8a44-001122337503", 101,),
+            Err(AudioClipSourceSlipValidationError::SourceOutsideMedia)
         );
     }
 

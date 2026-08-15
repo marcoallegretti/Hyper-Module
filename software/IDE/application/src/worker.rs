@@ -24,14 +24,14 @@ use super::{
     IdeArrangementPlacementEditError, IdeAudioClipActivationEditError,
     IdeAudioClipDuplicationError, IdeAudioClipFadeEditError, IdeAudioClipGainEditError,
     IdeAudioClipLoopEditError, IdeAudioClipRenameEditError, IdeAudioClipReverseEditError,
-    IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
-    IdeAudioPreviewError, IdeAudioTrackAdditionError, IdeAudioTrackEditError,
-    IdeAudioTrackRemovalError, IdeCloseOutcome, IdeInputDiscoveryError, IdeInputSelection,
-    IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError, IdeMixerChannelKind,
-    IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError, IdeMixerMainState,
-    IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState, IdeNativeCloseFailure,
-    IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError, IdeOutputTestError,
-    IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
+    IdeAudioClipSourceSlipEditError, IdeAudioInputInventory, IdeAudioOutputInventory,
+    IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioTrackAdditionError,
+    IdeAudioTrackEditError, IdeAudioTrackRemovalError, IdeCloseOutcome, IdeInputDiscoveryError,
+    IdeInputSelection, IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError,
+    IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
+    IdeMixerMainState, IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState,
+    IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError,
+    IdeOutputTestError, IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
     IdePendingCloseWait, IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait,
     IdePendingSaveCloseWait, IdeProjectOpenError, IdeProjectSaveError, IdeRecordingAbortError,
     IdeRecordingAbortOutcome, IdeRecordingClipCreationError, IdeRecordingError,
@@ -142,6 +142,7 @@ pub enum IdeWorkerCommandKind {
     SetAudioClipFades,
     SetAudioClipLoop,
     SetAudioClipReverse,
+    SetAudioClipSourceStart,
     StartRecording,
     StopRecording,
     AbortRecording,
@@ -264,6 +265,10 @@ pub enum IdeWorkerCommand {
         clip_id: String,
         reverse: bool,
     },
+    SetAudioClipSourceStart {
+        clip_id: String,
+        source_start_frame: u64,
+    },
     StartRecording {
         channel_index: usize,
     },
@@ -334,6 +339,7 @@ impl IdeWorkerCommand {
             Self::SetAudioClipFades { .. } => IdeWorkerCommandKind::SetAudioClipFades,
             Self::SetAudioClipLoop { .. } => IdeWorkerCommandKind::SetAudioClipLoop,
             Self::SetAudioClipReverse { .. } => IdeWorkerCommandKind::SetAudioClipReverse,
+            Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
             Self::StartRecording { .. } => IdeWorkerCommandKind::StartRecording,
             Self::StopRecording => IdeWorkerCommandKind::StopRecording,
             Self::AbortRecording => IdeWorkerCommandKind::AbortRecording,
@@ -597,6 +603,8 @@ pub struct IdeAudioClip {
     track_id: String,
     track_name: String,
     duration_ticks: u64,
+    source_start_frame: usize,
+    source_frame_count: usize,
     active: bool,
     gain_decibels: f64,
     loop_enabled: bool,
@@ -631,6 +639,16 @@ impl IdeAudioClip {
     #[must_use]
     pub const fn duration_ticks(&self) -> u64 {
         self.duration_ticks
+    }
+
+    #[must_use]
+    pub const fn source_start_frame(&self) -> usize {
+        self.source_start_frame
+    }
+
+    #[must_use]
+    pub const fn source_frame_count(&self) -> usize {
+        self.source_frame_count
     }
 
     #[must_use]
@@ -938,6 +956,7 @@ pub enum IdeWorkerCommandFailure {
     AudioClipFades(Box<IdeAudioClipFadeEditError>),
     AudioClipLoop(Box<IdeAudioClipLoopEditError>),
     AudioClipReverse(Box<IdeAudioClipReverseEditError>),
+    AudioClipSourceSlip(Box<IdeAudioClipSourceSlipEditError>),
     Recording(IdeRecordingError),
     AudioPreview(IdeAudioPreviewError),
     InvalidState,
@@ -985,6 +1004,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioClipFades(source) => source.fmt(formatter),
             Self::AudioClipLoop(source) => source.fmt(formatter),
             Self::AudioClipReverse(source) => source.fmt(formatter),
+            Self::AudioClipSourceSlip(source) => source.fmt(formatter),
             Self::Recording(source) => source.fmt(formatter),
             Self::AudioPreview(source) => source.fmt(formatter),
             Self::InvalidState => {
@@ -1038,6 +1058,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioClipFades(source) => Some(source),
             Self::AudioClipLoop(source) => Some(source),
             Self::AudioClipReverse(source) => Some(source),
+            Self::AudioClipSourceSlip(source) => Some(source),
             Self::Recording(source) => Some(source),
             Self::AudioPreview(source) => Some(source),
             Self::Publication(source) => Some(source),
@@ -1057,6 +1078,7 @@ pub enum IdeAudioClipEditCommittedWarning {
     Fades(Box<IdeAudioClipFadeEditError>),
     Loop(Box<IdeAudioClipLoopEditError>),
     Reverse(Box<IdeAudioClipReverseEditError>),
+    SourceSlip(Box<IdeAudioClipSourceSlipEditError>),
 }
 
 impl fmt::Display for IdeAudioClipEditCommittedWarning {
@@ -1068,6 +1090,7 @@ impl fmt::Display for IdeAudioClipEditCommittedWarning {
             Self::Fades(source) => source.fmt(formatter),
             Self::Loop(source) => source.fmt(formatter),
             Self::Reverse(source) => source.fmt(formatter),
+            Self::SourceSlip(source) => source.fmt(formatter),
         }
     }
 }
@@ -1081,6 +1104,7 @@ impl Error for IdeAudioClipEditCommittedWarning {
             Self::Fades(source) => Some(source),
             Self::Loop(source) => Some(source),
             Self::Reverse(source) => Some(source),
+            Self::SourceSlip(source) => Some(source),
         }
     }
 }
@@ -1214,6 +1238,11 @@ pub enum IdeWorkerEvent {
         changed: bool,
         reverse: bool,
     },
+    AudioClipSourceStartChanged {
+        revision: u64,
+        changed: bool,
+        source_start_frame: u64,
+    },
     RecordingPreparing,
     Recording(IdeRecordingState),
     RecordingFinalizing,
@@ -1271,6 +1300,9 @@ pub enum IdeWorkerEvent {
     },
     AudioClipReverseChanging {
         reverse: bool,
+    },
+    AudioClipSourceStartChanging {
+        source_start_frame: u64,
     },
     Closing,
     CommandFailed {
@@ -1673,6 +1705,10 @@ enum ProjectMutation {
         clip_id: String,
         reverse: bool,
     },
+    SetAudioClipSourceStart {
+        clip_id: String,
+        source_start_frame: u64,
+    },
 }
 
 impl ProjectMutation {
@@ -1711,6 +1747,7 @@ impl ProjectMutation {
             Self::SetAudioClipFades { .. } => IdeWorkerCommandKind::SetAudioClipFades,
             Self::SetAudioClipLoop { .. } => IdeWorkerCommandKind::SetAudioClipLoop,
             Self::SetAudioClipReverse { .. } => IdeWorkerCommandKind::SetAudioClipReverse,
+            Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
         }
     }
 
@@ -1787,6 +1824,11 @@ impl ProjectMutation {
             Self::SetAudioClipReverse { reverse, .. } => {
                 IdeWorkerEvent::AudioClipReverseChanging { reverse: *reverse }
             }
+            Self::SetAudioClipSourceStart {
+                source_start_frame, ..
+            } => IdeWorkerEvent::AudioClipSourceStartChanging {
+                source_start_frame: *source_start_frame,
+            },
         }
     }
 }
@@ -1994,7 +2036,8 @@ fn process_command(
         | IdeWorkerCommand::SetAudioClipGain { .. }
         | IdeWorkerCommand::SetAudioClipFades { .. }
         | IdeWorkerCommand::SetAudioClipLoop { .. }
-        | IdeWorkerCommand::SetAudioClipReverse { .. }) => {
+        | IdeWorkerCommand::SetAudioClipReverse { .. }
+        | IdeWorkerCommand::SetAudioClipSourceStart { .. }) => {
             process_project_mutation_command(state, command, events)
         }
         IdeWorkerCommand::StartRecording { channel_index } => {
@@ -2142,6 +2185,10 @@ fn process_project_mutation_command(
         IdeWorkerCommand::SetAudioClipReverse { clip_id, reverse } => {
             set_audio_clip_reverse(state, events, &clip_id, reverse)
         }
+        IdeWorkerCommand::SetAudioClipSourceStart {
+            clip_id,
+            source_start_frame,
+        } => set_audio_clip_source_start(state, events, &clip_id, source_start_frame),
         _ => unreachable!("only project-mutation commands are routed to this handler"),
     }
 }
@@ -3887,6 +3934,42 @@ fn set_audio_clip_reverse(
     )
 }
 
+fn set_audio_clip_source_start(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    clip_id: &str,
+    source_start_frame: u64,
+) -> bool {
+    if clip_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SetAudioClipSourceStart,
+            IdeWorkerCommandFailure::AudioClipSourceSlip(Box::new(
+                IdeAudioClipSourceSlipEditError::InvalidClipIdentity,
+            )),
+        );
+    }
+    let mut owned_clip_id = String::new();
+    if owned_clip_id.try_reserve_exact(clip_id.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SetAudioClipSourceStart,
+            IdeWorkerCommandFailure::AudioClipSourceSlip(Box::new(
+                IdeAudioClipSourceSlipEditError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_clip_id.push_str(clip_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::SetAudioClipSourceStart {
+            clip_id: owned_clip_id,
+            source_start_frame,
+        },
+    )
+}
+
 fn begin_project_mutation_request(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -4038,6 +4121,11 @@ fn project_mutation_save_failure(
         ProjectMutation::SetAudioClipReverse { .. } => IdeWorkerCommandFailure::AudioClipReverse(
             Box::new(IdeAudioClipReverseEditError::MixerSave(Box::new(reason))),
         ),
+        ProjectMutation::SetAudioClipSourceStart { .. } => {
+            IdeWorkerCommandFailure::AudioClipSourceSlip(Box::new(
+                IdeAudioClipSourceSlipEditError::MixerSave(Box::new(reason)),
+            ))
+        }
     }
 }
 
@@ -4187,6 +4275,11 @@ fn project_mutation_native_close_failure(
         ProjectMutation::SetAudioClipReverse { .. } => IdeWorkerCommandFailure::AudioClipReverse(
             Box::new(IdeAudioClipReverseEditError::NativeClose(failure)),
         ),
+        ProjectMutation::SetAudioClipSourceStart { .. } => {
+            IdeWorkerCommandFailure::AudioClipSourceSlip(Box::new(
+                IdeAudioClipSourceSlipEditError::NativeClose(failure),
+            ))
+        }
     }
 }
 
@@ -4310,6 +4403,13 @@ enum ProjectMutationAttempt {
             IdeAudioClipReverseEditError,
         >,
     },
+    SetAudioClipSourceStart {
+        source_start_frame: u64,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeAudioClipSourceSlipEditError,
+        >,
+    },
 }
 
 fn publish_arrangement_edit_failure(
@@ -4413,6 +4513,18 @@ pub(super) fn audio_clip_reverse_edit_failure_event(
         IdeAudioClipReverseEditError::publication_committed,
         IdeAudioClipEditCommittedWarning::Reverse,
         IdeWorkerCommandFailure::AudioClipReverse,
+    )
+}
+
+pub(super) fn audio_clip_source_slip_edit_failure_event(
+    reason: IdeAudioClipSourceSlipEditError,
+) -> IdeWorkerEvent {
+    audio_clip_edit_failure_event(
+        IdeWorkerCommandKind::SetAudioClipSourceStart,
+        reason,
+        IdeAudioClipSourceSlipEditError::publication_committed,
+        IdeAudioClipEditCommittedWarning::SourceSlip,
+        IdeWorkerCommandFailure::AudioClipSourceSlip,
     )
 }
 
@@ -4820,6 +4932,21 @@ fn complete_project_mutation(
                     result: Err(reason),
                     ..
                 } => send_event(events, audio_clip_reverse_edit_failure_event(reason)),
+                ProjectMutationAttempt::SetAudioClipSourceStart {
+                    source_start_frame,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::AudioClipSourceStartChanged {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                        source_start_frame,
+                    },
+                ),
+                ProjectMutationAttempt::SetAudioClipSourceStart {
+                    result: Err(reason),
+                    ..
+                } => send_event(events, audio_clip_source_slip_edit_failure_event(reason)),
             }
         }
         Err(failure) => {
@@ -5141,6 +5268,19 @@ fn attempt_project_mutation(
                 ),
             }
         }
+        ProjectMutation::SetAudioClipSourceStart {
+            clip_id,
+            source_start_frame,
+        } => ProjectMutationAttempt::SetAudioClipSourceStart {
+            source_start_frame,
+            result: attempt_audio_clip_source_slip(
+                application,
+                recovery,
+                &clip_id,
+                source_start_frame,
+                native_failure,
+            ),
+        },
     }
 }
 
@@ -5476,6 +5616,29 @@ fn attempt_audio_clip_reverse(
     })
 }
 
+fn attempt_audio_clip_source_slip(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    clip_id: &str,
+    source_start_frame: u64,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAudioClipSourceSlipEditError>
+{
+    if let Some(failure) = native_failure {
+        return Err(IdeAudioClipSourceSlipEditError::NativeClose(failure));
+    }
+    RunningDesktopIdeApplication::prepare_audio_clip_source_slip(
+        application,
+        recovery,
+        clip_id,
+        source_start_frame,
+    )
+    .and_then(|plan| {
+        plan.publish()
+            .map_err(|source| IdeAudioClipSourceSlipEditError::Publication(Box::new(source)))
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "every mutation outcome retains its command-specific recovery evidence"
@@ -5664,6 +5827,9 @@ fn project_mutation_reopen_failure(
         }
         ProjectMutationAttempt::SetAudioClipReverse { result, .. } => {
             audio_clip_reverse_edit_reopen_failure(result, reopen)
+        }
+        ProjectMutationAttempt::SetAudioClipSourceStart { result, .. } => {
+            audio_clip_source_slip_edit_reopen_failure(result, reopen)
         }
     }
 }
@@ -5931,6 +6097,38 @@ fn audio_clip_reverse_edit_reopen_failure(
         },
     };
     IdeWorkerCommandFailure::AudioClipReverse(Box::new(reason))
+}
+
+fn audio_clip_source_slip_edit_reopen_failure(
+    result: Result<
+        hyper_storage_engine::ProjectResourcePublicationOutcome,
+        IdeAudioClipSourceSlipEditError,
+    >,
+    reopen: IdeProjectOpenError,
+) -> IdeWorkerCommandFailure {
+    let reason = match result {
+        Ok(outcome) => IdeAudioClipSourceSlipEditError::ReopenAfterPublication {
+            outcome,
+            source: Box::new(reopen),
+        },
+        Err(IdeAudioClipSourceSlipEditError::Publication(publication)) => {
+            IdeAudioClipSourceSlipEditError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(IdeAudioClipSourceSlipEditError::NativeClose(close)) => {
+            IdeAudioClipSourceSlipEditError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(preparation) => IdeAudioClipSourceSlipEditError::ReopenAfterPreparation {
+            preparation: Box::new(preparation),
+            reopen: Box::new(reopen),
+        },
+    };
+    IdeWorkerCommandFailure::AudioClipSourceSlip(Box::new(reason))
 }
 
 fn arrangement_placement_edit_reopen_failure(
@@ -6346,6 +6544,14 @@ fn running_observation(
             duration_ticks: snapshot
                 .loaded
                 .clip_duration_ticks_at(clip_index)
+                .ok_or(IdeWorkerCommandFailure::ProjectSnapshotUnavailable)?,
+            source_start_frame: snapshot
+                .loaded
+                .clip_source_start_frame_at(clip_index)
+                .ok_or(IdeWorkerCommandFailure::ProjectSnapshotUnavailable)?,
+            source_frame_count: snapshot
+                .loaded
+                .clip_source_frame_count_at(clip_index)
                 .ok_or(IdeWorkerCommandFailure::ProjectSnapshotUnavailable)?,
             active: snapshot
                 .loaded
@@ -8651,6 +8857,63 @@ mod tests {
                 command: IdeWorkerCommandKind::SetAudioClipReverse,
                 reason: IdeWorkerCommandFailure::AudioClipReverse(reason),
             } if matches!(reason.as_ref(), IdeAudioClipReverseEditError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn audio_clip_source_slip_validates_identity_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SetAudioClipSourceStart {
+                clip_id: String::new(),
+                source_start_frame: 25,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetAudioClipSourceStart,
+                reason: IdeWorkerCommandFailure::AudioClipSourceSlip(reason),
+            } if matches!(reason.as_ref(), IdeAudioClipSourceSlipEditError::InvalidClipIdentity)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SetAudioClipSourceStart {
+                clip_id: "018f47a2-6b2d-7c11-8a44-001122334460".to_owned(),
+                source_start_frame: 25,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioClipSourceStartChanging {
+                source_start_frame: 25
+            }
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetAudioClipSourceStart,
+                reason: IdeWorkerCommandFailure::AudioClipSourceSlip(reason),
+            } if matches!(reason.as_ref(), IdeAudioClipSourceSlipEditError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
