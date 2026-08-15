@@ -37,10 +37,10 @@ use super::{
     IdePendingSaveCloseWait, IdeProjectOpenError, IdeProjectSaveError, IdeRecordingAbortError,
     IdeRecordingAbortOutcome, IdeRecordingClipCreationError, IdeRecordingError,
     IdeRecordingImportOutcome, IdeRecordingObservation, IdeSaveCloseOutcome, IdeSceneAvailability,
-    IdeSceneCreationError, IdeSceneEditError, IdeSceneLaunchQuantization, IdeSceneRenameError,
-    IdeSceneSlotEdit, IdeSceneSlotEditError, IdeTransportSeekError, InputInventoryError,
-    LocateState, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
-    OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication,
+    IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization,
+    IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError, IdeTransportSeekError,
+    InputInventoryError, LocateState, OutputInventoryError, OutputStreamSnapshot,
+    OutputStreamState, OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -146,6 +146,7 @@ pub enum IdeWorkerCommandKind {
     SetAudioClipReverse,
     SetAudioClipSourceStart,
     AddScene,
+    DuplicateScene,
     SetSceneSlot,
     RenameScene,
     SetSceneActive,
@@ -279,6 +280,10 @@ pub enum IdeWorkerCommand {
         name: String,
         quantization: IdeSceneLaunchQuantization,
     },
+    DuplicateScene {
+        scene_id: String,
+        name: String,
+    },
     SetSceneSlot {
         scene_id: String,
         track_id: String,
@@ -364,6 +369,7 @@ impl IdeWorkerCommand {
             Self::SetAudioClipReverse { .. } => IdeWorkerCommandKind::SetAudioClipReverse,
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
+            Self::DuplicateScene { .. } => IdeWorkerCommandKind::DuplicateScene,
             Self::SetSceneSlot { .. } => IdeWorkerCommandKind::SetSceneSlot,
             Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
             Self::SetSceneActive { .. } => IdeWorkerCommandKind::SetSceneActive,
@@ -1036,6 +1042,7 @@ pub enum IdeWorkerCommandFailure {
     AudioClipReverse(Box<IdeAudioClipReverseEditError>),
     AudioClipSourceSlip(Box<IdeAudioClipSourceSlipEditError>),
     SceneCreation(Box<IdeSceneCreationError>),
+    SceneDuplication(Box<IdeSceneDuplicationError>),
     SceneSlotEdit(Box<IdeSceneSlotEditError>),
     SceneRename(Box<IdeSceneRenameError>),
     SceneActivation(Box<IdeSceneEditError>),
@@ -1088,6 +1095,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioClipReverse(source) => source.fmt(formatter),
             Self::AudioClipSourceSlip(source) => source.fmt(formatter),
             Self::SceneCreation(source) => source.fmt(formatter),
+            Self::SceneDuplication(source) => source.fmt(formatter),
             Self::SceneSlotEdit(source) => source.fmt(formatter),
             Self::SceneRename(source) | Self::SceneActivation(source) => source.fmt(formatter),
             Self::Recording(source) => source.fmt(formatter),
@@ -1145,6 +1153,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioClipReverse(source) => Some(source),
             Self::AudioClipSourceSlip(source) => Some(source),
             Self::SceneCreation(source) => Some(source),
+            Self::SceneDuplication(source) => Some(source),
             Self::SceneSlotEdit(source) => Some(source),
             Self::SceneRename(source) | Self::SceneActivation(source) => Some(source),
             Self::Recording(source) => Some(source),
@@ -1340,6 +1349,15 @@ pub enum IdeWorkerEvent {
         name: String,
         warning: Box<IdeSceneCreationError>,
     },
+    SceneDuplicated {
+        revision: u64,
+        scene_id: String,
+        name: String,
+    },
+    SceneDuplicationCommittedWithWarning {
+        name: String,
+        warning: Box<IdeSceneDuplicationError>,
+    },
     SceneSlotChanged {
         revision: u64,
         changed: bool,
@@ -1429,6 +1447,7 @@ pub enum IdeWorkerEvent {
         source_start_frame: u64,
     },
     SceneAdding,
+    SceneDuplicating,
     SceneSlotChanging {
         edit: IdeSceneSlotEdit,
     },
@@ -1845,6 +1864,10 @@ enum ProjectMutation {
         name: String,
         quantization: IdeSceneLaunchQuantization,
     },
+    DuplicateScene {
+        scene_id: String,
+        name: String,
+    },
     SetSceneSlot {
         scene_id: String,
         track_id: String,
@@ -1898,6 +1921,7 @@ impl ProjectMutation {
             Self::SetAudioClipReverse { .. } => IdeWorkerCommandKind::SetAudioClipReverse,
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
+            Self::DuplicateScene { .. } => IdeWorkerCommandKind::DuplicateScene,
             Self::SetSceneSlot { .. } => IdeWorkerCommandKind::SetSceneSlot,
             Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
             Self::SetSceneActive { .. } => IdeWorkerCommandKind::SetSceneActive,
@@ -1983,6 +2007,7 @@ impl ProjectMutation {
                 source_start_frame: *source_start_frame,
             },
             Self::AddScene { .. } => IdeWorkerEvent::SceneAdding,
+            Self::DuplicateScene { .. } => IdeWorkerEvent::SceneDuplicating,
             Self::SetSceneSlot { edit, .. } => {
                 IdeWorkerEvent::SceneSlotChanging { edit: edit.clone() }
             }
@@ -2200,6 +2225,7 @@ fn process_command(
         | IdeWorkerCommand::SetAudioClipReverse { .. }
         | IdeWorkerCommand::SetAudioClipSourceStart { .. }
         | IdeWorkerCommand::AddScene { .. }
+        | IdeWorkerCommand::DuplicateScene { .. }
         | IdeWorkerCommand::SetSceneSlot { .. }
         | IdeWorkerCommand::RenameScene { .. }
         | IdeWorkerCommand::SetSceneActive { .. }) => {
@@ -2356,6 +2382,9 @@ fn process_project_mutation_command(
         } => set_audio_clip_source_start(state, events, &clip_id, source_start_frame),
         IdeWorkerCommand::AddScene { name, quantization } => {
             add_scene(state, events, &name, quantization)
+        }
+        IdeWorkerCommand::DuplicateScene { scene_id, name } => {
+            duplicate_scene(state, events, &scene_id, &name)
         }
         IdeWorkerCommand::SetSceneSlot {
             scene_id,
@@ -4010,6 +4039,52 @@ fn add_scene(
     )
 }
 
+fn duplicate_scene(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    scene_id: &str,
+    name: &str,
+) -> bool {
+    let name = name.trim();
+    let invalid = if scene_id.is_empty() {
+        Some(IdeSceneDuplicationError::InvalidSourceSceneIdentity)
+    } else if name.is_empty() || name.chars().count() > 120 {
+        Some(IdeSceneDuplicationError::InvalidName)
+    } else {
+        None
+    };
+    if let Some(reason) = invalid {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::DuplicateScene,
+            IdeWorkerCommandFailure::SceneDuplication(Box::new(reason)),
+        );
+    }
+    let mut owned_scene_id = String::new();
+    let mut owned_name = String::new();
+    if owned_scene_id.try_reserve_exact(scene_id.len()).is_err()
+        || owned_name.try_reserve_exact(name.len()).is_err()
+    {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::DuplicateScene,
+            IdeWorkerCommandFailure::SceneDuplication(Box::new(
+                IdeSceneDuplicationError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_scene_id.push_str(scene_id);
+    owned_name.push_str(name);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::DuplicateScene {
+            scene_id: owned_scene_id,
+            name: owned_name,
+        },
+    )
+}
+
 fn set_scene_slot(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -4492,6 +4567,9 @@ fn project_mutation_save_failure(
         ProjectMutation::AddScene { .. } => IdeWorkerCommandFailure::SceneCreation(Box::new(
             IdeSceneCreationError::MixerSave(Box::new(reason)),
         )),
+        ProjectMutation::DuplicateScene { .. } => IdeWorkerCommandFailure::SceneDuplication(
+            Box::new(IdeSceneDuplicationError::MixerSave(Box::new(reason))),
+        ),
         ProjectMutation::SetSceneSlot { .. } => IdeWorkerCommandFailure::SceneSlotEdit(Box::new(
             IdeSceneSlotEditError::MixerSave(Box::new(reason)),
         )),
@@ -4662,6 +4740,9 @@ fn project_mutation_native_close_failure(
         ProjectMutation::AddScene { .. } => IdeWorkerCommandFailure::SceneCreation(Box::new(
             IdeSceneCreationError::NativeClose(failure),
         )),
+        ProjectMutation::DuplicateScene { .. } => IdeWorkerCommandFailure::SceneDuplication(
+            Box::new(IdeSceneDuplicationError::NativeClose(failure)),
+        ),
         ProjectMutation::SetSceneSlot { .. } => IdeWorkerCommandFailure::SceneSlotEdit(Box::new(
             IdeSceneSlotEditError::NativeClose(failure),
         )),
@@ -4810,6 +4891,13 @@ enum ProjectMutationAttempt {
         name: String,
         result:
             Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeSceneCreationError>,
+    },
+    DuplicateScene {
+        name: String,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeSceneDuplicationError,
+        >,
     },
     RenameScene {
         name: String,
@@ -4968,6 +5056,23 @@ pub(super) fn scene_creation_failure_event(
         IdeWorkerEvent::CommandFailed {
             command: IdeWorkerCommandKind::AddScene,
             reason: IdeWorkerCommandFailure::SceneCreation(Box::new(reason)),
+        }
+    }
+}
+
+pub(super) fn scene_duplication_failure_event(
+    name: String,
+    reason: IdeSceneDuplicationError,
+) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::SceneDuplicationCommittedWithWarning {
+            name,
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::DuplicateScene,
+            reason: IdeWorkerCommandFailure::SceneDuplication(Box::new(reason)),
         }
     }
 }
@@ -5440,6 +5545,21 @@ fn complete_project_mutation(
                     name,
                     result: Err(reason),
                 } => send_event(events, scene_creation_failure_event(name, reason)),
+                ProjectMutationAttempt::DuplicateScene {
+                    name,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::SceneDuplicated {
+                        revision: outcome.project_revision(),
+                        scene_id: outcome.resource_id().to_owned(),
+                        name,
+                    },
+                ),
+                ProjectMutationAttempt::DuplicateScene {
+                    name,
+                    result: Err(reason),
+                } => send_event(events, scene_duplication_failure_event(name, reason)),
                 ProjectMutationAttempt::SetSceneSlot {
                     edit,
                     result: Ok(outcome),
@@ -5836,6 +5956,26 @@ fn attempt_project_mutation(
                 })
             },
         },
+        ProjectMutation::DuplicateScene { scene_id, name } => {
+            ProjectMutationAttempt::DuplicateScene {
+                name: name.clone(),
+                result: if let Some(failure) = native_failure {
+                    Err(IdeSceneDuplicationError::NativeClose(failure))
+                } else {
+                    RunningDesktopIdeApplication::prepare_scene_duplication(
+                        application,
+                        recovery,
+                        &scene_id,
+                        &name,
+                    )
+                    .and_then(|plan| {
+                        plan.publish().map_err(|source| {
+                            IdeSceneDuplicationError::Publication(Box::new(source))
+                        })
+                    })
+                },
+            }
+        }
         ProjectMutation::SetSceneSlot {
             scene_id,
             track_id,
@@ -6447,6 +6587,9 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::AddScene { result, .. } => {
             scene_creation_reopen_failure(result, reopen)
         }
+        ProjectMutationAttempt::DuplicateScene { result, .. } => {
+            scene_duplication_reopen_failure(result, reopen)
+        }
         ProjectMutationAttempt::SetSceneSlot { result, .. } => {
             scene_slot_edit_reopen_failure(result, reopen)
         }
@@ -6486,6 +6629,38 @@ fn scene_creation_reopen_failure(
         },
     };
     IdeWorkerCommandFailure::SceneCreation(Box::new(reason))
+}
+
+pub(super) fn scene_duplication_reopen_failure(
+    result: Result<
+        hyper_storage_engine::ProjectResourcePublicationOutcome,
+        IdeSceneDuplicationError,
+    >,
+    reopen: IdeProjectOpenError,
+) -> IdeWorkerCommandFailure {
+    let reason = match result {
+        Ok(outcome) => IdeSceneDuplicationError::ReopenAfterPublication {
+            outcome,
+            source: Box::new(reopen),
+        },
+        Err(IdeSceneDuplicationError::Publication(publication)) => {
+            IdeSceneDuplicationError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(IdeSceneDuplicationError::NativeClose(close)) => {
+            IdeSceneDuplicationError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(preparation) => IdeSceneDuplicationError::ReopenAfterPreparation {
+            preparation: Box::new(preparation),
+            reopen: Box::new(reopen),
+        },
+    };
+    IdeWorkerCommandFailure::SceneDuplication(Box::new(reason))
 }
 
 fn scene_slot_edit_reopen_failure(
@@ -9396,6 +9571,68 @@ mod tests {
                 command: IdeWorkerCommandKind::AddScene,
                 reason: IdeWorkerCommandFailure::SceneCreation(reason),
             } if matches!(reason.as_ref(), IdeSceneCreationError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn scene_duplication_validates_input_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 5, 10).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        for (scene_id, name, expected) in [
+            (
+                "",
+                "Copy",
+                IdeSceneDuplicationError::InvalidSourceSceneIdentity,
+            ),
+            ("scene", "   ", IdeSceneDuplicationError::InvalidName),
+        ] {
+            worker
+                .try_send(IdeWorkerCommand::DuplicateScene {
+                    scene_id: scene_id.to_owned(),
+                    name: name.to_owned(),
+                })
+                .unwrap();
+            let event = recv(&worker);
+            assert!(matches!(
+                event,
+                IdeWorkerEvent::CommandFailed {
+                    command: IdeWorkerCommandKind::DuplicateScene,
+                    reason: IdeWorkerCommandFailure::SceneDuplication(reason),
+                } if core::mem::discriminant(reason.as_ref()) == core::mem::discriminant(&expected)
+            ));
+        }
+
+        worker
+            .try_send(IdeWorkerCommand::DuplicateScene {
+                scene_id: "scene".to_owned(),
+                name: " Copy ".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::SceneDuplicating));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::DuplicateScene,
+                reason: IdeWorkerCommandFailure::SceneDuplication(reason),
+            } if matches!(reason.as_ref(), IdeSceneDuplicationError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);

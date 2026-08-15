@@ -58,19 +58,19 @@ use hyper_playback_json::{
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError, CompiledMixerTap,
     CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
     MixerSendBaseState, MixerStateSerializationError, SceneAdditionSerializationError,
-    SceneDocumentSerializationError, SceneRenameSerializationError, SceneSlotEdit,
-    SceneSlotEditSerializationError, serialize_arrangement_placement_activation,
-    serialize_arrangement_placement_addition, serialize_arrangement_placement_duplication,
-    serialize_arrangement_placement_duration, serialize_arrangement_placement_front_trim,
-    serialize_arrangement_placement_move, serialize_arrangement_placement_removal,
-    serialize_arrangement_placement_split, serialize_audio_clip_activation,
-    serialize_audio_clip_duplication, serialize_audio_clip_fades, serialize_audio_clip_gain,
-    serialize_audio_clip_loop, serialize_audio_clip_rename, serialize_audio_clip_reverse,
-    serialize_audio_clip_source_start, serialize_audio_track_activation,
-    serialize_audio_track_addition, serialize_audio_track_removal, serialize_audio_track_rename,
-    serialize_mixer_base_state, serialize_recording_audio_clip_addition,
-    serialize_scene_activation, serialize_scene_addition, serialize_scene_rename,
-    serialize_scene_slot_edit,
+    SceneDocumentSerializationError, SceneDuplicationSerializationError,
+    SceneRenameSerializationError, SceneSlotEdit, SceneSlotEditSerializationError,
+    serialize_arrangement_placement_activation, serialize_arrangement_placement_addition,
+    serialize_arrangement_placement_duplication, serialize_arrangement_placement_duration,
+    serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
+    serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
+    serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
+    serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_rename,
+    serialize_audio_clip_reverse, serialize_audio_clip_source_start,
+    serialize_audio_track_activation, serialize_audio_track_addition,
+    serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
+    serialize_recording_audio_clip_addition, serialize_scene_activation, serialize_scene_addition,
+    serialize_scene_duplication, serialize_scene_rename, serialize_scene_slot_edit,
 };
 use hyper_playback_session::{
     AudioClipGainValidationError, AudioClipSourceSlipValidationError, PlaybackSessionAssemblyLimits,
@@ -2765,7 +2765,7 @@ impl From<IdeSceneLaunchQuantization> for LaunchQuantization {
 }
 
 #[derive(Debug)]
-pub enum IdeSceneCreationPublicationError {
+pub enum IdeScenePublicationError {
     Mixer(Box<ProjectResourcePublicationError>),
     Scene {
         mixer: Box<ProjectResourcePublicationOutcome>,
@@ -2773,7 +2773,7 @@ pub enum IdeSceneCreationPublicationError {
     },
 }
 
-impl IdeSceneCreationPublicationError {
+impl IdeScenePublicationError {
     #[must_use]
     pub const fn scene_published(&self) -> bool {
         match self {
@@ -2783,7 +2783,7 @@ impl IdeSceneCreationPublicationError {
     }
 }
 
-impl fmt::Display for IdeSceneCreationPublicationError {
+impl fmt::Display for IdeScenePublicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Mixer(source) if source.published() => write!(
@@ -2792,15 +2792,15 @@ impl fmt::Display for IdeSceneCreationPublicationError {
             ),
             Self::Mixer(source) => write!(
                 formatter,
-                "live mixer could not be preserved before creating the scene: {source}"
+                "live mixer could not be preserved before publishing the new scene: {source}"
             ),
             Self::Scene { source, .. } if source.published() => write!(
                 formatter,
-                "scene was created, but project verification or transaction recovery is incomplete: {source}"
+                "new scene was published, but project verification or transaction recovery is incomplete: {source}"
             ),
             Self::Scene { mixer, source } if mixer.changed() => write!(
                 formatter,
-                "live mixer was preserved in project revision {} but scene creation failed: {source}",
+                "live mixer was preserved in project revision {} but new scene publication failed: {source}",
                 mixer.project_revision()
             ),
             Self::Scene { source, .. } => source.fmt(formatter),
@@ -2808,7 +2808,7 @@ impl fmt::Display for IdeSceneCreationPublicationError {
     }
 }
 
-impl Error for IdeSceneCreationPublicationError {
+impl Error for IdeScenePublicationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Mixer(source) | Self::Scene { source, .. } => Some(source),
@@ -2823,7 +2823,7 @@ pub enum IdeSceneCreationError {
     MixerSave(Box<IdeProjectSaveError>),
     Serialization(SceneAdditionSerializationError),
     CapacityUnavailable,
-    Publication(Box<IdeSceneCreationPublicationError>),
+    Publication(Box<IdeScenePublicationError>),
     NativeClose(IdeNativeCloseFailure),
     NativeCloseAndReopen {
         close: IdeNativeCloseFailure,
@@ -2838,7 +2838,7 @@ pub enum IdeSceneCreationError {
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
-        publication: Box<IdeSceneCreationPublicationError>,
+        publication: Box<IdeScenePublicationError>,
         reopen: Box<IdeProjectOpenError>,
     },
 }
@@ -2926,6 +2926,137 @@ impl Error for IdeSceneCreationError {
             Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
             Self::InvalidName
             | Self::InvalidQuantization
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeSceneDuplicationError {
+    InvalidSourceSceneIdentity,
+    InvalidName,
+    MixerSave(Box<IdeProjectSaveError>),
+    SceneResourceMissing,
+    SceneResourceRoleMismatch,
+    Storage(StorageError),
+    Serialization(SceneDuplicationSerializationError),
+    CapacityUnavailable,
+    Publication(Box<IdeScenePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeSceneDuplicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: ProjectResourcePublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<IdeScenePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeSceneDuplicationError {
+    #[must_use]
+    pub const fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication(source) => source.scene_published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. } => publication.scene_published(),
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeSceneDuplicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSourceSceneIdentity => {
+                formatter.write_str("scene duplication requires a source scene identity")
+            }
+            Self::InvalidName => {
+                formatter.write_str("duplicated scene name must contain 1 through 120 characters")
+            }
+            Self::MixerSave(source) => {
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
+            }
+            Self::SceneResourceMissing => {
+                formatter.write_str("the source scene is no longer present")
+            }
+            Self::SceneResourceRoleMismatch => {
+                formatter.write_str("the source identity is not a scene resource")
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("scene duplication capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before duplicating the scene: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before duplicating the scene ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "scene duplication preparation failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "scene {} was duplicated in project revision {} but the project could not be reopened: {source}",
+                outcome.resource_id(),
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.scene_published() => {
+                write!(
+                    formatter,
+                    "scene duplication committed with incomplete verification or recovery ({publication}) and the project could not be reopened ({reopen})"
+                )
+            }
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "scene duplication failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeSceneDuplicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidSourceSceneIdentity
+            | Self::InvalidName
+            | Self::SceneResourceMissing
+            | Self::SceneResourceRoleMismatch
             | Self::CapacityUnavailable
             | Self::NativeClose(_) => None,
         }
@@ -4229,7 +4360,7 @@ struct IdeSceneEditPlan {
 }
 
 #[derive(Debug)]
-struct IdeSceneCreationPlan {
+struct IdeScenePublicationPlan {
     mixer: IdeMixerSavePlan,
     scene_id: String,
     scene_bytes: Vec<u8>,
@@ -4567,14 +4698,12 @@ impl IdeSceneEditPlan {
     }
 }
 
-impl IdeSceneCreationPlan {
-    fn publish(
-        &self,
-    ) -> Result<ProjectResourcePublicationOutcome, IdeSceneCreationPublicationError> {
+impl IdeScenePublicationPlan {
+    fn publish(&self) -> Result<ProjectResourcePublicationOutcome, IdeScenePublicationError> {
         let mixer = self
             .mixer
             .publish()
-            .map_err(|source| IdeSceneCreationPublicationError::Mixer(Box::new(source)))?;
+            .map_err(|source| IdeScenePublicationError::Mixer(Box::new(source)))?;
         publish_scene(
             &self.mixer.project_path,
             ScenePublicationRequest {
@@ -4583,7 +4712,7 @@ impl IdeSceneCreationPlan {
                 scene_bytes: &self.scene_bytes,
             },
         )
-        .map_err(|source| IdeSceneCreationPublicationError::Scene {
+        .map_err(|source| IdeScenePublicationError::Scene {
             mixer: Box::new(mixer),
             source: Box::new(source),
         })
@@ -5746,7 +5875,7 @@ impl RunningDesktopIdeApplication {
         recovery: &DesktopPlaybackRecovery,
         scene_name: &str,
         quantization: IdeSceneLaunchQuantization,
-    ) -> Result<IdeSceneCreationPlan, IdeSceneCreationError> {
+    ) -> Result<IdeScenePublicationPlan, IdeSceneCreationError> {
         let name_length = scene_name.chars().count();
         if scene_name.trim() != scene_name || !(1..=120).contains(&name_length) {
             return Err(IdeSceneCreationError::InvalidName);
@@ -5780,7 +5909,78 @@ impl RunningDesktopIdeApplication {
             application.config.project_limits.session.documents,
         )
         .map_err(IdeSceneCreationError::Serialization)?;
-        Ok(IdeSceneCreationPlan {
+        Ok(IdeScenePublicationPlan {
+            mixer,
+            scene_id,
+            scene_bytes,
+        })
+    }
+
+    fn prepare_scene_duplication(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        source_scene_id: &str,
+        scene_name: &str,
+    ) -> Result<IdeScenePublicationPlan, IdeSceneDuplicationError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeSceneDuplicationError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeSceneDuplicationError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        Self::prepare_scene_duplication_from_project(
+            application,
+            mixer,
+            prepared,
+            source_scene_id,
+            scene_name,
+        )
+    }
+
+    fn prepare_scene_duplication_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        source_scene_id: &str,
+        scene_name: &str,
+    ) -> Result<IdeScenePublicationPlan, IdeSceneDuplicationError> {
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == source_scene_id)
+            .ok_or(IdeSceneDuplicationError::SceneResourceMissing)?;
+        if descriptor.role() != ResourceRole::Scene {
+            return Err(IdeSceneDuplicationError::SceneResourceRoleMismatch);
+        }
+        let source_scene = package
+            .read_resource(source_scene_id)
+            .map_err(IdeSceneDuplicationError::Storage)?;
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeSceneDuplicationError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let scene_id = uuid::Uuid::new_v4().to_string();
+        let scene_bytes = serialize_scene_duplication(
+            project,
+            &assets,
+            &source_scene,
+            source_scene_id,
+            &scene_id,
+            scene_name,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(|source| match source {
+            SceneDuplicationSerializationError::InvalidSceneName => {
+                IdeSceneDuplicationError::InvalidName
+            }
+            source => IdeSceneDuplicationError::Serialization(source),
+        })?;
+        Ok(IdeScenePublicationPlan {
             mixer,
             scene_id,
             scene_bytes,
@@ -7978,7 +8178,7 @@ mod tests {
         let expected_project_sha256 = *package.manifest_sha256();
         drop(prepared);
 
-        let outcome = IdeSceneCreationPlan {
+        let outcome = IdeScenePublicationPlan {
             mixer: IdeMixerSavePlan {
                 project_path: project_path.clone(),
                 expected_project_sha256,
@@ -8011,6 +8211,164 @@ mod tests {
                 .read_resource(ARRANGEMENT_TEST_RESOURCE_ID)
                 .unwrap(),
             source_arrangement
+        );
+    }
+
+    #[test]
+    fn scene_duplication_rejects_missing_and_non_scene_resources_before_publication() {
+        let fixture = ArrangementProjectFixture::with_scene();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, config.project_limits())
+                .unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let source_mixer = package.read_resource(&mixer_id).unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        let application = DesktopIdeApplication::from_inventories(
+            config,
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let mixer_plan = || IdeMixerSavePlan {
+            project_path: project_path.clone(),
+            expected_project_sha256,
+            resource_id: mixer_id.clone(),
+            resource_bytes: source_mixer.clone(),
+        };
+
+        assert!(matches!(
+            RunningDesktopIdeApplication::prepare_scene_duplication_from_project(
+                &application,
+                mixer_plan(),
+                &prepared,
+                "missing-scene",
+                "Copy",
+            ),
+            Err(IdeSceneDuplicationError::SceneResourceMissing)
+        ));
+        assert!(matches!(
+            RunningDesktopIdeApplication::prepare_scene_duplication_from_project(
+                &application,
+                mixer_plan(),
+                &prepared,
+                ARRANGEMENT_TEST_TRACK_ID,
+                "Copy",
+            ),
+            Err(IdeSceneDuplicationError::SceneResourceRoleMismatch)
+        ));
+    }
+
+    #[test]
+    fn scene_duplication_publishes_an_independent_scene_without_mutating_existing_resources() {
+        let fixture = ArrangementProjectFixture::with_scene();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let source_mixer = package.read_resource(&mixer_id).unwrap();
+        let source_scene = package.read_resource(ARRANGEMENT_TEST_SCENE_ID).unwrap();
+        let source_arrangement = package.read_resource(ARRANGEMENT_TEST_RESOURCE_ID).unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        let application = DesktopIdeApplication::from_inventories(
+            config,
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let plan = RunningDesktopIdeApplication::prepare_scene_duplication_from_project(
+            &application,
+            IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256,
+                resource_id: mixer_id.clone(),
+                resource_bytes: source_mixer.clone(),
+            },
+            &prepared,
+            ARRANGEMENT_TEST_SCENE_ID,
+            "Intro copy",
+        )
+        .unwrap();
+        let duplicated_scene_id = plan.scene_id.clone();
+        assert_ne!(duplicated_scene_id, ARRANGEMENT_TEST_SCENE_ID);
+        let mut expected_duplicate: Value = serde_json::from_slice(&source_scene).unwrap();
+        expected_duplicate["id"] = json!(duplicated_scene_id);
+        expected_duplicate["name"] = json!("Intro copy");
+        expected_duplicate["order"] = json!(1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&plan.scene_bytes).unwrap(),
+            expected_duplicate
+        );
+        drop(prepared);
+
+        let outcome = plan.publish().unwrap();
+        assert!(outcome.changed());
+        assert_eq!(outcome.project_revision(), 2);
+        assert_eq!(outcome.resource_id(), duplicated_scene_id);
+        assert_scene_edit_recovery_authority(&outcome);
+        assert!(matches!(
+            worker::scene_duplication_failure_event(
+                "Intro copy".to_owned(),
+                IdeSceneDuplicationError::ReopenAfterPublication {
+                    outcome: outcome.clone(),
+                    source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
+                },
+            ),
+            IdeWorkerEvent::SceneDuplicationCommittedWithWarning { name, warning }
+                if name == "Intro copy" && warning.publication_committed()
+        ));
+        assert!(matches!(
+            worker::scene_duplication_reopen_failure(
+                Ok(outcome.clone()),
+                IdeProjectOpenError::SelectedOutputUnavailable,
+            ),
+            IdeWorkerCommandFailure::SceneDuplication(reason)
+                if matches!(reason.as_ref(),
+                    IdeSceneDuplicationError::ReopenAfterPublication {
+                        outcome: retained,
+                        source,
+                    } if retained == &outcome
+                        && matches!(source.as_ref(),
+                            IdeProjectOpenError::SelectedOutputUnavailable))
+        ));
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = reopened.package();
+        let (loaded, _, _, _) = reopened.session().parts();
+        assert_eq!(loaded.scene_count(), 2);
+        assert_eq!(loaded.scene_id(0), Some(ARRANGEMENT_TEST_SCENE_ID));
+        assert_eq!(loaded.scene_id(1), Some(duplicated_scene_id.as_str()));
+        assert_eq!(loaded.scene_name(1), Some("Intro copy"));
+        assert_eq!(loaded.scene_enabled(1), Some(true));
+        assert_eq!(
+            package.read_resource(ARRANGEMENT_TEST_SCENE_ID).unwrap(),
+            source_scene
+        );
+        assert_eq!(package.read_resource(&mixer_id).unwrap(), source_mixer);
+        assert_eq!(
+            package.read_resource(ARRANGEMENT_TEST_RESOURCE_ID).unwrap(),
+            source_arrangement
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&package.read_resource(&duplicated_scene_id).unwrap())
+                .unwrap(),
+            expected_duplicate
         );
     }
 
