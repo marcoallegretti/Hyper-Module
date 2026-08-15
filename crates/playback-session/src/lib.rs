@@ -185,6 +185,30 @@ pub struct PlaybackArrangementPlacement {
     active: bool,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct PlaybackArrangementSceneLaunch {
+    id: String,
+    scene_index: usize,
+    tick: u64,
+}
+
+impl PlaybackArrangementSceneLaunch {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn scene_index(&self) -> usize {
+        self.scene_index
+    }
+
+    #[must_use]
+    pub const fn tick(&self) -> u64 {
+        self.tick
+    }
+}
+
 impl PlaybackArrangementPlacement {
     #[must_use]
     pub fn id(&self) -> &str {
@@ -250,7 +274,9 @@ impl PlaybackArrangementPlacement {
 pub struct PlaybackArrangement {
     track_names: Vec<String>,
     clip_names: Vec<String>,
+    scene_names: Vec<String>,
     placements: Vec<PlaybackArrangementPlacement>,
+    scene_launches: Vec<PlaybackArrangementSceneLaunch>,
     end_frame: usize,
 }
 
@@ -268,6 +294,16 @@ impl PlaybackArrangement {
     #[must_use]
     pub fn placements(&self) -> &[PlaybackArrangementPlacement] {
         &self.placements
+    }
+
+    #[must_use]
+    pub fn scene_name(&self, index: usize) -> Option<&str> {
+        self.scene_names.get(index).map(String::as_str)
+    }
+
+    #[must_use]
+    pub fn scene_launches(&self) -> &[PlaybackArrangementSceneLaunch] {
+        &self.scene_launches
     }
 
     #[must_use]
@@ -576,6 +612,37 @@ fn build_playback_arrangement(
         clip_names.push(try_arrangement_owned(name)?);
     }
 
+    let mut scene_names = Vec::new();
+    scene_names
+        .try_reserve_exact(project.scene_count())
+        .map_err(|_| PlaybackSessionAssemblyError::ArrangementCapacityUnavailable)?;
+    for scene_index in 0..project.scene_count() {
+        let name = project
+            .scene_name(scene_index)
+            .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?;
+        scene_names.push(try_arrangement_owned(name)?);
+    }
+
+    let mut scene_launches = Vec::new();
+    scene_launches
+        .try_reserve_exact(project.scene_launch_count())
+        .map_err(|_| PlaybackSessionAssemblyError::ArrangementCapacityUnavailable)?;
+    for launch_index in 0..project.scene_launch_count() {
+        scene_launches.push(PlaybackArrangementSceneLaunch {
+            id: try_arrangement_owned(
+                project
+                    .scene_launch_id_at(launch_index)
+                    .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?,
+            )?,
+            scene_index: project
+                .scene_launch_scene_index_at(launch_index)
+                .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?,
+            tick: project
+                .scene_launch_tick_at(launch_index)
+                .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?,
+        });
+    }
+
     let entries = schedule.into_entries();
     let mut placements = Vec::new();
     placements
@@ -602,7 +669,9 @@ fn build_playback_arrangement(
     Ok(PlaybackArrangement {
         track_names,
         clip_names,
+        scene_names,
         placements,
+        scene_launches,
         end_frame,
     })
 }

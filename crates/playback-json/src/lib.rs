@@ -4574,6 +4574,42 @@ impl LoadedPlaybackProject {
             .map_or(0, |arrangement| arrangement.placements.len())
     }
 
+    #[must_use]
+    pub fn scene_launch_count(&self) -> usize {
+        self.arrangement
+            .as_ref()
+            .map_or(0, |arrangement| arrangement.scene_launches.len())
+    }
+
+    #[must_use]
+    pub fn scene_launch_id_at(&self, launch_index: usize) -> Option<&str> {
+        self.arrangement
+            .as_ref()?
+            .scene_launches
+            .get(launch_index)
+            .map(|launch| launch.id.as_str())
+    }
+
+    #[must_use]
+    pub fn scene_launch_tick_at(&self, launch_index: usize) -> Option<u64> {
+        self.arrangement
+            .as_ref()?
+            .scene_launches
+            .get(launch_index)
+            .map(|launch| launch.tick)
+    }
+
+    #[must_use]
+    pub fn scene_launch_scene_index_at(&self, launch_index: usize) -> Option<usize> {
+        let scene_id = &self
+            .arrangement
+            .as_ref()?
+            .scene_launches
+            .get(launch_index)?
+            .scene_id;
+        self.scene_index(scene_id)
+    }
+
     /// Loads and resolves one strict version 1 mixer resource against this
     /// project's structural tracks and complete verified asset inventory.
     /// `assets` must contain every asset declared by the enclosing package;
