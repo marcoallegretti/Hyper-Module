@@ -542,6 +542,7 @@ impl IdeAudioPreviewObservation {
 
 #[derive(Debug)]
 pub struct IdeRunningObservation {
+    playback_session_generation: u64,
     project_id: String,
     project_name: String,
     sample_rate_hz: u32,
@@ -857,6 +858,15 @@ impl IdeSceneTrackSlot {
 }
 
 impl IdeRunningObservation {
+    /// Identifies the playback session that produced this observation.
+    ///
+    /// The value changes whenever project playback is closed and reopened,
+    /// including durable edits that rebuild the runtime.
+    #[must_use]
+    pub const fn playback_session_generation(&self) -> u64 {
+        self.playback_session_generation
+    }
+
     #[must_use]
     pub fn project_id(&self) -> &str {
         &self.project_id
@@ -7611,6 +7621,7 @@ fn running_observation(
         });
     }
     Ok(IdeRunningObservation {
+        playback_session_generation: snapshot.playback_session_generation,
         project_id,
         project_name,
         sample_rate_hz: snapshot.sample_rate_hz,

@@ -659,6 +659,7 @@ pub struct DesktopIdeApplication {
     output_selection: IdeOutputSelection,
     inputs: Option<IdeAudioInputInventory>,
     input_selection: IdeInputSelection,
+    playback_session_generation: u64,
 }
 
 #[derive(Debug)]
@@ -705,6 +706,7 @@ impl DesktopIdeApplication {
                 output_selection: IdeOutputSelection::SystemDefault,
                 inputs,
                 input_selection: IdeInputSelection::Disabled,
+                playback_session_generation: 0,
             },
             input_failure,
         })
@@ -721,6 +723,7 @@ impl DesktopIdeApplication {
             output_selection: IdeOutputSelection::SystemDefault,
             inputs: None,
             input_selection: IdeInputSelection::Disabled,
+            playback_session_generation: 0,
         }
     }
 
@@ -736,6 +739,7 @@ impl DesktopIdeApplication {
             output_selection: IdeOutputSelection::SystemDefault,
             inputs: Some(inputs),
             input_selection: IdeInputSelection::Disabled,
+            playback_session_generation: 0,
         }
     }
 
@@ -856,9 +860,17 @@ impl DesktopIdeApplication {
         reason = "the failure retains the sole closed application owner without allocating after project-open failure"
     )]
     pub fn open_project(
-        self,
+        mut self,
         root: impl AsRef<Path>,
     ) -> Result<RunningDesktopIdeApplication, IdeProjectOpenFailure> {
+        let Some(next_playback_session_generation) =
+            self.playback_session_generation.checked_add(1)
+        else {
+            return Err(IdeProjectOpenFailure {
+                application: self,
+                reason: IdeProjectOpenError::PlaybackSessionGenerationExhausted,
+            });
+        };
         let output = match self.output_config() {
             Ok(output) => output,
             Err(reason) => {
@@ -886,10 +898,13 @@ impl DesktopIdeApplication {
             None => DesktopPlaybackSession::open_project(output, root, self.config.project_limits),
         };
         match opened {
-            Ok(session) => Ok(RunningDesktopIdeApplication {
-                application: self,
-                session: IdePlaybackSessionOwner::Native(session),
-            }),
+            Ok(session) => {
+                self.playback_session_generation = next_playback_session_generation;
+                Ok(RunningDesktopIdeApplication {
+                    application: self,
+                    session: IdePlaybackSessionOwner::Native(session),
+                })
+            }
             Err(source) => Err(IdeProjectOpenFailure {
                 application: self,
                 reason: IdeProjectOpenError::Project(source),
@@ -1314,6 +1329,7 @@ impl Error for IdeInputSelectionError {}
 
 #[derive(Debug)]
 pub enum IdeProjectOpenError {
+    PlaybackSessionGenerationExhausted,
     SelectedOutputUnavailable,
     InputDiscoveryUnavailable,
     SelectedInputUnavailable,
@@ -1326,6 +1342,9 @@ pub enum IdeProjectOpenError {
 impl fmt::Display for IdeProjectOpenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PlaybackSessionGenerationExhausted => {
+                formatter.write_str("playback session generation is exhausted")
+            }
             Self::SelectedOutputUnavailable => {
                 formatter.write_str("selected audio output is no longer available")
             }
@@ -1346,7 +1365,8 @@ impl fmt::Display for IdeProjectOpenError {
 impl Error for IdeProjectOpenError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::SelectedOutputUnavailable
+            Self::PlaybackSessionGenerationExhausted
+            | Self::SelectedOutputUnavailable
             | Self::InputDiscoveryUnavailable
             | Self::SelectedInputUnavailable => None,
             Self::OutputConfig(source) => Some(source),
@@ -4882,6 +4902,7 @@ pub struct IdeMonitoringState {
 #[derive(Clone, Debug)]
 pub struct RunningIdeSnapshot<'a> {
     pub(crate) loaded: &'a hyper_playback_json::LoadedPlaybackProject,
+    pub playback_session_generation: u64,
     pub project_path: &'a Path,
     pub project_id: &'a str,
     pub project_name: &'a str,
@@ -6378,6 +6399,7 @@ impl RunningDesktopIdeApplication {
         let monitoring = session_monitoring_state(session).ok()?;
         Some(RunningIdeSnapshot {
             loaded,
+            playback_session_generation: self.application.playback_session_generation,
             project_path: project.package().root(),
             project_id: project.package().manifest().project_id(),
             project_name: project.package().manifest().name(),

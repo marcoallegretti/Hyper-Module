@@ -59,7 +59,37 @@ struct ProjectUiState {
     arrangement: RefCell<Option<ArrangementBinding>>,
     audio_clips: RefCell<Vec<IdeAudioClip>>,
     scenes: RefCell<Vec<IdeScene>>,
-    scene_launch_state: RefCell<Option<IdeSceneLaunchState>>,
+    scene_launch_evidence: RefCell<SceneLaunchEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SceneLaunchEvidence {
+    playback_session_generation: Option<u64>,
+    state: Option<IdeSceneLaunchState>,
+}
+
+impl SceneLaunchEvidence {
+    fn observe(
+        &mut self,
+        playback_session_generation: u64,
+        observed_state: Option<IdeSceneLaunchState>,
+        scenes_changed: bool,
+    ) -> bool {
+        let previous_state = self.state;
+        if self.playback_session_generation != Some(playback_session_generation) {
+            self.playback_session_generation = Some(playback_session_generation);
+            self.state = observed_state;
+        } else if let Some(observed_state) = observed_state {
+            self.state = Some(observed_state);
+        } else if scenes_changed {
+            self.state = None;
+        }
+        previous_state != self.state
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 struct ArrangementBinding {
@@ -4778,7 +4808,7 @@ fn reset_project(
     *project_state.arrangement.borrow_mut() = None;
     project_state.audio_clips.borrow_mut().clear();
     project_state.scenes.borrow_mut().clear();
-    *project_state.scene_launch_state.borrow_mut() = None;
+    project_state.scene_launch_evidence.borrow_mut().clear();
     ui.set_transport_extent_bounded(false);
     ui.set_transport_seek_available(false);
     ui.set_transport_progress_percent(0.0);
@@ -5511,27 +5541,20 @@ fn set_scenes(
     ui: &MainWindow,
     project_state: &ProjectUiStateCell,
     scenes: &[IdeScene],
+    playback_session_generation: u64,
     observed_launch_state: Option<IdeSceneLaunchState>,
     sample_rate_hz: u32,
 ) -> bool {
     let scenes_changed = project_state.scenes.borrow().as_slice() != scenes;
-    let launch_state_changed = if let Some(observed) = observed_launch_state {
-        let changed = *project_state.scene_launch_state.borrow() != Some(observed);
-        *project_state.scene_launch_state.borrow_mut() = Some(observed);
-        changed
-    } else if scenes_changed {
-        project_state
-            .scene_launch_state
-            .borrow_mut()
-            .take()
-            .is_some()
-    } else {
-        false
-    };
+    let launch_state_changed = project_state.scene_launch_evidence.borrow_mut().observe(
+        playback_session_generation,
+        observed_launch_state,
+        scenes_changed,
+    );
     if scenes_changed || launch_state_changed {
         ui.set_scenes(ModelRc::from(Rc::new(VecModel::from(scene_rows(
             scenes,
-            *project_state.scene_launch_state.borrow(),
+            project_state.scene_launch_evidence.borrow().state,
             sample_rate_hz,
         )))));
         *project_state.scenes.borrow_mut() = scenes.to_vec();
@@ -5548,6 +5571,7 @@ fn set_observed_scenes(
         ui,
         project_state,
         observation.scenes(),
+        observation.playback_session_generation(),
         observation.scene_launch_state(),
         observation.sample_rate_hz(),
     )
@@ -6106,6 +6130,30 @@ mod tests {
             scene_runtime_presentation(3, None, None, None, 48_000),
             (false, false, String::new())
         );
+    }
+
+    #[test]
+    fn scene_launch_evidence_is_retained_only_within_one_playback_session() {
+        let observed = IdeSceneLaunchState::default();
+        let mut evidence = SceneLaunchEvidence::default();
+
+        assert!(evidence.observe(7, Some(observed), false));
+        assert!(!evidence.observe(7, None, false));
+        assert_eq!(evidence.state, Some(observed));
+
+        assert!(evidence.observe(8, None, false));
+        assert_eq!(evidence.state, None);
+        assert_eq!(evidence.playback_session_generation, Some(8));
+    }
+
+    #[test]
+    fn scene_content_change_clears_unreplaced_launch_evidence() {
+        let observed = IdeSceneLaunchState::default();
+        let mut evidence = SceneLaunchEvidence::default();
+
+        assert!(evidence.observe(11, Some(observed), false));
+        assert!(evidence.observe(11, None, true));
+        assert_eq!(evidence.state, None);
     }
 
     #[test]
