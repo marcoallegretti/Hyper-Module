@@ -2851,7 +2851,7 @@ impl fmt::Display for IdeSceneEditError {
             ),
             Self::ReopenAfterPublication { outcome, source } => write!(
                 formatter,
-                "scene was renamed in project revision {} but the project could not be reopened: {source}",
+                "scene edit was committed in project revision {} but the project could not be reopened: {source}",
                 outcome.project_revision()
             ),
             Self::PublicationAndReopen {
@@ -6815,7 +6815,7 @@ mod tests {
         ));
     }
 
-    fn assert_scene_rename_recovery_authority(outcome: &ProjectResourcePublicationOutcome) {
+    fn assert_scene_edit_recovery_authority(outcome: &ProjectResourcePublicationOutcome) {
         assert!(matches!(
             worker::scene_rename_reopen_failure(
                 Ok(outcome.clone()),
@@ -6865,6 +6865,8 @@ mod tests {
             outcome: outcome.clone(),
             source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
         };
+        assert!(committed.to_string().contains("scene edit was committed"));
+        assert!(!committed.to_string().contains("renamed"));
         assert!(matches!(
             worker::scene_activation_failure_event(false, committed),
             IdeWorkerEvent::SceneActivationCommittedWithWarning { active: false, warning }
@@ -7415,7 +7417,7 @@ mod tests {
         .unwrap();
         assert!(outcome.changed());
         assert_eq!(outcome.project_revision(), 2);
-        assert_scene_rename_recovery_authority(&outcome);
+        assert_scene_edit_recovery_authority(&outcome);
 
         let reopened =
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
@@ -7518,6 +7520,7 @@ mod tests {
         .unwrap();
         assert!(outcome.changed());
         assert_eq!(outcome.project_revision(), 2);
+        assert_scene_edit_recovery_authority(&outcome);
 
         let reopened =
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
