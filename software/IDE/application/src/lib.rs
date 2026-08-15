@@ -58,18 +58,19 @@ use hyper_playback_json::{
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError, CompiledMixerTap,
     CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
     MixerSendBaseState, MixerStateSerializationError, SceneAdditionSerializationError,
-    SceneDocumentSerializationError, SceneRenameSerializationError,
-    serialize_arrangement_placement_activation, serialize_arrangement_placement_addition,
-    serialize_arrangement_placement_duplication, serialize_arrangement_placement_duration,
-    serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
-    serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
-    serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
-    serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_rename,
-    serialize_audio_clip_reverse, serialize_audio_clip_source_start,
-    serialize_audio_track_activation, serialize_audio_track_addition,
-    serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
-    serialize_recording_audio_clip_addition, serialize_scene_activation, serialize_scene_addition,
-    serialize_scene_rename,
+    SceneDocumentSerializationError, SceneRenameSerializationError, SceneSlotEdit,
+    SceneSlotEditSerializationError, serialize_arrangement_placement_activation,
+    serialize_arrangement_placement_addition, serialize_arrangement_placement_duplication,
+    serialize_arrangement_placement_duration, serialize_arrangement_placement_front_trim,
+    serialize_arrangement_placement_move, serialize_arrangement_placement_removal,
+    serialize_arrangement_placement_split, serialize_audio_clip_activation,
+    serialize_audio_clip_duplication, serialize_audio_clip_fades, serialize_audio_clip_gain,
+    serialize_audio_clip_loop, serialize_audio_clip_rename, serialize_audio_clip_reverse,
+    serialize_audio_clip_source_start, serialize_audio_track_activation,
+    serialize_audio_track_addition, serialize_audio_track_removal, serialize_audio_track_rename,
+    serialize_mixer_base_state, serialize_recording_audio_clip_addition,
+    serialize_scene_activation, serialize_scene_addition, serialize_scene_rename,
+    serialize_scene_slot_edit,
 };
 use hyper_playback_session::{
     AudioClipGainValidationError, AudioClipSourceSlipValidationError, PlaybackSessionAssemblyLimits,
@@ -101,11 +102,11 @@ pub use worker::{
     DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeAudioClip,
     IdeAudioClipEditCommittedWarning, IdeAudioPreviewObservation, IdeClosedSnapshot,
     IdeMixerChannel, IdeMixerSend, IdeProjectCreationError, IdeRecordingCaptureKind,
-    IdeRecordingState, IdeRecordingTake, IdeRunningObservation, IdeScene, IdeWorkerCommand,
-    IdeWorkerCommandFailure, IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError,
-    IdeWorkerJoinError, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
-    IdeWorkerShutdownReport, IdeWorkerStartError, MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS,
-    desktop_ide_worker_supervisor_snapshot,
+    IdeRecordingState, IdeRecordingTake, IdeRunningObservation, IdeScene, IdeSceneTrackAction,
+    IdeSceneTrackSlot, IdeWorkerCommand, IdeWorkerCommandFailure, IdeWorkerCommandKind,
+    IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError, IdeWorkerPendingShutdownWait,
+    IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, IdeWorkerStartError,
+    MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS, desktop_ide_worker_supervisor_snapshot,
 };
 
 const DESKTOP_MAXIMUM_BLOCK_FRAMES: usize = 4_096;
@@ -2737,6 +2738,23 @@ pub enum IdeSceneLaunchQuantization {
     Grid { quantum_ticks: u64 },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdeSceneSlotEdit {
+    Continue,
+    Stop,
+    Play { clip_id: String },
+}
+
+impl IdeSceneSlotEdit {
+    fn as_serialization_edit(&self) -> SceneSlotEdit<'_> {
+        match self {
+            Self::Continue => SceneSlotEdit::Continue,
+            Self::Stop => SceneSlotEdit::Stop,
+            Self::Play { clip_id } => SceneSlotEdit::Play { clip_id },
+        }
+    }
+}
+
 impl From<IdeSceneLaunchQuantization> for LaunchQuantization {
     fn from(value: IdeSceneLaunchQuantization) -> Self {
         match value {
@@ -2908,6 +2926,139 @@ impl Error for IdeSceneCreationError {
             Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
             Self::InvalidName
             | Self::InvalidQuantization
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeSceneSlotEditError {
+    InvalidSceneIdentity,
+    InvalidTrackIdentity,
+    InvalidClipIdentity,
+    MixerSave(Box<IdeProjectSaveError>),
+    SceneResourceMissing,
+    SceneResourceRoleMismatch,
+    Storage(StorageError),
+    Serialization(SceneSlotEditSerializationError),
+    CapacityUnavailable,
+    Publication(Box<IdeSceneEditPublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeSceneSlotEditError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: ProjectResourcePublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<IdeSceneEditPublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeSceneSlotEditError {
+    #[must_use]
+    pub const fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication(source) => source.scene_published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. } => publication.scene_published(),
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeSceneSlotEditError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSceneIdentity => {
+                formatter.write_str("scene slot edit requires a scene identity")
+            }
+            Self::InvalidTrackIdentity => {
+                formatter.write_str("scene slot edit requires a track identity")
+            }
+            Self::InvalidClipIdentity => {
+                formatter.write_str("scene play action requires an audio-clip identity")
+            }
+            Self::MixerSave(source) => {
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
+            }
+            Self::SceneResourceMissing => {
+                formatter.write_str("the selected scene resource is missing")
+            }
+            Self::SceneResourceRoleMismatch => {
+                formatter.write_str("the selected identity is not a scene resource")
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("scene slot edit capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before editing the scene slot: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before editing the scene slot ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "scene slot preparation failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "scene slot was edited in project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.scene_published() => write!(
+                formatter,
+                "scene slot edit committed with incomplete verification or recovery ({publication}) and the project could not be reopened ({reopen})"
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "scene slot edit failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeSceneSlotEditError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidSceneIdentity
+            | Self::InvalidTrackIdentity
+            | Self::InvalidClipIdentity
+            | Self::SceneResourceMissing
+            | Self::SceneResourceRoleMismatch
             | Self::CapacityUnavailable
             | Self::NativeClose(_) => None,
         }
@@ -5678,6 +5829,61 @@ impl RunningDesktopIdeApplication {
         )
     }
 
+    fn prepare_scene_slot_edit(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        scene_id: &str,
+        track_id: &str,
+        edit: &IdeSceneSlotEdit,
+    ) -> Result<IdeSceneEditPlan, IdeSceneSlotEditError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeSceneSlotEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeSceneSlotEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == scene_id)
+            .ok_or(IdeSceneSlotEditError::SceneResourceMissing)?;
+        if descriptor.role() != ResourceRole::Scene {
+            return Err(IdeSceneSlotEditError::SceneResourceRoleMismatch);
+        }
+        let source = package
+            .read_resource(scene_id)
+            .map_err(IdeSceneSlotEditError::Storage)?;
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeSceneSlotEditError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let scene_bytes = serialize_scene_slot_edit(
+            project,
+            &assets,
+            &source,
+            scene_id,
+            track_id,
+            edit.as_serialization_edit(),
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeSceneSlotEditError::Serialization)?;
+        let mut owned_scene_id = String::new();
+        owned_scene_id
+            .try_reserve_exact(scene_id.len())
+            .map_err(|_| IdeSceneSlotEditError::CapacityUnavailable)?;
+        owned_scene_id.push_str(scene_id);
+        Ok(IdeSceneEditPlan {
+            mixer,
+            scene_id: owned_scene_id,
+            scene_bytes,
+        })
+    }
+
     fn prepare_scene_edit(
         application: &DesktopIdeApplication,
         recovery: &DesktopPlaybackRecovery,
@@ -7805,6 +8011,65 @@ mod tests {
                 .read_resource(ARRANGEMENT_TEST_RESOURCE_ID)
                 .unwrap(),
             source_arrangement
+        );
+    }
+
+    #[test]
+    fn scene_slot_edit_publishes_durably_and_reopens_explicit_action() {
+        let fixture = ArrangementProjectFixture::with_scene();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let source_mixer = package.read_resource(&mixer_id).unwrap();
+        let source_scene = package.read_resource(ARRANGEMENT_TEST_SCENE_ID).unwrap();
+        let (project, _, _, media) = prepared.session().parts();
+        let assets: Vec<_> = media.media_asset_facts().collect();
+        let scene_bytes = serialize_scene_slot_edit(
+            project,
+            &assets,
+            &source_scene,
+            ARRANGEMENT_TEST_SCENE_ID,
+            ARRANGEMENT_TEST_TRACK_ID,
+            SceneSlotEdit::Stop,
+            limits.session.documents,
+        )
+        .unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        drop(prepared);
+
+        let outcome = IdeSceneEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256,
+                resource_id: mixer_id,
+                resource_bytes: source_mixer,
+            },
+            scene_id: ARRANGEMENT_TEST_SCENE_ID.to_owned(),
+            scene_bytes,
+        }
+        .publish()
+        .unwrap();
+
+        assert!(outcome.changed());
+        assert_eq!(outcome.project_revision(), 2);
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert_eq!(
+            reopened
+                .session()
+                .parts()
+                .0
+                .scene_track_action(ARRANGEMENT_TEST_SCENE_ID, ARRANGEMENT_TEST_TRACK_ID),
+            Some(hyper_playback_json::SceneTrackAction::Stop)
         );
     }
 

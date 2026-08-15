@@ -17,10 +17,10 @@ use hyper_desktop_ide::{
     IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeOutputSelection,
     IdeOutputTestState, IdePlaybackArrangement, IdePlaybackExtent, IdeRecordingAbortOutcome,
     IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation,
-    IdeScaledLoudnessValue, IdeScene, IdeSceneAvailability, IdeWorkerCommand, IdeWorkerCommandKind,
-    IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
-    IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState, TransportCommand,
-    desktop_ide_application_config, ide_audio_clip_gain_is_supported,
+    IdeScaledLoudnessValue, IdeScene, IdeSceneAvailability, IdeSceneSlotEdit, IdeWorkerCommand,
+    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError,
+    IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState, PlaybackRecoveryTransportState,
+    TransportCommand, desktop_ide_application_config, ide_audio_clip_gain_is_supported,
 };
 #[cfg(test)]
 use hyper_desktop_ide::{
@@ -2244,7 +2244,9 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::StartOutputTest => AppMode::StartingOutputTest,
         IdeWorkerCommandKind::StopOutputTest => AppMode::StoppingOutputTest,
         IdeWorkerCommandKind::CreateProject => AppMode::Creating,
-        IdeWorkerCommandKind::SaveProject | IdeWorkerCommandKind::AddScene => AppMode::Saving,
+        IdeWorkerCommandKind::SaveProject
+        | IdeWorkerCommandKind::AddScene
+        | IdeWorkerCommandKind::SetSceneSlot => AppMode::Saving,
         IdeWorkerCommandKind::AddAudioTrack => AppMode::AddingTrack,
         IdeWorkerCommandKind::RemoveAudioTrack => AppMode::RemovingTrack,
         IdeWorkerCommandKind::RenameAudioTrack => AppMode::RenamingTrack,
@@ -2369,6 +2371,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::AddScene => {
             "Preserving mixer state, creating the scene, and reopening project..."
+        }
+        IdeWorkerCommandKind::SetSceneSlot => {
+            "Preserving mixer state, updating the scene slot, and reopening project..."
         }
         IdeWorkerCommandKind::SetAudioClipSourceStart => {
             "Preserving mixer state, slipping the reusable audio-clip source, and reopening project..."
@@ -2552,6 +2557,9 @@ fn apply_event(
         event @ (IdeWorkerEvent::SceneAdded { .. }
         | IdeWorkerEvent::SceneCreationCommittedWithWarning { .. }
         | IdeWorkerEvent::SceneAdding) => apply_scene_creation_event(ui, &event),
+        event @ (IdeWorkerEvent::SceneSlotChanged { .. }
+        | IdeWorkerEvent::SceneSlotEditCommittedWithWarning { .. }
+        | IdeWorkerEvent::SceneSlotChanging { .. }) => apply_scene_slot_event(ui, &event),
         event @ (IdeWorkerEvent::SceneRenamed { .. }
         | IdeWorkerEvent::SceneRenameCommittedWithWarning { .. }
         | IdeWorkerEvent::SceneRenaming) => apply_scene_rename_event(ui, &event),
@@ -3064,6 +3072,57 @@ fn apply_scene_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_error_text(SharedString::default());
         }
         _ => unreachable!("scene creation event dispatcher received another event"),
+    }
+}
+
+fn scene_slot_action_label(edit: &IdeSceneSlotEdit) -> &'static str {
+    match edit {
+        IdeSceneSlotEdit::Continue => "continue",
+        IdeSceneSlotEdit::Stop => "stop",
+        IdeSceneSlotEdit::Play { .. } => "play",
+    }
+}
+
+fn apply_scene_slot_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::SceneSlotChanged {
+            revision,
+            changed,
+            edit,
+        } => {
+            let action = scene_slot_action_label(edit);
+            ui.set_status_text(
+                if *changed {
+                    format!("Scene slot set to {action} in project revision {revision}")
+                } else {
+                    format!("Scene slot was already set to {action} in project revision {revision}")
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::SceneSlotEditCommittedWithWarning { edit, warning } => {
+            ui.set_status_text(
+                committed_warning_status(
+                    ui.get_app_mode(),
+                    &format!("Scene slot {}", scene_slot_action_label(edit)),
+                )
+                .into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        IdeWorkerEvent::SceneSlotChanging { edit } => {
+            ui.set_app_mode(AppMode::Saving);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before applying scene slot {}...",
+                    scene_slot_action_label(edit)
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("scene slot event dispatcher received another event"),
     }
 }
 
@@ -4521,7 +4580,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::OpenProject if current == AppMode::Opening => AppMode::Closed,
         IdeWorkerCommandKind::Observe if current == AppMode::Opening => AppMode::Running,
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
-        IdeWorkerCommandKind::SaveProject | IdeWorkerCommandKind::AddScene
+        IdeWorkerCommandKind::SaveProject
+        | IdeWorkerCommandKind::AddScene
+        | IdeWorkerCommandKind::SetSceneSlot
             if current == AppMode::Saving =>
         {
             AppMode::Running

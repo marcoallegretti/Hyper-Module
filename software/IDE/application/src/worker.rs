@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use hyper_desktop_audio::{DesktopAudioPreviewSnapshot, DesktopAudioPreviewState};
 use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, TransportCommand};
+use hyper_playback_json::SceneTrackAction;
 use hyper_recording_metadata::RecordingCaptureKind;
 use hyper_storage_engine::{
     ProjectCreationError, ProjectCreationRequest, create_project as create_project_package,
@@ -37,9 +38,9 @@ use super::{
     IdeRecordingAbortOutcome, IdeRecordingClipCreationError, IdeRecordingError,
     IdeRecordingImportOutcome, IdeRecordingObservation, IdeSaveCloseOutcome, IdeSceneAvailability,
     IdeSceneCreationError, IdeSceneEditError, IdeSceneLaunchQuantization, IdeSceneRenameError,
-    IdeTransportSeekError, InputInventoryError, LocateState, OutputInventoryError,
-    OutputStreamSnapshot, OutputStreamState, OutputTestingDesktopIdeApplication,
-    RunningDesktopIdeApplication,
+    IdeSceneSlotEdit, IdeSceneSlotEditError, IdeTransportSeekError, InputInventoryError,
+    LocateState, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
+    OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -145,6 +146,7 @@ pub enum IdeWorkerCommandKind {
     SetAudioClipReverse,
     SetAudioClipSourceStart,
     AddScene,
+    SetSceneSlot,
     RenameScene,
     SetSceneActive,
     StartRecording,
@@ -277,6 +279,11 @@ pub enum IdeWorkerCommand {
         name: String,
         quantization: IdeSceneLaunchQuantization,
     },
+    SetSceneSlot {
+        scene_id: String,
+        track_id: String,
+        edit: IdeSceneSlotEdit,
+    },
     RenameScene {
         scene_id: String,
         name: String,
@@ -357,6 +364,7 @@ impl IdeWorkerCommand {
             Self::SetAudioClipReverse { .. } => IdeWorkerCommandKind::SetAudioClipReverse,
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
+            Self::SetSceneSlot { .. } => IdeWorkerCommandKind::SetSceneSlot,
             Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
             Self::SetSceneActive { .. } => IdeWorkerCommandKind::SetSceneActive,
             Self::StartRecording { .. } => IdeWorkerCommandKind::StartRecording,
@@ -614,6 +622,21 @@ pub struct IdeScene {
     name: String,
     active: bool,
     availability: IdeSceneAvailability,
+    track_slots: Vec<IdeSceneTrackSlot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdeSceneTrackSlot {
+    track_id: String,
+    track_name: String,
+    action: IdeSceneTrackAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdeSceneTrackAction {
+    Continue,
+    Stop,
+    Play { clip_id: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -803,6 +826,28 @@ impl IdeScene {
     pub const fn availability(&self) -> IdeSceneAvailability {
         self.availability
     }
+
+    #[must_use]
+    pub fn track_slots(&self) -> &[IdeSceneTrackSlot] {
+        &self.track_slots
+    }
+}
+
+impl IdeSceneTrackSlot {
+    #[must_use]
+    pub fn track_id(&self) -> &str {
+        &self.track_id
+    }
+
+    #[must_use]
+    pub fn track_name(&self) -> &str {
+        &self.track_name
+    }
+
+    #[must_use]
+    pub const fn action(&self) -> &IdeSceneTrackAction {
+        &self.action
+    }
 }
 
 impl IdeRunningObservation {
@@ -991,6 +1036,7 @@ pub enum IdeWorkerCommandFailure {
     AudioClipReverse(Box<IdeAudioClipReverseEditError>),
     AudioClipSourceSlip(Box<IdeAudioClipSourceSlipEditError>),
     SceneCreation(Box<IdeSceneCreationError>),
+    SceneSlotEdit(Box<IdeSceneSlotEditError>),
     SceneRename(Box<IdeSceneRenameError>),
     SceneActivation(Box<IdeSceneEditError>),
     Recording(IdeRecordingError),
@@ -1042,6 +1088,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioClipReverse(source) => source.fmt(formatter),
             Self::AudioClipSourceSlip(source) => source.fmt(formatter),
             Self::SceneCreation(source) => source.fmt(formatter),
+            Self::SceneSlotEdit(source) => source.fmt(formatter),
             Self::SceneRename(source) | Self::SceneActivation(source) => source.fmt(formatter),
             Self::Recording(source) => source.fmt(formatter),
             Self::AudioPreview(source) => source.fmt(formatter),
@@ -1098,6 +1145,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioClipReverse(source) => Some(source),
             Self::AudioClipSourceSlip(source) => Some(source),
             Self::SceneCreation(source) => Some(source),
+            Self::SceneSlotEdit(source) => Some(source),
             Self::SceneRename(source) | Self::SceneActivation(source) => Some(source),
             Self::Recording(source) => Some(source),
             Self::AudioPreview(source) => Some(source),
@@ -1292,6 +1340,15 @@ pub enum IdeWorkerEvent {
         name: String,
         warning: Box<IdeSceneCreationError>,
     },
+    SceneSlotChanged {
+        revision: u64,
+        changed: bool,
+        edit: IdeSceneSlotEdit,
+    },
+    SceneSlotEditCommittedWithWarning {
+        edit: IdeSceneSlotEdit,
+        warning: Box<IdeSceneSlotEditError>,
+    },
     SceneRenamed {
         revision: u64,
         changed: bool,
@@ -1372,6 +1429,9 @@ pub enum IdeWorkerEvent {
         source_start_frame: u64,
     },
     SceneAdding,
+    SceneSlotChanging {
+        edit: IdeSceneSlotEdit,
+    },
     SceneRenaming,
     SceneActivationChanging {
         active: bool,
@@ -1785,6 +1845,11 @@ enum ProjectMutation {
         name: String,
         quantization: IdeSceneLaunchQuantization,
     },
+    SetSceneSlot {
+        scene_id: String,
+        track_id: String,
+        edit: IdeSceneSlotEdit,
+    },
     RenameScene {
         scene_id: String,
         name: String,
@@ -1833,12 +1898,13 @@ impl ProjectMutation {
             Self::SetAudioClipReverse { .. } => IdeWorkerCommandKind::SetAudioClipReverse,
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
+            Self::SetSceneSlot { .. } => IdeWorkerCommandKind::SetSceneSlot,
             Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
             Self::SetSceneActive { .. } => IdeWorkerCommandKind::SetSceneActive,
         }
     }
 
-    const fn pending_event(&self) -> IdeWorkerEvent {
+    fn pending_event(&self) -> IdeWorkerEvent {
         match self {
             Self::SaveMixer => IdeWorkerEvent::Saving,
             Self::AddAudioTrack { .. } => IdeWorkerEvent::AudioTrackAdding,
@@ -1917,6 +1983,9 @@ impl ProjectMutation {
                 source_start_frame: *source_start_frame,
             },
             Self::AddScene { .. } => IdeWorkerEvent::SceneAdding,
+            Self::SetSceneSlot { edit, .. } => {
+                IdeWorkerEvent::SceneSlotChanging { edit: edit.clone() }
+            }
             Self::RenameScene { .. } => IdeWorkerEvent::SceneRenaming,
             Self::SetSceneActive { active, .. } => {
                 IdeWorkerEvent::SceneActivationChanging { active: *active }
@@ -2131,6 +2200,7 @@ fn process_command(
         | IdeWorkerCommand::SetAudioClipReverse { .. }
         | IdeWorkerCommand::SetAudioClipSourceStart { .. }
         | IdeWorkerCommand::AddScene { .. }
+        | IdeWorkerCommand::SetSceneSlot { .. }
         | IdeWorkerCommand::RenameScene { .. }
         | IdeWorkerCommand::SetSceneActive { .. }) => {
             process_project_mutation_command(state, command, events)
@@ -2287,6 +2357,11 @@ fn process_project_mutation_command(
         IdeWorkerCommand::AddScene { name, quantization } => {
             add_scene(state, events, &name, quantization)
         }
+        IdeWorkerCommand::SetSceneSlot {
+            scene_id,
+            track_id,
+            edit,
+        } => set_scene_slot(state, events, &scene_id, &track_id, edit),
         IdeWorkerCommand::RenameScene { scene_id, name } => {
             rename_scene(state, events, &scene_id, &name)
         }
@@ -3935,6 +4010,55 @@ fn add_scene(
     )
 }
 
+fn set_scene_slot(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    scene_id: &str,
+    track_id: &str,
+    edit: IdeSceneSlotEdit,
+) -> bool {
+    let invalid = if scene_id.is_empty() {
+        Some(IdeSceneSlotEditError::InvalidSceneIdentity)
+    } else if track_id.is_empty() {
+        Some(IdeSceneSlotEditError::InvalidTrackIdentity)
+    } else if matches!(&edit, IdeSceneSlotEdit::Play { clip_id } if clip_id.is_empty()) {
+        Some(IdeSceneSlotEditError::InvalidClipIdentity)
+    } else {
+        None
+    };
+    if let Some(reason) = invalid {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SetSceneSlot,
+            IdeWorkerCommandFailure::SceneSlotEdit(Box::new(reason)),
+        );
+    }
+    let mut owned_scene_id = String::new();
+    let mut owned_track_id = String::new();
+    if owned_scene_id.try_reserve_exact(scene_id.len()).is_err()
+        || owned_track_id.try_reserve_exact(track_id.len()).is_err()
+    {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SetSceneSlot,
+            IdeWorkerCommandFailure::SceneSlotEdit(Box::new(
+                IdeSceneSlotEditError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_scene_id.push_str(scene_id);
+    owned_track_id.push_str(track_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::SetSceneSlot {
+            scene_id: owned_scene_id,
+            track_id: owned_track_id,
+            edit,
+        },
+    )
+}
+
 fn rename_scene(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -4268,6 +4392,10 @@ fn begin_project_mutation_request(
     send_event(events, operation.pending_event())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive mutation-to-typed-save-error mapping remains auditable in one match"
+)]
 fn project_mutation_save_failure(
     operation: &ProjectMutation,
     reason: IdeProjectSaveError,
@@ -4363,6 +4491,9 @@ fn project_mutation_save_failure(
         }
         ProjectMutation::AddScene { .. } => IdeWorkerCommandFailure::SceneCreation(Box::new(
             IdeSceneCreationError::MixerSave(Box::new(reason)),
+        )),
+        ProjectMutation::SetSceneSlot { .. } => IdeWorkerCommandFailure::SceneSlotEdit(Box::new(
+            IdeSceneSlotEditError::MixerSave(Box::new(reason)),
         )),
         ProjectMutation::RenameScene { .. } => IdeWorkerCommandFailure::SceneRename(Box::new(
             IdeSceneRenameError::MixerSave(Box::new(reason)),
@@ -4531,6 +4662,9 @@ fn project_mutation_native_close_failure(
         ProjectMutation::AddScene { .. } => IdeWorkerCommandFailure::SceneCreation(Box::new(
             IdeSceneCreationError::NativeClose(failure),
         )),
+        ProjectMutation::SetSceneSlot { .. } => IdeWorkerCommandFailure::SceneSlotEdit(Box::new(
+            IdeSceneSlotEditError::NativeClose(failure),
+        )),
         ProjectMutation::RenameScene { .. } => IdeWorkerCommandFailure::SceneRename(Box::new(
             IdeSceneRenameError::NativeClose(failure),
         )),
@@ -4587,6 +4721,11 @@ enum ProjectMutationAttempt {
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeArrangementPlacementEditError,
         >,
+    },
+    SetSceneSlot {
+        edit: IdeSceneSlotEdit,
+        result:
+            Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeSceneSlotEditError>,
     },
     MoveArrangementPlacement {
         start_tick: u64,
@@ -4829,6 +4968,23 @@ pub(super) fn scene_creation_failure_event(
         IdeWorkerEvent::CommandFailed {
             command: IdeWorkerCommandKind::AddScene,
             reason: IdeWorkerCommandFailure::SceneCreation(Box::new(reason)),
+        }
+    }
+}
+
+fn scene_slot_edit_failure_event(
+    edit: IdeSceneSlotEdit,
+    reason: IdeSceneSlotEditError,
+) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::SceneSlotEditCommittedWithWarning {
+            edit,
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::SetSceneSlot,
+            reason: IdeWorkerCommandFailure::SceneSlotEdit(Box::new(reason)),
         }
     }
 }
@@ -5284,6 +5440,21 @@ fn complete_project_mutation(
                     name,
                     result: Err(reason),
                 } => send_event(events, scene_creation_failure_event(name, reason)),
+                ProjectMutationAttempt::SetSceneSlot {
+                    edit,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::SceneSlotChanged {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                        edit,
+                    },
+                ),
+                ProjectMutationAttempt::SetSceneSlot {
+                    edit,
+                    result: Err(reason),
+                } => send_event(events, scene_slot_edit_failure_event(edit, reason)),
                 ProjectMutationAttempt::RenameScene {
                     name,
                     result: Ok(outcome),
@@ -5662,6 +5833,28 @@ fn attempt_project_mutation(
                 .and_then(|plan| {
                     plan.publish()
                         .map_err(|source| IdeSceneCreationError::Publication(Box::new(source)))
+                })
+            },
+        },
+        ProjectMutation::SetSceneSlot {
+            scene_id,
+            track_id,
+            edit,
+        } => ProjectMutationAttempt::SetSceneSlot {
+            edit: edit.clone(),
+            result: if let Some(failure) = native_failure {
+                Err(IdeSceneSlotEditError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_scene_slot_edit(
+                    application,
+                    recovery,
+                    &scene_id,
+                    &track_id,
+                    &edit,
+                )
+                .and_then(|plan| {
+                    plan.publish()
+                        .map_err(|source| IdeSceneSlotEditError::Publication(Box::new(source)))
                 })
             },
         },
@@ -6254,6 +6447,9 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::AddScene { result, .. } => {
             scene_creation_reopen_failure(result, reopen)
         }
+        ProjectMutationAttempt::SetSceneSlot { result, .. } => {
+            scene_slot_edit_reopen_failure(result, reopen)
+        }
         ProjectMutationAttempt::RenameScene { result, .. } => {
             scene_rename_reopen_failure(result, reopen)
         }
@@ -6290,6 +6486,35 @@ fn scene_creation_reopen_failure(
         },
     };
     IdeWorkerCommandFailure::SceneCreation(Box::new(reason))
+}
+
+fn scene_slot_edit_reopen_failure(
+    result: Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeSceneSlotEditError>,
+    reopen: IdeProjectOpenError,
+) -> IdeWorkerCommandFailure {
+    let reason = match result {
+        Ok(outcome) => IdeSceneSlotEditError::ReopenAfterPublication {
+            outcome,
+            source: Box::new(reopen),
+        },
+        Err(IdeSceneSlotEditError::Publication(publication)) => {
+            IdeSceneSlotEditError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(IdeSceneSlotEditError::NativeClose(close)) => {
+            IdeSceneSlotEditError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(preparation) => IdeSceneSlotEditError::ReopenAfterPreparation {
+            preparation: Box::new(preparation),
+            reopen: Box::new(reopen),
+        },
+    };
+    IdeWorkerCommandFailure::SceneSlotEdit(Box::new(reason))
 }
 
 fn recording_clip_creation_reopen_failure(
@@ -7143,11 +7368,35 @@ fn running_observation(
         .try_reserve_exact(snapshot.scene_count)
         .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
     for scene_index in 0..snapshot.scene_count {
+        let mut track_slots = Vec::new();
+        track_slots
+            .try_reserve_exact(snapshot.mixer_channel_count)
+            .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
+        for channel_index in 0..snapshot.mixer_channel_count {
+            let track_id = snapshot.mixer_channel_ids[channel_index];
+            let action = match snapshot
+                .loaded
+                .scene_track_action(snapshot.scene_ids[scene_index], track_id)
+                .ok_or(IdeWorkerCommandFailure::ProjectSnapshotUnavailable)?
+            {
+                SceneTrackAction::Continue => IdeSceneTrackAction::Continue,
+                SceneTrackAction::Stop => IdeSceneTrackAction::Stop,
+                SceneTrackAction::Play { clip_id } => IdeSceneTrackAction::Play {
+                    clip_id: try_project_owned(clip_id)?,
+                },
+            };
+            track_slots.push(IdeSceneTrackSlot {
+                track_id: try_project_owned(track_id)?,
+                track_name: try_project_owned(snapshot.mixer_channel_names[channel_index])?,
+                action,
+            });
+        }
         scenes.push(IdeScene {
             id: try_project_owned(snapshot.scene_ids[scene_index])?,
             name: try_project_owned(snapshot.scene_names[scene_index])?,
             active: snapshot.scene_active[scene_index],
             availability: snapshot.scene_availability[scene_index],
+            track_slots,
         });
     }
     let mut mixer_channels = Vec::new();
@@ -9147,6 +9396,89 @@ mod tests {
                 command: IdeWorkerCommandKind::AddScene,
                 reason: IdeWorkerCommandFailure::SceneCreation(reason),
             } if matches!(reason.as_ref(), IdeSceneCreationError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn scene_slot_edit_validates_identities_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 5, 10).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        for (scene_id, track_id, edit, expected) in [
+            (
+                "",
+                "track",
+                IdeSceneSlotEdit::Stop,
+                IdeSceneSlotEditError::InvalidSceneIdentity,
+            ),
+            (
+                "scene",
+                "",
+                IdeSceneSlotEdit::Continue,
+                IdeSceneSlotEditError::InvalidTrackIdentity,
+            ),
+            (
+                "scene",
+                "track",
+                IdeSceneSlotEdit::Play {
+                    clip_id: String::new(),
+                },
+                IdeSceneSlotEditError::InvalidClipIdentity,
+            ),
+        ] {
+            worker
+                .try_send(IdeWorkerCommand::SetSceneSlot {
+                    scene_id: scene_id.to_owned(),
+                    track_id: track_id.to_owned(),
+                    edit,
+                })
+                .unwrap();
+            let event = recv(&worker);
+            assert!(matches!(
+                event,
+                IdeWorkerEvent::CommandFailed {
+                    command: IdeWorkerCommandKind::SetSceneSlot,
+                    reason: IdeWorkerCommandFailure::SceneSlotEdit(reason),
+                } if core::mem::discriminant(reason.as_ref()) == core::mem::discriminant(&expected)
+            ));
+        }
+
+        worker
+            .try_send(IdeWorkerCommand::SetSceneSlot {
+                scene_id: "scene".to_owned(),
+                track_id: "track".to_owned(),
+                edit: IdeSceneSlotEdit::Stop,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::SceneSlotChanging {
+                edit: IdeSceneSlotEdit::Stop
+            }
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetSceneSlot,
+                reason: IdeWorkerCommandFailure::SceneSlotEdit(reason),
+            } if matches!(reason.as_ref(), IdeSceneSlotEditError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);

@@ -336,6 +336,13 @@ struct LoadedScene {
     canonical_source: Arc<[u8]>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SceneTrackAction<'project> {
+    Continue,
+    Stop,
+    Play { clip_id: &'project str },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LoadedSceneLaunch {
     id: String,
@@ -4265,6 +4272,29 @@ impl LoadedPlaybackProject {
     #[must_use]
     pub fn scene_enabled(&self, scene_index: usize) -> Option<bool> {
         self.scenes.get(scene_index).map(|scene| scene.enabled)
+    }
+
+    /// Returns the persisted action for one validated scene/track pair.
+    /// Absence of an explicit slot is represented as [`SceneTrackAction::Continue`];
+    /// `None` means either stable identity is not present in this project.
+    #[must_use]
+    pub fn scene_track_action(
+        &self,
+        scene_id: &str,
+        track_id: &str,
+    ) -> Option<SceneTrackAction<'_>> {
+        self.track_index(track_id)?;
+        let scene = self.scenes.iter().find(|scene| scene.id == scene_id)?;
+        Some(
+            scene
+                .slots
+                .iter()
+                .find(|slot| slot.track_id == track_id)
+                .map_or(SceneTrackAction::Continue, |slot| match &slot.action {
+                    LoadedSceneSlotAction::Play { clip_id } => SceneTrackAction::Play { clip_id },
+                    LoadedSceneSlotAction::Stop => SceneTrackAction::Stop,
+                }),
+        )
     }
 
     #[must_use]
@@ -11229,6 +11259,19 @@ mod tests {
         assert_eq!(loaded.scene_count(), 1);
         assert_eq!(loaded.scene_name(0), Some("Verse"));
         assert_eq!(loaded.scene_name(1), None);
+        assert_eq!(
+            loaded.scene_track_action(
+                "018f47a2-6b2d-7c11-8a44-001122334461",
+                "018f47a2-6b2d-7c11-8a44-001122334456"
+            ),
+            Some(SceneTrackAction::Play {
+                clip_id: "018f47a2-6b2d-7c11-8a44-001122334460"
+            })
+        );
+        assert_eq!(
+            loaded.scene_track_action("018f47a2-6b2d-7c11-8a44-001122334461", "missing-track"),
+            None
+        );
         let later_scene = br#"{
             "format":"hyper-scene","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334462",
             "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Outro","order":1,"enabled":true,
@@ -11242,6 +11285,13 @@ mod tests {
         .unwrap();
         assert_eq!(ordered.scene_name(0), Some("Verse"));
         assert_eq!(ordered.scene_name(1), Some("Outro"));
+        assert_eq!(
+            ordered.scene_track_action(
+                "018f47a2-6b2d-7c11-8a44-001122334462",
+                "018f47a2-6b2d-7c11-8a44-001122334456"
+            ),
+            Some(SceneTrackAction::Continue)
+        );
         assert!(matches!(
             loaded.compile(
                 &[MediaAssetFact {
