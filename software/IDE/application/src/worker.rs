@@ -36,9 +36,9 @@ use super::{
     IdePendingSaveCloseWait, IdeProjectOpenError, IdeProjectSaveError, IdeRecordingAbortError,
     IdeRecordingAbortOutcome, IdeRecordingClipCreationError, IdeRecordingError,
     IdeRecordingImportOutcome, IdeRecordingObservation, IdeSaveCloseOutcome, IdeSceneAvailability,
-    IdeTransportSeekError, InputInventoryError, LocateState, OutputInventoryError,
-    OutputStreamSnapshot, OutputStreamState, OutputTestingDesktopIdeApplication,
-    RunningDesktopIdeApplication,
+    IdeSceneRenameError, IdeTransportSeekError, InputInventoryError, LocateState,
+    OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
+    OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -143,6 +143,7 @@ pub enum IdeWorkerCommandKind {
     SetAudioClipLoop,
     SetAudioClipReverse,
     SetAudioClipSourceStart,
+    RenameScene,
     StartRecording,
     StopRecording,
     AbortRecording,
@@ -269,6 +270,10 @@ pub enum IdeWorkerCommand {
         clip_id: String,
         source_start_frame: u64,
     },
+    RenameScene {
+        scene_id: String,
+        name: String,
+    },
     StartRecording {
         channel_index: usize,
     },
@@ -340,6 +345,7 @@ impl IdeWorkerCommand {
             Self::SetAudioClipLoop { .. } => IdeWorkerCommandKind::SetAudioClipLoop,
             Self::SetAudioClipReverse { .. } => IdeWorkerCommandKind::SetAudioClipReverse,
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
+            Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
             Self::StartRecording { .. } => IdeWorkerCommandKind::StartRecording,
             Self::StopRecording => IdeWorkerCommandKind::StopRecording,
             Self::AbortRecording => IdeWorkerCommandKind::AbortRecording,
@@ -591,6 +597,7 @@ impl IdeRecordingState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Owned UI-thread observation of one validated project scene.
 pub struct IdeScene {
+    id: String,
     name: String,
     availability: IdeSceneAvailability,
 }
@@ -759,6 +766,12 @@ impl IdeMixerSend {
 }
 
 impl IdeScene {
+    /// Returns the validated project-supplied scene identity.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     /// Returns the validated project-supplied scene name.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -957,6 +970,7 @@ pub enum IdeWorkerCommandFailure {
     AudioClipLoop(Box<IdeAudioClipLoopEditError>),
     AudioClipReverse(Box<IdeAudioClipReverseEditError>),
     AudioClipSourceSlip(Box<IdeAudioClipSourceSlipEditError>),
+    SceneRename(Box<IdeSceneRenameError>),
     Recording(IdeRecordingError),
     AudioPreview(IdeAudioPreviewError),
     InvalidState,
@@ -1005,6 +1019,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioClipLoop(source) => source.fmt(formatter),
             Self::AudioClipReverse(source) => source.fmt(formatter),
             Self::AudioClipSourceSlip(source) => source.fmt(formatter),
+            Self::SceneRename(source) => source.fmt(formatter),
             Self::Recording(source) => source.fmt(formatter),
             Self::AudioPreview(source) => source.fmt(formatter),
             Self::InvalidState => {
@@ -1059,6 +1074,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioClipLoop(source) => Some(source),
             Self::AudioClipReverse(source) => Some(source),
             Self::AudioClipSourceSlip(source) => Some(source),
+            Self::SceneRename(source) => Some(source),
             Self::Recording(source) => Some(source),
             Self::AudioPreview(source) => Some(source),
             Self::Publication(source) => Some(source),
@@ -1243,6 +1259,15 @@ pub enum IdeWorkerEvent {
         changed: bool,
         source_start_frame: u64,
     },
+    SceneRenamed {
+        revision: u64,
+        changed: bool,
+        name: String,
+    },
+    SceneRenameCommittedWithWarning {
+        name: String,
+        warning: Box<IdeSceneRenameError>,
+    },
     RecordingPreparing,
     Recording(IdeRecordingState),
     RecordingFinalizing,
@@ -1304,6 +1329,7 @@ pub enum IdeWorkerEvent {
     AudioClipSourceStartChanging {
         source_start_frame: u64,
     },
+    SceneRenaming,
     Closing,
     CommandFailed {
         command: IdeWorkerCommandKind,
@@ -1709,6 +1735,10 @@ enum ProjectMutation {
         clip_id: String,
         source_start_frame: u64,
     },
+    RenameScene {
+        scene_id: String,
+        name: String,
+    },
 }
 
 impl ProjectMutation {
@@ -1748,6 +1778,7 @@ impl ProjectMutation {
             Self::SetAudioClipLoop { .. } => IdeWorkerCommandKind::SetAudioClipLoop,
             Self::SetAudioClipReverse { .. } => IdeWorkerCommandKind::SetAudioClipReverse,
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
+            Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
         }
     }
 
@@ -1829,6 +1860,7 @@ impl ProjectMutation {
             } => IdeWorkerEvent::AudioClipSourceStartChanging {
                 source_start_frame: *source_start_frame,
             },
+            Self::RenameScene { .. } => IdeWorkerEvent::SceneRenaming,
         }
     }
 }
@@ -2037,7 +2069,8 @@ fn process_command(
         | IdeWorkerCommand::SetAudioClipFades { .. }
         | IdeWorkerCommand::SetAudioClipLoop { .. }
         | IdeWorkerCommand::SetAudioClipReverse { .. }
-        | IdeWorkerCommand::SetAudioClipSourceStart { .. }) => {
+        | IdeWorkerCommand::SetAudioClipSourceStart { .. }
+        | IdeWorkerCommand::RenameScene { .. }) => {
             process_project_mutation_command(state, command, events)
         }
         IdeWorkerCommand::StartRecording { channel_index } => {
@@ -2189,6 +2222,9 @@ fn process_project_mutation_command(
             clip_id,
             source_start_frame,
         } => set_audio_clip_source_start(state, events, &clip_id, source_start_frame),
+        IdeWorkerCommand::RenameScene { scene_id, name } => {
+            rename_scene(state, events, &scene_id, &name)
+        }
         _ => unreachable!("only project-mutation commands are routed to this handler"),
     }
 }
@@ -3784,6 +3820,54 @@ fn set_audio_clip_active(
     )
 }
 
+fn rename_scene(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    scene_id: &str,
+    name: &str,
+) -> bool {
+    let name = name.trim();
+    if scene_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RenameScene,
+            IdeWorkerCommandFailure::SceneRename(Box::new(
+                IdeSceneRenameError::InvalidSceneIdentity,
+            )),
+        );
+    }
+    if name.is_empty() || name.chars().count() > 120 {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RenameScene,
+            IdeWorkerCommandFailure::SceneRename(Box::new(IdeSceneRenameError::InvalidName)),
+        );
+    }
+    let mut owned_scene_id = String::new();
+    let mut normalized_name = String::new();
+    if owned_scene_id.try_reserve_exact(scene_id.len()).is_err()
+        || normalized_name.try_reserve_exact(name.len()).is_err()
+    {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RenameScene,
+            IdeWorkerCommandFailure::SceneRename(Box::new(
+                IdeSceneRenameError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_scene_id.push_str(scene_id);
+    normalized_name.push_str(name);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::RenameScene {
+            scene_id: owned_scene_id,
+            name: normalized_name,
+        },
+    )
+}
+
 fn set_audio_clip_gain(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -4126,6 +4210,9 @@ fn project_mutation_save_failure(
                 IdeAudioClipSourceSlipEditError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::RenameScene { .. } => IdeWorkerCommandFailure::SceneRename(Box::new(
+            IdeSceneRenameError::MixerSave(Box::new(reason)),
+        )),
     }
 }
 
@@ -4280,6 +4367,9 @@ fn project_mutation_native_close_failure(
                 IdeAudioClipSourceSlipEditError::NativeClose(failure),
             ))
         }
+        ProjectMutation::RenameScene { .. } => IdeWorkerCommandFailure::SceneRename(Box::new(
+            IdeSceneRenameError::NativeClose(failure),
+        )),
     }
 }
 
@@ -4410,6 +4500,11 @@ enum ProjectMutationAttempt {
             IdeAudioClipSourceSlipEditError,
         >,
     },
+    RenameScene {
+        name: String,
+        result:
+            Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeSceneRenameError>,
+    },
 }
 
 fn publish_arrangement_edit_failure(
@@ -4526,6 +4621,20 @@ pub(super) fn audio_clip_source_slip_edit_failure_event(
         IdeAudioClipEditCommittedWarning::SourceSlip,
         IdeWorkerCommandFailure::AudioClipSourceSlip,
     )
+}
+
+fn scene_rename_failure_event(name: String, reason: IdeSceneRenameError) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::SceneRenameCommittedWithWarning {
+            name,
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::RenameScene,
+            reason: IdeWorkerCommandFailure::SceneRename(Box::new(reason)),
+        }
+    }
 }
 
 pub(super) fn arrangement_edit_failure_event(
@@ -4947,6 +5056,21 @@ fn complete_project_mutation(
                     result: Err(reason),
                     ..
                 } => send_event(events, audio_clip_source_slip_edit_failure_event(reason)),
+                ProjectMutationAttempt::RenameScene {
+                    name,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::SceneRenamed {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                        name,
+                    },
+                ),
+                ProjectMutationAttempt::RenameScene {
+                    name,
+                    result: Err(reason),
+                } => send_event(events, scene_rename_failure_event(name, reason)),
             }
         }
         Err(failure) => {
@@ -5280,6 +5404,23 @@ fn attempt_project_mutation(
                 source_start_frame,
                 native_failure,
             ),
+        },
+        ProjectMutation::RenameScene { scene_id, name } => ProjectMutationAttempt::RenameScene {
+            name: name.clone(),
+            result: if let Some(failure) = native_failure {
+                Err(IdeSceneRenameError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_scene_rename(
+                    application,
+                    recovery,
+                    &scene_id,
+                    &name,
+                )
+                .and_then(|plan| {
+                    plan.publish()
+                        .map_err(|source| IdeSceneRenameError::Publication(Box::new(source)))
+                })
+            },
         },
     }
 }
@@ -5831,6 +5972,9 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::SetAudioClipSourceStart { result, .. } => {
             audio_clip_source_slip_edit_reopen_failure(result, reopen)
         }
+        ProjectMutationAttempt::RenameScene { result, .. } => {
+            scene_rename_reopen_failure(result, reopen)
+        }
     }
 }
 
@@ -5937,6 +6081,33 @@ pub(super) fn audio_clip_rename_edit_reopen_failure(
         },
     };
     IdeWorkerCommandFailure::AudioClipRename(Box::new(reason))
+}
+
+fn scene_rename_reopen_failure(
+    result: Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeSceneRenameError>,
+    reopen: IdeProjectOpenError,
+) -> IdeWorkerCommandFailure {
+    let reason = match result {
+        Ok(outcome) => IdeSceneRenameError::ReopenAfterPublication {
+            outcome,
+            source: Box::new(reopen),
+        },
+        Err(IdeSceneRenameError::Publication(publication)) => {
+            IdeSceneRenameError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(IdeSceneRenameError::NativeClose(close)) => IdeSceneRenameError::NativeCloseAndReopen {
+            close,
+            reopen: Box::new(reopen),
+        },
+        Err(preparation) => IdeSceneRenameError::ReopenAfterPreparation {
+            preparation: Box::new(preparation),
+            reopen: Box::new(reopen),
+        },
+    };
+    IdeWorkerCommandFailure::SceneRename(Box::new(reason))
 }
 
 fn audio_clip_activation_edit_reopen_failure(
@@ -6632,6 +6803,7 @@ fn running_observation(
         .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
     for scene_index in 0..snapshot.scene_count {
         scenes.push(IdeScene {
+            id: try_project_owned(snapshot.scene_ids[scene_index])?,
             name: try_project_owned(snapshot.scene_names[scene_index])?,
             availability: snapshot.scene_availability[scene_index],
         });
@@ -8501,6 +8673,70 @@ mod tests {
                 command: IdeWorkerCommandKind::RenameAudioClip,
                 reason: IdeWorkerCommandFailure::AudioClipRename(reason),
             } if matches!(reason.as_ref(), IdeAudioClipRenameEditError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn scene_rename_validates_input_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 3, 6).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::RenameScene {
+                scene_id: "scene-id".to_owned(),
+                name: "   ".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RenameScene,
+                reason: IdeWorkerCommandFailure::SceneRename(reason),
+            } if matches!(reason.as_ref(), IdeSceneRenameError::InvalidName)
+        ));
+        worker
+            .try_send(IdeWorkerCommand::RenameScene {
+                scene_id: String::new(),
+                name: "Verse".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RenameScene,
+                reason: IdeWorkerCommandFailure::SceneRename(reason),
+            } if matches!(reason.as_ref(), IdeSceneRenameError::InvalidSceneIdentity)
+        ));
+        worker
+            .try_send(IdeWorkerCommand::RenameScene {
+                scene_id: "scene-id".to_owned(),
+                name: format!(" {} ", "\u{00e9}".repeat(120)),
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::SceneRenaming));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RenameScene,
+                reason: IdeWorkerCommandFailure::SceneRename(reason),
+            } if matches!(reason.as_ref(), IdeSceneRenameError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);

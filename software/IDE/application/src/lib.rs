@@ -56,16 +56,17 @@ use hyper_playback_json::{
     AudioTrackDocumentSerializationError, AudioTrackRemovalBlockers,
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError, CompiledMixerTap,
     CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
-    MixerSendBaseState, MixerStateSerializationError, serialize_arrangement_placement_activation,
-    serialize_arrangement_placement_addition, serialize_arrangement_placement_duplication,
-    serialize_arrangement_placement_duration, serialize_arrangement_placement_front_trim,
-    serialize_arrangement_placement_move, serialize_arrangement_placement_removal,
-    serialize_arrangement_placement_split, serialize_audio_clip_activation,
-    serialize_audio_clip_duplication, serialize_audio_clip_fades, serialize_audio_clip_gain,
-    serialize_audio_clip_loop, serialize_audio_clip_rename, serialize_audio_clip_reverse,
-    serialize_audio_clip_source_start, serialize_audio_track_activation,
-    serialize_audio_track_addition, serialize_audio_track_removal, serialize_audio_track_rename,
-    serialize_mixer_base_state, serialize_recording_audio_clip_addition,
+    MixerSendBaseState, MixerStateSerializationError, SceneRenameSerializationError,
+    serialize_arrangement_placement_activation, serialize_arrangement_placement_addition,
+    serialize_arrangement_placement_duplication, serialize_arrangement_placement_duration,
+    serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
+    serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
+    serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
+    serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_rename,
+    serialize_audio_clip_reverse, serialize_audio_clip_source_start,
+    serialize_audio_track_activation, serialize_audio_track_addition,
+    serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
+    serialize_recording_audio_clip_addition, serialize_scene_rename,
 };
 use hyper_playback_session::{
     AudioClipGainValidationError, AudioClipSourceSlipValidationError, PlaybackSessionAssemblyLimits,
@@ -2717,6 +2718,182 @@ pub enum IdeAudioClipEditPublicationError {
     },
 }
 
+#[derive(Debug)]
+pub enum IdeSceneRenamePublicationError {
+    Mixer(Box<ProjectResourcePublicationError>),
+    Scene {
+        mixer: Box<ProjectResourcePublicationOutcome>,
+        source: Box<ProjectResourcePublicationError>,
+    },
+}
+
+impl IdeSceneRenamePublicationError {
+    #[must_use]
+    pub const fn scene_published(&self) -> bool {
+        match self {
+            Self::Mixer(_) => false,
+            Self::Scene { source, .. } => source.published(),
+        }
+    }
+}
+
+impl fmt::Display for IdeSceneRenamePublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mixer(source) if source.published() => write!(
+                formatter,
+                "live mixer was preserved, but its project transaction cleanup is incomplete: {source}"
+            ),
+            Self::Mixer(source) => write!(
+                formatter,
+                "live mixer could not be preserved before the scene rename: {source}"
+            ),
+            Self::Scene { source, .. } if source.published() => write!(
+                formatter,
+                "scene rename was published, but project verification or transaction recovery is incomplete: {source}"
+            ),
+            Self::Scene { mixer, source } if mixer.changed() => write!(
+                formatter,
+                "live mixer was preserved in project revision {} but the scene rename failed: {source}",
+                mixer.project_revision()
+            ),
+            Self::Scene { source, .. } => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeSceneRenamePublicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Mixer(source) | Self::Scene { source, .. } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeSceneRenameError {
+    InvalidSceneIdentity,
+    InvalidName,
+    MixerSave(Box<IdeProjectSaveError>),
+    SceneResourceMissing,
+    SceneResourceRoleMismatch,
+    Storage(StorageError),
+    Serialization(SceneRenameSerializationError),
+    CapacityUnavailable,
+    Publication(Box<IdeSceneRenamePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeSceneRenameError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: ProjectResourcePublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<IdeSceneRenamePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeSceneRenameError {
+    #[must_use]
+    pub const fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication(source) => source.scene_published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. } => publication.scene_published(),
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeSceneRenameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSceneIdentity => formatter.write_str("scene rename requires an identity"),
+            Self::InvalidName => {
+                formatter.write_str("scene rename requires a name of 1 to 120 characters")
+            }
+            Self::MixerSave(source) => write!(
+                formatter,
+                "live mixer state could not be preserved: {source}"
+            ),
+            Self::SceneResourceMissing => {
+                formatter.write_str("the selected scene resource is missing")
+            }
+            Self::SceneResourceRoleMismatch => {
+                formatter.write_str("the selected identity is not a scene resource")
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("scene rename capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before renaming the scene: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before renaming the scene ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "scene rename preparation failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "scene was renamed in project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.scene_published() => write!(
+                formatter,
+                "scene rename was committed with incomplete project verification or transaction recovery ({publication}) and the project could not be reopened ({reopen})"
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "scene rename publication failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeSceneRenameError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidSceneIdentity
+            | Self::InvalidName
+            | Self::SceneResourceMissing
+            | Self::SceneResourceRoleMismatch
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
 impl IdeAudioClipEditPublicationError {
     #[must_use]
     pub const fn clip_published(&self) -> bool {
@@ -3706,6 +3883,43 @@ struct IdeAudioClipEditPlan {
     clip_bytes: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct IdeSceneRenamePlan {
+    mixer: IdeMixerSavePlan,
+    scene_id: String,
+    scene_bytes: Vec<u8>,
+}
+
+fn prepare_scene_rename_resource(
+    prepared: &PreparedProjectPlayback,
+    scene_id: &str,
+    scene_name: &str,
+    limits: LoaderLimits,
+) -> Result<(String, Vec<u8>), IdeSceneRenameError> {
+    let package = prepared.package();
+    let descriptor = package
+        .manifest()
+        .resources()
+        .iter()
+        .find(|descriptor| descriptor.id() == scene_id)
+        .ok_or(IdeSceneRenameError::SceneResourceMissing)?;
+    if descriptor.role() != ResourceRole::Scene {
+        return Err(IdeSceneRenameError::SceneResourceRoleMismatch);
+    }
+    let source = package
+        .read_resource(scene_id)
+        .map_err(IdeSceneRenameError::Storage)?;
+    let (project, _, _, _) = prepared.session().parts();
+    let scene_bytes = serialize_scene_rename(project, &source, scene_id, scene_name, limits)
+        .map_err(IdeSceneRenameError::Serialization)?;
+    let mut owned_scene_id = String::new();
+    owned_scene_id
+        .try_reserve_exact(scene_id.len())
+        .map_err(|_| IdeSceneRenameError::CapacityUnavailable)?;
+    owned_scene_id.push_str(scene_id);
+    Ok((owned_scene_id, scene_bytes))
+}
+
 fn prepare_audio_clip_rename_resource(
     prepared: &PreparedProjectPlayback,
     clip_id: &str,
@@ -3983,6 +4197,28 @@ impl IdeAudioClipEditPlan {
     }
 }
 
+impl IdeSceneRenamePlan {
+    fn publish(&self) -> Result<ProjectResourcePublicationOutcome, IdeSceneRenamePublicationError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeSceneRenamePublicationError::Mixer(Box::new(source)))?;
+        publish_project_resource(
+            &self.mixer.project_path,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                resource_id: &self.scene_id,
+                expected_role: ResourceRole::Scene,
+                resource_bytes: &self.scene_bytes,
+            },
+        )
+        .map_err(|source| IdeSceneRenamePublicationError::Scene {
+            mixer: Box::new(mixer),
+            source: Box::new(source),
+        })
+    }
+}
+
 impl IdeAudioClipCreationPlan {
     fn publish(&self) -> Result<AudioClipPublicationOutcome, IdeAudioClipCreationPublicationError> {
         let mixer = self
@@ -4154,6 +4390,7 @@ pub struct RunningIdeSnapshot<'a> {
     pub recording_metadata: &'a [hyper_recording_metadata::RecordingMetadataDocument],
     pub scene_count: usize,
     pub track_count: usize,
+    pub scene_ids: [&'a str; MAX_IDE_SCENES],
     pub scene_names: [&'a str; MAX_IDE_SCENES],
     pub scene_availability: [IdeSceneAvailability; MAX_IDE_SCENES],
     pub mixer_channel_count: usize,
@@ -5132,6 +5369,32 @@ impl RunningDesktopIdeApplication {
         })
     }
 
+    fn prepare_scene_rename(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        scene_id: &str,
+        scene_name: &str,
+    ) -> Result<IdeSceneRenamePlan, IdeSceneRenameError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeSceneRenameError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeSceneRenameError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let (scene_id, scene_bytes) = prepare_scene_rename_resource(
+            prepared,
+            scene_id,
+            scene_name,
+            application.config.project_limits.session.documents,
+        )?;
+        Ok(IdeSceneRenamePlan {
+            mixer,
+            scene_id,
+            scene_bytes,
+        })
+    }
+
     fn prepare_audio_clip_gain(
         application: &DesktopIdeApplication,
         recovery: &DesktopPlaybackRecovery,
@@ -5320,9 +5583,11 @@ impl RunningDesktopIdeApplication {
         if scene_count > MAX_IDE_SCENES || session.scene_count() != scene_count {
             return None;
         }
+        let mut scene_ids = [""; MAX_IDE_SCENES];
         let mut scene_names = [""; MAX_IDE_SCENES];
         let mut scene_availability = [IdeSceneAvailability::NotPrepared; MAX_IDE_SCENES];
         for scene_index in 0..scene_count {
+            scene_ids[scene_index] = loaded.scene_id(scene_index)?;
             scene_names[scene_index] = loaded.scene_name(scene_index)?;
             scene_availability[scene_index] = session.scene_availability(scene_index)?;
         }
@@ -5402,6 +5667,7 @@ impl RunningDesktopIdeApplication {
             recording_metadata: project.recording_metadata(),
             scene_count,
             track_count: loaded.track_count(),
+            scene_ids,
             scene_names,
             scene_availability,
             mixer_channel_count,
@@ -6252,6 +6518,7 @@ mod tests {
     const ARRANGEMENT_TEST_RESOURCE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338505";
     const ARRANGEMENT_TEST_PLACEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338506";
     const ARRANGEMENT_TEST_MIXER_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338507";
+    const ARRANGEMENT_TEST_SCENE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338508";
 
     struct ArrangementProjectFixture {
         directory: TestDirectory,
@@ -6281,6 +6548,35 @@ mod tests {
             .unwrap();
             std::fs::remove_file(fixture.directory.0.join(path)).unwrap();
             std::fs::remove_dir(fixture.directory.0.join("arrangement")).unwrap();
+            hyper_storage_engine::verify_project_package(&fixture.directory.0).unwrap();
+            fixture
+        }
+
+        fn with_scene() -> Self {
+            let fixture = Self::new();
+            let scene = json!({
+                "format":"hyper-scene", "format_version":1,
+                "id":ARRANGEMENT_TEST_SCENE_ID,
+                "project_id":ARRANGEMENT_TEST_PROJECT_ID,
+                "name":"Intro", "order":0, "enabled":true,
+                "launch_quantization":{"mode":"immediate"},
+                "slots":[], "extensions":{"com.hyper.fixture":"preserve"}
+            });
+            let scene_bytes = arrangement_test_canonical(&scene);
+            arrangement_test_write(&fixture.directory.0, "scenes/intro.json", &scene_bytes);
+            let manifest_path = fixture.directory.0.join("project.json");
+            let mut manifest: Value =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            manifest["resources"]
+                .as_array_mut()
+                .unwrap()
+                .push(arrangement_test_descriptor(
+                    ARRANGEMENT_TEST_SCENE_ID,
+                    "scene",
+                    "scenes/intro.json",
+                    &scene_bytes,
+                ));
+            std::fs::write(manifest_path, arrangement_test_canonical(&manifest)).unwrap();
             hyper_storage_engine::verify_project_package(&fixture.directory.0).unwrap();
             fixture
         }
@@ -6923,6 +7219,108 @@ mod tests {
         .unwrap();
         assert!(!unchanged.changed());
         assert_eq!(unchanged.project_revision(), 4);
+    }
+
+    #[test]
+    fn scene_rename_publishes_durably_and_preserves_other_resources() {
+        let fixture = ArrangementProjectFixture::with_scene();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let source_mixer = package.read_resource(&mixer_id).unwrap();
+        let source_arrangement = package.read_resource(ARRANGEMENT_TEST_RESOURCE_ID).unwrap();
+        let source_scene = package.read_resource(ARRANGEMENT_TEST_SCENE_ID).unwrap();
+        let (scene_id, scene_bytes) = prepare_scene_rename_resource(
+            &prepared,
+            ARRANGEMENT_TEST_SCENE_ID,
+            "Verse A",
+            limits.session.documents,
+        )
+        .unwrap();
+        assert_ne!(scene_bytes, source_scene);
+        let expected_project_sha256 = *package.manifest_sha256();
+        drop(prepared);
+
+        let outcome = IdeSceneRenamePlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256,
+                resource_id: mixer_id.clone(),
+                resource_bytes: source_mixer.clone(),
+            },
+            scene_id,
+            scene_bytes: scene_bytes.clone(),
+        }
+        .publish()
+        .unwrap();
+        assert!(outcome.changed());
+        assert_eq!(outcome.project_revision(), 2);
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let (loaded, _, _, _) = reopened.session().parts();
+        assert_eq!(loaded.scene_name(0), Some("Verse A"));
+        assert_eq!(loaded.scene_id(0), Some(ARRANGEMENT_TEST_SCENE_ID));
+        assert_eq!(
+            reopened.package().read_resource(&mixer_id).unwrap(),
+            source_mixer
+        );
+        assert_eq!(
+            reopened
+                .package()
+                .read_resource(ARRANGEMENT_TEST_RESOURCE_ID)
+                .unwrap(),
+            source_arrangement
+        );
+        assert_eq!(
+            reopened
+                .package()
+                .read_resource(ARRANGEMENT_TEST_SCENE_ID)
+                .unwrap(),
+            scene_bytes
+        );
+        let unchanged_identity = *reopened.package().manifest_sha256();
+        let (scene_id, unchanged_scene) = prepare_scene_rename_resource(
+            &reopened,
+            ARRANGEMENT_TEST_SCENE_ID,
+            "Verse A",
+            limits.session.documents,
+        )
+        .unwrap();
+        assert!(matches!(
+            prepare_scene_rename_resource(
+                &reopened,
+                ARRANGEMENT_TEST_TRACK_ID,
+                "Invalid",
+                limits.session.documents,
+            ),
+            Err(IdeSceneRenameError::SceneResourceRoleMismatch)
+        ));
+        drop(reopened);
+
+        let unchanged = IdeSceneRenamePlan {
+            mixer: IdeMixerSavePlan {
+                project_path,
+                expected_project_sha256: unchanged_identity,
+                resource_id: mixer_id,
+                resource_bytes: source_mixer,
+            },
+            scene_id,
+            scene_bytes: unchanged_scene,
+        }
+        .publish()
+        .unwrap();
+        assert!(!unchanged.changed());
+        assert_eq!(unchanged.project_revision(), 2);
     }
 
     #[test]
