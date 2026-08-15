@@ -752,6 +752,7 @@ pub enum ArrangementPlacementDocumentSerializationError {
     InvalidPlacementIdentity,
     InvalidSceneLaunchIdentity,
     SceneLaunchTickOccupied,
+    SceneLaunchMissing,
     PlacementMissing,
     InvalidDocumentShape,
     Serialization(serde_json::Error),
@@ -774,6 +775,10 @@ pub type ArrangementPlacementDuplicationSerializationError =
 pub type ArrangementPlacementSplitSerializationError =
     ArrangementPlacementDocumentSerializationError;
 pub type ArrangementSceneLaunchAdditionSerializationError =
+    ArrangementPlacementDocumentSerializationError;
+pub type ArrangementSceneLaunchMoveSerializationError =
+    ArrangementPlacementDocumentSerializationError;
+pub type ArrangementSceneLaunchRemovalSerializationError =
     ArrangementPlacementDocumentSerializationError;
 
 #[derive(Debug)]
@@ -1125,6 +1130,9 @@ impl fmt::Display for ArrangementPlacementDocumentSerializationError {
             Self::SceneLaunchTickOccupied => {
                 formatter.write_str("the arrangement already launches a scene at this tick")
             }
+            Self::SceneLaunchMissing => {
+                formatter.write_str("the selected arrangement scene launch is not present")
+            }
             Self::PlacementMissing => {
                 formatter.write_str("the selected arrangement placement is not present")
             }
@@ -1154,6 +1162,7 @@ impl Error for ArrangementPlacementDocumentSerializationError {
             | Self::InvalidPlacementIdentity
             | Self::InvalidSceneLaunchIdentity
             | Self::SceneLaunchTickOccupied
+            | Self::SceneLaunchMissing
             | Self::PlacementMissing
             | Self::InvalidDocumentShape => None,
         }
@@ -2866,6 +2875,169 @@ pub fn serialize_arrangement_scene_launch_addition(
         .and_then(Value::as_array_mut)
         .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
     launches.push(json!({"id": launch_id, "tick": tick, "scene_id": scene_id}));
+    if launches
+        .iter()
+        .any(|launch| scene_launch_sort_key(launch).is_none())
+    {
+        return Err(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape);
+    }
+    launches.sort_unstable_by(|left, right| {
+        match (scene_launch_sort_key(left), scene_launch_sort_key(right)) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            _ => core::cmp::Ordering::Equal,
+        }
+    });
+
+    let output = serde_json_canonicalizer::to_vec(&value)
+        .map_err(ArrangementPlacementDocumentSerializationError::Serialization)?;
+    let edited = load_arrangement(
+        &output,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_placements,
+        limits.max_scene_launches,
+    )
+    .map_err(ArrangementPlacementDocumentSerializationError::Source)?;
+    let mut edited_project = project.clone();
+    edited_project.arrangement = Some(edited);
+    validate_loaded_identities(&edited_project)
+        .map_err(ArrangementPlacementDocumentSerializationError::Source)?;
+    edited_project
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(ArrangementPlacementDocumentSerializationError::ProjectCompilation)?;
+    Ok(output)
+}
+
+/// Moves one persisted scene launch to an exact project tick while preserving
+/// its stable identity, scene binding, and all unrelated arrangement content.
+///
+/// This is a non-ripple edit. Other scene launches and placements retain their
+/// exact ticks. Version 1 permits at most one scene launch at a tick, and the
+/// complete edited playback graph is compiled before bytes are returned.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the project has no arrangement, the
+/// launch is absent, the supplied bytes disagree with loaded authority, the
+/// target tick is occupied, or the edited project cannot execute.
+pub fn serialize_arrangement_scene_launch_move(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_arrangement: &[u8],
+    launch_id: &str,
+    tick: u64,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, ArrangementSceneLaunchMoveSerializationError> {
+    serialize_arrangement_scene_launch_document_edit(
+        project,
+        assets,
+        source_arrangement,
+        launch_id,
+        limits,
+        |current, launches| {
+            if current.tick != tick
+                && project.arrangement.as_ref().is_some_and(|arrangement| {
+                    arrangement
+                        .scene_launches
+                        .iter()
+                        .any(|launch| launch.id != launch_id && launch.tick == tick)
+                })
+            {
+                return Err(
+                    ArrangementPlacementDocumentSerializationError::SceneLaunchTickOccupied,
+                );
+            }
+            let document = launches
+                .iter_mut()
+                .find(|launch| launch.get("id").and_then(Value::as_str) == Some(launch_id))
+                .and_then(Value::as_object_mut)
+                .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
+            document.insert("tick".to_owned(), tick.into());
+            Ok(())
+        },
+    )
+}
+
+/// Removes exactly one persisted scene launch without moving any other event
+/// or changing the referenced scene.
+///
+/// The explicit arrangement remains present when its final scene launch is
+/// removed. The complete resulting playback graph is compiled before bytes are
+/// returned.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the project has no arrangement, the
+/// launch is absent, the supplied bytes disagree with loaded authority, or the
+/// resulting project cannot execute.
+pub fn serialize_arrangement_scene_launch_removal(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_arrangement: &[u8],
+    launch_id: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, ArrangementSceneLaunchRemovalSerializationError> {
+    serialize_arrangement_scene_launch_document_edit(
+        project,
+        assets,
+        source_arrangement,
+        launch_id,
+        limits,
+        |_, launches| {
+            let index = launches
+                .iter()
+                .position(|launch| launch.get("id").and_then(Value::as_str) == Some(launch_id))
+                .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
+            launches.remove(index);
+            Ok(())
+        },
+    )
+}
+
+fn serialize_arrangement_scene_launch_document_edit(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_arrangement: &[u8],
+    launch_id: &str,
+    limits: LoaderLimits,
+    edit: impl FnOnce(
+        &LoadedSceneLaunch,
+        &mut Vec<Value>,
+    ) -> Result<(), ArrangementPlacementDocumentSerializationError>,
+) -> Result<Vec<u8>, ArrangementPlacementDocumentSerializationError> {
+    let current = project
+        .arrangement
+        .as_ref()
+        .ok_or(ArrangementPlacementDocumentSerializationError::ArrangementMissing)?;
+    let current_launch = current
+        .scene_launches
+        .iter()
+        .find(|launch| launch.id == launch_id)
+        .ok_or(ArrangementPlacementDocumentSerializationError::SceneLaunchMissing)?;
+    let source = load_arrangement(
+        source_arrangement,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_placements,
+        limits.max_scene_launches,
+    )
+    .map_err(ArrangementPlacementDocumentSerializationError::Source)?;
+    if &source != current {
+        return Err(ArrangementPlacementDocumentSerializationError::SourceArrangementMismatch);
+    }
+
+    let mut value: Value = serde_json::from_slice(source_arrangement)
+        .map_err(ArrangementPlacementDocumentSerializationError::Serialization)?;
+    let canonical_source = serde_json_canonicalizer::to_vec(&value)
+        .map_err(ArrangementPlacementDocumentSerializationError::Serialization)?;
+    if canonical_source != source_arrangement {
+        return Err(ArrangementPlacementDocumentSerializationError::NonCanonicalSource);
+    }
+    let launches = value
+        .get_mut("scene_launches")
+        .and_then(Value::as_array_mut)
+        .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
+    edit(current_launch, launches)?;
     if launches
         .iter()
         .any(|launch| scene_launch_sort_key(launch).is_none())
@@ -9658,6 +9830,190 @@ mod tests {
                 SceneLimits::VERSION_1,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn arrangement_scene_launch_move_preserves_identity_and_restores_order() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let first_id = "018f47a2-6b2d-7c11-8a44-001122334466";
+        let moved_id = "018f47a2-6b2d-7c11-8a44-001122334467";
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["placements"] = json!([]);
+        source["scene_launches"] = json!([
+            {
+                "id": first_id,
+                "tick": 4,
+                "scene_id": "018f47a2-6b2d-7c11-8a44-001122334461"
+            },
+            {
+                "id": moved_id,
+                "tick": 8,
+                "scene_id": "018f47a2-6b2d-7c11-8a44-001122334461"
+            }
+        ]);
+        source["extensions"]["org.example.arrangement"] = json!({"opaque": true});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let moved = serialize_arrangement_scene_launch_move(
+            &loaded,
+            &asset_facts(),
+            &source,
+            moved_id,
+            2,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&moved).unwrap();
+
+        assert_eq!(
+            value["scene_launches"],
+            json!([
+                {
+                    "id": moved_id,
+                    "tick": 2,
+                    "scene_id": "018f47a2-6b2d-7c11-8a44-001122334461"
+                },
+                {
+                    "id": first_id,
+                    "tick": 4,
+                    "scene_id": "018f47a2-6b2d-7c11-8a44-001122334461"
+                }
+            ])
+        );
+        assert_eq!(
+            value["extensions"]["org.example.arrangement"],
+            json!({"opaque": true})
+        );
+        assert_eq!(serde_json_canonicalizer::to_vec(&value).unwrap(), moved);
+    }
+
+    #[test]
+    fn arrangement_scene_launch_move_rejects_missing_occupied_and_stale_authority() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let first_id = "018f47a2-6b2d-7c11-8a44-001122334466";
+        let second_id = "018f47a2-6b2d-7c11-8a44-001122334467";
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["placements"] = json!([]);
+        source["scene_launches"] = json!([
+            {
+                "id": first_id,
+                "tick": 4,
+                "scene_id": "018f47a2-6b2d-7c11-8a44-001122334461"
+            },
+            {
+                "id": second_id,
+                "tick": 8,
+                "scene_id": "018f47a2-6b2d-7c11-8a44-001122334461"
+            }
+        ]);
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            serialize_arrangement_scene_launch_move(
+                &loaded,
+                &asset_facts(),
+                &source,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                2,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementSceneLaunchMoveSerializationError::SceneLaunchMissing)
+        ));
+        assert!(matches!(
+            serialize_arrangement_scene_launch_move(
+                &loaded,
+                &asset_facts(),
+                &source,
+                second_id,
+                4,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementSceneLaunchMoveSerializationError::SceneLaunchTickOccupied)
+        ));
+        let mut stale: Value = serde_json::from_slice(&source).unwrap();
+        stale["name"] = "Stale".into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_arrangement_scene_launch_move(
+                &loaded,
+                &asset_facts(),
+                &stale,
+                second_id,
+                2,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementSceneLaunchMoveSerializationError::SourceArrangementMismatch)
+        ));
+    }
+
+    #[test]
+    fn arrangement_scene_launch_removal_preserves_unrelated_content_and_allows_empty() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let launch_id = "018f47a2-6b2d-7c11-8a44-001122334466";
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["placements"] = json!([]);
+        source["scene_launches"] = json!([{
+            "id": launch_id,
+            "tick": 4,
+            "scene_id": "018f47a2-6b2d-7c11-8a44-001122334461"
+        }]);
+        source["extensions"]["org.example.arrangement"] = json!({"opaque": true});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let removed = serialize_arrangement_scene_launch_removal(
+            &loaded,
+            &asset_facts(),
+            &source,
+            launch_id,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&removed).unwrap();
+        assert_eq!(value["scene_launches"], json!([]));
+        assert_eq!(value["placements"], json!([]));
+        assert_eq!(
+            value["extensions"]["org.example.arrangement"],
+            json!({"opaque": true})
+        );
+        assert_eq!(serde_json_canonicalizer::to_vec(&value).unwrap(), removed);
+
+        let reopened = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&removed)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.scene_launch_count(), 0);
+        assert!(matches!(
+            serialize_arrangement_scene_launch_removal(
+                &reopened,
+                &asset_facts(),
+                &removed,
+                launch_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementSceneLaunchRemovalSerializationError::SceneLaunchMissing)
+        ));
     }
 
     #[test]
