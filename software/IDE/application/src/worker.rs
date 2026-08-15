@@ -4623,7 +4623,10 @@ pub(super) fn audio_clip_source_slip_edit_failure_event(
     )
 }
 
-fn scene_rename_failure_event(name: String, reason: IdeSceneRenameError) -> IdeWorkerEvent {
+pub(super) fn scene_rename_failure_event(
+    name: String,
+    reason: IdeSceneRenameError,
+) -> IdeWorkerEvent {
     if reason.publication_committed() {
         IdeWorkerEvent::SceneRenameCommittedWithWarning {
             name,
@@ -6083,7 +6086,7 @@ pub(super) fn audio_clip_rename_edit_reopen_failure(
     IdeWorkerCommandFailure::AudioClipRename(Box::new(reason))
 }
 
-fn scene_rename_reopen_failure(
+pub(super) fn scene_rename_reopen_failure(
     result: Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeSceneRenameError>,
     reopen: IdeProjectOpenError,
 ) -> IdeWorkerCommandFailure {

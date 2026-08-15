@@ -6763,6 +6763,41 @@ mod tests {
         ));
     }
 
+    fn assert_scene_rename_recovery_authority(outcome: &ProjectResourcePublicationOutcome) {
+        assert!(matches!(
+            worker::scene_rename_reopen_failure(
+                Ok(outcome.clone()),
+                IdeProjectOpenError::SelectedOutputUnavailable,
+            ),
+            IdeWorkerCommandFailure::SceneRename(reason)
+                if matches!(reason.as_ref(), IdeSceneRenameError::ReopenAfterPublication {
+                    outcome,
+                    source,
+                } if outcome.changed()
+                    && outcome.project_revision() == 2
+                    && matches!(source.as_ref(), IdeProjectOpenError::SelectedOutputUnavailable))
+        ));
+        let committed = IdeSceneRenameError::ReopenAfterPublication {
+            outcome: outcome.clone(),
+            source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
+        };
+        assert!(matches!(
+            worker::scene_rename_failure_event("Verse A".to_owned(), committed),
+            IdeWorkerEvent::SceneRenameCommittedWithWarning { name, warning }
+                if name == "Verse A" && warning.publication_committed()
+        ));
+        assert!(matches!(
+            worker::scene_rename_failure_event(
+                "Verse A".to_owned(),
+                IdeSceneRenameError::InvalidName,
+            ),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RenameScene,
+                reason: IdeWorkerCommandFailure::SceneRename(reason),
+            } if matches!(reason.as_ref(), IdeSceneRenameError::InvalidName)
+        ));
+    }
+
     fn arrangement_test_sha256(bytes: &[u8]) -> String {
         let mut output = String::with_capacity(64);
         for byte in Sha256::digest(bytes) {
@@ -7264,6 +7299,7 @@ mod tests {
         .unwrap();
         assert!(outcome.changed());
         assert_eq!(outcome.project_revision(), 2);
+        assert_scene_rename_recovery_authority(&outcome);
 
         let reopened =
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();

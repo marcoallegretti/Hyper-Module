@@ -25,7 +25,7 @@ use hyper_desktop_ide::{
 #[cfg(test)]
 use hyper_desktop_ide::{
     IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError, IdeAudioClipLoopEditError,
-    IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError,
+    IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError, IdeSceneRenameError,
 };
 use slint::platform::PlatformError;
 use slint::{
@@ -6036,6 +6036,23 @@ mod tests {
         assert!(ui.get_scene_rename_name().is_empty());
         assert!(ui.get_status_text().contains("project revision 4"));
         assert!(ui.get_error_text().is_empty());
+
+        ui.set_scene_rename_visible(true);
+        ui.set_scene_rename_id("scene-a".into());
+        ui.set_scene_rename_original("Intro".into());
+        ui.set_scene_rename_name("Verse A".into());
+        apply_scene_rename_event(
+            ui,
+            &IdeWorkerEvent::SceneRenameCommittedWithWarning {
+                name: "Verse A".to_owned(),
+                warning: Box::new(IdeSceneRenameError::InvalidName),
+            },
+        );
+        assert!(!ui.get_scene_rename_visible());
+        assert!(ui.get_scene_rename_id().is_empty());
+        assert!(ui.get_scene_rename_name().is_empty());
+        assert!(ui.get_status_text().contains("committed and reopened"));
+        assert!(!ui.get_error_text().is_empty());
     }
 
     #[test]
