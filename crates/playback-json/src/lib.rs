@@ -678,6 +678,8 @@ pub enum SceneDocumentSerializationError {
     Serialization(serde_json::Error),
 }
 
+pub type SceneActivationSerializationError = SceneDocumentSerializationError;
+
 #[derive(Debug)]
 pub enum AudioTrackDocumentSerializationError {
     Source(LoadError),
@@ -2228,6 +2230,27 @@ pub fn serialize_scene_rename(
         document.insert("name".to_owned(), scene_name.into());
     })
     .map_err(SceneRenameSerializationError::Document)
+}
+
+/// Replaces only the activation state in one validated canonical scene
+/// document while preserving identity, name, order, launch quantization, slot
+/// actions, and namespaced extensions.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the scene is absent, the supplied bytes
+/// disagree with the loaded project, or the resulting document fails
+/// version-1 validation.
+pub fn serialize_scene_activation(
+    project: &LoadedPlaybackProject,
+    source_scene: &[u8],
+    scene_id: &str,
+    active: bool,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, SceneActivationSerializationError> {
+    serialize_scene_document_edit(project, source_scene, scene_id, limits, |document| {
+        document.insert("enabled".to_owned(), active.into());
+    })
 }
 
 /// Replaces only the activation state in one validated canonical audio-track
@@ -3958,6 +3981,13 @@ impl LoadedPlaybackProject {
         self.scenes
             .get(scene_index)
             .map(|scene| scene.name.as_str())
+    }
+
+    /// Returns the validated persisted activation state by canonical scene
+    /// order.
+    #[must_use]
+    pub fn scene_enabled(&self, scene_index: usize) -> Option<bool> {
+        self.scenes.get(scene_index).map(|scene| scene.enabled)
     }
 
     #[must_use]
@@ -7470,6 +7500,101 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn scene_activation_changes_only_the_selected_canonical_field() {
+        let mut source: Value = serde_json::from_slice(SCENE).unwrap();
+        source["extensions"]["org.example.scene"] = json!({"opaque": [1, 2, 3]});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [&source];
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let scene_id = "018f47a2-6b2d-7c11-8a44-001122334461";
+
+        let inactive =
+            serialize_scene_activation(&loaded, &source, scene_id, false, LoaderLimits::VERSION_1)
+                .unwrap();
+        let mut expected: Value = serde_json::from_slice(&source).unwrap();
+        expected["enabled"] = false.into();
+
+        assert_eq!(
+            inactive,
+            serde_json_canonicalizer::to_vec(&expected).unwrap()
+        );
+        assert_eq!(
+            expected["extensions"]["org.example.scene"],
+            json!({"opaque": [1, 2, 3]})
+        );
+        let inactive_scenes: [&[u8]; 1] = [&inactive];
+        let reopened = load(
+            input_with_scenes(
+                TIMELINE,
+                &tracks,
+                &clips,
+                &inactive_scenes,
+                Some(ARRANGEMENT),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.scene_id(0), Some(scene_id));
+        assert_eq!(reopened.scene_name(0), Some("Verse"));
+        assert_eq!(reopened.scene_enabled(0), Some(false));
+        assert_eq!(
+            serialize_scene_activation(&loaded, &source, scene_id, true, LoaderLimits::VERSION_1,)
+                .unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn scene_activation_rejects_missing_stale_and_noncanonical_inputs() {
+        let source: Value = serde_json::from_slice(SCENE).unwrap();
+        let canonical = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [&canonical];
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let scene_id = "018f47a2-6b2d-7c11-8a44-001122334461";
+
+        assert!(matches!(
+            serialize_scene_activation(
+                &loaded,
+                &canonical,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                false,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(SceneDocumentSerializationError::SceneMissing)
+        ));
+        let mut stale = source.clone();
+        stale["name"] = "Different source".into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_scene_activation(&loaded, &stale, scene_id, false, LoaderLimits::VERSION_1,),
+            Err(SceneDocumentSerializationError::SourceSceneMismatch)
+        ));
+        let noncanonical = serde_json::to_vec_pretty(&source).unwrap();
+        assert!(matches!(
+            serialize_scene_activation(
+                &loaded,
+                &noncanonical,
+                scene_id,
+                false,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(SceneDocumentSerializationError::NonCanonicalSource)
+        ));
     }
 
     #[test]
