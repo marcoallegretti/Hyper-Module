@@ -65,13 +65,14 @@ use hyper_playback_json::{
     serialize_arrangement_placement_duplication, serialize_arrangement_placement_duration,
     serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
     serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
-    serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
-    serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_rename,
-    serialize_audio_clip_reverse, serialize_audio_clip_source_start,
-    serialize_audio_track_activation, serialize_audio_track_addition,
-    serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
-    serialize_recording_audio_clip_addition, serialize_scene_activation, serialize_scene_addition,
-    serialize_scene_duplication, serialize_scene_rename, serialize_scene_slot_edit,
+    serialize_arrangement_scene_launch_addition, serialize_audio_clip_activation,
+    serialize_audio_clip_duplication, serialize_audio_clip_fades, serialize_audio_clip_gain,
+    serialize_audio_clip_loop, serialize_audio_clip_rename, serialize_audio_clip_reverse,
+    serialize_audio_clip_source_start, serialize_audio_track_activation,
+    serialize_audio_track_addition, serialize_audio_track_removal, serialize_audio_track_rename,
+    serialize_mixer_base_state, serialize_recording_audio_clip_addition,
+    serialize_scene_activation, serialize_scene_addition, serialize_scene_duplication,
+    serialize_scene_rename, serialize_scene_slot_edit,
 };
 use hyper_playback_session::{
     AudioClipGainValidationError, AudioClipSourceSlipValidationError, PlaybackSessionAssemblyLimits,
@@ -2556,6 +2557,7 @@ impl Error for IdeArrangementPlacementEditPublicationError {
 pub enum IdeArrangementPlacementEditError {
     InvalidPlacementIdentity,
     InvalidClipIdentity,
+    InvalidSceneIdentity,
     MixerSave(Box<IdeProjectSaveError>),
     ArrangementResourceMissing,
     ArrangementResourceAmbiguous,
@@ -2627,6 +2629,9 @@ impl fmt::Display for IdeArrangementPlacementEditError {
             }
             Self::InvalidClipIdentity => formatter
                 .write_str("arrangement placement addition requires an audio-clip identity"),
+            Self::InvalidSceneIdentity => {
+                formatter.write_str("arrangement scene launch requires a scene identity")
+            }
             Self::MixerSave(source) => {
                 write!(
                     formatter,
@@ -2727,6 +2732,7 @@ impl Error for IdeArrangementPlacementEditError {
             Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
             Self::InvalidPlacementIdentity
             | Self::InvalidClipIdentity
+            | Self::InvalidSceneIdentity
             | Self::ArrangementResourceMissing
             | Self::ArrangementResourceAmbiguous
             | Self::CapacityUnavailable
@@ -5612,6 +5618,65 @@ impl RunningDesktopIdeApplication {
             arrangement_bytes,
             addition,
             created_placement_id: Some(placement_id),
+        })
+    }
+
+    fn prepare_arrangement_scene_launch_addition(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        scene_id: &str,
+        tick: u64,
+    ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeArrangementPlacementEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeArrangementPlacementEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let mut descriptors = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::Arrangement);
+        let descriptor = descriptors.next();
+        if descriptors.next().is_some() {
+            return Err(IdeArrangementPlacementEditError::ArrangementResourceAmbiguous);
+        }
+        let addition = descriptor.is_none();
+        let arrangement_id = descriptor.map_or_else(
+            || uuid::Uuid::new_v4().to_string(),
+            |descriptor| descriptor.id().to_owned(),
+        );
+        let source = descriptor
+            .map(|descriptor| package.read_resource(descriptor.id()))
+            .transpose()
+            .map_err(IdeArrangementPlacementEditError::Storage)?;
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeArrangementPlacementEditError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let launch_id = uuid::Uuid::new_v4().to_string();
+        let arrangement_bytes = serialize_arrangement_scene_launch_addition(
+            project,
+            &assets,
+            source.as_deref(),
+            &arrangement_id,
+            &launch_id,
+            scene_id,
+            tick,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeArrangementPlacementEditError::Serialization)?;
+        Ok(IdeArrangementPlacementEditPlan {
+            mixer,
+            arrangement_id,
+            arrangement_bytes,
+            addition,
+            created_placement_id: None,
         })
     }
 
@@ -9350,6 +9415,70 @@ mod tests {
             reopened.package().read_resource(arrangement_id).unwrap(),
             arrangement_bytes
         );
+    }
+
+    #[test]
+    fn arrangement_scene_launch_publishes_and_reopens_with_exact_tick() {
+        let fixture = ArrangementProjectFixture::with_scene();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let source_arrangement = package.read_resource(ARRANGEMENT_TEST_RESOURCE_ID).unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        let launch_id = "018f47a2-6b2d-7c11-8a44-001122338509";
+        let (project, _, _, media) = prepared.session().parts();
+        let assets: Vec<_> = media.media_asset_facts().collect();
+        let arrangement_bytes = serialize_arrangement_scene_launch_addition(
+            project,
+            &assets,
+            Some(&source_arrangement),
+            ARRANGEMENT_TEST_RESOURCE_ID,
+            launch_id,
+            ARRANGEMENT_TEST_SCENE_ID,
+            4,
+            limits.session.documents,
+        )
+        .unwrap();
+        drop(prepared);
+
+        let outcome = IdeArrangementPlacementEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256,
+                resource_id: mixer_id,
+                resource_bytes: mixer_bytes,
+            },
+            arrangement_id: ARRANGEMENT_TEST_RESOURCE_ID.to_owned(),
+            arrangement_bytes,
+            addition: false,
+            created_placement_id: None,
+        }
+        .publish()
+        .unwrap();
+        assert_eq!(outcome.project_revision(), 2);
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let loaded = reopened.session().parts().0;
+        assert_eq!(loaded.scene_launch_count(), 1);
+        assert_eq!(loaded.scene_launch_id_at(0), Some(launch_id));
+        assert_eq!(loaded.scene_launch_tick_at(0), Some(4));
+        assert_eq!(loaded.scene_launch_scene_index_at(0), Some(0));
+        let published = reopened.session().arrangement();
+        assert_eq!(published.scene_launches().len(), 1);
+        assert_eq!(published.scene_launches()[0].id(), launch_id);
+        assert_eq!(published.scene_launches()[0].tick(), 4);
+        assert_eq!(published.scene_name(0), Some("Intro"));
     }
 
     #[test]
