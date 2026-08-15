@@ -15,6 +15,7 @@ export enum AppMode {
     renaming-track,
     changing-track-activation,
     adding-arrangement-placement,
+    adding-arrangement-scene-launch,
     duplicating-arrangement-placement,
     splitting-arrangement-placement,
     changing-arrangement-activation,
@@ -120,6 +121,12 @@ export struct ArrangementRow {
     active: bool,
 }
 
+export struct ArrangementSceneLaunchRow {
+    id: string,
+    scene-name: string,
+    tick: string,
+}
+
 export struct ClipRow {
     id: string,
     name: string,
@@ -164,6 +171,7 @@ export global IdeActions {
     callback trim-arrangement-placement-front(string, string);
     callback remove-arrangement-placement(string);
     callback add-arrangement-placement(string, string);
+    callback add-arrangement-scene-launch(string, string);
     callback duplicate-arrangement-placement(string, string);
     callback split-arrangement-placement(string, string);
     callback rename-audio-clip(string, string);
@@ -345,6 +353,10 @@ export component MainWindow inherits Window {
     in-out property <string> take-clip-track-name: "";
     in-out property <string> take-clip-name: "";
     in-out property <bool> arrangement-visible: false;
+    in-out property <bool> add-arrangement-scene-launch-visible: false;
+    in-out property <string> add-arrangement-scene-launch-id: "";
+    in-out property <string> add-arrangement-scene-launch-name: "";
+    in-out property <string> add-arrangement-scene-launch-tick: "0";
     in-out property <bool> remove-arrangement-placement-visible: false;
     in-out property <string> remove-arrangement-placement-id: "";
     in-out property <string> remove-arrangement-placement-clip-name: "";
@@ -424,6 +436,7 @@ export component MainWindow inherits Window {
     in property <string> recording-drop-count: "0";
     in property <[TakeRow]> recording-takes: [];
     in property <[ArrangementRow]> arrangement-placements: [];
+    in property <[ArrangementSceneLaunchRow]> arrangement-scene-launches: [];
     in property <[ClipRow]> audio-clips: [];
     in property <string> arrangement-span-clock: "—";
     in property <bool> preview-active: false;
@@ -503,6 +516,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.renaming-track ? "◌  RENAMING TRACK"
                         : root.app-mode == AppMode.changing-track-activation ? "◌  UPDATING TRACK"
                         : root.app-mode == AppMode.adding-arrangement-placement ? "◌  PLACING CLIP"
+                        : root.app-mode == AppMode.adding-arrangement-scene-launch ? "◌  ADDING SCENE MARKER"
                         : root.app-mode == AppMode.duplicating-arrangement-placement ? "◌  COPYING PLACEMENT"
                         : root.app-mode == AppMode.changing-arrangement-activation ? "◌  UPDATING CLIP"
                         : root.app-mode == AppMode.moving-arrangement-placement ? "◌  MOVING CLIP"
@@ -955,6 +969,19 @@ export component MainWindow inherits Window {
                                         accessible-label: (scene.active ? "Disable scene " : "Enable scene ") + scene.name;
                                         enabled: root.app-mode == AppMode.running && scene.id != "";
                                         clicked => { IdeActions.set-scene-active(scene.id, !scene.active); }
+                                    }
+                                    Button {
+                                        horizontal-stretch: 1;
+                                        text: "Mark";
+                                        accessible-label: "Add scene " + scene.name + " to the linear arrangement";
+                                        enabled: root.app-mode == AppMode.running && scene.id != "";
+                                        clicked => {
+                                            root.add-arrangement-scene-launch-id = scene.id;
+                                            root.add-arrangement-scene-launch-name = scene.name;
+                                            root.add-arrangement-scene-launch-tick = "0";
+                                            root.add-arrangement-scene-launch-visible = true;
+                                            root.arrangement-visible = true;
+                                        }
                                     }
                                 }
                                 Text {
@@ -1716,7 +1743,7 @@ export component MainWindow inherits Window {
                             height: 48px;
                             VerticalLayout {
                                 Text { text: "ARRANGEMENT"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: "Verified compiled placements · span " + root.arrangement-span-clock; color: #aebccc; font-size: 12px; }
+                                Text { text: root.arrangement-placements.length + " placements · " + root.arrangement-scene-launches.length + " scene markers · span " + root.arrangement-span-clock; color: #aebccc; font-size: 12px; }
                             }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Button {
@@ -1732,7 +1759,55 @@ export component MainWindow inherits Window {
 
                         Rectangle { height: 1px; background: #27313d; }
 
-                        if root.remove-arrangement-placement-visible : VerticalLayout {
+                        if root.add-arrangement-scene-launch-visible : VerticalLayout {
+                            vertical-stretch: 1;
+                            spacing: 14px;
+                            Text { text: "ADD SCENE MARKER"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            Text { text: root.add-arrangement-scene-launch-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                            Text {
+                                text: "This writes a durable scene launch at one exact project tick. It does not capture a live performance, move existing events, or bypass the single-authority playback rules.";
+                                color: #aebccc;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                            GridLayout {
+                                spacing: 8px;
+                                Text { row: 0; col: 0; text: "Project tick"; color: #8fa0b4; vertical-alignment: center; }
+                                LineEdit {
+                                    row: 0; col: 1;
+                                    text <=> root.add-arrangement-scene-launch-tick;
+                                    input-type: number;
+                                    accessible-label: "Exact project tick for scene marker";
+                                    accepted => {
+                                        IdeActions.add-arrangement-scene-launch(root.add-arrangement-scene-launch-id, self.text);
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Button {
+                                    text: "Cancel";
+                                    enabled: root.app-mode == AppMode.running;
+                                    clicked => { root.add-arrangement-scene-launch-visible = false; }
+                                }
+                                Button {
+                                    horizontal-stretch: 1;
+                                    text: root.app-mode == AppMode.adding-arrangement-scene-launch ? "Adding marker..." : "Add marker";
+                                    enabled: root.app-mode == AppMode.running
+                                        && root.add-arrangement-scene-launch-id != ""
+                                        && root.add-arrangement-scene-launch-tick != "";
+                                    clicked => {
+                                        IdeActions.add-arrangement-scene-launch(
+                                            root.add-arrangement-scene-launch-id,
+                                            root.add-arrangement-scene-launch-tick
+                                        );
+                                    }
+                                }
+                            }
+                            Rectangle { vertical-stretch: 1; background: transparent; }
+                        }
+
+                        if root.remove-arrangement-placement-visible && !root.add-arrangement-scene-launch-visible : VerticalLayout {
                             vertical-stretch: 1;
                             spacing: 14px;
                             Text { text: "REMOVE ARRANGEMENT PLACEMENT"; color: #ff9d76; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
@@ -1773,7 +1848,7 @@ export component MainWindow inherits Window {
                             Rectangle { vertical-stretch: 1; background: transparent; }
                         }
 
-                        if !root.remove-arrangement-placement-visible && root.arrangement-placements.length == 0 : Text {
+                        if !root.remove-arrangement-placement-visible && !root.add-arrangement-scene-launch-visible && root.arrangement-placements.length == 0 && root.arrangement-scene-launches.length == 0 : Text {
                             text: "This project has no linear arrangement placements.";
                             color: #8fa0b4;
                             font-size: 13px;
@@ -1782,7 +1857,27 @@ export component MainWindow inherits Window {
                             vertical-stretch: 1;
                         }
 
-                        if !root.remove-arrangement-placement-visible && root.arrangement-placements.length > 0 : ListView {
+                        if !root.remove-arrangement-placement-visible && !root.add-arrangement-scene-launch-visible && root.arrangement-scene-launches.length > 0 : ListView {
+                            height: Math.min(112px, root.arrangement-scene-launches.length * 34px);
+                            for marker in root.arrangement-scene-launches : Rectangle {
+                                height: 30px;
+                                width: parent.width;
+                                background: #101820;
+                                border-color: #27313d;
+                                border-width: 1px;
+                                border-radius: 4px;
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 10px;
+                                    Text { text: "SCENE"; color: #6f8197; font-size: 9px; vertical-alignment: center; }
+                                    Text { text: marker.scene-name; color: #dce5ef; font-size: 11px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                    Text { text: "TICK " + marker.tick; color: #e7b96d; font-size: 10px; vertical-alignment: center; }
+                                }
+                            }
+                        }
+
+                        if !root.remove-arrangement-placement-visible && !root.add-arrangement-scene-launch-visible && root.arrangement-placements.length > 0 : ListView {
                             vertical-stretch: 1;
                             for placement in root.arrangement-placements : Rectangle {
                                 height: 112px;
@@ -1951,8 +2046,8 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        if !root.remove-arrangement-placement-visible : Text {
-                            text: "Exact non-ripple copies, splits, moves, edge trims, activation, and confirmed removal persist. Splits preserve contiguous source playback. No drag, snap, or waveform editing.";
+                        if !root.remove-arrangement-placement-visible && !root.add-arrangement-scene-launch-visible : Text {
+                            text: "Scene markers and exact non-ripple placement edits persist. Markers must preserve single-track authority; this surface does not claim live performance capture, drag, snap, or waveform editing.";
                             color: #65758a;
                             font-size: 9px;
                         }

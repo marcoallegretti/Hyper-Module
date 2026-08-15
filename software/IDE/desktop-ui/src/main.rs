@@ -1418,6 +1418,7 @@ fn bind_arrangement_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    bind_arrangement_scene_launch_callback(ui, worker, project_state);
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_locate = Rc::clone(worker);
@@ -1499,6 +1500,68 @@ fn bind_arrangement_callback(
     bind_arrangement_duration_callback(ui, worker, project_state);
     bind_arrangement_front_trim_callback(ui, worker, project_state);
     bind_arrangement_removal_callback(ui, worker, project_state);
+}
+
+fn bind_arrangement_scene_launch_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    let project_state = Rc::clone(project_state);
+    actions.on_add_arrangement_scene_launch(move |scene_id, tick| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_add_arrangement_scene_launch_visible()
+            || ui.get_add_arrangement_scene_launch_id().as_str() != scene_id.as_str()
+        {
+            ui.set_error_text("Scene-marker request is no longer current".into());
+            return;
+        }
+        let tick = match parse_arrangement_start_tick(tick.as_str()) {
+            Ok(tick) => tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        if !project_state
+            .scenes
+            .borrow()
+            .iter()
+            .any(|scene| scene.id() == scene_id.as_str())
+        {
+            ui.set_error_text("The selected scene is no longer available".into());
+            return;
+        }
+        if project_state
+            .arrangement
+            .borrow()
+            .as_ref()
+            .is_some_and(|binding| {
+                binding
+                    .owner
+                    .scene_launches()
+                    .iter()
+                    .any(|launch| launch.tick() == tick)
+            })
+        {
+            ui.set_error_text("The arrangement already has a scene marker at that tick".into());
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker,
+            IdeWorkerCommand::AddArrangementSceneLaunch {
+                scene_id: scene_id.to_string(),
+                tick,
+            },
+        );
+    });
 }
 
 fn bind_arrangement_duplication_callback(
@@ -2428,6 +2491,9 @@ fn submit_to_ui(ui: &MainWindow, worker: &WorkerCell, command: IdeWorkerCommand)
             if command_kind == IdeWorkerCommandKind::AddArrangementPlacement {
                 ui.set_add_arrangement_placement_visible(false);
             }
+            if command_kind == IdeWorkerCommandKind::AddArrangementSceneLaunch {
+                ui.set_add_arrangement_scene_launch_visible(false);
+            }
             ui.set_error_text(SharedString::default());
             ui.set_status_text(command_status(command_kind).into());
         }
@@ -2468,6 +2534,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         }
         IdeWorkerCommandKind::RemoveArrangementPlacement => AppMode::RemovingArrangementPlacement,
         IdeWorkerCommandKind::AddArrangementPlacement => AppMode::AddingArrangementPlacement,
+        IdeWorkerCommandKind::AddArrangementSceneLaunch => AppMode::AddingArrangementSceneLaunch,
         IdeWorkerCommandKind::DuplicateArrangementPlacement => {
             AppMode::DuplicatingArrangementPlacement
         }
@@ -2520,6 +2587,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::Mixer => "Mixer command queued…",
         IdeWorkerCommandKind::Monitoring => "Applying input cue control…",
         IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
+        IdeWorkerCommandKind::AddArrangementSceneLaunch => {
+            "Preserving mixer state, adding the scene marker, and reopening project..."
+        }
         IdeWorkerCommandKind::AddAudioTrack => {
             "Saving mixer state, adding the audio track, and reopening project…"
         }
@@ -2718,6 +2788,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementPlacementAdded { .. }
         | IdeWorkerEvent::ArrangementPlacementAdding { .. }) => {
             apply_arrangement_placement_addition_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ArrangementSceneLaunchAdded { .. }
+        | IdeWorkerEvent::ArrangementSceneLaunchAdding { .. }) => {
+            apply_arrangement_scene_launch_addition_event(ui, &event);
         }
         event @ (IdeWorkerEvent::ArrangementPlacementDuplicated { .. }
         | IdeWorkerEvent::ArrangementPlacementDuplicating { .. }) => {
@@ -3118,6 +3192,36 @@ fn apply_arrangement_placement_addition_event(ui: &MainWindow, event: &IdeWorker
     }
 }
 
+fn apply_arrangement_scene_launch_addition_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ArrangementSceneLaunchAdded {
+            revision,
+            scene_id,
+            tick,
+        } => {
+            ui.set_add_arrangement_scene_launch_visible(false);
+            ui.set_add_arrangement_scene_launch_id(SharedString::default());
+            ui.set_add_arrangement_scene_launch_name(SharedString::default());
+            ui.set_add_arrangement_scene_launch_tick("0".into());
+            ui.set_status_text(
+                format!("Added scene {scene_id} at tick {tick} in project revision {revision}")
+                    .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementSceneLaunchAdding { tick } => {
+            ui.set_app_mode(AppMode::AddingArrangementSceneLaunch);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before adding the scene marker at tick {tick}..."
+                )
+                .into(),
+            );
+        }
+        _ => unreachable!("arrangement scene-launch dispatcher received another event"),
+    }
+}
+
 fn apply_arrangement_placement_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::ArrangementPlacementDuplicated {
@@ -3182,6 +3286,10 @@ fn apply_arrangement_placement_committed_warning(ui: &MainWindow, event: &IdeWor
         unreachable!("arrangement committed-warning dispatcher received another event");
     };
     let action = match command {
+        IdeWorkerCommandKind::AddArrangementSceneLaunch => {
+            ui.set_add_arrangement_scene_launch_visible(false);
+            "Arrangement scene marker".to_owned()
+        }
         IdeWorkerCommandKind::AddArrangementPlacement => {
             reset_arrangement_placement_addition_form(ui);
             let placement_id = warning
@@ -4345,6 +4453,31 @@ struct ArrangementListModel {
     sample_rate_hz: u32,
 }
 
+struct ArrangementSceneLaunchListModel {
+    owner: Arc<IdePlaybackArrangement>,
+}
+
+impl Model for ArrangementSceneLaunchListModel {
+    type Data = ArrangementSceneLaunchRow;
+
+    fn row_count(&self) -> usize {
+        self.owner.scene_launches().len()
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        let launch = self.owner.scene_launches().get(row)?;
+        Some(ArrangementSceneLaunchRow {
+            id: launch.id().into(),
+            scene_name: self.owner.scene_name(launch.scene_index())?.into(),
+            tick: launch.tick().to_string().into(),
+        })
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &()
+    }
+}
+
 impl Model for ArrangementListModel {
     type Data = ArrangementRow;
 
@@ -4401,6 +4534,9 @@ fn set_arrangement(
     ui.set_arrangement_placements(ModelRc::new(ArrangementListModel {
         owner: Arc::clone(owner),
         sample_rate_hz: observation.sample_rate_hz(),
+    }));
+    ui.set_arrangement_scene_launches(ModelRc::new(ArrangementSceneLaunchListModel {
+        owner: Arc::clone(owner),
     }));
     ui.set_arrangement_span_clock(
         format_frame_clock(owner.end_frame(), observation.sample_rate_hz()).into(),
@@ -4798,6 +4934,11 @@ fn reset_project(
     ui.set_loudness_visible(false);
     ui.set_loudness_reset_confirming(false);
     ui.set_arrangement_placements(ModelRc::default());
+    ui.set_arrangement_scene_launches(ModelRc::default());
+    ui.set_add_arrangement_scene_launch_visible(false);
+    ui.set_add_arrangement_scene_launch_id(SharedString::default());
+    ui.set_add_arrangement_scene_launch_name(SharedString::default());
+    ui.set_add_arrangement_scene_launch_tick("0".into());
     ui.set_arrangement_span_clock("—".into());
     ui.set_preview_active(false);
     ui.set_preview_gain_percent(25.0);
@@ -4893,6 +5034,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         }
         IdeWorkerCommandKind::AddArrangementPlacement
             if current == AppMode::AddingArrangementPlacement =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::AddArrangementSceneLaunch
+            if current == AppMode::AddingArrangementSceneLaunch =>
         {
             AppMode::Running
         }
@@ -6637,6 +6783,24 @@ mod tests {
             mode_after_failure(
                 AppMode::AddingArrangementPlacement,
                 IdeWorkerCommandKind::AddArrangementPlacement,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn arrangement_scene_launch_submission_and_failure_use_a_dedicated_mode() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::AddArrangementSceneLaunch,
+            ),
+            AppMode::AddingArrangementSceneLaunch
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::AddingArrangementSceneLaunch,
+                IdeWorkerCommandKind::AddArrangementSceneLaunch,
             ),
             AppMode::Running
         );
