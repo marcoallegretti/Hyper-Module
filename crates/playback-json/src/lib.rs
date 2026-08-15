@@ -313,19 +313,19 @@ struct LoadedPlacement {
     enabled: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum LoadedSceneSlotAction {
     Play { clip_id: String },
     Stop,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LoadedSceneSlot {
     track_id: String,
     action: LoadedSceneSlotAction,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LoadedScene {
     id: String,
     name: String,
@@ -333,6 +333,7 @@ struct LoadedScene {
     order: u8,
     launch_quantization: LaunchQuantization,
     slots: Vec<LoadedSceneSlot>,
+    canonical_source: Arc<[u8]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -662,6 +663,22 @@ pub enum AudioTrackRenameSerializationError {
 }
 
 #[derive(Debug)]
+pub enum SceneRenameSerializationError {
+    InvalidSceneName,
+    Document(SceneDocumentSerializationError),
+}
+
+#[derive(Debug)]
+pub enum SceneDocumentSerializationError {
+    Source(LoadError),
+    NonCanonicalSource,
+    SceneMissing,
+    SourceSceneMismatch,
+    InvalidDocumentShape,
+    Serialization(serde_json::Error),
+}
+
+#[derive(Debug)]
 pub enum AudioTrackDocumentSerializationError {
     Source(LoadError),
     NonCanonicalSource,
@@ -866,6 +883,60 @@ impl Error for AudioTrackDocumentSerializationError {
             | Self::TrackMissing
             | Self::TrackNotAudio
             | Self::SourceTrackMismatch
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
+impl fmt::Display for SceneRenameSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSceneName => {
+                formatter.write_str("the scene name is outside the version-1 domain")
+            }
+            Self::Document(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for SceneRenameSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Document(source) => Some(source),
+            Self::InvalidSceneName => None,
+        }
+    }
+}
+
+impl fmt::Display for SceneDocumentSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => source.fmt(formatter),
+            Self::NonCanonicalSource => {
+                formatter.write_str("source scene is not canonical RFC 8785 JSON")
+            }
+            Self::SceneMissing => {
+                formatter.write_str("the selected scene is not present in the project")
+            }
+            Self::SourceSceneMismatch => {
+                formatter.write_str("source scene bytes do not match the loaded project")
+            }
+            Self::InvalidDocumentShape => {
+                formatter.write_str("source scene shape changed after typed validation")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for SceneDocumentSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::NonCanonicalSource
+            | Self::SceneMissing
+            | Self::SourceSceneMismatch
             | Self::InvalidDocumentShape => None,
         }
     }
@@ -2131,6 +2202,34 @@ pub fn serialize_audio_track_rename(
     .map_err(AudioTrackRenameSerializationError::Document)
 }
 
+/// Replaces only the display name in one validated canonical scene document
+/// while preserving identity, order, activation, launch quantization, slot
+/// actions, and namespaced extensions.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the scene is absent, the supplied bytes
+/// disagree with the loaded project, the new name is outside the version-1
+/// domain, or the resulting document fails version-1 validation.
+pub fn serialize_scene_rename(
+    project: &LoadedPlaybackProject,
+    source_scene: &[u8],
+    scene_id: &str,
+    scene_name: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, SceneRenameSerializationError> {
+    let name_length = scene_name.chars().count();
+    if scene_name.trim() != scene_name
+        || !(1..=MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length)
+    {
+        return Err(SceneRenameSerializationError::InvalidSceneName);
+    }
+    serialize_scene_document_edit(project, source_scene, scene_id, limits, |document| {
+        document.insert("name".to_owned(), scene_name.into());
+    })
+    .map_err(SceneRenameSerializationError::Document)
+}
+
 /// Replaces only the activation state in one validated canonical audio-track
 /// document while preserving its identity, structure, clip ownership, and
 /// namespaced extensions.
@@ -3203,6 +3302,56 @@ fn serialize_audio_clip_document_edit(
     Ok(output)
 }
 
+fn serialize_scene_document_edit(
+    project: &LoadedPlaybackProject,
+    source_scene: &[u8],
+    scene_id: &str,
+    limits: LoaderLimits,
+    edit: impl FnOnce(&mut serde_json::Map<String, Value>),
+) -> Result<Vec<u8>, SceneDocumentSerializationError> {
+    let scene_index = project
+        .scenes
+        .iter()
+        .position(|scene| scene.id == scene_id)
+        .ok_or(SceneDocumentSerializationError::SceneMissing)?;
+    let source = load_scene(
+        source_scene,
+        scene_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_scene_slots,
+    )
+    .map_err(SceneDocumentSerializationError::Source)?;
+    let mut value: Value = serde_json::from_slice(source_scene)
+        .map_err(SceneDocumentSerializationError::Serialization)?;
+    let canonical_source = serde_json_canonicalizer::to_vec(&value)
+        .map_err(SceneDocumentSerializationError::Serialization)?;
+    if canonical_source != source_scene {
+        return Err(SceneDocumentSerializationError::NonCanonicalSource);
+    }
+    if source != project.scenes[scene_index] {
+        return Err(SceneDocumentSerializationError::SourceSceneMismatch);
+    }
+    let document = value
+        .as_object_mut()
+        .ok_or(SceneDocumentSerializationError::InvalidDocumentShape)?;
+    edit(document);
+    let output = serde_json_canonicalizer::to_vec(&value)
+        .map_err(SceneDocumentSerializationError::Serialization)?;
+    let edited = load_scene(
+        &output,
+        scene_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_scene_slots,
+    )
+    .map_err(SceneDocumentSerializationError::Source)?;
+    let mut edited_project = project.clone();
+    edited_project.scenes[scene_index] = edited;
+    validate_loaded_identities(&edited_project).map_err(SceneDocumentSerializationError::Source)?;
+    Ok(output)
+}
+
 /// Returns whether a decibel gain can execute in the native clip engine
 /// without consolidation.
 #[must_use]
@@ -3795,6 +3944,12 @@ impl LoadedPlaybackProject {
     #[must_use]
     pub fn scene_index(&self, scene_id: &str) -> Option<usize> {
         self.scenes.iter().position(|scene| scene.id == scene_id)
+    }
+
+    /// Returns a validated scene identity by canonical scene order.
+    #[must_use]
+    pub fn scene_id(&self, scene_index: usize) -> Option<&str> {
+        self.scenes.get(scene_index).map(|scene| scene.id.as_str())
     }
 
     /// Returns a validated scene name by its canonical order.
@@ -4393,6 +4548,9 @@ fn load_scene(
         index,
     };
     let document: SceneDocument = parse_document(bytes, location, maximum_bytes)?;
+    let source_value: Value = parse_document(bytes, location, maximum_bytes)?;
+    let canonical_source = serde_json_canonicalizer::to_vec(&source_value)
+        .map_err(|error| domain_error_value(location, &error.to_string()))?;
     validate_header(
         &document.format,
         document.format_version,
@@ -4456,6 +4614,7 @@ fn load_scene(
         order: document.order,
         launch_quantization,
         slots,
+        canonical_source: canonical_source.into(),
     })
 }
 
@@ -7182,6 +7341,134 @@ mod tests {
             )
             .unwrap(),
             source
+        );
+    }
+
+    #[test]
+    fn scene_rename_changes_only_the_selected_canonical_name() {
+        let mut source: Value = serde_json::from_slice(SCENE).unwrap();
+        source["extensions"]["org.example.scene"] = json!({"opaque": [1, 2, 3]});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [&source];
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let scene_id = "018f47a2-6b2d-7c11-8a44-001122334461";
+
+        let renamed = serialize_scene_rename(
+            &loaded,
+            &source,
+            scene_id,
+            "First verse",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut expected: Value = serde_json::from_slice(&source).unwrap();
+        expected["name"] = "First verse".into();
+
+        assert_eq!(
+            renamed,
+            serde_json_canonicalizer::to_vec(&expected).unwrap()
+        );
+        assert_eq!(
+            expected["extensions"]["org.example.scene"],
+            json!({"opaque": [1, 2, 3]})
+        );
+        let renamed_scenes: [&[u8]; 1] = [&renamed];
+        let reopened = load(
+            input_with_scenes(
+                TIMELINE,
+                &tracks,
+                &clips,
+                &renamed_scenes,
+                Some(ARRANGEMENT),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.scene_id(0), Some(scene_id));
+        assert_eq!(reopened.scene_name(0), Some("First verse"));
+        assert_eq!(
+            serialize_scene_rename(&loaded, &source, scene_id, "Verse", LoaderLimits::VERSION_1,)
+                .unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn scene_rename_rejects_invalid_missing_stale_and_noncanonical_inputs() {
+        let source: Value = serde_json::from_slice(SCENE).unwrap();
+        let canonical = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [&canonical];
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let scene_id = "018f47a2-6b2d-7c11-8a44-001122334461";
+
+        for invalid in [String::new(), " padded ".to_owned(), "\u{00e9}".repeat(121)] {
+            assert!(matches!(
+                serialize_scene_rename(
+                    &loaded,
+                    &canonical,
+                    scene_id,
+                    &invalid,
+                    LoaderLimits::VERSION_1,
+                ),
+                Err(SceneRenameSerializationError::InvalidSceneName)
+            ));
+        }
+        assert!(matches!(
+            serialize_scene_rename(
+                &loaded,
+                &canonical,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                "Verse",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(SceneRenameSerializationError::Document(
+                SceneDocumentSerializationError::SceneMissing
+            ))
+        ));
+        let mut stale = source.clone();
+        stale["enabled"] = false.into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_scene_rename(&loaded, &stale, scene_id, "Verse", LoaderLimits::VERSION_1,),
+            Err(SceneRenameSerializationError::Document(
+                SceneDocumentSerializationError::SourceSceneMismatch
+            ))
+        ));
+        let noncanonical = serde_json::to_vec_pretty(&source).unwrap();
+        assert!(matches!(
+            serialize_scene_rename(
+                &loaded,
+                &noncanonical,
+                scene_id,
+                "Verse",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(SceneRenameSerializationError::Document(
+                SceneDocumentSerializationError::NonCanonicalSource
+            ))
+        ));
+        let maximum = "\u{00e9}".repeat(MAX_VERSION_1_NAME_CHARACTERS);
+        assert!(
+            serialize_scene_rename(
+                &loaded,
+                &canonical,
+                scene_id,
+                &maximum,
+                LoaderLimits::VERSION_1,
+            )
+            .is_ok()
         );
     }
 
