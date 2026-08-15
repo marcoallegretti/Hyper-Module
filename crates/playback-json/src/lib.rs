@@ -734,6 +734,12 @@ pub enum AudioClipLoopSerializationError {
     Document(AudioClipDocumentSerializationError),
 }
 
+#[derive(Debug)]
+pub enum AudioClipSourceStartSerializationError {
+    Document(AudioClipDocumentSerializationError),
+    ProjectCompilation(AdapterCompileError),
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AudioTrackRemovalBlockers {
     pub clip_references: usize,
@@ -1026,6 +1032,24 @@ impl Error for AudioClipLoopSerializationError {
         match self {
             Self::Document(source) => Some(source),
             Self::InvalidLoopRange => None,
+        }
+    }
+}
+
+impl fmt::Display for AudioClipSourceStartSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Document(source) => source.fmt(formatter),
+            Self::ProjectCompilation(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioClipSourceStartSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Document(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
         }
     }
 }
@@ -3042,6 +3066,61 @@ pub fn serialize_audio_clip_reverse(
     })
 }
 
+/// Moves the reusable clip's complete source view to an exact frame within its
+/// immutable audio asset while preserving frame count, clip duration, warp,
+/// loop, fades, playback parameters, identity, and namespaced extensions.
+///
+/// This is a nondestructive source-slip edit. It does not move or resize any
+/// arrangement placement and does not change the clip-local tick domain.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the clip is absent, the supplied bytes
+/// disagree with the loaded project, the resulting source view falls outside
+/// the verified media asset, or the complete project no longer compiles.
+pub fn serialize_audio_clip_source_start(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_clip: &[u8],
+    clip_id: &str,
+    source_start_frame: u64,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AudioClipSourceStartSerializationError> {
+    let output =
+        serialize_audio_clip_document_edit(project, source_clip, clip_id, limits, |document| {
+            let source = document
+                .get_mut("source")
+                .and_then(Value::as_object_mut)
+                .ok_or(AudioClipDocumentSerializationError::InvalidDocumentShape)?;
+            source.insert("start_frame".to_owned(), source_start_frame.into());
+            Ok(())
+        })
+        .map_err(AudioClipSourceStartSerializationError::Document)?;
+
+    let clip_index = project
+        .clips
+        .iter()
+        .position(|clip| clip.id == clip_id)
+        .ok_or(AudioClipSourceStartSerializationError::Document(
+            AudioClipDocumentSerializationError::ClipMissing,
+        ))?;
+    let edited = load_clip(
+        &output,
+        clip_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_warp_markers,
+    )
+    .map_err(AudioClipDocumentSerializationError::Source)
+    .map_err(AudioClipSourceStartSerializationError::Document)?;
+    let mut edited_project = project.clone();
+    edited_project.clips[clip_index] = edited;
+    edited_project
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(AudioClipSourceStartSerializationError::ProjectCompilation)?;
+    Ok(output)
+}
+
 /// Replaces only the global activation state in one validated canonical audio
 /// clip while preserving source, timing, looping, fades, playback parameters,
 /// identity, and namespaced extensions.
@@ -3645,6 +3724,23 @@ impl LoadedPlaybackProject {
     #[must_use]
     pub fn clip_reverse_at(&self, clip_index: usize) -> Option<bool> {
         self.clips.get(clip_index).map(|clip| clip.reverse)
+    }
+
+    /// Returns the first immutable-media frame selected by the reusable clip.
+    #[must_use]
+    pub fn clip_source_start_frame_at(&self, clip_index: usize) -> Option<usize> {
+        self.clips
+            .get(clip_index)
+            .map(|clip| clip.source_start_frame)
+    }
+
+    /// Returns the exact immutable-media frame count selected by the reusable
+    /// clip.
+    #[must_use]
+    pub fn clip_source_frame_count_at(&self, clip_index: usize) -> Option<usize> {
+        self.clips
+            .get(clip_index)
+            .map(|clip| clip.source_frame_count)
     }
 
     /// Returns the persisted linear-amplitude fade-in duration in project ticks.
@@ -8887,6 +8983,141 @@ mod tests {
                 LoaderLimits::VERSION_1,
             ),
             Err(AudioClipDocumentSerializationError::NonCanonicalSource)
+        ));
+    }
+
+    #[test]
+    fn audio_clip_source_start_slips_only_the_selected_canonical_view() {
+        let mut source: Value = serde_json::from_slice(CLIP).unwrap();
+        source["extensions"]["org.example.clip"] = json!({"opaque": [1, 2, 3]});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [&source];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334460";
+        let assets = [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
+            sample_rate_hz: 48_000,
+            frame_count: 150,
+        }];
+
+        let edited = serialize_audio_clip_source_start(
+            &loaded,
+            &assets,
+            &source,
+            clip_id,
+            25,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut expected: Value = serde_json::from_slice(&source).unwrap();
+        expected["source"]["start_frame"] = 25.into();
+
+        assert_eq!(edited, serde_json_canonicalizer::to_vec(&expected).unwrap());
+        assert_eq!(
+            expected["extensions"]["org.example.clip"],
+            json!({"opaque": [1, 2, 3]})
+        );
+        let edited_clips: [&[u8]; 1] = [&edited];
+        let reopened = load(
+            input(TIMELINE, &tracks, &edited_clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.clip_source_start_frame_at(0), Some(25));
+        assert_eq!(reopened.clip_source_frame_count_at(0), Some(100));
+        assert_eq!(reopened.clip_duration_ticks_at(0), Some(4));
+        assert_eq!(
+            serialize_audio_clip_source_start(
+                &loaded,
+                &assets,
+                &source,
+                clip_id,
+                0,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn audio_clip_source_start_rejects_outside_missing_stale_and_noncanonical_inputs() {
+        let source: Value = serde_json::from_slice(CLIP).unwrap();
+        let canonical = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [&canonical];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334460";
+        let assets = [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
+            sample_rate_hz: 48_000,
+            frame_count: 150,
+        }];
+
+        assert!(matches!(
+            serialize_audio_clip_source_start(
+                &loaded,
+                &assets,
+                &canonical,
+                clip_id,
+                51,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipSourceStartSerializationError::ProjectCompilation(
+                AdapterCompileError::Graph(GraphError::SourceOutsideAsset { clip_index: 0 })
+            ))
+        ));
+        assert!(matches!(
+            serialize_audio_clip_source_start(
+                &loaded,
+                &assets,
+                &canonical,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                1,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipSourceStartSerializationError::Document(
+                AudioClipDocumentSerializationError::ClipMissing
+            ))
+        ));
+        let mut stale = source.clone();
+        stale["enabled"] = false.into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_audio_clip_source_start(
+                &loaded,
+                &assets,
+                &stale,
+                clip_id,
+                1,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipSourceStartSerializationError::Document(
+                AudioClipDocumentSerializationError::SourceClipMismatch
+            ))
+        ));
+        let noncanonical = serde_json::to_vec_pretty(&source).unwrap();
+        assert!(matches!(
+            serialize_audio_clip_source_start(
+                &loaded,
+                &assets,
+                &noncanonical,
+                clip_id,
+                1,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipSourceStartSerializationError::Document(
+                AudioClipDocumentSerializationError::NonCanonicalSource
+            ))
         ));
     }
 
