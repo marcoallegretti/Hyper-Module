@@ -36,9 +36,10 @@ use super::{
     IdePendingSaveCloseWait, IdeProjectOpenError, IdeProjectSaveError, IdeRecordingAbortError,
     IdeRecordingAbortOutcome, IdeRecordingClipCreationError, IdeRecordingError,
     IdeRecordingImportOutcome, IdeRecordingObservation, IdeSaveCloseOutcome, IdeSceneAvailability,
-    IdeSceneEditError, IdeSceneRenameError, IdeTransportSeekError, InputInventoryError,
-    LocateState, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
-    OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication,
+    IdeSceneCreationError, IdeSceneEditError, IdeSceneLaunchQuantization, IdeSceneRenameError,
+    IdeTransportSeekError, InputInventoryError, LocateState, OutputInventoryError,
+    OutputStreamSnapshot, OutputStreamState, OutputTestingDesktopIdeApplication,
+    RunningDesktopIdeApplication,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -143,6 +144,7 @@ pub enum IdeWorkerCommandKind {
     SetAudioClipLoop,
     SetAudioClipReverse,
     SetAudioClipSourceStart,
+    AddScene,
     RenameScene,
     SetSceneActive,
     StartRecording,
@@ -271,6 +273,10 @@ pub enum IdeWorkerCommand {
         clip_id: String,
         source_start_frame: u64,
     },
+    AddScene {
+        name: String,
+        quantization: IdeSceneLaunchQuantization,
+    },
     RenameScene {
         scene_id: String,
         name: String,
@@ -350,6 +356,7 @@ impl IdeWorkerCommand {
             Self::SetAudioClipLoop { .. } => IdeWorkerCommandKind::SetAudioClipLoop,
             Self::SetAudioClipReverse { .. } => IdeWorkerCommandKind::SetAudioClipReverse,
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
+            Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
             Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
             Self::SetSceneActive { .. } => IdeWorkerCommandKind::SetSceneActive,
             Self::StartRecording { .. } => IdeWorkerCommandKind::StartRecording,
@@ -983,6 +990,7 @@ pub enum IdeWorkerCommandFailure {
     AudioClipLoop(Box<IdeAudioClipLoopEditError>),
     AudioClipReverse(Box<IdeAudioClipReverseEditError>),
     AudioClipSourceSlip(Box<IdeAudioClipSourceSlipEditError>),
+    SceneCreation(Box<IdeSceneCreationError>),
     SceneRename(Box<IdeSceneRenameError>),
     SceneActivation(Box<IdeSceneEditError>),
     Recording(IdeRecordingError),
@@ -1033,6 +1041,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioClipLoop(source) => source.fmt(formatter),
             Self::AudioClipReverse(source) => source.fmt(formatter),
             Self::AudioClipSourceSlip(source) => source.fmt(formatter),
+            Self::SceneCreation(source) => source.fmt(formatter),
             Self::SceneRename(source) | Self::SceneActivation(source) => source.fmt(formatter),
             Self::Recording(source) => source.fmt(formatter),
             Self::AudioPreview(source) => source.fmt(formatter),
@@ -1088,6 +1097,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioClipLoop(source) => Some(source),
             Self::AudioClipReverse(source) => Some(source),
             Self::AudioClipSourceSlip(source) => Some(source),
+            Self::SceneCreation(source) => Some(source),
             Self::SceneRename(source) | Self::SceneActivation(source) => Some(source),
             Self::Recording(source) => Some(source),
             Self::AudioPreview(source) => Some(source),
@@ -1273,6 +1283,15 @@ pub enum IdeWorkerEvent {
         changed: bool,
         source_start_frame: u64,
     },
+    SceneAdded {
+        revision: u64,
+        scene_id: String,
+        name: String,
+    },
+    SceneCreationCommittedWithWarning {
+        name: String,
+        warning: Box<IdeSceneCreationError>,
+    },
     SceneRenamed {
         revision: u64,
         changed: bool,
@@ -1352,6 +1371,7 @@ pub enum IdeWorkerEvent {
     AudioClipSourceStartChanging {
         source_start_frame: u64,
     },
+    SceneAdding,
     SceneRenaming,
     SceneActivationChanging {
         active: bool,
@@ -1761,6 +1781,10 @@ enum ProjectMutation {
         clip_id: String,
         source_start_frame: u64,
     },
+    AddScene {
+        name: String,
+        quantization: IdeSceneLaunchQuantization,
+    },
     RenameScene {
         scene_id: String,
         name: String,
@@ -1808,6 +1832,7 @@ impl ProjectMutation {
             Self::SetAudioClipLoop { .. } => IdeWorkerCommandKind::SetAudioClipLoop,
             Self::SetAudioClipReverse { .. } => IdeWorkerCommandKind::SetAudioClipReverse,
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
+            Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
             Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
             Self::SetSceneActive { .. } => IdeWorkerCommandKind::SetSceneActive,
         }
@@ -1891,6 +1916,7 @@ impl ProjectMutation {
             } => IdeWorkerEvent::AudioClipSourceStartChanging {
                 source_start_frame: *source_start_frame,
             },
+            Self::AddScene { .. } => IdeWorkerEvent::SceneAdding,
             Self::RenameScene { .. } => IdeWorkerEvent::SceneRenaming,
             Self::SetSceneActive { active, .. } => {
                 IdeWorkerEvent::SceneActivationChanging { active: *active }
@@ -2104,6 +2130,7 @@ fn process_command(
         | IdeWorkerCommand::SetAudioClipLoop { .. }
         | IdeWorkerCommand::SetAudioClipReverse { .. }
         | IdeWorkerCommand::SetAudioClipSourceStart { .. }
+        | IdeWorkerCommand::AddScene { .. }
         | IdeWorkerCommand::RenameScene { .. }
         | IdeWorkerCommand::SetSceneActive { .. }) => {
             process_project_mutation_command(state, command, events)
@@ -2257,6 +2284,9 @@ fn process_project_mutation_command(
             clip_id,
             source_start_frame,
         } => set_audio_clip_source_start(state, events, &clip_id, source_start_frame),
+        IdeWorkerCommand::AddScene { name, quantization } => {
+            add_scene(state, events, &name, quantization)
+        }
         IdeWorkerCommand::RenameScene { scene_id, name } => {
             rename_scene(state, events, &scene_id, &name)
         }
@@ -3858,6 +3888,53 @@ fn set_audio_clip_active(
     )
 }
 
+fn add_scene(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    name: &str,
+    quantization: IdeSceneLaunchQuantization,
+) -> bool {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::AddScene,
+            IdeWorkerCommandFailure::SceneCreation(Box::new(IdeSceneCreationError::InvalidName)),
+        );
+    }
+    if matches!(
+        quantization,
+        IdeSceneLaunchQuantization::Grid { quantum_ticks: 0 }
+    ) {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::AddScene,
+            IdeWorkerCommandFailure::SceneCreation(Box::new(
+                IdeSceneCreationError::InvalidQuantization,
+            )),
+        );
+    }
+    let mut normalized_name = String::new();
+    if normalized_name.try_reserve_exact(name.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::AddScene,
+            IdeWorkerCommandFailure::SceneCreation(Box::new(
+                IdeSceneCreationError::CapacityUnavailable,
+            )),
+        );
+    }
+    normalized_name.push_str(name);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::AddScene {
+            name: normalized_name,
+            quantization,
+        },
+    )
+}
+
 fn rename_scene(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -4284,6 +4361,9 @@ fn project_mutation_save_failure(
                 IdeAudioClipSourceSlipEditError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::AddScene { .. } => IdeWorkerCommandFailure::SceneCreation(Box::new(
+            IdeSceneCreationError::MixerSave(Box::new(reason)),
+        )),
         ProjectMutation::RenameScene { .. } => IdeWorkerCommandFailure::SceneRename(Box::new(
             IdeSceneRenameError::MixerSave(Box::new(reason)),
         )),
@@ -4349,6 +4429,10 @@ fn publish_closed_project_mutation_failure(
     publish_failure(events, command, reason)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive mutation-to-typed-close-error mapping remains auditable in one match"
+)]
 fn project_mutation_native_close_failure(
     operation: &ProjectMutation,
     failure: IdeNativeCloseFailure,
@@ -4444,6 +4528,9 @@ fn project_mutation_native_close_failure(
                 IdeAudioClipSourceSlipEditError::NativeClose(failure),
             ))
         }
+        ProjectMutation::AddScene { .. } => IdeWorkerCommandFailure::SceneCreation(Box::new(
+            IdeSceneCreationError::NativeClose(failure),
+        )),
         ProjectMutation::RenameScene { .. } => IdeWorkerCommandFailure::SceneRename(Box::new(
             IdeSceneRenameError::NativeClose(failure),
         )),
@@ -4579,6 +4666,11 @@ enum ProjectMutationAttempt {
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeAudioClipSourceSlipEditError,
         >,
+    },
+    AddScene {
+        name: String,
+        result:
+            Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeSceneCreationError>,
     },
     RenameScene {
         name: String,
@@ -4720,6 +4812,23 @@ pub(super) fn scene_rename_failure_event(
         IdeWorkerEvent::CommandFailed {
             command: IdeWorkerCommandKind::RenameScene,
             reason: IdeWorkerCommandFailure::SceneRename(Box::new(reason)),
+        }
+    }
+}
+
+pub(super) fn scene_creation_failure_event(
+    name: String,
+    reason: IdeSceneCreationError,
+) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::SceneCreationCommittedWithWarning {
+            name,
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::AddScene,
+            reason: IdeWorkerCommandFailure::SceneCreation(Box::new(reason)),
         }
     }
 }
@@ -5160,6 +5269,21 @@ fn complete_project_mutation(
                     result: Err(reason),
                     ..
                 } => send_event(events, audio_clip_source_slip_edit_failure_event(reason)),
+                ProjectMutationAttempt::AddScene {
+                    name,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::SceneAdded {
+                        revision: outcome.project_revision(),
+                        scene_id: outcome.resource_id().to_owned(),
+                        name,
+                    },
+                ),
+                ProjectMutationAttempt::AddScene {
+                    name,
+                    result: Err(reason),
+                } => send_event(events, scene_creation_failure_event(name, reason)),
                 ProjectMutationAttempt::RenameScene {
                     name,
                     result: Ok(outcome),
@@ -5523,6 +5647,23 @@ fn attempt_project_mutation(
                 source_start_frame,
                 native_failure,
             ),
+        },
+        ProjectMutation::AddScene { name, quantization } => ProjectMutationAttempt::AddScene {
+            name: name.clone(),
+            result: if let Some(failure) = native_failure {
+                Err(IdeSceneCreationError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_scene_creation(
+                    application,
+                    recovery,
+                    &name,
+                    quantization,
+                )
+                .and_then(|plan| {
+                    plan.publish()
+                        .map_err(|source| IdeSceneCreationError::Publication(Box::new(source)))
+                })
+            },
         },
         ProjectMutation::RenameScene { scene_id, name } => ProjectMutationAttempt::RenameScene {
             name: name.clone(),
@@ -6110,6 +6251,9 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::SetAudioClipSourceStart { result, .. } => {
             audio_clip_source_slip_edit_reopen_failure(result, reopen)
         }
+        ProjectMutationAttempt::AddScene { result, .. } => {
+            scene_creation_reopen_failure(result, reopen)
+        }
         ProjectMutationAttempt::RenameScene { result, .. } => {
             scene_rename_reopen_failure(result, reopen)
         }
@@ -6117,6 +6261,35 @@ fn project_mutation_reopen_failure(
             scene_activation_reopen_failure(result, reopen)
         }
     }
+}
+
+fn scene_creation_reopen_failure(
+    result: Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeSceneCreationError>,
+    reopen: IdeProjectOpenError,
+) -> IdeWorkerCommandFailure {
+    let reason = match result {
+        Ok(outcome) => IdeSceneCreationError::ReopenAfterPublication {
+            outcome,
+            source: Box::new(reopen),
+        },
+        Err(IdeSceneCreationError::Publication(publication)) => {
+            IdeSceneCreationError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(IdeSceneCreationError::NativeClose(close)) => {
+            IdeSceneCreationError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(preparation) => IdeSceneCreationError::ReopenAfterPreparation {
+            preparation: Box::new(preparation),
+            reopen: Box::new(reopen),
+        },
+    };
+    IdeWorkerCommandFailure::SceneCreation(Box::new(reason))
 }
 
 fn recording_clip_creation_reopen_failure(
@@ -8906,6 +9079,74 @@ mod tests {
                 command: IdeWorkerCommandKind::RenameScene,
                 reason: IdeWorkerCommandFailure::SceneRename(reason),
             } if matches!(reason.as_ref(), IdeSceneRenameError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn scene_creation_validates_input_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 4, 8).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::AddScene {
+                name: "   ".to_owned(),
+                quantization: IdeSceneLaunchQuantization::Immediate,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::AddScene,
+                reason: IdeWorkerCommandFailure::SceneCreation(reason),
+            } if matches!(reason.as_ref(), IdeSceneCreationError::InvalidName)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::AddScene {
+                name: "Verse".to_owned(),
+                quantization: IdeSceneLaunchQuantization::Grid { quantum_ticks: 0 },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::AddScene,
+                reason: IdeWorkerCommandFailure::SceneCreation(reason),
+            } if matches!(reason.as_ref(), IdeSceneCreationError::InvalidQuantization)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::AddScene {
+                name: " Verse ".to_owned(),
+                quantization: IdeSceneLaunchQuantization::Grid {
+                    quantum_ticks: 1_920,
+                },
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::SceneAdding));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::AddScene,
+                reason: IdeWorkerCommandFailure::SceneCreation(reason),
+            } if matches!(reason.as_ref(), IdeSceneCreationError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);

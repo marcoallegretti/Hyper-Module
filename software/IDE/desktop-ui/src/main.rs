@@ -2244,7 +2244,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::StartOutputTest => AppMode::StartingOutputTest,
         IdeWorkerCommandKind::StopOutputTest => AppMode::StoppingOutputTest,
         IdeWorkerCommandKind::CreateProject => AppMode::Creating,
-        IdeWorkerCommandKind::SaveProject => AppMode::Saving,
+        IdeWorkerCommandKind::SaveProject | IdeWorkerCommandKind::AddScene => AppMode::Saving,
         IdeWorkerCommandKind::AddAudioTrack => AppMode::AddingTrack,
         IdeWorkerCommandKind::RemoveAudioTrack => AppMode::RemovingTrack,
         IdeWorkerCommandKind::RenameAudioTrack => AppMode::RenamingTrack,
@@ -2366,6 +2366,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetAudioClipReverse => {
             "Preserving mixer state, updating audio-clip direction, and reopening project..."
+        }
+        IdeWorkerCommandKind::AddScene => {
+            "Preserving mixer state, creating the scene, and reopening project..."
         }
         IdeWorkerCommandKind::SetAudioClipSourceStart => {
             "Preserving mixer state, slipping the reusable audio-clip source, and reopening project..."
@@ -2546,6 +2549,9 @@ fn apply_event(
         | IdeWorkerEvent::AudioClipSourceStartChanging { .. }) => {
             apply_audio_clip_source_slip_event(ui, &event);
         }
+        event @ (IdeWorkerEvent::SceneAdded { .. }
+        | IdeWorkerEvent::SceneCreationCommittedWithWarning { .. }
+        | IdeWorkerEvent::SceneAdding) => apply_scene_creation_event(ui, &event),
         event @ (IdeWorkerEvent::SceneRenamed { .. }
         | IdeWorkerEvent::SceneRenameCommittedWithWarning { .. }
         | IdeWorkerEvent::SceneRenaming) => apply_scene_rename_event(ui, &event),
@@ -3031,6 +3037,34 @@ fn reset_audio_clip_rename_form(ui: &MainWindow) {
     ui.set_clip_rename_id(SharedString::default());
     ui.set_clip_rename_original(SharedString::default());
     ui.set_clip_rename_name(SharedString::default());
+}
+
+fn apply_scene_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::SceneAdded {
+            revision,
+            scene_id: _,
+            name,
+        } => {
+            ui.set_status_text(
+                format!("Scene {name} created in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::SceneCreationCommittedWithWarning { name, warning } => {
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), &format!("Scene creation for {name}"))
+                    .into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        IdeWorkerEvent::SceneAdding => {
+            ui.set_app_mode(AppMode::Saving);
+            ui.set_status_text("Waiting for native output before creating the scene...".into());
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("scene creation event dispatcher received another event"),
+    }
 }
 
 fn apply_scene_rename_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -4487,7 +4521,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::OpenProject if current == AppMode::Opening => AppMode::Closed,
         IdeWorkerCommandKind::Observe if current == AppMode::Opening => AppMode::Running,
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
-        IdeWorkerCommandKind::SaveProject if current == AppMode::Saving => AppMode::Running,
+        IdeWorkerCommandKind::SaveProject | IdeWorkerCommandKind::AddScene
+            if current == AppMode::Saving =>
+        {
+            AppMode::Running
+        }
         IdeWorkerCommandKind::AddAudioTrack if current == AppMode::AddingTrack => AppMode::Running,
         IdeWorkerCommandKind::RemoveAudioTrack if current == AppMode::RemovingTrack => {
             AppMode::Running
