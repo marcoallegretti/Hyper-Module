@@ -669,6 +669,33 @@ pub enum SceneRenameSerializationError {
 }
 
 #[derive(Debug)]
+pub enum SceneAdditionSerializationError {
+    SceneCapacity,
+    InvalidSceneIdentity,
+    InvalidSceneName,
+    Source(LoadError),
+    Serialization(serde_json::Error),
+    ProjectCompilation(AdapterCompileError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SceneSlotEdit<'a> {
+    Continue,
+    Stop,
+    Play { clip_id: &'a str },
+}
+
+#[derive(Debug)]
+pub enum SceneSlotEditSerializationError {
+    TrackMissing,
+    ClipMissing,
+    ClipOwnerMismatch,
+    SlotCapacity,
+    Document(SceneDocumentSerializationError),
+    ProjectCompilation(AdapterCompileError),
+}
+
+#[derive(Debug)]
 pub enum SceneDocumentSerializationError {
     Source(LoadError),
     NonCanonicalSource,
@@ -906,6 +933,66 @@ impl Error for SceneRenameSerializationError {
         match self {
             Self::Document(source) => Some(source),
             Self::InvalidSceneName => None,
+        }
+    }
+}
+
+impl fmt::Display for SceneAdditionSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SceneCapacity => formatter.write_str("the scene capacity is exhausted"),
+            Self::InvalidSceneIdentity => {
+                formatter.write_str("the new scene identity is invalid or collides")
+            }
+            Self::InvalidSceneName => {
+                formatter.write_str("the scene name is outside the version-1 domain")
+            }
+            Self::Source(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::ProjectCompilation(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for SceneAdditionSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
+            Self::SceneCapacity | Self::InvalidSceneIdentity | Self::InvalidSceneName => None,
+        }
+    }
+}
+
+impl fmt::Display for SceneSlotEditSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TrackMissing => {
+                formatter.write_str("the selected structural track is not present")
+            }
+            Self::ClipMissing => {
+                formatter.write_str("the selected reusable audio clip is not present")
+            }
+            Self::ClipOwnerMismatch => {
+                formatter.write_str("the selected audio clip belongs to another track")
+            }
+            Self::SlotCapacity => formatter.write_str("the scene slot capacity is exhausted"),
+            Self::Document(source) => source.fmt(formatter),
+            Self::ProjectCompilation(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for SceneSlotEditSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Document(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
+            Self::TrackMissing
+            | Self::ClipMissing
+            | Self::ClipOwnerMismatch
+            | Self::SlotCapacity => None,
         }
     }
 }
@@ -2228,6 +2315,7 @@ pub fn serialize_scene_rename(
     }
     serialize_scene_document_edit(project, source_scene, scene_id, limits, |document| {
         document.insert("name".to_owned(), scene_name.into());
+        Ok(())
     })
     .map_err(SceneRenameSerializationError::Document)
 }
@@ -2250,7 +2338,194 @@ pub fn serialize_scene_activation(
 ) -> Result<Vec<u8>, SceneActivationSerializationError> {
     serialize_scene_document_edit(project, source_scene, scene_id, limits, |document| {
         document.insert("enabled".to_owned(), active.into());
+        Ok(())
     })
+}
+
+/// Builds and validates one canonical empty scene appended after the loaded
+/// version-1 scene order.
+///
+/// The new scene is enabled and contains no slots, so every track keeps its
+/// current runtime state until an explicit play or stop action is assigned.
+///
+/// # Errors
+///
+/// Returns a classified rejection for exhausted scene capacity, invalid or
+/// colliding identity, invalid name, or a candidate that cannot pass complete
+/// playback compilation.
+pub fn serialize_scene_addition(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    scene_id: &str,
+    scene_name: &str,
+    launch_quantization: LaunchQuantization,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, SceneAdditionSerializationError> {
+    let next_order = project
+        .scenes
+        .iter()
+        .map(|scene| scene.order)
+        .max()
+        .map_or(Some(0), |order| order.checked_add(1))
+        .filter(|order| *order <= 7)
+        .ok_or(SceneAdditionSerializationError::SceneCapacity)?;
+    if project.scenes.len() >= limits.max_scene_documents {
+        return Err(SceneAdditionSerializationError::SceneCapacity);
+    }
+    let name_length = scene_name.chars().count();
+    if scene_name.trim() != scene_name
+        || !(1..=MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length)
+    {
+        return Err(SceneAdditionSerializationError::InvalidSceneName);
+    }
+    if !is_valid_entity_id(scene_id)
+        || scene_id == project.project_id
+        || project_contains_identity(project, scene_id)
+        || assets.iter().any(|asset| asset.id == scene_id)
+    {
+        return Err(SceneAdditionSerializationError::InvalidSceneIdentity);
+    }
+    let quantization = match launch_quantization {
+        LaunchQuantization::Immediate => json!({"mode": "immediate"}),
+        LaunchQuantization::Grid { quantum_ticks } => {
+            json!({"mode": "grid", "quantum_ticks": quantum_ticks})
+        }
+    };
+    let output = serde_json_canonicalizer::to_vec(&json!({
+        "format": "hyper-scene",
+        "format_version": 1,
+        "id": scene_id,
+        "project_id": project.project_id,
+        "name": scene_name,
+        "order": next_order,
+        "enabled": true,
+        "launch_quantization": quantization,
+        "slots": [],
+        "extensions": {}
+    }))
+    .map_err(SceneAdditionSerializationError::Serialization)?;
+    let added = load_scene(
+        &output,
+        project.scenes.len(),
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_scene_slots,
+    )
+    .map_err(SceneAdditionSerializationError::Source)?;
+    let mut extended = project.clone();
+    extended
+        .scenes
+        .try_reserve(1)
+        .map_err(|_| SceneAdditionSerializationError::Source(capacity_error()))?;
+    extended.scenes.push(added);
+    validate_loaded_identities(&extended).map_err(SceneAdditionSerializationError::Source)?;
+    extended
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(SceneAdditionSerializationError::ProjectCompilation)?;
+    Ok(output)
+}
+
+/// Replaces one scene's action for a structural track with explicit play,
+/// explicit stop, or sparse omission (`Continue`).
+///
+/// Existing unrelated slots retain their exact array order and bytes. Adding a
+/// new action appends one slot; clearing an action removes only that track's
+/// slot. The complete playback candidate is compiled before bytes are returned.
+///
+/// # Errors
+///
+/// Returns a classified rejection for missing or mismatched track/clip
+/// authority, exhausted slot capacity, stale scene bytes, malformed document
+/// shape, or a candidate that cannot pass complete playback compilation.
+pub fn serialize_scene_slot_edit(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_scene: &[u8],
+    scene_id: &str,
+    track_id: &str,
+    edit: SceneSlotEdit<'_>,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, SceneSlotEditSerializationError> {
+    if !project.tracks.iter().any(|track| track.id == track_id) {
+        return Err(SceneSlotEditSerializationError::TrackMissing);
+    }
+    if let SceneSlotEdit::Play { clip_id } = edit {
+        let clip = project
+            .clips
+            .iter()
+            .find(|clip| clip.id == clip_id)
+            .ok_or(SceneSlotEditSerializationError::ClipMissing)?;
+        if clip.track_id != track_id {
+            return Err(SceneSlotEditSerializationError::ClipOwnerMismatch);
+        }
+    }
+    let scene_index =
+        project
+            .scene_index(scene_id)
+            .ok_or(SceneSlotEditSerializationError::Document(
+                SceneDocumentSerializationError::SceneMissing,
+            ))?;
+    let existing = project.scenes[scene_index]
+        .slots
+        .iter()
+        .any(|slot| slot.track_id == track_id);
+    if !existing
+        && !matches!(edit, SceneSlotEdit::Continue)
+        && project.scenes[scene_index].slots.len() >= limits.max_scene_slots
+    {
+        return Err(SceneSlotEditSerializationError::SlotCapacity);
+    }
+
+    let output =
+        serialize_scene_document_edit(project, source_scene, scene_id, limits, |document| {
+            let slots = document
+                .get_mut("slots")
+                .and_then(Value::as_array_mut)
+                .ok_or(SceneDocumentSerializationError::InvalidDocumentShape)?;
+            let existing_index = slots
+                .iter()
+                .position(|slot| slot.get("track_id").and_then(Value::as_str) == Some(track_id));
+            match (existing_index, edit) {
+                (Some(index), SceneSlotEdit::Continue) => {
+                    slots.remove(index);
+                }
+                (Some(index), SceneSlotEdit::Stop) => {
+                    slots[index] = json!({"track_id": track_id, "action": "stop"});
+                }
+                (Some(index), SceneSlotEdit::Play { clip_id }) => {
+                    slots[index] =
+                        json!({"track_id": track_id, "action": "play", "clip_id": clip_id});
+                }
+                (None, SceneSlotEdit::Continue) => {}
+                (None, SceneSlotEdit::Stop) => {
+                    slots.push(json!({"track_id": track_id, "action": "stop"}));
+                }
+                (None, SceneSlotEdit::Play { clip_id }) => {
+                    slots.push(json!({"track_id": track_id, "action": "play", "clip_id": clip_id}));
+                }
+            }
+            Ok(())
+        })
+        .map_err(SceneSlotEditSerializationError::Document)?;
+    let edited = load_scene(
+        &output,
+        scene_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_scene_slots,
+    )
+    .map_err(|source| {
+        SceneSlotEditSerializationError::Document(SceneDocumentSerializationError::Source(source))
+    })?;
+    let mut edited_project = project.clone();
+    edited_project.scenes[scene_index] = edited;
+    validate_loaded_identities(&edited_project).map_err(|source| {
+        SceneSlotEditSerializationError::Document(SceneDocumentSerializationError::Source(source))
+    })?;
+    edited_project
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(SceneSlotEditSerializationError::ProjectCompilation)?;
+    Ok(output)
 }
 
 /// Replaces only the activation state in one validated canonical audio-track
@@ -3330,7 +3605,9 @@ fn serialize_scene_document_edit(
     source_scene: &[u8],
     scene_id: &str,
     limits: LoaderLimits,
-    edit: impl FnOnce(&mut serde_json::Map<String, Value>),
+    edit: impl FnOnce(
+        &mut serde_json::Map<String, Value>,
+    ) -> Result<(), SceneDocumentSerializationError>,
 ) -> Result<Vec<u8>, SceneDocumentSerializationError> {
     let scene_index = project
         .scenes
@@ -3358,7 +3635,7 @@ fn serialize_scene_document_edit(
     let document = value
         .as_object_mut()
         .ok_or(SceneDocumentSerializationError::InvalidDocumentShape)?;
-    edit(document);
+    edit(document)?;
     let output = serde_json_canonicalizer::to_vec(&value)
         .map_err(SceneDocumentSerializationError::Serialization)?;
     let edited = load_scene(
@@ -6436,6 +6713,16 @@ mod tests {
         }]
     }
 
+    fn serialize_test_scene_addition(
+        loaded: &LoadedPlaybackProject,
+        scene_id: &str,
+        name: &str,
+        quantization: LaunchQuantization,
+        limits: LoaderLimits,
+    ) -> Result<Vec<u8>, SceneAdditionSerializationError> {
+        serialize_scene_addition(loaded, &asset_facts(), scene_id, name, quantization, limits)
+    }
+
     #[test]
     fn schedule_identity_index_preserves_document_positions() {
         let index = build_schedule_identity_index(["clip-b", "clip-a"].into_iter()).unwrap();
@@ -7594,6 +7881,387 @@ mod tests {
                 LoaderLimits::VERSION_1,
             ),
             Err(SceneDocumentSerializationError::NonCanonicalSource)
+        ));
+    }
+
+    #[test]
+    fn scene_addition_appends_one_empty_compilable_scene() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let scene_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let added = serialize_scene_addition(
+            &loaded,
+            &asset_facts(),
+            scene_id,
+            "Chorus",
+            LaunchQuantization::Grid {
+                quantum_ticks: 7_680,
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&added).unwrap();
+        assert_eq!(value["id"], scene_id);
+        assert_eq!(value["project_id"], PROJECT_ID);
+        assert_eq!(value["name"], "Chorus");
+        assert_eq!(value["order"], 1);
+        assert_eq!(value["enabled"], true);
+        assert_eq!(
+            value["launch_quantization"],
+            json!({"mode": "grid", "quantum_ticks": 7_680})
+        );
+        assert_eq!(value["slots"], json!([]));
+        assert_eq!(value["extensions"], json!({}));
+
+        let extended_scenes: [&[u8]; 2] = [SCENE, &added];
+        let reopened = load(
+            input_with_scenes(
+                TIMELINE,
+                &tracks,
+                &clips,
+                &extended_scenes,
+                Some(ARRANGEMENT),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.scene_count(), 2);
+        assert_eq!(reopened.scene_id(1), Some(scene_id));
+        assert_eq!(reopened.scene_name(1), Some("Chorus"));
+        assert_eq!(reopened.scene_enabled(1), Some(true));
+    }
+
+    #[test]
+    fn scene_addition_rejects_capacity_identity_name_and_quantization_failures() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let new_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        assert!(matches!(
+            serialize_test_scene_addition(
+                &loaded,
+                new_id,
+                "Scene",
+                LaunchQuantization::Immediate,
+                LoaderLimits {
+                    max_scene_documents: 0,
+                    ..LoaderLimits::VERSION_1
+                },
+            ),
+            Err(SceneAdditionSerializationError::SceneCapacity)
+        ));
+        for collision in [
+            PROJECT_ID,
+            loaded.clip_track_id_at(0).unwrap(),
+            asset_facts()[0].id,
+        ] {
+            assert!(matches!(
+                serialize_test_scene_addition(
+                    &loaded,
+                    collision,
+                    "Scene",
+                    LaunchQuantization::Immediate,
+                    LoaderLimits::VERSION_1,
+                ),
+                Err(SceneAdditionSerializationError::InvalidSceneIdentity)
+            ));
+        }
+        for invalid in [String::new(), " padded ".to_owned(), "x".repeat(121)] {
+            assert!(matches!(
+                serialize_test_scene_addition(
+                    &loaded,
+                    new_id,
+                    &invalid,
+                    LaunchQuantization::Immediate,
+                    LoaderLimits::VERSION_1,
+                ),
+                Err(SceneAdditionSerializationError::InvalidSceneName)
+            ));
+        }
+        assert!(matches!(
+            serialize_test_scene_addition(
+                &loaded,
+                new_id,
+                "Scene",
+                LaunchQuantization::Grid { quantum_ticks: 0 },
+                LoaderLimits::VERSION_1,
+            ),
+            Err(SceneAdditionSerializationError::Source(_))
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the test keeps the play-to-stop-to-continue round trip and exact canonical preservation in one state sequence"
+    )]
+    fn scene_slot_edit_distinguishes_play_stop_and_sparse_continue() {
+        let mut source: Value = serde_json::from_slice(SCENE).unwrap();
+        source["extensions"]["org.example.scene"] = json!({"opaque": [1, 2, 3]});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [&source];
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let scene_id = loaded.scene_id(0).unwrap();
+        let track_id = loaded.clip_track_id_at(0).unwrap();
+        assert_eq!(
+            serialize_scene_slot_edit(
+                &loaded,
+                &asset_facts(),
+                &source,
+                scene_id,
+                track_id,
+                SceneSlotEdit::Play {
+                    clip_id: loaded.clip_id_at(0).unwrap(),
+                },
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap(),
+            source
+        );
+
+        let stopped = serialize_scene_slot_edit(
+            &loaded,
+            &asset_facts(),
+            &source,
+            scene_id,
+            track_id,
+            SceneSlotEdit::Stop,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let stopped_value: Value = serde_json::from_slice(&stopped).unwrap();
+        assert_eq!(
+            stopped_value["slots"],
+            json!([{"track_id": track_id, "action": "stop"}])
+        );
+        assert_eq!(
+            stopped_value["extensions"]["org.example.scene"],
+            json!({"opaque": [1, 2, 3]})
+        );
+        let stopped_scenes: [&[u8]; 1] = [&stopped];
+        let stopped_project = load(
+            input_with_scenes(
+                TIMELINE,
+                &tracks,
+                &clips,
+                &stopped_scenes,
+                Some(ARRANGEMENT),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let continued = serialize_scene_slot_edit(
+            &stopped_project,
+            &asset_facts(),
+            &stopped,
+            scene_id,
+            track_id,
+            SceneSlotEdit::Continue,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&continued).unwrap()["slots"],
+            json!([])
+        );
+        let continued_scenes: [&[u8]; 1] = [&continued];
+        let continued_project = load(
+            input_with_scenes(
+                TIMELINE,
+                &tracks,
+                &clips,
+                &continued_scenes,
+                Some(ARRANGEMENT),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let played = serialize_scene_slot_edit(
+            &continued_project,
+            &asset_facts(),
+            &continued,
+            scene_id,
+            track_id,
+            SceneSlotEdit::Play {
+                clip_id: loaded.clip_id_at(0).unwrap(),
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&played).unwrap()["slots"],
+            json!([{
+                "track_id": track_id,
+                "action": "play",
+                "clip_id": loaded.clip_id_at(0).unwrap()
+            }])
+        );
+        assert_eq!(
+            serialize_scene_slot_edit(
+                &continued_project,
+                &asset_facts(),
+                &continued,
+                scene_id,
+                track_id,
+                SceneSlotEdit::Continue,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap(),
+            continued
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the rejection matrix keeps identity, ownership, source authority, and capacity precedence together"
+    )]
+    fn scene_slot_edit_rejects_missing_mismatched_stale_and_exhausted_authority() {
+        let source: Value = serde_json::from_slice(SCENE).unwrap();
+        let canonical = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [&canonical];
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let scene_id = loaded.scene_id(0).unwrap();
+        let track_id = loaded.clip_track_id_at(0).unwrap();
+        assert!(matches!(
+            serialize_scene_slot_edit(
+                &loaded,
+                &asset_facts(),
+                &canonical,
+                scene_id,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                SceneSlotEdit::Stop,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(SceneSlotEditSerializationError::TrackMissing)
+        ));
+        assert!(matches!(
+            serialize_scene_slot_edit(
+                &loaded,
+                &asset_facts(),
+                &canonical,
+                scene_id,
+                track_id,
+                SceneSlotEdit::Play {
+                    clip_id: "018f47a2-6b2d-7c11-8a44-001122334499",
+                },
+                LoaderLimits::VERSION_1,
+            ),
+            Err(SceneSlotEditSerializationError::ClipMissing)
+        ));
+        let mut stale = source.clone();
+        stale["enabled"] = false.into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_scene_slot_edit(
+                &loaded,
+                &asset_facts(),
+                &stale,
+                scene_id,
+                track_id,
+                SceneSlotEdit::Stop,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(SceneSlotEditSerializationError::Document(
+                SceneDocumentSerializationError::SourceSceneMismatch
+            ))
+        ));
+        let noncanonical = serde_json::to_vec_pretty(&source).unwrap();
+        assert!(matches!(
+            serialize_scene_slot_edit(
+                &loaded,
+                &asset_facts(),
+                &noncanonical,
+                scene_id,
+                track_id,
+                SceneSlotEdit::Stop,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(SceneSlotEditSerializationError::Document(
+                SceneDocumentSerializationError::NonCanonicalSource
+            ))
+        ));
+
+        let second_track_id = "018f47a2-6b2d-7c11-8a44-001122334470";
+        let second_track = serde_json_canonicalizer::to_vec(&json!({
+            "format": "hyper-track",
+            "format_version": 1,
+            "id": second_track_id,
+            "project_id": PROJECT_ID,
+            "name": "Second",
+            "kind": "audio",
+            "order": 1,
+            "active": true,
+            "clip_ids": [],
+            "extensions": {}
+        }))
+        .unwrap();
+        let two_tracks: [&[u8]; 2] = [TRACK, &second_track];
+        let two_track_project = load(
+            input_with_scenes(TIMELINE, &two_tracks, &clips, &scenes, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_scene_slot_edit(
+                &two_track_project,
+                &asset_facts(),
+                &canonical,
+                scene_id,
+                second_track_id,
+                SceneSlotEdit::Play {
+                    clip_id: loaded.clip_id_at(0).unwrap(),
+                },
+                LoaderLimits::VERSION_1,
+            ),
+            Err(SceneSlotEditSerializationError::ClipOwnerMismatch)
+        ));
+
+        let mut empty = source;
+        empty["slots"] = json!([]);
+        let empty = serde_json_canonicalizer::to_vec(&empty).unwrap();
+        let empty_scenes: [&[u8]; 1] = [&empty];
+        let empty_project = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &empty_scenes, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_scene_slot_edit(
+                &empty_project,
+                &asset_facts(),
+                &empty,
+                scene_id,
+                track_id,
+                SceneSlotEdit::Stop,
+                LoaderLimits {
+                    max_scene_slots: 0,
+                    ..LoaderLimits::VERSION_1
+                },
+            ),
+            Err(SceneSlotEditSerializationError::SlotCapacity)
         ));
     }
 
