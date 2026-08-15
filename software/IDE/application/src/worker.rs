@@ -9622,6 +9622,20 @@ mod tests {
         worker
             .try_send(IdeWorkerCommand::DuplicateScene {
                 scene_id: "scene".to_owned(),
+                name: "\u{00e9}".repeat(121),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::DuplicateScene,
+                reason: IdeWorkerCommandFailure::SceneDuplication(reason),
+            } if matches!(reason.as_ref(), IdeSceneDuplicationError::InvalidName)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::DuplicateScene {
+                scene_id: "scene".to_owned(),
                 name: " Copy ".to_owned(),
             })
             .unwrap();
