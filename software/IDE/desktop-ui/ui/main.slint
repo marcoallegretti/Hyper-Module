@@ -28,6 +28,7 @@ export enum AppMode {
     changing-clip-fades,
     changing-clip-loop,
     changing-clip-reverse,
+    changing-clip-source,
     creating-clip,
     preparing-preview,
     previewing,
@@ -109,6 +110,8 @@ export struct ClipRow {
     name: string,
     track-name: string,
     duration-ticks: string,
+    source-start-edit: string,
+    source-frame-count: string,
     active: bool,
     gain-label: string,
     gain-edit: string,
@@ -155,6 +158,7 @@ export global IdeActions {
     callback set-audio-clip-fades(string, string, string);
     callback set-audio-clip-loop(string, bool, string, string);
     callback set-audio-clip-reverse(string, bool);
+    callback set-audio-clip-source-start(string, string);
     callback loudness-run();
     callback loudness-standby();
     callback loudness-reset();
@@ -331,6 +335,12 @@ export component MainWindow inherits Window {
     in-out property <bool> clip-loop-enabled: false;
     in-out property <string> clip-loop-start: "";
     in-out property <string> clip-loop-end: "";
+    in-out property <bool> clip-source-slip-visible: false;
+    in-out property <string> clip-source-slip-id: "";
+    in-out property <string> clip-source-slip-name: "";
+    in-out property <string> clip-source-slip-frame-count: "";
+    in-out property <string> clip-source-slip-original: "";
+    in-out property <string> clip-source-slip-start: "";
     in-out property <bool> add-arrangement-placement-visible: false;
     in-out property <string> add-arrangement-placement-clip-id: "";
     in-out property <string> add-arrangement-placement-clip-name: "";
@@ -457,6 +467,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.changing-clip-fades ? "◌  UPDATING FADES"
                         : root.app-mode == AppMode.changing-clip-loop ? "◌  UPDATING LOOP"
                         : root.app-mode == AppMode.changing-clip-reverse ? "◌  UPDATING DIRECTION"
+                        : root.app-mode == AppMode.changing-clip-source ? "◌  SLIPPING SOURCE"
                         : root.app-mode == AppMode.creating-clip ? "◌  CREATING CLIP"
                         : root.app-mode == AppMode.selecting ? "◌  SELECTING"
                         : root.app-mode == AppMode.closing ? "◌  CLOSING"
@@ -1624,7 +1635,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.clip-loop-visible && !root.add-arrangement-placement-visible : Panel {
+                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.clip-loop-visible && !root.clip-source-slip-visible && !root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1640,12 +1651,12 @@ export component MainWindow inherits Window {
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Button {
                                 text: "Performance";
-                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.add-arrangement-placement-visible = false; }
+                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.clip-source-slip-visible = false; root.add-arrangement-placement-visible = false; }
                             }
                             Button {
                                 text: "Mixer";
                                 enabled: root.app-mode == AppMode.running;
-                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
+                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.clip-source-slip-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
                             }
                         }
 
@@ -1663,7 +1674,7 @@ export component MainWindow inherits Window {
                         if root.audio-clips.length > 0 : ListView {
                             vertical-stretch: 1;
                             for clip in root.audio-clips : Rectangle {
-                                height: 86px;
+                                height: 116px;
                                 width: parent.width;
                                 background: #0e141b;
                                 border-color: #27313d;
@@ -1678,6 +1689,7 @@ export component MainWindow inherits Window {
                                         Text { text: clip.name; color: #edf2f8; font-size: 13px; font-weight: 600; overflow: elide; }
                                         Text { text: clip.track-name; color: #8290a2; font-size: 9px; overflow: elide; }
                                         Text { text: clip.duration-ticks + " ticks · full reusable clip"; color: #65758a; font-size: 8px; overflow: elide; }
+                                        Text { text: "SOURCE START  " + clip.source-start-edit + "  ·  VIEW  " + clip.source-frame-count + " FRAMES"; color: #65758a; font-size: 8px; overflow: elide; }
                                     }
                                     VerticalLayout {
                                         width: 142px;
@@ -1735,21 +1747,7 @@ export component MainWindow inherits Window {
                                         HorizontalLayout {
                                             spacing: 4px;
                                             Button {
-                                                width: 55px;
-                                                text: clip.active ? "Disable" : "Enable";
-                                                accessible-label: (clip.active ? "Disable " : "Enable ") + clip.name + " everywhere";
-                                                enabled: root.app-mode == AppMode.running;
-                                                clicked => { IdeActions.set-audio-clip-active(clip.id, !clip.active); }
-                                            }
-                                            Button {
-                                                width: 55px;
-                                                text: clip.reverse ? "Forward" : "Reverse";
-                                                accessible-label: (clip.reverse ? "Use forward playback for " : "Use reverse playback for ") + clip.name + " everywhere";
-                                                enabled: root.app-mode == AppMode.running;
-                                                clicked => { IdeActions.set-audio-clip-reverse(clip.id, !clip.reverse); }
-                                            }
-                                            Button {
-                                                width: 55px;
+                                                width: 92px;
                                                 text: "Gain";
                                                 accessible-label: "Edit gain for " + clip.name;
                                                 enabled: root.app-mode == AppMode.running;
@@ -1762,7 +1760,7 @@ export component MainWindow inherits Window {
                                                 }
                                             }
                                             Button {
-                                                width: 55px;
+                                                width: 92px;
                                                 text: "Loop";
                                                 accessible-label: "Edit reusable loop for " + clip.name;
                                                 enabled: root.app-mode == AppMode.running;
@@ -1780,7 +1778,7 @@ export component MainWindow inherits Window {
                                                 }
                                             }
                                             Button {
-                                                width: 55px;
+                                                width: 92px;
                                                 text: "Fades";
                                                 accessible-label: "Edit linear fades for " + clip.name;
                                                 enabled: root.app-mode == AppMode.running;
@@ -1796,13 +1794,44 @@ export component MainWindow inherits Window {
                                                 }
                                             }
                                         }
+                                        HorizontalLayout {
+                                            spacing: 4px;
+                                            Button {
+                                                width: 92px;
+                                                text: clip.active ? "Disable" : "Enable";
+                                                accessible-label: (clip.active ? "Disable " : "Enable ") + clip.name + " everywhere";
+                                                enabled: root.app-mode == AppMode.running;
+                                                clicked => { IdeActions.set-audio-clip-active(clip.id, !clip.active); }
+                                            }
+                                            Button {
+                                                width: 92px;
+                                                text: clip.reverse ? "Forward" : "Reverse";
+                                                accessible-label: (clip.reverse ? "Use forward playback for " : "Use reverse playback for ") + clip.name + " everywhere";
+                                                enabled: root.app-mode == AppMode.running;
+                                                clicked => { IdeActions.set-audio-clip-reverse(clip.id, !clip.reverse); }
+                                            }
+                                            Button {
+                                                width: 92px;
+                                                text: "Slip source";
+                                                accessible-label: "Move the immutable source view for " + clip.name + " to an exact frame everywhere";
+                                                enabled: root.app-mode == AppMode.running;
+                                                clicked => {
+                                                    root.clip-source-slip-id = clip.id;
+                                                    root.clip-source-slip-name = clip.name;
+                                                    root.clip-source-slip-frame-count = clip.source-frame-count;
+                                                    root.clip-source-slip-original = clip.source-start-edit;
+                                                    root.clip-source-slip-start = clip.source-start-edit;
+                                                    root.clip-source-slip-visible = true;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
 
                         Text {
-                            text: "Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Place creates one full-length non-ripple reference. Activation, direction, gain, loop, and fades affect every existing reference; reverse does not reverse transport or rewrite media.";
+                            text: "Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Place creates one full-length non-ripple reference. Activation, direction, source slip, gain, loop, and fades affect every existing reference. Source slip keeps duration and placements fixed; reverse does not reverse transport or rewrite media.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;
@@ -2093,6 +2122,49 @@ export component MainWindow inherits Window {
                                         root.clip-loop-end
                                     );
                                 }
+                            }
+                        }
+                    }
+                }
+
+                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.clip-loop-visible && root.clip-source-slip-visible && !root.add-arrangement-placement-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 16px;
+                        Text { text: "SLIP REUSABLE CLIP SOURCE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.clip-source-slip-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                        Text {
+                            text: "Enter the exact first frame for this " + root.clip-source-slip-frame-count + "-frame view. The complete view must remain inside the verified audio asset.";
+                            color: #aebccc;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        GridLayout {
+                            spacing: 8px;
+                            Text { text: "Source start frame"; color: #8fa0b4; vertical-alignment: center; }
+                            LineEdit { text <=> root.clip-source-slip-start; placeholder-text: "0"; accessible-label: "Audio clip source start frame"; }
+                        }
+                        Text {
+                            text: "This is a nondestructive global slip of the reusable clip. Duration, warp, loop, fades, arrangement timing, scene references, and media bytes remain unchanged.";
+                            color: #65758a;
+                            font-size: 9px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Cancel"; clicked => { root.clip-source-slip-visible = false; } }
+                            Button { text: "Asset start"; clicked => { root.clip-source-slip-start = "0"; } }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: "Apply source slip";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.clip-source-slip-id != ""
+                                    && root.clip-source-slip-start != ""
+                                    && root.clip-source-slip-start != root.clip-source-slip-original;
+                                clicked => { IdeActions.set-audio-clip-source-start(root.clip-source-slip-id, root.clip-source-slip-start); }
                             }
                         }
                     }

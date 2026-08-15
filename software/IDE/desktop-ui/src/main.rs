@@ -25,7 +25,7 @@ use hyper_desktop_ide::{
 #[cfg(test)]
 use hyper_desktop_ide::{
     IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError, IdeAudioClipLoopEditError,
-    IdeAudioClipReverseEditError,
+    IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError,
 };
 use slint::platform::PlatformError;
 use slint::{
@@ -1559,6 +1559,7 @@ fn bind_audio_clip_callback(
     bind_audio_clip_fade_callback(ui, worker, project_state);
     bind_audio_clip_loop_callback(ui, worker, project_state);
     bind_audio_clip_reverse_callback(ui, worker, project_state);
+    bind_audio_clip_source_slip_callback(ui, worker, project_state);
 
     bind_arrangement_placement_addition_callback(ui, worker, project_state);
 }
@@ -1599,6 +1600,58 @@ fn bind_audio_clip_reverse_callback(
             IdeWorkerCommand::SetAudioClipReverse {
                 clip_id: owned_clip_id,
                 reverse,
+            },
+        );
+    });
+}
+
+fn bind_audio_clip_source_slip_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    let project_state = Rc::clone(project_state);
+    actions.on_set_audio_clip_source_start(move |clip_id, value| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            ui.set_error_text(
+                "Audio-clip source-slip editing is not available in the current state".into(),
+            );
+            return;
+        }
+        let source_start_frame = match parse_audio_clip_source_start(value.as_str()) {
+            Ok(source_start_frame) => source_start_frame,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let clips = project_state.audio_clips.borrow();
+        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+            ui.set_error_text("The selected audio clip is no longer available".into());
+            return;
+        };
+        if usize::try_from(source_start_frame).ok() == Some(clip.source_start_frame()) {
+            reset_audio_clip_source_slip_form(&ui);
+            ui.set_status_text(
+                "Audio-clip source start already matches the committed value".into(),
+            );
+            ui.set_error_text(SharedString::default());
+            return;
+        }
+        let owned_clip_id = clip.id().to_owned();
+        drop(clips);
+        submit_to_ui(
+            &ui,
+            &worker,
+            IdeWorkerCommand::SetAudioClipSourceStart {
+                clip_id: owned_clip_id,
+                source_start_frame,
             },
         );
     });
@@ -1932,6 +1985,20 @@ fn parse_audio_clip_loop(
     Ok((start_tick, end_tick))
 }
 
+fn parse_audio_clip_source_start(value: &str) -> Result<u64, &'static str> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("Source start must be a non-negative whole frame number");
+    }
+    let frame = value
+        .parse::<u64>()
+        .map_err(|_| "Source start is outside the supported range")?;
+    if frame > MAX_SAFE_TIMELINE_TICK {
+        return Err("Source start exceeds the exact project range");
+    }
+    Ok(frame)
+}
+
 fn parse_arrangement_start_tick(value: &str) -> Result<u64, &'static str> {
     parse_exact_arrangement_tick(
         value,
@@ -2134,6 +2201,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::SetAudioClipFades => AppMode::ChangingClipFades,
         IdeWorkerCommandKind::SetAudioClipLoop => AppMode::ChangingClipLoop,
         IdeWorkerCommandKind::SetAudioClipReverse => AppMode::ChangingClipReverse,
+        IdeWorkerCommandKind::SetAudioClipSourceStart => AppMode::ChangingClipSource,
         IdeWorkerCommandKind::CreateAudioClipFromTake => AppMode::CreatingClip,
         IdeWorkerCommandKind::StartRecording => AppMode::PreparingRecording,
         IdeWorkerCommandKind::StopRecording | IdeWorkerCommandKind::AbortRecording => {
@@ -2223,6 +2291,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetAudioClipReverse => {
             "Preserving mixer state, updating audio-clip direction, and reopening project..."
+        }
+        IdeWorkerCommandKind::SetAudioClipSourceStart => {
+            "Preserving mixer state, slipping the reusable audio-clip source, and reopening project..."
         }
         IdeWorkerCommandKind::CreateAudioClipFromTake => {
             "Preserving mixer state, creating the reusable audio clip, and reopening project…"
@@ -2393,6 +2464,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::AudioClipReverseChanged { .. }
         | IdeWorkerEvent::AudioClipReverseChanging { .. }) => {
             apply_audio_clip_reverse_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioClipSourceStartChanged { .. }
+        | IdeWorkerEvent::AudioClipSourceStartChanging { .. }) => {
+            apply_audio_clip_source_slip_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipCreatedFromTake { .. }
         | IdeWorkerEvent::AudioClipCreatingFromTake) => {
@@ -2929,6 +3004,7 @@ enum AudioClipEditWarningForm {
     Fades,
     Loop,
     Reverse,
+    SourceSlip,
 }
 
 fn audio_clip_edit_warning_presentation(
@@ -2954,6 +3030,10 @@ fn audio_clip_edit_warning_presentation(
             AudioClipEditWarningForm::Reverse,
             "Audio-clip direction edit",
         )),
+        IdeWorkerCommandKind::SetAudioClipSourceStart => Some((
+            AudioClipEditWarningForm::SourceSlip,
+            "Audio-clip source-slip edit",
+        )),
         _ => None,
     }
 }
@@ -2971,6 +3051,7 @@ fn apply_audio_clip_edit_committed_warning(ui: &MainWindow, event: &IdeWorkerEve
         AudioClipEditWarningForm::Gain => reset_audio_clip_gain_form(ui),
         AudioClipEditWarningForm::Fades => reset_audio_clip_fade_form(ui),
         AudioClipEditWarningForm::Loop => reset_audio_clip_loop_form(ui),
+        AudioClipEditWarningForm::SourceSlip => reset_audio_clip_source_slip_form(ui),
     }
     ui.set_status_text(committed_warning_status(ui.get_app_mode(), action).into());
     ui.set_error_text(warning.to_string().into());
@@ -3178,6 +3259,50 @@ fn apply_audio_clip_reverse_event(ui: &MainWindow, event: &IdeWorkerEvent) {
         }
         _ => unreachable!("audio-clip reverse event dispatcher received another event"),
     }
+}
+
+fn apply_audio_clip_source_slip_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioClipSourceStartChanged {
+            revision,
+            changed,
+            source_start_frame,
+        } => {
+            reset_audio_clip_source_slip_form(ui);
+            ui.set_status_text(
+                if *changed {
+                    format!(
+                        "Audio-clip source start set to frame {source_start_frame} in project revision {revision}"
+                    )
+                } else {
+                    format!(
+                        "Audio-clip source start already matched frame {source_start_frame} in project revision {revision}"
+                    )
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipSourceStartChanging { source_start_frame } => {
+            ui.set_app_mode(AppMode::ChangingClipSource);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before slipping the reusable audio clip to source frame {source_start_frame}..."
+                )
+                .into(),
+            );
+        }
+        _ => unreachable!("audio-clip source-slip event dispatcher received another event"),
+    }
+}
+
+fn reset_audio_clip_source_slip_form(ui: &MainWindow) {
+    ui.set_clip_source_slip_visible(false);
+    ui.set_clip_source_slip_id(SharedString::default());
+    ui.set_clip_source_slip_name(SharedString::default());
+    ui.set_clip_source_slip_frame_count(SharedString::default());
+    ui.set_clip_source_slip_original(SharedString::default());
+    ui.set_clip_source_slip_start(SharedString::default());
 }
 
 fn apply_recording_clip_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
@@ -3799,6 +3924,8 @@ fn set_audio_clips(ui: &MainWindow, project_state: &ProjectUiStateCell, clips: &
             fade_in_edit: clip.fade_in_ticks().to_string().into(),
             fade_out_edit: clip.fade_out_ticks().to_string().into(),
             duration_ticks: clip.duration_ticks().to_string().into(),
+            source_start_edit: clip.source_start_frame().to_string().into(),
+            source_frame_count: clip.source_frame_count().to_string().into(),
         })
         .collect();
     ui.set_audio_clips(ModelRc::from(Rc::new(VecModel::from(rows))));
@@ -4135,6 +4262,7 @@ fn reset_project(
     ui.set_clip_gain_value(SharedString::default());
     reset_audio_clip_fade_form(ui);
     reset_audio_clip_loop_form(ui);
+    reset_audio_clip_source_slip_form(ui);
     ui.set_audio_clips(ModelRc::default());
     ui.set_loudness_visible(false);
     ui.set_loudness_reset_confirming(false);
@@ -4258,6 +4386,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::SetAudioClipReverse if current == AppMode::ChangingClipReverse => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::SetAudioClipSourceStart if current == AppMode::ChangingClipSource => {
             AppMode::Running
         }
         IdeWorkerCommandKind::CreateAudioClipFromTake if current == AppMode::CreatingClip => {
@@ -5433,6 +5564,21 @@ mod tests {
     }
 
     #[test]
+    fn audio_clip_source_start_input_matches_the_exact_frame_domain() {
+        assert_eq!(parse_audio_clip_source_start(" 25 "), Ok(25));
+        assert_eq!(parse_audio_clip_source_start("0"), Ok(0));
+        assert_eq!(
+            parse_audio_clip_source_start("9007199254740991"),
+            Ok(MAX_SAFE_TIMELINE_TICK)
+        );
+        assert!(parse_audio_clip_source_start("").is_err());
+        assert!(parse_audio_clip_source_start("-1").is_err());
+        assert!(parse_audio_clip_source_start("1.5").is_err());
+        assert!(parse_audio_clip_source_start("9007199254740992").is_err());
+        assert!(parse_audio_clip_source_start("18446744073709551616").is_err());
+    }
+
+    #[test]
     fn audio_clip_rename_command_normalizes_name_and_preserves_identity() {
         assert!(matches!(
             audio_clip_rename_command("clip-a", "Verse", " Lead vocal "),
@@ -5573,6 +5719,24 @@ mod tests {
     }
 
     #[test]
+    fn audio_clip_source_slip_submission_and_failure_use_a_dedicated_mode() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::SetAudioClipSourceStart,
+            ),
+            AppMode::ChangingClipSource
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ChangingClipSource,
+                IdeWorkerCommandKind::SetAudioClipSourceStart,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
     fn committed_audio_clip_edit_warning_presentation_identifies_the_matching_form() {
         assert_eq!(
             audio_clip_edit_warning_presentation(IdeWorkerCommandKind::RenameAudioClip),
@@ -5599,6 +5763,13 @@ mod tests {
             Some((
                 AudioClipEditWarningForm::Reverse,
                 "Audio-clip direction edit"
+            ))
+        );
+        assert_eq!(
+            audio_clip_edit_warning_presentation(IdeWorkerCommandKind::SetAudioClipSourceStart),
+            Some((
+                AudioClipEditWarningForm::SourceSlip,
+                "Audio-clip source-slip edit"
             ))
         );
         assert_eq!(
@@ -5682,6 +5853,35 @@ mod tests {
             },
         );
         assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(ui.get_status_text().contains("committed and reopened"));
+        assert!(!ui.get_error_text().is_empty());
+    }
+
+    #[test]
+    fn source_slip_warning_preserves_authority_and_resets_the_form() {
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_clip_source_slip_visible(true);
+        ui.set_clip_source_slip_id("clip-a".into());
+        ui.set_clip_source_slip_name("Clip A".into());
+        ui.set_clip_source_slip_frame_count("100".into());
+        ui.set_clip_source_slip_original("0".into());
+        ui.set_clip_source_slip_start("25".into());
+
+        apply_audio_clip_edit_committed_warning(
+            &ui,
+            &IdeWorkerEvent::AudioClipEditCommittedWithWarning {
+                command: IdeWorkerCommandKind::SetAudioClipSourceStart,
+                warning: IdeAudioClipEditCommittedWarning::SourceSlip(Box::new(
+                    IdeAudioClipSourceSlipEditError::InvalidClipIdentity,
+                )),
+            },
+        );
+
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(!ui.get_clip_source_slip_visible());
+        assert!(ui.get_clip_source_slip_id().is_empty());
+        assert!(ui.get_clip_source_slip_start().is_empty());
         assert!(ui.get_status_text().contains("committed and reopened"));
         assert!(!ui.get_error_text().is_empty());
     }
