@@ -9602,6 +9602,65 @@ mod tests {
     }
 
     #[test]
+    fn arrangement_scene_launch_addition_creates_the_first_arrangement() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let arrangement_id = "018f47a2-6b2d-7c11-8a44-001122334466";
+        let launch_id = "018f47a2-6b2d-7c11-8a44-001122334467";
+
+        let added = serialize_arrangement_scene_launch_addition(
+            &loaded,
+            &asset_facts(),
+            None,
+            arrangement_id,
+            launch_id,
+            "018f47a2-6b2d-7c11-8a44-001122334461",
+            7,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&added).unwrap();
+
+        assert_eq!(value["id"], arrangement_id);
+        assert_eq!(value["name"], "Main");
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["placements"], json!([]));
+        assert_eq!(value["extensions"], json!({}));
+        assert_eq!(
+            value["scene_launches"],
+            json!([{
+                "id": launch_id,
+                "tick": 7,
+                "scene_id": "018f47a2-6b2d-7c11-8a44-001122334461"
+            }])
+        );
+        assert_eq!(serde_json_canonicalizer::to_vec(&value).unwrap(), added);
+
+        let reopened = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&added)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.scene_launch_count(), 1);
+        assert_eq!(reopened.scene_launch_id_at(0), Some(launch_id));
+        assert_eq!(reopened.scene_launch_tick_at(0), Some(7));
+        assert_eq!(reopened.scene_launch_scene_index_at(0), Some(0));
+        reopened
+            .compile_playback(
+                &asset_facts(),
+                GraphLimits::VERSION_1,
+                SceneLimits::VERSION_1,
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn arrangement_placement_addition_creates_the_first_arrangement() {
         let tracks: [&[u8]; 1] = [TRACK];
         let clips: [&[u8]; 1] = [CLIP];

@@ -7361,7 +7361,15 @@ mod tests {
         }
 
         fn with_scene() -> Self {
-            let fixture = Self::new();
+            Self::new().add_scene()
+        }
+
+        fn with_scene_without_arrangement() -> Self {
+            Self::without_arrangement().add_scene()
+        }
+
+        fn add_scene(self) -> Self {
+            let fixture = self;
             let scene = json!({
                 "format":"hyper-scene", "format_version":1,
                 "id":ARRANGEMENT_TEST_SCENE_ID,
@@ -9479,6 +9487,90 @@ mod tests {
         assert_eq!(published.scene_launches()[0].id(), launch_id);
         assert_eq!(published.scene_launches()[0].tick(), 4);
         assert_eq!(published.scene_name(0), Some("Intro"));
+    }
+
+    #[test]
+    fn arrangement_scene_launch_publishes_the_first_arrangement_resource() {
+        let fixture = ArrangementProjectFixture::with_scene_without_arrangement();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        assert!(
+            !package
+                .manifest()
+                .resources()
+                .iter()
+                .any(|descriptor| descriptor.role() == ResourceRole::Arrangement)
+        );
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        let launch_id = "018f47a2-6b2d-7c11-8a44-001122338509";
+        let (project, _, _, media) = prepared.session().parts();
+        let assets: Vec<_> = media.media_asset_facts().collect();
+        let arrangement_bytes = serialize_arrangement_scene_launch_addition(
+            project,
+            &assets,
+            None,
+            ARRANGEMENT_TEST_RESOURCE_ID,
+            launch_id,
+            ARRANGEMENT_TEST_SCENE_ID,
+            7,
+            limits.session.documents,
+        )
+        .unwrap();
+        drop(prepared);
+
+        let outcome = IdeArrangementPlacementEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256,
+                resource_id: mixer_id,
+                resource_bytes: mixer_bytes,
+            },
+            arrangement_id: ARRANGEMENT_TEST_RESOURCE_ID.to_owned(),
+            arrangement_bytes: arrangement_bytes.clone(),
+            addition: true,
+            created_placement_id: None,
+        }
+        .publish()
+        .unwrap();
+        assert_eq!(outcome.project_revision(), 2);
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let arrangement_descriptor = reopened
+            .package()
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Arrangement)
+            .unwrap();
+        assert_eq!(arrangement_descriptor.id(), ARRANGEMENT_TEST_RESOURCE_ID);
+        assert_eq!(
+            reopened
+                .package()
+                .read_resource(ARRANGEMENT_TEST_RESOURCE_ID)
+                .unwrap(),
+            arrangement_bytes
+        );
+        let loaded = reopened.session().parts().0;
+        assert_eq!(loaded.scene_launch_count(), 1);
+        assert_eq!(loaded.scene_launch_id_at(0), Some(launch_id));
+        assert_eq!(loaded.scene_launch_tick_at(0), Some(7));
+        assert_eq!(loaded.scene_launch_scene_index_at(0), Some(0));
+        let arrangement = reopened.session().arrangement();
+        assert_eq!(arrangement.scene_launches()[0].id(), launch_id);
+        assert_eq!(arrangement.scene_launches()[0].tick(), 7);
+        assert_eq!(arrangement.scene_name(0), Some("Intro"));
     }
 
     #[test]
