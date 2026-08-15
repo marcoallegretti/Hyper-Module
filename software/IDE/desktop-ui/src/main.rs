@@ -5855,11 +5855,7 @@ mod tests {
         assert_eq!(ui.get_app_mode(), AppMode::Running);
         assert!(ui.get_status_text().contains("committed and reopened"));
         assert!(!ui.get_error_text().is_empty());
-    }
 
-    #[test]
-    fn source_slip_warning_preserves_authority_and_resets_the_form() {
-        let ui = MainWindow::new().unwrap();
         ui.set_app_mode(AppMode::Running);
         ui.set_clip_source_slip_visible(true);
         ui.set_clip_source_slip_id("clip-a".into());
