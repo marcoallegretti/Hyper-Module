@@ -58,6 +58,13 @@ pub struct ArrangementPublicationRequest<'a> {
     pub arrangement_bytes: &'a [u8],
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ScenePublicationRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub scene_id: &'a str,
+    pub scene_bytes: &'a [u8],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectResourcePublicationErrorKind {
     InvalidResource,
@@ -353,6 +360,7 @@ enum PublicationPhase {
 enum ProjectResourcePublicationMode {
     Replacement,
     ArrangementAddition,
+    SceneAddition,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -404,6 +412,31 @@ pub fn publish_arrangement(
             resource_bytes: request.arrangement_bytes,
         },
         ProjectResourcePublicationMode::ArrangementAddition,
+        |_, _| Ok(()),
+    )
+}
+
+/// Publishes one new canonical scene resource through the existing serialized,
+/// recoverable manifest-last resource transaction family.
+///
+/// # Errors
+///
+/// Returns a classified validation, conflict, integrity, I/O, or recovery
+/// error. Publication is rejected if the stable identity or managed path
+/// collides with active project content.
+pub fn publish_scene(
+    project_path: impl AsRef<Path>,
+    request: ScenePublicationRequest<'_>,
+) -> Result<ProjectResourcePublicationOutcome, ProjectResourcePublicationError> {
+    publish_project_resource_observed(
+        project_path.as_ref(),
+        ProjectResourcePublicationRequest {
+            expected_project_sha256: request.expected_project_sha256,
+            resource_id: request.scene_id,
+            expected_role: ResourceRole::Scene,
+            resource_bytes: request.scene_bytes,
+        },
+        ProjectResourcePublicationMode::SceneAddition,
         |_, _| Ok(()),
     )
 }
@@ -931,8 +964,14 @@ fn publish_project_resource_observed(
             "project changed after the resource edit began",
         ));
     }
-    if mode == ProjectResourcePublicationMode::ArrangementAddition {
-        validate_arrangement_addition_request(&verified, request)?;
+    match mode {
+        ProjectResourcePublicationMode::Replacement => {}
+        ProjectResourcePublicationMode::ArrangementAddition => {
+            validate_arrangement_addition_request(&verified, request)?;
+        }
+        ProjectResourcePublicationMode::SceneAddition => {
+            validate_scene_addition_request(&verified, request)?;
+        }
     }
     let backups = open_or_create_dir(&verified.root_dir, "backups")?;
     let _lock = ProjectLock::acquire(&backups).map_err(|error| {
@@ -1014,10 +1053,22 @@ fn publish_project_resource_observed(
         }
         ProjectResourcePublicationMode::ArrangementAddition => {
             let path = format!("arrangement/{}.json", request.resource_id);
-            let created_parent_directory =
-                inspect_arrangement_destination(&verified.root_dir, &path)?;
+            let created_parent_directory = inspect_addition_destination(
+                &verified.root_dir,
+                "arrangement",
+                &path,
+                "arrangement",
+            )?;
             let candidate =
-                candidate_arrangement_manifest(&active_project, request, &path, next_revision)?;
+                candidate_addition_manifest(&active_project, request, &path, next_revision)?;
+            (path, None, created_parent_directory, candidate)
+        }
+        ProjectResourcePublicationMode::SceneAddition => {
+            let path = format!("scenes/{}.json", request.resource_id);
+            let created_parent_directory =
+                inspect_addition_destination(&verified.root_dir, "scenes", &path, "scene")?;
+            let candidate =
+                candidate_addition_manifest(&active_project, request, &path, next_revision)?;
             (path, None, created_parent_directory, candidate)
         }
     };
@@ -1201,16 +1252,19 @@ fn run_publication(
     observer(PublicationPhase::Transaction, verified.root())?;
 
     if created_parent_directory {
-        verified
-            .root_dir
-            .create_dir("arrangement")
-            .map_err(|error| {
-                caused(
-                    ProjectResourcePublicationErrorKind::Io,
-                    "create arrangement resource directory",
-                    error,
-                )
-            })?;
+        let directory = addition_directory(request.expected_role).ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "resource addition directory is inconsistent",
+            )
+        })?;
+        verified.root_dir.create_dir(directory).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "create resource directory",
+                error,
+            )
+        })?;
         sync_dir(&verified.root_dir)?;
     }
     let parent = open_relative_parent(&verified.root_dir, resource_path)?;
@@ -1569,29 +1623,74 @@ fn validate_arrangement_addition_request(
     Ok(())
 }
 
-fn inspect_arrangement_destination(
+fn validate_scene_addition_request(
+    verified: &StructurallyVerifiedProject,
+    request: ProjectResourcePublicationRequest<'_>,
+) -> Result<(), ProjectResourcePublicationError> {
+    if request.expected_role != ResourceRole::Scene
+        || !is_valid_entity_id(request.resource_id)
+        || request.resource_id == verified.manifest().project_id()
+        || verified
+            .manifest()
+            .resources()
+            .iter()
+            .any(|descriptor| descriptor.id() == request.resource_id)
+        || verified
+            .manifest()
+            .assets()
+            .iter()
+            .any(|descriptor| descriptor.id() == request.resource_id)
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "scene identity conflicts with the active project",
+        ));
+    }
+    let scene: Value = serde_json::from_slice(request.resource_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse new scene resource",
+            error,
+        )
+    })?;
+    if scene["format"].as_str() != Some("hyper-scene")
+        || scene["format_version"].as_u64() != Some(1)
+        || scene["id"].as_str() != Some(request.resource_id)
+        || scene["project_id"].as_str() != Some(verified.manifest().project_id())
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "scene resource does not match the active project",
+        ));
+    }
+    Ok(())
+}
+
+fn inspect_addition_destination(
     root: &Dir,
+    directory_name: &str,
     resource_path: &str,
+    resource_label: &str,
 ) -> Result<bool, ProjectResourcePublicationError> {
-    let directory = match root.symlink_metadata("arrangement") {
+    let directory = match root.symlink_metadata(directory_name) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(error) => {
             return Err(caused(
                 ProjectResourcePublicationErrorKind::Io,
-                "inspect arrangement resource directory",
+                "inspect resource directory",
                 error,
             ));
         }
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             return Err(failure(
                 ProjectResourcePublicationErrorKind::Integrity,
-                "arrangement resource directory is not a real directory",
+                format!("{resource_label} resource directory is not a real directory"),
             ));
         }
-        Ok(_) => root.open_dir_nofollow("arrangement").map_err(|error| {
+        Ok(_) => root.open_dir_nofollow(directory_name).map_err(|error| {
             caused(
                 ProjectResourcePublicationErrorKind::Io,
-                "open arrangement resource directory",
+                "open resource directory",
                 error,
             )
         })?,
@@ -1601,7 +1700,7 @@ fn inspect_arrangement_destination(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Ok(_) => Err(failure(
             ProjectResourcePublicationErrorKind::ResourceConflict,
-            "arrangement resource path already exists",
+            format!("{resource_label} resource path already exists"),
         )),
         Err(error) => Err(caused(
             ProjectResourcePublicationErrorKind::Io,
@@ -2136,7 +2235,7 @@ fn candidate_manifest(
     Ok(bytes)
 }
 
-fn candidate_arrangement_manifest(
+fn candidate_addition_manifest(
     active: &[u8],
     request: ProjectResourcePublicationRequest<'_>,
     resource_path: &str,
@@ -2158,7 +2257,7 @@ fn candidate_arrangement_manifest(
     })?;
     resources.push(serde_json::json!({
         "id": request.resource_id,
-        "role": "arrangement",
+        "role": role_name(request.expected_role),
         "path": resource_path,
         "media_type": "application/json",
         "byte_length": request.resource_bytes.len(),
@@ -2181,11 +2280,19 @@ fn candidate_arrangement_manifest(
     ProjectManifest::parse(&bytes).map_err(|error| {
         caused(
             ProjectResourcePublicationErrorKind::Integrity,
-            "candidate arrangement project manifest is invalid",
+            "candidate resource-addition manifest is invalid",
             error,
         )
     })?;
     Ok(bytes)
+}
+
+const fn addition_directory(role: ResourceRole) -> Option<&'static str> {
+    match role {
+        ResourceRole::Arrangement => Some("arrangement"),
+        ResourceRole::Scene => Some("scenes"),
+        _ => None,
+    }
 }
 
 fn role_name(role: ResourceRole) -> &'static str {
@@ -3003,13 +3110,27 @@ fn remove_created_resource_parent(
     if !tx.created_parent_directory {
         return Ok(());
     }
-    match root.remove_dir("arrangement") {
+    let directory = transaction_addition_directory(tx)?;
+    match root.remove_dir(directory) {
         Ok(()) => sync_dir(root),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(caused(
             ProjectResourcePublicationErrorKind::Recovery,
-            "remove transaction-created arrangement directory",
+            "remove transaction-created resource directory",
             error,
+        )),
+    }
+}
+
+fn transaction_addition_directory(
+    tx: &TransactionRecord,
+) -> Result<&'static str, ProjectResourcePublicationError> {
+    match tx.resource_role.as_str() {
+        "arrangement" if addition_path_matches(tx, "arrangement") => Ok("arrangement"),
+        "scene" if addition_path_matches(tx, "scenes") => Ok("scenes"),
+        _ => Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "resource addition transaction directory is invalid",
         )),
     }
 }
@@ -3227,8 +3348,7 @@ fn read_transaction(
                 || decode_digest(&previous.sha256).is_err()
         })
         || tx.created_parent_directory && tx.previous_resource.is_some()
-        || tx.previous_resource.is_none()
-            && (tx.resource_role != "arrangement" || !tx.resource.path.starts_with("arrangement/"))
+        || tx.previous_resource.is_none() && !is_valid_addition_destination(&tx)
         || decode_digest(&tx.before_project_sha256).is_err()
         || decode_digest(&tx.after_project_sha256).is_err()
         || tx.before_project_revision.checked_add(1) != Some(tx.after_project_revision)
@@ -3239,6 +3359,15 @@ fn read_transaction(
         ));
     }
     Ok(tx)
+}
+
+fn is_valid_addition_destination(tx: &TransactionRecord) -> bool {
+    matches!(tx.resource_role.as_str(), "arrangement") && addition_path_matches(tx, "arrangement")
+        || matches!(tx.resource_role.as_str(), "scene") && addition_path_matches(tx, "scenes")
+}
+
+fn addition_path_matches(tx: &TransactionRecord, directory: &str) -> bool {
+    tx.resource.path == format!("{directory}/{}.json", tx.resource_id)
 }
 
 fn validate_prepublication_residue(
@@ -4048,6 +4177,8 @@ mod tests {
     const MIXER_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334468";
     const NEW_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334469";
     const ARRANGEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334470";
+    const SCENE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334471";
+    const SECOND_SCENE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334472";
 
     struct Fixture {
         root: PathBuf,
@@ -4392,6 +4523,90 @@ mod tests {
         }
     }
 
+    struct SceneFixture {
+        parent: PathBuf,
+        root: PathBuf,
+        scene: Vec<u8>,
+    }
+
+    impl SceneFixture {
+        fn new() -> Self {
+            let parent = std::env::temp_dir().join(format!(
+                "hyper-scene-publication-{}-{}",
+                std::process::id(),
+                NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&parent).unwrap();
+            let created = crate::create_project(
+                &parent,
+                crate::ProjectCreationRequest {
+                    directory_name: "Session",
+                    project_name: "Session",
+                },
+            )
+            .unwrap();
+            let root = created.project().root().to_path_buf();
+            let project_id = created.project().manifest().project_id();
+            let scene = serde_json_canonicalizer::to_vec(&json!({
+                "format": "hyper-scene",
+                "format_version": 1,
+                "id": SCENE_ID,
+                "project_id": project_id,
+                "name": "Intro",
+                "order": 0,
+                "enabled": true,
+                "launch_quantization": {"mode": "immediate"},
+                "slots": [],
+                "extensions": {}
+            }))
+            .unwrap();
+            Self {
+                parent,
+                root,
+                scene,
+            }
+        }
+
+        fn request(&self) -> ScenePublicationRequest<'_> {
+            ScenePublicationRequest {
+                expected_project_sha256: *verify_project_package(&self.root)
+                    .unwrap()
+                    .manifest_sha256(),
+                scene_id: SCENE_ID,
+                scene_bytes: &self.scene,
+            }
+        }
+
+        fn resource_request(&self) -> ProjectResourcePublicationRequest<'_> {
+            let request = self.request();
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: request.expected_project_sha256,
+                resource_id: request.scene_id,
+                expected_role: ResourceRole::Scene,
+                resource_bytes: request.scene_bytes,
+            }
+        }
+
+        fn transaction_count(&self) -> usize {
+            fs::read_dir(self.root.join("backups"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(TRANSACTION_PREFIX)
+                })
+                .count()
+        }
+    }
+
+    impl Drop for SceneFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.parent);
+        }
+    }
+
     #[test]
     fn replaces_existing_resource_and_identical_save_is_a_no_op() {
         let fixture = Fixture::new();
@@ -4467,6 +4682,214 @@ mod tests {
             error.kind(),
             ProjectResourcePublicationErrorKind::ResourceConflict
         );
+    }
+
+    #[test]
+    fn publishes_a_new_scene_resource_manifest_last() {
+        let fixture = SceneFixture::new();
+        assert!(!fixture.root.join("scenes").exists());
+
+        let published = publish_scene(&fixture.root, fixture.request()).unwrap();
+
+        assert!(published.changed());
+        assert_eq!(published.project_revision(), 2);
+        assert_eq!(published.resource_id(), SCENE_ID);
+        assert_eq!(published.resource_path(), format!("scenes/{SCENE_ID}.json"));
+        assert_eq!(
+            fs::read(fixture.root.join(published.resource_path())).unwrap(),
+            fixture.scene
+        );
+        let verified = verify_project_package(&fixture.root).unwrap();
+        let descriptor = verified
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == SCENE_ID)
+            .unwrap();
+        assert_eq!(descriptor.role(), ResourceRole::Scene);
+        assert_eq!(fixture.transaction_count(), 0);
+
+        let error = publish_scene(
+            &fixture.root,
+            ScenePublicationRequest {
+                expected_project_sha256: *published.project_identity(),
+                ..fixture.request()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::ResourceConflict
+        );
+    }
+
+    #[test]
+    fn scene_publication_rejects_stale_noncanonical_and_mismatched_documents() {
+        let fixture = SceneFixture::new();
+        let mut stale = fixture.request();
+        stale.expected_project_sha256 = [0; 32];
+        assert_eq!(
+            publish_scene(&fixture.root, stale).unwrap_err().kind(),
+            ProjectResourcePublicationErrorKind::ProjectChanged
+        );
+
+        let mut wrong: Value = serde_json::from_slice(&fixture.scene).unwrap();
+        wrong["id"] = ARRANGEMENT_ID.into();
+        let wrong = serde_json_canonicalizer::to_vec(&wrong).unwrap();
+        let mut request = fixture.request();
+        request.scene_bytes = &wrong;
+        assert_eq!(
+            publish_scene(&fixture.root, request).unwrap_err().kind(),
+            ProjectResourcePublicationErrorKind::InvalidResource
+        );
+
+        let pretty =
+            serde_json::to_vec_pretty(&serde_json::from_slice::<Value>(&fixture.scene).unwrap())
+                .unwrap();
+        let mut request = fixture.request();
+        request.scene_bytes = &pretty;
+        assert_eq!(
+            publish_scene(&fixture.root, request).unwrap_err().kind(),
+            ProjectResourcePublicationErrorKind::InvalidResource
+        );
+        assert!(!fixture.root.join("scenes").exists());
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            1
+        );
+    }
+
+    #[test]
+    fn scene_crashes_before_manifest_roll_back_resource_and_created_directory() {
+        for crash_phase in [PublicationPhase::Transaction, PublicationPhase::Resource] {
+            let fixture = SceneFixture::new();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = publish_project_resource_observed(
+                    &fixture.root,
+                    fixture.resource_request(),
+                    ProjectResourcePublicationMode::SceneAddition,
+                    |phase, _| {
+                        assert_ne!(phase, crash_phase, "simulated process crash");
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+
+            let recovered = recover_project_resource_publications(&fixture.root).unwrap();
+
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(
+                recovered[0].disposition(),
+                ProjectResourcePublicationRecoveryDisposition::RolledBack
+            );
+            assert!(!fixture.root.join("scenes").exists());
+            assert_eq!(
+                verify_project_package(&fixture.root)
+                    .unwrap()
+                    .manifest()
+                    .revision(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn scene_crash_after_manifest_recovers_as_committed() {
+        let fixture = SceneFixture::new();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = publish_project_resource_observed(
+                &fixture.root,
+                fixture.resource_request(),
+                ProjectResourcePublicationMode::SceneAddition,
+                |phase, _| {
+                    assert_ne!(phase, PublicationPhase::Manifest, "simulated process crash");
+                    Ok(())
+                },
+            );
+        }));
+        assert!(result.is_err());
+
+        let recovered = recover_project_resource_publications(&fixture.root).unwrap();
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].disposition(),
+            ProjectResourcePublicationRecoveryDisposition::Committed
+        );
+        assert_eq!(
+            fs::read(fixture.root.join(format!("scenes/{SCENE_ID}.json"))).unwrap(),
+            fixture.scene
+        );
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            2
+        );
+    }
+
+    #[test]
+    fn scene_rollback_preserves_a_preexisting_directory_and_scene() {
+        let fixture = SceneFixture::new();
+        let first = publish_scene(&fixture.root, fixture.request()).unwrap();
+        let mut second: Value = serde_json::from_slice(&fixture.scene).unwrap();
+        second["id"] = SECOND_SCENE_ID.into();
+        second["name"] = "Verse".into();
+        second["order"] = 1.into();
+        let second = serde_json_canonicalizer::to_vec(&second).unwrap();
+        let request = ProjectResourcePublicationRequest {
+            expected_project_sha256: *first.project_identity(),
+            resource_id: SECOND_SCENE_ID,
+            expected_role: ResourceRole::Scene,
+            resource_bytes: &second,
+        };
+        let scenes = fixture.root.join("scenes");
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = publish_project_resource_observed(
+                &fixture.root,
+                request,
+                ProjectResourcePublicationMode::SceneAddition,
+                |phase, _| {
+                    assert_ne!(phase, PublicationPhase::Resource, "simulated process crash");
+                    Ok(())
+                },
+            );
+        }));
+        assert!(result.is_err());
+
+        let recovered = recover_project_resource_publications(&fixture.root).unwrap();
+
+        assert_eq!(
+            recovered[0].disposition(),
+            ProjectResourcePublicationRecoveryDisposition::RolledBack
+        );
+        assert!(scenes.is_dir());
+        assert_eq!(
+            fs::read(scenes.join(format!("{SCENE_ID}.json"))).unwrap(),
+            fixture.scene
+        );
+        assert!(!scenes.join(format!("{SECOND_SCENE_ID}.json")).exists());
+    }
+
+    #[test]
+    fn scene_publication_refuses_an_unmanaged_destination_without_overwrite() {
+        let fixture = SceneFixture::new();
+        let request = fixture.request();
+        let scenes = fixture.root.join("scenes");
+        fs::create_dir(&scenes).unwrap();
+        let destination = scenes.join(format!("{SCENE_ID}.json"));
+        fs::write(&destination, b"unrelated").unwrap();
+
+        let error = publish_scene(&fixture.root, request).unwrap_err();
+
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Integrity);
+        assert_eq!(fs::read(destination).unwrap(), b"unrelated");
+        assert_eq!(fixture.transaction_count(), 0);
     }
 
     #[test]

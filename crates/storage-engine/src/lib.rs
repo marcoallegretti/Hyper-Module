@@ -36,9 +36,10 @@ pub use resource_publication::{
     AudioTrackRemovalOutcome, AudioTrackRemovalRequest, ProjectResourcePublicationError,
     ProjectResourcePublicationErrorKind, ProjectResourcePublicationOutcome,
     ProjectResourcePublicationRecovery, ProjectResourcePublicationRecoveryDisposition,
-    ProjectResourcePublicationRequest, publish_arrangement, publish_audio_clip,
-    publish_audio_track, publish_project_resource, recover_audio_clip_publications,
-    recover_audio_track_publications, recover_project_resource_publications, remove_audio_track,
+    ProjectResourcePublicationRequest, ScenePublicationRequest, publish_arrangement,
+    publish_audio_clip, publish_audio_track, publish_project_resource, publish_scene,
+    recover_audio_clip_publications, recover_audio_track_publications,
+    recover_project_resource_publications, remove_audio_track,
 };
 
 use core::error::Error;
