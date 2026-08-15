@@ -38,7 +38,8 @@ pub use hyper_mixer_runtime::{
     LoudnessPresentationSnapshot as IdeLoudnessPresentationSnapshot,
     LoudnessScaleRegion as IdeLoudnessScaleRegion,
     MaximumTruePeakDisplay as IdeMaximumTruePeakDisplay, PlaybackRecoveryTransportState,
-    ScaledLoudnessValue as IdeScaledLoudnessValue, TransportCommand,
+    ScaledLoudnessValue as IdeScaledLoudnessValue, SceneLaunchState as IdeSceneLaunchState,
+    TransportCommand,
 };
 use hyper_mixer_runtime::{
     LatestOutputMeterSnapshot, LoudnessCommandSendError, MixerParameterCommand,

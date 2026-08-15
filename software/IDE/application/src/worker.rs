@@ -947,6 +947,15 @@ impl IdeRunningObservation {
         self.meter
     }
 
+    /// Returns scene-launch state from the newest committed audio cycle, when
+    /// this observation received one.
+    #[must_use]
+    pub fn scene_launch_state(&self) -> Option<super::IdeSceneLaunchState> {
+        self.meter
+            .snapshot()
+            .map(|snapshot| snapshot.cycle().scene_launch_state())
+    }
+
     /// Derives one display-ready loudness snapshot from the same newest meter
     /// observation used by the sample-peak UI.
     #[must_use]

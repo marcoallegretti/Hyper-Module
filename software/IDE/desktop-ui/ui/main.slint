@@ -49,8 +49,11 @@ export struct SceneRow {
     name: string,
     display-name: string,
     availability: string,
+    runtime-state: string,
     active: bool,
     launchable: bool,
+    queued: bool,
+    current: bool,
 }
 
 export struct SceneSlotRow {
@@ -934,8 +937,8 @@ export component MainWindow inherits Window {
                                     Button {
                                         min-width: 0px;
                                         horizontal-stretch: 2;
-                                        text: scene.display-name;
-                                        accessible-label: scene.name + ", " + scene.availability;
+                                        text: (scene.queued ? "[Q] " : scene.current ? "[>] " : "") + scene.display-name;
+                                        accessible-label: scene.name + ", " + (scene.runtime-state != "" ? scene.runtime-state : scene.availability);
                                         enabled: root.app-mode == AppMode.running && scene.launchable;
                                         clicked => { IdeActions.launch-scene(scene.index); }
                                     }
@@ -955,8 +958,8 @@ export component MainWindow inherits Window {
                                     }
                                 }
                                 Text {
-                                    text: scene.availability;
-                                    color: scene.launchable ? #63e6b5 : #8fa0b4;
+                                    text: scene.runtime-state != "" ? scene.runtime-state : scene.availability;
+                                    color: scene.queued ? #e7b96d : scene.current ? #63e6b5 : scene.launchable ? #63e6b5 : #8fa0b4;
                                     font-size: 9px;
                                     horizontal-alignment: center;
                                     overflow: elide;

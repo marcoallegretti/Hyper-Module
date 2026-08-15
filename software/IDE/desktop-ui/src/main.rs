@@ -18,10 +18,11 @@ use hyper_desktop_ide::{
     IdeOutputTestState, IdePlaybackArrangement, IdePlaybackExtent, IdeRecordingAbortOutcome,
     IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation,
     IdeScaledLoudnessValue, IdeScene, IdeSceneAvailability, IdeSceneLaunchQuantization,
-    IdeSceneSlotEdit, IdeSceneTrackAction, IdeWorkerCommand, IdeWorkerCommandKind, IdeWorkerEvent,
-    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
-    IdeWorkerShutdownReport, LocateState, MAX_IDE_SCENES, PlaybackRecoveryTransportState,
-    TransportCommand, desktop_ide_application_config, ide_audio_clip_gain_is_supported,
+    IdeSceneLaunchState, IdeSceneSlotEdit, IdeSceneTrackAction, IdeWorkerCommand,
+    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError,
+    IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState, MAX_IDE_SCENES,
+    PlaybackRecoveryTransportState, TransportCommand, desktop_ide_application_config,
+    ide_audio_clip_gain_is_supported,
 };
 #[cfg(test)]
 use hyper_desktop_ide::{
@@ -58,6 +59,7 @@ struct ProjectUiState {
     arrangement: RefCell<Option<ArrangementBinding>>,
     audio_clips: RefCell<Vec<IdeAudioClip>>,
     scenes: RefCell<Vec<IdeScene>>,
+    scene_launch_state: RefCell<Option<IdeSceneLaunchState>>,
 }
 
 struct ArrangementBinding {
@@ -3982,7 +3984,7 @@ fn apply_running_event(
     if !ui.get_new_track_visible() {
         ui.set_new_track_name(next_audio_track_name(ui.get_track_count()));
     }
-    let scenes_changed = set_scenes(ui, project_state, observation.scenes());
+    let scenes_changed = set_observed_scenes(ui, project_state, observation);
     apply_mixer_observation(ui, observation);
     set_recording_targets(ui, recording_routes, observation.mixer_channels());
     set_recording_takes(ui, take_routes, observation);
@@ -4776,6 +4778,7 @@ fn reset_project(
     *project_state.arrangement.borrow_mut() = None;
     project_state.audio_clips.borrow_mut().clear();
     project_state.scenes.borrow_mut().clear();
+    *project_state.scene_launch_state.borrow_mut() = None;
     ui.set_transport_extent_bounded(false);
     ui.set_transport_seek_available(false);
     ui.set_transport_progress_percent(0.0);
@@ -4928,23 +4931,69 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
     }
 }
 
-fn scene_rows(scenes: &[IdeScene]) -> Vec<SceneRow> {
+fn scene_rows(
+    scenes: &[IdeScene],
+    launch_state: Option<IdeSceneLaunchState>,
+    sample_rate_hz: u32,
+) -> Vec<SceneRow> {
     scenes
         .iter()
         .enumerate()
         .map(|(index, scene)| {
             let (availability, launchable) = scene_availability_presentation(scene.availability());
+            let (queued_scene_index, queued_launch_frame, current_scene_index) = launch_state
+                .map_or((None, None, None), |state| {
+                    (
+                        state.queued_scene_index(),
+                        state.queued_launch_frame(),
+                        state.last_launched_scene_index(),
+                    )
+                });
+            let (queued, current, runtime_state) = scene_runtime_presentation(
+                index,
+                queued_scene_index,
+                queued_launch_frame,
+                current_scene_index,
+                sample_rate_hz,
+            );
             SceneRow {
                 index: i32::try_from(index).unwrap_or(-1),
                 id: scene.id().into(),
                 name: scene.name().into(),
                 display_name: scene_display_name(scene.name()).into(),
                 availability: availability.into(),
+                runtime_state: runtime_state.into(),
                 active: scene.active(),
                 launchable,
+                queued,
+                current,
             }
         })
         .collect()
+}
+
+fn scene_runtime_presentation(
+    scene_index: usize,
+    queued_scene_index: Option<usize>,
+    queued_launch_frame: Option<usize>,
+    current_scene_index: Option<usize>,
+    sample_rate_hz: u32,
+) -> (bool, bool, String) {
+    let queued = queued_scene_index == Some(scene_index);
+    let current = current_scene_index == Some(scene_index);
+    let runtime_state = match (queued, current, queued_launch_frame) {
+        (true, true, Some(frame)) => format!(
+            "Current · queued for {}",
+            format_transport_clock(u64::try_from(frame).unwrap_or(u64::MAX), sample_rate_hz)
+        ),
+        (true, false, Some(frame)) => format!(
+            "Queued for {}",
+            format_transport_clock(u64::try_from(frame).unwrap_or(u64::MAX), sample_rate_hz)
+        ),
+        (false, true, _) => "Current".to_owned(),
+        _ => String::new(),
+    };
+    (queued, current, runtime_state)
 }
 
 fn next_scene_name(scenes: &[IdeScene]) -> String {
@@ -5458,13 +5507,50 @@ fn pan_percent_to_millionths(percent: f32) -> Result<i32, MixerControlFailure> {
     Ok((percent * 10_000.0).round() as i32)
 }
 
-fn set_scenes(ui: &MainWindow, project_state: &ProjectUiStateCell, scenes: &[IdeScene]) -> bool {
-    let unchanged = project_state.scenes.borrow().as_slice() == scenes;
-    if !unchanged {
-        ui.set_scenes(ModelRc::from(Rc::new(VecModel::from(scene_rows(scenes)))));
+fn set_scenes(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    scenes: &[IdeScene],
+    observed_launch_state: Option<IdeSceneLaunchState>,
+    sample_rate_hz: u32,
+) -> bool {
+    let scenes_changed = project_state.scenes.borrow().as_slice() != scenes;
+    let launch_state_changed = if let Some(observed) = observed_launch_state {
+        let changed = *project_state.scene_launch_state.borrow() != Some(observed);
+        *project_state.scene_launch_state.borrow_mut() = Some(observed);
+        changed
+    } else if scenes_changed {
+        project_state
+            .scene_launch_state
+            .borrow_mut()
+            .take()
+            .is_some()
+    } else {
+        false
+    };
+    if scenes_changed || launch_state_changed {
+        ui.set_scenes(ModelRc::from(Rc::new(VecModel::from(scene_rows(
+            scenes,
+            *project_state.scene_launch_state.borrow(),
+            sample_rate_hz,
+        )))));
         *project_state.scenes.borrow_mut() = scenes.to_vec();
     }
-    !unchanged
+    scenes_changed
+}
+
+fn set_observed_scenes(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    observation: &IdeRunningObservation,
+) -> bool {
+    set_scenes(
+        ui,
+        project_state,
+        observation.scenes(),
+        observation.scene_launch_state(),
+        observation.sample_rate_hz(),
+    )
 }
 
 fn mixer_rows(channels: &[IdeMixerChannel]) -> Vec<MixerChannelRow> {
@@ -6003,6 +6089,26 @@ mod tests {
     }
 
     #[test]
+    fn scene_runtime_presentation_distinguishes_queued_and_current_state() {
+        assert_eq!(
+            scene_runtime_presentation(1, Some(1), Some(48_000), Some(0), 48_000),
+            (true, false, "Queued for 00:00:01.000".to_owned())
+        );
+        assert_eq!(
+            scene_runtime_presentation(0, Some(0), Some(96_000), Some(0), 48_000),
+            (true, true, "Current · queued for 00:00:02.000".to_owned())
+        );
+        assert_eq!(
+            scene_runtime_presentation(2, None, None, Some(2), 48_000),
+            (false, true, "Current".to_owned())
+        );
+        assert_eq!(
+            scene_runtime_presentation(3, None, None, None, 48_000),
+            (false, false, String::new())
+        );
+    }
+
+    #[test]
     fn scene_display_names_are_unicode_safe_and_bounded() {
         assert_eq!(scene_display_name("Verse"), "Verse");
         let display = scene_display_name("Ambient interlude with instruments");
@@ -6022,8 +6128,11 @@ mod tests {
                 name: "Verse".into(),
                 display_name: "Verse".into(),
                 availability: "Ready".into(),
+                runtime_state: "".into(),
                 active: true,
                 launchable: true,
+                queued: false,
+                current: false,
             },
             SceneRow {
                 index: 1,
@@ -6031,8 +6140,11 @@ mod tests {
                 name: "Break".into(),
                 display_name: "Break".into(),
                 availability: "Disabled".into(),
+                runtime_state: "".into(),
                 active: false,
                 launchable: false,
+                queued: false,
+                current: false,
             },
         ])));
 
