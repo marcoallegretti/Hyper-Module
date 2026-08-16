@@ -12601,6 +12601,308 @@ mod tests {
         ));
     }
 
+    const AUTOMATION_GROUP_TRACK: &[u8] = br#"{
+        "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334471",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Group","kind":"group","order":1,
+        "active":true,"clip_ids":[],"extensions":{}
+    }"#;
+    const AUTOMATION_RETURN_TRACK: &[u8] = br#"{
+        "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334472",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Return","kind":"return","order":2,
+        "active":true,"clip_ids":[],"extensions":{}
+    }"#;
+    const AUTOMATION_SEND_MIXER: &[u8] = br#"{
+        "format":"hyper-mixer","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334468",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122334455",
+        "channels":[
+            {
+                "track_id":"018f47a2-6b2d-7c11-8a44-001122334456","gain_millionths":1000000,
+                "pan_millionths":0,"mute":false,"solo":false,
+                "destination":{"kind":"track","track_id":"018f47a2-6b2d-7c11-8a44-001122334471"},
+                "sends":[{
+                    "id":"018f47a2-6b2d-7c11-8a44-001122334469","bus":"a","tap":"post-fader",
+                    "gain_millionths":1000000,"pan_millionths":0,
+                    "enabled":true
+                }]
+            },
+            {
+                "track_id":"018f47a2-6b2d-7c11-8a44-001122334471","gain_millionths":1000000,
+                "pan_millionths":0,"mute":false,"solo":false,
+                "destination":{"kind":"main"},"sends":[]
+            },
+            {
+                "track_id":"018f47a2-6b2d-7c11-8a44-001122334472","gain_millionths":1000000,
+                "pan_millionths":0,"mute":false,"solo":false,
+                "destination":{"kind":"main"},"sends":[]
+            }
+        ],
+        "return_buses":[{"bus":"a","track_id":"018f47a2-6b2d-7c11-8a44-001122334472"}],
+        "main":{"gain_millionths":1000000,"mute":false},
+        "cue":{"source":"main","gain_millionths":1000000,"mute":false},
+        "extensions":{}
+    }"#;
+
+    fn automation_send_project() -> (LoadedPlaybackProject, LoadedMixer) {
+        let tracks: [&[u8]; 3] = [TRACK, AUTOMATION_GROUP_TRACK, AUTOMATION_RETURN_TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer = loaded
+            .load_mixer(AUTOMATION_SEND_MIXER, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+        (loaded, mixer)
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one table keeps every serialized target parameter and its resolved target together"
+    )]
+    fn automation_take_addition_round_trips_every_target_parameter() {
+        const TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334456";
+        const SEND_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let (loaded, mixer) = automation_send_project();
+        let unit = [
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(4, AutomationValue::Integer(0)),
+        ];
+        let pan = [
+            AutomationPoint::new(0, AutomationValue::Integer(-1_000_000)),
+            AutomationPoint::new(4, AutomationValue::Integer(1_000_000)),
+        ];
+        let switch = [
+            AutomationPoint::new(0, AutomationValue::Boolean(false)),
+            AutomationPoint::new(4, AutomationValue::Boolean(true)),
+        ];
+        let cases: [(AutomationTargetSelection<'_>, &[AutomationPoint], AutomationTarget); 9] = [
+            (
+                AutomationTargetSelection::Main {
+                    parameter: AutomationMainParameter::Gain,
+                },
+                &unit,
+                AutomationTarget::Main {
+                    parameter: AutomationMainParameter::Gain,
+                },
+            ),
+            (
+                AutomationTargetSelection::Main {
+                    parameter: AutomationMainParameter::Mute,
+                },
+                &switch,
+                AutomationTarget::Main {
+                    parameter: AutomationMainParameter::Mute,
+                },
+            ),
+            (
+                AutomationTargetSelection::Channel {
+                    track_id: TRACK_ID,
+                    parameter: AutomationChannelParameter::Gain,
+                },
+                &unit,
+                AutomationTarget::Channel {
+                    slot: 0,
+                    parameter: AutomationChannelParameter::Gain,
+                },
+            ),
+            (
+                AutomationTargetSelection::Channel {
+                    track_id: TRACK_ID,
+                    parameter: AutomationChannelParameter::Pan,
+                },
+                &pan,
+                AutomationTarget::Channel {
+                    slot: 0,
+                    parameter: AutomationChannelParameter::Pan,
+                },
+            ),
+            (
+                AutomationTargetSelection::Channel {
+                    track_id: TRACK_ID,
+                    parameter: AutomationChannelParameter::Mute,
+                },
+                &switch,
+                AutomationTarget::Channel {
+                    slot: 0,
+                    parameter: AutomationChannelParameter::Mute,
+                },
+            ),
+            (
+                AutomationTargetSelection::Channel {
+                    track_id: TRACK_ID,
+                    parameter: AutomationChannelParameter::Solo,
+                },
+                &switch,
+                AutomationTarget::Channel {
+                    slot: 0,
+                    parameter: AutomationChannelParameter::Solo,
+                },
+            ),
+            (
+                AutomationTargetSelection::Send {
+                    send_id: SEND_ID,
+                    parameter: AutomationSendParameter::Gain,
+                },
+                &unit,
+                AutomationTarget::Send {
+                    slot: 0,
+                    send: 0,
+                    parameter: AutomationSendParameter::Gain,
+                },
+            ),
+            (
+                AutomationTargetSelection::Send {
+                    send_id: SEND_ID,
+                    parameter: AutomationSendParameter::Pan,
+                },
+                &pan,
+                AutomationTarget::Send {
+                    slot: 0,
+                    send: 0,
+                    parameter: AutomationSendParameter::Pan,
+                },
+            ),
+            (
+                AutomationTargetSelection::Send {
+                    send_id: SEND_ID,
+                    parameter: AutomationSendParameter::Enabled,
+                },
+                &switch,
+                AutomationTarget::Send {
+                    slot: 0,
+                    send: 0,
+                    parameter: AutomationSendParameter::Enabled,
+                },
+            ),
+        ];
+        for (selection, points, expected) in cases {
+            let boolean = matches!(points[0].value(), AutomationValue::Boolean(_));
+            let document = serialize_automation_take_addition(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[],
+                AutomationTakeAddition {
+                    take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                    lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a1",
+                    name: "Pass",
+                    captured_at_utc: "2026-08-16T09:30:00.000Z",
+                    start_tick: 0,
+                    end_tick: 8,
+                    target: selection,
+                    interpolation: if boolean {
+                        AutomationInterpolation::Hold
+                    } else {
+                        AutomationInterpolation::Linear
+                    },
+                    points,
+                },
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap_or_else(|error| panic!("{expected:?}: {error}"));
+            let reloaded = loaded
+                .load_automation_takes(
+                    &mixer,
+                    &asset_facts(),
+                    &[&document],
+                    LoaderLimits::VERSION_1,
+                )
+                .unwrap();
+            assert_eq!(reloaded.takes()[0].lanes()[0].target(), expected);
+            assert_eq!(reloaded.takes()[0].lanes()[0].points(), points);
+        }
+    }
+
+    #[test]
+    fn automation_take_activation_rewrites_the_addressed_take_at_any_index() {
+        let (loaded, mixer) = automation_send_project();
+        let mut documents: Vec<Vec<u8>> = Vec::new();
+        for (index, (take, lane)) in [
+            (
+                "018f47a2-6b2d-7c11-8a44-0011223344b0",
+                "018f47a2-6b2d-7c11-8a44-0011223344b1",
+            ),
+            (
+                "018f47a2-6b2d-7c11-8a44-0011223344b2",
+                "018f47a2-6b2d-7c11-8a44-0011223344b3",
+            ),
+            (
+                "018f47a2-6b2d-7c11-8a44-0011223344b4",
+                "018f47a2-6b2d-7c11-8a44-0011223344b5",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let start = index as u64 * 8;
+            let points = [AutomationPoint::new(
+                start,
+                AutomationValue::Integer(i32::try_from(index).unwrap() * 100),
+            )];
+            let existing: Vec<&[u8]> = documents.iter().map(Vec::as_slice).collect();
+            documents.push(
+                serialize_automation_take_addition(
+                    &loaded,
+                    &mixer,
+                    &asset_facts(),
+                    &existing,
+                    AutomationTakeAddition {
+                        take_id: take,
+                        lane_id: lane,
+                        name: "Pass",
+                        captured_at_utc: "2026-08-16T09:30:00.000Z",
+                        start_tick: start,
+                        end_tick: start + 8,
+                        target: AutomationTargetSelection::Main {
+                            parameter: AutomationMainParameter::Gain,
+                        },
+                        interpolation: AutomationInterpolation::Hold,
+                        points: &points,
+                    },
+                    LoaderLimits::VERSION_1,
+                )
+                .unwrap(),
+            );
+        }
+        let references: Vec<&[u8]> = documents.iter().map(Vec::as_slice).collect();
+
+        let rewritten = serialize_automation_take_activation(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &references,
+            "018f47a2-6b2d-7c11-8a44-0011223344b2",
+            false,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let rewritten_value: Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(
+            rewritten_value["id"].as_str(),
+            Some("018f47a2-6b2d-7c11-8a44-0011223344b2")
+        );
+        assert_eq!(rewritten_value["start_tick"].as_u64(), Some(8));
+        assert_eq!(rewritten_value["enabled"].as_bool(), Some(false));
+
+        let candidate: [&[u8]; 3] = [&documents[0], &rewritten, &documents[2]];
+        let reloaded = loaded
+            .load_automation_takes(&mixer, &asset_facts(), &candidate, LoaderLimits::VERSION_1)
+            .unwrap();
+        let enabled: Vec<bool> = reloaded.takes().iter().map(AutomationTake::enabled).collect();
+        assert_eq!(enabled, vec![true, false, true]);
+        let identities: Vec<&str> = reloaded.takes().iter().map(AutomationTake::id).collect();
+        assert_eq!(
+            identities,
+            vec![
+                "018f47a2-6b2d-7c11-8a44-0011223344b0",
+                "018f47a2-6b2d-7c11-8a44-0011223344b2",
+                "018f47a2-6b2d-7c11-8a44-0011223344b4",
+            ]
+        );
+    }
+
     type AutomationRejectionCheck = fn(&AutomationTakeAdditionSerializationError) -> bool;
 
     fn automation_take_request(points: &[AutomationPoint]) -> AutomationTakeAddition<'_> {

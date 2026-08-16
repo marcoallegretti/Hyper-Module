@@ -757,7 +757,6 @@ pub fn serialize_automation_take_addition(
 pub enum AutomationTakeEditSerializationError {
     TakeMissing,
     NonCanonicalSource,
-    InvalidDocumentShape,
     Source(LoadError),
     Serialization(serde_json::Error),
     MixerCompilation(MixerCompileError),
@@ -772,9 +771,6 @@ impl fmt::Display for AutomationTakeEditSerializationError {
             }
             Self::NonCanonicalSource => {
                 formatter.write_str("the source automation take is not canonical")
-            }
-            Self::InvalidDocumentShape => {
-                formatter.write_str("the automation take document is not a JSON object")
             }
             Self::Source(source) => source.fmt(formatter),
             Self::Serialization(source) => source.fmt(formatter),
@@ -791,23 +787,25 @@ impl Error for AutomationTakeEditSerializationError {
             Self::Serialization(source) => Some(source),
             Self::MixerCompilation(source) => Some(source),
             Self::AutomationCompilation(source) => Some(source),
-            Self::TakeMissing | Self::NonCanonicalSource | Self::InvalidDocumentShape => None,
+            Self::TakeMissing | Self::NonCanonicalSource => None,
         }
     }
 }
 
 /// Rewrites one existing automation take with a new `enabled` flag.
 ///
-/// `takes` must be the project's complete canonical automation set in manifest
-/// order. The rewrite is accepted only after the complete candidate set reloads
-/// without an enabled-interval overlap and compiles against the committed
-/// mixer graph.
+/// `takes` must be the project's complete canonical automation set, in the same
+/// order the loader will observe. The rewritten document is confirmed to carry
+/// `take_id` before it is edited, so a loader that ever reordered its output
+/// could not redirect this rewrite to another take. The result is accepted only
+/// after the complete candidate set reloads without an enabled-interval overlap
+/// and compiles against the committed mixer graph.
 ///
 /// # Errors
 ///
-/// Returns a classified rejection for a missing take, noncanonical source
-/// bytes, an unexpected document shape, a candidate set the loader rejects, or
-/// a candidate set that cannot compile.
+/// Returns a classified rejection for a missing or misaddressed take,
+/// noncanonical source bytes, a candidate set the loader rejects, or a
+/// candidate set that cannot compile.
 pub fn serialize_automation_take_activation(
     project: &LoadedPlaybackProject,
     mixer: &LoadedMixer,
@@ -833,10 +831,13 @@ pub fn serialize_automation_take_activation(
     if canonical_source != source {
         return Err(AutomationTakeEditSerializationError::NonCanonicalSource);
     }
-    value
+    let document = value
         .as_object_mut()
-        .ok_or(AutomationTakeEditSerializationError::InvalidDocumentShape)?
-        .insert("enabled".to_owned(), enabled.into());
+        .ok_or(AutomationTakeEditSerializationError::TakeMissing)?;
+    if document.get("id").and_then(Value::as_str) != Some(take_id) {
+        return Err(AutomationTakeEditSerializationError::TakeMissing);
+    }
+    document.insert("enabled".to_owned(), enabled.into());
     let output = serde_json_canonicalizer::to_vec(&value)
         .map_err(AutomationTakeEditSerializationError::Serialization)?;
     let mut documents = Vec::new();
