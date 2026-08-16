@@ -534,3 +534,110 @@ fn a_live_mixer_override_changes_the_render_and_must_match_the_prepared_layout()
     );
 
 }
+
+const GROUP_TRACK: &[u8] = br#"{
+    "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-00112233750a",
+    "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Group","kind":"group","order":1,
+    "active":true,"clip_ids":[],"extensions":{}
+}"#;
+const RETURN_TRACK: &[u8] = br#"{
+    "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-00112233750b",
+    "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Return","kind":"return","order":2,
+    "active":true,"clip_ids":[],"extensions":{}
+}"#;
+const ROUTED_MIXER: &[u8] = br#"{
+    "format":"hyper-mixer","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337507",
+    "project_id":"018f47a2-6b2d-7c11-8a44-001122337500",
+    "channels":[
+        {
+            "track_id":"018f47a2-6b2d-7c11-8a44-001122337502","gain_millionths":700000,
+            "pan_millionths":-400000,"mute":false,"solo":false,
+            "destination":{"kind":"track","track_id":"018f47a2-6b2d-7c11-8a44-00112233750a"},
+            "sends":[{
+                "id":"018f47a2-6b2d-7c11-8a44-00112233750c","bus":"a","tap":"post-fader",
+                "gain_millionths":800000,"pan_millionths":300000,"enabled":true
+            }]
+        },
+        {
+            "track_id":"018f47a2-6b2d-7c11-8a44-00112233750a","gain_millionths":900000,
+            "pan_millionths":200000,"mute":false,"solo":false,
+            "destination":{"kind":"main"},"sends":[]
+        },
+        {
+            "track_id":"018f47a2-6b2d-7c11-8a44-00112233750b","gain_millionths":600000,
+            "pan_millionths":-200000,"mute":false,"solo":false,
+            "destination":{"kind":"main"},"sends":[]
+        }
+    ],
+    "return_buses":[{"bus":"a","track_id":"018f47a2-6b2d-7c11-8a44-00112233750b"}],
+    "main":{"gain_millionths":900000,"mute":false},
+    "cue":{"source":"main","gain_millionths":1000000,"mute":false},
+    "extensions":{}
+}"#;
+
+/// A group destination, a post-fader send, and a return bus — three of the
+/// things ADR-117 cites when it rejects the flat aligned-source renderer.
+fn routed_session() -> PreparedPlaybackSession {
+    assemble_playback_session(PlaybackSessionAssemblyInput {
+        documents: PlaybackDocumentBytes {
+            project_id: PROJECT_ID.to_owned(),
+            sample_rate_hz: 48_000,
+            timeline: TIMELINE.to_vec(),
+            tracks: vec![TRACK.to_vec(), GROUP_TRACK.to_vec(), RETURN_TRACK.to_vec()],
+            clips: vec![CLIP.to_vec()],
+            scenes: Vec::new(),
+            arrangement: Some(ARRANGEMENT.to_vec()),
+            mixer: ROUTED_MIXER.to_vec(),
+            automation_takes: Vec::new(),
+        },
+        decoded_assets: vec![DecodedPlaybackAsset::new(
+            "018f47a2-6b2d-7c11-8a44-001122337504".to_owned(),
+            DecodedAudio::from_mono(48_000, (0..100_i16).map(|n| f32::from(n) / 200.0).collect())
+                .unwrap(),
+        )],
+        limits: PlaybackSessionAssemblyLimits {
+            documents: LoaderLimits::VERSION_1,
+            media_cache: CacheLimits {
+                max_assets: 2,
+                max_frames_per_asset: 100,
+                max_decoded_sample_bytes: 800,
+            },
+        },
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_grouped_and_sent_project_exports_exactly_as_it_plays() {
+    let session = routed_session();
+    assert_eq!(
+        session.parts().1.slots().len(),
+        3,
+        "the fixture exercises more than one mixer slot"
+    );
+
+    let rendered = render_project_offline(&session, OfflineExportSpec { block_frames: 32 }).unwrap();
+    let expected = render_through_playback(&session, 32);
+    let left = rendered.plane(0).unwrap();
+    let right = rendered.plane(1).unwrap();
+    for (index, (expected_left, expected_right)) in expected.iter().take(100).enumerate() {
+        assert!(
+            (left[index] - expected_left).abs() < f32::EPSILON,
+            "left frame {index}: export {} playback {expected_left}",
+            left[index]
+        );
+        assert!(
+            (right[index] - expected_right).abs() < f32::EPSILON,
+            "right frame {index}: export {} playback {expected_right}",
+            right[index]
+        );
+    }
+    assert!(
+        left.iter().any(|sample| sample.abs() > 0.0),
+        "the routed graph reaches the main output"
+    );
+    assert!(
+        left.iter().zip(right.iter()).any(|(l, r)| (l - r).abs() > f32::EPSILON),
+        "the send pan and channel pan distinguish the channels"
+    );
+}

@@ -11279,6 +11279,44 @@ mod tests {
     }
 
     #[test]
+    fn export_reports_its_own_command_and_refuses_without_a_prepared_project() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                ..
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::ExportProject {
+                wav_path: std::path::PathBuf::from("export.wav"),
+                block_frames: 1_024,
+            })
+            .unwrap();
+        assert!(
+            matches!(recv(&worker), IdeWorkerEvent::ProjectExporting),
+            "the export announces itself before doing blocking work"
+        );
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ExportProject,
+                reason: IdeWorkerCommandFailure::ProjectExport(reason),
+            } if matches!(reason.as_ref(), IdeProjectExportError::ProjectSnapshotUnavailable)
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
     fn control_mapping_edit_validates_identity_and_waits_for_the_mixer_fence() {
         let running = RunningDesktopIdeApplication {
             application: closed_application(),

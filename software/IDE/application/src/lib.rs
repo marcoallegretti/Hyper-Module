@@ -11148,6 +11148,27 @@ mod tests {
     }
 
     #[test]
+    fn the_export_journal_never_collides_with_its_destination() {
+        let wav = Path::new("C:/Renders/night drive.wav");
+        let journal = export_journal_path(wav).unwrap();
+        assert_eq!(journal.parent(), wav.parent(), "staging sits beside the file");
+        assert_ne!(journal, wav.to_path_buf());
+        assert_eq!(
+            journal.file_name().unwrap().to_str().unwrap(),
+            "night drive.wav.export-journal"
+        );
+
+        // A destination already named like a journal must not be overwritten by
+        // its own staging file.
+        let awkward = Path::new("C:/Renders/take.export-journal");
+        let staged = export_journal_path(awkward).unwrap();
+        assert_ne!(staged, awkward.to_path_buf());
+
+        // A path with no file name has nowhere to stage.
+        assert!(export_journal_path(Path::new("C:/")).is_none());
+    }
+
+    #[test]
     fn control_binding_insertion_publishes_and_compiles_into_the_runtime() {
         let fixture = ArrangementProjectFixture::with_two_scenes();
         let project_path = fixture.root().to_path_buf();
