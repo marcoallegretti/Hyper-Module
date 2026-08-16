@@ -17,6 +17,7 @@ export enum AppMode {
     adding-arrangement-placement,
     adding-arrangement-scene-launch,
     moving-arrangement-scene-launch,
+    changing-arrangement-scene-launch-scene,
     removing-arrangement-scene-launch,
     duplicating-arrangement-placement,
     splitting-arrangement-placement,
@@ -124,7 +125,10 @@ export struct ArrangementRow {
 }
 
 export struct ArrangementSceneLaunchRow {
+    index: int,
     id: string,
+    scene-index: int,
+    scene-id: string,
     scene-name: string,
     tick: string,
 }
@@ -175,6 +179,8 @@ export global IdeActions {
     callback add-arrangement-placement(string, string);
     callback add-arrangement-scene-launch(string, string);
     callback move-arrangement-scene-launch(string, string);
+    callback locate-arrangement-scene-launch(int, string, bool);
+    callback set-arrangement-scene-launch-scene(string, int);
     callback remove-arrangement-scene-launch(string);
     callback duplicate-arrangement-placement(string, string);
     callback split-arrangement-placement(string, string);
@@ -366,6 +372,13 @@ export component MainWindow inherits Window {
     in-out property <string> move-arrangement-scene-launch-name: "";
     in-out property <string> move-arrangement-scene-launch-original-tick: "";
     in-out property <string> move-arrangement-scene-launch-tick: "";
+    in-out property <bool> set-arrangement-scene-launch-scene-visible: false;
+    in-out property <string> set-arrangement-scene-launch-scene-id: "";
+    in-out property <string> set-arrangement-scene-launch-scene-name: "";
+    in-out property <string> set-arrangement-scene-launch-scene-current-id: "";
+    in-out property <int> set-arrangement-scene-launch-scene-current-index: -1;
+    in-out property <string> set-arrangement-scene-launch-scene-tick: "";
+    in-out property <int> set-arrangement-scene-launch-scene-target-index: -1;
     in-out property <bool> remove-arrangement-scene-launch-visible: false;
     in-out property <string> remove-arrangement-scene-launch-id: "";
     in-out property <string> remove-arrangement-scene-launch-name: "";
@@ -373,6 +386,7 @@ export component MainWindow inherits Window {
     private property <bool> arrangement-scene-launch-form-visible:
         root.add-arrangement-scene-launch-visible
         || root.move-arrangement-scene-launch-visible
+        || root.set-arrangement-scene-launch-scene-visible
         || root.remove-arrangement-scene-launch-visible;
     in-out property <bool> remove-arrangement-placement-visible: false;
     in-out property <string> remove-arrangement-placement-id: "";
@@ -454,6 +468,7 @@ export component MainWindow inherits Window {
     in property <[TakeRow]> recording-takes: [];
     in property <[ArrangementRow]> arrangement-placements: [];
     in property <[ArrangementSceneLaunchRow]> arrangement-scene-launches: [];
+    in property <[string]> scene-names: [];
     in property <[ClipRow]> audio-clips: [];
     in property <string> arrangement-span-clock: "—";
     in property <bool> preview-active: false;
@@ -535,6 +550,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.adding-arrangement-placement ? "◌  PLACING CLIP"
                         : root.app-mode == AppMode.adding-arrangement-scene-launch ? "◌  ADDING SCENE MARKER"
                         : root.app-mode == AppMode.moving-arrangement-scene-launch ? "◌  MOVING SCENE MARKER"
+                        : root.app-mode == AppMode.changing-arrangement-scene-launch-scene ? "◌  CHANGING SCENE"
                         : root.app-mode == AppMode.removing-arrangement-scene-launch ? "◌  REMOVING SCENE MARKER"
                         : root.app-mode == AppMode.duplicating-arrangement-placement ? "◌  COPYING PLACEMENT"
                         : root.app-mode == AppMode.changing-arrangement-activation ? "◌  UPDATING CLIP"
@@ -997,6 +1013,7 @@ export component MainWindow inherits Window {
                                         clicked => {
                                             root.remove-arrangement-placement-visible = false;
                                             root.move-arrangement-scene-launch-visible = false;
+                                            root.set-arrangement-scene-launch-scene-visible = false;
                                             root.remove-arrangement-scene-launch-visible = false;
                                             root.add-arrangement-scene-launch-id = scene.id;
                                             root.add-arrangement-scene-launch-name = scene.name;
@@ -1890,6 +1907,62 @@ export component MainWindow inherits Window {
                             Rectangle { vertical-stretch: 1; background: transparent; }
                         }
 
+                        if root.set-arrangement-scene-launch-scene-visible : VerticalLayout {
+                            vertical-stretch: 1;
+                            spacing: 14px;
+                            Text { text: "CHANGE MARKER SCENE"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            Text { text: root.set-arrangement-scene-launch-scene-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                            Text { text: "Project tick " + root.set-arrangement-scene-launch-scene-tick; color: #8fa0b4; font-size: 12px; }
+                            Text {
+                                text: "Change which scene this durable marker launches. Its identity and exact project tick remain unchanged.";
+                                color: #aebccc;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                            GridLayout {
+                                spacing: 8px;
+                                Text { row: 0; col: 0; text: "Scene"; color: #8fa0b4; vertical-alignment: center; }
+                                ComboBox {
+                                    row: 0; col: 1;
+                                    model: root.scene-names;
+                                    current-index <=> root.set-arrangement-scene-launch-scene-target-index;
+                                    accessible-label: "Replacement scene for marker at tick " + root.set-arrangement-scene-launch-scene-tick;
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Button {
+                                    text: "Cancel";
+                                    enabled: root.app-mode == AppMode.running;
+                                    clicked => {
+                                        root.set-arrangement-scene-launch-scene-visible = false;
+                                        root.set-arrangement-scene-launch-scene-id = "";
+                                        root.set-arrangement-scene-launch-scene-name = "";
+                                        root.set-arrangement-scene-launch-scene-current-id = "";
+                                        root.set-arrangement-scene-launch-scene-current-index = -1;
+                                        root.set-arrangement-scene-launch-scene-tick = "";
+                                        root.set-arrangement-scene-launch-scene-target-index = -1;
+                                    }
+                                }
+                                Button {
+                                    horizontal-stretch: 1;
+                                    text: root.app-mode == AppMode.changing-arrangement-scene-launch-scene ? "Changing scene..." : "Change scene";
+                                    enabled: root.app-mode == AppMode.running
+                                        && root.set-arrangement-scene-launch-scene-id != ""
+                                        && root.set-arrangement-scene-launch-scene-target-index >= 0
+                                        && root.set-arrangement-scene-launch-scene-target-index < root.scene-names.length
+                                        && root.set-arrangement-scene-launch-scene-target-index != root.set-arrangement-scene-launch-scene-current-index;
+                                    clicked => {
+                                        IdeActions.set-arrangement-scene-launch-scene(
+                                            root.set-arrangement-scene-launch-scene-id,
+                                            root.set-arrangement-scene-launch-scene-target-index
+                                        );
+                                    }
+                                }
+                            }
+                            Rectangle { vertical-stretch: 1; background: transparent; }
+                        }
+
                         if root.remove-arrangement-scene-launch-visible : VerticalLayout {
                             vertical-stretch: 1;
                             spacing: 14px;
@@ -1998,6 +2071,39 @@ export component MainWindow inherits Window {
                                     Text { text: marker.scene-name; color: #dce5ef; font-size: 11px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
                                     Text { text: "TICK " + marker.tick; color: #e7b96d; font-size: 10px; vertical-alignment: center; }
                                     Button {
+                                        width: 54px;
+                                        text: "Locate";
+                                        accessible-label: "Locate " + marker.scene-name + " scene marker at tick " + marker.tick;
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => { IdeActions.locate-arrangement-scene-launch(marker.index, marker.id, false); }
+                                    }
+                                    Button {
+                                        width: 48px;
+                                        text: "Play";
+                                        accessible-label: "Play from " + marker.scene-name + " scene marker at tick " + marker.tick;
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => { IdeActions.locate-arrangement-scene-launch(marker.index, marker.id, true); }
+                                    }
+                                    Button {
+                                        width: 54px;
+                                        text: "Scene";
+                                        accessible-label: "Change scene for " + marker.scene-name + " marker at tick " + marker.tick;
+                                        enabled: root.app-mode == AppMode.running && root.scenes.length > 1;
+                                        clicked => {
+                                            root.remove-arrangement-placement-visible = false;
+                                            root.add-arrangement-scene-launch-visible = false;
+                                            root.move-arrangement-scene-launch-visible = false;
+                                            root.remove-arrangement-scene-launch-visible = false;
+                                            root.set-arrangement-scene-launch-scene-id = marker.id;
+                                            root.set-arrangement-scene-launch-scene-name = marker.scene-name;
+                                            root.set-arrangement-scene-launch-scene-current-id = marker.scene-id;
+                                            root.set-arrangement-scene-launch-scene-current-index = marker.scene-index;
+                                            root.set-arrangement-scene-launch-scene-tick = marker.tick;
+                                            root.set-arrangement-scene-launch-scene-target-index = marker.scene-index;
+                                            root.set-arrangement-scene-launch-scene-visible = true;
+                                        }
+                                    }
+                                    Button {
                                         width: 58px;
                                         text: "Move";
                                         accessible-label: "Move " + marker.scene-name + " scene marker from tick " + marker.tick;
@@ -2005,6 +2111,7 @@ export component MainWindow inherits Window {
                                         clicked => {
                                             root.remove-arrangement-placement-visible = false;
                                             root.add-arrangement-scene-launch-visible = false;
+                                            root.set-arrangement-scene-launch-scene-visible = false;
                                             root.remove-arrangement-scene-launch-visible = false;
                                             root.move-arrangement-scene-launch-id = marker.id;
                                             root.move-arrangement-scene-launch-name = marker.scene-name;
@@ -2022,6 +2129,7 @@ export component MainWindow inherits Window {
                                             root.remove-arrangement-placement-visible = false;
                                             root.add-arrangement-scene-launch-visible = false;
                                             root.move-arrangement-scene-launch-visible = false;
+                                            root.set-arrangement-scene-launch-scene-visible = false;
                                             root.remove-arrangement-scene-launch-id = marker.id;
                                             root.remove-arrangement-scene-launch-name = marker.scene-name;
                                             root.remove-arrangement-scene-launch-tick = marker.tick;
