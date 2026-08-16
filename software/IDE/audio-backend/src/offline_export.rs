@@ -2,7 +2,10 @@ use core::error::Error;
 use core::fmt;
 
 use hyper_arrangement_renderer::RenderScratchSlot;
-use hyper_audio_engine::StereoOutput;
+use hyper_audio_engine::{
+    StereoLoudnessError, StereoLoudnessMeter, StereoOutput, StereoTruePeakError,
+    StereoTruePeakMeter,
+};
 use hyper_audio_source::{DecodeError, DecodedAudio};
 use hyper_media_cache::PreparePlaybackError;
 use hyper_mixer_runtime::{
@@ -33,6 +36,8 @@ pub enum OfflineExportError {
     Process(RuntimeProcessError),
     Output(DecodeError),
     Journal(JournalError),
+    TruePeak(StereoTruePeakError),
+    Loudness(StereoLoudnessError),
     ShortRender { rendered: usize, expected: usize },
 }
 
@@ -55,6 +60,8 @@ impl fmt::Display for OfflineExportError {
             Self::Process(source) => source.fmt(formatter),
             Self::Output(source) => source.fmt(formatter),
             Self::Journal(source) => source.fmt(formatter),
+            Self::TruePeak(source) => source.fmt(formatter),
+            Self::Loudness(source) => source.fmt(formatter),
             Self::ShortRender { rendered, expected } => write!(
                 formatter,
                 "offline export produced {rendered} of {expected} frames"
@@ -72,6 +79,8 @@ impl Error for OfflineExportError {
             Self::Process(source) => Some(source),
             Self::Output(source) => Some(source),
             Self::Journal(source) => Some(source),
+            Self::TruePeak(source) => Some(source),
+            Self::Loudness(source) => Some(source),
             Self::UnboundedExtent
             | Self::EmptyExtent
             | Self::InvalidBlockFrames
@@ -209,13 +218,18 @@ pub struct OfflineExportReport {
     pub frame_count: usize,
     pub sample_rate_hz: u32,
     pub sample_peak: f32,
+    pub true_peak: f32,
+    pub integrated_lufs: Option<f32>,
 }
 
-/// Renders the project and publishes it as one float WAV.
+/// Renders the project, publishes it as one float WAV, and measures it.
 ///
 /// The audio is staged through the recording journal so publication reuses the
 /// proven durable path, including its recovery. The journal stores `f32`, so
 /// the published file carries the rendered samples without quantization.
+///
+/// Measurement runs the same 4x-oversampled true-peak and EBU loudness meters
+/// the live output uses, over the rendered audio in the same block order.
 ///
 /// # Errors
 ///
@@ -249,7 +263,13 @@ pub fn export_project_wav(
     interleaved
         .try_reserve_exact(spec.block_frames * 2)
         .map_err(|_| OfflineExportError::CapacityUnavailable)?;
+    let mut true_peak_meter =
+        StereoTruePeakMeter::try_new(sample_rate_hz).map_err(OfflineExportError::TruePeak)?;
+    let mut loudness_meter =
+        StereoLoudnessMeter::try_new(sample_rate_hz).map_err(OfflineExportError::Loudness)?;
+
     let mut sample_peak = 0.0_f32;
+    let mut true_peak = 0.0_f32;
     for start in (0..frame_count).step_by(spec.block_frames) {
         let end = (start + spec.block_frames).min(frame_count);
         interleaved.clear();
@@ -258,6 +278,14 @@ pub fn export_project_wav(
             interleaved.push(right[index]);
             sample_peak = sample_peak.max(left[index].abs()).max(right[index].abs());
         }
+        let block = true_peak_meter
+            .process(&left[start..end], &right[start..end])
+            .map_err(OfflineExportError::TruePeak)?;
+        let block_true_peak = block.left_linear().max(block.right_linear());
+        true_peak = true_peak.max(block_true_peak);
+        loudness_meter
+            .process(&left[start..end], &right[start..end], block_true_peak)
+            .map_err(OfflineExportError::Loudness)?;
         writer
             .append(&interleaved)
             .map_err(OfflineExportError::Journal)?;
@@ -270,5 +298,7 @@ pub fn export_project_wav(
         frame_count,
         sample_rate_hz,
         sample_peak,
+        true_peak,
+        integrated_lufs: loudness_meter.snapshot().integrated_lufs(),
     })
 }

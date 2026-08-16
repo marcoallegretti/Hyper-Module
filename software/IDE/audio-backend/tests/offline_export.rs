@@ -249,6 +249,54 @@ fn exported_wav_carries_the_rendered_samples_without_quantization() {
     assert_eq!(report.sample_rate_hz, 48_000);
     assert!(report.sample_peak > 0.0, "the export is not silent");
 
+    let expected_sample_peak = rendered
+        .plane(0)
+        .unwrap()
+        .iter()
+        .chain(rendered.plane(1).unwrap())
+        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    assert!(
+        (report.sample_peak - expected_sample_peak).abs() < f32::EPSILON,
+        "the reported sample peak is the rendered peak"
+    );
+    let mut reference_true_peak_meter =
+        hyper_audio_engine::StereoTruePeakMeter::try_new(48_000).unwrap();
+    let mut reference_loudness_meter =
+        hyper_audio_engine::StereoLoudnessMeter::try_new(48_000).unwrap();
+    let mut reference_true_peak = 0.0_f32;
+    let rendered_left = rendered.plane(0).unwrap();
+    let rendered_right = rendered.plane(1).unwrap();
+    for start in (0..rendered.frame_count()).step_by(32) {
+        let end = (start + 32).min(rendered.frame_count());
+        let block = reference_true_peak_meter
+            .process(&rendered_left[start..end], &rendered_right[start..end])
+            .unwrap();
+        let block_true_peak = block.left_linear().max(block.right_linear());
+        reference_true_peak = reference_true_peak.max(block_true_peak);
+        reference_loudness_meter
+            .process(
+                &rendered_left[start..end],
+                &rendered_right[start..end],
+                block_true_peak,
+            )
+            .unwrap();
+    }
+    assert!(
+        (report.true_peak - reference_true_peak).abs() < f32::EPSILON,
+        "the reported true peak is the oversampled meter's: report {} meter {}",
+        report.true_peak,
+        reference_true_peak
+    );
+    assert_eq!(
+        report.integrated_lufs,
+        reference_loudness_meter.snapshot().integrated_lufs(),
+        "the reported loudness is the running EBU meter's"
+    );
+    assert!(
+        report.integrated_lufs.is_none(),
+        "100 frames is far below the EBU 400 ms gate, so no integrated value exists yet"
+    );
+
     let published = std::fs::read(&wav).unwrap();
     assert_eq!(&published[0..4], b"RIFF");
     assert_eq!(&published[8..12], b"WAVE");
@@ -268,5 +316,107 @@ fn exported_wav_carries_the_rendered_samples_without_quantization() {
             "published plane {plane} differs from the rendered audio"
         );
     }
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+const LONG_CLIP: &[u8] = br#"{
+    "format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337503",
+    "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","track_id":"018f47a2-6b2d-7c11-8a44-001122337502","name":"Clip","enabled":true,
+    "duration_ticks":1920,
+    "source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122337504","start_frame":0,"frame_count":48000},
+    "loop":{"enabled":false,"start_tick":0,"end_tick":1920},
+    "playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},
+    "fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},
+    "warp_markers":[
+        {"tick":0,"source_frame_offset":0},
+        {"tick":1920,"source_frame_offset":48000}
+    ],
+    "extensions":{}
+}"#;
+const LONG_ARRANGEMENT: &[u8] = br#"{
+    "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337505",
+    "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Main","enabled":true,
+    "placements":[{
+        "id":"018f47a2-6b2d-7c11-8a44-001122337506","track_id":"018f47a2-6b2d-7c11-8a44-001122337502","clip_id":"018f47a2-6b2d-7c11-8a44-001122337503",
+        "start_tick":0,"clip_start_tick":0,"duration_ticks":1920,"enabled":true
+    }],
+    "scene_launches":[],"extensions":{}
+}"#;
+
+/// One second of steady tone, which clears the EBU 400 ms gate.
+fn long_session() -> PreparedPlaybackSession {
+    let samples: Vec<f32> = (0..48_000_i32)
+        .map(|n| (f32::from(i16::try_from(n % 480).unwrap()) / 480.0).mul_add(2.0, -1.0) * 0.5)
+        .collect();
+    assemble_playback_session(PlaybackSessionAssemblyInput {
+        documents: PlaybackDocumentBytes {
+            project_id: PROJECT_ID.to_owned(),
+            sample_rate_hz: 48_000,
+            timeline: TIMELINE.to_vec(),
+            tracks: vec![TRACK.to_vec()],
+            clips: vec![LONG_CLIP.to_vec()],
+            scenes: Vec::new(),
+            arrangement: Some(LONG_ARRANGEMENT.to_vec()),
+            mixer: MIXER.to_vec(),
+            automation_takes: Vec::new(),
+        },
+        decoded_assets: vec![DecodedPlaybackAsset::new(
+            "018f47a2-6b2d-7c11-8a44-001122337504".to_owned(),
+            DecodedAudio::from_mono(48_000, samples).unwrap(),
+        )],
+        limits: PlaybackSessionAssemblyLimits {
+            documents: LoaderLimits::VERSION_1,
+            media_cache: CacheLimits {
+                max_assets: 2,
+                max_frames_per_asset: 48_000,
+                max_decoded_sample_bytes: 400_000,
+            },
+        },
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_programme_past_the_gate_reports_integrated_loudness_and_a_true_peak() {
+    let session = long_session();
+    let spec = OfflineExportSpec { block_frames: 256 };
+    let directory = std::env::temp_dir().join(format!(
+        "hyper-offline-loudness-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+
+    let report = export_project_wav(
+        &session,
+        spec,
+        &directory.join("export.journal"),
+        &directory.join("export.wav"),
+    )
+    .unwrap();
+
+    assert_eq!(report.frame_count, 48_000);
+    assert_eq!(
+        hyper_audio_engine::StereoLoudnessMeter::try_new(48_000)
+            .unwrap()
+            .state(),
+        hyper_audio_engine::LoudnessMeasurementState::Running,
+        "the export relies on a new loudness meter measuring by default"
+    );
+    let integrated = report
+        .integrated_lufs
+        .expect("one second of tone clears the EBU 400 ms gate");
+    assert!(
+        (-70.0..0.0).contains(&integrated),
+        "integrated loudness is a plausible LUFS value: {integrated}"
+    );
+    assert!(report.true_peak > 0.0);
+    assert!(
+        report.true_peak >= report.sample_peak,
+        "true peak {} is not below sample peak {}",
+        report.true_peak,
+        report.sample_peak
+    );
     let _ = std::fs::remove_dir_all(&directory);
 }
