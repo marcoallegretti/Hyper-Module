@@ -13,6 +13,8 @@ use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
 use hyper_playback_json::AdapterCompileError;
 use hyper_playback_session::{PlaybackExtent, PreparedPlaybackSession};
+use hyper_recording_journal::{JournalConfig, JournalError, JournalWriter};
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OfflineExportSpec {
@@ -30,6 +32,7 @@ pub enum OfflineExportError {
     Runtime(RuntimeCreationError),
     Process(RuntimeProcessError),
     Output(DecodeError),
+    Journal(JournalError),
     ShortRender { rendered: usize, expected: usize },
 }
 
@@ -51,6 +54,7 @@ impl fmt::Display for OfflineExportError {
             Self::Runtime(source) => source.fmt(formatter),
             Self::Process(source) => source.fmt(formatter),
             Self::Output(source) => source.fmt(formatter),
+            Self::Journal(source) => source.fmt(formatter),
             Self::ShortRender { rendered, expected } => write!(
                 formatter,
                 "offline export produced {rendered} of {expected} frames"
@@ -67,6 +71,7 @@ impl Error for OfflineExportError {
             Self::Runtime(source) => Some(source),
             Self::Process(source) => Some(source),
             Self::Output(source) => Some(source),
+            Self::Journal(source) => Some(source),
             Self::UnboundedExtent
             | Self::EmptyExtent
             | Self::InvalidBlockFrames
@@ -195,4 +200,75 @@ fn allocate_silence(frames: usize) -> Result<Vec<f32>, OfflineExportError> {
         .map_err(|_| OfflineExportError::CapacityUnavailable)?;
     plane.resize(frames, 0.0);
     Ok(plane)
+}
+
+/// One rendered export written to disk, with the measurements the live meters
+/// would report for the same audio.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OfflineExportReport {
+    pub frame_count: usize,
+    pub sample_rate_hz: u32,
+    pub sample_peak: f32,
+}
+
+/// Renders the project and publishes it as one float WAV.
+///
+/// The audio is staged through the recording journal so publication reuses the
+/// proven durable path, including its recovery. The journal stores `f32`, so
+/// the published file carries the rendered samples without quantization.
+///
+/// # Errors
+///
+/// Returns a classified rejection for any render failure, or a journal
+/// staging, append, or publication failure.
+pub fn export_project_wav(
+    session: &PreparedPlaybackSession,
+    spec: OfflineExportSpec,
+    journal_path: &Path,
+    wav_path: &Path,
+) -> Result<OfflineExportReport, OfflineExportError> {
+    let rendered = render_project_offline(session, spec)?;
+    let frame_count = rendered.frame_count();
+    let sample_rate_hz = rendered.sample_rate_hz();
+    let left = rendered.plane(0).ok_or(OfflineExportError::EmptyExtent)?;
+    let right = rendered.plane(1).unwrap_or(left);
+
+    let max_chunk_frames = u32::try_from(spec.block_frames)
+        .map_err(|_| OfflineExportError::InvalidBlockFrames)?;
+    let mut writer = JournalWriter::create(
+        journal_path,
+        JournalConfig {
+            sample_rate: sample_rate_hz,
+            max_chunk_frames,
+            max_total_frames: frame_count as u64,
+        },
+    )
+    .map_err(OfflineExportError::Journal)?;
+
+    let mut interleaved = Vec::new();
+    interleaved
+        .try_reserve_exact(spec.block_frames * 2)
+        .map_err(|_| OfflineExportError::CapacityUnavailable)?;
+    let mut sample_peak = 0.0_f32;
+    for start in (0..frame_count).step_by(spec.block_frames) {
+        let end = (start + spec.block_frames).min(frame_count);
+        interleaved.clear();
+        for index in start..end {
+            interleaved.push(left[index]);
+            interleaved.push(right[index]);
+            sample_peak = sample_peak.max(left[index].abs()).max(right[index].abs());
+        }
+        writer
+            .append(&interleaved)
+            .map_err(OfflineExportError::Journal)?;
+    }
+    writer
+        .publish_wav(wav_path)
+        .map_err(OfflineExportError::Journal)?;
+
+    Ok(OfflineExportReport {
+        frame_count,
+        sample_rate_hz,
+        sample_peak,
+    })
 }

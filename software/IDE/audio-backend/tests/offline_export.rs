@@ -1,7 +1,9 @@
 use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::StereoOutput;
 use hyper_audio_source::DecodedAudio;
-use hyper_desktop_audio::{OfflineExportError, OfflineExportSpec, render_project_offline};
+use hyper_desktop_audio::{
+    OfflineExportError, OfflineExportSpec, export_project_wav, render_project_offline,
+};
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{RoutedMainRuntime, RoutedTransportRuntime, TransportCommand};
 use hyper_playback_compiler::graph::GraphLimits;
@@ -53,7 +55,7 @@ const MIXER: &[u8] = br#"{
     "project_id":"018f47a2-6b2d-7c11-8a44-001122337500",
     "channels":[{
         "track_id":"018f47a2-6b2d-7c11-8a44-001122337502","gain_millionths":500000,
-        "pan_millionths":0,"mute":false,"solo":false,
+        "pan_millionths":-600000,"mute":false,"solo":false,
         "destination":{"kind":"main"},"sends":[]
     }],
     "return_buses":[],
@@ -178,6 +180,10 @@ fn offline_export_matches_the_playback_runtime_sample_for_sample() {
         left.iter().any(|sample| sample.abs() > 0.0),
         "the export is not silent"
     );
+    assert!(
+        left.iter().zip(right.iter()).any(|(l, r)| (l - r).abs() > f32::EPSILON),
+        "the panned fixture distinguishes the two channels"
+    );
 }
 
 #[test]
@@ -220,4 +226,47 @@ fn offline_export_rejects_an_unusable_block_size() {
             Err(OfflineExportError::InvalidBlockFrames)
         ));
     }
+}
+
+#[test]
+fn exported_wav_carries_the_rendered_samples_without_quantization() {
+    let session = session(Some(ARRANGEMENT), vec![AUTOMATION.to_vec()]);
+    let spec = OfflineExportSpec { block_frames: 32 };
+    let rendered = render_project_offline(&session, spec).unwrap();
+
+    let directory = std::env::temp_dir().join(format!(
+        "hyper-offline-export-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let journal = directory.join("export.journal");
+    let wav = directory.join("export.wav");
+
+    let report = export_project_wav(&session, spec, &journal, &wav).unwrap();
+    assert_eq!(report.frame_count, rendered.frame_count());
+    assert_eq!(report.sample_rate_hz, 48_000);
+    assert!(report.sample_peak > 0.0, "the export is not silent");
+
+    let published = std::fs::read(&wav).unwrap();
+    assert_eq!(&published[0..4], b"RIFF");
+    assert_eq!(&published[8..12], b"WAVE");
+
+    let decoded = hyper_audio_source::decode_bytes(
+        published.clone(),
+        hyper_audio_source::AudioContainer::Wav,
+        48_000,
+        hyper_audio_source::DecodeLimits::new(1_048_576, 4_096, 65_536).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(decoded.frame_count(), rendered.frame_count());
+    for plane in 0..2 {
+        assert_eq!(
+            decoded.plane(plane).unwrap(),
+            rendered.plane(plane).unwrap(),
+            "published plane {plane} differs from the rendered audio"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&directory);
 }

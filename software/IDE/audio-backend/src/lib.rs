@@ -77,7 +77,10 @@ where
 
 mod offline_export;
 mod capture;
-pub use offline_export::{OfflineExportError, OfflineExportSpec, render_project_offline};
+pub use offline_export::{
+    OfflineExportError, OfflineExportReport, OfflineExportSpec, export_project_wav,
+    render_project_offline,
+};
 pub use capture::{
     CaptureCallback, CaptureCallbackConfigError, CaptureCallbackStatus, CaptureStreamCounters,
     CaptureStreamSnapshot, InterleavedStereoCaptureProcessor,
