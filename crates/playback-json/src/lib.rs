@@ -7,8 +7,9 @@ pub use automation::{
     AutomationChannelParameter, AutomationCompileError, AutomationEvaluationError,
     AutomationInterpolation, AutomationLane, AutomationMainParameter, AutomationPoint,
     AutomationSendParameter, AutomationTake, AutomationTakeAddition,
-    AutomationTakeAdditionSerializationError, AutomationTarget, AutomationTargetSelection,
-    AutomationValue, CompiledAutomation, LoadedAutomationSet, serialize_automation_take_addition,
+    AutomationTakeAdditionSerializationError, AutomationTakeEditSerializationError,
+    AutomationTarget, AutomationTargetSelection, AutomationValue, CompiledAutomation,
+    LoadedAutomationSet, serialize_automation_take_activation, serialize_automation_take_addition,
 };
 
 use core::error::Error;
@@ -12456,6 +12457,148 @@ mod tests {
             ),
             "{capacity}"
         );
+    }
+
+    #[test]
+    fn automation_take_activation_rewrites_only_the_enabled_flag() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer = loaded
+            .load_mixer(MIXER, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+        let points = [
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(4, AutomationValue::Integer(0)),
+        ];
+        let first = serialize_automation_take_addition(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[],
+            automation_take_request(&points),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let disabled = serialize_automation_take_activation(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[&first],
+            "018f47a2-6b2d-7c11-8a44-0011223344a0",
+            false,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let reloaded = loaded
+            .load_automation_takes(
+                &mixer,
+                &asset_facts(),
+                &[&disabled],
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap();
+        assert!(!reloaded.takes()[0].enabled());
+        assert_eq!(reloaded.takes()[0].name(), "Fade out");
+        assert_eq!(reloaded.takes()[0].lanes()[0].points().len(), 2);
+
+        let later_points = [
+            AutomationPoint::new(2, AutomationValue::Integer(0)),
+            AutomationPoint::new(9, AutomationValue::Integer(1_000_000)),
+        ];
+        let overlapping = serialize_automation_take_addition(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[&disabled],
+            AutomationTakeAddition {
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a2",
+                lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a3",
+                start_tick: 2,
+                end_tick: 10,
+                points: &later_points,
+                ..automation_take_request(&points)
+            },
+            LoaderLimits::VERSION_1,
+        );
+        assert!(
+            overlapping.is_ok(),
+            "a disabled take releases its target interval"
+        );
+        let restored = serialize_automation_take_activation(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[&disabled, &overlapping.unwrap()],
+            "018f47a2-6b2d-7c11-8a44-0011223344a0",
+            true,
+            LoaderLimits::VERSION_1,
+        );
+        assert!(
+            matches!(
+                restored,
+                Err(AutomationTakeEditSerializationError::Source(_))
+            ),
+            "re-enabling may not overlap an enabled take on one target"
+        );
+    }
+
+    #[test]
+    fn automation_take_activation_rejects_unknown_and_noncanonical_sources() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer = loaded
+            .load_mixer(MIXER, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+        let points = [
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(4, AutomationValue::Integer(0)),
+        ];
+        let disabled = serialize_automation_take_addition(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[],
+            automation_take_request(&points),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_automation_take_activation(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&disabled],
+                "018f47a2-6b2d-7c11-8a44-0011223344ff",
+                true,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AutomationTakeEditSerializationError::TakeMissing)
+        ));
+        let pretty =
+            serde_json::to_vec_pretty(&serde_json::from_slice::<Value>(&disabled).unwrap())
+                .unwrap();
+        assert!(matches!(
+            serialize_automation_take_activation(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[&pretty],
+                "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                true,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AutomationTakeEditSerializationError::NonCanonicalSource)
+        ));
     }
 
     type AutomationRejectionCheck = fn(&AutomationTakeAdditionSerializationError) -> bool;

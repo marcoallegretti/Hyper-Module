@@ -4,7 +4,7 @@ use core::fmt;
 use hyper_playback_compiler::{FrameTickPosition, FrameTimeline, FrameTimelineError};
 use hyper_project_model::is_valid_entity_id;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{
     CollectionLimit, CompiledMixerGraph, DocumentKind, DocumentLocation, ExtensionsDocument,
@@ -750,6 +750,110 @@ pub fn serialize_automation_take_addition(
     project
         .compile_main_automation(&graph, &candidate)
         .map_err(AutomationTakeAdditionSerializationError::AutomationCompilation)?;
+    Ok(output)
+}
+
+#[derive(Debug)]
+pub enum AutomationTakeEditSerializationError {
+    TakeMissing,
+    NonCanonicalSource,
+    InvalidDocumentShape,
+    Source(LoadError),
+    Serialization(serde_json::Error),
+    MixerCompilation(MixerCompileError),
+    AutomationCompilation(AutomationCompileError),
+}
+
+impl fmt::Display for AutomationTakeEditSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TakeMissing => {
+                formatter.write_str("the automation take is missing from the project")
+            }
+            Self::NonCanonicalSource => {
+                formatter.write_str("the source automation take is not canonical")
+            }
+            Self::InvalidDocumentShape => {
+                formatter.write_str("the automation take document is not a JSON object")
+            }
+            Self::Source(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::MixerCompilation(source) => source.fmt(formatter),
+            Self::AutomationCompilation(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AutomationTakeEditSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::MixerCompilation(source) => Some(source),
+            Self::AutomationCompilation(source) => Some(source),
+            Self::TakeMissing | Self::NonCanonicalSource | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
+/// Rewrites one existing automation take with a new `enabled` flag.
+///
+/// `takes` must be the project's complete canonical automation set in manifest
+/// order. The rewrite is accepted only after the complete candidate set reloads
+/// without an enabled-interval overlap and compiles against the committed
+/// mixer graph.
+///
+/// # Errors
+///
+/// Returns a classified rejection for a missing take, noncanonical source
+/// bytes, an unexpected document shape, a candidate set the loader rejects, or
+/// a candidate set that cannot compile.
+pub fn serialize_automation_take_activation(
+    project: &LoadedPlaybackProject,
+    mixer: &LoadedMixer,
+    assets: &[MediaAssetFact<'_>],
+    takes: &[&[u8]],
+    take_id: &str,
+    enabled: bool,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AutomationTakeEditSerializationError> {
+    let loaded = project
+        .load_automation_takes(mixer, assets, takes, limits)
+        .map_err(AutomationTakeEditSerializationError::Source)?;
+    let index = loaded
+        .takes()
+        .iter()
+        .position(|take| take.id() == take_id)
+        .ok_or(AutomationTakeEditSerializationError::TakeMissing)?;
+    let source = takes[index];
+    let mut value: Value =
+        serde_json::from_slice(source).map_err(AutomationTakeEditSerializationError::Serialization)?;
+    let canonical_source = serde_json_canonicalizer::to_vec(&value)
+        .map_err(AutomationTakeEditSerializationError::Serialization)?;
+    if canonical_source != source {
+        return Err(AutomationTakeEditSerializationError::NonCanonicalSource);
+    }
+    value
+        .as_object_mut()
+        .ok_or(AutomationTakeEditSerializationError::InvalidDocumentShape)?
+        .insert("enabled".to_owned(), enabled.into());
+    let output = serde_json_canonicalizer::to_vec(&value)
+        .map_err(AutomationTakeEditSerializationError::Serialization)?;
+    let mut documents = Vec::new();
+    documents
+        .try_reserve_exact(takes.len())
+        .map_err(|_| AutomationTakeEditSerializationError::Source(capacity_error()))?;
+    documents.extend_from_slice(takes);
+    documents[index] = &output;
+    let candidate = project
+        .load_automation_takes(mixer, assets, &documents, limits)
+        .map_err(AutomationTakeEditSerializationError::Source)?;
+    let graph = mixer
+        .compile_main_graph()
+        .map_err(AutomationTakeEditSerializationError::MixerCompilation)?;
+    project
+        .compile_main_automation(&graph, &candidate)
+        .map_err(AutomationTakeEditSerializationError::AutomationCompilation)?;
     Ok(output)
 }
 
