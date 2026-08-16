@@ -30,10 +30,11 @@ use hyper_desktop_audio::{
     DesktopOutputStartError, DesktopOutputStopError, DesktopPlaybackRecovery,
     DesktopPlaybackRecoveryPendingStop, DesktopPlaybackRecoveryPendingStopWait,
     DesktopPlaybackSession, DesktopProjectOpenError, DesktopTestToneConfig, DesktopTestToneSession,
-    MonitoringSnapshot, OutputStreamSnapshot, OutputStreamState, PendingNativeShutdown,
-    PendingNativeShutdownWait, StreamState, discover_desktop_input_targets,
-    discover_desktop_output_targets,
+    MonitoringSnapshot, OfflineExportError, OfflineExportSpec, OutputStreamSnapshot,
+    OutputStreamState, PendingNativeShutdown, PendingNativeShutdownWait, StreamState,
+    discover_desktop_input_targets, discover_desktop_output_targets, export_project_wav,
 };
+pub use hyper_desktop_audio::OfflineExportReport;
 pub use hyper_desktop_audio::{
     DesktopAudioPreviewState, DesktopSceneAvailability as IdeSceneAvailability,
 };
@@ -3332,6 +3333,36 @@ pub enum IdeControlMappingEdit {
     Insert(IdeControlBindingRequest),
     SetEnabled { binding_id: String, enabled: bool },
     Remove { binding_id: String },
+}
+
+#[derive(Debug)]
+pub enum IdeProjectExportError {
+    ProjectSnapshotUnavailable,
+    DestinationUnavailable,
+    Export(Box<OfflineExportError>),
+}
+
+impl fmt::Display for IdeProjectExportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProjectSnapshotUnavailable => {
+                formatter.write_str("no open project is available to export")
+            }
+            Self::DestinationUnavailable => {
+                formatter.write_str("the export destination has no usable parent directory")
+            }
+            Self::Export(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeProjectExportError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Export(source) => Some(source.as_ref()),
+            Self::ProjectSnapshotUnavailable | Self::DestinationUnavailable => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -6856,6 +6887,42 @@ impl RunningDesktopIdeApplication {
             scene_id,
             scene_bytes,
         })
+    }
+
+    /// Renders the open project to a WAV beside the requested destination.
+    ///
+    /// This reads the prepared project and writes outside it, so it takes no
+    /// mixer fence and does not close or reopen playback.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified rejection when no project is open, the destination
+    /// has no parent directory, or the render, publication, or measurement
+    /// fails.
+    pub fn export_project(
+        &self,
+        wav_path: &Path,
+        block_frames: usize,
+    ) -> Result<OfflineExportReport, IdeProjectExportError> {
+        let prepared = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session.prepared_project(),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => None,
+        }
+        .ok_or(IdeProjectExportError::ProjectSnapshotUnavailable)?;
+        let journal_path = wav_path.with_extension("journal");
+        if journal_path == wav_path || wav_path.parent().is_none() {
+            return Err(IdeProjectExportError::DestinationUnavailable);
+        }
+        let report = export_project_wav(
+            prepared.session(),
+            OfflineExportSpec { block_frames },
+            &journal_path,
+            wav_path,
+        )
+        .map_err(|source| IdeProjectExportError::Export(Box::new(source)))?;
+        let _ = std::fs::remove_file(&journal_path);
+        Ok(report)
     }
 
     fn prepare_control_mapping_edit(

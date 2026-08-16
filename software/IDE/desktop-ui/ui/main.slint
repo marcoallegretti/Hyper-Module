@@ -35,6 +35,7 @@ export enum AppMode {
     changing-clip-source,
     adding-automation-take,
     editing-control-mapping,
+    exporting-project,
     changing-automation-take-activation,
     renaming-scene,
     duplicating-scene,
@@ -240,6 +241,7 @@ export global IdeActions {
     callback add-control-binding(int, int, bool, string, string);
     callback set-control-binding-active(string, bool);
     callback remove-control-binding(string);
+    callback export-project();
     callback save-project();
     callback add-audio-track(string);
     callback remove-audio-track(string);
@@ -493,6 +495,9 @@ export component MainWindow inherits Window {
     in property <[bool]> control-target-boolean: [];
     in property <[string]> control-target-range: [];
     in-out property <bool> mixer-control-visible: false;
+    in property <bool> export-available: false;
+    in property <string> export-destination: "";
+    in property <string> export-summary: "";
     in-out property <bool> control-create-visible: false;
     in-out property <int> control-create-source-index: 0;
     in-out property <int> control-create-target-index: 0;
@@ -873,6 +878,24 @@ export component MainWindow inherits Window {
                                 enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing;
                                 clicked => { IdeActions.close-project(); }
                             }
+                        }
+                        if !root.new-project-visible && !root.new-track-visible : Button {
+                            text: root.app-mode == AppMode.exporting-project ? "Exporting…" : "Export WAV";
+                            enabled: root.app-mode == AppMode.running && root.export-available;
+                            accessible-label: "Export the project as a WAV file";
+                            clicked => { IdeActions.export-project(); }
+                        }
+                        if root.export-summary != "" : Text {
+                            text: root.export-summary;
+                            color: #8fa0b4;
+                            font-size: 9px;
+                            wrap: word-wrap;
+                        }
+                        if root.export-destination != "" : Text {
+                            text: root.export-destination;
+                            color: #728196;
+                            font-size: 8px;
+                            overflow: elide;
                         }
                         if !root.new-project-visible && !root.new-track-visible : Text { text: "Verified identity"; color: #65758a; font-size: 10px; }
                         if !root.new-project-visible && !root.new-track-visible : Text { text: root.project-id; color: #b9c5d3; font-size: 11px; overflow: elide; }

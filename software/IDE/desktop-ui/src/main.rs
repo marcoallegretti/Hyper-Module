@@ -21,6 +21,7 @@ use hyper_desktop_ide::{
     IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
     IdeControlMappingEdit, SceneAction, TransportAction, TriggerBehavior,
     IdeAutomationTakeRequest, IdeAutomationTarget, IdeOutputTestState, IdePlaybackArrangement,
+    OfflineExportReport,
     IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent, IdeRecordingAbortOutcome,
     IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation,
     IdeScaledLoudnessValue, IdeScene, IdeSceneAvailability, IdeSceneLaunchQuantization,
@@ -44,6 +45,7 @@ use slint::{
 slint::include_modules!();
 
 const WORKER_COMMAND_CAPACITY: usize = 16;
+const EXPORT_BLOCK_FRAMES: usize = 1_024;
 const WORKER_EVENT_CAPACITY: usize = 16;
 const UI_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const INITIAL_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
@@ -1550,6 +1552,7 @@ fn bind_arrangement_scene_launch_callback(
     bind_automation_take_callback(ui, worker, project_state);
     bind_automation_take_activation_callback(ui, worker);
     bind_control_mapping_callbacks(ui, worker, project_state);
+    bind_project_export_callback(ui, worker);
     bind_arrangement_scene_launch_locate_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_scene_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_removal_callback(ui, worker, project_state);
@@ -2942,6 +2945,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
             AppMode::ChangingAutomationTakeActivation
         }
         IdeWorkerCommandKind::EditControlMapping => AppMode::EditingControlMapping,
+        IdeWorkerCommandKind::ExportProject => AppMode::ExportingProject,
         IdeWorkerCommandKind::MoveArrangementSceneLaunch => AppMode::MovingArrangementSceneLaunch,
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => {
             AppMode::ChangingArrangementSceneLaunchScene
@@ -3082,6 +3086,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::EditControlMapping => {
             "Preserving mixer state, editing control mappings, and reopening project..."
+        }
+        IdeWorkerCommandKind::ExportProject => {
+            "Rendering the project through the playback runtime..."
         }
         IdeWorkerCommandKind::DuplicateScene => {
             "Preserving mixer state, duplicating the scene, and reopening project..."
@@ -3301,6 +3308,9 @@ fn apply_event(
         | IdeWorkerEvent::ControlMappingEditCommittedWithWarning { .. }
         | IdeWorkerEvent::ControlMappingEditing { .. }) => {
             apply_control_mapping_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ProjectExporting | IdeWorkerEvent::ProjectExported { .. }) => {
+            apply_project_export_event(ui, &event);
         }
         event @ (IdeWorkerEvent::SceneDuplicated { .. }
         | IdeWorkerEvent::SceneDuplicationCommittedWithWarning { .. }
@@ -5006,6 +5016,7 @@ fn set_playback_extent(
             *project_state.playback_end_frame.borrow_mut() = Some(end_frame);
             ui.set_transport_extent_bounded(true);
             ui.set_transport_seek_available(end_frame > 0);
+            ui.set_export_available(export_available(observation.playback_extent()));
             ui.set_transport_end_clock(
                 format_transport_clock(
                     u64::try_from(end_frame).unwrap_or(u64::MAX),
@@ -5022,6 +5033,7 @@ fn set_playback_extent(
             *project_state.playback_end_frame.borrow_mut() = None;
             ui.set_transport_extent_bounded(false);
             ui.set_transport_seek_available(false);
+            ui.set_export_available(export_available(observation.playback_extent()));
             ui.set_transport_end_clock("—".into());
             ui.set_transport_progress_percent(0.0);
         }
@@ -5569,6 +5581,9 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_control_target_range(ModelRc::default());
     ui.set_mixer_control_visible(false);
     ui.set_control_create_visible(false);
+    ui.set_export_available(false);
+    ui.set_export_destination(SharedString::default());
+    ui.set_export_summary(SharedString::default());
     reset_arrangement_scene_launch_addition_form(ui);
     reset_arrangement_scene_launch_move_form(ui);
     reset_arrangement_scene_launch_scene_form(ui);
@@ -5658,6 +5673,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::EditControlMapping if current == AppMode::EditingControlMapping => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::ExportProject if current == AppMode::ExportingProject => {
             AppMode::Running
         }
         IdeWorkerCommandKind::MoveArrangementSceneLaunch
@@ -7381,6 +7399,101 @@ fn bind_control_mapping_callbacks(
     });
 }
 
+/// Describes one finished export without implying a measurement it does not
+/// have. Material shorter than the EBU 400 ms gate has no integrated loudness,
+/// and the summary says so rather than showing a placeholder number.
+/// Export needs an end and something to render, so only a bounded, non-empty
+/// extent can be exported. An unbounded project has no last frame to write.
+const fn export_available(extent: IdePlaybackExtent) -> bool {
+    matches!(extent, IdePlaybackExtent::Bounded { end_frame } if end_frame > 0)
+}
+
+fn export_summary(report: &OfflineExportReport) -> String {
+    let seconds = u32::try_from(report.frame_count).map_or(f64::NAN, |frames| {
+        f64::from(frames) / f64::from(report.sample_rate_hz)
+    });
+    let loudness = report.integrated_lufs.map_or_else(
+        || "integrated loudness needs at least 400 ms".to_owned(),
+        |lufs| format!("{lufs:.1} LUFS integrated"),
+    );
+    format!(
+        "{seconds:.2} s  ·  peak {:.1} dBFS  ·  true peak {:.1} dBTP  ·  {loudness}",
+        linear_to_dbfs(report.sample_peak),
+        linear_to_dbfs(report.true_peak),
+    )
+}
+
+fn linear_to_dbfs(linear: f32) -> f32 {
+    if linear > 0.0 {
+        20.0 * linear.log10()
+    } else {
+        f32::NEG_INFINITY
+    }
+}
+
+fn apply_project_export_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ProjectExporting => {
+            ui.set_app_mode(AppMode::ExportingProject);
+            ui.set_status_text("Rendering the project through the playback runtime…".into());
+        }
+        IdeWorkerEvent::ProjectExported { report } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_export_summary(export_summary(report).into());
+            ui.set_status_text("Export complete".into());
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("project export event dispatcher received another event"),
+    }
+}
+
+fn bind_project_export_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_export = Rc::clone(worker);
+    actions.on_export_project(move || {
+        let weak = weak.clone();
+        let worker = Rc::clone(&worker_for_export);
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        ui.set_error_text(SharedString::default());
+        ui.set_status_text("Waiting for export destination…".into());
+        let spawn_result = slint::spawn_local(async move {
+            let selection = rfd::AsyncFileDialog::new()
+                .set_title("Export project audio")
+                .set_file_name("export.wav")
+                .add_filter("WAV", &["wav"])
+                .save_file()
+                .await;
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Some(selection) = selection else {
+                ui.set_status_text("Export cancelled".into());
+                return;
+            };
+            let path = selection.path().to_path_buf();
+            ui.set_export_destination(path.display().to_string().into());
+            ui.set_export_summary(SharedString::default());
+            submit_to_ui(
+                &ui,
+                &worker,
+                IdeWorkerCommand::ExportProject {
+                    wav_path: path,
+                    block_frames: EXPORT_BLOCK_FRAMES,
+                },
+            );
+        });
+        if spawn_result.is_err() {
+            ui.set_status_text("Export destination selection is unavailable".into());
+        }
+    });
+}
+
 fn parse_control_millionths(value: &str) -> Result<i32, &'static str> {
     let parsed = value
         .trim()
@@ -8987,6 +9100,45 @@ mod tests {
             },
         );
         assert_eq!(ui.get_app_mode(), AppMode::EditingControlMapping);
+    }
+
+    #[test]
+    fn only_a_bounded_non_empty_project_can_be_exported() {
+        assert!(export_available(IdePlaybackExtent::Bounded { end_frame: 1 }));
+        assert!(!export_available(IdePlaybackExtent::Bounded { end_frame: 0 }));
+        assert!(!export_available(IdePlaybackExtent::Unbounded));
+    }
+
+    #[test]
+    fn export_summary_reports_measurements_and_declines_to_invent_loudness() {
+        let gated = export_summary(&OfflineExportReport {
+            frame_count: 48_000,
+            sample_rate_hz: 48_000,
+            sample_peak: 0.5,
+            true_peak: 0.5,
+            integrated_lufs: Some(-14.2),
+        });
+        assert!(gated.contains("1.00 s"), "{gated}");
+        assert!(gated.contains("-6.0 dBFS"), "{gated}");
+        assert!(gated.contains("-6.0 dBTP"), "{gated}");
+        assert!(gated.contains("-14.2 LUFS integrated"), "{gated}");
+
+        let ungated = export_summary(&OfflineExportReport {
+            frame_count: 100,
+            sample_rate_hz: 48_000,
+            sample_peak: 0.25,
+            true_peak: 0.3,
+            integrated_lufs: None,
+        });
+        assert!(
+            ungated.contains("integrated loudness needs at least 400 ms"),
+            "short material states why there is no value: {ungated}"
+        );
+        assert!(
+            !ungated.contains("LUFS integrated"),
+            "no placeholder loudness number is shown: {ungated}"
+        );
+        assert!(ungated.contains("true peak -10.5 dBTP"), "{ungated}");
     }
 
     #[test]

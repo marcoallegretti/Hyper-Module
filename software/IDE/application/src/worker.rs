@@ -29,7 +29,7 @@ use super::{
     IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioTrackAdditionError,
     ControlBinding, ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
     IdeAudioTrackEditError, IdeAudioTrackRemovalError, IdeAutomationTakeCreationError,
-    IdeControlMappingEdit, IdeControlMappingEditError,
+    IdeControlMappingEdit, IdeControlMappingEditError, IdeProjectExportError,
     IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
     IdeInputDiscoveryError,
     IdeInputSelection, IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError,
@@ -163,6 +163,7 @@ pub enum IdeWorkerCommandKind {
     AddAutomationTake,
     SetAutomationTakeActive,
     EditControlMapping,
+    ExportProject,
     StartRecording,
     StopRecording,
     AbortRecording,
@@ -324,6 +325,10 @@ pub enum IdeWorkerCommand {
     EditControlMapping {
         edit: IdeControlMappingEdit,
     },
+    ExportProject {
+        wav_path: std::path::PathBuf,
+        block_frames: usize,
+    },
     DuplicateScene {
         scene_id: String,
         name: String,
@@ -429,6 +434,7 @@ impl IdeWorkerCommand {
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
             Self::EditControlMapping { .. } => IdeWorkerCommandKind::EditControlMapping,
+            Self::ExportProject { .. } => IdeWorkerCommandKind::ExportProject,
             Self::DuplicateScene { .. } => IdeWorkerCommandKind::DuplicateScene,
             Self::SetSceneSlot { .. } => IdeWorkerCommandKind::SetSceneSlot,
             Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
@@ -1315,6 +1321,7 @@ pub enum IdeWorkerCommandFailure {
     AutomationTakeCreation(Box<IdeAutomationTakeCreationError>),
     AutomationTakeActivation(Box<IdeAutomationTakeEditError>),
     ControlMappingEdit(Box<IdeControlMappingEditError>),
+    ProjectExport(Box<IdeProjectExportError>),
     SceneDuplication(Box<IdeSceneDuplicationError>),
     SceneSlotEdit(Box<IdeSceneSlotEditError>),
     SceneRename(Box<IdeSceneRenameError>),
@@ -1375,6 +1382,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AutomationTakeCreation(source) => source.fmt(formatter),
             Self::AutomationTakeActivation(source) => source.fmt(formatter),
             Self::ControlMappingEdit(source) => source.fmt(formatter),
+            Self::ProjectExport(source) => source.fmt(formatter),
             Self::SceneDuplication(source) => source.fmt(formatter),
             Self::SceneSlotEdit(source) => source.fmt(formatter),
             Self::SceneRename(source) | Self::SceneActivation(source) => source.fmt(formatter),
@@ -1440,6 +1448,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AutomationTakeCreation(source) => Some(source),
             Self::AutomationTakeActivation(source) => Some(source),
             Self::ControlMappingEdit(source) => Some(source),
+            Self::ProjectExport(source) => Some(source),
             Self::SceneDuplication(source) => Some(source),
             Self::SceneSlotEdit(source) => Some(source),
             Self::SceneRename(source) | Self::SceneActivation(source) => Some(source),
@@ -1678,6 +1687,10 @@ pub enum IdeWorkerEvent {
     },
     ControlMappingEditCommittedWithWarning {
         warning: Box<IdeControlMappingEditError>,
+    },
+    ProjectExporting,
+    ProjectExported {
+        report: hyper_desktop_audio::OfflineExportReport,
     },
     SceneDuplicated {
         revision: u64,
@@ -2673,6 +2686,10 @@ fn process_command(
         | IdeWorkerCommand::AudioPreviewControl(_)) => {
             process_audio_preview_command(state, command, events)
         }
+        IdeWorkerCommand::ExportProject {
+            wav_path,
+            block_frames,
+        } => export_project(state, events, &wav_path, block_frames),
         IdeWorkerCommand::Observe => publish_state(state, events, unpublished_native_failure),
         IdeWorkerCommand::CloseProject => close_project(
             state,
@@ -4747,6 +4764,34 @@ fn add_automation_take(
     normalized_name.push_str(name);
     request.name = normalized_name;
     begin_project_mutation_request(state, events, ProjectMutation::AddAutomationTake { request })
+}
+
+fn export_project(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    wav_path: &std::path::Path,
+    block_frames: usize,
+) -> bool {
+    let WorkerState::Running(running) = state else {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::ExportProject,
+            IdeWorkerCommandFailure::ProjectExport(Box::new(
+                IdeProjectExportError::ProjectSnapshotUnavailable,
+            )),
+        );
+    };
+    if !send_event(events, IdeWorkerEvent::ProjectExporting) {
+        return false;
+    }
+    match running.export_project(wav_path, block_frames) {
+        Ok(report) => send_event(events, IdeWorkerEvent::ProjectExported { report }),
+        Err(reason) => publish_failure(
+            events,
+            IdeWorkerCommandKind::ExportProject,
+            IdeWorkerCommandFailure::ProjectExport(Box::new(reason)),
+        ),
+    }
 }
 
 fn edit_control_mapping(
