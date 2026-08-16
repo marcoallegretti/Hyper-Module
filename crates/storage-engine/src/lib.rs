@@ -13,6 +13,7 @@ pub use mapping_publication::{
     ControlMappingPublicationError, ControlMappingPublicationErrorKind,
     ControlMappingPublicationOutcome, ControlMappingPublicationRecovery,
     ControlMappingPublicationRecoveryDisposition, ControlMappingPublicationRequest,
+    RequiredControlCapabilities,
     publish_control_mapping, recover_control_mapping_publications,
 };
 pub use project_creation::{

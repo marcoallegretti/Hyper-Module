@@ -66,19 +66,26 @@ struct ProjectUiState {
     audio_clips: RefCell<Vec<IdeAudioClip>>,
     scenes: RefCell<Vec<IdeScene>>,
     scene_launch_evidence: RefCell<SceneLaunchEvidence>,
-    automation_channels: RefCell<Vec<AutomationChannelFacts>>,
+    automation_channels: RefCell<Vec<MixerChannelFacts>>,
     control_targets: RefCell<Vec<ControlTargetChoice>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct AutomationChannelFacts {
+struct MixerChannelFacts {
     track_id: String,
     name: String,
-    sends: Vec<AutomationSendFacts>,
+    audio: bool,
+    sends: Vec<MixerSendFacts>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct AutomationSendFacts {
+struct SceneFacts {
+    scene_id: String,
+    name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MixerSendFacts {
     send_id: String,
     target_name: String,
 }
@@ -6461,7 +6468,7 @@ fn automation_main_choices() -> Vec<AutomationTargetChoice> {
 
 fn automation_channel_choices(
     slot: usize,
-    channel: &AutomationChannelFacts,
+    channel: &MixerChannelFacts,
     choices: &mut Vec<AutomationTargetChoice>,
 ) {
     for (suffix, domain, boolean, parameter) in [
@@ -6505,7 +6512,7 @@ fn automation_channel_choices(
 
 fn automation_send_choices(
     slot: usize,
-    channel: &AutomationChannelFacts,
+    channel: &MixerChannelFacts,
     choices: &mut Vec<AutomationTargetChoice>,
 ) {
     for (send_index, send) in channel.sends.iter().enumerate() {
@@ -6547,7 +6554,7 @@ fn automation_send_choices(
     }
 }
 
-fn automation_target_choices(channels: &[AutomationChannelFacts]) -> Vec<AutomationTargetChoice> {
+fn automation_target_choices(channels: &[MixerChannelFacts]) -> Vec<AutomationTargetChoice> {
     let mut choices = automation_main_choices();
     for (slot, channel) in channels.iter().enumerate() {
         automation_channel_choices(slot, channel, &mut choices);
@@ -6559,16 +6566,17 @@ fn automation_target_choices(channels: &[AutomationChannelFacts]) -> Vec<Automat
 /// Projects the compiled mixer topology the automation target table depends on.
 /// Slot and send positions are the compiled graph's own ordering, so the
 /// resolved targets match the runtime addresses published for existing takes.
-fn automation_channel_facts(channels: &[IdeMixerChannel]) -> Vec<AutomationChannelFacts> {
+fn mixer_channel_facts(channels: &[IdeMixerChannel]) -> Vec<MixerChannelFacts> {
     channels
         .iter()
-        .map(|channel| AutomationChannelFacts {
+        .map(|channel| MixerChannelFacts {
             track_id: channel.id().to_owned(),
             name: channel.name().to_owned(),
+            audio: channel.kind() == IdeMixerChannelKind::Audio,
             sends: channel
                 .sends()
                 .iter()
-                .map(|send| AutomationSendFacts {
+                .map(|send| MixerSendFacts {
                     send_id: send.id().to_owned(),
                     target_name: send.target_name().to_owned(),
                 })
@@ -6580,7 +6588,7 @@ fn automation_channel_facts(channels: &[IdeMixerChannel]) -> Vec<AutomationChann
 fn set_automation_targets(
     ui: &MainWindow,
     project_state: &ProjectUiStateCell,
-    channels: &[AutomationChannelFacts],
+    channels: &[MixerChannelFacts],
 ) {
     if project_state.automation_channels.borrow().as_slice() == channels {
         return;
@@ -6675,7 +6683,7 @@ fn set_automation(
     project_state: &ProjectUiStateCell,
     observation: &IdeRunningObservation,
 ) {
-    let channels = automation_channel_facts(observation.mixer_channels());
+    let channels = mixer_channel_facts(observation.mixer_channels());
     set_automation_targets(ui, project_state, &channels);
     let owner = observation.automation();
     let choices = automation_target_choices(&channels);
@@ -6995,9 +7003,22 @@ fn control_source_choices() -> Vec<ControlSourceChoice> {
     choices
 }
 
+fn scene_facts(scenes: &[IdeScene]) -> Vec<SceneFacts> {
+    scenes
+        .iter()
+        .map(|scene| SceneFacts {
+            scene_id: scene.id().to_owned(),
+            name: scene.name().to_owned(),
+        })
+        .collect()
+}
+
+/// Solo is offered only on audio channels because `is_solo_source_track`
+/// resolves to `is_audio_track`, so a solo binding on a group or return is
+/// rejected by the compiler as `SoloTargetNotSource`.
 fn control_target_choices(
-    channels: &[IdeMixerChannel],
-    scenes: &[IdeScene],
+    channels: &[MixerChannelFacts],
+    scenes: &[SceneFacts],
 ) -> Vec<ControlTargetChoice> {
     let mut choices = vec![
         ControlTargetChoice {
@@ -7044,12 +7065,15 @@ fn control_target_choices(
                 IdeControlChannelParameter::Solo,
             ),
         ] {
+            if parameter == IdeControlChannelParameter::Solo && !channel.audio {
+                continue;
+            }
             choices.push(ControlTargetChoice {
-                label: format!("{} {suffix}", channel.name()),
+                label: format!("{} {suffix}", channel.name),
                 domain,
                 range_hint: hint.to_owned(),
                 target: ControlTarget::MixerChannel {
-                    track_id: channel.id().to_owned(),
+                    track_id: channel.track_id.clone(),
                     parameter,
                 },
             });
@@ -7057,11 +7081,11 @@ fn control_target_choices(
     }
     for scene in scenes {
         choices.push(ControlTargetChoice {
-            label: format!("Launch scene {}", scene.name()),
+            label: format!("Launch scene {}", scene.name),
             domain: ControlTargetDomain::Action,
             range_hint: String::new(),
             target: ControlTarget::Scene {
-                scene_id: scene.id().to_owned(),
+                scene_id: scene.scene_id.clone(),
                 action: SceneAction::Launch,
             },
         });
@@ -7167,7 +7191,10 @@ fn set_control_mappings(
     project_state: &ProjectUiStateCell,
     observation: &IdeRunningObservation,
 ) {
-    let targets = control_target_choices(observation.mixer_channels(), observation.scenes());
+    let targets = control_target_choices(
+        &mixer_channel_facts(observation.mixer_channels()),
+        &scene_facts(observation.scenes()),
+    );
     if *project_state.control_targets.borrow() != targets {
         let sources = control_source_choices();
         ui.set_control_source_names(ModelRc::from(Rc::new(VecModel::from(
@@ -8799,22 +8826,167 @@ mod tests {
         );
     }
 
-    fn automation_channel_fixture() -> Vec<AutomationChannelFacts> {
+    fn automation_channel_fixture() -> Vec<MixerChannelFacts> {
         vec![
-            AutomationChannelFacts {
+            MixerChannelFacts {
                 track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
                 name: "Drums".to_owned(),
-                sends: vec![AutomationSendFacts {
+                audio: true,
+                sends: vec![MixerSendFacts {
                     send_id: "018f47a2-6b2d-7c11-8a44-001122334469".to_owned(),
                     target_name: "Reverb".to_owned(),
                 }],
             },
-            AutomationChannelFacts {
+            MixerChannelFacts {
                 track_id: "018f47a2-6b2d-7c11-8a44-001122334472".to_owned(),
                 name: "Reverb".to_owned(),
+                audio: false,
                 sends: Vec::new(),
             },
         ]
+    }
+
+    fn control_scene_fixture() -> Vec<SceneFacts> {
+        vec![SceneFacts {
+            scene_id: "018f47a2-6b2d-7c11-8a44-001122334461".to_owned(),
+            name: "Verse".to_owned(),
+        }]
+    }
+
+    #[test]
+    fn control_target_choices_offer_only_targets_the_compiler_accepts() {
+        let choices = control_target_choices(&automation_channel_fixture(), &control_scene_fixture());
+        let labels: Vec<&str> = choices.iter().map(|choice| choice.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Main gain",
+                "Main mute",
+                "Drums gain",
+                "Drums pan",
+                "Drums mute",
+                "Drums solo",
+                "Reverb gain",
+                "Reverb pan",
+                "Reverb mute",
+                "Launch scene Verse",
+                "Transport play",
+                "Transport stop",
+                "Transport toggle",
+                "Transport reset",
+            ],
+            "solo is offered on the audio channel and withheld from the return"
+        );
+        let drums_gain = &choices[2];
+        assert_eq!(
+            drums_gain.target,
+            ControlTarget::MixerChannel {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
+                parameter: IdeControlChannelParameter::Gain,
+            }
+        );
+        assert_eq!(drums_gain.domain, ControlTargetDomain::Continuous);
+        let drums_pan = &choices[3];
+        assert_eq!(
+            drums_pan.target,
+            ControlTarget::MixerChannel {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
+                parameter: IdeControlChannelParameter::Pan,
+            }
+        );
+        assert_eq!(choices[4].domain, ControlTargetDomain::Boolean);
+        assert_eq!(choices[9].domain, ControlTargetDomain::Action);
+        assert_eq!(
+            choices[9].target,
+            ControlTarget::Scene {
+                scene_id: "018f47a2-6b2d-7c11-8a44-001122334461".to_owned(),
+                action: SceneAction::Launch,
+            }
+        );
+    }
+
+    fn assert_control_targets_repopulate_after_a_project_reset(ui: &MainWindow) {
+        let recording_routes: RecordingRoutes = Rc::new(RefCell::new(Vec::new()));
+        let take_routes: TakeRoutes = Rc::new(RefCell::new(Vec::new()));
+        let project_state = Rc::new(ProjectUiState::default());
+        let targets = control_target_choices(&automation_channel_fixture(), &control_scene_fixture());
+        *project_state.control_targets.borrow_mut() = targets.clone();
+
+        reset_project(ui, &recording_routes, &take_routes, &project_state);
+        assert!(
+            project_state.control_targets.borrow().is_empty(),
+            "the control target cache must not survive a project reset"
+        );
+    }
+
+    fn assert_control_mapping_events_report_durable_outcomes(ui: &MainWindow) {
+        ui.set_app_mode(AppMode::Running);
+        ui.set_control_create_visible(true);
+        apply_control_mapping_event(
+            ui,
+            &IdeWorkerEvent::ControlMappingEdited {
+                revision: 7,
+                edit: IdeControlMappingEdit::Insert(IdeControlBindingRequest {
+                    source: ControlSource::CvInput { input_index: 0 },
+                    scope: ControlScope::Global,
+                    transform: ControlTransform::Linear {
+                        input_min: -1_000_000,
+                        input_max: 1_000_000,
+                        output_min: 0,
+                        output_max: 1_000_000,
+                    },
+                    target: ControlTarget::MixerMain {
+                        parameter: IdeControlMainParameter::Gain,
+                    },
+                }),
+            },
+        );
+        assert!(!ui.get_control_create_visible());
+        assert!(ui.get_status_text().contains("added in project revision 7"));
+        assert!(ui.get_error_text().is_empty());
+
+        for (edit, expected) in [
+            (
+                IdeControlMappingEdit::SetEnabled {
+                    binding_id: "b".to_owned(),
+                    enabled: false,
+                },
+                "disabled in project revision 8",
+            ),
+            (
+                IdeControlMappingEdit::SetEnabled {
+                    binding_id: "b".to_owned(),
+                    enabled: true,
+                },
+                "enabled in project revision 8",
+            ),
+            (
+                IdeControlMappingEdit::Remove {
+                    binding_id: "b".to_owned(),
+                },
+                "removed in project revision 8",
+            ),
+        ] {
+            apply_control_mapping_event(
+                ui,
+                &IdeWorkerEvent::ControlMappingEdited { revision: 8, edit },
+            );
+            assert!(
+                ui.get_status_text().contains(expected),
+                "expected {expected}, got {}",
+                ui.get_status_text()
+            );
+        }
+
+        apply_control_mapping_event(
+            ui,
+            &IdeWorkerEvent::ControlMappingEditing {
+                edit: IdeControlMappingEdit::Remove {
+                    binding_id: "b".to_owned(),
+                },
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::EditingControlMapping);
     }
 
     #[test]
@@ -9550,6 +9722,8 @@ mod tests {
         assert_scene_activation_events_preserve_state(&ui);
         assert_automation_take_events_report_durable_outcomes(&ui);
         assert_automation_targets_repopulate_after_a_project_reset(&ui);
+        assert_control_targets_repopulate_after_a_project_reset(&ui);
+        assert_control_mapping_events_report_durable_outcomes(&ui);
     }
 
     fn assert_committed_audio_clip_source_slip_warning(ui: &MainWindow) {

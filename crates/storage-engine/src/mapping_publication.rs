@@ -6,7 +6,7 @@ use std::path::Path;
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::fs::{Dir, OpenOptions};
-use hyper_control_mappings::{ControlMappingDocument, ControlSource};
+use hyper_control_mappings::{ControlBinding, ControlMappingDocument, ControlSource};
 use hyper_project_model::{AssetDescriptor, ProjectManifest, ResourceDescriptor, ResourceRole};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -328,7 +328,7 @@ fn publish_control_mapping_observed(
                 error,
             )
         })?;
-    let required = RequiredControlCapabilities::of(&document);
+    let required = RequiredControlCapabilities::of_bindings(document.bindings());
     if previous_bytes.as_deref() == Some(request.mapping_bytes)
         && required.covered_by(verified.manifest.required_capabilities())
     {
@@ -667,22 +667,30 @@ fn mapping_descriptor<'a>(
     Ok(mapping)
 }
 
-/// Capabilities one control-mapping document requires from its project.
+/// Capabilities one set of control bindings requires from its project.
+///
+/// This is the single derivation rule. Any caller that must resolve or compile
+/// bindings before they are published uses it too, so a preview and its
+/// publication cannot disagree about what the project will declare.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RequiredControlCapabilities {
+pub struct RequiredControlCapabilities {
     cv_inputs: u8,
     has_clock_input: bool,
     has_reset_input: bool,
 }
 
 impl RequiredControlCapabilities {
-    fn of(document: &ControlMappingDocument) -> Self {
+    /// Derives the capabilities `bindings` require, counting disabled bindings
+    /// because the loader validates every persisted binding, not only the
+    /// enabled ones.
+    #[must_use]
+    pub fn of_bindings(bindings: &[ControlBinding]) -> Self {
         let mut required = Self {
             cv_inputs: 0,
             has_clock_input: false,
             has_reset_input: false,
         };
-        for binding in document.bindings() {
+        for binding in bindings {
             match binding.source() {
                 ControlSource::CvInput { input_index } => {
                     required.cv_inputs = required.cv_inputs.max(input_index.saturating_add(1));
@@ -692,6 +700,21 @@ impl RequiredControlCapabilities {
             }
         }
         required
+    }
+
+    #[must_use]
+    pub const fn cv_inputs(self) -> u8 {
+        self.cv_inputs
+    }
+
+    #[must_use]
+    pub const fn has_clock_input(self) -> bool {
+        self.has_clock_input
+    }
+
+    #[must_use]
+    pub const fn has_reset_input(self) -> bool {
+        self.has_reset_input
     }
 
     const fn covered_by(self, declared: &hyper_project_model::HardwareCapabilities) -> bool {
@@ -2253,6 +2276,75 @@ mod tests {
             "an already covered republication stays a no-op"
         );
         let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn required_capabilities_count_disabled_bindings_and_every_source() {
+        use hyper_control_mappings::{ControlTarget, ControlTransform};
+
+        let linear = ControlTransform::Linear {
+            input_min: -1_000_000,
+            input_max: 1_000_000,
+            output_min: 0,
+            output_max: 1_000_000,
+        };
+        let disabled_cv = ControlBinding::try_new(
+            BINDING_ID.to_owned(),
+            false,
+            ControlSource::CvInput { input_index: 3 },
+            hyper_control_mappings::ControlScope::Global,
+            linear,
+            ControlTarget::MixerMain {
+                parameter: hyper_control_mappings::MainParameter::Gain,
+            },
+        )
+        .unwrap();
+        let required = RequiredControlCapabilities::of_bindings(&[disabled_cv]);
+        assert_eq!(
+            required.cv_inputs(),
+            4,
+            "a disabled binding still requires its input, because the loader validates it"
+        );
+        assert!(!required.has_clock_input());
+        assert!(!required.has_reset_input());
+
+        let trigger = ControlTransform::Trigger {
+            behavior: hyper_control_mappings::TriggerBehavior::Invoke,
+        };
+        let clock = ControlBinding::try_new(
+            "018f47a2-6b2d-7c11-8a44-0011223344d0".to_owned(),
+            true,
+            ControlSource::ClockInput {
+                edge: hyper_control_mappings::Edge::Rising,
+            },
+            hyper_control_mappings::ControlScope::Global,
+            trigger,
+            ControlTarget::Transport {
+                action: hyper_control_mappings::TransportAction::Play,
+            },
+        )
+        .unwrap();
+        let reset = ControlBinding::try_new(
+            "018f47a2-6b2d-7c11-8a44-0011223344d1".to_owned(),
+            true,
+            ControlSource::ResetInput {
+                edge: hyper_control_mappings::Edge::Falling,
+            },
+            hyper_control_mappings::ControlScope::Global,
+            trigger,
+            ControlTarget::Transport {
+                action: hyper_control_mappings::TransportAction::Stop,
+            },
+        )
+        .unwrap();
+        let clock_only = RequiredControlCapabilities::of_bindings(std::slice::from_ref(&clock));
+        assert!(clock_only.has_clock_input() && !clock_only.has_reset_input());
+        let reset_only = RequiredControlCapabilities::of_bindings(std::slice::from_ref(&reset));
+        assert!(reset_only.has_reset_input() && !reset_only.has_clock_input());
+        let both = RequiredControlCapabilities::of_bindings(&[clock, reset]);
+        assert!(both.has_clock_input() && both.has_reset_input());
+        assert_eq!(both.cv_inputs(), 0);
+        assert_eq!(RequiredControlCapabilities::of_bindings(&[]).cv_inputs(), 0);
     }
 
     #[test]
