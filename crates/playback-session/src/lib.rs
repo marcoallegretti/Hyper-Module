@@ -13,9 +13,10 @@ use hyper_media_cache::{
 use hyper_playback_compiler::scene::{RecordedSceneExtent, SceneLimits};
 use hyper_playback_compiler::{FrameTimelineError, graph::GraphLimits};
 use hyper_playback_json::{
-    AdapterCompileError, AutomationCompileError, CompiledAutomation, CompiledMixerGraph,
-    CompiledPlaybackGraph, LoadError, LoadedPlaybackProject, LoaderLimits, MediaAssetFact,
-    MixerCompileError, PlaybackJsonInput, load,
+    AdapterCompileError, AutomationCompileError, AutomationInterpolation, AutomationTarget,
+    CompiledAutomation, CompiledMixerGraph, CompiledPlaybackGraph, LoadError,
+    LoadedAutomationSet, LoadedPlaybackProject, LoaderLimits, MediaAssetFact, MixerCompileError,
+    PlaybackJsonInput, load,
 };
 
 /// Canonical resource bytes supplied to playback-session assembly.
@@ -85,6 +86,7 @@ pub struct PreparedPlaybackSession {
     media: DecodedMediaCache,
     extent: PlaybackExtent,
     arrangement: Arc<PlaybackArrangement>,
+    automation_view: Arc<PlaybackAutomation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,6 +278,124 @@ impl PlaybackArrangementPlacement {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct PlaybackAutomationLane {
+    id: String,
+    target: AutomationTarget,
+    interpolation: AutomationInterpolation,
+    point_count: usize,
+}
+
+impl PlaybackAutomationLane {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> AutomationTarget {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn interpolation(&self) -> AutomationInterpolation {
+        self.interpolation
+    }
+
+    #[must_use]
+    pub const fn point_count(&self) -> usize {
+        self.point_count
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct PlaybackAutomationTake {
+    id: String,
+    name: String,
+    enabled: bool,
+    start_tick: u64,
+    end_tick: u64,
+    lanes: Vec<PlaybackAutomationLane>,
+}
+
+impl PlaybackAutomationTake {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub const fn start_tick(&self) -> u64 {
+        self.start_tick
+    }
+
+    #[must_use]
+    pub const fn end_tick(&self) -> u64 {
+        self.end_tick
+    }
+
+    #[must_use]
+    pub fn lanes(&self) -> &[PlaybackAutomationLane] {
+        &self.lanes
+    }
+}
+
+/// Immutable view of every persisted automation take, including takes whose
+/// `enabled` flag keeps them out of the compiled runtime.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct PlaybackAutomation {
+    takes: Vec<PlaybackAutomationTake>,
+}
+
+impl PlaybackAutomation {
+    #[must_use]
+    pub fn takes(&self) -> &[PlaybackAutomationTake] {
+        &self.takes
+    }
+}
+
+fn retain_automation(
+    loaded: &LoadedAutomationSet,
+) -> Result<PlaybackAutomation, PlaybackSessionAssemblyError> {
+    let mut takes = Vec::new();
+    takes
+        .try_reserve_exact(loaded.takes().len())
+        .map_err(|_| PlaybackSessionAssemblyError::AutomationViewCapacityUnavailable)?;
+    for take in loaded.takes() {
+        let mut lanes = Vec::new();
+        lanes
+            .try_reserve_exact(take.lanes().len())
+            .map_err(|_| PlaybackSessionAssemblyError::AutomationViewCapacityUnavailable)?;
+        for lane in take.lanes() {
+            lanes.push(PlaybackAutomationLane {
+                id: lane.id().to_owned(),
+                target: lane.target(),
+                interpolation: lane.interpolation(),
+                point_count: lane.points().len(),
+            });
+        }
+        takes.push(PlaybackAutomationTake {
+            id: take.id().to_owned(),
+            name: take.name().to_owned(),
+            enabled: take.enabled(),
+            start_tick: take.start_tick(),
+            end_tick: take.end_tick(),
+            lanes,
+        });
+    }
+    Ok(PlaybackAutomation { takes })
+}
+
 #[derive(Debug)]
 pub struct PlaybackArrangement {
     track_names: Vec<String>,
@@ -367,6 +487,16 @@ impl PreparedPlaybackSession {
     #[must_use]
     pub fn shared_arrangement(&self) -> Arc<PlaybackArrangement> {
         Arc::clone(&self.arrangement)
+    }
+
+    #[must_use]
+    pub fn automation_takes(&self) -> &PlaybackAutomation {
+        &self.automation_view
+    }
+
+    #[must_use]
+    pub fn shared_automation_takes(&self) -> Arc<PlaybackAutomation> {
+        Arc::clone(&self.automation_view)
     }
 
     /// Validates a candidate constant gain against the exact immutable decoded
@@ -499,6 +629,7 @@ pub enum PlaybackSessionAssemblyError {
     ArrangementTimeline(FrameTimelineError),
     ArrangementCapacityUnavailable,
     ArrangementMetadataMismatch,
+    AutomationViewCapacityUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -568,6 +699,9 @@ impl fmt::Display for PlaybackSessionAssemblyError {
             Self::ArrangementMetadataMismatch => {
                 formatter.write_str("loaded project arrangement metadata is inconsistent")
             }
+            Self::AutomationViewCapacityUnavailable => {
+                formatter.write_str("published automation take capacity is unavailable")
+            }
         }
     }
 }
@@ -586,7 +720,8 @@ impl Error for PlaybackSessionAssemblyError {
             | Self::DocumentReferenceCapacityUnavailable
             | Self::MediaFactCapacityUnavailable
             | Self::ArrangementCapacityUnavailable
-            | Self::ArrangementMetadataMismatch => None,
+            | Self::ArrangementMetadataMismatch
+            | Self::AutomationViewCapacityUnavailable => None,
         }
     }
 }
@@ -804,7 +939,7 @@ pub fn assemble_playback_session(
     let mixer = loaded_mixer
         .compile_main_graph()
         .map_err(PlaybackSessionAssemblyError::MixerCompile)?;
-    let automation = if has_automation {
+    let (automation, automation_view) = if has_automation {
         let loaded = project
             .load_automation_takes(
                 &loaded_mixer,
@@ -813,13 +948,12 @@ pub fn assemble_playback_session(
                 limits.documents,
             )
             .map_err(PlaybackSessionAssemblyError::Automation)?;
-        Some(
-            project
-                .compile_main_automation(&mixer, &loaded)
-                .map_err(PlaybackSessionAssemblyError::AutomationCompile)?,
-        )
+        let compiled = project
+            .compile_main_automation(&mixer, &loaded)
+            .map_err(PlaybackSessionAssemblyError::AutomationCompile)?;
+        (Some(compiled), retain_automation(&loaded)?)
     } else {
-        None
+        (None, PlaybackAutomation::default())
     };
 
     let graph = project
@@ -838,6 +972,7 @@ pub fn assemble_playback_session(
         media,
         extent,
         arrangement,
+        automation_view: Arc::new(automation_view),
     })
 }
 
@@ -969,6 +1104,24 @@ mod tests {
         assert_eq!(session.sample_rate_hz(), 48_000);
         assert_eq!(session.media_asset_count(), 1);
         assert!(session.has_automation());
+        let takes = session.automation_takes().takes();
+        assert_eq!(takes.len(), 1);
+        assert_eq!(takes[0].id(), "018f47a2-6b2d-7c11-8a44-001122337508");
+        assert_eq!(takes[0].name(), "Pass");
+        assert!(takes[0].enabled());
+        assert_eq!((takes[0].start_tick(), takes[0].end_tick()), (0, 8));
+        assert_eq!(
+            takes[0].lanes()[0],
+            PlaybackAutomationLane {
+                id: "018f47a2-6b2d-7c11-8a44-001122337509".to_owned(),
+                target: AutomationTarget::Channel {
+                    slot: 0,
+                    parameter: hyper_playback_json::AutomationChannelParameter::Gain,
+                },
+                interpolation: AutomationInterpolation::Linear,
+                point_count: 2,
+            }
+        );
         assert_eq!(session.extent(), PlaybackExtent::Bounded { end_frame: 100 });
         let arrangement = session.arrangement();
         assert_eq!(arrangement.track_name(0), Some("Audio"));
