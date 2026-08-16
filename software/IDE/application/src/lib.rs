@@ -10299,6 +10299,144 @@ mod tests {
             }
         );
         assert_eq!(published[0].lanes()[0].point_count(), 2);
+        let (_, _, automation, _) = reopened.session().parts();
+        let compiled = automation.unwrap();
+        assert_eq!(compiled.target_count(), 1);
+        let main_gain = AutomationTarget::Main {
+            parameter: AutomationMainParameter::Gain,
+        };
+        for (frame, expected) in [(0, 1_000_000), (25, 666_667), (75, 0)] {
+            let mut observed = Vec::new();
+            compiled
+                .visit_frame_values(frame, |target, value| observed.push((target, value)))
+                .unwrap();
+            assert_eq!(
+                observed,
+                vec![(main_gain, AutomationValue::Integer(expected))],
+                "frame {frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabling_an_automation_take_removes_it_from_the_compiled_runtime() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let take_id = "018f47a2-6b2d-7c11-8a44-00112233850a";
+        publish_main_gain_automation(&project_path, limits, take_id);
+
+        let opened = hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = opened.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        let source = package.read_resource(take_id).unwrap();
+        let (project, _, _, media) = opened.session().parts();
+        let assets: Vec<_> = media.media_asset_facts().collect();
+        let loaded_mixer = project
+            .load_mixer(&mixer_bytes, &assets, limits.session.documents)
+            .unwrap();
+        let take_bytes = serialize_automation_take_activation(
+            project,
+            &loaded_mixer,
+            &assets,
+            &[&source],
+            take_id,
+            false,
+            limits.session.documents,
+        )
+        .unwrap();
+        drop(opened);
+
+        let outcome = IdeAutomationTakeEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256,
+                resource_id: mixer_id,
+                resource_bytes: mixer_bytes,
+            },
+            take_id: take_id.to_owned(),
+            take_bytes,
+        }
+        .publish()
+        .unwrap();
+        assert!(outcome.changed());
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let published = reopened.session().automation_takes().takes();
+        assert_eq!(published.len(), 1);
+        assert!(!published[0].enabled());
+        let (_, _, automation, _) = reopened.session().parts();
+        assert_eq!(automation.unwrap().target_count(), 0);
+    }
+
+    fn publish_main_gain_automation(
+        project_path: &Path,
+        limits: ProjectPlaybackLimits,
+        take_id: &str,
+    ) {
+        let prepared = hyper_project_loader::prepare_project_playback(project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        let (project, _, _, media) = prepared.session().parts();
+        let assets: Vec<_> = media.media_asset_facts().collect();
+        let loaded_mixer = project
+            .load_mixer(&mixer_bytes, &assets, limits.session.documents)
+            .unwrap();
+        let points = [
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(3, AutomationValue::Integer(0)),
+        ];
+        let take_bytes = serialize_automation_take_addition(
+            project,
+            &loaded_mixer,
+            &assets,
+            &[],
+            AutomationTakeAddition {
+                take_id,
+                lane_id: "018f47a2-6b2d-7c11-8a44-00112233850b",
+                name: "Main fade",
+                captured_at_utc: "2026-08-16T09:30:00.000Z",
+                start_tick: 0,
+                end_tick: 4,
+                target: AutomationTargetSelection::Main {
+                    parameter: AutomationMainParameter::Gain,
+                },
+                interpolation: AutomationInterpolation::Linear,
+                points: &points,
+            },
+            limits.session.documents,
+        )
+        .unwrap();
+        drop(prepared);
+        IdeAutomationTakePublicationPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.to_path_buf(),
+                expected_project_sha256,
+                resource_id: mixer_id,
+                resource_bytes: mixer_bytes,
+            },
+            take_id: take_id.to_owned(),
+            take_bytes,
+        }
+        .publish()
+        .unwrap();
     }
 
     #[test]
