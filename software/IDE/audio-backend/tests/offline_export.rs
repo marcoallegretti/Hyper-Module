@@ -641,3 +641,90 @@ fn a_grouped_and_sent_project_exports_exactly_as_it_plays() {
         "the send pan and channel pan distinguish the channels"
     );
 }
+
+const SCENE: &[u8] = br#"{
+    "format":"hyper-scene","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-00112233750d",
+    "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Verse","order":0,"enabled":true,
+    "launch_quantization":{"mode":"immediate"},
+    "slots":[{
+        "track_id":"018f47a2-6b2d-7c11-8a44-001122337502","action":"play",
+        "clip_id":"018f47a2-6b2d-7c11-8a44-001122337503"
+    }],
+    "extensions":{}
+}"#;
+const SCENE_ARRANGEMENT: &[u8] = br#"{
+    "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337505",
+    "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Main","enabled":true,
+    "placements":[],
+    "scene_launches":[{
+        "id":"018f47a2-6b2d-7c11-8a44-00112233750e","tick":0,
+        "scene_id":"018f47a2-6b2d-7c11-8a44-00112233750d"
+    }],
+    "extensions":{}
+}"#;
+
+/// Audio driven by scene authority rather than a linear placement — the fifth
+/// capability ADR-117 cites when it rejects the flat aligned-source renderer.
+fn scene_session() -> PreparedPlaybackSession {
+    assemble_playback_session(PlaybackSessionAssemblyInput {
+        documents: PlaybackDocumentBytes {
+            project_id: PROJECT_ID.to_owned(),
+            sample_rate_hz: 48_000,
+            timeline: TIMELINE.to_vec(),
+            tracks: vec![TRACK.to_vec()],
+            clips: vec![CLIP.to_vec()],
+            scenes: vec![SCENE.to_vec()],
+            arrangement: Some(SCENE_ARRANGEMENT.to_vec()),
+            mixer: MIXER.to_vec(),
+            automation_takes: Vec::new(),
+        },
+        decoded_assets: vec![DecodedPlaybackAsset::new(
+            "018f47a2-6b2d-7c11-8a44-001122337504".to_owned(),
+            DecodedAudio::from_mono(48_000, (0..100_i16).map(|n| f32::from(n) / 200.0).collect())
+                .unwrap(),
+        )],
+        limits: PlaybackSessionAssemblyLimits {
+            documents: LoaderLimits::VERSION_1,
+            media_cache: CacheLimits {
+                max_assets: 2,
+                max_frames_per_asset: 100,
+                max_decoded_sample_bytes: 800,
+            },
+        },
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_scene_launched_project_exports_exactly_as_it_plays() {
+    let session = scene_session();
+    assert!(
+        session.arrangement().placements().is_empty(),
+        "this project's audio comes from scene authority, not a placement"
+    );
+    assert_eq!(session.arrangement().scene_launches().len(), 1);
+    let rendered = render_project_offline(&session, OfflineExportSpec { block_frames: 32 }).unwrap();
+    assert_eq!(rendered.frame_count(), 100);
+    let expected = render_through_playback(&session, 32);
+
+    let left = rendered.plane(0).unwrap();
+    let right = rendered.plane(1).unwrap();
+    for (index, (expected_left, expected_right)) in
+        expected.iter().take(rendered.frame_count()).enumerate()
+    {
+        assert!(
+            (left[index] - expected_left).abs() < f32::EPSILON,
+            "left frame {index}: export {} playback {expected_left}",
+            left[index]
+        );
+        assert!(
+            (right[index] - expected_right).abs() < f32::EPSILON,
+            "right frame {index}: export {} playback {expected_right}",
+            right[index]
+        );
+    }
+    assert!(
+        left.iter().any(|sample| sample.abs() > 0.0),
+        "the scene launch reaches the main output in the export"
+    );
+}
