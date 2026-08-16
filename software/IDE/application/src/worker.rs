@@ -120,6 +120,7 @@ pub enum IdeWorkerCommandKind {
     Transport,
     Seek,
     LocatePlacement,
+    LocateSceneLaunch,
     Loudness,
     Mixer,
     Monitoring,
@@ -133,6 +134,7 @@ pub enum IdeWorkerCommandKind {
     AddArrangementPlacement,
     AddArrangementSceneLaunch,
     MoveArrangementSceneLaunch,
+    SetArrangementSceneLaunchScene,
     RemoveArrangementSceneLaunch,
     DuplicateArrangementPlacement,
     SplitArrangementPlacement,
@@ -191,6 +193,12 @@ pub enum IdeWorkerCommand {
         index: usize,
         placement_id: String,
     },
+    LocateSceneLaunch {
+        project_id: String,
+        index: usize,
+        launch_id: String,
+        state: LocateState,
+    },
     Loudness(IdeLoudnessCommand),
     Mixer(IdeMixerCommand),
     Monitoring(IdeMonitoringCommand),
@@ -228,6 +236,10 @@ pub enum IdeWorkerCommand {
     MoveArrangementSceneLaunch {
         launch_id: String,
         tick: u64,
+    },
+    SetArrangementSceneLaunchScene {
+        launch_id: String,
+        scene_id: String,
     },
     RemoveArrangementSceneLaunch {
         launch_id: String,
@@ -345,6 +357,7 @@ impl IdeWorkerCommand {
             Self::Transport(_) => IdeWorkerCommandKind::Transport,
             Self::Seek { .. } => IdeWorkerCommandKind::Seek,
             Self::LocatePlacement { .. } => IdeWorkerCommandKind::LocatePlacement,
+            Self::LocateSceneLaunch { .. } => IdeWorkerCommandKind::LocateSceneLaunch,
             Self::Loudness(_) => IdeWorkerCommandKind::Loudness,
             Self::Mixer(_) => IdeWorkerCommandKind::Mixer,
             Self::Monitoring(_) => IdeWorkerCommandKind::Monitoring,
@@ -361,6 +374,9 @@ impl IdeWorkerCommand {
             }
             Self::MoveArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::MoveArrangementSceneLaunch
+            }
+            Self::SetArrangementSceneLaunchScene { .. } => {
+                IdeWorkerCommandKind::SetArrangementSceneLaunchScene
             }
             Self::RemoveArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::RemoveArrangementSceneLaunch
@@ -1071,6 +1087,7 @@ pub enum IdeWorkerCommandFailure {
     ArrangementPlacementAddition(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchAddition(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchMove(Box<IdeArrangementPlacementEditError>),
+    ArrangementSceneLaunchSceneEdit(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchRemoval(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementDuplication(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementSplit(Box<IdeArrangementPlacementEditError>),
@@ -1127,6 +1144,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::ArrangementPlacementAddition(source)
             | Self::ArrangementSceneLaunchAddition(source)
             | Self::ArrangementSceneLaunchMove(source)
+            | Self::ArrangementSceneLaunchSceneEdit(source)
             | Self::ArrangementSceneLaunchRemoval(source)
             | Self::ArrangementPlacementDuplication(source)
             | Self::ArrangementPlacementSplit(source)
@@ -1188,6 +1206,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::ArrangementPlacementAddition(source)
             | Self::ArrangementSceneLaunchAddition(source)
             | Self::ArrangementSceneLaunchMove(source)
+            | Self::ArrangementSceneLaunchSceneEdit(source)
             | Self::ArrangementSceneLaunchRemoval(source)
             | Self::ArrangementPlacementDuplication(source)
             | Self::ArrangementPlacementSplit(source)
@@ -1325,6 +1344,11 @@ pub enum IdeWorkerEvent {
         revision: u64,
         launch_id: String,
         tick: u64,
+    },
+    ArrangementSceneLaunchSceneChanged {
+        revision: u64,
+        launch_id: String,
+        scene_id: String,
     },
     ArrangementSceneLaunchRemoved {
         revision: u64,
@@ -1476,6 +1500,7 @@ pub enum IdeWorkerEvent {
     ArrangementSceneLaunchMoving {
         tick: u64,
     },
+    ArrangementSceneLaunchSceneChanging,
     ArrangementSceneLaunchRemoving,
     ArrangementPlacementDuplicating {
         start_tick: u64,
@@ -1882,6 +1907,10 @@ enum ProjectMutation {
         launch_id: String,
         tick: u64,
     },
+    SetArrangementSceneLaunchScene {
+        launch_id: String,
+        scene_id: String,
+    },
     RemoveArrangementSceneLaunch {
         launch_id: String,
     },
@@ -1983,6 +2012,9 @@ impl ProjectMutation {
             Self::MoveArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::MoveArrangementSceneLaunch
             }
+            Self::SetArrangementSceneLaunchScene { .. } => {
+                IdeWorkerCommandKind::SetArrangementSceneLaunchScene
+            }
             Self::RemoveArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::RemoveArrangementSceneLaunch
             }
@@ -2041,6 +2073,9 @@ impl ProjectMutation {
             }
             Self::MoveArrangementSceneLaunch { tick, .. } => {
                 IdeWorkerEvent::ArrangementSceneLaunchMoving { tick: *tick }
+            }
+            Self::SetArrangementSceneLaunchScene { .. } => {
+                IdeWorkerEvent::ArrangementSceneLaunchSceneChanging
             }
             Self::RemoveArrangementSceneLaunch { .. } => {
                 IdeWorkerEvent::ArrangementSceneLaunchRemoving
@@ -2296,6 +2331,19 @@ fn process_command(
             index,
             placement_id,
         } => process_arrangement_locate_command(state, &project_id, index, &placement_id, events),
+        IdeWorkerCommand::LocateSceneLaunch {
+            project_id,
+            index,
+            launch_id,
+            state: locate_state,
+        } => process_arrangement_scene_launch_locate_command(
+            state,
+            &project_id,
+            index,
+            &launch_id,
+            locate_state,
+            events,
+        ),
         IdeWorkerCommand::Loudness(command) => process_loudness_command(state, command, events),
         IdeWorkerCommand::Mixer(command) => match state {
             WorkerState::Running(application) => match application.try_send_mixer(command) {
@@ -2317,6 +2365,7 @@ fn process_command(
         | IdeWorkerCommand::AddArrangementPlacement { .. }
         | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
+        | IdeWorkerCommand::SetArrangementSceneLaunchScene { .. }
         | IdeWorkerCommand::RemoveArrangementSceneLaunch { .. }
         | IdeWorkerCommand::DuplicateArrangementPlacement { .. }
         | IdeWorkerCommand::SplitArrangementPlacement { .. }
@@ -2432,6 +2481,7 @@ fn process_project_mutation_command(
         command @ (IdeWorkerCommand::AddArrangementPlacement { .. }
         | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
+        | IdeWorkerCommand::SetArrangementSceneLaunchScene { .. }
         | IdeWorkerCommand::RemoveArrangementSceneLaunch { .. }
         | IdeWorkerCommand::DuplicateArrangementPlacement { .. }
         | IdeWorkerCommand::SplitArrangementPlacement { .. }
@@ -2507,6 +2557,10 @@ fn process_arrangement_mutation_command(
         IdeWorkerCommand::MoveArrangementSceneLaunch { launch_id, tick } => {
             move_arrangement_scene_launch(state, events, &launch_id, tick)
         }
+        IdeWorkerCommand::SetArrangementSceneLaunchScene {
+            launch_id,
+            scene_id,
+        } => set_arrangement_scene_launch_scene(state, events, &launch_id, &scene_id),
         IdeWorkerCommand::RemoveArrangementSceneLaunch { launch_id } => {
             remove_arrangement_scene_launch(state, events, &launch_id)
         }
@@ -2835,6 +2889,53 @@ fn process_arrangement_locate_command(
         _ => publish_failure(
             events,
             IdeWorkerCommandKind::LocatePlacement,
+            IdeWorkerCommandFailure::InvalidState,
+        ),
+    }
+}
+
+fn process_arrangement_scene_launch_locate_command(
+    state: &mut WorkerState,
+    project_id: &str,
+    index: usize,
+    launch_id: &str,
+    locate_state: LocateState,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    match state {
+        WorkerState::Running(application) if application.audio_preview_is_active() => {
+            publish_failure(
+                events,
+                IdeWorkerCommandKind::LocateSceneLaunch,
+                IdeWorkerCommandFailure::AudioPreview(IdeAudioPreviewError::Command(
+                    hyper_desktop_audio::DesktopAudioPreviewCommandError::PreviewBusy,
+                )),
+            )
+        }
+        WorkerState::Running(application) => {
+            match application.try_locate_arrangement_scene_launch(
+                project_id,
+                index,
+                launch_id,
+                locate_state,
+            ) {
+                Ok(frame) => send_event(
+                    events,
+                    IdeWorkerEvent::TransportQueued(TransportCommand::Locate {
+                        frame,
+                        state: locate_state,
+                    }),
+                ),
+                Err(reason) => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::LocateSceneLaunch,
+                    IdeWorkerCommandFailure::ArrangementLocate(reason),
+                ),
+            }
+        }
+        _ => publish_failure(
+            events,
+            IdeWorkerCommandKind::LocateSceneLaunch,
             IdeWorkerCommandFailure::InvalidState,
         ),
     }
@@ -3873,6 +3974,52 @@ fn move_arrangement_scene_launch(
     )
 }
 
+fn set_arrangement_scene_launch_scene(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    launch_id: &str,
+    scene_id: &str,
+) -> bool {
+    let launch_id = match own_arrangement_scene_launch_id(launch_id) {
+        Ok(launch_id) => launch_id,
+        Err(reason) => {
+            return publish_failure(
+                events,
+                IdeWorkerCommandKind::SetArrangementSceneLaunchScene,
+                IdeWorkerCommandFailure::ArrangementSceneLaunchSceneEdit(Box::new(reason)),
+            );
+        }
+    };
+    if scene_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SetArrangementSceneLaunchScene,
+            IdeWorkerCommandFailure::ArrangementSceneLaunchSceneEdit(Box::new(
+                IdeArrangementPlacementEditError::InvalidSceneIdentity,
+            )),
+        );
+    }
+    let mut owned_scene_id = String::new();
+    if owned_scene_id.try_reserve_exact(scene_id.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SetArrangementSceneLaunchScene,
+            IdeWorkerCommandFailure::ArrangementSceneLaunchSceneEdit(Box::new(
+                IdeArrangementPlacementEditError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_scene_id.push_str(scene_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::SetArrangementSceneLaunchScene {
+            launch_id,
+            scene_id: owned_scene_id,
+        },
+    )
+}
+
 fn remove_arrangement_scene_launch(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -4751,6 +4898,11 @@ fn project_mutation_save_failure(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::SetArrangementSceneLaunchScene { .. } => {
+            IdeWorkerCommandFailure::ArrangementSceneLaunchSceneEdit(Box::new(
+                IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
+            ))
+        }
         ProjectMutation::RemoveArrangementSceneLaunch { .. } => {
             IdeWorkerCommandFailure::ArrangementSceneLaunchRemoval(Box::new(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
@@ -4939,6 +5091,11 @@ fn project_mutation_native_close_failure(
                 IdeArrangementPlacementEditError::NativeClose(failure),
             ))
         }
+        ProjectMutation::SetArrangementSceneLaunchScene { .. } => {
+            IdeWorkerCommandFailure::ArrangementSceneLaunchSceneEdit(Box::new(
+                IdeArrangementPlacementEditError::NativeClose(failure),
+            ))
+        }
         ProjectMutation::RemoveArrangementSceneLaunch { .. } => {
             IdeWorkerCommandFailure::ArrangementSceneLaunchRemoval(Box::new(
                 IdeArrangementPlacementEditError::NativeClose(failure),
@@ -5064,6 +5221,14 @@ enum ProjectMutationAttempt {
     MoveArrangementSceneLaunch {
         launch_id: String,
         tick: u64,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeArrangementPlacementEditError,
+        >,
+    },
+    SetArrangementSceneLaunchScene {
+        launch_id: String,
+        scene_id: String,
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeArrangementPlacementEditError,
@@ -5622,6 +5787,27 @@ fn complete_project_mutation(
                     reason,
                     IdeWorkerCommandFailure::ArrangementSceneLaunchMove,
                 ),
+                ProjectMutationAttempt::SetArrangementSceneLaunchScene {
+                    launch_id,
+                    scene_id,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::ArrangementSceneLaunchSceneChanged {
+                        revision: outcome.project_revision(),
+                        launch_id,
+                        scene_id,
+                    },
+                ),
+                ProjectMutationAttempt::SetArrangementSceneLaunchScene {
+                    result: Err(reason),
+                    ..
+                } => publish_arrangement_edit_failure(
+                    events,
+                    IdeWorkerCommandKind::SetArrangementSceneLaunchScene,
+                    reason,
+                    IdeWorkerCommandFailure::ArrangementSceneLaunchSceneEdit,
+                ),
                 ProjectMutationAttempt::RemoveArrangementSceneLaunch {
                     launch_id,
                     result: Ok(outcome),
@@ -6129,6 +6315,20 @@ fn attempt_project_mutation(
                 ),
             }
         }
+        ProjectMutation::SetArrangementSceneLaunchScene {
+            launch_id,
+            scene_id,
+        } => ProjectMutationAttempt::SetArrangementSceneLaunchScene {
+            launch_id: launch_id.clone(),
+            scene_id: scene_id.clone(),
+            result: attempt_arrangement_scene_launch_scene_edit(
+                application,
+                recovery,
+                &launch_id,
+                &scene_id,
+                native_failure,
+            ),
+        },
         ProjectMutation::RemoveArrangementSceneLaunch { launch_id } => {
             ProjectMutationAttempt::RemoveArrangementSceneLaunch {
                 launch_id: launch_id.clone(),
@@ -6554,6 +6754,26 @@ fn attempt_arrangement_scene_launch_move(
     .and_then(publish_arrangement_placement_edit_plan)
 }
 
+fn attempt_arrangement_scene_launch_scene_edit(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    launch_id: &str,
+    scene_id: &str,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeArrangementPlacementEditError>
+{
+    if let Some(failure) = native_failure {
+        return Err(IdeArrangementPlacementEditError::NativeClose(failure));
+    }
+    RunningDesktopIdeApplication::prepare_arrangement_scene_launch_scene_edit(
+        application,
+        recovery,
+        launch_id,
+        scene_id,
+    )
+    .and_then(publish_arrangement_placement_edit_plan)
+}
+
 fn attempt_arrangement_scene_launch_removal(
     application: &DesktopIdeApplication,
     recovery: &DesktopPlaybackRecovery,
@@ -6970,6 +7190,13 @@ fn project_mutation_reopen_failure(
                 result,
                 reopen,
                 IdeWorkerCommandFailure::ArrangementSceneLaunchMove,
+            )
+        }
+        ProjectMutationAttempt::SetArrangementSceneLaunchScene { result, .. } => {
+            arrangement_placement_edit_reopen_failure(
+                result,
+                reopen,
+                IdeWorkerCommandFailure::ArrangementSceneLaunchSceneEdit,
             )
         }
         ProjectMutationAttempt::RemoveArrangementSceneLaunch { result, .. } => {
@@ -8768,6 +8995,61 @@ mod tests {
     }
 
     #[test]
+    fn running_worker_locates_and_plays_only_the_current_scene_marker_identity() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                extent: IdePlaybackExtent::Unbounded,
+                arrangement_project_id: "project-a".to_owned(),
+                arrangement_scene_launches: vec![("marker-a".to_owned(), 2_500)],
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 3, 3).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::LocateSceneLaunch {
+                project_id: "project-a".to_owned(),
+                index: 0,
+                launch_id: "stale".to_owned(),
+                state: LocateState::Preserve,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::LocateSceneLaunch,
+                reason: IdeWorkerCommandFailure::ArrangementLocate(
+                    IdeArrangementLocateError::StaleSceneLaunch { requested_index: 0 }
+                ),
+            }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::LocateSceneLaunch {
+                project_id: "project-a".to_owned(),
+                index: 0,
+                launch_id: "marker-a".to_owned(),
+                state: LocateState::Rolling,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::TransportQueued(TransportCommand::Locate {
+                frame: 2_500,
+                state: LocateState::Rolling,
+            })
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
     fn running_worker_queues_typed_loudness_controls_in_order() {
         let running = RunningDesktopIdeApplication {
             application: closed_application(),
@@ -9667,6 +9949,80 @@ mod tests {
             IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::MoveArrangementSceneLaunch,
                 reason: IdeWorkerCommandFailure::ArrangementSceneLaunchMove(reason),
+            } if matches!(reason.as_ref(), IdeArrangementPlacementEditError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn arrangement_scene_launch_scene_edit_validates_identities_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SetArrangementSceneLaunchScene {
+                launch_id: String::new(),
+                scene_id: "scene-a".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetArrangementSceneLaunchScene,
+                reason: IdeWorkerCommandFailure::ArrangementSceneLaunchSceneEdit(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeArrangementPlacementEditError::InvalidSceneLaunchIdentity
+            )
+        ));
+        worker
+            .try_send(IdeWorkerCommand::SetArrangementSceneLaunchScene {
+                launch_id: "marker-a".to_owned(),
+                scene_id: String::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetArrangementSceneLaunchScene,
+                reason: IdeWorkerCommandFailure::ArrangementSceneLaunchSceneEdit(reason),
+            } if matches!(
+                reason.as_ref(),
+                IdeArrangementPlacementEditError::InvalidSceneIdentity
+            )
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SetArrangementSceneLaunchScene {
+                launch_id: "marker-a".to_owned(),
+                scene_id: "scene-a".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ArrangementSceneLaunchSceneChanging
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetArrangementSceneLaunchScene,
+                reason: IdeWorkerCommandFailure::ArrangementSceneLaunchSceneEdit(reason),
             } if matches!(reason.as_ref(), IdeArrangementPlacementEditError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));

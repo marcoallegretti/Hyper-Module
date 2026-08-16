@@ -10,8 +10,8 @@ use hyper_clip_engine::{ClipPlanError, FrameRange, validate_native_clip_gain};
 use hyper_media_cache::{
     CacheBuildError, CacheLimits, DecodedMediaCache, DecodedMediaCacheBuilder, PreparePlaybackError,
 };
-use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::{RecordedSceneExtent, SceneLimits};
+use hyper_playback_compiler::{FrameTimelineError, graph::GraphLimits};
 use hyper_playback_json::{
     AdapterCompileError, AutomationCompileError, CompiledAutomation, CompiledMixerGraph,
     CompiledPlaybackGraph, LoadError, LoadedPlaybackProject, LoaderLimits, MediaAssetFact,
@@ -190,6 +190,7 @@ pub struct PlaybackArrangementSceneLaunch {
     id: String,
     scene_index: usize,
     tick: u64,
+    start_frame: usize,
 }
 
 impl PlaybackArrangementSceneLaunch {
@@ -206,6 +207,11 @@ impl PlaybackArrangementSceneLaunch {
     #[must_use]
     pub const fn tick(&self) -> u64 {
         self.tick
+    }
+
+    #[must_use]
+    pub const fn start_frame(&self) -> usize {
+        self.start_frame
     }
 }
 
@@ -490,6 +496,7 @@ pub enum PlaybackSessionAssemblyError {
     },
     Playback(AdapterCompileError),
     MediaBinding(PreparePlaybackError),
+    ArrangementTimeline(FrameTimelineError),
     ArrangementCapacityUnavailable,
     ArrangementMetadataMismatch,
 }
@@ -549,6 +556,12 @@ impl fmt::Display for PlaybackSessionAssemblyError {
             Self::MediaBinding(source) => {
                 write!(formatter, "playback media binding failed: {source}")
             }
+            Self::ArrangementTimeline(source) => {
+                write!(
+                    formatter,
+                    "arrangement timeline conversion failed: {source}"
+                )
+            }
             Self::ArrangementCapacityUnavailable => {
                 formatter.write_str("playback arrangement capacity is unavailable")
             }
@@ -568,6 +581,7 @@ impl Error for PlaybackSessionAssemblyError {
             Self::MediaCache(source) | Self::MediaAsset { source, .. } => Some(source),
             Self::Playback(source) => Some(source),
             Self::MediaBinding(source) => Some(source),
+            Self::ArrangementTimeline(source) => Some(source),
             Self::DocumentCountLimit { .. }
             | Self::DocumentReferenceCapacityUnavailable
             | Self::MediaFactCapacityUnavailable
@@ -589,6 +603,7 @@ fn try_arrangement_owned(value: &str) -> Result<String, PlaybackSessionAssemblyE
 fn build_playback_arrangement(
     project: &LoadedPlaybackProject,
     schedule: hyper_playback_json::OwnedCompiledSchedule,
+    scene_launch_frames: &[usize],
 ) -> Result<PlaybackArrangement, PlaybackSessionAssemblyError> {
     let mut track_names = Vec::new();
     track_names
@@ -627,7 +642,10 @@ fn build_playback_arrangement(
     scene_launches
         .try_reserve_exact(project.scene_launch_count())
         .map_err(|_| PlaybackSessionAssemblyError::ArrangementCapacityUnavailable)?;
-    for launch_index in 0..project.scene_launch_count() {
+    if scene_launch_frames.len() != project.scene_launch_count() {
+        return Err(PlaybackSessionAssemblyError::ArrangementMetadataMismatch);
+    }
+    for (launch_index, start_frame) in scene_launch_frames.iter().copied().enumerate() {
         scene_launches.push(PlaybackArrangementSceneLaunch {
             id: try_arrangement_owned(
                 project
@@ -640,6 +658,7 @@ fn build_playback_arrangement(
             tick: project
                 .scene_launch_tick_at(launch_index)
                 .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?,
+            start_frame,
         });
     }
 
@@ -685,9 +704,25 @@ fn bind_and_retain_arrangement(
         .prepare_playback(&graph)
         .map_err(PlaybackSessionAssemblyError::MediaBinding)?;
     drop(prepared);
+    let mut scene_launch_frames = Vec::new();
+    scene_launch_frames
+        .try_reserve_exact(project.scene_launch_count())
+        .map_err(|_| PlaybackSessionAssemblyError::ArrangementCapacityUnavailable)?;
+    for launch_index in 0..project.scene_launch_count() {
+        let tick = project
+            .scene_launch_tick_at(launch_index)
+            .ok_or(PlaybackSessionAssemblyError::ArrangementMetadataMismatch)?;
+        scene_launch_frames.push(
+            graph
+                .scene_authority()
+                .tick_to_frame_ceil(tick)
+                .map_err(PlaybackSessionAssemblyError::ArrangementTimeline)?,
+        );
+    }
     Ok(Arc::new(build_playback_arrangement(
         project,
         graph.into_arrangement(),
+        &scene_launch_frames,
     )?))
 }
 

@@ -464,6 +464,17 @@ impl<'resource> CompiledScenePerformance<'resource> {
         self.scenes.get(index).map(|scene| scene.id)
     }
 
+    /// Converts an exact project tick through the same compiled tempo map used
+    /// by recorded and interactive scene scheduling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameTimelineError`] if checked arithmetic fails or the
+    /// resulting frame lies outside the platform range.
+    pub fn tick_to_frame_ceil(&self, tick: u64) -> Result<usize, FrameTimelineError> {
+        self.timeline.tick_to_frame_ceil(tick)
+    }
+
     #[must_use]
     pub fn scene_enabled(&self, index: usize) -> Option<bool> {
         self.scenes.get(index).map(|scene| scene.enabled)

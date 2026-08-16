@@ -66,14 +66,14 @@ use hyper_playback_json::{
     serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
     serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
     serialize_arrangement_scene_launch_addition, serialize_arrangement_scene_launch_move,
-    serialize_arrangement_scene_launch_removal, serialize_audio_clip_activation,
-    serialize_audio_clip_duplication, serialize_audio_clip_fades, serialize_audio_clip_gain,
-    serialize_audio_clip_loop, serialize_audio_clip_rename, serialize_audio_clip_reverse,
-    serialize_audio_clip_source_start, serialize_audio_track_activation,
-    serialize_audio_track_addition, serialize_audio_track_removal, serialize_audio_track_rename,
-    serialize_mixer_base_state, serialize_recording_audio_clip_addition,
-    serialize_scene_activation, serialize_scene_addition, serialize_scene_duplication,
-    serialize_scene_rename, serialize_scene_slot_edit,
+    serialize_arrangement_scene_launch_removal, serialize_arrangement_scene_launch_scene_edit,
+    serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
+    serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_rename,
+    serialize_audio_clip_reverse, serialize_audio_clip_source_start,
+    serialize_audio_track_activation, serialize_audio_track_addition,
+    serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
+    serialize_recording_audio_clip_addition, serialize_scene_activation, serialize_scene_addition,
+    serialize_scene_duplication, serialize_scene_rename, serialize_scene_slot_edit,
 };
 use hyper_playback_session::{
     AudioClipGainValidationError, AudioClipSourceSlipValidationError, PlaybackSessionAssemblyLimits,
@@ -1547,6 +1547,7 @@ pub enum IdeArrangementLocateError {
     Unavailable,
     StaleProject,
     StalePlacement { requested_index: usize },
+    StaleSceneLaunch { requested_index: usize },
     Send(DesktopDirectControlError),
 }
 
@@ -1604,6 +1605,10 @@ impl fmt::Display for IdeArrangementLocateError {
                 formatter,
                 "arrangement placement {requested_index} is no longer current"
             ),
+            Self::StaleSceneLaunch { requested_index } => write!(
+                formatter,
+                "arrangement scene marker {requested_index} is no longer current"
+            ),
             Self::Send(source) => source.fmt(formatter),
         }
     }
@@ -1613,7 +1618,10 @@ impl Error for IdeArrangementLocateError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Send(source) => Some(source),
-            Self::Unavailable | Self::StaleProject | Self::StalePlacement { .. } => None,
+            Self::Unavailable
+            | Self::StaleProject
+            | Self::StalePlacement { .. }
+            | Self::StaleSceneLaunch { .. } => None,
         }
     }
 }
@@ -4982,6 +4990,7 @@ struct TestPlaybackSession {
     extent: IdePlaybackExtent,
     arrangement_project_id: String,
     arrangement_placements: Vec<(String, usize)>,
+    arrangement_scene_launches: Vec<(String, usize)>,
 }
 
 #[cfg(test)]
@@ -5000,6 +5009,7 @@ impl Default for TestPlaybackSession {
             extent: IdePlaybackExtent::Bounded { end_frame: 0 },
             arrangement_project_id: String::new(),
             arrangement_placements: Vec::new(),
+            arrangement_scene_launches: Vec::new(),
         }
     }
 }
@@ -5698,6 +5708,23 @@ impl RunningDesktopIdeApplication {
             |project, assets, source, limits| {
                 serialize_arrangement_scene_launch_move(
                     project, assets, source, launch_id, tick, limits,
+                )
+            },
+        )
+    }
+
+    fn prepare_arrangement_scene_launch_scene_edit(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        launch_id: &str,
+        scene_id: &str,
+    ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        Self::prepare_arrangement_scene_launch_edit(
+            application,
+            recovery,
+            |project, assets, source, limits| {
+                serialize_arrangement_scene_launch_scene_edit(
+                    project, assets, source, launch_id, scene_id, limits,
                 )
             },
         )
@@ -6731,6 +6758,70 @@ impl RunningDesktopIdeApplication {
         Ok(frame)
     }
 
+    /// Locates to one exact compiled scene-marker frame after validating the
+    /// immutable project and marker identities published to the UI.
+    ///
+    /// The requested locate state can preserve, stop, or start transport in
+    /// the same bounded command, so play-from-marker has no intermediate seek
+    /// state visible to the audio thread.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unavailable project authority, stale project or marker
+    /// identities, and command delivery failures without queueing a locate.
+    pub fn try_locate_arrangement_scene_launch(
+        &mut self,
+        project_id: &str,
+        index: usize,
+        launch_id: &str,
+        state: LocateState,
+    ) -> Result<usize, IdeArrangementLocateError> {
+        let frame = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => {
+                let prepared = session
+                    .prepared_project()
+                    .ok_or(IdeArrangementLocateError::Unavailable)?;
+                if prepared.session().project_id() != project_id {
+                    return Err(IdeArrangementLocateError::StaleProject);
+                }
+                let launch = prepared
+                    .session()
+                    .arrangement()
+                    .scene_launches()
+                    .get(index)
+                    .ok_or(IdeArrangementLocateError::StaleSceneLaunch {
+                        requested_index: index,
+                    })?;
+                if launch.id() != launch_id {
+                    return Err(IdeArrangementLocateError::StaleSceneLaunch {
+                        requested_index: index,
+                    });
+                }
+                launch.start_frame()
+            }
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => {
+                if session.arrangement_project_id != project_id {
+                    return Err(IdeArrangementLocateError::StaleProject);
+                }
+                let (current_id, frame) = session.arrangement_scene_launches.get(index).ok_or(
+                    IdeArrangementLocateError::StaleSceneLaunch {
+                        requested_index: index,
+                    },
+                )?;
+                if current_id != launch_id {
+                    return Err(IdeArrangementLocateError::StaleSceneLaunch {
+                        requested_index: index,
+                    });
+                }
+                *frame
+            }
+        };
+        self.try_send_transport(TransportCommand::Locate { frame, state })
+            .map_err(IdeArrangementLocateError::Send)?;
+        Ok(frame)
+    }
+
     /// Sends one validated base-mixer command through the only live owner.
     ///
     /// # Errors
@@ -7426,6 +7517,7 @@ mod tests {
     const ARRANGEMENT_TEST_PLACEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338506";
     const ARRANGEMENT_TEST_MIXER_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338507";
     const ARRANGEMENT_TEST_SCENE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338508";
+    const ARRANGEMENT_TEST_SECOND_SCENE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122338510";
 
     struct ArrangementProjectFixture {
         directory: TestDirectory,
@@ -7463,6 +7555,10 @@ mod tests {
             Self::new().add_scene()
         }
 
+        fn with_two_scenes() -> Self {
+            Self::with_scene().add_second_scene()
+        }
+
         fn with_scene_without_arrangement() -> Self {
             Self::without_arrangement().add_scene()
         }
@@ -7489,6 +7585,35 @@ mod tests {
                     ARRANGEMENT_TEST_SCENE_ID,
                     "scene",
                     "scenes/intro.json",
+                    &scene_bytes,
+                ));
+            std::fs::write(manifest_path, arrangement_test_canonical(&manifest)).unwrap();
+            hyper_storage_engine::verify_project_package(&fixture.directory.0).unwrap();
+            fixture
+        }
+
+        fn add_second_scene(self) -> Self {
+            let fixture = self;
+            let scene = json!({
+                "format":"hyper-scene", "format_version":1,
+                "id":ARRANGEMENT_TEST_SECOND_SCENE_ID,
+                "project_id":ARRANGEMENT_TEST_PROJECT_ID,
+                "name":"Chorus", "order":1, "enabled":true,
+                "launch_quantization":{"mode":"immediate"},
+                "slots":[], "extensions":{"com.hyper.fixture":"preserve-second"}
+            });
+            let scene_bytes = arrangement_test_canonical(&scene);
+            arrangement_test_write(&fixture.directory.0, "scenes/chorus.json", &scene_bytes);
+            let manifest_path = fixture.directory.0.join("project.json");
+            let mut manifest: Value =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            manifest["resources"]
+                .as_array_mut()
+                .unwrap()
+                .push(arrangement_test_descriptor(
+                    ARRANGEMENT_TEST_SECOND_SCENE_ID,
+                    "scene",
+                    "scenes/chorus.json",
                     &scene_bytes,
                 ));
             std::fs::write(manifest_path, arrangement_test_canonical(&manifest)).unwrap();
@@ -9527,10 +9652,10 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one integration test keeps scene-marker add, move, removal, and each durable reopen together"
+        reason = "one integration test keeps scene-marker add, move, reassignment, removal, and each durable reopen together"
     )]
     fn arrangement_scene_launch_edits_publish_and_reopen_exactly() {
-        let fixture = ArrangementProjectFixture::with_scene();
+        let fixture = ArrangementProjectFixture::with_two_scenes();
         let project_path = fixture.root().to_path_buf();
         let limits = desktop_ide_application_config().unwrap().project_limits();
         let prepared =
@@ -9591,6 +9716,7 @@ mod tests {
         assert_eq!(published.scene_launches().len(), 1);
         assert_eq!(published.scene_launches()[0].id(), launch_id);
         assert_eq!(published.scene_launches()[0].tick(), 4);
+        assert_eq!(published.scene_launches()[0].start_frame(), 100);
         assert_eq!(published.scene_name(0), Some("Intro"));
 
         let package = reopened.package();
@@ -9637,6 +9763,66 @@ mod tests {
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
         let arrangement = reopened.session().arrangement();
         assert_eq!(arrangement.scene_launches()[0].tick(), 7);
+        assert_eq!(arrangement.scene_launches()[0].start_frame(), 175);
+        assert_arrangement_fixture_placement_is_unchanged(arrangement);
+        assert_eq!(
+            reopened
+                .package()
+                .read_resource(&original_mixer_id)
+                .unwrap(),
+            original_mixer_bytes
+        );
+        let package = reopened.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let source_arrangement = package.read_resource(ARRANGEMENT_TEST_RESOURCE_ID).unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        let (project, _, _, media) = reopened.session().parts();
+        let assets: Vec<_> = media.media_asset_facts().collect();
+        let reassigned_arrangement = serialize_arrangement_scene_launch_scene_edit(
+            project,
+            &assets,
+            &source_arrangement,
+            launch_id,
+            ARRANGEMENT_TEST_SECOND_SCENE_ID,
+            limits.session.documents,
+        )
+        .unwrap();
+        drop(reopened);
+
+        let reassigned = IdeArrangementPlacementEditPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256,
+                resource_id: mixer_id,
+                resource_bytes: mixer_bytes,
+            },
+            arrangement_id: ARRANGEMENT_TEST_RESOURCE_ID.to_owned(),
+            arrangement_bytes: reassigned_arrangement,
+            addition: false,
+            created_placement_id: None,
+        }
+        .publish()
+        .unwrap();
+        assert_eq!(reassigned.project_revision(), 4);
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let loaded = reopened.session().parts().0;
+        assert_eq!(loaded.scene_launch_id_at(0), Some(launch_id));
+        assert_eq!(loaded.scene_launch_tick_at(0), Some(7));
+        assert_eq!(loaded.scene_launch_scene_index_at(0), Some(1));
+        let arrangement = reopened.session().arrangement();
+        assert_eq!(arrangement.scene_launches()[0].id(), launch_id);
+        assert_eq!(arrangement.scene_launches()[0].tick(), 7);
+        assert_eq!(arrangement.scene_launches()[0].start_frame(), 175);
+        assert_eq!(arrangement.scene_name(1), Some("Chorus"));
         assert_arrangement_fixture_placement_is_unchanged(arrangement);
         assert_eq!(
             reopened
@@ -9682,7 +9868,7 @@ mod tests {
         }
         .publish()
         .unwrap();
-        assert_eq!(removed.project_revision(), 4);
+        assert_eq!(removed.project_revision(), 5);
 
         let reopened =
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
@@ -10607,7 +10793,7 @@ mod tests {
     }
 
     #[test]
-    fn arrangement_locate_validates_identity_and_works_with_unbounded_scene_authority() {
+    fn arrangement_navigation_validates_identity_and_uses_exact_compiled_frames() {
         let application = DesktopIdeApplication::from_inventory(
             config(256).unwrap(),
             IdeAudioOutputInventory::default(),
@@ -10618,6 +10804,7 @@ mod tests {
                 extent: IdePlaybackExtent::Unbounded,
                 arrangement_project_id: "project-a".to_owned(),
                 arrangement_placements: vec![("placement-a".to_owned(), 480)],
+                arrangement_scene_launches: vec![("marker-a".to_owned(), 960)],
                 ..TestPlaybackSession::default()
             }),
         };
@@ -10635,15 +10822,50 @@ mod tests {
                 .unwrap(),
             480
         );
+        assert!(matches!(
+            running.try_locate_arrangement_scene_launch(
+                "project-b",
+                0,
+                "marker-a",
+                LocateState::Preserve,
+            ),
+            Err(IdeArrangementLocateError::StaleProject)
+        ));
+        assert!(matches!(
+            running.try_locate_arrangement_scene_launch(
+                "project-a",
+                0,
+                "stale-marker",
+                LocateState::Preserve,
+            ),
+            Err(IdeArrangementLocateError::StaleSceneLaunch { requested_index: 0 })
+        ));
+        assert_eq!(
+            running
+                .try_locate_arrangement_scene_launch(
+                    "project-a",
+                    0,
+                    "marker-a",
+                    LocateState::Rolling,
+                )
+                .unwrap(),
+            960
+        );
         let IdePlaybackSessionOwner::Test(session) = &running.session else {
             unreachable!("test constructed the deterministic session owner");
         };
         assert_eq!(
             session.commands,
-            [TransportCommand::Locate {
-                frame: 480,
-                state: LocateState::Preserve,
-            }]
+            [
+                TransportCommand::Locate {
+                    frame: 480,
+                    state: LocateState::Preserve,
+                },
+                TransportCommand::Locate {
+                    frame: 960,
+                    state: LocateState::Rolling,
+                }
+            ]
         );
     }
 
