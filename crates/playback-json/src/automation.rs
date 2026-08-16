@@ -2,13 +2,16 @@ use core::error::Error;
 use core::fmt;
 
 use hyper_playback_compiler::{FrameTickPosition, FrameTimeline, FrameTimelineError};
+use hyper_project_model::is_valid_entity_id;
 use serde::Deserialize;
+use serde_json::json;
 
 use super::{
     CollectionLimit, CompiledMixerGraph, DocumentKind, DocumentLocation, ExtensionsDocument,
-    LoadError, LoadedMixer, LoadedPlaybackProject, LoaderLimits, MediaAssetFact, TrackKind,
-    capacity_error, domain_error, enforce_loader_limit, parse_document, project_contains_identity,
-    validate_contract_document, validate_entity_reference, validate_header,
+    LoadError, LoadedMixer, LoadedPlaybackProject, LoaderLimits, MediaAssetFact,
+    MixerCompileError, TrackKind, capacity_error, domain_error, enforce_loader_limit,
+    parse_document, project_contains_identity, validate_contract_document,
+    validate_entity_reference, validate_header,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -83,6 +86,11 @@ pub struct AutomationPoint {
 }
 
 impl AutomationPoint {
+    #[must_use]
+    pub const fn new(tick: u64, value: AutomationValue) -> Self {
+        Self { tick, value }
+    }
+
     #[must_use]
     pub const fn tick(self) -> u64 {
         self.tick
@@ -535,6 +543,237 @@ impl LoadedPlaybackProject {
             timeline,
             targets,
         })
+    }
+}
+
+/// One mixer parameter an authored automation lane may drive.
+///
+/// Cue targets are absent because the main-output runtime rejects them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutomationTargetSelection<'a> {
+    Channel {
+        track_id: &'a str,
+        parameter: AutomationChannelParameter,
+    },
+    Send {
+        send_id: &'a str,
+        parameter: AutomationSendParameter,
+    },
+    Main {
+        parameter: AutomationMainParameter,
+    },
+}
+
+/// One authored automation take holding exactly one lane.
+#[derive(Clone, Copy, Debug)]
+pub struct AutomationTakeAddition<'a> {
+    pub take_id: &'a str,
+    pub lane_id: &'a str,
+    pub name: &'a str,
+    pub captured_at_utc: &'a str,
+    pub start_tick: u64,
+    pub end_tick: u64,
+    pub target: AutomationTargetSelection<'a>,
+    pub interpolation: AutomationInterpolation,
+    pub points: &'a [AutomationPoint],
+}
+
+#[derive(Debug)]
+pub enum AutomationTakeAdditionSerializationError {
+    TakeCapacity,
+    InvalidTakeIdentity,
+    InvalidLaneIdentity,
+    InvalidTakeName,
+    InvalidInterval,
+    EmptyLane,
+    Source(LoadError),
+    Serialization(serde_json::Error),
+    MixerCompilation(MixerCompileError),
+    AutomationCompilation(AutomationCompileError),
+}
+
+impl fmt::Display for AutomationTakeAdditionSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TakeCapacity => formatter.write_str("the automation take capacity is exhausted"),
+            Self::InvalidTakeIdentity => {
+                formatter.write_str("the new automation take identity is invalid or collides")
+            }
+            Self::InvalidLaneIdentity => {
+                formatter.write_str("the new automation lane identity is invalid or collides")
+            }
+            Self::InvalidTakeName => {
+                formatter.write_str("the automation take name is outside the version-1 domain")
+            }
+            Self::InvalidInterval => {
+                formatter.write_str("the automation interval is empty or exceeds the tick domain")
+            }
+            Self::EmptyLane => formatter.write_str("the automation lane declares no points"),
+            Self::Source(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::MixerCompilation(source) => source.fmt(formatter),
+            Self::AutomationCompilation(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AutomationTakeAdditionSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::MixerCompilation(source) => Some(source),
+            Self::AutomationCompilation(source) => Some(source),
+            Self::TakeCapacity
+            | Self::InvalidTakeIdentity
+            | Self::InvalidLaneIdentity
+            | Self::InvalidTakeName
+            | Self::InvalidInterval
+            | Self::EmptyLane => None,
+        }
+    }
+}
+
+/// Creates one canonical enabled automation take that drives a single verified
+/// mixer target across an explicit half-open tick interval.
+///
+/// `existing_takes` must be the project's complete canonical automation set so
+/// identity collisions and enabled-interval overlaps are decided against every
+/// active take. The candidate is accepted only after the complete set reloads
+/// and compiles against the committed mixer graph.
+///
+/// # Errors
+///
+/// Returns a classified rejection for exhausted capacity, invalid or colliding
+/// identities, an invalid name or interval, an empty lane, a document the
+/// loader rejects, or a candidate set that cannot compile.
+pub fn serialize_automation_take_addition(
+    project: &LoadedPlaybackProject,
+    mixer: &LoadedMixer,
+    assets: &[MediaAssetFact<'_>],
+    existing_takes: &[&[u8]],
+    request: AutomationTakeAddition<'_>,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AutomationTakeAdditionSerializationError> {
+    if existing_takes.len() >= limits.max_automation_documents {
+        return Err(AutomationTakeAdditionSerializationError::TakeCapacity);
+    }
+    if !is_valid_entity_id(request.take_id)
+        || identity_collides(project, mixer, assets, "", request.take_id)
+    {
+        return Err(AutomationTakeAdditionSerializationError::InvalidTakeIdentity);
+    }
+    if !is_valid_entity_id(request.lane_id)
+        || request.lane_id == request.take_id
+        || identity_collides(project, mixer, assets, "", request.lane_id)
+    {
+        return Err(AutomationTakeAdditionSerializationError::InvalidLaneIdentity);
+    }
+    let name_length = request.name.chars().count();
+    if request.name.trim() != request.name
+        || !(1..=super::MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length)
+    {
+        return Err(AutomationTakeAdditionSerializationError::InvalidTakeName);
+    }
+    if request.start_tick >= request.end_tick || request.end_tick > super::MAX_SAFE_INTEGER {
+        return Err(AutomationTakeAdditionSerializationError::InvalidInterval);
+    }
+    if request.points.is_empty() {
+        return Err(AutomationTakeAdditionSerializationError::EmptyLane);
+    }
+    let target = match request.target {
+        AutomationTargetSelection::Channel {
+            track_id,
+            parameter,
+        } => json!({
+            "kind": "mixer-channel",
+            "track_id": track_id,
+            "parameter": channel_parameter_name(parameter),
+        }),
+        AutomationTargetSelection::Send {
+            send_id,
+            parameter,
+        } => json!({
+            "kind": "mixer-send",
+            "send_id": send_id,
+            "parameter": send_parameter_name(parameter),
+        }),
+        AutomationTargetSelection::Main { parameter } => json!({
+            "kind": "mixer-main",
+            "parameter": main_parameter_name(parameter),
+        }),
+    };
+    let mut points = Vec::new();
+    points
+        .try_reserve_exact(request.points.len())
+        .map_err(|_| AutomationTakeAdditionSerializationError::Source(capacity_error()))?;
+    for point in request.points {
+        points.push(match point.value {
+            AutomationValue::Integer(value) => json!({"tick": point.tick, "value": value}),
+            AutomationValue::Boolean(value) => json!({"tick": point.tick, "value": value}),
+        });
+    }
+    let output = serde_json_canonicalizer::to_vec(&json!({
+        "format": "hyper-automation-take",
+        "format_version": 1,
+        "id": request.take_id,
+        "project_id": project.project_id(),
+        "name": request.name,
+        "enabled": true,
+        "captured_at_utc": request.captured_at_utc,
+        "start_tick": request.start_tick,
+        "end_tick": request.end_tick,
+        "lanes": [{
+            "id": request.lane_id,
+            "target": target,
+            "interpolation": match request.interpolation {
+                AutomationInterpolation::Hold => "hold",
+                AutomationInterpolation::Linear => "linear",
+            },
+            "points": points,
+        }],
+        "extensions": {}
+    }))
+    .map_err(AutomationTakeAdditionSerializationError::Serialization)?;
+    let mut documents = Vec::new();
+    documents
+        .try_reserve_exact(existing_takes.len() + 1)
+        .map_err(|_| AutomationTakeAdditionSerializationError::Source(capacity_error()))?;
+    documents.extend_from_slice(existing_takes);
+    documents.push(&output);
+    let candidate = project
+        .load_automation_takes(mixer, assets, &documents, limits)
+        .map_err(AutomationTakeAdditionSerializationError::Source)?;
+    let graph = mixer
+        .compile_main_graph()
+        .map_err(AutomationTakeAdditionSerializationError::MixerCompilation)?;
+    project
+        .compile_main_automation(&graph, &candidate)
+        .map_err(AutomationTakeAdditionSerializationError::AutomationCompilation)?;
+    Ok(output)
+}
+
+const fn channel_parameter_name(parameter: AutomationChannelParameter) -> &'static str {
+    match parameter {
+        AutomationChannelParameter::Gain => "gain",
+        AutomationChannelParameter::Pan => "pan",
+        AutomationChannelParameter::Mute => "mute",
+        AutomationChannelParameter::Solo => "solo",
+    }
+}
+
+const fn send_parameter_name(parameter: AutomationSendParameter) -> &'static str {
+    match parameter {
+        AutomationSendParameter::Gain => "gain",
+        AutomationSendParameter::Pan => "pan",
+        AutomationSendParameter::Enabled => "enabled",
+    }
+}
+
+const fn main_parameter_name(parameter: AutomationMainParameter) -> &'static str {
+    match parameter {
+        AutomationMainParameter::Gain => "gain",
+        AutomationMainParameter::Mute => "mute",
     }
 }
 

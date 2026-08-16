@@ -6,8 +6,9 @@ mod automation;
 pub use automation::{
     AutomationChannelParameter, AutomationCompileError, AutomationEvaluationError,
     AutomationInterpolation, AutomationLane, AutomationMainParameter, AutomationPoint,
-    AutomationSendParameter, AutomationTake, AutomationTarget, AutomationValue, CompiledAutomation,
-    LoadedAutomationSet,
+    AutomationSendParameter, AutomationTake, AutomationTakeAddition,
+    AutomationTakeAdditionSerializationError, AutomationTarget, AutomationTargetSelection,
+    AutomationValue, CompiledAutomation, LoadedAutomationSet, serialize_automation_take_addition,
 };
 
 use core::error::Error;
@@ -12119,6 +12120,370 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn automation_take_addition_serializes_one_verified_lane() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer = loaded
+            .load_mixer(MIXER, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+        let points = [
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(4, AutomationValue::Integer(0)),
+        ];
+        let request = AutomationTakeAddition {
+            take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0",
+            lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a1",
+            name: "Fade out",
+            captured_at_utc: "2026-08-16T09:30:00.000Z",
+            start_tick: 0,
+            end_tick: 8,
+            target: AutomationTargetSelection::Channel {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456",
+                parameter: AutomationChannelParameter::Gain,
+            },
+            interpolation: AutomationInterpolation::Linear,
+            points: &points,
+        };
+        let document = serialize_automation_take_addition(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[],
+            request,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let reloaded = loaded
+            .load_automation_takes(
+                &mixer,
+                &asset_facts(),
+                &[&document],
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap();
+        let take = &reloaded.takes()[0];
+        assert_eq!(take.id(), "018f47a2-6b2d-7c11-8a44-0011223344a0");
+        assert_eq!(take.name(), "Fade out");
+        assert!(take.enabled());
+        assert_eq!((take.start_tick(), take.end_tick()), (0, 8));
+        let lane = &take.lanes()[0];
+        assert_eq!(
+            lane.target(),
+            AutomationTarget::Channel {
+                slot: 0,
+                parameter: AutomationChannelParameter::Gain,
+            }
+        );
+        assert_eq!(lane.value_at(2), Ok(AutomationValue::Integer(500_000)));
+        assert_eq!(lane.value_at(6), Ok(AutomationValue::Integer(0)));
+
+        let second_points = [AutomationPoint::new(9, AutomationValue::Boolean(true))];
+        let second = serialize_automation_take_addition(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[&document],
+            AutomationTakeAddition {
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a2",
+                lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a3",
+                name: "Main mute",
+                captured_at_utc: "2026-08-16T09:31:00.000Z",
+                start_tick: 8,
+                end_tick: 16,
+                target: AutomationTargetSelection::Main {
+                    parameter: AutomationMainParameter::Mute,
+                },
+                interpolation: AutomationInterpolation::Hold,
+                points: &second_points,
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let both = loaded
+            .load_automation_takes(
+                &mixer,
+                &asset_facts(),
+                &[&document, &second],
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap();
+        assert_eq!(both.takes().len(), 2);
+        assert_eq!(
+            both.takes()[1].lanes()[0].target(),
+            AutomationTarget::Main {
+                parameter: AutomationMainParameter::Mute,
+            }
+        );
+    }
+
+    #[test]
+    fn automation_take_addition_classifies_request_rejections() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer = loaded
+            .load_mixer(MIXER, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+        let points = [
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(4, AutomationValue::Integer(0)),
+        ];
+        let accepted = automation_take_request(&points);
+        let classified: [(AutomationTakeAddition<'_>, AutomationRejectionCheck); 5] = [
+            (
+                AutomationTakeAddition {
+                    take_id: "018f47a2-6b2d-7c11-8a44-001122334456",
+                    ..accepted
+                },
+                |error| {
+                    matches!(
+                        error,
+                        AutomationTakeAdditionSerializationError::InvalidTakeIdentity
+                    )
+                },
+            ),
+            (
+                AutomationTakeAddition {
+                    lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a0",
+                    ..accepted
+                },
+                |error| {
+                    matches!(
+                        error,
+                        AutomationTakeAdditionSerializationError::InvalidLaneIdentity
+                    )
+                },
+            ),
+            (
+                AutomationTakeAddition {
+                    name: " Fade",
+                    ..accepted
+                },
+                |error| {
+                    matches!(
+                        error,
+                        AutomationTakeAdditionSerializationError::InvalidTakeName
+                    )
+                },
+            ),
+            (
+                AutomationTakeAddition {
+                    start_tick: 8,
+                    ..accepted
+                },
+                |error| {
+                    matches!(
+                        error,
+                        AutomationTakeAdditionSerializationError::InvalidInterval
+                    )
+                },
+            ),
+            (
+                AutomationTakeAddition {
+                    points: &[],
+                    ..accepted
+                },
+                |error| matches!(error, AutomationTakeAdditionSerializationError::EmptyLane),
+            ),
+        ];
+        for (request, expected) in classified {
+            let error = serialize_automation_take_addition(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[],
+                request,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap_err();
+            assert!(expected(&error), "{error}");
+        }
+    }
+
+    #[test]
+    fn automation_take_addition_defers_to_the_loader_domain() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer = loaded
+            .load_mixer(MIXER, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+        let points = [
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(4, AutomationValue::Integer(0)),
+        ];
+        let accepted = automation_take_request(&points);
+        let committed = serialize_automation_take_addition(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[],
+            accepted,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let boolean_points = [AutomationPoint::new(0, AutomationValue::Boolean(true))];
+        let out_of_interval = [AutomationPoint::new(8, AutomationValue::Integer(0))];
+        let unordered = [
+            AutomationPoint::new(4, AutomationValue::Integer(0)),
+            AutomationPoint::new(1, AutomationValue::Integer(0)),
+        ];
+        let out_of_domain = [AutomationPoint::new(0, AutomationValue::Integer(2_000_001))];
+        let rejected: [AutomationTakeAddition<'_>; 5] = [
+            AutomationTakeAddition {
+                points: &out_of_interval,
+                ..accepted
+            },
+            AutomationTakeAddition {
+                points: &unordered,
+                ..accepted
+            },
+            AutomationTakeAddition {
+                points: &out_of_domain,
+                ..accepted
+            },
+            AutomationTakeAddition {
+                target: AutomationTargetSelection::Channel {
+                    track_id: "018f47a2-6b2d-7c11-8a44-001122334456",
+                    parameter: AutomationChannelParameter::Mute,
+                },
+                points: &boolean_points,
+                ..accepted
+            },
+            AutomationTakeAddition {
+                target: AutomationTargetSelection::Channel {
+                    track_id: "018f47a2-6b2d-7c11-8a44-0011223344ff",
+                    parameter: AutomationChannelParameter::Gain,
+                },
+                ..accepted
+            },
+        ];
+        for request in rejected {
+            let error = serialize_automation_take_addition(
+                &loaded,
+                &mixer,
+                &asset_facts(),
+                &[],
+                request,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, AutomationTakeAdditionSerializationError::Source(_)),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn automation_take_addition_rejects_overlap_and_capacity() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer = loaded
+            .load_mixer(MIXER, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+        let points = [
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(4, AutomationValue::Integer(0)),
+        ];
+        let accepted = automation_take_request(&points);
+        let committed = serialize_automation_take_addition(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[],
+            accepted,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let overlapping = serialize_automation_take_addition(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[&committed],
+            AutomationTakeAddition {
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a2",
+                lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a3",
+                start_tick: 4,
+                end_tick: 12,
+                ..accepted
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                overlapping,
+                AutomationTakeAdditionSerializationError::Source(_)
+            ),
+            "{overlapping}"
+        );
+
+        let mut exhausted = LoaderLimits::VERSION_1;
+        exhausted.max_automation_documents = 1;
+        let capacity = serialize_automation_take_addition(
+            &loaded,
+            &mixer,
+            &asset_facts(),
+            &[&committed],
+            AutomationTakeAddition {
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a2",
+                lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a3",
+                start_tick: 16,
+                end_tick: 24,
+                points: &[AutomationPoint::new(16, AutomationValue::Integer(0))],
+                ..accepted
+            },
+            exhausted,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                capacity,
+                AutomationTakeAdditionSerializationError::TakeCapacity
+            ),
+            "{capacity}"
+        );
+    }
+
+    type AutomationRejectionCheck = fn(&AutomationTakeAdditionSerializationError) -> bool;
+
+    fn automation_take_request(points: &[AutomationPoint]) -> AutomationTakeAddition<'_> {
+        AutomationTakeAddition {
+            take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0",
+            lane_id: "018f47a2-6b2d-7c11-8a44-0011223344a1",
+            name: "Fade out",
+            captured_at_utc: "2026-08-16T09:30:00.000Z",
+            start_tick: 0,
+            end_tick: 8,
+            target: AutomationTargetSelection::Channel {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456",
+                parameter: AutomationChannelParameter::Gain,
+            },
+            interpolation: AutomationInterpolation::Linear,
+            points,
+        }
     }
 
     fn assert_automation_schema_domain_rejections(
