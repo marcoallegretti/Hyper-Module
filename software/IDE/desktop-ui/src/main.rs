@@ -1515,6 +1515,10 @@ fn bind_arrangement_scene_launch_callback(
     bind_arrangement_scene_launch_removal_callback(ui, worker, project_state);
 }
 
+#[allow(
+    clippy::redundant_closure_for_method_calls,
+    reason = "the public return type is owned by a transitive crate that this binary does not link directly"
+)]
 fn bind_arrangement_scene_launch_locate_callback(
     ui: &MainWindow,
     worker: &WorkerCell,
@@ -1528,41 +1532,63 @@ fn bind_arrangement_scene_launch_locate_callback(
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        if ui.get_app_mode() != AppMode::Running {
-            ui.set_error_text("Scene-marker locate is unavailable in the current state".into());
-            return;
-        }
-        let Ok(index) = usize::try_from(index) else {
-            ui.set_error_text("The selected scene marker is no longer available".into());
-            return;
-        };
         let state = project_state_for_locate.arrangement.borrow();
         let Some(binding) = state.as_ref() else {
             ui.set_error_text("Arrangement scene-marker authority is no longer available".into());
             return;
         };
-        if binding
-            .owner
-            .scene_launches()
-            .get(index)
-            .is_none_or(|launch| launch.id() != launch_id.as_str())
-        {
-            ui.set_error_text("The selected scene marker is no longer available".into());
-            return;
-        }
-        let command = IdeWorkerCommand::LocateSceneLaunch {
-            project_id: binding.project_id.clone(),
+        let current_launch_id = usize::try_from(index).ok().and_then(|index| {
+            binding
+                .owner
+                .scene_launches()
+                .get(index)
+                .map(|launch| launch.id())
+        });
+        let command = match arrangement_scene_launch_locate_command(
+            ui.get_app_mode(),
+            binding.project_id.as_str(),
             index,
-            launch_id: launch_id.to_string(),
-            state: if play {
-                LocateState::Rolling
-            } else {
-                LocateState::Preserve
-            },
+            launch_id.as_str(),
+            current_launch_id,
+            play,
+        ) {
+            Ok(command) => command,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
         };
         drop(state);
         submit_to_ui(&ui, &worker_for_locate, command);
     });
+}
+
+fn arrangement_scene_launch_locate_command(
+    app_mode: AppMode,
+    project_id: &str,
+    index: i32,
+    requested_launch_id: &str,
+    current_launch_id: Option<&str>,
+    play: bool,
+) -> Result<IdeWorkerCommand, &'static str> {
+    if app_mode != AppMode::Running {
+        return Err("Scene-marker locate is unavailable in the current state");
+    }
+    let index =
+        usize::try_from(index).map_err(|_| "The selected scene marker is no longer available")?;
+    if current_launch_id != Some(requested_launch_id) {
+        return Err("The selected scene marker is no longer available");
+    }
+    Ok(IdeWorkerCommand::LocateSceneLaunch {
+        project_id: project_id.to_owned(),
+        index,
+        launch_id: requested_launch_id.to_owned(),
+        state: if play {
+            LocateState::Rolling
+        } else {
+            LocateState::Preserve
+        },
+    })
 }
 
 fn bind_arrangement_scene_launch_scene_callback(
@@ -1619,37 +1645,68 @@ fn bind_arrangement_scene_launch_scene_callback(
         };
         let scenes = project_state_for_scene.scenes.borrow();
         let current_scene_id = ui.get_set_arrangement_scene_launch_scene_current_id();
-        if launch.tick() != confirmed_tick
-            || launch.scene_index() != current_index
-            || scenes
-                .get(current_index)
-                .is_none_or(|scene| scene.id() != current_scene_id.as_str())
-        {
+        if !arrangement_scene_launch_scene_authority_is_current(
+            launch.tick(),
+            confirmed_tick,
+            launch.scene_index(),
+            current_index,
+            scenes.get(current_index).map(IdeScene::id),
+            current_scene_id.as_str(),
+        ) {
             ui.set_error_text("The selected scene marker has changed since it was opened".into());
             return;
         }
-        let Some(target) = scenes.get(target_index) else {
-            ui.set_error_text("The replacement scene is no longer available".into());
-            return;
-        };
-        if target_index == current_index {
-            ui.set_status_text("Scene marker already launches that scene".into());
-            ui.set_error_text(SharedString::default());
-            return;
-        }
-        let scene_id = target.id().to_owned();
         let launch_id = launch.id().to_owned();
+        let command = match arrangement_scene_launch_scene_command(
+            &launch_id,
+            current_index,
+            target_index,
+            scenes.get(target_index).map(IdeScene::id),
+        ) {
+            Ok(Some(command)) => command,
+            Ok(None) => {
+                ui.set_status_text("Scene marker already launches that scene".into());
+                ui.set_error_text(SharedString::default());
+                return;
+            }
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
         drop(scenes);
         drop(arrangement);
-        submit_to_ui(
-            &ui,
-            &worker_for_scene,
-            IdeWorkerCommand::SetArrangementSceneLaunchScene {
-                launch_id,
-                scene_id,
-            },
-        );
+        submit_to_ui(&ui, &worker_for_scene, command);
     });
+}
+
+fn arrangement_scene_launch_scene_authority_is_current(
+    launch_tick: u64,
+    confirmed_tick: u64,
+    launch_scene_index: usize,
+    confirmed_scene_index: usize,
+    authoritative_scene_id: Option<&str>,
+    confirmed_scene_id: &str,
+) -> bool {
+    launch_tick == confirmed_tick
+        && launch_scene_index == confirmed_scene_index
+        && authoritative_scene_id == Some(confirmed_scene_id)
+}
+
+fn arrangement_scene_launch_scene_command(
+    launch_id: &str,
+    current_scene_index: usize,
+    target_scene_index: usize,
+    target_scene_id: Option<&str>,
+) -> Result<Option<IdeWorkerCommand>, &'static str> {
+    let target_scene_id = target_scene_id.ok_or("The replacement scene is no longer available")?;
+    if target_scene_index == current_scene_index {
+        return Ok(None);
+    }
+    Ok(Some(IdeWorkerCommand::SetArrangementSceneLaunchScene {
+        launch_id: launch_id.to_owned(),
+        scene_id: target_scene_id.to_owned(),
+    }))
 }
 
 fn bind_arrangement_scene_launch_addition_callback(
@@ -7372,6 +7429,127 @@ mod tests {
             "",
             "",
         ));
+    }
+
+    #[test]
+    fn arrangement_scene_launch_navigation_builds_the_exact_user_intent() {
+        assert!(matches!(
+            arrangement_scene_launch_locate_command(
+                AppMode::Running,
+                "project-a",
+                2,
+                "marker-a",
+                Some("marker-a"),
+                false,
+            ),
+            Ok(IdeWorkerCommand::LocateSceneLaunch {
+                project_id,
+                index: 2,
+                launch_id,
+                state: LocateState::Preserve,
+            }) if project_id == "project-a" && launch_id == "marker-a"
+        ));
+        assert!(matches!(
+            arrangement_scene_launch_locate_command(
+                AppMode::Running,
+                "project-a",
+                2,
+                "marker-a",
+                Some("marker-a"),
+                true,
+            ),
+            Ok(IdeWorkerCommand::LocateSceneLaunch {
+                state: LocateState::Rolling,
+                ..
+            })
+        ));
+        assert!(
+            arrangement_scene_launch_locate_command(
+                AppMode::MovingArrangementSceneLaunch,
+                "project-a",
+                2,
+                "marker-a",
+                Some("marker-a"),
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            arrangement_scene_launch_locate_command(
+                AppMode::Running,
+                "project-a",
+                -1,
+                "marker-a",
+                None,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            arrangement_scene_launch_locate_command(
+                AppMode::Running,
+                "project-a",
+                2,
+                "marker-a",
+                Some("marker-b"),
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn arrangement_scene_launch_reassignment_requires_refreshed_authority() {
+        assert!(arrangement_scene_launch_scene_authority_is_current(
+            960,
+            960,
+            0,
+            0,
+            Some("scene-a"),
+            "scene-a",
+        ));
+        for current in [
+            arrangement_scene_launch_scene_authority_is_current(
+                961,
+                960,
+                0,
+                0,
+                Some("scene-a"),
+                "scene-a",
+            ),
+            arrangement_scene_launch_scene_authority_is_current(
+                960,
+                960,
+                1,
+                0,
+                Some("scene-a"),
+                "scene-a",
+            ),
+            arrangement_scene_launch_scene_authority_is_current(
+                960,
+                960,
+                0,
+                0,
+                Some("scene-b"),
+                "scene-a",
+            ),
+            arrangement_scene_launch_scene_authority_is_current(960, 960, 0, 0, None, "scene-a"),
+        ] {
+            assert!(!current);
+        }
+
+        assert!(matches!(
+            arrangement_scene_launch_scene_command("marker-a", 0, 1, Some("scene-b")),
+            Ok(Some(IdeWorkerCommand::SetArrangementSceneLaunchScene {
+                launch_id,
+                scene_id,
+            })) if launch_id == "marker-a" && scene_id == "scene-b"
+        ));
+        assert!(matches!(
+            arrangement_scene_launch_scene_command("marker-a", 0, 0, Some("scene-a")),
+            Ok(None)
+        ));
+        assert!(arrangement_scene_launch_scene_command("marker-a", 0, 1, None).is_err());
     }
 
     fn assert_arrangement_scene_launch_edit_events(ui: &MainWindow) {
