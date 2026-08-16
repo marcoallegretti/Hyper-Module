@@ -26,9 +26,9 @@ use hyper_desktop_ide::{
 };
 #[cfg(test)]
 use hyper_desktop_ide::{
-    IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError, IdeAudioClipLoopEditError,
-    IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError, IdeSceneCreationError,
-    IdeSceneDuplicationError, IdeSceneRenameError, IdeSceneSlotEditError,
+    IdeArrangementPlacementEditError, IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError,
+    IdeAudioClipLoopEditError, IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError,
+    IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneRenameError, IdeSceneSlotEditError,
 };
 use slint::platform::PlatformError;
 use slint::{
@@ -7197,6 +7197,48 @@ mod tests {
         assert!(ui.get_status_text().contains("revision 4"));
     }
 
+    fn assert_arrangement_scene_launch_committed_warnings(ui: &MainWindow) {
+        ui.set_app_mode(AppMode::Running);
+        ui.set_move_arrangement_scene_launch_visible(true);
+        ui.set_move_arrangement_scene_launch_id("marker-a".into());
+        ui.set_move_arrangement_scene_launch_name("Verse".into());
+        ui.set_move_arrangement_scene_launch_original_tick("960".into());
+        ui.set_move_arrangement_scene_launch_tick("1920".into());
+        apply_arrangement_placement_committed_warning(
+            ui,
+            &IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning {
+                command: IdeWorkerCommandKind::MoveArrangementSceneLaunch,
+                warning: Box::new(IdeArrangementPlacementEditError::InvalidSceneLaunchIdentity),
+            },
+        );
+        assert!(!ui.get_move_arrangement_scene_launch_visible());
+        assert!(ui.get_move_arrangement_scene_launch_id().is_empty());
+        assert!(ui.get_move_arrangement_scene_launch_tick().is_empty());
+        assert!(ui.get_status_text().contains("committed and reopened"));
+        assert!(!ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::Closed);
+        ui.set_remove_arrangement_scene_launch_visible(true);
+        ui.set_remove_arrangement_scene_launch_id("marker-a".into());
+        ui.set_remove_arrangement_scene_launch_name("Verse".into());
+        ui.set_remove_arrangement_scene_launch_tick("1920".into());
+        apply_arrangement_placement_committed_warning(
+            ui,
+            &IdeWorkerEvent::ArrangementPlacementEditCommittedWithWarning {
+                command: IdeWorkerCommandKind::RemoveArrangementSceneLaunch,
+                warning: Box::new(IdeArrangementPlacementEditError::InvalidSceneLaunchIdentity),
+            },
+        );
+        assert!(!ui.get_remove_arrangement_scene_launch_visible());
+        assert!(ui.get_remove_arrangement_scene_launch_id().is_empty());
+        assert!(ui.get_remove_arrangement_scene_launch_tick().is_empty());
+        assert!(
+            ui.get_status_text()
+                .contains("committed, but the project could not be reopened")
+        );
+        assert!(!ui.get_error_text().is_empty());
+    }
+
     #[test]
     fn arrangement_duplication_submission_and_failure_use_a_dedicated_mode() {
         assert_eq!(
@@ -7569,6 +7611,7 @@ mod tests {
 
         assert_committed_audio_clip_source_slip_warning(&ui);
         assert_arrangement_scene_launch_edit_events(&ui);
+        assert_arrangement_scene_launch_committed_warnings(&ui);
         assert_scene_authoring_forms(&ui);
         assert_scene_duplication_events_reset_form(&ui);
         assert_scene_rename_success_resets_form(&ui);

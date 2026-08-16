@@ -9544,6 +9544,8 @@ mod tests {
             .unwrap();
         let mixer_id = mixer.id().to_owned();
         let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let original_mixer_id = mixer_id.clone();
+        let original_mixer_bytes = mixer_bytes.clone();
         let source_arrangement = package.read_resource(ARRANGEMENT_TEST_RESOURCE_ID).unwrap();
         let expected_project_sha256 = *package.manifest_sha256();
         let launch_id = "018f47a2-6b2d-7c11-8a44-001122338509";
@@ -9633,9 +9635,15 @@ mod tests {
 
         let reopened =
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let arrangement = reopened.session().arrangement();
+        assert_eq!(arrangement.scene_launches()[0].tick(), 7);
+        assert_arrangement_fixture_placement_is_unchanged(arrangement);
         assert_eq!(
-            reopened.session().arrangement().scene_launches()[0].tick(),
-            7
+            reopened
+                .package()
+                .read_resource(&original_mixer_id)
+                .unwrap(),
+            original_mixer_bytes
         );
         let package = reopened.package();
         let mixer = package
@@ -9678,7 +9686,16 @@ mod tests {
 
         let reopened =
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
-        assert_eq!(reopened.session().arrangement().scene_launches(), &[]);
+        let arrangement = reopened.session().arrangement();
+        assert_eq!(arrangement.scene_launches(), &[]);
+        assert_arrangement_fixture_placement_is_unchanged(arrangement);
+        assert_eq!(
+            reopened
+                .package()
+                .read_resource(&original_mixer_id)
+                .unwrap(),
+            original_mixer_bytes
+        );
         assert!(
             reopened
                 .package()
@@ -9686,6 +9703,24 @@ mod tests {
                 .resources()
                 .iter()
                 .any(|descriptor| descriptor.role() == ResourceRole::Arrangement)
+        );
+    }
+
+    fn assert_arrangement_fixture_placement_is_unchanged(arrangement: &IdePlaybackArrangement) {
+        let placements = arrangement.placements();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].id(), ARRANGEMENT_TEST_PLACEMENT_ID);
+        assert_eq!(placements[0].start_tick(), 0);
+        assert_eq!(placements[0].clip_start_tick(), 0);
+        assert_eq!(placements[0].duration_ticks(), 4);
+        assert!(placements[0].enabled());
+        assert_eq!(
+            arrangement.track_name(placements[0].track_index()),
+            Some("Audio")
+        );
+        assert_eq!(
+            arrangement.clip_name(placements[0].clip_index()),
+            Some("Disabled Clip")
         );
     }
 

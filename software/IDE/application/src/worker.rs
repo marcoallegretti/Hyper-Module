@@ -407,42 +407,6 @@ impl IdeWorkerCommand {
             Self::Shutdown => IdeWorkerCommandKind::Shutdown,
         }
     }
-
-    const fn is_project_mutation(&self) -> bool {
-        matches!(
-            self,
-            Self::SaveProject
-                | Self::AddAudioTrack { .. }
-                | Self::RemoveAudioTrack { .. }
-                | Self::RenameAudioTrack { .. }
-                | Self::SetAudioTrackActive { .. }
-                | Self::CreateAudioClipFromTake { .. }
-                | Self::DuplicateAudioClip { .. }
-                | Self::AddArrangementPlacement { .. }
-                | Self::AddArrangementSceneLaunch { .. }
-                | Self::MoveArrangementSceneLaunch { .. }
-                | Self::RemoveArrangementSceneLaunch { .. }
-                | Self::DuplicateArrangementPlacement { .. }
-                | Self::SplitArrangementPlacement { .. }
-                | Self::SetArrangementPlacementActive { .. }
-                | Self::MoveArrangementPlacement { .. }
-                | Self::SetArrangementPlacementDuration { .. }
-                | Self::TrimArrangementPlacementFront { .. }
-                | Self::RemoveArrangementPlacement { .. }
-                | Self::RenameAudioClip { .. }
-                | Self::SetAudioClipActive { .. }
-                | Self::SetAudioClipGain { .. }
-                | Self::SetAudioClipFades { .. }
-                | Self::SetAudioClipLoop { .. }
-                | Self::SetAudioClipReverse { .. }
-                | Self::SetAudioClipSourceStart { .. }
-                | Self::AddScene { .. }
-                | Self::DuplicateScene { .. }
-                | Self::SetSceneSlot { .. }
-                | Self::RenameScene { .. }
-                | Self::SetSceneActive { .. }
-        )
-    }
 }
 
 #[derive(Debug)]
@@ -2282,6 +2246,10 @@ fn publish_closed_state(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive top-level command router must remain compiler-checked"
+)]
 fn process_command(
     state: &mut WorkerState,
     command: IdeWorkerCommand,
@@ -2339,7 +2307,36 @@ fn process_command(
             _ => publish_failure(events, kind, IdeWorkerCommandFailure::InvalidState),
         },
         IdeWorkerCommand::Monitoring(command) => process_monitoring_command(state, command, events),
-        command if command.is_project_mutation() => {
+        command @ (IdeWorkerCommand::SaveProject
+        | IdeWorkerCommand::AddAudioTrack { .. }
+        | IdeWorkerCommand::RemoveAudioTrack { .. }
+        | IdeWorkerCommand::RenameAudioTrack { .. }
+        | IdeWorkerCommand::SetAudioTrackActive { .. }
+        | IdeWorkerCommand::CreateAudioClipFromTake { .. }
+        | IdeWorkerCommand::DuplicateAudioClip { .. }
+        | IdeWorkerCommand::AddArrangementPlacement { .. }
+        | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
+        | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
+        | IdeWorkerCommand::RemoveArrangementSceneLaunch { .. }
+        | IdeWorkerCommand::DuplicateArrangementPlacement { .. }
+        | IdeWorkerCommand::SplitArrangementPlacement { .. }
+        | IdeWorkerCommand::SetArrangementPlacementActive { .. }
+        | IdeWorkerCommand::MoveArrangementPlacement { .. }
+        | IdeWorkerCommand::SetArrangementPlacementDuration { .. }
+        | IdeWorkerCommand::TrimArrangementPlacementFront { .. }
+        | IdeWorkerCommand::RemoveArrangementPlacement { .. }
+        | IdeWorkerCommand::RenameAudioClip { .. }
+        | IdeWorkerCommand::SetAudioClipActive { .. }
+        | IdeWorkerCommand::SetAudioClipGain { .. }
+        | IdeWorkerCommand::SetAudioClipFades { .. }
+        | IdeWorkerCommand::SetAudioClipLoop { .. }
+        | IdeWorkerCommand::SetAudioClipReverse { .. }
+        | IdeWorkerCommand::SetAudioClipSourceStart { .. }
+        | IdeWorkerCommand::AddScene { .. }
+        | IdeWorkerCommand::DuplicateScene { .. }
+        | IdeWorkerCommand::SetSceneSlot { .. }
+        | IdeWorkerCommand::RenameScene { .. }
+        | IdeWorkerCommand::SetSceneActive { .. }) => {
             process_project_mutation_command(state, command, events)
         }
         IdeWorkerCommand::StartRecording { channel_index } => {
@@ -2360,7 +2357,6 @@ fn process_command(
             IdeWorkerCommandKind::CloseProject,
         ),
         IdeWorkerCommand::Shutdown => unreachable!("shutdown is handled by the worker loop"),
-        _ => unreachable!("project mutation classification must match command routing"),
     }
 }
 
