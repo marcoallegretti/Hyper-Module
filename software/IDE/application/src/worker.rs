@@ -28,7 +28,8 @@ use super::{
     IdeAudioClipSourceSlipEditError, IdeAudioInputInventory, IdeAudioOutputInventory,
     IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioTrackAdditionError,
     IdeAudioTrackEditError, IdeAudioTrackRemovalError, IdeAutomationTakeCreationError,
-    IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome, IdeInputDiscoveryError,
+    IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
+    IdeInputDiscoveryError,
     IdeInputSelection, IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError,
     IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
     IdeMixerMainState, IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState,
@@ -157,6 +158,7 @@ pub enum IdeWorkerCommandKind {
     RenameScene,
     SetSceneActive,
     AddAutomationTake,
+    SetAutomationTakeActive,
     StartRecording,
     StopRecording,
     AbortRecording,
@@ -311,6 +313,10 @@ pub enum IdeWorkerCommand {
     AddAutomationTake {
         request: IdeAutomationTakeRequest,
     },
+    SetAutomationTakeActive {
+        take_id: String,
+        enabled: bool,
+    },
     DuplicateScene {
         scene_id: String,
         name: String,
@@ -414,6 +420,7 @@ impl IdeWorkerCommand {
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
+            Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
             Self::DuplicateScene { .. } => IdeWorkerCommandKind::DuplicateScene,
             Self::SetSceneSlot { .. } => IdeWorkerCommandKind::SetSceneSlot,
             Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
@@ -1123,6 +1130,7 @@ pub enum IdeWorkerCommandFailure {
     AudioClipSourceSlip(Box<IdeAudioClipSourceSlipEditError>),
     SceneCreation(Box<IdeSceneCreationError>),
     AutomationTakeCreation(Box<IdeAutomationTakeCreationError>),
+    AutomationTakeActivation(Box<IdeAutomationTakeEditError>),
     SceneDuplication(Box<IdeSceneDuplicationError>),
     SceneSlotEdit(Box<IdeSceneSlotEditError>),
     SceneRename(Box<IdeSceneRenameError>),
@@ -1181,6 +1189,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioClipSourceSlip(source) => source.fmt(formatter),
             Self::SceneCreation(source) => source.fmt(formatter),
             Self::AutomationTakeCreation(source) => source.fmt(formatter),
+            Self::AutomationTakeActivation(source) => source.fmt(formatter),
             Self::SceneDuplication(source) => source.fmt(formatter),
             Self::SceneSlotEdit(source) => source.fmt(formatter),
             Self::SceneRename(source) | Self::SceneActivation(source) => source.fmt(formatter),
@@ -1244,6 +1253,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioClipSourceSlip(source) => Some(source),
             Self::SceneCreation(source) => Some(source),
             Self::AutomationTakeCreation(source) => Some(source),
+            Self::AutomationTakeActivation(source) => Some(source),
             Self::SceneDuplication(source) => Some(source),
             Self::SceneSlotEdit(source) => Some(source),
             Self::SceneRename(source) | Self::SceneActivation(source) => Some(source),
@@ -1468,6 +1478,14 @@ pub enum IdeWorkerEvent {
         name: String,
         warning: Box<IdeAutomationTakeCreationError>,
     },
+    AutomationTakeActivationChanged {
+        revision: u64,
+        changed: bool,
+        enabled: bool,
+    },
+    AutomationTakeActivationCommittedWithWarning {
+        warning: Box<IdeAutomationTakeEditError>,
+    },
     SceneDuplicated {
         revision: u64,
         scene_id: String,
@@ -1575,6 +1593,9 @@ pub enum IdeWorkerEvent {
     },
     SceneAdding,
     AutomationTakeAdding,
+    AutomationTakeActivationChanging {
+        enabled: bool,
+    },
     SceneDuplicating,
     SceneSlotChanging {
         edit: IdeSceneSlotEdit,
@@ -2010,6 +2031,10 @@ enum ProjectMutation {
     AddAutomationTake {
         request: IdeAutomationTakeRequest,
     },
+    SetAutomationTakeActive {
+        take_id: String,
+        enabled: bool,
+    },
     DuplicateScene {
         scene_id: String,
         name: String,
@@ -2080,6 +2105,7 @@ impl ProjectMutation {
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
+            Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
             Self::DuplicateScene { .. } => IdeWorkerCommandKind::DuplicateScene,
             Self::SetSceneSlot { .. } => IdeWorkerCommandKind::SetSceneSlot,
             Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
@@ -2087,6 +2113,10 @@ impl ProjectMutation {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive mapping keeps every pending project mutation observable"
+    )]
     fn pending_event(&self) -> IdeWorkerEvent {
         match self {
             Self::SaveMixer => IdeWorkerEvent::Saving,
@@ -2179,6 +2209,9 @@ impl ProjectMutation {
             },
             Self::AddScene { .. } => IdeWorkerEvent::SceneAdding,
             Self::AddAutomationTake { .. } => IdeWorkerEvent::AutomationTakeAdding,
+            Self::SetAutomationTakeActive { enabled, .. } => {
+                IdeWorkerEvent::AutomationTakeActivationChanging { enabled: *enabled }
+            }
             Self::DuplicateScene { .. } => IdeWorkerEvent::SceneDuplicating,
             Self::SetSceneSlot { edit, .. } => {
                 IdeWorkerEvent::SceneSlotChanging { edit: edit.clone() }
@@ -2419,6 +2452,7 @@ fn process_command(
         | IdeWorkerCommand::SetAudioClipSourceStart { .. }
         | IdeWorkerCommand::AddScene { .. }
         | IdeWorkerCommand::AddAutomationTake { .. }
+        | IdeWorkerCommand::SetAutomationTakeActive { .. }
         | IdeWorkerCommand::DuplicateScene { .. }
         | IdeWorkerCommand::SetSceneSlot { .. }
         | IdeWorkerCommand::RenameScene { .. }
@@ -2562,6 +2596,9 @@ fn process_project_mutation_command(
         }
         IdeWorkerCommand::AddAutomationTake { request } => {
             add_automation_take(state, events, request)
+        }
+        IdeWorkerCommand::SetAutomationTakeActive { take_id, enabled } => {
+            set_automation_take_active(state, events, &take_id, enabled)
         }
         IdeWorkerCommand::DuplicateScene { scene_id, name } => {
             duplicate_scene(state, events, &scene_id, &name)
@@ -4493,6 +4530,35 @@ fn add_automation_take(
     begin_project_mutation_request(state, events, ProjectMutation::AddAutomationTake { request })
 }
 
+fn set_automation_take_active(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    take_id: &str,
+    enabled: bool,
+) -> bool {
+    let mut owned_take_id = String::new();
+    if take_id.is_empty() || owned_take_id.try_reserve_exact(take_id.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::SetAutomationTakeActive,
+            IdeWorkerCommandFailure::AutomationTakeActivation(Box::new(if take_id.is_empty() {
+                IdeAutomationTakeEditError::InvalidTakeIdentity
+            } else {
+                IdeAutomationTakeEditError::CapacityUnavailable
+            })),
+        );
+    }
+    owned_take_id.push_str(take_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::SetAutomationTakeActive {
+            take_id: owned_take_id,
+            enabled,
+        },
+    )
+}
+
 fn duplicate_scene(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -5046,6 +5112,11 @@ fn project_mutation_save_failure(
                 IdeAutomationTakeCreationError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::SetAutomationTakeActive { .. } => {
+            IdeWorkerCommandFailure::AutomationTakeActivation(Box::new(
+                IdeAutomationTakeEditError::MixerSave(Box::new(reason)),
+            ))
+        }
         ProjectMutation::DuplicateScene { .. } => IdeWorkerCommandFailure::SceneDuplication(
             Box::new(IdeSceneDuplicationError::MixerSave(Box::new(reason))),
         ),
@@ -5244,6 +5315,11 @@ fn project_mutation_native_close_failure(
                 IdeAutomationTakeCreationError::NativeClose(failure),
             ))
         }
+        ProjectMutation::SetAutomationTakeActive { .. } => {
+            IdeWorkerCommandFailure::AutomationTakeActivation(Box::new(
+                IdeAutomationTakeEditError::NativeClose(failure),
+            ))
+        }
         ProjectMutation::DuplicateScene { .. } => IdeWorkerCommandFailure::SceneDuplication(
             Box::new(IdeSceneDuplicationError::NativeClose(failure)),
         ),
@@ -5434,6 +5510,13 @@ enum ProjectMutationAttempt {
             IdeAutomationTakeCreationError,
         >,
     },
+    SetAutomationTakeActive {
+        enabled: bool,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeAutomationTakeEditError,
+        >,
+    },
     DuplicateScene {
         name: String,
         result: Result<
@@ -5598,6 +5681,21 @@ pub(super) fn scene_creation_failure_event(
         IdeWorkerEvent::CommandFailed {
             command: IdeWorkerCommandKind::AddScene,
             reason: IdeWorkerCommandFailure::SceneCreation(Box::new(reason)),
+        }
+    }
+}
+
+fn automation_take_activation_failure_event(
+    reason: IdeAutomationTakeEditError,
+) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::AutomationTakeActivationCommittedWithWarning {
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::SetAutomationTakeActive,
+            reason: IdeWorkerCommandFailure::AutomationTakeActivation(Box::new(reason)),
         }
     }
 }
@@ -6201,6 +6299,21 @@ fn complete_project_mutation(
                     name,
                     result: Err(reason),
                 } => send_event(events, automation_take_creation_failure_event(name, reason)),
+                ProjectMutationAttempt::SetAutomationTakeActive {
+                    enabled,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::AutomationTakeActivationChanged {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                        enabled,
+                    },
+                ),
+                ProjectMutationAttempt::SetAutomationTakeActive {
+                    result: Err(reason),
+                    ..
+                } => send_event(events, automation_take_activation_failure_event(reason)),
                 ProjectMutationAttempt::DuplicateScene {
                     name,
                     result: Ok(outcome),
@@ -6646,6 +6759,18 @@ fn attempt_project_mutation(
                 native_failure,
             ),
         },
+        ProjectMutation::SetAutomationTakeActive { take_id, enabled } => {
+            ProjectMutationAttempt::SetAutomationTakeActive {
+                enabled,
+                result: attempt_automation_take_activation(
+                    application,
+                    recovery,
+                    &take_id,
+                    enabled,
+                    native_failure,
+                ),
+            }
+        }
         ProjectMutation::AddAutomationTake { request } => {
             ProjectMutationAttempt::AddAutomationTake {
                 name: request.name.clone(),
@@ -7433,6 +7558,9 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::AddAutomationTake { result, .. } => {
             automation_take_creation_reopen_failure(result, reopen)
         }
+        ProjectMutationAttempt::SetAutomationTakeActive { result, .. } => {
+            automation_take_activation_reopen_failure(result, reopen)
+        }
         ProjectMutationAttempt::DuplicateScene { result, .. } => {
             scene_duplication_reopen_failure(result, reopen)
         }
@@ -7446,6 +7574,60 @@ fn project_mutation_reopen_failure(
             scene_activation_reopen_failure(result, reopen)
         }
     }
+}
+
+fn attempt_automation_take_activation(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    take_id: &str,
+    enabled: bool,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAutomationTakeEditError> {
+    if let Some(failure) = native_failure {
+        return Err(IdeAutomationTakeEditError::NativeClose(failure));
+    }
+    RunningDesktopIdeApplication::prepare_automation_take_activation(
+        application,
+        recovery,
+        take_id,
+        enabled,
+    )
+    .and_then(|plan| {
+        plan.publish()
+            .map_err(|source| IdeAutomationTakeEditError::Publication(Box::new(source)))
+    })
+}
+
+fn automation_take_activation_reopen_failure(
+    result: Result<
+        hyper_storage_engine::ProjectResourcePublicationOutcome,
+        IdeAutomationTakeEditError,
+    >,
+    reopen: IdeProjectOpenError,
+) -> IdeWorkerCommandFailure {
+    let reason = match result {
+        Ok(outcome) => IdeAutomationTakeEditError::ReopenAfterPublication {
+            outcome,
+            source: Box::new(reopen),
+        },
+        Err(IdeAutomationTakeEditError::Publication(publication)) => {
+            IdeAutomationTakeEditError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(IdeAutomationTakeEditError::NativeClose(close)) => {
+            IdeAutomationTakeEditError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(preparation) => IdeAutomationTakeEditError::ReopenAfterPreparation {
+            preparation: Box::new(preparation),
+            reopen: Box::new(reopen),
+        },
+    };
+    IdeWorkerCommandFailure::AutomationTakeActivation(Box::new(reason))
 }
 
 fn automation_take_creation_reopen_failure(
@@ -10708,6 +10890,61 @@ mod tests {
                 command: IdeWorkerCommandKind::AddAutomationTake,
                 reason: IdeWorkerCommandFailure::AutomationTakeCreation(reason),
             } if matches!(reason.as_ref(), IdeAutomationTakeCreationError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn automation_take_activation_validates_identity_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SetAutomationTakeActive {
+                take_id: String::new(),
+                enabled: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetAutomationTakeActive,
+                reason: IdeWorkerCommandFailure::AutomationTakeActivation(reason),
+            } if matches!(reason.as_ref(), IdeAutomationTakeEditError::InvalidTakeIdentity)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SetAutomationTakeActive {
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned(),
+                enabled: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AutomationTakeActivationChanging { enabled: false }
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SetAutomationTakeActive,
+                reason: IdeWorkerCommandFailure::AutomationTakeActivation(reason),
+            } if matches!(reason.as_ref(), IdeAutomationTakeEditError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);

@@ -34,6 +34,7 @@ export enum AppMode {
     changing-clip-reverse,
     changing-clip-source,
     adding-automation-take,
+    changing-automation-take-activation,
     renaming-scene,
     duplicating-scene,
     changing-scene-activation,
@@ -226,6 +227,7 @@ export global IdeActions {
     callback mixer-send-pan(int, float);
     callback mixer-send-enabled(int);
     callback add-automation-take(string, int, int, string, string, string);
+    callback set-automation-take-active(string, bool);
     callback save-project();
     callback add-audio-track(string);
     callback remove-audio-track(string);
@@ -1755,6 +1757,17 @@ export component MainWindow inherits Window {
                                     color: take.enabled ? #63e6b5 : #728196;
                                     font-size: 9px;
                                     vertical-alignment: center;
+                                }
+                                VerticalLayout {
+                                    width: 76px;
+                                    padding-top: 9px;
+                                    padding-bottom: 9px;
+                                    Button {
+                                        text: take.enabled ? "Disable" : "Enable";
+                                        accessible-label: (take.enabled ? "Disable " : "Enable ") + take.name + " automation take";
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => { IdeActions.set-automation-take-active(take.id, !take.enabled); }
+                                    }
                                 }
                             }
                         }

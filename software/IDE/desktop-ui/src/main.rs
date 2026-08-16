@@ -1524,6 +1524,7 @@ fn bind_arrangement_scene_launch_callback(
     bind_arrangement_scene_launch_addition_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_move_callback(ui, worker, project_state);
     bind_automation_take_callback(ui, worker, project_state);
+    bind_automation_take_activation_callback(ui, worker);
     bind_arrangement_scene_launch_locate_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_scene_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_removal_callback(ui, worker, project_state);
@@ -2912,6 +2913,9 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::AddArrangementPlacement => AppMode::AddingArrangementPlacement,
         IdeWorkerCommandKind::AddArrangementSceneLaunch => AppMode::AddingArrangementSceneLaunch,
         IdeWorkerCommandKind::AddAutomationTake => AppMode::AddingAutomationTake,
+        IdeWorkerCommandKind::SetAutomationTakeActive => {
+            AppMode::ChangingAutomationTakeActivation
+        }
         IdeWorkerCommandKind::MoveArrangementSceneLaunch => AppMode::MovingArrangementSceneLaunch,
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => {
             AppMode::ChangingArrangementSceneLaunchScene
@@ -3046,6 +3050,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::AddAutomationTake => {
             "Preserving mixer state, adding the automation take, and reopening project..."
+        }
+        IdeWorkerCommandKind::SetAutomationTakeActive => {
+            "Preserving mixer state, editing the automation take, and reopening project..."
         }
         IdeWorkerCommandKind::DuplicateScene => {
             "Preserving mixer state, duplicating the scene, and reopening project..."
@@ -3255,6 +3262,11 @@ fn apply_event(
         | IdeWorkerEvent::AutomationTakeCreationCommittedWithWarning { .. }
         | IdeWorkerEvent::AutomationTakeAdding) => {
             apply_automation_take_creation_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AutomationTakeActivationChanged { .. }
+        | IdeWorkerEvent::AutomationTakeActivationCommittedWithWarning { .. }
+        | IdeWorkerEvent::AutomationTakeActivationChanging { .. }) => {
+            apply_automation_take_activation_event(ui, &event);
         }
         event @ (IdeWorkerEvent::SceneDuplicated { .. }
         | IdeWorkerEvent::SceneDuplicationCommittedWithWarning { .. }
@@ -5594,6 +5606,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::AddAutomationTake if current == AppMode::AddingAutomationTake => {
             AppMode::Running
         }
+        IdeWorkerCommandKind::SetAutomationTakeActive
+            if current == AppMode::ChangingAutomationTakeActivation =>
+        {
+            AppMode::Running
+        }
         IdeWorkerCommandKind::MoveArrangementSceneLaunch
             if current == AppMode::MovingArrangementSceneLaunch =>
         {
@@ -6723,6 +6740,68 @@ fn bind_automation_take_callback(
             );
         },
     );
+}
+
+fn apply_automation_take_activation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AutomationTakeActivationChanged {
+            revision,
+            changed,
+            enabled,
+        } => {
+            let state = if *enabled { "enabled" } else { "disabled" };
+            ui.set_status_text(
+                if *changed {
+                    format!("Automation take {state} in project revision {revision}")
+                } else {
+                    format!("Automation take was already {state} in project revision {revision}")
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AutomationTakeActivationCommittedWithWarning { warning } => {
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), "Automation take edit").into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        IdeWorkerEvent::AutomationTakeActivationChanging { enabled } => {
+            ui.set_app_mode(AppMode::ChangingAutomationTakeActivation);
+            ui.set_status_text(
+                if *enabled {
+                    "Waiting for native output before enabling the automation take…"
+                } else {
+                    "Waiting for native output before disabling the automation take…"
+                }
+                .into(),
+            );
+        }
+        _ => unreachable!("automation activation event dispatcher received another event"),
+    }
+}
+
+fn bind_automation_take_activation_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_activation = Rc::clone(worker);
+    actions.on_set_automation_take_active(move |take_id, enabled| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || take_id.is_empty() {
+            ui.set_error_text("Automation take edit request is no longer current".into());
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_activation,
+            IdeWorkerCommand::SetAutomationTakeActive {
+                take_id: take_id.to_string(),
+                enabled,
+            },
+        );
+    });
 }
 
 fn parse_automation_tick(value: &str) -> Result<u64, &'static str> {
@@ -8184,6 +8263,24 @@ mod tests {
         assert!(parse_automation_points("1000000", false).is_err());
         assert!(parse_automation_points("-1=0", false).is_err());
         assert!(parse_automation_points("   ", false).is_err());
+    }
+
+    #[test]
+    fn automation_take_activation_submission_and_failure_use_a_dedicated_mode() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::SetAutomationTakeActive,
+            ),
+            AppMode::ChangingAutomationTakeActivation
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::ChangingAutomationTakeActivation,
+                IdeWorkerCommandKind::SetAutomationTakeActive,
+            ),
+            AppMode::Running
+        );
     }
 
     #[test]

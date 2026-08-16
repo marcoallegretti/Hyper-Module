@@ -57,7 +57,8 @@ use hyper_playback_json::{
     AudioClipSourceStartSerializationError, AudioTrackAdditionSerializationError,
     AudioTrackDocumentSerializationError, AudioTrackRemovalBlockers,
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
-    AutomationTakeAddition, AutomationTakeAdditionSerializationError, AutomationTargetSelection,
+    AutomationTakeAddition, AutomationTakeAdditionSerializationError,
+    AutomationTakeEditSerializationError, AutomationTargetSelection,
     CompiledMixerTap, CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits,
     MixerBaseState, MixerChannelBaseState,
     MixerSendBaseState, MixerStateSerializationError, SceneAdditionSerializationError,
@@ -68,7 +69,7 @@ use hyper_playback_json::{
     serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
     serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
     serialize_arrangement_scene_launch_addition, serialize_arrangement_scene_launch_move,
-    serialize_automation_take_addition,
+    serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_arrangement_scene_launch_removal, serialize_arrangement_scene_launch_scene_edit,
     serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
     serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_rename,
@@ -3183,6 +3184,121 @@ impl Error for IdeAutomationTakeCreationError {
 }
 
 #[derive(Debug)]
+pub enum IdeAutomationTakeEditError {
+    InvalidTakeIdentity,
+    MixerSave(Box<IdeProjectSaveError>),
+    Storage(StorageError),
+    MixerDocument(PlaybackDocumentLoadError),
+    Serialization(AutomationTakeEditSerializationError),
+    CapacityUnavailable,
+    Publication(Box<IdeAutomationTakePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeAutomationTakeEditError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: ProjectResourcePublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<IdeAutomationTakePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeAutomationTakeEditError {
+    #[must_use]
+    pub const fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication(source) => source.take_published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. } => publication.take_published(),
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeAutomationTakeEditError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTakeIdentity => {
+                formatter.write_str("the automation take identity is empty")
+            }
+            Self::MixerSave(source) => {
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::MixerDocument(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("automation take edit capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before editing the automation take: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before editing the automation take ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "automation take edit preparation failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "automation take {} was edited in project revision {} but the project could not be reopened: {source}",
+                outcome.resource_id(),
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.take_published() => write!(
+                formatter,
+                "automation take edit committed with incomplete verification or recovery ({publication}) and the project could not be reopened ({reopen})"
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "automation take edit failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAutomationTakeEditError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::MixerDocument(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidTakeIdentity | Self::CapacityUnavailable | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum IdeSceneDuplicationError {
     InvalidSourceSceneIdentity,
     InvalidName,
@@ -4621,6 +4737,37 @@ struct IdeAutomationTakePublicationPlan {
     mixer: IdeMixerSavePlan,
     take_id: String,
     take_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct IdeAutomationTakeEditPlan {
+    mixer: IdeMixerSavePlan,
+    take_id: String,
+    take_bytes: Vec<u8>,
+}
+
+impl IdeAutomationTakeEditPlan {
+    fn publish(
+        &self,
+    ) -> Result<ProjectResourcePublicationOutcome, IdeAutomationTakePublicationError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeAutomationTakePublicationError::Mixer(Box::new(source)))?;
+        publish_project_resource(
+            &self.mixer.project_path,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                resource_id: &self.take_id,
+                expected_role: ResourceRole::AutomationTake,
+                resource_bytes: &self.take_bytes,
+            },
+        )
+        .map_err(|source| IdeAutomationTakePublicationError::Take {
+            mixer: Box::new(mixer),
+            source: Box::new(source),
+        })
+    }
 }
 
 impl IdeAutomationTakePublicationPlan {
@@ -6470,6 +6617,74 @@ impl RunningDesktopIdeApplication {
         Ok(IdeAutomationTakePublicationPlan {
             mixer,
             take_id,
+            take_bytes,
+        })
+    }
+
+    fn prepare_automation_take_activation(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        take_id: &str,
+        enabled: bool,
+    ) -> Result<IdeAutomationTakeEditPlan, IdeAutomationTakeEditError> {
+        if take_id.is_empty() {
+            return Err(IdeAutomationTakeEditError::InvalidTakeIdentity);
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAutomationTakeEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAutomationTakeEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let limits = application.config.project_limits.session.documents;
+        let loaded_mixer = project
+            .load_mixer(&mixer.resource_bytes, &assets, limits)
+            .map_err(IdeAutomationTakeEditError::MixerDocument)?;
+        let mut existing = Vec::new();
+        for descriptor in package.manifest().resources() {
+            if descriptor.role() != ResourceRole::AutomationTake {
+                continue;
+            }
+            existing
+                .try_reserve(1)
+                .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+            existing.push(
+                package
+                    .read_resource(descriptor.id())
+                    .map_err(IdeAutomationTakeEditError::Storage)?,
+            );
+        }
+        let mut references = Vec::new();
+        references
+            .try_reserve_exact(existing.len())
+            .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+        references.extend(existing.iter().map(Vec::as_slice));
+        let take_bytes = serialize_automation_take_activation(
+            project,
+            &loaded_mixer,
+            &assets,
+            &references,
+            take_id,
+            enabled,
+            limits,
+        )
+        .map_err(IdeAutomationTakeEditError::Serialization)?;
+        let mut owned_take_id = String::new();
+        owned_take_id
+            .try_reserve_exact(take_id.len())
+            .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+        owned_take_id.push_str(take_id);
+        Ok(IdeAutomationTakeEditPlan {
+            mixer,
+            take_id: owned_take_id,
             take_bytes,
         })
     }
