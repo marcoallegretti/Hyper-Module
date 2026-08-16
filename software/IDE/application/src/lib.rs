@@ -6542,6 +6542,15 @@ impl RunningDesktopIdeApplication {
                 IdeProjectSaveError::ProjectSnapshotUnavailable,
             ))
         })?;
+        Self::prepare_automation_take_creation_from_project(application, mixer, prepared, request)
+    }
+
+    fn prepare_automation_take_creation_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        request: &IdeAutomationTakeRequest,
+    ) -> Result<IdeAutomationTakePublicationPlan, IdeAutomationTakeCreationError> {
         let package = prepared.package();
         let (project, _, _, media) = prepared.session().parts();
         let mut assets = Vec::new();
@@ -6637,6 +6646,18 @@ impl RunningDesktopIdeApplication {
                 IdeProjectSaveError::ProjectSnapshotUnavailable,
             ))
         })?;
+        Self::prepare_automation_take_activation_from_project(
+            application, mixer, prepared, take_id, enabled,
+        )
+    }
+
+    fn prepare_automation_take_activation_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        take_id: &str,
+        enabled: bool,
+    ) -> Result<IdeAutomationTakeEditPlan, IdeAutomationTakeEditError> {
         let package = prepared.package();
         let (project, _, _, media) = prepared.session().parts();
         let mut assets = Vec::new();
@@ -10376,6 +10397,160 @@ mod tests {
         assert!(!published[0].enabled());
         let (_, _, automation, _) = reopened.session().parts();
         assert_eq!(automation.unwrap().target_count(), 0);
+    }
+
+    #[test]
+    fn automation_take_preparation_reads_the_committed_take_set_from_the_manifest() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let take_id = "018f47a2-6b2d-7c11-8a44-00112233850a";
+        publish_main_gain_automation(&project_path, limits, take_id);
+
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer_id = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap()
+            .id()
+            .to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        let application = DesktopIdeApplication::from_inventories(
+            config,
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let mixer_plan = || IdeMixerSavePlan {
+            project_path: project_path.clone(),
+            expected_project_sha256,
+            resource_id: mixer_id.clone(),
+            resource_bytes: mixer_bytes.clone(),
+        };
+        let request = |start_tick: u64, end_tick: u64| IdeAutomationTakeRequest {
+            name: "Second pass".to_owned(),
+            start_tick,
+            end_tick,
+            target: IdeAutomationTarget::Main {
+                parameter: AutomationMainParameter::Gain,
+            },
+            interpolation: AutomationInterpolation::Linear,
+            points: vec![
+                AutomationPoint::new(start_tick, AutomationValue::Integer(0)),
+                AutomationPoint::new(end_tick - 1, AutomationValue::Integer(1_000_000)),
+            ],
+        };
+
+        let overlapping = RunningDesktopIdeApplication::prepare_automation_take_creation_from_project(
+            &application,
+            mixer_plan(),
+            &prepared,
+            &request(2, 6),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                overlapping,
+                IdeAutomationTakeCreationError::Serialization(_)
+            ),
+            "the committed take must be visible to the overlap check: {overlapping}"
+        );
+        assert!(!overlapping.publication_committed());
+
+        let plan = RunningDesktopIdeApplication::prepare_automation_take_creation_from_project(
+            &application,
+            mixer_plan(),
+            &prepared,
+            &request(8, 16),
+        )
+        .unwrap();
+        assert_ne!(plan.take_id, take_id);
+        let document: Value = serde_json::from_slice(&plan.take_bytes).unwrap();
+        assert_eq!(document["id"].as_str(), Some(plan.take_id.as_str()));
+        assert_eq!(document["name"].as_str(), Some("Second pass"));
+        assert_eq!(document["enabled"].as_bool(), Some(true));
+        assert_eq!(document["start_tick"].as_u64(), Some(8));
+        assert_ne!(
+            document["lanes"][0]["id"].as_str(),
+            Some(plan.take_id.as_str())
+        );
+        drop(prepared);
+
+        let outcome = plan.publish().unwrap();
+        assert!(outcome.changed());
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let published = reopened.session().automation_takes().takes();
+        assert_eq!(published.len(), 2);
+        assert!(published.iter().all(hyper_playback_session::PlaybackAutomationTake::enabled));
+        let (_, _, automation, _) = reopened.session().parts();
+        assert_eq!(automation.unwrap().target_count(), 1);
+    }
+
+    #[test]
+    fn automation_take_activation_preparation_addresses_the_requested_take() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let take_id = "018f47a2-6b2d-7c11-8a44-00112233850a";
+        publish_main_gain_automation(&project_path, limits, take_id);
+
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer_id = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap()
+            .id()
+            .to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        let application = DesktopIdeApplication::from_inventories(
+            config,
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let mixer_plan = || IdeMixerSavePlan {
+            project_path: project_path.clone(),
+            expected_project_sha256,
+            resource_id: mixer_id.clone(),
+            resource_bytes: mixer_bytes.clone(),
+        };
+
+        let missing = RunningDesktopIdeApplication::prepare_automation_take_activation_from_project(
+            &application,
+            mixer_plan(),
+            &prepared,
+            "018f47a2-6b2d-7c11-8a44-0011223344ff",
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(missing, IdeAutomationTakeEditError::Serialization(_)),
+            "{missing}"
+        );
+
+        let plan = RunningDesktopIdeApplication::prepare_automation_take_activation_from_project(
+            &application,
+            mixer_plan(),
+            &prepared,
+            take_id,
+            false,
+        )
+        .unwrap();
+        assert_eq!(plan.take_id, take_id);
+        let document: Value = serde_json::from_slice(&plan.take_bytes).unwrap();
+        assert_eq!(document["id"].as_str(), Some(take_id));
+        assert_eq!(document["enabled"].as_bool(), Some(false));
     }
 
     fn publish_main_gain_automation(
