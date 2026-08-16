@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 hyper-arrangement-renderer = { path = "../../../crates/arrangement-renderer" }
+hyper-audio-source = { path = "../../../crates/audio-source" }
 hyper-audio-engine = { path = "../../../crates/audio-engine" }
 hyper-control-runtime = { path = "../../RUNTIME/control-runtime" }
 hyper-control-mappings = { path = "../../../crates/control-mappings" }
@@ -39,4 +40,3 @@ bytemuck = "=1.24.0"
 wasapi = "=0.22.0"
 
 [dev-dependencies]
-hyper-audio-source = { path = "../../../crates/audio-source" }
