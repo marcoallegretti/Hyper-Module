@@ -122,6 +122,7 @@ pub struct ProjectResourcePublicationOutcome {
     resource_id: String,
     resource_path: String,
     changed: bool,
+    previous_resource: Option<Vec<u8>>,
 }
 
 impl ProjectResourcePublicationOutcome {
@@ -148,6 +149,19 @@ impl ProjectResourcePublicationOutcome {
     #[must_use]
     pub const fn changed(&self) -> bool {
         self.changed
+    }
+
+    /// The complete canonical bytes this publication replaced, present only
+    /// when a replacement actually changed content. Republishing them through
+    /// the same lifecycle restores the previous state exactly.
+    #[must_use]
+    pub fn previous_resource(&self) -> Option<&[u8]> {
+        self.previous_resource.as_deref()
+    }
+
+    #[must_use]
+    pub fn into_previous_resource(self) -> Option<Vec<u8>> {
+        self.previous_resource
     }
 }
 
@@ -1072,6 +1086,7 @@ fn publish_project_resource_observed(
                     resource_id: request.resource_id.to_owned(),
                     resource_path: descriptor.path().to_owned(),
                     changed: false,
+                    previous_resource: None,
                 });
             }
             let candidate = candidate_manifest(
@@ -1153,7 +1168,7 @@ fn publish_project_resource_observed(
         &mut observer,
     );
     match result {
-        Ok(outcome) => {
+        Ok(mut outcome) => {
             clear_and_remove_transaction(&backups, transaction, &transaction_name).map_err(
                 |error| ProjectResourcePublicationError {
                     kind: ProjectResourcePublicationErrorKind::Recovery,
@@ -1163,6 +1178,7 @@ fn publish_project_resource_observed(
                     source: Some(Box::new(error)),
                 },
             )?;
+            outcome.previous_resource = previous;
             Ok(outcome)
         }
         Err(operation_error) => {
@@ -3536,6 +3552,7 @@ fn outcome_from_transaction(
         resource_id: tx.resource_id.clone(),
         resource_path: tx.resource.path.clone(),
         changed,
+        previous_resource: None,
     })
 }
 
@@ -4919,6 +4936,11 @@ mod tests {
             fs::read(fixture.root.join(published.resource_path())).unwrap(),
             fixture.replacement
         );
+        assert_eq!(
+            published.previous_resource(),
+            Some(fixture.original.as_slice()),
+            "a changed replacement carries the bytes it replaced"
+        );
         let unchanged = publish_project_resource(
             &fixture.root,
             ProjectResourcePublicationRequest {
@@ -4930,6 +4952,11 @@ mod tests {
         )
         .unwrap();
         assert!(!unchanged.changed());
+        assert_eq!(
+            unchanged.previous_resource(),
+            None,
+            "an identical republication replaces nothing"
+        );
         assert_eq!(unchanged.project_revision(), 2);
         assert!(
             recover_project_resource_publications(&fixture.root)

@@ -1741,7 +1741,7 @@ pub enum IdeProjectSaveError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -2114,7 +2114,7 @@ pub enum IdeAudioTrackEditError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -2614,7 +2614,7 @@ pub enum IdeArrangementPlacementEditError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         created_placement_id: Option<Box<str>>,
         source: Box<IdeProjectOpenError>,
     },
@@ -2901,7 +2901,7 @@ pub enum IdeSceneCreationError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -3098,7 +3098,7 @@ pub enum IdeAutomationTakeCreationError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -3219,7 +3219,7 @@ pub enum IdeAutomationTakeEditError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -3334,6 +3334,101 @@ pub enum IdeControlMappingEdit {
     Insert(IdeControlBindingRequest),
     SetEnabled { binding_id: String, enabled: bool },
     Remove { binding_id: String },
+}
+
+#[derive(Debug)]
+pub enum IdeResourceRestoreError {
+    ResourceMissing,
+    MixerSave(Box<IdeProjectSaveError>),
+    Storage(StorageError),
+    CapacityUnavailable,
+    CandidateInvalid(Box<dyn Error + Send + Sync>),
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeResourceRestoreError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: Box<ProjectResourcePublicationOutcome>,
+        source: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeResourceRestoreError {
+    #[must_use]
+    pub const fn publication_committed(&self) -> bool {
+        match self {
+            Self::ReopenAfterPublication { .. } => true,
+            Self::Publication(source) => source.published(),
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeResourceRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResourceMissing => {
+                formatter.write_str("the edited resource no longer exists in this project")
+            }
+            Self::MixerSave(source) => {
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("undo capacity is unavailable")
+            }
+            Self::CandidateInvalid(source) => write!(
+                formatter,
+                "undoing this edit would leave a project that cannot open: {source}"
+            ),
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before the undo: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before the undo ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "undo preparation failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "the previous state of {} was restored in project revision {} but the project could not be reopened: {source}",
+                outcome.resource_id(),
+                outcome.project_revision()
+            ),
+        }
+    }
+}
+
+impl Error for IdeResourceRestoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::CandidateInvalid(source) => Some(source.as_ref()),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::ResourceMissing | Self::CapacityUnavailable | Self::NativeClose(_) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -3579,7 +3674,7 @@ pub enum IdeSceneDuplicationError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -3711,7 +3806,7 @@ pub enum IdeSceneSlotEditError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -3886,7 +3981,7 @@ pub enum IdeSceneEditError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -4053,7 +4148,7 @@ pub enum IdeAudioClipRenameEditError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -4181,7 +4276,7 @@ pub enum IdeAudioClipGainEditError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -4306,7 +4401,7 @@ pub enum IdeAudioClipFadeEditError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -4429,7 +4524,7 @@ pub enum IdeAudioClipLoopEditError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -4552,7 +4647,7 @@ pub enum IdeAudioClipReverseEditError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -4676,7 +4771,7 @@ pub enum IdeAudioClipSourceSlipEditError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -4801,7 +4896,7 @@ pub enum IdeAudioClipActivationEditError {
         reopen: Box<IdeProjectOpenError>,
     },
     ReopenAfterPublication {
-        outcome: ProjectResourcePublicationOutcome,
+        outcome: Box<ProjectResourcePublicationOutcome>,
         source: Box<IdeProjectOpenError>,
     },
     PublicationAndReopen {
@@ -5093,6 +5188,33 @@ impl ControlMappingResolver for RaisedCapabilityProject<'_> {
 
     fn mixer_send_address(&self, send_id: &str) -> Option<MixerSendAddress> {
         self.project.mixer_send_address(send_id)
+    }
+}
+
+#[derive(Debug)]
+struct IdeResourceRestorePlan {
+    mixer: IdeMixerSavePlan,
+    resource_id: String,
+    role: ResourceRole,
+    resource_bytes: Vec<u8>,
+}
+
+impl IdeResourceRestorePlan {
+    fn publish(&self) -> Result<ProjectResourcePublicationOutcome, IdeResourceRestoreError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeResourceRestoreError::Publication(Box::new(source)))?;
+        publish_project_resource(
+            &self.mixer.project_path,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                resource_id: &self.resource_id,
+                expected_role: self.role,
+                resource_bytes: &self.resource_bytes,
+            },
+        )
+        .map_err(|source| IdeResourceRestoreError::Publication(Box::new(source)))
     }
 }
 
@@ -7004,6 +7126,149 @@ impl RunningDesktopIdeApplication {
             .compile_main_graph()
             .map(Some)
             .map_err(|_| IdeProjectExportError::LiveMixerUnavailable)
+    }
+
+    /// Prepares republication of one resource's earlier bytes.
+    ///
+    /// Other resources may have changed since the bytes were captured, so the
+    /// complete candidate project is reloaded and recompiled before anything
+    /// is written. A restore that would produce an unopenable project is
+    /// refused with the entry intact.
+    fn prepare_resource_restore(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        resource_id: &str,
+        resource_bytes: &[u8],
+    ) -> Result<IdeResourceRestorePlan, IdeResourceRestoreError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeResourceRestoreError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeResourceRestoreError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        Self::prepare_resource_restore_from_project(
+            application,
+            mixer,
+            prepared,
+            resource_id,
+            resource_bytes,
+        )
+    }
+
+    fn prepare_resource_restore_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        resource_id: &str,
+        resource_bytes: &[u8],
+    ) -> Result<IdeResourceRestorePlan, IdeResourceRestoreError> {
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == resource_id)
+            .ok_or(IdeResourceRestoreError::ResourceMissing)?;
+        let role = descriptor.role();
+        Self::validate_restore_candidate(application, prepared, resource_id, resource_bytes)?;
+        let mut owned_id = String::new();
+        owned_id
+            .try_reserve_exact(resource_id.len())
+            .map_err(|_| IdeResourceRestoreError::CapacityUnavailable)?;
+        owned_id.push_str(resource_id);
+        let mut owned_bytes = Vec::new();
+        owned_bytes
+            .try_reserve_exact(resource_bytes.len())
+            .map_err(|_| IdeResourceRestoreError::CapacityUnavailable)?;
+        owned_bytes.extend_from_slice(resource_bytes);
+        Ok(IdeResourceRestorePlan {
+            mixer,
+            resource_id: owned_id,
+            role,
+            resource_bytes: owned_bytes,
+        })
+    }
+
+    /// Reloads and recompiles the whole project with `resource_bytes`
+    /// substituted, exactly as the serializers validate their own candidates.
+    fn validate_restore_candidate(
+        application: &DesktopIdeApplication,
+        prepared: &PreparedProjectPlayback,
+        resource_id: &str,
+        resource_bytes: &[u8],
+    ) -> Result<(), IdeResourceRestoreError> {
+        let package = prepared.package();
+        let limits = application.config.project_limits.session.documents;
+        let mut timeline = Vec::new();
+        let mut tracks = Vec::new();
+        let mut clips = Vec::new();
+        let mut scenes = Vec::new();
+        let mut arrangement = None;
+        let mut mixer_bytes = Vec::new();
+        let mut takes = Vec::new();
+        for descriptor in package.manifest().resources() {
+            let bytes = if descriptor.id() == resource_id {
+                resource_bytes.to_vec()
+            } else {
+                package
+                    .read_resource(descriptor.id())
+                    .map_err(IdeResourceRestoreError::Storage)?
+            };
+            match descriptor.role() {
+                ResourceRole::Timeline => timeline = bytes,
+                ResourceRole::Track => tracks.push(bytes),
+                ResourceRole::Clip => clips.push(bytes),
+                ResourceRole::Scene => scenes.push(bytes),
+                ResourceRole::Arrangement => arrangement = Some(bytes),
+                ResourceRole::Mixer => mixer_bytes = bytes,
+                ResourceRole::AutomationTake => takes.push(bytes),
+                ResourceRole::Mapping | ResourceRole::RecordingMetadata => {}
+            }
+        }
+        let invalid =
+            |source: Box<dyn Error + Send + Sync>| IdeResourceRestoreError::CandidateInvalid(source);
+        let track_refs: Vec<&[u8]> = tracks.iter().map(Vec::as_slice).collect();
+        let clip_refs: Vec<&[u8]> = clips.iter().map(Vec::as_slice).collect();
+        let scene_refs: Vec<&[u8]> = scenes.iter().map(Vec::as_slice).collect();
+        let take_refs: Vec<&[u8]> = takes.iter().map(Vec::as_slice).collect();
+        let loaded = hyper_playback_json::load(
+            hyper_playback_json::PlaybackJsonInput {
+                project_id: package.manifest().project_id(),
+                sample_rate_hz: package.manifest().sample_rate_hz(),
+                timeline: &timeline,
+                tracks: &track_refs,
+                clips: &clip_refs,
+                scenes: &scene_refs,
+                arrangement: arrangement.as_deref(),
+            },
+            limits,
+        )
+        .map_err(|source| invalid(Box::new(source)))?;
+        let (_, _, _, media) = prepared.session().parts();
+        let facts: Vec<_> = media.media_asset_facts().collect();
+        let loaded_mixer = loaded
+            .load_mixer(&mixer_bytes, &facts, limits)
+            .map_err(|source| invalid(Box::new(source)))?;
+        let compiled = loaded_mixer
+            .compile_main_graph()
+            .map_err(|source| invalid(Box::new(source)))?;
+        if !take_refs.is_empty() {
+            let automation = loaded
+                .load_automation_takes(&loaded_mixer, &facts, &take_refs, limits)
+                .map_err(|source| invalid(Box::new(source)))?;
+            loaded
+                .compile_main_automation(&compiled, &automation)
+                .map_err(|source| invalid(Box::new(source)))?;
+        }
+        loaded
+            .compile_playback(
+                &facts,
+                hyper_playback_compiler::graph::GraphLimits::VERSION_1,
+                hyper_playback_compiler::scene::SceneLimits::VERSION_1,
+            )
+            .map_err(|source| invalid(Box::new(source)))?;
+        Ok(())
     }
 
     fn prepare_control_mapping_edit(
@@ -8998,7 +9263,7 @@ mod tests {
                     && matches!(source.as_ref(), IdeProjectOpenError::SelectedOutputUnavailable))
         ));
         let committed = IdeSceneRenameError::ReopenAfterPublication {
-            outcome: outcome.clone(),
+            outcome: Box::new(outcome.clone()),
             source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
         };
         assert!(matches!(
@@ -9030,7 +9295,7 @@ mod tests {
                     && matches!(source.as_ref(), IdeProjectOpenError::SelectedOutputUnavailable))
         ));
         let committed = IdeSceneEditError::ReopenAfterPublication {
-            outcome: outcome.clone(),
+            outcome: Box::new(outcome.clone()),
             source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
         };
         assert!(committed.to_string().contains("scene edit was committed"));
@@ -9825,7 +10090,7 @@ mod tests {
             worker::scene_duplication_failure_event(
                 "Intro copy".to_owned(),
                 IdeSceneDuplicationError::ReopenAfterPublication {
-                    outcome: outcome.clone(),
+                    outcome: Box::new(outcome.clone()),
                     source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
                 },
             ),
@@ -9842,7 +10107,7 @@ mod tests {
                     IdeSceneDuplicationError::ReopenAfterPublication {
                         outcome: retained,
                         source,
-                    } if retained == &outcome
+                    } if retained.as_ref() == &outcome
                         && matches!(source.as_ref(),
                             IdeProjectOpenError::SelectedOutputUnavailable))
         ));
@@ -11148,6 +11413,160 @@ mod tests {
     }
 
     #[test]
+    fn a_restore_republishes_previous_bytes_and_reports_its_own_previous_state() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let scene_bytes = package.read_resource(ARRANGEMENT_TEST_SCENE_ID).unwrap();
+        let mixer_id = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap()
+            .id()
+            .to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+
+        let (project, _, _, _) = prepared.session().parts();
+        let renamed = serialize_scene_rename(
+            project,
+            &scene_bytes,
+            ARRANGEMENT_TEST_SCENE_ID,
+            "Renamed",
+            limits.session.documents,
+        )
+        .unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        drop(prepared);
+        let edited = publish_project_resource(
+            &project_path,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256,
+                resource_id: ARRANGEMENT_TEST_SCENE_ID,
+                expected_role: ResourceRole::Scene,
+                resource_bytes: &renamed,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            edited.previous_resource(),
+            Some(scene_bytes.as_slice()),
+            "the edit carries the bytes an undo will restore"
+        );
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let application = DesktopIdeApplication::from_inventories(
+            config,
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let plan = {
+            let package = reopened.package();
+            let mixer_plan = IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: *package.manifest_sha256(),
+                resource_id: mixer_id.clone(),
+                resource_bytes: mixer_bytes.clone(),
+            };
+            RunningDesktopIdeApplication::prepare_resource_restore_from_project(
+                &application,
+                mixer_plan,
+                &reopened,
+                ARRANGEMENT_TEST_SCENE_ID,
+                &scene_bytes,
+            )
+            .unwrap()
+        };
+        assert_eq!(plan.role, ResourceRole::Scene, "the role comes from the manifest");
+        drop(reopened);
+        let restored = plan.publish().unwrap();
+        assert_eq!(
+            restored.previous_resource(),
+            Some(renamed.as_slice()),
+            "the restore's own previous bytes are the redo entry"
+        );
+
+        let verified =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert_eq!(
+            verified.package().read_resource(ARRANGEMENT_TEST_SCENE_ID).unwrap(),
+            scene_bytes,
+            "the undone edit is byte-identical to the original"
+        );
+    }
+
+    #[test]
+    fn a_restore_that_would_break_the_project_is_refused_before_writing() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let application = DesktopIdeApplication::from_inventories(
+            config,
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+
+        let scene_bytes = prepared
+            .package()
+            .read_resource(ARRANGEMENT_TEST_SCENE_ID)
+            .unwrap();
+        let broken = String::from_utf8(scene_bytes.clone()).unwrap().replace(
+            "\"slots\":[]",
+            "\"slots\":[{\"action\":\"play\",\"clip_id\":\"018f47a2-6b2d-7c11-8a44-0011223344fe\",\"track_id\":\"018f47a2-6b2d-7c11-8a44-0011223344ff\"}]",
+        );
+        assert_ne!(broken.as_bytes(), scene_bytes.as_slice());
+        let mixer_plan = || IdeMixerSavePlan {
+            project_path: project_path.clone(),
+            expected_project_sha256: *prepared.package().manifest_sha256(),
+            resource_id: "mixer".to_owned(),
+            resource_bytes: Vec::new(),
+        };
+        let refused = RunningDesktopIdeApplication::prepare_resource_restore_from_project(
+            &application,
+            mixer_plan(),
+            &prepared,
+            ARRANGEMENT_TEST_SCENE_ID,
+            broken.as_bytes(),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(
+            matches!(refused, IdeResourceRestoreError::CandidateInvalid(_)),
+            "restoring bytes that no longer fit the project is refused: {refused}"
+        );
+
+        assert!(
+            RunningDesktopIdeApplication::prepare_resource_restore_from_project(
+                &application,
+                mixer_plan(),
+                &prepared,
+                ARRANGEMENT_TEST_SCENE_ID,
+                &scene_bytes,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            RunningDesktopIdeApplication::prepare_resource_restore_from_project(
+                &application,
+                mixer_plan(),
+                &prepared,
+                "018f47a2-6b2d-7c11-8a44-0011223344fd",
+                &scene_bytes,
+            ),
+            Err(IdeResourceRestoreError::ResourceMissing)
+        ));
+    }
+
+    #[test]
     fn the_export_journal_never_collides_with_its_destination() {
         let wav = Path::new("C:/Renders/night drive.wav");
         let journal = export_journal_path(wav).unwrap();
@@ -12026,7 +12445,7 @@ mod tests {
         assert!(outcome.changed());
         assert_eq!(outcome.project_revision(), 2);
         let committed_warning = IdeAudioClipFadeEditError::ReopenAfterPublication {
-            outcome: outcome.clone(),
+            outcome: Box::new(outcome.clone()),
             source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
         };
         assert!(committed_warning.publication_committed());
@@ -12048,21 +12467,21 @@ mod tests {
         ));
         assert!(
             IdeAudioClipRenameEditError::ReopenAfterPublication {
-                outcome: outcome.clone(),
+                outcome: Box::new(outcome.clone()),
                 source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
             }
             .publication_committed()
         );
         assert!(
             IdeAudioClipActivationEditError::ReopenAfterPublication {
-                outcome: outcome.clone(),
+                outcome: Box::new(outcome.clone()),
                 source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
             }
             .publication_committed()
         );
         assert!(
             IdeAudioClipGainEditError::ReopenAfterPublication {
-                outcome: outcome.clone(),
+                outcome: Box::new(outcome.clone()),
                 source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
             }
             .publication_committed()
@@ -12128,7 +12547,7 @@ mod tests {
         assert!(outcome.changed());
         assert_eq!(outcome.project_revision(), 2);
         let committed_warning = IdeAudioClipLoopEditError::ReopenAfterPublication {
-            outcome: outcome.clone(),
+            outcome: Box::new(outcome.clone()),
             source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
         };
         assert!(committed_warning.publication_committed());
@@ -12208,7 +12627,7 @@ mod tests {
         assert!(outcome.changed());
         assert_eq!(outcome.project_revision(), 2);
         let committed_warning = IdeAudioClipReverseEditError::ReopenAfterPublication {
-            outcome: outcome.clone(),
+            outcome: Box::new(outcome.clone()),
             source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
         };
         assert!(committed_warning.publication_committed());
@@ -12296,7 +12715,7 @@ mod tests {
         assert!(outcome.changed());
         assert_eq!(outcome.project_revision(), 2);
         let committed_warning = IdeAudioClipSourceSlipEditError::ReopenAfterPublication {
-            outcome: outcome.clone(),
+            outcome: Box::new(outcome.clone()),
             source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
         };
         assert!(committed_warning.publication_committed());

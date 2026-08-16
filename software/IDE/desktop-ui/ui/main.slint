@@ -36,6 +36,7 @@ export enum AppMode {
     adding-automation-take,
     editing-control-mapping,
     exporting-project,
+    restoring-edit,
     changing-automation-take-activation,
     renaming-scene,
     duplicating-scene,
@@ -242,6 +243,8 @@ export global IdeActions {
     callback set-control-binding-active(string, bool);
     callback remove-control-binding(string);
     callback export-project();
+    callback undo-edit();
+    callback redo-edit();
     callback save-project();
     callback add-audio-track(string);
     callback remove-audio-track(string);
@@ -498,6 +501,8 @@ export component MainWindow inherits Window {
     in property <bool> export-available: false;
     in property <string> export-destination: "";
     in property <string> export-summary: "";
+    in property <string> undo-label: "";
+    in property <string> redo-label: "";
     in-out property <bool> control-create-visible: false;
     in-out property <int> control-create-source-index: 0;
     in-out property <int> control-create-target-index: 0;
@@ -877,6 +882,23 @@ export component MainWindow inherits Window {
                                 text: "Close";
                                 enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing;
                                 clicked => { IdeActions.close-project(); }
+                            }
+                        }
+                        if !root.new-project-visible && !root.new-track-visible : HorizontalLayout {
+                            spacing: 8px;
+                            Button {
+                                horizontal-stretch: 1;
+                                text: root.undo-label == "" ? "Undo" : "Undo " + root.undo-label;
+                                enabled: root.app-mode == AppMode.running && root.undo-label != "";
+                                accessible-label: "Undo the last durable edit";
+                                clicked => { IdeActions.undo-edit(); }
+                            }
+                            Button {
+                                horizontal-stretch: 1;
+                                text: root.redo-label == "" ? "Redo" : "Redo " + root.redo-label;
+                                enabled: root.app-mode == AppMode.running && root.redo-label != "";
+                                accessible-label: "Redo the last undone edit";
+                                clicked => { IdeActions.redo-edit(); }
                             }
                         }
                         if !root.new-project-visible && !root.new-track-visible : Button {

@@ -1553,6 +1553,7 @@ fn bind_arrangement_scene_launch_callback(
     bind_automation_take_activation_callback(ui, worker);
     bind_control_mapping_callbacks(ui, worker, project_state);
     bind_project_export_callback(ui, worker);
+    bind_undo_callbacks(ui, worker);
     bind_arrangement_scene_launch_locate_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_scene_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_removal_callback(ui, worker, project_state);
@@ -2946,6 +2947,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         }
         IdeWorkerCommandKind::EditControlMapping => AppMode::EditingControlMapping,
         IdeWorkerCommandKind::ExportProject => AppMode::ExportingProject,
+        IdeWorkerCommandKind::Undo | IdeWorkerCommandKind::Redo => AppMode::RestoringEdit,
         IdeWorkerCommandKind::MoveArrangementSceneLaunch => AppMode::MovingArrangementSceneLaunch,
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => {
             AppMode::ChangingArrangementSceneLaunchScene
@@ -3089,6 +3091,12 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::ExportProject => {
             "Rendering the project through the playback runtime..."
+        }
+        IdeWorkerCommandKind::Undo => {
+            "Preserving mixer state, restoring the previous edit, and reopening project..."
+        }
+        IdeWorkerCommandKind::Redo => {
+            "Preserving mixer state, reapplying the undone edit, and reopening project..."
         }
         IdeWorkerCommandKind::DuplicateScene => {
             "Preserving mixer state, duplicating the scene, and reopening project..."
@@ -3312,6 +3320,9 @@ fn apply_event(
         event @ (IdeWorkerEvent::ProjectExporting | IdeWorkerEvent::ProjectExported { .. }) => {
             apply_project_export_event(ui, &event);
         }
+        event @ (IdeWorkerEvent::UndoStateChanged { .. }
+        | IdeWorkerEvent::EditRestored { .. }
+        | IdeWorkerEvent::EditRestoring { .. }) => apply_undo_event(ui, &event),
         event @ (IdeWorkerEvent::SceneDuplicated { .. }
         | IdeWorkerEvent::SceneDuplicationCommittedWithWarning { .. }
         | IdeWorkerEvent::SceneDuplicating) => apply_scene_duplication_event(ui, &event),
@@ -5584,6 +5595,8 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_export_available(false);
     ui.set_export_destination(SharedString::default());
     ui.set_export_summary(SharedString::default());
+    ui.set_undo_label(SharedString::default());
+    ui.set_redo_label(SharedString::default());
     reset_arrangement_scene_launch_addition_form(ui);
     reset_arrangement_scene_launch_move_form(ui);
     reset_arrangement_scene_launch_scene_form(ui);
@@ -5676,6 +5689,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::ExportProject if current == AppMode::ExportingProject => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::Undo | IdeWorkerCommandKind::Redo
+            if current == AppMode::RestoringEdit =>
+        {
             AppMode::Running
         }
         IdeWorkerCommandKind::MoveArrangementSceneLaunch
@@ -7448,6 +7466,73 @@ fn apply_project_export_event(ui: &MainWindow, event: &IdeWorkerEvent) {
         }
         _ => unreachable!("project export event dispatcher received another event"),
     }
+}
+
+fn apply_undo_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::UndoStateChanged {
+            undo_label,
+            redo_label,
+        } => {
+            ui.set_undo_label(undo_label.unwrap_or_default().into());
+            ui.set_redo_label(redo_label.unwrap_or_default().into());
+        }
+        IdeWorkerEvent::EditRestored {
+            revision,
+            redo,
+            label: _,
+        } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text(
+                if *redo {
+                    format!("Edit reapplied in project revision {revision}")
+                } else {
+                    format!("Edit undone in project revision {revision}")
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::EditRestoring { redo, label } => {
+            ui.set_app_mode(AppMode::RestoringEdit);
+            ui.set_status_text(
+                if *redo {
+                    format!("Reapplying the undone {label}…")
+                } else {
+                    format!("Undoing the {label}…")
+                }
+                .into(),
+            );
+        }
+        _ => unreachable!("undo event dispatcher received another event"),
+    }
+}
+
+fn bind_undo_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let restore = |redo: bool| {
+        let weak = ui.as_weak();
+        let worker = Rc::clone(worker);
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::Running {
+                return;
+            }
+            submit_to_ui(
+                &ui,
+                &worker,
+                if redo {
+                    IdeWorkerCommand::Redo
+                } else {
+                    IdeWorkerCommand::Undo
+                },
+            );
+        }
+    };
+    let actions = ui.global::<IdeActions>();
+    actions.on_undo_edit(restore(false));
+    actions.on_redo_edit(restore(true));
 }
 
 fn bind_project_export_callback(ui: &MainWindow, worker: &WorkerCell) {

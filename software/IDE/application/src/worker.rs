@@ -30,6 +30,7 @@ use super::{
     ControlBinding, ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
     IdeAudioTrackEditError, IdeAudioTrackRemovalError, IdeAutomationTakeCreationError,
     IdeControlMappingEdit, IdeControlMappingEditError, IdeProjectExportError,
+    IdeResourceRestoreError,
     IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
     IdeInputDiscoveryError,
     IdeInputSelection, IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError,
@@ -164,6 +165,8 @@ pub enum IdeWorkerCommandKind {
     SetAutomationTakeActive,
     EditControlMapping,
     ExportProject,
+    Undo,
+    Redo,
     StartRecording,
     StopRecording,
     AbortRecording,
@@ -329,6 +332,8 @@ pub enum IdeWorkerCommand {
         wav_path: std::path::PathBuf,
         block_frames: usize,
     },
+    Undo,
+    Redo,
     DuplicateScene {
         scene_id: String,
         name: String,
@@ -435,6 +440,8 @@ impl IdeWorkerCommand {
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
             Self::EditControlMapping { .. } => IdeWorkerCommandKind::EditControlMapping,
             Self::ExportProject { .. } => IdeWorkerCommandKind::ExportProject,
+            Self::Undo => IdeWorkerCommandKind::Undo,
+            Self::Redo => IdeWorkerCommandKind::Redo,
             Self::DuplicateScene { .. } => IdeWorkerCommandKind::DuplicateScene,
             Self::SetSceneSlot { .. } => IdeWorkerCommandKind::SetSceneSlot,
             Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
@@ -1322,6 +1329,8 @@ pub enum IdeWorkerCommandFailure {
     AutomationTakeActivation(Box<IdeAutomationTakeEditError>),
     ControlMappingEdit(Box<IdeControlMappingEditError>),
     ProjectExport(Box<IdeProjectExportError>),
+    EditRestore(Box<IdeResourceRestoreError>),
+    NothingToRestore,
     SceneDuplication(Box<IdeSceneDuplicationError>),
     SceneSlotEdit(Box<IdeSceneSlotEditError>),
     SceneRename(Box<IdeSceneRenameError>),
@@ -1383,6 +1392,8 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AutomationTakeActivation(source) => source.fmt(formatter),
             Self::ControlMappingEdit(source) => source.fmt(formatter),
             Self::ProjectExport(source) => source.fmt(formatter),
+            Self::EditRestore(source) => source.fmt(formatter),
+            Self::NothingToRestore => formatter.write_str("there is no edit to restore"),
             Self::SceneDuplication(source) => source.fmt(formatter),
             Self::SceneSlotEdit(source) => source.fmt(formatter),
             Self::SceneRename(source) | Self::SceneActivation(source) => source.fmt(formatter),
@@ -1449,6 +1460,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AutomationTakeActivation(source) => Some(source),
             Self::ControlMappingEdit(source) => Some(source),
             Self::ProjectExport(source) => Some(source),
+            Self::EditRestore(source) => Some(source),
             Self::SceneDuplication(source) => Some(source),
             Self::SceneSlotEdit(source) => Some(source),
             Self::SceneRename(source) | Self::SceneActivation(source) => Some(source),
@@ -1458,7 +1470,8 @@ impl Error for IdeWorkerCommandFailure {
             Self::InputPublication(source) => Some(source),
             Self::InvalidState
             | Self::ProjectPublicationCapacityUnavailable
-            | Self::ProjectSnapshotUnavailable => None,
+            | Self::ProjectSnapshotUnavailable
+            | Self::NothingToRestore => None,
         }
     }
 }
@@ -1691,6 +1704,19 @@ pub enum IdeWorkerEvent {
     ProjectExporting,
     ProjectExported {
         report: hyper_desktop_audio::OfflineExportReport,
+    },
+    UndoStateChanged {
+        undo_label: Option<&'static str>,
+        redo_label: Option<&'static str>,
+    },
+    EditRestored {
+        revision: u64,
+        redo: bool,
+        label: &'static str,
+    },
+    EditRestoring {
+        redo: bool,
+        label: &'static str,
     },
     SceneDuplicated {
         revision: u64,
@@ -2247,6 +2273,10 @@ enum ProjectMutation {
     EditControlMapping {
         edit: IdeControlMappingEdit,
     },
+    RestoreResource {
+        entry: UndoEntry,
+        redo: bool,
+    },
     DuplicateScene {
         scene_id: String,
         name: String,
@@ -2319,6 +2349,8 @@ impl ProjectMutation {
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
             Self::EditControlMapping { .. } => IdeWorkerCommandKind::EditControlMapping,
+            Self::RestoreResource { redo: false, .. } => IdeWorkerCommandKind::Undo,
+            Self::RestoreResource { redo: true, .. } => IdeWorkerCommandKind::Redo,
             Self::DuplicateScene { .. } => IdeWorkerCommandKind::DuplicateScene,
             Self::SetSceneSlot { .. } => IdeWorkerCommandKind::SetSceneSlot,
             Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
@@ -2428,6 +2460,10 @@ impl ProjectMutation {
             Self::EditControlMapping { edit } => {
                 IdeWorkerEvent::ControlMappingEditing { edit: edit.clone() }
             }
+            Self::RestoreResource { entry, redo } => IdeWorkerEvent::EditRestoring {
+                redo: *redo,
+                label: entry.label,
+            },
             Self::DuplicateScene { .. } => IdeWorkerEvent::SceneDuplicating,
             Self::SetSceneSlot { edit, .. } => {
                 IdeWorkerEvent::SceneSlotChanging { edit: edit.clone() }
@@ -2440,17 +2476,109 @@ impl ProjectMutation {
     }
 }
 
+const MAX_UNDO_DEPTH: usize = 20;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UndoEntry {
+    resource_id: String,
+    bytes: Vec<u8>,
+    label: &'static str,
+}
+
+/// Ardour's two bounded lists, holding complete previous documents rather than
+/// inverse operations. History is per-session and dies with the project.
+#[derive(Debug, Default)]
+struct UndoHistory {
+    undo: Vec<UndoEntry>,
+    redo: Vec<UndoEntry>,
+}
+
+impl UndoHistory {
+    fn record_edit(&mut self, entry: UndoEntry) {
+        self.redo.clear();
+        push_bounded(&mut self.undo, entry);
+    }
+
+    fn record_restore(&mut self, redo: bool, entry: UndoEntry) {
+        if redo {
+            push_bounded(&mut self.undo, entry);
+        } else {
+            push_bounded(&mut self.redo, entry);
+        }
+    }
+
+    fn pop(&mut self, redo: bool) -> Option<UndoEntry> {
+        if redo {
+            self.redo.pop()
+        } else {
+            self.undo.pop()
+        }
+    }
+
+    fn clear(&mut self) -> bool {
+        let had_entries = !self.undo.is_empty() || !self.redo.is_empty();
+        self.undo.clear();
+        self.redo.clear();
+        had_entries
+    }
+
+    fn state_event(&self) -> IdeWorkerEvent {
+        IdeWorkerEvent::UndoStateChanged {
+            undo_label: self.undo.last().map(|entry| entry.label),
+            redo_label: self.redo.last().map(|entry| entry.label),
+        }
+    }
+}
+
+fn push_bounded(stack: &mut Vec<UndoEntry>, entry: UndoEntry) {
+    if stack.len() >= MAX_UNDO_DEPTH {
+        stack.remove(0);
+    }
+    stack.push(entry);
+}
+
+/// The user-facing name of the durable edit a history entry reverses.
+const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
+    match command {
+        IdeWorkerCommandKind::SaveProject => "mixer save",
+        IdeWorkerCommandKind::RenameAudioTrack => "track rename",
+        IdeWorkerCommandKind::SetAudioTrackActive => "track activation",
+        IdeWorkerCommandKind::MoveArrangementPlacement => "placement move",
+        IdeWorkerCommandKind::SetArrangementPlacementDuration => "placement duration",
+        IdeWorkerCommandKind::TrimArrangementPlacementFront => "placement trim",
+        IdeWorkerCommandKind::RemoveArrangementPlacement => "placement removal",
+        IdeWorkerCommandKind::SetArrangementPlacementActive => "placement activation",
+        IdeWorkerCommandKind::MoveArrangementSceneLaunch => "scene marker move",
+        IdeWorkerCommandKind::SetArrangementSceneLaunchScene => "scene marker reassignment",
+        IdeWorkerCommandKind::RemoveArrangementSceneLaunch => "scene marker removal",
+        IdeWorkerCommandKind::RenameAudioClip => "clip rename",
+        IdeWorkerCommandKind::SetAudioClipActive => "clip activation",
+        IdeWorkerCommandKind::SetAudioClipGain => "clip gain",
+        IdeWorkerCommandKind::SetAudioClipFades => "clip fades",
+        IdeWorkerCommandKind::SetAudioClipLoop => "clip loop",
+        IdeWorkerCommandKind::SetAudioClipReverse => "clip direction",
+        IdeWorkerCommandKind::SetAudioClipSourceStart => "clip source slip",
+        IdeWorkerCommandKind::RenameScene => "scene rename",
+        IdeWorkerCommandKind::SetSceneSlot => "scene slot edit",
+        IdeWorkerCommandKind::SetSceneActive => "scene activation",
+        IdeWorkerCommandKind::SetAutomationTakeActive => "automation activation",
+        _ => "edit",
+    }
+}
+
 fn run_worker(
     mut state: WorkerState,
     commands: &Receiver<IdeWorkerCommand>,
     events: &SyncSender<IdeWorkerEvent>,
 ) -> IdeWorkerShutdownReport {
     let mut unpublished_native_failure = None;
+    let mut history = UndoHistory::default();
     if !initialize_state(&mut state, events, &mut unpublished_native_failure) {
         return finish_worker(state, unpublished_native_failure);
     }
     loop {
-        if !poll_pending_state(&mut state, events, &mut unpublished_native_failure) {
+        if !poll_pending_state(&mut state, events, &mut unpublished_native_failure, &mut history)
+        {
             return finish_worker(state, unpublished_native_failure);
         }
         let command = if matches!(
@@ -2477,7 +2605,13 @@ fn run_worker(
         if matches!(command, IdeWorkerCommand::Shutdown) {
             break;
         }
-        if !process_command(&mut state, command, events, &mut unpublished_native_failure) {
+        if !process_command(
+            &mut state,
+            command,
+            events,
+            &mut unpublished_native_failure,
+            &mut history,
+        ) {
             break;
         }
     }
@@ -2575,8 +2709,19 @@ fn process_command(
     command: IdeWorkerCommand,
     events: &SyncSender<IdeWorkerEvent>,
     unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+    history: &mut UndoHistory,
 ) -> bool {
     let kind = command.kind();
+    if matches!(
+        command,
+        IdeWorkerCommand::CloseProject
+            | IdeWorkerCommand::OpenProject(_)
+            | IdeWorkerCommand::CreateProject { .. }
+    ) && history.clear()
+        && !send_event(events, history.state_event())
+    {
+        return false;
+    }
     match command {
         command @ (IdeWorkerCommand::RetryDiscovery
         | IdeWorkerCommand::RefreshOutputs
@@ -2670,11 +2815,13 @@ fn process_command(
         | IdeWorkerCommand::AddAutomationTake { .. }
         | IdeWorkerCommand::SetAutomationTakeActive { .. }
         | IdeWorkerCommand::EditControlMapping { .. }
+        | IdeWorkerCommand::Undo
+        | IdeWorkerCommand::Redo
         | IdeWorkerCommand::DuplicateScene { .. }
         | IdeWorkerCommand::SetSceneSlot { .. }
         | IdeWorkerCommand::RenameScene { .. }
         | IdeWorkerCommand::SetSceneActive { .. }) => {
-            process_project_mutation_command(state, command, events)
+            process_project_mutation_command(state, command, events, history)
         }
         IdeWorkerCommand::StartRecording { channel_index } => {
             start_recording(state, channel_index, events)
@@ -2751,6 +2898,7 @@ fn process_project_mutation_command(
     state: &mut WorkerState,
     command: IdeWorkerCommand,
     events: &SyncSender<IdeWorkerEvent>,
+    history: &mut UndoHistory,
 ) -> bool {
     match command {
         IdeWorkerCommand::SaveProject => save_project(state, events),
@@ -2824,6 +2972,8 @@ fn process_project_mutation_command(
         IdeWorkerCommand::EditControlMapping { edit } => {
             edit_control_mapping(state, events, edit)
         }
+        IdeWorkerCommand::Undo => restore_edit(state, events, history, false),
+        IdeWorkerCommand::Redo => restore_edit(state, events, history, true),
         IdeWorkerCommand::DuplicateScene { scene_id, name } => {
             duplicate_scene(state, events, &scene_id, &name)
         }
@@ -4794,6 +4944,112 @@ fn export_project(
     }
 }
 
+const fn undo_label_of_restore(redo: bool) -> &'static str {
+    if redo { "redo" } else { "undo" }
+}
+
+/// The single capture point: any successful replacement that carried previous
+/// bytes becomes a history entry. A restore's own outcome feeds the opposite
+/// stack, so undoing an undo is redo.
+fn observe_history(
+    history: &mut UndoHistory,
+    attempt: &ProjectMutationAttempt,
+    command: IdeWorkerCommandKind,
+    events: &SyncSender<IdeWorkerEvent>,
+) {
+    let changed = match attempt {
+        ProjectMutationAttempt::RestoreResource {
+            entry,
+            redo,
+            result: Ok(outcome),
+        } => {
+            if let Some(previous) = outcome.previous_resource() {
+                history.record_restore(
+                    *redo,
+                    UndoEntry {
+                        resource_id: entry.resource_id.clone(),
+                        bytes: previous.to_vec(),
+                        label: entry.label,
+                    },
+                );
+            }
+            true
+        }
+        other => match replacement_outcome(other) {
+            Some(outcome) => {
+                if let Some(previous) = outcome.previous_resource() {
+                    history.record_edit(UndoEntry {
+                        resource_id: outcome.resource_id().to_owned(),
+                        bytes: previous.to_vec(),
+                        label: undo_label(command),
+                    });
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        },
+    };
+    if changed {
+        let _ = send_event(events, history.state_event());
+    }
+}
+
+/// Every attempt whose success is one replacement publication outcome.
+fn replacement_outcome(
+    attempt: &ProjectMutationAttempt,
+) -> Option<&hyper_storage_engine::ProjectResourcePublicationOutcome> {
+    match attempt {
+        ProjectMutationAttempt::Save(Ok(outcome))
+        | ProjectMutationAttempt::RenameAudioTrack(Ok(outcome))
+        | ProjectMutationAttempt::SetAudioTrackActive { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetArrangementPlacementActive { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::MoveArrangementPlacement { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetArrangementPlacementDuration { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::TrimArrangementPlacementFront { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::RemoveArrangementPlacement(Ok(outcome))
+        | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetArrangementSceneLaunchScene { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::RemoveArrangementSceneLaunch { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::RenameAudioClip { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetAudioClipActive { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetAudioClipGain { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetAudioClipFades { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetAudioClipLoop { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetAudioClipReverse { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetAudioClipSourceStart { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::RenameScene { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetSceneSlot { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetSceneActive { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetAutomationTakeActive { result: Ok(outcome), .. } => {
+            Some(outcome)
+        }
+        _ => None,
+    }
+}
+
+fn restore_edit(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    history: &mut UndoHistory,
+    redo: bool,
+) -> bool {
+    let command = if redo {
+        IdeWorkerCommandKind::Redo
+    } else {
+        IdeWorkerCommandKind::Undo
+    };
+    let Some(entry) = history.pop(redo) else {
+        return publish_failure(events, command, IdeWorkerCommandFailure::NothingToRestore);
+    };
+    if !send_event(events, history.state_event()) {
+        return false;
+    }
+    begin_project_mutation_request(state, events, ProjectMutation::RestoreResource { entry, redo })
+}
+
 fn edit_control_mapping(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -5465,6 +5721,9 @@ fn project_mutation_save_failure(
         ProjectMutation::EditControlMapping { .. } => IdeWorkerCommandFailure::ControlMappingEdit(
             Box::new(IdeControlMappingEditError::MixerSave(Box::new(reason))),
         ),
+        ProjectMutation::RestoreResource { .. } => IdeWorkerCommandFailure::EditRestore(Box::new(
+            IdeResourceRestoreError::MixerSave(Box::new(reason)),
+        )),
         ProjectMutation::DuplicateScene { .. } => IdeWorkerCommandFailure::SceneDuplication(
             Box::new(IdeSceneDuplicationError::MixerSave(Box::new(reason))),
         ),
@@ -5485,13 +5744,22 @@ fn begin_save_close(
     application: RunningDesktopIdeApplication,
     operation: ProjectMutation,
     events: &SyncSender<IdeWorkerEvent>,
+    history: &mut UndoHistory,
 ) -> bool {
     match application.close_for_save() {
         IdeSaveCloseOutcome::Closed {
             application,
             recovery,
             failure,
-        } => complete_project_mutation(state, application, recovery, operation, failure, events),
+        } => complete_project_mutation(
+            state,
+            application,
+            recovery,
+            operation,
+            failure,
+            events,
+            history,
+        ),
         IdeSaveCloseOutcome::Pending(pending) => {
             let event = operation.pending_event();
             *state = WorkerState::Saving { pending, operation };
@@ -5671,6 +5939,9 @@ fn project_mutation_native_close_failure(
         ProjectMutation::EditControlMapping { .. } => IdeWorkerCommandFailure::ControlMappingEdit(
             Box::new(IdeControlMappingEditError::NativeClose(failure)),
         ),
+        ProjectMutation::RestoreResource { .. } => IdeWorkerCommandFailure::EditRestore(Box::new(
+            IdeResourceRestoreError::NativeClose(failure),
+        )),
         ProjectMutation::DuplicateScene { .. } => IdeWorkerCommandFailure::SceneDuplication(
             Box::new(IdeSceneDuplicationError::NativeClose(failure)),
         ),
@@ -5871,6 +6142,14 @@ enum ProjectMutationAttempt {
     EditControlMapping {
         edit: IdeControlMappingEdit,
         result: Result<u64, IdeControlMappingEditError>,
+    },
+    RestoreResource {
+        entry: UndoEntry,
+        redo: bool,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeResourceRestoreError,
+        >,
     },
     DuplicateScene {
         name: String,
@@ -6152,6 +6431,7 @@ fn complete_project_mutation(
     operation: ProjectMutation,
     native_failure: Option<IdeNativeCloseFailure>,
     events: &SyncSender<IdeWorkerEvent>,
+    history: &mut UndoHistory,
 ) -> bool {
     let command = operation.command();
     let Some(project_path) = recovery
@@ -6171,6 +6451,7 @@ fn complete_project_mutation(
     };
     let attempt = attempt_project_mutation(&application, &recovery, operation, native_failure);
     drop(recovery);
+    observe_history(history, &attempt, command, events);
     match application.open_project(&project_path) {
         Ok(running) => {
             *state = WorkerState::Running(running);
@@ -6680,6 +6961,42 @@ fn complete_project_mutation(
                     result: Err(reason),
                     ..
                 } => send_event(events, control_mapping_edit_failure_event(reason)),
+                ProjectMutationAttempt::RestoreResource {
+                    entry,
+                    redo,
+                    result: Ok(outcome),
+                } => {
+                    let _ = (entry, &outcome);
+                    send_event(
+                        events,
+                        IdeWorkerEvent::EditRestored {
+                            revision: outcome.project_revision(),
+                            redo,
+                            label: undo_label_of_restore(redo),
+                        },
+                    ) && send_event(events, history.state_event())
+                }
+                ProjectMutationAttempt::RestoreResource {
+                    entry,
+                    redo,
+                    result: Err(reason),
+                } => {
+                    if !reason.publication_committed() {
+                        history.record_restore(!redo, entry);
+                    }
+                    send_event(events, history.state_event())
+                        && send_event(
+                            events,
+                            IdeWorkerEvent::CommandFailed {
+                                command: if redo {
+                                    IdeWorkerCommandKind::Redo
+                                } else {
+                                    IdeWorkerCommandKind::Undo
+                                },
+                                reason: IdeWorkerCommandFailure::EditRestore(Box::new(reason)),
+                            },
+                        )
+                }
                 ProjectMutationAttempt::DuplicateScene {
                     name,
                     result: Ok(outcome),
@@ -7129,6 +7446,24 @@ fn attempt_project_mutation(
             ProjectMutationAttempt::EditControlMapping {
                 edit: edit.clone(),
                 result: attempt_control_mapping_edit(application, recovery, &edit, native_failure),
+            }
+        }
+        ProjectMutation::RestoreResource { entry, redo } => {
+            let result = if let Some(failure) = native_failure {
+                Err(IdeResourceRestoreError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_resource_restore(
+                    application,
+                    recovery,
+                    &entry.resource_id,
+                    &entry.bytes,
+                )
+                .and_then(|plan| plan.publish())
+            };
+            ProjectMutationAttempt::RestoreResource {
+                entry,
+                redo,
+                result,
             }
         }
         ProjectMutation::SetAutomationTakeActive { take_id, enabled } => {
@@ -7715,7 +8050,7 @@ fn project_mutation_reopen_failure(
     match attempt {
         ProjectMutationAttempt::Save(Ok(outcome)) => {
             IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::ReopenAfterPublication {
-                outcome,
+                outcome: Box::new(outcome),
                 source: Box::new(reopen),
             })
         }
@@ -7936,6 +8271,25 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::EditControlMapping { result, .. } => {
             control_mapping_edit_reopen_failure(result, reopen)
         }
+        ProjectMutationAttempt::RestoreResource { result, .. } => {
+            let reason = match result {
+                Ok(outcome) => IdeResourceRestoreError::ReopenAfterPublication {
+                    outcome: Box::new(outcome),
+                    source: Box::new(reopen),
+                },
+                Err(IdeResourceRestoreError::NativeClose(close)) => {
+                    IdeResourceRestoreError::NativeCloseAndReopen {
+                        close,
+                        reopen: Box::new(reopen),
+                    }
+                }
+                Err(preparation) => IdeResourceRestoreError::ReopenAfterPreparation {
+                    preparation: Box::new(preparation),
+                    reopen: Box::new(reopen),
+                },
+            };
+            IdeWorkerCommandFailure::EditRestore(Box::new(reason))
+        }
         ProjectMutationAttempt::DuplicateScene { result, .. } => {
             scene_duplication_reopen_failure(result, reopen)
         }
@@ -7982,7 +8336,7 @@ fn automation_take_activation_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeAutomationTakeEditError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeAutomationTakeEditError::Publication(publication)) => {
@@ -8014,7 +8368,7 @@ fn automation_take_creation_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeAutomationTakeCreationError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeAutomationTakeCreationError::Publication(publication)) => {
@@ -8043,7 +8397,7 @@ fn scene_creation_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeSceneCreationError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeSceneCreationError::Publication(publication)) => {
@@ -8075,7 +8429,7 @@ pub(super) fn scene_duplication_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeSceneDuplicationError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeSceneDuplicationError::Publication(publication)) => {
@@ -8104,7 +8458,7 @@ fn scene_slot_edit_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeSceneSlotEditError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeSceneSlotEditError::Publication(publication)) => {
@@ -8209,7 +8563,7 @@ pub(super) fn audio_clip_rename_edit_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeAudioClipRenameEditError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeAudioClipRenameEditError::Publication(publication)) => {
@@ -8238,7 +8592,7 @@ pub(super) fn scene_rename_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeSceneRenameError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeSceneRenameError::Publication(publication)) => {
@@ -8265,7 +8619,7 @@ pub(super) fn scene_activation_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeSceneEditError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeSceneEditError::Publication(publication)) => {
@@ -8295,7 +8649,7 @@ fn audio_clip_activation_edit_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeAudioClipActivationEditError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeAudioClipActivationEditError::Publication(publication)) => {
@@ -8327,7 +8681,7 @@ fn audio_clip_gain_edit_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeAudioClipGainEditError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeAudioClipGainEditError::Publication(publication)) => {
@@ -8359,7 +8713,7 @@ fn audio_clip_fade_edit_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeAudioClipFadeEditError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeAudioClipFadeEditError::Publication(publication)) => {
@@ -8391,7 +8745,7 @@ fn audio_clip_loop_edit_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeAudioClipLoopEditError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeAudioClipLoopEditError::Publication(publication)) => {
@@ -8423,7 +8777,7 @@ fn audio_clip_reverse_edit_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeAudioClipReverseEditError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeAudioClipReverseEditError::Publication(publication)) => {
@@ -8455,7 +8809,7 @@ fn audio_clip_source_slip_edit_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeAudioClipSourceSlipEditError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeAudioClipSourceSlipEditError::Publication(publication)) => {
@@ -8488,7 +8842,7 @@ fn arrangement_placement_edit_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeArrangementPlacementEditError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             created_placement_id: None,
             source: Box::new(reopen),
         },
@@ -8521,7 +8875,7 @@ pub(super) fn arrangement_placement_creation_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(publication) => IdeArrangementPlacementEditError::ReopenAfterPublication {
-            outcome: publication.outcome,
+            outcome: Box::new(publication.outcome),
             created_placement_id: Some(publication.placement_id.into_boxed_str()),
             source: Box::new(reopen),
         },
@@ -8554,7 +8908,7 @@ fn audio_track_edit_reopen_failure(
 ) -> IdeWorkerCommandFailure {
     let reason = match result {
         Ok(outcome) => IdeAudioTrackEditError::ReopenAfterPublication {
-            outcome,
+            outcome: Box::new(outcome),
             source: Box::new(reopen),
         },
         Err(IdeAudioTrackEditError::Publication(publication)) => {
@@ -8585,6 +8939,7 @@ fn poll_pending_state(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
     unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+    history: &mut UndoHistory,
 ) -> bool {
     match std::mem::replace(state, WorkerState::Empty) {
         WorkerState::Closing(pending) => match pending.wait(Duration::ZERO) {
@@ -8607,7 +8962,15 @@ fn poll_pending_state(
                 recovery,
                 failure,
             } => {
-                complete_project_mutation(state, application, recovery, operation, failure, events)
+                complete_project_mutation(
+                    state,
+                    application,
+                    recovery,
+                    operation,
+                    failure,
+                    events,
+                    history,
+                )
             }
             IdePendingSaveCloseWait::TimedOut(pending) => {
                 *state = WorkerState::Saving { pending, operation };
@@ -8632,7 +8995,7 @@ fn poll_pending_state(
             deadline,
         } => {
             if application.committed_mixer_fence() >= sequence {
-                begin_save_close(state, application, operation, events)
+                begin_save_close(state, application, operation, events, history)
             } else if Instant::now() >= deadline {
                 let command = operation.command();
                 let reason = project_mutation_save_failure(
@@ -11274,6 +11637,238 @@ mod tests {
                 reason: IdeWorkerCommandFailure::AutomationTakeCreation(reason),
             } if matches!(reason.as_ref(), IdeAutomationTakeCreationError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    fn entry(id: &str) -> UndoEntry {
+        UndoEntry {
+            resource_id: id.to_owned(),
+            bytes: id.as_bytes().to_vec(),
+            label: "clip gain",
+        }
+    }
+
+    #[test]
+    fn undo_history_bounds_depth_and_clears_redo_on_a_new_edit() {
+        let mut history = UndoHistory::default();
+        for index in 0..MAX_UNDO_DEPTH + 5 {
+            history.record_edit(entry(&format!("edit-{index}")));
+        }
+        assert_eq!(history.undo.len(), MAX_UNDO_DEPTH, "depth is bounded");
+        assert_eq!(
+            history.undo.first().unwrap().resource_id,
+            "edit-5",
+            "the oldest entries are dropped first"
+        );
+
+        let popped = history.pop(false).unwrap();
+        assert_eq!(
+            popped.resource_id,
+            format!("edit-{}", MAX_UNDO_DEPTH + 4),
+            "undo pops the newest entry"
+        );
+        history.record_restore(false, entry("inverse"));
+        assert_eq!(history.redo.len(), 1, "an undo feeds the redo stack");
+        assert!(matches!(
+            history.state_event(),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("clip gain"),
+                redo_label: Some("clip gain"),
+            }
+        ));
+
+        history.record_edit(entry("new-edit"));
+        assert!(history.redo.is_empty(), "a new edit invalidates redo");
+
+        history.clear();
+        assert!(matches!(
+            history.state_event(),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: None,
+            }
+        ));
+    }
+
+    struct CapturedEdit {
+        parent: std::path::PathBuf,
+        root: std::path::PathBuf,
+        mixer_id: String,
+        original: Vec<u8>,
+        replacement: String,
+        outcome: hyper_storage_engine::ProjectResourcePublicationOutcome,
+    }
+
+    impl Drop for CapturedEdit {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    /// A real project whose mixer has been replaced once, so the outcome under
+    /// test is the one production publishes rather than a hand-built value.
+    fn captured_mixer_edit(name: &str) -> CapturedEdit {
+        let parent = std::env::temp_dir()
+            .join(format!("hyper-undo-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir(&parent).unwrap();
+        let created = hyper_storage_engine::create_project(
+            &parent,
+            hyper_storage_engine::ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let root = created.project().root().to_path_buf();
+        let package = hyper_storage_engine::verify_project_package(&root).unwrap();
+        let mixer_id = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == hyper_project_model::ResourceRole::Mixer)
+            .unwrap()
+            .id()
+            .to_owned();
+        let original = package.read_resource(&mixer_id).unwrap();
+        let replacement = String::from_utf8(original.clone())
+            .unwrap()
+            .replace("\"gain_millionths\":1000000", "\"gain_millionths\":500000");
+        assert_ne!(replacement.as_bytes(), original.as_slice());
+        let outcome = hyper_storage_engine::publish_project_resource(
+            &root,
+            hyper_storage_engine::ProjectResourcePublicationRequest {
+                expected_project_sha256: *package.manifest_sha256(),
+                resource_id: &mixer_id,
+                expected_role: hyper_project_model::ResourceRole::Mixer,
+                resource_bytes: replacement.as_bytes(),
+            },
+        )
+        .unwrap();
+        CapturedEdit {
+            parent,
+            root,
+            mixer_id,
+            original,
+            replacement,
+            outcome,
+        }
+    }
+
+    #[test]
+    fn history_captures_a_changed_replacement_and_names_the_command() {
+        let edit = captured_mixer_edit("capture");
+        let (mixer_id, original, outcome) = (&edit.mixer_id, &edit.original, &edit.outcome);
+        let (events, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut history = UndoHistory::default();
+        observe_history(
+            &mut history,
+            &ProjectMutationAttempt::Save(Ok(outcome.clone())),
+            IdeWorkerCommandKind::SaveProject,
+            &events,
+        );
+        assert_eq!(history.undo.len(), 1, "a changed replacement is captured");
+        assert_eq!(&history.undo[0].resource_id, mixer_id);
+        assert_eq!(&history.undo[0].bytes, original);
+        assert_eq!(history.undo[0].label, "mixer save");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("mixer save"),
+                ..
+            })
+        ));
+
+        let entry = history.pop(false).unwrap();
+        observe_history(
+            &mut history,
+            &ProjectMutationAttempt::RestoreResource {
+                entry: entry.clone(),
+                redo: false,
+                result: Ok(outcome.clone()),
+            },
+            IdeWorkerCommandKind::Undo,
+            &events,
+        );
+        assert_eq!(
+            history.redo.len(),
+            1,
+            "an undo's own previous bytes become the redo entry"
+        );
+        assert_eq!(&history.redo[0].bytes, original);
+        assert_eq!(history.redo[0].label, "mixer save");
+    }
+
+    #[test]
+    fn history_captures_nothing_from_an_unchanged_republication() {
+        let edit = captured_mixer_edit("unchanged");
+        let (events, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut history = UndoHistory::default();
+        let root = &edit.root;
+        let mixer_id = &edit.mixer_id;
+        let replacement = &edit.replacement;
+        let identical = hyper_storage_engine::publish_project_resource(
+            root,
+            hyper_storage_engine::ProjectResourcePublicationRequest {
+                expected_project_sha256: *hyper_storage_engine::verify_project_package(root)
+                    .unwrap()
+                    .manifest_sha256(),
+                resource_id: mixer_id,
+                expected_role: hyper_project_model::ResourceRole::Mixer,
+                resource_bytes: replacement.as_bytes(),
+            },
+        )
+        .unwrap();
+        observe_history(
+            &mut history,
+            &ProjectMutationAttempt::Save(Ok(identical)),
+            IdeWorkerCommandKind::SaveProject,
+            &events,
+        );
+        assert!(
+            history.undo.is_empty(),
+            "an unchanged publication captures nothing"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "and announces no history change"
+        );
+    }
+
+    #[test]
+    fn undo_without_history_fails_without_touching_the_project() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                ..
+            }
+        ));
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Undo,
+                reason: IdeWorkerCommandFailure::NothingToRestore,
+            }
+        ));
+        worker.try_send(IdeWorkerCommand::Redo).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Redo,
+                reason: IdeWorkerCommandFailure::NothingToRestore,
+            }
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
     }
