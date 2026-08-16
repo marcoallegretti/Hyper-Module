@@ -65,6 +65,13 @@ pub struct ScenePublicationRequest<'a> {
     pub scene_bytes: &'a [u8],
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct AutomationTakePublicationRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub take_id: &'a str,
+    pub take_bytes: &'a [u8],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectResourcePublicationErrorKind {
     InvalidResource,
@@ -361,6 +368,7 @@ enum ProjectResourcePublicationMode {
     Replacement,
     ArrangementAddition,
     SceneAddition,
+    AutomationTakeAddition,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -437,6 +445,31 @@ pub fn publish_scene(
             resource_bytes: request.scene_bytes,
         },
         ProjectResourcePublicationMode::SceneAddition,
+        |_, _| Ok(()),
+    )
+}
+
+/// Publishes one new canonical automation take through the existing
+/// serialized, recoverable manifest-last resource transaction family.
+///
+/// # Errors
+///
+/// Returns a classified validation, conflict, integrity, I/O, or recovery
+/// error. Publication is rejected if the stable identity or managed path
+/// collides with active project content.
+pub fn publish_automation_take(
+    project_path: impl AsRef<Path>,
+    request: AutomationTakePublicationRequest<'_>,
+) -> Result<ProjectResourcePublicationOutcome, ProjectResourcePublicationError> {
+    publish_project_resource_observed(
+        project_path.as_ref(),
+        ProjectResourcePublicationRequest {
+            expected_project_sha256: request.expected_project_sha256,
+            resource_id: request.take_id,
+            expected_role: ResourceRole::AutomationTake,
+            resource_bytes: request.take_bytes,
+        },
+        ProjectResourcePublicationMode::AutomationTakeAddition,
         |_, _| Ok(()),
     )
 }
@@ -972,6 +1005,9 @@ fn publish_project_resource_observed(
         ProjectResourcePublicationMode::SceneAddition => {
             validate_scene_addition_request(&verified, request)?;
         }
+        ProjectResourcePublicationMode::AutomationTakeAddition => {
+            validate_automation_take_addition_request(&verified, request)?;
+        }
     }
     let backups = open_or_create_dir(&verified.root_dir, "backups")?;
     let _lock = ProjectLock::acquire(&backups).map_err(|error| {
@@ -1067,6 +1103,18 @@ fn publish_project_resource_observed(
             let path = format!("scenes/{}.json", request.resource_id);
             let created_parent_directory =
                 inspect_addition_destination(&verified.root_dir, "scenes", &path, "scene")?;
+            let candidate =
+                candidate_addition_manifest(&active_project, request, &path, next_revision)?;
+            (path, None, created_parent_directory, candidate)
+        }
+        ProjectResourcePublicationMode::AutomationTakeAddition => {
+            let path = format!("takes/{}.json", request.resource_id);
+            let created_parent_directory = inspect_addition_destination(
+                &verified.root_dir,
+                "takes",
+                &path,
+                "automation take",
+            )?;
             let candidate =
                 candidate_addition_manifest(&active_project, request, &path, next_revision)?;
             (path, None, created_parent_directory, candidate)
@@ -1661,6 +1709,49 @@ fn validate_scene_addition_request(
         return Err(failure(
             ProjectResourcePublicationErrorKind::InvalidResource,
             "scene resource does not match the active project",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_automation_take_addition_request(
+    verified: &StructurallyVerifiedProject,
+    request: ProjectResourcePublicationRequest<'_>,
+) -> Result<(), ProjectResourcePublicationError> {
+    if request.expected_role != ResourceRole::AutomationTake
+        || !is_valid_entity_id(request.resource_id)
+        || request.resource_id == verified.manifest().project_id()
+        || verified
+            .manifest()
+            .resources()
+            .iter()
+            .any(|descriptor| descriptor.id() == request.resource_id)
+        || verified
+            .manifest()
+            .assets()
+            .iter()
+            .any(|descriptor| descriptor.id() == request.resource_id)
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "automation take identity conflicts with the active project",
+        ));
+    }
+    let take: Value = serde_json::from_slice(request.resource_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse new automation take resource",
+            error,
+        )
+    })?;
+    if take["format"].as_str() != Some("hyper-automation-take")
+        || take["format_version"].as_u64() != Some(1)
+        || take["id"].as_str() != Some(request.resource_id)
+        || take["project_id"].as_str() != Some(verified.manifest().project_id())
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "automation take resource does not match the active project",
         ));
     }
     Ok(())
@@ -2291,6 +2382,7 @@ const fn addition_directory(role: ResourceRole) -> Option<&'static str> {
     match role {
         ResourceRole::Arrangement => Some("arrangement"),
         ResourceRole::Scene => Some("scenes"),
+        ResourceRole::AutomationTake => Some("takes"),
         _ => None,
     }
 }
@@ -3128,6 +3220,7 @@ fn transaction_addition_directory(
     match tx.resource_role.as_str() {
         "arrangement" if addition_path_matches(tx, "arrangement") => Ok("arrangement"),
         "scene" if addition_path_matches(tx, "scenes") => Ok("scenes"),
+        "automation-take" if addition_path_matches(tx, "takes") => Ok("takes"),
         _ => Err(failure(
             ProjectResourcePublicationErrorKind::Recovery,
             "resource addition transaction directory is invalid",
@@ -3364,6 +3457,8 @@ fn read_transaction(
 fn is_valid_addition_destination(tx: &TransactionRecord) -> bool {
     matches!(tx.resource_role.as_str(), "arrangement") && addition_path_matches(tx, "arrangement")
         || matches!(tx.resource_role.as_str(), "scene") && addition_path_matches(tx, "scenes")
+        || matches!(tx.resource_role.as_str(), "automation-take")
+            && addition_path_matches(tx, "takes")
 }
 
 fn addition_path_matches(tx: &TransactionRecord, directory: &str) -> bool {
@@ -4179,6 +4274,8 @@ mod tests {
     const ARRANGEMENT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334470";
     const SCENE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334471";
     const SECOND_SCENE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334472";
+    const AUTOMATION_TAKE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334479";
+    const AUTOMATION_LANE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334481";
 
     struct Fixture {
         root: PathBuf,
@@ -4604,6 +4701,207 @@ mod tests {
     impl Drop for SceneFixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    struct AutomationTakeFixture {
+        parent: PathBuf,
+        root: PathBuf,
+        take: Vec<u8>,
+    }
+
+    impl AutomationTakeFixture {
+        fn new() -> Self {
+            let parent = std::env::temp_dir().join(format!(
+                "hyper-automation-publication-{}-{}",
+                std::process::id(),
+                NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&parent).unwrap();
+            let created = crate::create_project(
+                &parent,
+                crate::ProjectCreationRequest {
+                    directory_name: "Session",
+                    project_name: "Session",
+                },
+            )
+            .unwrap();
+            let root = created.project().root().to_path_buf();
+            let project_id = created.project().manifest().project_id();
+            let take = serde_json_canonicalizer::to_vec(&json!({
+                "format": "hyper-automation-take",
+                "format_version": 1,
+                "id": AUTOMATION_TAKE_ID,
+                "project_id": project_id,
+                "name": "Fade out",
+                "enabled": true,
+                "captured_at_utc": "2026-08-16T09:30:00.000Z",
+                "start_tick": 0,
+                "end_tick": 8,
+                "lanes": [{
+                    "id": AUTOMATION_LANE_ID,
+                    "target": {"kind": "mixer-main", "parameter": "gain"},
+                    "interpolation": "linear",
+                    "points": [
+                        {"tick": 0, "value": 1_000_000},
+                        {"tick": 4, "value": 0}
+                    ]
+                }],
+                "extensions": {}
+            }))
+            .unwrap();
+            Self { parent, root, take }
+        }
+
+        fn request(&self) -> AutomationTakePublicationRequest<'_> {
+            AutomationTakePublicationRequest {
+                expected_project_sha256: *verify_project_package(&self.root)
+                    .unwrap()
+                    .manifest_sha256(),
+                take_id: AUTOMATION_TAKE_ID,
+                take_bytes: &self.take,
+            }
+        }
+
+        fn resource_request(&self) -> ProjectResourcePublicationRequest<'_> {
+            let request = self.request();
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: request.expected_project_sha256,
+                resource_id: request.take_id,
+                expected_role: ResourceRole::AutomationTake,
+                resource_bytes: request.take_bytes,
+            }
+        }
+    }
+
+    impl Drop for AutomationTakeFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    #[test]
+    fn publishes_a_new_automation_take_manifest_last() {
+        let fixture = AutomationTakeFixture::new();
+        assert!(!fixture.root.join("takes").exists());
+
+        let published = publish_automation_take(&fixture.root, fixture.request()).unwrap();
+
+        assert!(published.changed());
+        assert_eq!(published.project_revision(), 2);
+        assert_eq!(published.resource_id(), AUTOMATION_TAKE_ID);
+        assert_eq!(
+            published.resource_path(),
+            format!("takes/{AUTOMATION_TAKE_ID}.json")
+        );
+        assert_eq!(
+            fs::read(fixture.root.join(published.resource_path())).unwrap(),
+            fixture.take
+        );
+        let verified = verify_project_package(&fixture.root).unwrap();
+        let descriptor = verified
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == AUTOMATION_TAKE_ID)
+            .unwrap();
+        assert_eq!(descriptor.role(), ResourceRole::AutomationTake);
+        assert!(
+            recover_project_resource_publications(&fixture.root)
+                .unwrap()
+                .is_empty()
+        );
+
+        let error = publish_automation_take(
+            &fixture.root,
+            AutomationTakePublicationRequest {
+                expected_project_sha256: *published.project_identity(),
+                ..fixture.request()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::ResourceConflict
+        );
+    }
+
+    #[test]
+    fn automation_take_publication_rejects_stale_and_mismatched_documents() {
+        let fixture = AutomationTakeFixture::new();
+        let mut stale = fixture.request();
+        stale.expected_project_sha256 = [0; 32];
+        assert_eq!(
+            publish_automation_take(&fixture.root, stale)
+                .unwrap_err()
+                .kind(),
+            ProjectResourcePublicationErrorKind::ProjectChanged
+        );
+
+        let mut wrong: Value = serde_json::from_slice(&fixture.take).unwrap();
+        wrong["id"] = SCENE_ID.into();
+        let wrong = serde_json_canonicalizer::to_vec(&wrong).unwrap();
+        let mut request = fixture.request();
+        request.take_bytes = &wrong;
+        assert_eq!(
+            publish_automation_take(&fixture.root, request)
+                .unwrap_err()
+                .kind(),
+            ProjectResourcePublicationErrorKind::InvalidResource
+        );
+
+        let pretty =
+            serde_json::to_vec_pretty(&serde_json::from_slice::<Value>(&fixture.take).unwrap())
+                .unwrap();
+        let mut request = fixture.request();
+        request.take_bytes = &pretty;
+        assert_eq!(
+            publish_automation_take(&fixture.root, request)
+                .unwrap_err()
+                .kind(),
+            ProjectResourcePublicationErrorKind::InvalidResource
+        );
+        assert!(!fixture.root.join("takes").exists());
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            1
+        );
+    }
+
+    #[test]
+    fn automation_take_crashes_before_manifest_roll_back_the_created_directory() {
+        for crash_phase in [PublicationPhase::Transaction, PublicationPhase::Resource] {
+            let fixture = AutomationTakeFixture::new();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = publish_project_resource_observed(
+                    &fixture.root,
+                    fixture.resource_request(),
+                    ProjectResourcePublicationMode::AutomationTakeAddition,
+                    |phase, _| {
+                        assert_ne!(phase, crash_phase, "simulated process crash");
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+
+            let recovered = recover_project_resource_publications(&fixture.root).unwrap();
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(
+                recovered[0].disposition(),
+                ProjectResourcePublicationRecoveryDisposition::RolledBack
+            );
+            assert!(!fixture.root.join("takes").exists());
+            assert_eq!(
+                verify_project_package(&fixture.root)
+                    .unwrap()
+                    .manifest()
+                    .revision(),
+                1
+            );
         }
     }
 
