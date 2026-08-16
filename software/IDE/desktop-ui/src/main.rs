@@ -63,7 +63,20 @@ struct ProjectUiState {
     audio_clips: RefCell<Vec<IdeAudioClip>>,
     scenes: RefCell<Vec<IdeScene>>,
     scene_launch_evidence: RefCell<SceneLaunchEvidence>,
-    automation_targets: RefCell<Vec<AutomationTargetChoice>>,
+    automation_channels: RefCell<Vec<AutomationChannelFacts>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutomationChannelFacts {
+    track_id: String,
+    name: String,
+    sends: Vec<AutomationSendFacts>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutomationSendFacts {
+    send_id: String,
+    target_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5492,6 +5505,7 @@ fn reset_project(
     *project_state.arrangement.borrow_mut() = None;
     project_state.audio_clips.borrow_mut().clear();
     project_state.scenes.borrow_mut().clear();
+    project_state.automation_channels.borrow_mut().clear();
     project_state.scene_launch_evidence.borrow_mut().clear();
     ui.set_transport_extent_bounded(false);
     ui.set_transport_seek_available(false);
@@ -6419,7 +6433,7 @@ fn automation_main_choices() -> Vec<AutomationTargetChoice> {
 
 fn automation_channel_choices(
     slot: usize,
-    channel: &IdeMixerChannel,
+    channel: &AutomationChannelFacts,
     choices: &mut Vec<AutomationTargetChoice>,
 ) {
     for (suffix, domain, boolean, parameter) in [
@@ -6449,11 +6463,11 @@ fn automation_channel_choices(
             ),
         ] {
             choices.push(AutomationTargetChoice {
-                label: format!("{} {suffix}", channel.name()),
+                label: format!("{} {suffix}", channel.name),
                 domain: domain.to_owned(),
                 boolean,
                 target: IdeAutomationTarget::Channel {
-                    track_id: channel.id().to_owned(),
+                    track_id: channel.track_id.clone(),
                     parameter,
                 },
                 resolved: AutomationTarget::Channel { slot, parameter },
@@ -6463,10 +6477,10 @@ fn automation_channel_choices(
 
 fn automation_send_choices(
     slot: usize,
-    channel: &IdeMixerChannel,
+    channel: &AutomationChannelFacts,
     choices: &mut Vec<AutomationTargetChoice>,
 ) {
-    for (send_index, send) in channel.sends().iter().enumerate() {
+    for (send_index, send) in channel.sends.iter().enumerate() {
         for (suffix, domain, boolean, parameter) in [
                 (
                     "send gain",
@@ -6488,15 +6502,11 @@ fn automation_send_choices(
                 ),
             ] {
                 choices.push(AutomationTargetChoice {
-                    label: format!(
-                        "{} to {} {suffix}",
-                        channel.name(),
-                        send.target_name()
-                    ),
+                    label: format!("{} to {} {suffix}", channel.name, send.target_name),
                     domain: domain.to_owned(),
                     boolean,
                     target: IdeAutomationTarget::Send {
-                        send_id: send.id().to_owned(),
+                        send_id: send.send_id.clone(),
                         parameter,
                     },
                 resolved: AutomationTarget::Send {
@@ -6509,7 +6519,7 @@ fn automation_send_choices(
     }
 }
 
-fn automation_target_choices(channels: &[IdeMixerChannel]) -> Vec<AutomationTargetChoice> {
+fn automation_target_choices(channels: &[AutomationChannelFacts]) -> Vec<AutomationTargetChoice> {
     let mut choices = automation_main_choices();
     for (slot, channel) in channels.iter().enumerate() {
         automation_channel_choices(slot, channel, &mut choices);
@@ -6518,15 +6528,36 @@ fn automation_target_choices(channels: &[IdeMixerChannel]) -> Vec<AutomationTarg
     choices
 }
 
+/// Projects the compiled mixer topology the automation target table depends on.
+/// Slot and send positions are the compiled graph's own ordering, so the
+/// resolved targets match the runtime addresses published for existing takes.
+fn automation_channel_facts(channels: &[IdeMixerChannel]) -> Vec<AutomationChannelFacts> {
+    channels
+        .iter()
+        .map(|channel| AutomationChannelFacts {
+            track_id: channel.id().to_owned(),
+            name: channel.name().to_owned(),
+            sends: channel
+                .sends()
+                .iter()
+                .map(|send| AutomationSendFacts {
+                    send_id: send.id().to_owned(),
+                    target_name: send.target_name().to_owned(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 fn set_automation_targets(
     ui: &MainWindow,
     project_state: &ProjectUiStateCell,
-    channels: &[IdeMixerChannel],
+    channels: &[AutomationChannelFacts],
 ) {
-    let choices = automation_target_choices(channels);
-    if *project_state.automation_targets.borrow() == choices {
+    if project_state.automation_channels.borrow().as_slice() == channels {
         return;
     }
+    let choices = automation_target_choices(channels);
     ui.set_automation_target_names(ModelRc::from(Rc::new(VecModel::from(
         choices
             .iter()
@@ -6545,7 +6576,7 @@ fn set_automation_targets(
     if ui.get_automation_create_target_index() >= i32::try_from(choices.len()).unwrap_or(0) {
         ui.set_automation_create_target_index(0);
     }
-    *project_state.automation_targets.borrow_mut() = choices;
+    *project_state.automation_channels.borrow_mut() = channels.to_vec();
 }
 
 struct AutomationTakeListModel {
@@ -6573,17 +6604,25 @@ impl Model for AutomationTakeListModel {
         } else {
             format!("{} lanes", take.lanes().len())
         };
+        let uniform = take
+            .lanes()
+            .iter()
+            .all(|other| other.interpolation() == lane.interpolation());
+        let interpolation = if uniform {
+            match lane.interpolation() {
+                AutomationInterpolation::Hold => "Hold",
+                AutomationInterpolation::Linear => "Linear",
+            }
+        } else {
+            "Mixed"
+        };
         Some(AutomationTakeRow {
-            index: i32::try_from(row).ok()?,
             id: take.id().into(),
             name: take.name().into(),
             enabled: take.enabled(),
             range: format!("TICK {} to {}", take.start_tick(), take.end_tick()).into(),
             target: target.into(),
-            interpolation: match lane.interpolation() {
-                AutomationInterpolation::Hold => "Hold".into(),
-                AutomationInterpolation::Linear => "Linear".into(),
-            },
+            interpolation: interpolation.into(),
             points: format!("{points} points").into(),
         })
     }
@@ -6608,9 +6647,10 @@ fn set_automation(
     project_state: &ProjectUiStateCell,
     observation: &IdeRunningObservation,
 ) {
-    set_automation_targets(ui, project_state, observation.mixer_channels());
+    let channels = automation_channel_facts(observation.mixer_channels());
+    set_automation_targets(ui, project_state, &channels);
     let owner = observation.automation();
-    let choices = project_state.automation_targets.borrow();
+    let choices = automation_target_choices(&channels);
     let labels = owner
         .takes()
         .iter()
@@ -6668,6 +6708,45 @@ fn parse_automation_points(
     Ok(points)
 }
 
+/// Builds one authoring request from the exact values the form submitted.
+///
+/// The target index addresses `choices`, which the caller derives from the same
+/// compiled mixer topology that populated the form. Boolean targets are forced
+/// to `hold` here because the loader rejects any other interpolation for them.
+fn automation_take_request(
+    choices: &[AutomationTargetChoice],
+    name: &str,
+    target_index: i32,
+    interpolation_index: i32,
+    start: &str,
+    end: &str,
+    points: &str,
+) -> Result<IdeAutomationTakeRequest, &'static str> {
+    let choice = usize::try_from(target_index)
+        .ok()
+        .and_then(|index| choices.get(index))
+        .ok_or("The selected automation target is unavailable")?;
+    let interpolation = if choice.boolean || interpolation_index == 0 {
+        AutomationInterpolation::Hold
+    } else {
+        AutomationInterpolation::Linear
+    };
+    let start_tick = parse_automation_tick(start)?;
+    let end_tick = parse_automation_tick(end)?;
+    if start_tick >= end_tick {
+        return Err("The automation end tick must follow its start tick");
+    }
+    let points = parse_automation_points(points, choice.boolean)?;
+    Ok(IdeAutomationTakeRequest {
+        name: name.trim().to_owned(),
+        start_tick,
+        end_tick,
+        target: choice.target.clone(),
+        interpolation,
+        points,
+    })
+}
+
 fn bind_automation_take_callback(
     ui: &MainWindow,
     worker: &WorkerCell,
@@ -6686,53 +6765,23 @@ fn bind_automation_take_callback(
                 ui.set_error_text("Automation take request is no longer current".into());
                 return;
             }
-            let choices = project_state_for_take.automation_targets.borrow();
-            let Some(choice) = usize::try_from(target_index)
-                .ok()
-                .and_then(|index| choices.get(index))
-            else {
-                ui.set_error_text("The selected automation target is unavailable".into());
-                return;
-            };
-            let interpolation = if choice.boolean || interpolation_index == 0 {
-                AutomationInterpolation::Hold
-            } else {
-                AutomationInterpolation::Linear
-            };
-            let start_tick = match parse_automation_tick(start.as_str()) {
-                Ok(tick) => tick,
+            let choices =
+                automation_target_choices(&project_state_for_take.automation_channels.borrow());
+            let request = match automation_take_request(
+                &choices,
+                name.as_str(),
+                target_index,
+                interpolation_index,
+                start.as_str(),
+                end.as_str(),
+                points.as_str(),
+            ) {
+                Ok(request) => request,
                 Err(message) => {
                     ui.set_error_text(message.into());
                     return;
                 }
             };
-            let end_tick = match parse_automation_tick(end.as_str()) {
-                Ok(tick) => tick,
-                Err(message) => {
-                    ui.set_error_text(message.into());
-                    return;
-                }
-            };
-            if start_tick >= end_tick {
-                ui.set_error_text("The automation end tick must follow its start tick".into());
-                return;
-            }
-            let points = match parse_automation_points(points.as_str(), choice.boolean) {
-                Ok(points) => points,
-                Err(message) => {
-                    ui.set_error_text(message.into());
-                    return;
-                }
-            };
-            let request = IdeAutomationTakeRequest {
-                name: name.trim().to_owned(),
-                start_tick,
-                end_tick,
-                target: choice.target.clone(),
-                interpolation,
-                points,
-            };
-            drop(choices);
             submit_to_ui(
                 &ui,
                 &worker_for_take,
@@ -8283,44 +8332,147 @@ mod tests {
         );
     }
 
+    fn automation_channel_fixture() -> Vec<AutomationChannelFacts> {
+        vec![
+            AutomationChannelFacts {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
+                name: "Drums".to_owned(),
+                sends: vec![AutomationSendFacts {
+                    send_id: "018f47a2-6b2d-7c11-8a44-001122334469".to_owned(),
+                    target_name: "Reverb".to_owned(),
+                }],
+            },
+            AutomationChannelFacts {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334472".to_owned(),
+                name: "Reverb".to_owned(),
+                sends: Vec::new(),
+            },
+        ]
+    }
+
     #[test]
-    fn automation_lane_labels_resolve_only_compiled_mixer_targets() {
-        let choices = vec![
-            AutomationTargetChoice {
-                label: "Main gain".to_owned(),
-                domain: AUTOMATION_UNIT_DOMAIN.to_owned(),
-                boolean: false,
-                target: IdeAutomationTarget::Main {
-                    parameter: AutomationMainParameter::Gain,
-                },
-                resolved: AutomationTarget::Main {
-                    parameter: AutomationMainParameter::Gain,
-                },
-            },
-            AutomationTargetChoice {
-                label: "Drums to Reverb send enabled".to_owned(),
-                domain: AUTOMATION_SWITCH_DOMAIN.to_owned(),
-                boolean: true,
-                target: IdeAutomationTarget::Send {
-                    send_id: "018f47a2-6b2d-7c11-8a44-001122334488".to_owned(),
-                    parameter: AutomationSendParameter::Enabled,
-                },
-                resolved: AutomationTarget::Send {
-                    slot: 0,
-                    send: 0,
-                    parameter: AutomationSendParameter::Enabled,
-                },
-            },
-        ];
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one table pins every offered automation target against its compiled address"
+    )]
+    fn automation_target_choices_match_the_compiled_mixer_addresses() {
+        let choices = automation_target_choices(&automation_channel_fixture());
+        let table: Vec<(&str, bool, AutomationTarget)> = choices
+            .iter()
+            .map(|choice| (choice.label.as_str(), choice.boolean, choice.resolved))
+            .collect();
         assert_eq!(
-            automation_lane_label(
-                AutomationTarget::Main {
-                    parameter: AutomationMainParameter::Gain,
-                },
-                &choices
-            ),
-            "Main gain"
+            table,
+            vec![
+                (
+                    "Main gain",
+                    false,
+                    AutomationTarget::Main {
+                        parameter: AutomationMainParameter::Gain
+                    }
+                ),
+                (
+                    "Main mute",
+                    true,
+                    AutomationTarget::Main {
+                        parameter: AutomationMainParameter::Mute
+                    }
+                ),
+                (
+                    "Drums gain",
+                    false,
+                    AutomationTarget::Channel {
+                        slot: 0,
+                        parameter: AutomationChannelParameter::Gain
+                    }
+                ),
+                (
+                    "Drums pan",
+                    false,
+                    AutomationTarget::Channel {
+                        slot: 0,
+                        parameter: AutomationChannelParameter::Pan
+                    }
+                ),
+                (
+                    "Drums mute",
+                    true,
+                    AutomationTarget::Channel {
+                        slot: 0,
+                        parameter: AutomationChannelParameter::Mute
+                    }
+                ),
+                (
+                    "Drums solo",
+                    true,
+                    AutomationTarget::Channel {
+                        slot: 0,
+                        parameter: AutomationChannelParameter::Solo
+                    }
+                ),
+                (
+                    "Drums to Reverb send gain",
+                    false,
+                    AutomationTarget::Send {
+                        slot: 0,
+                        send: 0,
+                        parameter: AutomationSendParameter::Gain
+                    }
+                ),
+                (
+                    "Drums to Reverb send pan",
+                    false,
+                    AutomationTarget::Send {
+                        slot: 0,
+                        send: 0,
+                        parameter: AutomationSendParameter::Pan
+                    }
+                ),
+                (
+                    "Drums to Reverb send enabled",
+                    true,
+                    AutomationTarget::Send {
+                        slot: 0,
+                        send: 0,
+                        parameter: AutomationSendParameter::Enabled
+                    }
+                ),
+                (
+                    "Reverb gain",
+                    false,
+                    AutomationTarget::Channel {
+                        slot: 1,
+                        parameter: AutomationChannelParameter::Gain
+                    }
+                ),
+                (
+                    "Reverb pan",
+                    false,
+                    AutomationTarget::Channel {
+                        slot: 1,
+                        parameter: AutomationChannelParameter::Pan
+                    }
+                ),
+                (
+                    "Reverb mute",
+                    true,
+                    AutomationTarget::Channel {
+                        slot: 1,
+                        parameter: AutomationChannelParameter::Mute
+                    }
+                ),
+                (
+                    "Reverb solo",
+                    true,
+                    AutomationTarget::Channel {
+                        slot: 1,
+                        parameter: AutomationChannelParameter::Solo
+                    }
+                ),
+            ]
         );
+        assert_eq!(choices[3].domain, AUTOMATION_PAN_DOMAIN);
+        assert_eq!(choices[4].domain, AUTOMATION_SWITCH_DOMAIN);
         assert_eq!(
             automation_lane_label(
                 AutomationTarget::Send {
@@ -8342,6 +8494,132 @@ mod tests {
             ),
             "Unresolved mixer target"
         );
+    }
+
+    fn assert_automation_targets_repopulate_after_a_project_reset(ui: &MainWindow) {
+        let recording_routes: RecordingRoutes = Rc::new(RefCell::new(Vec::new()));
+        let take_routes: TakeRoutes = Rc::new(RefCell::new(Vec::new()));
+        let project_state = Rc::new(ProjectUiState::default());
+        let channels = automation_channel_fixture();
+
+        set_automation_targets(ui, &project_state, &channels);
+        assert_eq!(ui.get_automation_target_names().row_count(), 13);
+
+        reset_project(ui, &recording_routes, &take_routes, &project_state);
+        assert_eq!(ui.get_automation_target_names().row_count(), 0);
+
+        set_automation_targets(ui, &project_state, &channels);
+        assert_eq!(ui.get_automation_target_names().row_count(), 13);
+        assert_eq!(ui.get_automation_target_boolean().row_count(), 13);
+        assert_eq!(ui.get_automation_target_domain().row_count(), 13);
+    }
+
+    #[test]
+    fn automation_take_requests_coerce_interpolation_and_reject_invalid_forms() {
+        let choices = automation_target_choices(&automation_channel_fixture());
+        let linear = automation_take_request(&choices, " Fade ", 2, 1, "0", "1920", "0=1000000")
+            .unwrap();
+        assert_eq!(linear.name, "Fade");
+        assert_eq!(linear.interpolation, AutomationInterpolation::Linear);
+        assert_eq!(
+            linear.target,
+            IdeAutomationTarget::Channel {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
+                parameter: AutomationChannelParameter::Gain,
+            }
+        );
+        assert_eq!((linear.start_tick, linear.end_tick), (0, 1_920));
+
+        let held = automation_take_request(&choices, "Hold", 2, 0, "0", "1920", "0=1000000")
+            .unwrap();
+        assert_eq!(held.interpolation, AutomationInterpolation::Hold);
+
+        let switch = automation_take_request(&choices, "Mute", 4, 1, "0", "1920", "0=on").unwrap();
+        assert_eq!(
+            switch.interpolation,
+            AutomationInterpolation::Hold,
+            "a boolean target may not request linear interpolation"
+        );
+        assert_eq!(
+            switch.points,
+            vec![AutomationPoint::new(0, AutomationValue::Boolean(true))]
+        );
+        assert_eq!(
+            switch.target,
+            IdeAutomationTarget::Channel {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
+                parameter: AutomationChannelParameter::Mute,
+            }
+        );
+
+        let send = automation_take_request(&choices, "Send", 8, 1, "0", "1920", "0=off").unwrap();
+        assert_eq!(
+            send.target,
+            IdeAutomationTarget::Send {
+                send_id: "018f47a2-6b2d-7c11-8a44-001122334469".to_owned(),
+                parameter: AutomationSendParameter::Enabled,
+            }
+        );
+
+        assert!(automation_take_request(&choices, "Out", 13, 0, "0", "1920", "0=0").is_err());
+        assert!(automation_take_request(&choices, "Out", -1, 0, "0", "1920", "0=0").is_err());
+        assert!(automation_take_request(&choices, "Empty", 2, 0, "1920", "1920", "0=0").is_err());
+        assert!(automation_take_request(&choices, "Reversed", 2, 0, "1920", "0", "0=0").is_err());
+        assert!(automation_take_request(&choices, "Switch", 4, 0, "0", "1920", "0=5").is_err());
+    }
+
+    fn assert_automation_take_events_report_durable_outcomes(ui: &MainWindow) {
+        ui.set_app_mode(AppMode::Running);
+        ui.set_automation_create_visible(true);
+        ui.set_automation_create_name("Fade".into());
+        ui.set_automation_create_points("0=1000000".into());
+
+        apply_automation_take_creation_event(
+            ui,
+            &IdeWorkerEvent::AutomationTakeAdded {
+                revision: 4,
+                take_id: "018f47a2-6b2d-7c11-8a44-0011223344a0".to_owned(),
+                name: "Fade".to_owned(),
+            },
+        );
+        assert!(!ui.get_automation_create_visible());
+        assert!(ui.get_automation_create_name().is_empty());
+        assert!(ui.get_automation_create_points().is_empty());
+        assert!(ui.get_status_text().contains("project revision 4"));
+        assert!(ui.get_error_text().is_empty());
+
+        apply_automation_take_creation_event(ui, &IdeWorkerEvent::AutomationTakeAdding);
+        assert_eq!(ui.get_app_mode(), AppMode::AddingAutomationTake);
+
+        apply_automation_take_activation_event(
+            ui,
+            &IdeWorkerEvent::AutomationTakeActivationChanged {
+                revision: 5,
+                changed: true,
+                enabled: false,
+            },
+        );
+        assert!(ui.get_status_text().contains("disabled in project revision 5"));
+        assert!(!ui.get_status_text().contains("already"));
+
+        apply_automation_take_activation_event(
+            ui,
+            &IdeWorkerEvent::AutomationTakeActivationChanged {
+                revision: 5,
+                changed: false,
+                enabled: true,
+            },
+        );
+        assert!(
+            ui.get_status_text()
+                .contains("was already enabled in project revision 5")
+        );
+
+        apply_automation_take_activation_event(
+            ui,
+            &IdeWorkerEvent::AutomationTakeActivationChanging { enabled: true },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::ChangingAutomationTakeActivation);
     }
 
     #[test]
@@ -8721,6 +8999,8 @@ mod tests {
         assert_scene_duplication_events_reset_form(&ui);
         assert_scene_rename_success_resets_form(&ui);
         assert_scene_activation_events_preserve_state(&ui);
+        assert_automation_take_events_report_durable_outcomes(&ui);
+        assert_automation_targets_repopulate_after_a_project_reset(&ui);
     }
 
     fn assert_committed_audio_clip_source_slip_warning(ui: &MainWindow) {

@@ -4501,7 +4501,7 @@ fn add_scene(
 fn add_automation_take(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
-    request: IdeAutomationTakeRequest,
+    mut request: IdeAutomationTakeRequest,
 ) -> bool {
     let name = request.name.trim();
     if name.is_empty() || name.chars().count() > 120 {
@@ -4527,6 +4527,18 @@ fn add_automation_take(
             )),
         );
     }
+    let mut normalized_name = String::new();
+    if normalized_name.try_reserve_exact(name.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::AddAutomationTake,
+            IdeWorkerCommandFailure::AutomationTakeCreation(Box::new(
+                IdeAutomationTakeCreationError::CapacityUnavailable,
+            )),
+        );
+    }
+    normalized_name.push_str(name);
+    request.name = normalized_name;
     begin_project_mutation_request(state, events, ProjectMutation::AddAutomationTake { request })
 }
 
