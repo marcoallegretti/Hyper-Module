@@ -5096,6 +5096,47 @@ mod tests {
     }
 
     #[test]
+    fn automation_take_crash_after_manifest_recovers_as_committed() {
+        let fixture = AutomationTakeFixture::new();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = publish_project_resource_observed(
+                &fixture.root,
+                fixture.resource_request(),
+                ProjectResourcePublicationMode::AutomationTakeAddition,
+                |phase, _| {
+                    assert_ne!(phase, PublicationPhase::Manifest, "simulated process crash");
+                    Ok(())
+                },
+            );
+        }));
+        assert!(result.is_err());
+
+        let recovered = recover_project_resource_publications(&fixture.root).unwrap();
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].disposition(),
+            ProjectResourcePublicationRecoveryDisposition::Committed
+        );
+        assert_eq!(
+            fs::read(
+                fixture
+                    .root
+                    .join(format!("takes/{AUTOMATION_TAKE_ID}.json"))
+            )
+            .unwrap(),
+            fixture.take
+        );
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            2
+        );
+    }
+
+    #[test]
     fn scene_crash_after_manifest_recovers_as_committed() {
         let fixture = SceneFixture::new();
         let result = catch_unwind(AssertUnwindSafe(|| {
