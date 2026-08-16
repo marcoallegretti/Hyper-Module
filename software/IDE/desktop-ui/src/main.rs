@@ -1507,10 +1507,20 @@ fn bind_arrangement_scene_launch_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    bind_arrangement_scene_launch_addition_callback(ui, worker, project_state);
+    bind_arrangement_scene_launch_move_callback(ui, worker, project_state);
+    bind_arrangement_scene_launch_removal_callback(ui, worker, project_state);
+}
+
+fn bind_arrangement_scene_launch_addition_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    let worker = Rc::clone(worker);
-    let project_state = Rc::clone(project_state);
+    let worker_for_addition = Rc::clone(worker);
+    let project_state_for_addition = Rc::clone(project_state);
     actions.on_add_arrangement_scene_launch(move |scene_id, tick| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -1522,14 +1532,14 @@ fn bind_arrangement_scene_launch_callback(
             ui.set_error_text("Scene-marker request is no longer current".into());
             return;
         }
-        let tick = match parse_arrangement_start_tick(tick.as_str()) {
+        let tick = match parse_arrangement_scene_launch_tick(tick.as_str()) {
             Ok(tick) => tick,
             Err(message) => {
                 ui.set_error_text(message.into());
                 return;
             }
         };
-        if !project_state
+        if !project_state_for_addition
             .scenes
             .borrow()
             .iter()
@@ -1538,7 +1548,7 @@ fn bind_arrangement_scene_launch_callback(
             ui.set_error_text("The selected scene is no longer available".into());
             return;
         }
-        if project_state
+        if project_state_for_addition
             .arrangement
             .borrow()
             .as_ref()
@@ -1555,13 +1565,159 @@ fn bind_arrangement_scene_launch_callback(
         }
         submit_to_ui(
             &ui,
-            &worker,
+            &worker_for_addition,
             IdeWorkerCommand::AddArrangementSceneLaunch {
                 scene_id: scene_id.to_string(),
                 tick,
             },
         );
     });
+}
+
+fn bind_arrangement_scene_launch_move_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_move = Rc::clone(worker);
+    let project_state_for_move = Rc::clone(project_state);
+    actions.on_move_arrangement_scene_launch(move |launch_id, tick| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if !arrangement_scene_launch_form_is_current(
+            ui.get_app_mode(),
+            ui.get_move_arrangement_scene_launch_visible(),
+            ui.get_move_arrangement_scene_launch_id().as_str(),
+            launch_id.as_str(),
+        ) {
+            ui.set_error_text("Scene-marker move request is no longer current".into());
+            return;
+        }
+        let tick = match parse_arrangement_scene_launch_tick(tick.as_str()) {
+            Ok(tick) => tick,
+            Err(message) => {
+                ui.set_error_text(message.into());
+                return;
+            }
+        };
+        let Ok(original_tick) = parse_arrangement_scene_launch_tick(
+            ui.get_move_arrangement_scene_launch_original_tick()
+                .as_str(),
+        ) else {
+            ui.set_error_text("Scene-marker move request is no longer current".into());
+            return;
+        };
+        let state = project_state_for_move.arrangement.borrow();
+        let Some(binding) = state.as_ref() else {
+            ui.set_error_text("Arrangement scene-marker authority is no longer available".into());
+            return;
+        };
+        let Some(launch) = binding
+            .owner
+            .scene_launches()
+            .iter()
+            .find(|launch| launch.id() == launch_id.as_str())
+        else {
+            ui.set_error_text("The selected scene marker is no longer available".into());
+            return;
+        };
+        if launch.tick() != original_tick {
+            ui.set_error_text("The selected scene marker has changed since it was opened".into());
+            return;
+        }
+        if launch.tick() == tick {
+            ui.set_status_text("Scene marker already uses that project tick".into());
+            ui.set_error_text(SharedString::default());
+            return;
+        }
+        if binding
+            .owner
+            .scene_launches()
+            .iter()
+            .any(|candidate| candidate.id() != launch.id() && candidate.tick() == tick)
+        {
+            ui.set_error_text("The arrangement already has a scene marker at that tick".into());
+            return;
+        }
+        let launch_id = launch.id().to_owned();
+        drop(state);
+        submit_to_ui(
+            &ui,
+            &worker_for_move,
+            IdeWorkerCommand::MoveArrangementSceneLaunch { launch_id, tick },
+        );
+    });
+}
+
+fn bind_arrangement_scene_launch_removal_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_removal = Rc::clone(worker);
+    let project_state_for_removal = Rc::clone(project_state);
+    actions.on_remove_arrangement_scene_launch(move |launch_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if !arrangement_scene_launch_form_is_current(
+            ui.get_app_mode(),
+            ui.get_remove_arrangement_scene_launch_visible(),
+            ui.get_remove_arrangement_scene_launch_id().as_str(),
+            launch_id.as_str(),
+        ) {
+            ui.set_error_text("Scene-marker removal confirmation is no longer current".into());
+            return;
+        }
+        let Ok(confirmed_tick) = parse_arrangement_scene_launch_tick(
+            ui.get_remove_arrangement_scene_launch_tick().as_str(),
+        ) else {
+            ui.set_error_text("Scene-marker removal confirmation is no longer current".into());
+            return;
+        };
+        let state = project_state_for_removal.arrangement.borrow();
+        let Some(binding) = state.as_ref() else {
+            ui.set_error_text("Arrangement scene-marker authority is no longer available".into());
+            return;
+        };
+        let Some(launch) = binding
+            .owner
+            .scene_launches()
+            .iter()
+            .find(|launch| launch.id() == launch_id.as_str())
+        else {
+            ui.set_error_text("The selected scene marker is no longer available".into());
+            return;
+        };
+        if launch.tick() != confirmed_tick {
+            ui.set_error_text("The selected scene marker has changed since it was opened".into());
+            return;
+        }
+        let launch_id = launch.id().to_owned();
+        drop(state);
+        submit_to_ui(
+            &ui,
+            &worker_for_removal,
+            IdeWorkerCommand::RemoveArrangementSceneLaunch { launch_id },
+        );
+    });
+}
+
+fn arrangement_scene_launch_form_is_current(
+    app_mode: AppMode,
+    visible: bool,
+    selected_launch_id: &str,
+    requested_launch_id: &str,
+) -> bool {
+    app_mode == AppMode::Running
+        && visible
+        && !selected_launch_id.is_empty()
+        && selected_launch_id == requested_launch_id
 }
 
 fn bind_arrangement_duplication_callback(
@@ -2347,6 +2503,15 @@ fn parse_arrangement_start_tick(value: &str) -> Result<u64, &'static str> {
     )
 }
 
+fn parse_arrangement_scene_launch_tick(value: &str) -> Result<u64, &'static str> {
+    parse_exact_arrangement_tick(
+        value,
+        "Scene-marker tick must be a non-negative whole number",
+        "Scene-marker tick is outside the supported range",
+        "Scene-marker tick exceeds the exact project range",
+    )
+}
+
 fn parse_arrangement_duration_ticks(value: &str) -> Result<u64, &'static str> {
     let duration_ticks = parse_exact_arrangement_tick(
         value,
@@ -2535,6 +2700,10 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::RemoveArrangementPlacement => AppMode::RemovingArrangementPlacement,
         IdeWorkerCommandKind::AddArrangementPlacement => AppMode::AddingArrangementPlacement,
         IdeWorkerCommandKind::AddArrangementSceneLaunch => AppMode::AddingArrangementSceneLaunch,
+        IdeWorkerCommandKind::MoveArrangementSceneLaunch => AppMode::MovingArrangementSceneLaunch,
+        IdeWorkerCommandKind::RemoveArrangementSceneLaunch => {
+            AppMode::RemovingArrangementSceneLaunch
+        }
         IdeWorkerCommandKind::DuplicateArrangementPlacement => {
             AppMode::DuplicatingArrangementPlacement
         }
@@ -2589,6 +2758,12 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
         IdeWorkerCommandKind::AddArrangementSceneLaunch => {
             "Preserving mixer state, adding the scene marker, and reopening project..."
+        }
+        IdeWorkerCommandKind::MoveArrangementSceneLaunch => {
+            "Preserving mixer state, moving the scene marker, and reopening project..."
+        }
+        IdeWorkerCommandKind::RemoveArrangementSceneLaunch => {
+            "Preserving mixer state, removing the scene marker, and reopening project..."
         }
         IdeWorkerCommandKind::AddAudioTrack => {
             "Saving mixer state, adding the audio track, and reopening project…"
@@ -2792,6 +2967,14 @@ fn apply_event(
         event @ (IdeWorkerEvent::ArrangementSceneLaunchAdded { .. }
         | IdeWorkerEvent::ArrangementSceneLaunchAdding { .. }) => {
             apply_arrangement_scene_launch_addition_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ArrangementSceneLaunchMoved { .. }
+        | IdeWorkerEvent::ArrangementSceneLaunchMoving { .. }) => {
+            apply_arrangement_scene_launch_move_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ArrangementSceneLaunchRemoved { .. }
+        | IdeWorkerEvent::ArrangementSceneLaunchRemoving) => {
+            apply_arrangement_scene_launch_removal_event(ui, &event);
         }
         event @ (IdeWorkerEvent::ArrangementPlacementDuplicated { .. }
         | IdeWorkerEvent::ArrangementPlacementDuplicating { .. }) => {
@@ -3199,10 +3382,7 @@ fn apply_arrangement_scene_launch_addition_event(ui: &MainWindow, event: &IdeWor
             scene_id,
             tick,
         } => {
-            ui.set_add_arrangement_scene_launch_visible(false);
-            ui.set_add_arrangement_scene_launch_id(SharedString::default());
-            ui.set_add_arrangement_scene_launch_name(SharedString::default());
-            ui.set_add_arrangement_scene_launch_tick("0".into());
+            reset_arrangement_scene_launch_addition_form(ui);
             ui.set_status_text(
                 format!("Added scene {scene_id} at tick {tick} in project revision {revision}")
                     .into(),
@@ -3219,6 +3399,57 @@ fn apply_arrangement_scene_launch_addition_event(ui: &MainWindow, event: &IdeWor
             );
         }
         _ => unreachable!("arrangement scene-launch dispatcher received another event"),
+    }
+}
+
+fn apply_arrangement_scene_launch_move_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ArrangementSceneLaunchMoved {
+            revision,
+            launch_id,
+            tick,
+        } => {
+            reset_arrangement_scene_launch_move_form(ui);
+            ui.set_status_text(
+                format!(
+                    "Scene marker {launch_id} moved to tick {tick} in project revision {revision}"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementSceneLaunchMoving { tick } => {
+            ui.set_app_mode(AppMode::MovingArrangementSceneLaunch);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before moving the scene marker to tick {tick}..."
+                )
+                .into(),
+            );
+        }
+        _ => unreachable!("arrangement scene-launch move dispatcher received another event"),
+    }
+}
+
+fn apply_arrangement_scene_launch_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ArrangementSceneLaunchRemoved {
+            revision,
+            launch_id,
+        } => {
+            reset_arrangement_scene_launch_removal_form(ui);
+            ui.set_status_text(
+                format!("Scene marker {launch_id} removed in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementSceneLaunchRemoving => {
+            ui.set_app_mode(AppMode::RemovingArrangementSceneLaunch);
+            ui.set_status_text(
+                "Waiting for native output before removing the scene marker...".into(),
+            );
+        }
+        _ => unreachable!("arrangement scene-launch removal dispatcher received another event"),
     }
 }
 
@@ -3287,8 +3518,16 @@ fn apply_arrangement_placement_committed_warning(ui: &MainWindow, event: &IdeWor
     };
     let action = match command {
         IdeWorkerCommandKind::AddArrangementSceneLaunch => {
-            ui.set_add_arrangement_scene_launch_visible(false);
+            reset_arrangement_scene_launch_addition_form(ui);
             "Arrangement scene marker".to_owned()
+        }
+        IdeWorkerCommandKind::MoveArrangementSceneLaunch => {
+            reset_arrangement_scene_launch_move_form(ui);
+            "Arrangement scene marker move".to_owned()
+        }
+        IdeWorkerCommandKind::RemoveArrangementSceneLaunch => {
+            reset_arrangement_scene_launch_removal_form(ui);
+            "Arrangement scene marker removal".to_owned()
         }
         IdeWorkerCommandKind::AddArrangementPlacement => {
             reset_arrangement_placement_addition_form(ui);
@@ -3326,6 +3565,28 @@ fn reset_arrangement_placement_addition_form(ui: &MainWindow) {
     ui.set_add_arrangement_placement_track_name(SharedString::default());
     ui.set_add_arrangement_placement_duration_ticks(SharedString::default());
     ui.set_add_arrangement_placement_start_tick("0".into());
+}
+
+fn reset_arrangement_scene_launch_move_form(ui: &MainWindow) {
+    ui.set_move_arrangement_scene_launch_visible(false);
+    ui.set_move_arrangement_scene_launch_id(SharedString::default());
+    ui.set_move_arrangement_scene_launch_name(SharedString::default());
+    ui.set_move_arrangement_scene_launch_original_tick(SharedString::default());
+    ui.set_move_arrangement_scene_launch_tick(SharedString::default());
+}
+
+fn reset_arrangement_scene_launch_addition_form(ui: &MainWindow) {
+    ui.set_add_arrangement_scene_launch_visible(false);
+    ui.set_add_arrangement_scene_launch_id(SharedString::default());
+    ui.set_add_arrangement_scene_launch_name(SharedString::default());
+    ui.set_add_arrangement_scene_launch_tick("0".into());
+}
+
+fn reset_arrangement_scene_launch_removal_form(ui: &MainWindow) {
+    ui.set_remove_arrangement_scene_launch_visible(false);
+    ui.set_remove_arrangement_scene_launch_id(SharedString::default());
+    ui.set_remove_arrangement_scene_launch_name(SharedString::default());
+    ui.set_remove_arrangement_scene_launch_tick(SharedString::default());
 }
 
 fn reset_arrangement_placement_removal_confirmation(ui: &MainWindow) {
@@ -4905,17 +5166,7 @@ fn reset_project(
     ui.set_take_clip_track_name(SharedString::default());
     ui.set_take_clip_name(SharedString::default());
     ui.set_takes_visible(false);
-    ui.set_arrangement_visible(false);
-    ui.set_remove_arrangement_placement_visible(false);
-    ui.set_remove_arrangement_placement_id(SharedString::default());
-    ui.set_remove_arrangement_placement_clip_name(SharedString::default());
-    ui.set_remove_arrangement_placement_track_name(SharedString::default());
-    ui.set_add_arrangement_placement_visible(false);
-    ui.set_add_arrangement_placement_clip_id(SharedString::default());
-    ui.set_add_arrangement_placement_clip_name(SharedString::default());
-    ui.set_add_arrangement_placement_track_name(SharedString::default());
-    ui.set_add_arrangement_placement_duration_ticks(SharedString::default());
-    ui.set_add_arrangement_placement_start_tick("0".into());
+    reset_arrangement_ui(ui);
     ui.set_clips_visible(false);
     ui.set_clip_rename_visible(false);
     ui.set_clip_rename_id(SharedString::default());
@@ -4933,12 +5184,6 @@ fn reset_project(
     ui.set_audio_clips(ModelRc::default());
     ui.set_loudness_visible(false);
     ui.set_loudness_reset_confirming(false);
-    ui.set_arrangement_placements(ModelRc::default());
-    ui.set_arrangement_scene_launches(ModelRc::default());
-    ui.set_add_arrangement_scene_launch_visible(false);
-    ui.set_add_arrangement_scene_launch_id(SharedString::default());
-    ui.set_add_arrangement_scene_launch_name(SharedString::default());
-    ui.set_add_arrangement_scene_launch_tick("0".into());
     ui.set_arrangement_span_clock("—".into());
     ui.set_preview_active(false);
     ui.set_preview_gain_percent(25.0);
@@ -4966,6 +5211,17 @@ fn reset_project(
     ui.set_left_reading("—".into());
     ui.set_right_reading("—".into());
     reset_loudness_observation(ui);
+}
+
+fn reset_arrangement_ui(ui: &MainWindow) {
+    ui.set_arrangement_visible(false);
+    reset_arrangement_placement_removal_confirmation(ui);
+    reset_arrangement_placement_addition_form(ui);
+    ui.set_arrangement_placements(ModelRc::default());
+    ui.set_arrangement_scene_launches(ModelRc::default());
+    reset_arrangement_scene_launch_addition_form(ui);
+    reset_arrangement_scene_launch_move_form(ui);
+    reset_arrangement_scene_launch_removal_form(ui);
 }
 
 fn reset_monitoring(ui: &MainWindow) {
@@ -5039,6 +5295,16 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         }
         IdeWorkerCommandKind::AddArrangementSceneLaunch
             if current == AppMode::AddingArrangementSceneLaunch =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::MoveArrangementSceneLaunch
+            if current == AppMode::MovingArrangementSceneLaunch =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::RemoveArrangementSceneLaunch
+            if current == AppMode::RemovingArrangementSceneLaunch =>
         {
             AppMode::Running
         }
@@ -6671,7 +6937,7 @@ mod tests {
     }
 
     #[test]
-    fn arrangement_move_input_preserves_the_exact_project_tick_domain() {
+    fn arrangement_edit_input_preserves_the_exact_project_tick_domain() {
         assert_eq!(parse_arrangement_start_tick(" 1920 "), Ok(1_920));
         assert_eq!(
             parse_arrangement_start_tick("9007199254740991"),
@@ -6682,6 +6948,15 @@ mod tests {
         assert!(parse_arrangement_start_tick("1.5").is_err());
         assert!(parse_arrangement_start_tick("9007199254740992").is_err());
         assert!(parse_arrangement_start_tick("18446744073709551616").is_err());
+        assert_eq!(parse_arrangement_scene_launch_tick(" 960 "), Ok(960));
+        assert_eq!(
+            parse_arrangement_scene_launch_tick("9007199254740991"),
+            Ok(MAX_SAFE_TIMELINE_TICK)
+        );
+        assert!(parse_arrangement_scene_launch_tick("").is_err());
+        assert!(parse_arrangement_scene_launch_tick("-1").is_err());
+        assert!(parse_arrangement_scene_launch_tick("1.5").is_err());
+        assert!(parse_arrangement_scene_launch_tick("9007199254740992").is_err());
     }
 
     #[test]
@@ -6804,6 +7079,122 @@ mod tests {
             ),
             AppMode::Running
         );
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::MoveArrangementSceneLaunch,
+            ),
+            AppMode::MovingArrangementSceneLaunch
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::MovingArrangementSceneLaunch,
+                IdeWorkerCommandKind::MoveArrangementSceneLaunch,
+            ),
+            AppMode::Running
+        );
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::RemoveArrangementSceneLaunch,
+            ),
+            AppMode::RemovingArrangementSceneLaunch
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::RemovingArrangementSceneLaunch,
+                IdeWorkerCommandKind::RemoveArrangementSceneLaunch,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn arrangement_scene_launch_edit_requires_the_open_form_identity() {
+        assert!(arrangement_scene_launch_form_is_current(
+            AppMode::Running,
+            true,
+            "marker-a",
+            "marker-a",
+        ));
+        assert!(!arrangement_scene_launch_form_is_current(
+            AppMode::MovingArrangementSceneLaunch,
+            true,
+            "marker-a",
+            "marker-a",
+        ));
+        assert!(!arrangement_scene_launch_form_is_current(
+            AppMode::Running,
+            false,
+            "marker-a",
+            "marker-a",
+        ));
+        assert!(!arrangement_scene_launch_form_is_current(
+            AppMode::Running,
+            true,
+            "marker-a",
+            "marker-b",
+        ));
+        assert!(!arrangement_scene_launch_form_is_current(
+            AppMode::Running,
+            true,
+            "",
+            "",
+        ));
+    }
+
+    fn assert_arrangement_scene_launch_edit_events(ui: &MainWindow) {
+        ui.set_app_mode(AppMode::Running);
+        ui.set_move_arrangement_scene_launch_visible(true);
+        ui.set_move_arrangement_scene_launch_id("marker-a".into());
+        ui.set_move_arrangement_scene_launch_name("Verse".into());
+        ui.set_move_arrangement_scene_launch_original_tick("960".into());
+        ui.set_move_arrangement_scene_launch_tick("1920".into());
+
+        apply_arrangement_scene_launch_move_event(
+            ui,
+            &IdeWorkerEvent::ArrangementSceneLaunchMoving { tick: 1_920 },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::MovingArrangementSceneLaunch);
+        assert!(ui.get_move_arrangement_scene_launch_visible());
+
+        apply_arrangement_scene_launch_move_event(
+            ui,
+            &IdeWorkerEvent::ArrangementSceneLaunchMoved {
+                revision: 3,
+                launch_id: "marker-a".to_owned(),
+                tick: 1_920,
+            },
+        );
+        assert!(!ui.get_move_arrangement_scene_launch_visible());
+        assert!(ui.get_move_arrangement_scene_launch_id().is_empty());
+        assert!(ui.get_move_arrangement_scene_launch_tick().is_empty());
+        assert!(ui.get_status_text().contains("revision 3"));
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_remove_arrangement_scene_launch_visible(true);
+        ui.set_remove_arrangement_scene_launch_id("marker-a".into());
+        ui.set_remove_arrangement_scene_launch_name("Verse".into());
+        ui.set_remove_arrangement_scene_launch_tick("1920".into());
+
+        apply_arrangement_scene_launch_removal_event(
+            ui,
+            &IdeWorkerEvent::ArrangementSceneLaunchRemoving,
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::RemovingArrangementSceneLaunch);
+        assert!(ui.get_remove_arrangement_scene_launch_visible());
+
+        apply_arrangement_scene_launch_removal_event(
+            ui,
+            &IdeWorkerEvent::ArrangementSceneLaunchRemoved {
+                revision: 4,
+                launch_id: "marker-a".to_owned(),
+            },
+        );
+        assert!(!ui.get_remove_arrangement_scene_launch_visible());
+        assert!(ui.get_remove_arrangement_scene_launch_id().is_empty());
+        assert!(ui.get_remove_arrangement_scene_launch_tick().is_empty());
+        assert!(ui.get_status_text().contains("revision 4"));
     }
 
     #[test]
@@ -7176,6 +7567,15 @@ mod tests {
         assert!(ui.get_status_text().contains("committed and reopened"));
         assert!(!ui.get_error_text().is_empty());
 
+        assert_committed_audio_clip_source_slip_warning(&ui);
+        assert_arrangement_scene_launch_edit_events(&ui);
+        assert_scene_authoring_forms(&ui);
+        assert_scene_duplication_events_reset_form(&ui);
+        assert_scene_rename_success_resets_form(&ui);
+        assert_scene_activation_events_preserve_state(&ui);
+    }
+
+    fn assert_committed_audio_clip_source_slip_warning(ui: &MainWindow) {
         ui.set_app_mode(AppMode::Running);
         ui.set_clip_source_slip_visible(true);
         ui.set_clip_source_slip_id("clip-a".into());
@@ -7185,7 +7585,7 @@ mod tests {
         ui.set_clip_source_slip_start("25".into());
 
         apply_audio_clip_edit_committed_warning(
-            &ui,
+            ui,
             &IdeWorkerEvent::AudioClipEditCommittedWithWarning {
                 command: IdeWorkerCommandKind::SetAudioClipSourceStart,
                 warning: IdeAudioClipEditCommittedWarning::SourceSlip(Box::new(
@@ -7200,11 +7600,6 @@ mod tests {
         assert!(ui.get_clip_source_slip_start().is_empty());
         assert!(ui.get_status_text().contains("committed and reopened"));
         assert!(!ui.get_error_text().is_empty());
-
-        assert_scene_authoring_forms(&ui);
-        assert_scene_duplication_events_reset_form(&ui);
-        assert_scene_rename_success_resets_form(&ui);
-        assert_scene_activation_events_preserve_state(&ui);
     }
 
     fn assert_scene_authoring_forms(ui: &MainWindow) {

@@ -16,6 +16,8 @@ export enum AppMode {
     changing-track-activation,
     adding-arrangement-placement,
     adding-arrangement-scene-launch,
+    moving-arrangement-scene-launch,
+    removing-arrangement-scene-launch,
     duplicating-arrangement-placement,
     splitting-arrangement-placement,
     changing-arrangement-activation,
@@ -172,6 +174,8 @@ export global IdeActions {
     callback remove-arrangement-placement(string);
     callback add-arrangement-placement(string, string);
     callback add-arrangement-scene-launch(string, string);
+    callback move-arrangement-scene-launch(string, string);
+    callback remove-arrangement-scene-launch(string);
     callback duplicate-arrangement-placement(string, string);
     callback split-arrangement-placement(string, string);
     callback rename-audio-clip(string, string);
@@ -357,6 +361,19 @@ export component MainWindow inherits Window {
     in-out property <string> add-arrangement-scene-launch-id: "";
     in-out property <string> add-arrangement-scene-launch-name: "";
     in-out property <string> add-arrangement-scene-launch-tick: "0";
+    in-out property <bool> move-arrangement-scene-launch-visible: false;
+    in-out property <string> move-arrangement-scene-launch-id: "";
+    in-out property <string> move-arrangement-scene-launch-name: "";
+    in-out property <string> move-arrangement-scene-launch-original-tick: "";
+    in-out property <string> move-arrangement-scene-launch-tick: "";
+    in-out property <bool> remove-arrangement-scene-launch-visible: false;
+    in-out property <string> remove-arrangement-scene-launch-id: "";
+    in-out property <string> remove-arrangement-scene-launch-name: "";
+    in-out property <string> remove-arrangement-scene-launch-tick: "";
+    private property <bool> arrangement-scene-launch-form-visible:
+        root.add-arrangement-scene-launch-visible
+        || root.move-arrangement-scene-launch-visible
+        || root.remove-arrangement-scene-launch-visible;
     in-out property <bool> remove-arrangement-placement-visible: false;
     in-out property <string> remove-arrangement-placement-id: "";
     in-out property <string> remove-arrangement-placement-clip-name: "";
@@ -517,6 +534,8 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.changing-track-activation ? "◌  UPDATING TRACK"
                         : root.app-mode == AppMode.adding-arrangement-placement ? "◌  PLACING CLIP"
                         : root.app-mode == AppMode.adding-arrangement-scene-launch ? "◌  ADDING SCENE MARKER"
+                        : root.app-mode == AppMode.moving-arrangement-scene-launch ? "◌  MOVING SCENE MARKER"
+                        : root.app-mode == AppMode.removing-arrangement-scene-launch ? "◌  REMOVING SCENE MARKER"
                         : root.app-mode == AppMode.duplicating-arrangement-placement ? "◌  COPYING PLACEMENT"
                         : root.app-mode == AppMode.changing-arrangement-activation ? "◌  UPDATING CLIP"
                         : root.app-mode == AppMode.moving-arrangement-placement ? "◌  MOVING CLIP"
@@ -976,6 +995,9 @@ export component MainWindow inherits Window {
                                         accessible-label: "Add scene " + scene.name + " to the linear arrangement";
                                         enabled: root.app-mode == AppMode.running && scene.id != "";
                                         clicked => {
+                                            root.remove-arrangement-placement-visible = false;
+                                            root.move-arrangement-scene-launch-visible = false;
+                                            root.remove-arrangement-scene-launch-visible = false;
                                             root.add-arrangement-scene-launch-id = scene.id;
                                             root.add-arrangement-scene-launch-name = scene.name;
                                             root.add-arrangement-scene-launch-tick = "0";
@@ -1807,7 +1829,109 @@ export component MainWindow inherits Window {
                             Rectangle { vertical-stretch: 1; background: transparent; }
                         }
 
-                        if root.remove-arrangement-placement-visible && !root.add-arrangement-scene-launch-visible : VerticalLayout {
+                        if root.move-arrangement-scene-launch-visible : VerticalLayout {
+                            vertical-stretch: 1;
+                            spacing: 14px;
+                            Text { text: "MOVE SCENE MARKER"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            Text { text: root.move-arrangement-scene-launch-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                            Text {
+                                text: "Move this durable launch from tick " + root.move-arrangement-scene-launch-original-tick + " to one exact project tick.";
+                                color: #aebccc;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "This is a non-ripple edit. Other markers and arrangement placements keep their positions.";
+                                color: #728196;
+                                font-size: 10px;
+                                wrap: word-wrap;
+                            }
+                            GridLayout {
+                                spacing: 8px;
+                                Text { row: 0; col: 0; text: "Project tick"; color: #8fa0b4; vertical-alignment: center; }
+                                LineEdit {
+                                    row: 0; col: 1;
+                                    text <=> root.move-arrangement-scene-launch-tick;
+                                    input-type: number;
+                                    accessible-label: "New exact project tick for " + root.move-arrangement-scene-launch-name + " scene marker";
+                                    accepted => {
+                                        IdeActions.move-arrangement-scene-launch(root.move-arrangement-scene-launch-id, self.text);
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Button {
+                                    text: "Cancel";
+                                    enabled: root.app-mode == AppMode.running;
+                                    clicked => {
+                                        root.move-arrangement-scene-launch-visible = false;
+                                        root.move-arrangement-scene-launch-id = "";
+                                        root.move-arrangement-scene-launch-name = "";
+                                        root.move-arrangement-scene-launch-original-tick = "";
+                                        root.move-arrangement-scene-launch-tick = "";
+                                    }
+                                }
+                                Button {
+                                    horizontal-stretch: 1;
+                                    text: root.app-mode == AppMode.moving-arrangement-scene-launch ? "Moving marker..." : "Move marker";
+                                    enabled: root.app-mode == AppMode.running
+                                        && root.move-arrangement-scene-launch-id != ""
+                                        && root.move-arrangement-scene-launch-tick != ""
+                                        && root.move-arrangement-scene-launch-tick != root.move-arrangement-scene-launch-original-tick;
+                                    clicked => {
+                                        IdeActions.move-arrangement-scene-launch(
+                                            root.move-arrangement-scene-launch-id,
+                                            root.move-arrangement-scene-launch-tick
+                                        );
+                                    }
+                                }
+                            }
+                            Rectangle { vertical-stretch: 1; background: transparent; }
+                        }
+
+                        if root.remove-arrangement-scene-launch-visible : VerticalLayout {
+                            vertical-stretch: 1;
+                            spacing: 14px;
+                            Text { text: "REMOVE SCENE MARKER"; color: #ff9d76; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            Text { text: root.remove-arrangement-scene-launch-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                            Text { text: "Project tick " + root.remove-arrangement-scene-launch-tick; color: #8fa0b4; font-size: 12px; }
+                            Rectangle { height: 1px; background: #27313d; }
+                            Text {
+                                text: "This cannot be undone. Only this scheduled scene launch is removed. The scene, its slots, arrangement placements, tracks, clips, and mixer state remain unchanged.";
+                                color: #aebccc;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "This is a non-ripple edit. Later markers keep their project ticks, and the project is reopened and verified before completion is reported.";
+                                color: #728196;
+                                font-size: 10px;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Button {
+                                    text: "Cancel";
+                                    enabled: root.app-mode == AppMode.running;
+                                    clicked => {
+                                        root.remove-arrangement-scene-launch-visible = false;
+                                        root.remove-arrangement-scene-launch-id = "";
+                                        root.remove-arrangement-scene-launch-name = "";
+                                        root.remove-arrangement-scene-launch-tick = "";
+                                    }
+                                }
+                                Button {
+                                    horizontal-stretch: 1;
+                                    text: root.app-mode == AppMode.removing-arrangement-scene-launch ? "Removing marker..." : "Remove marker";
+                                    enabled: root.app-mode == AppMode.running && root.remove-arrangement-scene-launch-id != "";
+                                    clicked => { IdeActions.remove-arrangement-scene-launch(root.remove-arrangement-scene-launch-id); }
+                                }
+                            }
+                            Rectangle { vertical-stretch: 1; background: transparent; }
+                        }
+
+                        if root.remove-arrangement-placement-visible && !root.arrangement-scene-launch-form-visible : VerticalLayout {
                             vertical-stretch: 1;
                             spacing: 14px;
                             Text { text: "REMOVE ARRANGEMENT PLACEMENT"; color: #ff9d76; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
@@ -1848,7 +1972,7 @@ export component MainWindow inherits Window {
                             Rectangle { vertical-stretch: 1; background: transparent; }
                         }
 
-                        if !root.remove-arrangement-placement-visible && !root.add-arrangement-scene-launch-visible && root.arrangement-placements.length == 0 && root.arrangement-scene-launches.length == 0 : Text {
+                        if !root.remove-arrangement-placement-visible && !root.arrangement-scene-launch-form-visible && root.arrangement-placements.length == 0 && root.arrangement-scene-launches.length == 0 : Text {
                             text: "This project has no linear arrangement placements.";
                             color: #8fa0b4;
                             font-size: 13px;
@@ -1857,10 +1981,10 @@ export component MainWindow inherits Window {
                             vertical-stretch: 1;
                         }
 
-                        if !root.remove-arrangement-placement-visible && !root.add-arrangement-scene-launch-visible && root.arrangement-scene-launches.length > 0 : ListView {
-                            height: Math.min(112px, root.arrangement-scene-launches.length * 34px);
+                        if !root.remove-arrangement-placement-visible && !root.arrangement-scene-launch-form-visible && root.arrangement-scene-launches.length > 0 : ListView {
+                            height: Math.min(144px, root.arrangement-scene-launches.length * 42px);
                             for marker in root.arrangement-scene-launches : Rectangle {
-                                height: 30px;
+                                height: 38px;
                                 width: parent.width;
                                 background: #101820;
                                 border-color: #27313d;
@@ -1873,11 +1997,42 @@ export component MainWindow inherits Window {
                                     Text { text: "SCENE"; color: #6f8197; font-size: 9px; vertical-alignment: center; }
                                     Text { text: marker.scene-name; color: #dce5ef; font-size: 11px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
                                     Text { text: "TICK " + marker.tick; color: #e7b96d; font-size: 10px; vertical-alignment: center; }
+                                    Button {
+                                        width: 58px;
+                                        text: "Move";
+                                        accessible-label: "Move " + marker.scene-name + " scene marker from tick " + marker.tick;
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => {
+                                            root.remove-arrangement-placement-visible = false;
+                                            root.add-arrangement-scene-launch-visible = false;
+                                            root.remove-arrangement-scene-launch-visible = false;
+                                            root.move-arrangement-scene-launch-id = marker.id;
+                                            root.move-arrangement-scene-launch-name = marker.scene-name;
+                                            root.move-arrangement-scene-launch-original-tick = marker.tick;
+                                            root.move-arrangement-scene-launch-tick = marker.tick;
+                                            root.move-arrangement-scene-launch-visible = true;
+                                        }
+                                    }
+                                    Button {
+                                        width: 68px;
+                                        text: "Remove";
+                                        accessible-label: "Review removal of " + marker.scene-name + " scene marker at tick " + marker.tick;
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => {
+                                            root.remove-arrangement-placement-visible = false;
+                                            root.add-arrangement-scene-launch-visible = false;
+                                            root.move-arrangement-scene-launch-visible = false;
+                                            root.remove-arrangement-scene-launch-id = marker.id;
+                                            root.remove-arrangement-scene-launch-name = marker.scene-name;
+                                            root.remove-arrangement-scene-launch-tick = marker.tick;
+                                            root.remove-arrangement-scene-launch-visible = true;
+                                        }
+                                    }
                                 }
                             }
                         }
 
-                        if !root.remove-arrangement-placement-visible && !root.add-arrangement-scene-launch-visible && root.arrangement-placements.length > 0 : ListView {
+                        if !root.remove-arrangement-placement-visible && !root.arrangement-scene-launch-form-visible && root.arrangement-placements.length > 0 : ListView {
                             vertical-stretch: 1;
                             for placement in root.arrangement-placements : Rectangle {
                                 height: 112px;
@@ -2046,7 +2201,7 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        if !root.remove-arrangement-placement-visible && !root.add-arrangement-scene-launch-visible : Text {
+                        if !root.remove-arrangement-placement-visible && !root.arrangement-scene-launch-form-visible : Text {
                             text: "Scene markers and exact non-ripple placement edits persist. Markers must preserve single-track authority; this surface does not claim live performance capture, drag, snap, or waveform editing.";
                             color: #65758a;
                             font-size: 9px;
