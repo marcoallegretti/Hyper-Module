@@ -12329,15 +12329,6 @@ mod tests {
             AutomationPoint::new(4, AutomationValue::Integer(0)),
         ];
         let accepted = automation_take_request(&points);
-        let committed = serialize_automation_take_addition(
-            &loaded,
-            &mixer,
-            &asset_facts(),
-            &[],
-            accepted,
-            LoaderLimits::VERSION_1,
-        )
-        .unwrap();
         let boolean_points = [AutomationPoint::new(0, AutomationValue::Boolean(true))];
         let out_of_interval = [AutomationPoint::new(8, AutomationValue::Integer(0))];
         let unordered = [

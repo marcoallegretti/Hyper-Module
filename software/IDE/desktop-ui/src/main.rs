@@ -9,13 +9,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyper_desktop_ide::{
-    DesktopAudioPreviewState, DesktopIdeWorker, IdeApplicationConfig, IdeAudioClip,
+    AutomationChannelParameter, AutomationInterpolation, AutomationMainParameter, AutomationPoint,
+    AutomationSendParameter, AutomationTarget, AutomationValue, DesktopAudioPreviewState,
+    DesktopIdeWorker, IdeApplicationConfig, IdeAudioClip,
     IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
     IdeInputSelection, IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
     IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
     IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelKind, IdeMixerCommand,
     IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeOutputSelection,
-    IdeOutputTestState, IdePlaybackArrangement, IdePlaybackExtent, IdeRecordingAbortOutcome,
+    IdeAutomationTakeRequest, IdeAutomationTarget, IdeOutputTestState, IdePlaybackArrangement,
+    IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent, IdeRecordingAbortOutcome,
     IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation,
     IdeScaledLoudnessValue, IdeScene, IdeSceneAvailability, IdeSceneLaunchQuantization,
     IdeSceneLaunchState, IdeSceneSlotEdit, IdeSceneTrackAction, IdeWorkerCommand,
@@ -60,6 +63,16 @@ struct ProjectUiState {
     audio_clips: RefCell<Vec<IdeAudioClip>>,
     scenes: RefCell<Vec<IdeScene>>,
     scene_launch_evidence: RefCell<SceneLaunchEvidence>,
+    automation_targets: RefCell<Vec<AutomationTargetChoice>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AutomationTargetChoice {
+    label: String,
+    domain: String,
+    boolean: bool,
+    target: IdeAutomationTarget,
+    resolved: AutomationTarget,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1510,6 +1523,7 @@ fn bind_arrangement_scene_launch_callback(
 ) {
     bind_arrangement_scene_launch_addition_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_move_callback(ui, worker, project_state);
+    bind_automation_take_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_locate_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_scene_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_removal_callback(ui, worker, project_state);
@@ -2897,6 +2911,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::RemoveArrangementPlacement => AppMode::RemovingArrangementPlacement,
         IdeWorkerCommandKind::AddArrangementPlacement => AppMode::AddingArrangementPlacement,
         IdeWorkerCommandKind::AddArrangementSceneLaunch => AppMode::AddingArrangementSceneLaunch,
+        IdeWorkerCommandKind::AddAutomationTake => AppMode::AddingAutomationTake,
         IdeWorkerCommandKind::MoveArrangementSceneLaunch => AppMode::MovingArrangementSceneLaunch,
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => {
             AppMode::ChangingArrangementSceneLaunchScene
@@ -3028,6 +3043,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::AddScene => {
             "Preserving mixer state, creating the scene, and reopening project..."
+        }
+        IdeWorkerCommandKind::AddAutomationTake => {
+            "Preserving mixer state, adding the automation take, and reopening project..."
         }
         IdeWorkerCommandKind::DuplicateScene => {
             "Preserving mixer state, duplicating the scene, and reopening project..."
@@ -3233,6 +3251,11 @@ fn apply_event(
         event @ (IdeWorkerEvent::SceneAdded { .. }
         | IdeWorkerEvent::SceneCreationCommittedWithWarning { .. }
         | IdeWorkerEvent::SceneAdding) => apply_scene_creation_event(ui, &event),
+        event @ (IdeWorkerEvent::AutomationTakeAdded { .. }
+        | IdeWorkerEvent::AutomationTakeCreationCommittedWithWarning { .. }
+        | IdeWorkerEvent::AutomationTakeAdding) => {
+            apply_automation_take_creation_event(ui, &event);
+        }
         event @ (IdeWorkerEvent::SceneDuplicated { .. }
         | IdeWorkerEvent::SceneDuplicationCommittedWithWarning { .. }
         | IdeWorkerEvent::SceneDuplicating) => apply_scene_duplication_event(ui, &event),
@@ -4637,6 +4660,7 @@ fn apply_running_event(
     set_recording_takes(ui, take_routes, observation);
     set_playback_extent(ui, project_state, observation);
     set_arrangement(ui, project_state, observation);
+    set_automation(ui, project_state, observation);
     let clips_changed = set_audio_clips(ui, project_state, observation.audio_clips());
     refresh_scene_slots_if_changed(ui, project_state, scenes_changed || clips_changed);
     ui.set_stream_state(format!("{:?}", observation.output_state()).into());
@@ -5481,6 +5505,12 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     reset_arrangement_placement_addition_form(ui);
     ui.set_arrangement_placements(ModelRc::default());
     ui.set_arrangement_scene_launches(ModelRc::default());
+    ui.set_automation_takes(ModelRc::default());
+    ui.set_automation_target_names(ModelRc::default());
+    ui.set_automation_target_boolean(ModelRc::default());
+    ui.set_automation_target_domain(ModelRc::default());
+    ui.set_mixer_automation_visible(false);
+    reset_automation_creation_form(ui);
     reset_arrangement_scene_launch_addition_form(ui);
     reset_arrangement_scene_launch_move_form(ui);
     reset_arrangement_scene_launch_scene_form(ui);
@@ -5559,6 +5589,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::AddArrangementSceneLaunch
             if current == AppMode::AddingArrangementSceneLaunch =>
         {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::AddAutomationTake if current == AppMode::AddingAutomationTake => {
             AppMode::Running
         }
         IdeWorkerCommandKind::MoveArrangementSceneLaunch
@@ -6332,6 +6365,409 @@ const fn mixer_kind_name(kind: IdeMixerChannelKind) -> &'static str {
         IdeMixerChannelKind::Audio => "AUDIO",
         IdeMixerChannelKind::Group => "GROUP",
         IdeMixerChannelKind::Return => "RETURN",
+    }
+}
+
+
+const AUTOMATION_UNIT_DOMAIN: &str = "0-2000000 (1000000 = unity)";
+const AUTOMATION_PAN_DOMAIN: &str = "-1000000 to 1000000";
+const AUTOMATION_SWITCH_DOMAIN: &str = "on / off";
+
+fn automation_main_choices() -> Vec<AutomationTargetChoice> {
+    vec![
+        AutomationTargetChoice {
+            label: "Main gain".to_owned(),
+            domain: AUTOMATION_UNIT_DOMAIN.to_owned(),
+            boolean: false,
+            target: IdeAutomationTarget::Main {
+                parameter: AutomationMainParameter::Gain,
+            },
+            resolved: AutomationTarget::Main {
+                parameter: AutomationMainParameter::Gain,
+            },
+        },
+        AutomationTargetChoice {
+            label: "Main mute".to_owned(),
+            domain: AUTOMATION_SWITCH_DOMAIN.to_owned(),
+            boolean: true,
+            target: IdeAutomationTarget::Main {
+                parameter: AutomationMainParameter::Mute,
+            },
+            resolved: AutomationTarget::Main {
+                parameter: AutomationMainParameter::Mute,
+            },
+        },
+    ]
+}
+
+fn automation_channel_choices(
+    slot: usize,
+    channel: &IdeMixerChannel,
+    choices: &mut Vec<AutomationTargetChoice>,
+) {
+    for (suffix, domain, boolean, parameter) in [
+            (
+                "gain",
+                AUTOMATION_UNIT_DOMAIN,
+                false,
+                AutomationChannelParameter::Gain,
+            ),
+            (
+                "pan",
+                AUTOMATION_PAN_DOMAIN,
+                false,
+                AutomationChannelParameter::Pan,
+            ),
+            (
+                "mute",
+                AUTOMATION_SWITCH_DOMAIN,
+                true,
+                AutomationChannelParameter::Mute,
+            ),
+            (
+                "solo",
+                AUTOMATION_SWITCH_DOMAIN,
+                true,
+                AutomationChannelParameter::Solo,
+            ),
+        ] {
+            choices.push(AutomationTargetChoice {
+                label: format!("{} {suffix}", channel.name()),
+                domain: domain.to_owned(),
+                boolean,
+                target: IdeAutomationTarget::Channel {
+                    track_id: channel.id().to_owned(),
+                    parameter,
+                },
+                resolved: AutomationTarget::Channel { slot, parameter },
+            });
+    }
+}
+
+fn automation_send_choices(
+    slot: usize,
+    channel: &IdeMixerChannel,
+    choices: &mut Vec<AutomationTargetChoice>,
+) {
+    for (send_index, send) in channel.sends().iter().enumerate() {
+        for (suffix, domain, boolean, parameter) in [
+                (
+                    "send gain",
+                    AUTOMATION_UNIT_DOMAIN,
+                    false,
+                    AutomationSendParameter::Gain,
+                ),
+                (
+                    "send pan",
+                    AUTOMATION_PAN_DOMAIN,
+                    false,
+                    AutomationSendParameter::Pan,
+                ),
+                (
+                    "send enabled",
+                    AUTOMATION_SWITCH_DOMAIN,
+                    true,
+                    AutomationSendParameter::Enabled,
+                ),
+            ] {
+                choices.push(AutomationTargetChoice {
+                    label: format!(
+                        "{} to {} {suffix}",
+                        channel.name(),
+                        send.target_name()
+                    ),
+                    domain: domain.to_owned(),
+                    boolean,
+                    target: IdeAutomationTarget::Send {
+                        send_id: send.id().to_owned(),
+                        parameter,
+                    },
+                resolved: AutomationTarget::Send {
+                    slot,
+                    send: send_index,
+                    parameter,
+                },
+            });
+        }
+    }
+}
+
+fn automation_target_choices(channels: &[IdeMixerChannel]) -> Vec<AutomationTargetChoice> {
+    let mut choices = automation_main_choices();
+    for (slot, channel) in channels.iter().enumerate() {
+        automation_channel_choices(slot, channel, &mut choices);
+        automation_send_choices(slot, channel, &mut choices);
+    }
+    choices
+}
+
+fn set_automation_targets(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    channels: &[IdeMixerChannel],
+) {
+    let choices = automation_target_choices(channels);
+    if *project_state.automation_targets.borrow() == choices {
+        return;
+    }
+    ui.set_automation_target_names(ModelRc::from(Rc::new(VecModel::from(
+        choices
+            .iter()
+            .map(|choice| SharedString::from(choice.label.as_str()))
+            .collect::<Vec<_>>(),
+    ))));
+    ui.set_automation_target_boolean(ModelRc::from(Rc::new(VecModel::from(
+        choices.iter().map(|choice| choice.boolean).collect::<Vec<_>>(),
+    ))));
+    ui.set_automation_target_domain(ModelRc::from(Rc::new(VecModel::from(
+        choices
+            .iter()
+            .map(|choice| SharedString::from(choice.domain.as_str()))
+            .collect::<Vec<_>>(),
+    ))));
+    if ui.get_automation_create_target_index() >= i32::try_from(choices.len()).unwrap_or(0) {
+        ui.set_automation_create_target_index(0);
+    }
+    *project_state.automation_targets.borrow_mut() = choices;
+}
+
+struct AutomationTakeListModel {
+    owner: Arc<IdePlaybackAutomation>,
+    labels: Vec<String>,
+}
+
+impl Model for AutomationTakeListModel {
+    type Data = AutomationTakeRow;
+
+    fn row_count(&self) -> usize {
+        self.owner.takes().len()
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        let take = self.owner.takes().get(row)?;
+        let lane = take.lanes().first()?;
+        let points: usize = take
+            .lanes()
+            .iter()
+            .map(IdePlaybackAutomationLane::point_count)
+            .sum();
+        let target = if take.lanes().len() == 1 {
+            self.labels.get(row)?.clone()
+        } else {
+            format!("{} lanes", take.lanes().len())
+        };
+        Some(AutomationTakeRow {
+            index: i32::try_from(row).ok()?,
+            id: take.id().into(),
+            name: take.name().into(),
+            enabled: take.enabled(),
+            range: format!("TICK {} to {}", take.start_tick(), take.end_tick()).into(),
+            target: target.into(),
+            interpolation: match lane.interpolation() {
+                AutomationInterpolation::Hold => "Hold".into(),
+                AutomationInterpolation::Linear => "Linear".into(),
+            },
+            points: format!("{points} points").into(),
+        })
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &()
+    }
+}
+
+fn automation_lane_label(target: AutomationTarget, choices: &[AutomationTargetChoice]) -> String {
+    choices
+        .iter()
+        .find(|choice| choice.resolved == target)
+        .map_or_else(
+            || "Unresolved mixer target".to_owned(),
+            |choice| choice.label.clone(),
+        )
+}
+
+fn set_automation(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    observation: &IdeRunningObservation,
+) {
+    set_automation_targets(ui, project_state, observation.mixer_channels());
+    let owner = observation.automation();
+    let choices = project_state.automation_targets.borrow();
+    let labels = owner
+        .takes()
+        .iter()
+        .map(|take| {
+            take.lanes().first().map_or_else(
+                || "Unresolved mixer target".to_owned(),
+                |lane| automation_lane_label(lane.target(), &choices),
+            )
+        })
+        .collect();
+    ui.set_automation_takes(ModelRc::new(AutomationTakeListModel {
+        owner: Arc::clone(owner),
+        labels,
+    }));
+}
+
+fn parse_automation_points(
+    value: &str,
+    boolean: bool,
+) -> Result<Vec<AutomationPoint>, &'static str> {
+    let mut points = Vec::new();
+    for entry in value.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (tick, raw) = entry
+            .split_once('=')
+            .ok_or("Each automation point must be written as tick=value")?;
+        let tick = tick
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "Automation point ticks must be non-negative whole numbers")?;
+        if tick > MAX_SAFE_TIMELINE_TICK {
+            return Err("Automation point tick exceeds the exact project range");
+        }
+        let raw = raw.trim();
+        let point = if boolean {
+            match raw {
+                "on" | "true" => AutomationValue::Boolean(true),
+                "off" | "false" => AutomationValue::Boolean(false),
+                _ => return Err("Switch automation values must be on or off"),
+            }
+        } else {
+            AutomationValue::Integer(
+                raw.parse::<i32>()
+                    .map_err(|_| "Automation values must be whole millionths")?,
+            )
+        };
+        points.push(AutomationPoint::new(tick, point));
+    }
+    if points.is_empty() {
+        return Err("An automation take needs at least one point");
+    }
+    Ok(points)
+}
+
+fn bind_automation_take_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_take = Rc::clone(worker);
+    let project_state_for_take = Rc::clone(project_state);
+    actions.on_add_automation_take(
+        move |name, target_index, interpolation_index, start, end, points| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::Running || !ui.get_automation_create_visible() {
+                ui.set_error_text("Automation take request is no longer current".into());
+                return;
+            }
+            let choices = project_state_for_take.automation_targets.borrow();
+            let Some(choice) = usize::try_from(target_index)
+                .ok()
+                .and_then(|index| choices.get(index))
+            else {
+                ui.set_error_text("The selected automation target is unavailable".into());
+                return;
+            };
+            let interpolation = if choice.boolean || interpolation_index == 0 {
+                AutomationInterpolation::Hold
+            } else {
+                AutomationInterpolation::Linear
+            };
+            let start_tick = match parse_automation_tick(start.as_str()) {
+                Ok(tick) => tick,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
+            };
+            let end_tick = match parse_automation_tick(end.as_str()) {
+                Ok(tick) => tick,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
+            };
+            if start_tick >= end_tick {
+                ui.set_error_text("The automation end tick must follow its start tick".into());
+                return;
+            }
+            let points = match parse_automation_points(points.as_str(), choice.boolean) {
+                Ok(points) => points,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
+            };
+            let request = IdeAutomationTakeRequest {
+                name: name.trim().to_owned(),
+                start_tick,
+                end_tick,
+                target: choice.target.clone(),
+                interpolation,
+                points,
+            };
+            drop(choices);
+            submit_to_ui(
+                &ui,
+                &worker_for_take,
+                IdeWorkerCommand::AddAutomationTake { request },
+            );
+        },
+    );
+}
+
+fn parse_automation_tick(value: &str) -> Result<u64, &'static str> {
+    parse_exact_arrangement_tick(
+        value,
+        "Automation ticks must be non-negative whole numbers",
+        "Automation tick is outside the supported range",
+        "Automation tick exceeds the exact project range",
+    )
+}
+
+fn reset_automation_creation_form(ui: &MainWindow) {
+    ui.set_automation_create_visible(false);
+    ui.set_automation_create_name(SharedString::default());
+    ui.set_automation_create_points(SharedString::default());
+}
+
+fn apply_automation_take_creation_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AutomationTakeAdded {
+            revision,
+            take_id: _,
+            name,
+        } => {
+            reset_automation_creation_form(ui);
+            ui.set_status_text(
+                format!("Automation take {name} added in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AutomationTakeCreationCommittedWithWarning { name, warning } => {
+            reset_automation_creation_form(ui);
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), &format!("Automation take {name}"))
+                    .into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        IdeWorkerEvent::AutomationTakeAdding => {
+            ui.set_app_mode(AppMode::AddingAutomationTake);
+            ui.set_status_text(
+                "Waiting for native output before adding the automation take…".into(),
+            );
+        }
+        _ => unreachable!("automation take event dispatcher received another event"),
     }
 }
 
@@ -7707,6 +8143,108 @@ mod tests {
                 .contains("committed, but the project could not be reopened")
         );
         assert!(!ui.get_error_text().is_empty());
+    }
+
+    #[test]
+    fn automation_take_submission_and_failure_use_a_dedicated_mode() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::AddAutomationTake,
+            ),
+            AppMode::AddingAutomationTake
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::AddingAutomationTake,
+                IdeWorkerCommandKind::AddAutomationTake,
+            ),
+            AppMode::Running
+        );
+    }
+
+    #[test]
+    fn automation_points_parse_only_inside_their_declared_value_kind() {
+        assert_eq!(
+            parse_automation_points("0=1000000, 3840=0", false),
+            Ok(vec![
+                AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+                AutomationPoint::new(3_840, AutomationValue::Integer(0)),
+            ])
+        );
+        assert_eq!(
+            parse_automation_points(" 0 = off , 1920 = on ", true),
+            Ok(vec![
+                AutomationPoint::new(0, AutomationValue::Boolean(false)),
+                AutomationPoint::new(1_920, AutomationValue::Boolean(true)),
+            ])
+        );
+        assert!(parse_automation_points("0=on", false).is_err());
+        assert!(parse_automation_points("0=1000000", true).is_err());
+        assert!(parse_automation_points("1000000", false).is_err());
+        assert!(parse_automation_points("-1=0", false).is_err());
+        assert!(parse_automation_points("   ", false).is_err());
+    }
+
+    #[test]
+    fn automation_lane_labels_resolve_only_compiled_mixer_targets() {
+        let choices = vec![
+            AutomationTargetChoice {
+                label: "Main gain".to_owned(),
+                domain: AUTOMATION_UNIT_DOMAIN.to_owned(),
+                boolean: false,
+                target: IdeAutomationTarget::Main {
+                    parameter: AutomationMainParameter::Gain,
+                },
+                resolved: AutomationTarget::Main {
+                    parameter: AutomationMainParameter::Gain,
+                },
+            },
+            AutomationTargetChoice {
+                label: "Drums to Reverb send enabled".to_owned(),
+                domain: AUTOMATION_SWITCH_DOMAIN.to_owned(),
+                boolean: true,
+                target: IdeAutomationTarget::Send {
+                    send_id: "018f47a2-6b2d-7c11-8a44-001122334488".to_owned(),
+                    parameter: AutomationSendParameter::Enabled,
+                },
+                resolved: AutomationTarget::Send {
+                    slot: 0,
+                    send: 0,
+                    parameter: AutomationSendParameter::Enabled,
+                },
+            },
+        ];
+        assert_eq!(
+            automation_lane_label(
+                AutomationTarget::Main {
+                    parameter: AutomationMainParameter::Gain,
+                },
+                &choices
+            ),
+            "Main gain"
+        );
+        assert_eq!(
+            automation_lane_label(
+                AutomationTarget::Send {
+                    slot: 0,
+                    send: 0,
+                    parameter: AutomationSendParameter::Enabled,
+                },
+                &choices
+            ),
+            "Drums to Reverb send enabled"
+        );
+        assert_eq!(
+            automation_lane_label(
+                AutomationTarget::Channel {
+                    slot: 7,
+                    parameter: AutomationChannelParameter::Gain,
+                },
+                &choices
+            ),
+            "Unresolved mixer target"
+        );
     }
 
     #[test]

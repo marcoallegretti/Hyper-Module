@@ -56,8 +56,10 @@ use hyper_playback_json::{
     AudioClipLoopSerializationError, AudioClipRenameSerializationError,
     AudioClipSourceStartSerializationError, AudioTrackAdditionSerializationError,
     AudioTrackDocumentSerializationError, AudioTrackRemovalBlockers,
-    AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError, CompiledMixerTap,
-    CompiledMixerTrackKind, LoaderLimits, MixerBaseState, MixerChannelBaseState,
+    AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
+    AutomationTakeAddition, AutomationTakeAdditionSerializationError, AutomationTargetSelection,
+    CompiledMixerTap, CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits,
+    MixerBaseState, MixerChannelBaseState,
     MixerSendBaseState, MixerStateSerializationError, SceneAdditionSerializationError,
     SceneDocumentSerializationError, SceneDuplicationSerializationError,
     SceneRenameSerializationError, SceneSlotEdit, SceneSlotEditSerializationError,
@@ -66,6 +68,7 @@ use hyper_playback_json::{
     serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
     serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
     serialize_arrangement_scene_launch_addition, serialize_arrangement_scene_launch_move,
+    serialize_automation_take_addition,
     serialize_arrangement_scene_launch_removal, serialize_arrangement_scene_launch_scene_edit,
     serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
     serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_rename,
@@ -75,21 +78,26 @@ use hyper_playback_json::{
     serialize_recording_audio_clip_addition, serialize_scene_activation, serialize_scene_addition,
     serialize_scene_duplication, serialize_scene_rename, serialize_scene_slot_edit,
 };
+pub use hyper_playback_json::{
+    AutomationChannelParameter, AutomationInterpolation, AutomationMainParameter, AutomationPoint,
+    AutomationSendParameter, AutomationTarget, AutomationValue,
+};
 use hyper_playback_session::{
     AudioClipGainValidationError, AudioClipSourceSlipValidationError, PlaybackSessionAssemblyLimits,
 };
 pub use hyper_playback_session::{
-    PlaybackArrangement as IdePlaybackArrangement, PlaybackExtent as IdePlaybackExtent,
+    PlaybackArrangement as IdePlaybackArrangement, PlaybackAutomation as IdePlaybackAutomation,
+    PlaybackAutomationLane as IdePlaybackAutomationLane, PlaybackExtent as IdePlaybackExtent,
 };
 use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackLimits};
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
     AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
-    AudioTrackRemovalRequest, ProjectResourcePublicationError, ProjectResourcePublicationOutcome,
-    ProjectResourcePublicationRequest, ScenePublicationRequest, StorageError, publish_arrangement,
-    publish_audio_clip, publish_audio_track, publish_project_resource, publish_scene,
-    remove_audio_track,
+    AudioTrackRemovalRequest, AutomationTakePublicationRequest, ProjectResourcePublicationError,
+    ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest, ScenePublicationRequest,
+    StorageError, publish_arrangement, publish_audio_clip, publish_audio_track,
+    publish_automation_take, publish_project_resource, publish_scene, remove_audio_track,
 };
 
 mod recording;
@@ -2973,6 +2981,207 @@ impl Error for IdeSceneCreationError {
     }
 }
 
+/// One mixer parameter a desktop-authored automation lane may drive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdeAutomationTarget {
+    Channel {
+        track_id: String,
+        parameter: AutomationChannelParameter,
+    },
+    Send {
+        send_id: String,
+        parameter: AutomationSendParameter,
+    },
+    Main {
+        parameter: AutomationMainParameter,
+    },
+}
+
+/// One desktop-authored automation take holding exactly one lane.
+#[derive(Clone, Debug)]
+pub struct IdeAutomationTakeRequest {
+    pub name: String,
+    pub start_tick: u64,
+    pub end_tick: u64,
+    pub target: IdeAutomationTarget,
+    pub interpolation: AutomationInterpolation,
+    pub points: Vec<AutomationPoint>,
+}
+
+#[derive(Debug)]
+pub enum IdeAutomationTakePublicationError {
+    Mixer(Box<ProjectResourcePublicationError>),
+    Take {
+        mixer: Box<ProjectResourcePublicationOutcome>,
+        source: Box<ProjectResourcePublicationError>,
+    },
+}
+
+impl IdeAutomationTakePublicationError {
+    #[must_use]
+    pub const fn take_published(&self) -> bool {
+        match self {
+            Self::Mixer(_) => false,
+            Self::Take { source, .. } => source.published(),
+        }
+    }
+}
+
+impl fmt::Display for IdeAutomationTakePublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mixer(source) if source.published() => write!(
+                formatter,
+                "live mixer was preserved, but its project transaction cleanup is incomplete: {source}"
+            ),
+            Self::Mixer(source) => write!(
+                formatter,
+                "live mixer could not be preserved before publishing the automation take: {source}"
+            ),
+            Self::Take { source, .. } if source.published() => write!(
+                formatter,
+                "automation take was published, but project verification or transaction recovery is incomplete: {source}"
+            ),
+            Self::Take { mixer, source } if mixer.changed() => write!(
+                formatter,
+                "live mixer was preserved in project revision {} but automation take publication failed: {source}",
+                mixer.project_revision()
+            ),
+            Self::Take { source, .. } => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeAutomationTakePublicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Mixer(source) | Self::Take { source, .. } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeAutomationTakeCreationError {
+    InvalidName,
+    InvalidTargetIdentity,
+    MixerSave(Box<IdeProjectSaveError>),
+    Storage(StorageError),
+    MixerDocument(PlaybackDocumentLoadError),
+    Serialization(AutomationTakeAdditionSerializationError),
+    CapacityUnavailable,
+    Publication(Box<IdeAutomationTakePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeAutomationTakeCreationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: ProjectResourcePublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<IdeAutomationTakePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeAutomationTakeCreationError {
+    #[must_use]
+    pub const fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication(source) => source.take_published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. } => publication.take_published(),
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeAutomationTakeCreationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidName => {
+                formatter.write_str("automation take name must contain 1 through 120 characters")
+            }
+            Self::InvalidTargetIdentity => {
+                formatter.write_str("the automation target identity is empty")
+            }
+            Self::MixerSave(source) => {
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::MixerDocument(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("automation take capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before adding the automation take: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before adding the automation take ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "automation take preparation failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "automation take {} was added in project revision {} but the project could not be reopened: {source}",
+                outcome.resource_id(),
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.take_published() => write!(
+                formatter,
+                "automation take committed with incomplete verification or recovery ({publication}) and the project could not be reopened ({reopen})"
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "automation take publication failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAutomationTakeCreationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::MixerDocument(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidName
+            | Self::InvalidTargetIdentity
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum IdeSceneDuplicationError {
     InvalidSourceSceneIdentity,
@@ -4407,6 +4616,36 @@ struct IdeScenePublicationPlan {
     scene_bytes: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct IdeAutomationTakePublicationPlan {
+    mixer: IdeMixerSavePlan,
+    take_id: String,
+    take_bytes: Vec<u8>,
+}
+
+impl IdeAutomationTakePublicationPlan {
+    fn publish(
+        &self,
+    ) -> Result<ProjectResourcePublicationOutcome, IdeAutomationTakePublicationError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeAutomationTakePublicationError::Mixer(Box::new(source)))?;
+        publish_automation_take(
+            &self.mixer.project_path,
+            AutomationTakePublicationRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                take_id: &self.take_id,
+                take_bytes: &self.take_bytes,
+            },
+        )
+        .map_err(|source| IdeAutomationTakePublicationError::Take {
+            mixer: Box::new(mixer),
+            source: Box::new(source),
+        })
+    }
+}
+
 fn prepare_scene_edit_resource(
     prepared: &PreparedProjectPlayback,
     scene_id: &str,
@@ -4929,6 +5168,7 @@ pub struct RunningIdeSnapshot<'a> {
     pub sample_rate_hz: u32,
     pub playback_extent: IdePlaybackExtent,
     pub arrangement: Arc<IdePlaybackArrangement>,
+    pub automation: Arc<IdePlaybackAutomation>,
     pub recording_metadata: &'a [hyper_recording_metadata::RecordingMetadataDocument],
     pub scene_count: usize,
     pub track_count: usize,
@@ -4943,6 +5183,8 @@ pub struct RunningIdeSnapshot<'a> {
     pub mixer_channel_active: [bool; MAX_IDE_MIXER_CHANNELS],
     pub mixer_channel_states: [Option<IdeMixerChannelState>; MAX_IDE_MIXER_CHANNELS],
     pub mixer_send_counts: [usize; MAX_IDE_MIXER_CHANNELS],
+    pub mixer_send_ids:
+        [[&'a str; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS],
     pub mixer_send_target_names:
         [[&'a str; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS],
     pub mixer_send_taps:
@@ -6129,6 +6371,109 @@ impl RunningDesktopIdeApplication {
         })
     }
 
+    fn prepare_automation_take_creation(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        request: &IdeAutomationTakeRequest,
+    ) -> Result<IdeAutomationTakePublicationPlan, IdeAutomationTakeCreationError> {
+        let name_length = request.name.chars().count();
+        if request.name.trim() != request.name || !(1..=120).contains(&name_length) {
+            return Err(IdeAutomationTakeCreationError::InvalidName);
+        }
+        let empty_target = match &request.target {
+            IdeAutomationTarget::Channel { track_id, .. } => track_id.is_empty(),
+            IdeAutomationTarget::Send { send_id, .. } => send_id.is_empty(),
+            IdeAutomationTarget::Main { .. } => false,
+        };
+        if empty_target {
+            return Err(IdeAutomationTakeCreationError::InvalidTargetIdentity);
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAutomationTakeCreationError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAutomationTakeCreationError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeAutomationTakeCreationError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let limits = application.config.project_limits.session.documents;
+        let loaded_mixer = project
+            .load_mixer(&mixer.resource_bytes, &assets, limits)
+            .map_err(IdeAutomationTakeCreationError::MixerDocument)?;
+        let mut existing = Vec::new();
+        for descriptor in package.manifest().resources() {
+            if descriptor.role() != ResourceRole::AutomationTake {
+                continue;
+            }
+            existing
+                .try_reserve(1)
+                .map_err(|_| IdeAutomationTakeCreationError::CapacityUnavailable)?;
+            existing.push(
+                package
+                    .read_resource(descriptor.id())
+                    .map_err(IdeAutomationTakeCreationError::Storage)?,
+            );
+        }
+        let mut references = Vec::new();
+        references
+            .try_reserve_exact(existing.len())
+            .map_err(|_| IdeAutomationTakeCreationError::CapacityUnavailable)?;
+        references.extend(existing.iter().map(Vec::as_slice));
+        let take_id = uuid::Uuid::new_v4().to_string();
+        let lane_id = uuid::Uuid::new_v4().to_string();
+        let captured_at_utc =
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let target = match &request.target {
+            IdeAutomationTarget::Channel {
+                track_id,
+                parameter,
+            } => AutomationTargetSelection::Channel {
+                track_id,
+                parameter: *parameter,
+            },
+            IdeAutomationTarget::Send {
+                send_id,
+                parameter,
+            } => AutomationTargetSelection::Send {
+                send_id,
+                parameter: *parameter,
+            },
+            IdeAutomationTarget::Main { parameter } => AutomationTargetSelection::Main {
+                parameter: *parameter,
+            },
+        };
+        let take_bytes = serialize_automation_take_addition(
+            project,
+            &loaded_mixer,
+            &assets,
+            &references,
+            AutomationTakeAddition {
+                take_id: &take_id,
+                lane_id: &lane_id,
+                name: &request.name,
+                captured_at_utc: &captured_at_utc,
+                start_tick: request.start_tick,
+                end_tick: request.end_tick,
+                target,
+                interpolation: request.interpolation,
+                points: &request.points,
+            },
+            limits,
+        )
+        .map_err(IdeAutomationTakeCreationError::Serialization)?;
+        Ok(IdeAutomationTakePublicationPlan {
+            mixer,
+            take_id,
+            take_bytes,
+        })
+    }
+
     fn prepare_scene_duplication(
         application: &DesktopIdeApplication,
         recovery: &DesktopPlaybackRecovery,
@@ -6540,6 +6885,8 @@ impl RunningDesktopIdeApplication {
         let mut mixer_channel_active = [false; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_states = [None; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_send_counts = [0; MAX_IDE_MIXER_CHANNELS];
+        let mut mixer_send_ids =
+            [[""; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_send_target_names =
             [[""; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_send_taps = [[IdeMixerSendTap::PostFader;
@@ -6571,6 +6918,7 @@ impl RunningDesktopIdeApplication {
             }
             for (send_index, send) in slot.sends().iter().enumerate() {
                 let target = mixer.slots().get(send.target_slot())?;
+                mixer_send_ids[channel_index][send_index] = send.id();
                 mixer_send_target_names[channel_index][send_index] =
                     loaded.track_name(target.track_id())?;
                 mixer_send_taps[channel_index][send_index] = match send.tap() {
@@ -6597,6 +6945,7 @@ impl RunningDesktopIdeApplication {
             sample_rate_hz: project.session().sample_rate_hz(),
             playback_extent: project.session().extent(),
             arrangement: project.session().shared_arrangement(),
+            automation: project.session().shared_automation_takes(),
             recording_metadata: project.recording_metadata(),
             scene_count,
             track_count: loaded.track_count(),
@@ -6611,6 +6960,7 @@ impl RunningDesktopIdeApplication {
             mixer_channel_active,
             mixer_channel_states,
             mixer_send_counts,
+            mixer_send_ids,
             mixer_send_target_names,
             mixer_send_taps,
             mixer_send_states,
@@ -9647,6 +9997,93 @@ mod tests {
             reopened.package().read_resource(arrangement_id).unwrap(),
             arrangement_bytes
         );
+    }
+
+    #[test]
+    fn automation_take_publishes_and_reopens_as_compiled_mixer_automation() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let expected_project_sha256 = *package.manifest_sha256();
+        let take_id = "018f47a2-6b2d-7c11-8a44-00112233850a";
+        let lane_id = "018f47a2-6b2d-7c11-8a44-00112233850b";
+        let (project, _, _, media) = prepared.session().parts();
+        let assets: Vec<_> = media.media_asset_facts().collect();
+        let loaded_mixer = project
+            .load_mixer(&mixer_bytes, &assets, limits.session.documents)
+            .unwrap();
+        let points = [
+            AutomationPoint::new(0, AutomationValue::Integer(1_000_000)),
+            AutomationPoint::new(3, AutomationValue::Integer(0)),
+        ];
+        let take_bytes = serialize_automation_take_addition(
+            project,
+            &loaded_mixer,
+            &assets,
+            &[],
+            AutomationTakeAddition {
+                take_id,
+                lane_id,
+                name: "Main fade",
+                captured_at_utc: "2026-08-16T09:30:00.000Z",
+                start_tick: 0,
+                end_tick: 4,
+                target: AutomationTargetSelection::Main {
+                    parameter: AutomationMainParameter::Gain,
+                },
+                interpolation: AutomationInterpolation::Linear,
+                points: &points,
+            },
+            limits.session.documents,
+        )
+        .unwrap();
+        drop(prepared);
+
+        let outcome = IdeAutomationTakePublicationPlan {
+            mixer: IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256,
+                resource_id: mixer_id,
+                resource_bytes: mixer_bytes,
+            },
+            take_id: take_id.to_owned(),
+            take_bytes,
+        }
+        .publish()
+        .unwrap();
+        assert_eq!(outcome.project_revision(), 2);
+        assert_eq!(outcome.resource_id(), take_id);
+        assert_eq!(outcome.resource_path(), format!("takes/{take_id}.json"));
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert!(reopened.session().has_automation());
+        let published = reopened.session().automation_takes().takes();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].id(), take_id);
+        assert_eq!(published[0].name(), "Main fade");
+        assert!(published[0].enabled());
+        assert_eq!((published[0].start_tick(), published[0].end_tick()), (0, 4));
+        assert_eq!(published[0].lanes().len(), 1);
+        assert_eq!(published[0].lanes()[0].id(), lane_id);
+        assert_eq!(
+            published[0].lanes()[0].target(),
+            AutomationTarget::Main {
+                parameter: AutomationMainParameter::Gain,
+            }
+        );
+        assert_eq!(published[0].lanes()[0].point_count(), 2);
     }
 
     #[test]
