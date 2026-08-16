@@ -328,7 +328,10 @@ fn publish_control_mapping_observed(
                 error,
             )
         })?;
-    if previous_bytes.as_deref() == Some(request.mapping_bytes) {
+    let required = RequiredControlCapabilities::of(&document);
+    if previous_bytes.as_deref() == Some(request.mapping_bytes)
+        && required.covered_by(verified.manifest.required_capabilities())
+    {
         return Ok(ControlMappingPublicationOutcome {
             project_identity: request.expected_project_sha256,
             project_revision: verified.manifest.revision(),
@@ -356,6 +359,7 @@ fn publish_control_mapping_observed(
         request.mapping_bytes,
         next_revision,
         existing.is_some(),
+        required,
     )?;
     let mappings_exists = open_optional_dir(&verified.root_dir, "mappings")?.is_some();
     let created_mappings_directory = !mappings_exists && existing.is_none();
@@ -619,35 +623,6 @@ fn validate_mapping_project(
                 "control binding identity collides with a project record",
             ));
         }
-        match binding.source() {
-            ControlSource::CvInput { input_index }
-                if *input_index >= verified.manifest.required_capabilities().cv_inputs() =>
-            {
-                return Err(failure(
-                    ControlMappingPublicationErrorKind::ProjectMismatch,
-                    "control mapping requires an unavailable CV input",
-                ));
-            }
-            ControlSource::ClockInput { .. }
-                if !verified.manifest.required_capabilities().has_clock_input() =>
-            {
-                return Err(failure(
-                    ControlMappingPublicationErrorKind::ProjectMismatch,
-                    "control mapping requires an unavailable Clock input",
-                ));
-            }
-            ControlSource::ResetInput { .. }
-                if !verified.manifest.required_capabilities().has_reset_input() =>
-            {
-                return Err(failure(
-                    ControlMappingPublicationErrorKind::ProjectMismatch,
-                    "control mapping requires an unavailable Reset input",
-                ));
-            }
-            ControlSource::CvInput { .. }
-            | ControlSource::ClockInput { .. }
-            | ControlSource::ResetInput { .. } => {}
-        }
     }
     mapping_descriptor(verified, document.id())?;
     Ok(())
@@ -692,6 +667,76 @@ fn mapping_descriptor<'a>(
     Ok(mapping)
 }
 
+/// Capabilities one control-mapping document requires from its project.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RequiredControlCapabilities {
+    cv_inputs: u8,
+    has_clock_input: bool,
+    has_reset_input: bool,
+}
+
+impl RequiredControlCapabilities {
+    fn of(document: &ControlMappingDocument) -> Self {
+        let mut required = Self {
+            cv_inputs: 0,
+            has_clock_input: false,
+            has_reset_input: false,
+        };
+        for binding in document.bindings() {
+            match binding.source() {
+                ControlSource::CvInput { input_index } => {
+                    required.cv_inputs = required.cv_inputs.max(input_index.saturating_add(1));
+                }
+                ControlSource::ClockInput { .. } => required.has_clock_input = true,
+                ControlSource::ResetInput { .. } => required.has_reset_input = true,
+            }
+        }
+        required
+    }
+
+    const fn covered_by(self, declared: &hyper_project_model::HardwareCapabilities) -> bool {
+        self.cv_inputs <= declared.cv_inputs()
+            && (!self.has_clock_input || declared.has_clock_input())
+            && (!self.has_reset_input || declared.has_reset_input())
+    }
+}
+
+/// Raises the declared capability record to cover `required`, never lowering a
+/// value. The version 1 binding domain bounds every derived value inside the
+/// schema range, so no ceiling rejection is reachable here.
+fn raise_required_capabilities(
+    value: &mut Value,
+    required: RequiredControlCapabilities,
+) -> Result<(), ControlMappingPublicationError> {
+    let declared = value["required_capabilities"]
+        .as_object_mut()
+        .ok_or_else(|| {
+            failure(
+                ControlMappingPublicationErrorKind::Integrity,
+                "project capability declaration is invalid",
+            )
+        })?;
+    let cv_inputs = declared
+        .get("cv_inputs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .max(u64::from(required.cv_inputs));
+    let clock = declared
+        .get("has_clock_input")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || required.has_clock_input;
+    let reset = declared
+        .get("has_reset_input")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || required.has_reset_input;
+    declared.insert("cv_inputs".to_owned(), cv_inputs.into());
+    declared.insert("has_clock_input".to_owned(), clock.into());
+    declared.insert("has_reset_input".to_owned(), reset.into());
+    Ok(())
+}
+
 fn candidate_manifest(
     active: &[u8],
     mapping_id: &str,
@@ -699,6 +744,7 @@ fn candidate_manifest(
     mapping_bytes: &[u8],
     revision: u64,
     replacing: bool,
+    required: RequiredControlCapabilities,
 ) -> Result<Vec<u8>, ControlMappingPublicationError> {
     let mut value: Value = serde_json::from_slice(active).map_err(|error| {
         caused(
@@ -708,6 +754,7 @@ fn candidate_manifest(
         )
     })?;
     value["revision"] = revision.into();
+    raise_required_capabilities(&mut value, required)?;
     let resources = value["resources"].as_array_mut().ok_or_else(|| {
         failure(
             ControlMappingPublicationErrorKind::Integrity,
@@ -1932,6 +1979,10 @@ mod tests {
 
     impl Fixture {
         fn new(with_mapping: bool) -> Self {
+            Self::with_clock_capability(with_mapping, true)
+        }
+
+        fn with_clock_capability(with_mapping: bool, has_clock_input: bool) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "hyper-control-mapping-publication-{}-{}",
                 std::process::id(),
@@ -1979,7 +2030,7 @@ mod tests {
                     "cv_inputs": 0,
                     "cv_outputs": 0,
                     "gate_outputs": 0,
-                    "has_clock_input": true,
+                    "has_clock_input": has_clock_input,
                     "has_reset_input": false,
                     "has_clock_output": false,
                     "usb_mode": "none",
@@ -2117,6 +2168,177 @@ mod tests {
         );
         assert!(foreign.exists());
         assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
+    fn publication_raises_only_the_capabilities_the_mapping_requires() {
+        let parent = std::env::temp_dir().join(format!(
+            "hyper-mapping-capability-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let created = crate::create_project(
+            &parent,
+            crate::ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let root = created.project().root().to_path_buf();
+        let project_id = created.project().manifest().project_id().to_owned();
+        let declared = created.project().manifest().required_capabilities();
+        assert_eq!(declared.cv_inputs(), 0);
+        assert!(!declared.has_clock_input());
+        assert!(!declared.has_reset_input());
+        let audio_outputs = declared.audio_outputs();
+
+        let mapping = serde_json_canonicalizer::to_vec(&json!({
+            "format": "hyper-control-mappings",
+            "format_version": 1,
+            "id": MAPPING_ID,
+            "project_id": project_id,
+            "bindings": [{
+                "id": BINDING_ID,
+                "enabled": true,
+                "source": {"kind": "cv-input", "input_index": 2},
+                "scope": {"kind": "global"},
+                "transform": {
+                    "kind": "linear",
+                    "input_min": -1_000_000,
+                    "input_max": 1_000_000,
+                    "output_min": 0,
+                    "output_max": 1_000_000
+                },
+                "target": {"kind": "mixer-main", "parameter": "gain"}
+            }],
+            "extensions": {}
+        }))
+        .unwrap();
+
+        let published = publish_control_mapping(
+            &root,
+            ControlMappingPublicationRequest {
+                expected_project_sha256: *verify_project_package(&root)
+                    .unwrap()
+                    .manifest_sha256(),
+                mapping_bytes: &mapping,
+            },
+        )
+        .unwrap();
+        assert!(published.changed());
+
+        let verified = verify_project_package(&root).unwrap();
+        let raised = verified.manifest().required_capabilities();
+        assert_eq!(raised.cv_inputs(), 3, "raised to cover CV input index 2");
+        assert!(!raised.has_clock_input(), "clock is not required");
+        assert!(!raised.has_reset_input(), "reset is not required");
+        assert_eq!(
+            raised.audio_outputs(),
+            audio_outputs,
+            "unrelated capabilities are untouched"
+        );
+
+        let unchanged = publish_control_mapping(
+            &root,
+            ControlMappingPublicationRequest {
+                expected_project_sha256: *verified.manifest_sha256(),
+                mapping_bytes: &mapping,
+            },
+        )
+        .unwrap();
+        assert!(
+            !unchanged.changed(),
+            "an already covered republication stays a no-op"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn publication_raises_each_edge_source_capability_independently() {
+        for (source, expect_clock, expect_reset) in [
+            (json!({"kind": "clock-input", "edge": "rising"}), true, false),
+            (json!({"kind": "reset-input", "edge": "falling"}), false, true),
+        ] {
+            let parent = std::env::temp_dir().join(format!(
+                "hyper-mapping-edge-capability-{}-{}",
+                std::process::id(),
+                NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&parent).unwrap();
+            let created = crate::create_project(
+                &parent,
+                crate::ProjectCreationRequest {
+                    directory_name: "Session",
+                    project_name: "Session",
+                },
+            )
+            .unwrap();
+            let root = created.project().root().to_path_buf();
+            let project_id = created.project().manifest().project_id().to_owned();
+            let mapping = serde_json_canonicalizer::to_vec(&json!({
+                "format": "hyper-control-mappings",
+                "format_version": 1,
+                "id": MAPPING_ID,
+                "project_id": project_id,
+                "bindings": [{
+                    "id": BINDING_ID,
+                    "enabled": true,
+                    "source": source,
+                    "scope": {"kind": "global"},
+                    "transform": {"kind": "trigger", "behavior": "invoke"},
+                    "target": {"kind": "transport", "action": "play"}
+                }],
+                "extensions": {}
+            }))
+            .unwrap();
+
+            publish_control_mapping(
+                &root,
+                ControlMappingPublicationRequest {
+                    expected_project_sha256: *verify_project_package(&root)
+                        .unwrap()
+                        .manifest_sha256(),
+                    mapping_bytes: &mapping,
+                },
+            )
+            .unwrap();
+
+            let verified = verify_project_package(&root).unwrap();
+            let raised = verified.manifest().required_capabilities();
+            assert_eq!(raised.has_clock_input(), expect_clock);
+            assert_eq!(raised.has_reset_input(), expect_reset);
+            assert_eq!(raised.cv_inputs(), 0, "an edge source requires no CV input");
+            let _ = fs::remove_dir_all(&parent);
+        }
+    }
+
+    #[test]
+    fn republishing_an_identical_mapping_repairs_an_under_declared_capability() {
+        let fixture = Fixture::with_clock_capability(true, false);
+        let identical = fixture.original_mapping.clone();
+
+        let repaired = publish_control_mapping(
+            &fixture.root,
+            ControlMappingPublicationRequest {
+                expected_project_sha256: fixture.identity(),
+                mapping_bytes: &identical,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            repaired.changed(),
+            "an under-declared capability is not an unchanged project"
+        );
+        let verified = verify_project_package(&fixture.root).unwrap();
+        assert!(verified.manifest().required_capabilities().has_clock_input());
+        assert_eq!(
+            verified.read_resource(MAPPING_ID).unwrap(),
+            identical,
+            "the mapping bytes are unchanged by the repair"
+        );
     }
 
     #[test]
