@@ -778,6 +778,8 @@ pub type ArrangementSceneLaunchAdditionSerializationError =
     ArrangementPlacementDocumentSerializationError;
 pub type ArrangementSceneLaunchMoveSerializationError =
     ArrangementPlacementDocumentSerializationError;
+pub type ArrangementSceneLaunchSceneEditSerializationError =
+    ArrangementPlacementDocumentSerializationError;
 pub type ArrangementSceneLaunchRemovalSerializationError =
     ArrangementPlacementDocumentSerializationError;
 
@@ -2953,6 +2955,46 @@ pub fn serialize_arrangement_scene_launch_move(
                 .and_then(Value::as_object_mut)
                 .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
             document.insert("tick".to_owned(), tick.into());
+            Ok(())
+        },
+    )
+}
+
+/// Rebinds one persisted scene launch to an existing scene while preserving
+/// its stable identity, exact tick, and all unrelated arrangement content.
+///
+/// The complete edited playback graph is compiled before bytes are returned,
+/// so single-track authority remains enforced for the replacement scene.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the project has no arrangement, the
+/// launch or replacement scene is absent, the supplied bytes disagree with
+/// loaded authority, or the edited project cannot execute.
+pub fn serialize_arrangement_scene_launch_scene_edit(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_arrangement: &[u8],
+    launch_id: &str,
+    scene_id: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, ArrangementSceneLaunchSceneEditSerializationError> {
+    if !project.scenes.iter().any(|scene| scene.id == scene_id) {
+        return Err(ArrangementPlacementDocumentSerializationError::SceneMissing);
+    }
+    serialize_arrangement_scene_launch_document_edit(
+        project,
+        assets,
+        source_arrangement,
+        launch_id,
+        limits,
+        |_, launches| {
+            let document = launches
+                .iter_mut()
+                .find(|launch| launch.get("id").and_then(Value::as_str) == Some(launch_id))
+                .and_then(Value::as_object_mut)
+                .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
+            document.insert("scene_id".to_owned(), scene_id.into());
             Ok(())
         },
     )
@@ -9957,6 +9999,133 @@ mod tests {
                 LoaderLimits::VERSION_1,
             ),
             Err(ArrangementSceneLaunchMoveSerializationError::SourceArrangementMismatch)
+        ));
+    }
+
+    #[test]
+    fn arrangement_scene_launch_scene_edit_preserves_identity_tick_and_content() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let replacement_id = "018f47a2-6b2d-7c11-8a44-001122334462";
+        let mut replacement: Value = serde_json::from_slice(SCENE).unwrap();
+        replacement["id"] = replacement_id.into();
+        replacement["name"] = "Chorus".into();
+        replacement["order"] = 1.into();
+        let replacement = serde_json_canonicalizer::to_vec(&replacement).unwrap();
+        let scenes: [&[u8]; 2] = [SCENE, &replacement];
+        let launch_id = "018f47a2-6b2d-7c11-8a44-001122334466";
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["placements"] = json!([]);
+        source["scene_launches"] = json!([{
+            "id": launch_id,
+            "tick": 4,
+            "scene_id": "018f47a2-6b2d-7c11-8a44-001122334461"
+        }]);
+        source["extensions"]["org.example.arrangement"] = json!({"opaque": true});
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let edited = serialize_arrangement_scene_launch_scene_edit(
+            &loaded,
+            &asset_facts(),
+            &source,
+            launch_id,
+            replacement_id,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&edited).unwrap();
+
+        assert_eq!(
+            value["scene_launches"],
+            json!([{
+                "id": launch_id,
+                "tick": 4,
+                "scene_id": replacement_id
+            }])
+        );
+        assert_eq!(value["placements"], json!([]));
+        assert_eq!(
+            value["extensions"]["org.example.arrangement"],
+            json!({"opaque": true})
+        );
+        assert_eq!(serde_json_canonicalizer::to_vec(&value).unwrap(), edited);
+        let reopened = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&edited)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.scene_launch_id_at(0), Some(launch_id));
+        assert_eq!(reopened.scene_launch_tick_at(0), Some(4));
+        assert_eq!(reopened.scene_launch_scene_index_at(0), Some(1));
+        reopened
+            .compile_playback(
+                &asset_facts(),
+                GraphLimits::VERSION_1,
+                SceneLimits::VERSION_1,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn arrangement_scene_launch_scene_edit_rejects_missing_or_stale_authority() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let launch_id = "018f47a2-6b2d-7c11-8a44-001122334466";
+        let mut source: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        source["placements"] = json!([]);
+        source["scene_launches"] = json!([{
+            "id": launch_id,
+            "tick": 4,
+            "scene_id": "018f47a2-6b2d-7c11-8a44-001122334461"
+        }]);
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            serialize_arrangement_scene_launch_scene_edit(
+                &loaded,
+                &asset_facts(),
+                &source,
+                launch_id,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementSceneLaunchSceneEditSerializationError::SceneMissing)
+        ));
+        assert!(matches!(
+            serialize_arrangement_scene_launch_scene_edit(
+                &loaded,
+                &asset_facts(),
+                &source,
+                "018f47a2-6b2d-7c11-8a44-001122334499",
+                "018f47a2-6b2d-7c11-8a44-001122334461",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementSceneLaunchSceneEditSerializationError::SceneLaunchMissing)
+        ));
+        let mut stale: Value = serde_json::from_slice(&source).unwrap();
+        stale["name"] = "Stale".into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_arrangement_scene_launch_scene_edit(
+                &loaded,
+                &asset_facts(),
+                &stale,
+                launch_id,
+                "018f47a2-6b2d-7c11-8a44-001122334461",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementSceneLaunchSceneEditSerializationError::SourceArrangementMismatch)
         ));
     }
 
