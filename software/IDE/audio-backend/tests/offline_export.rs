@@ -3,6 +3,7 @@ use hyper_audio_engine::StereoOutput;
 use hyper_audio_source::DecodedAudio;
 use hyper_desktop_audio::{
     OfflineExportError, OfflineExportSpec, export_project_wav, render_project_offline,
+    render_project_offline_with_mixer,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{RoutedMainRuntime, RoutedTransportRuntime, TransportCommand};
@@ -419,4 +420,117 @@ fn a_programme_past_the_gate_reports_integrated_loudness_and_a_true_peak() {
         report.sample_peak
     );
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn a_project_shorter_than_one_block_still_exports() {
+    let session = session(Some(ARRANGEMENT), Vec::new());
+    let directory = std::env::temp_dir().join(format!(
+        "hyper-offline-short-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let wav = directory.join("short.wav");
+
+    // The desktop passes 1024, far beyond this project's 100 frames.
+    let report = export_project_wav(
+        &session,
+        OfflineExportSpec {
+            block_frames: 1_024,
+        },
+        &directory.join("short.journal"),
+        &wav,
+    )
+    .expect("a block larger than the extent must not fail the export");
+
+    assert_eq!(report.frame_count, 100);
+    assert!(wav.exists());
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn re_exporting_to_the_same_destination_replaces_it_and_leaves_no_journal() {
+    let session = session(Some(ARRANGEMENT), Vec::new());
+    let directory = std::env::temp_dir().join(format!(
+        "hyper-offline-reexport-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let journal = directory.join("bounce.journal");
+    let wav = directory.join("bounce.wav");
+    let spec = OfflineExportSpec { block_frames: 32 };
+
+    export_project_wav(&session, spec, &journal, &wav).unwrap();
+    let first = std::fs::read(&wav).unwrap();
+    assert!(!journal.exists(), "a successful export leaves no staging journal");
+
+    // Tweak the mix, as a bounce-tweak-bounce loop does, so the second export
+    // is genuinely different content rather than an idempotent republication.
+    let (project, _, _, media) = session.parts();
+    let facts: Vec<_> = media.media_asset_facts().collect();
+    let quieter = String::from_utf8(MIXER.to_vec())
+        .unwrap()
+        .replace("\"gain_millionths\":500000", "\"gain_millionths\":125000");
+    let tweaked = project
+        .load_mixer(quieter.as_bytes(), &facts, LoaderLimits::VERSION_1)
+        .unwrap()
+        .compile_main_graph()
+        .unwrap();
+
+    let second_report =
+        hyper_desktop_audio::export_project_wav_with_mixer(
+            &session,
+            spec,
+            Some(&tweaked),
+            &journal,
+            &wav,
+        )
+        .expect("bounce, tweak, bounce again must not fail on the second bounce");
+    assert_eq!(second_report.frame_count, 100);
+    assert_ne!(
+        std::fs::read(&wav).unwrap(),
+        first,
+        "the destination carries the newer render, not the first one"
+    );
+
+    // A journal orphaned by an earlier failure must not poison later exports.
+    std::fs::write(&journal, b"stale").unwrap();
+    export_project_wav(&session, spec, &journal, &wav)
+        .expect("a stale staging journal must not permanently block export");
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn a_live_mixer_override_changes_the_render_and_must_match_the_prepared_layout() {
+    let session = session(Some(ARRANGEMENT), Vec::new());
+    let spec = OfflineExportSpec { block_frames: 32 };
+    let prepared_render = render_project_offline(&session, spec).unwrap();
+
+    let (project, _, _, media) = session.parts();
+    let facts: Vec<_> = media.media_asset_facts().collect();
+    let quieter = String::from_utf8(MIXER.to_vec())
+        .unwrap()
+        .replace("\"gain_millionths\":500000", "\"gain_millionths\":125000");
+    let live = project
+        .load_mixer(quieter.as_bytes(), &facts, LoaderLimits::VERSION_1)
+        .unwrap()
+        .compile_main_graph()
+        .unwrap();
+
+    let live_render = render_project_offline_with_mixer(&session, spec, Some(&live)).unwrap();
+    assert_eq!(live_render.frame_count(), prepared_render.frame_count());
+    assert!(
+        live_render
+            .plane(0)
+            .unwrap()
+            .iter()
+            .zip(prepared_render.plane(0).unwrap())
+            .any(|(live, prepared)| (live - prepared).abs() > f32::EPSILON),
+        "a different live gain must produce a different render"
+    );
+
 }

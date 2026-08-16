@@ -79,7 +79,7 @@ mod offline_export;
 mod capture;
 pub use offline_export::{
     OfflineExportError, OfflineExportReport, OfflineExportSpec, export_project_wav,
-    render_project_offline,
+    export_project_wav_with_mixer, render_project_offline, render_project_offline_with_mixer,
 };
 pub use capture::{
     CaptureCallback, CaptureCallbackConfigError, CaptureCallbackStatus, CaptureStreamCounters,

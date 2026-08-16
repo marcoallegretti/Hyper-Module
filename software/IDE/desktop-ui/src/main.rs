@@ -7412,6 +7412,9 @@ fn export_summary(report: &OfflineExportReport) -> String {
     let seconds = u32::try_from(report.frame_count).map_or(f64::NAN, |frames| {
         f64::from(frames) / f64::from(report.sample_rate_hz)
     });
+    if report.sample_peak <= 0.0 {
+        return format!("{seconds:.2} s  ·  silent");
+    }
     let loudness = report.integrated_lufs.map_or_else(
         || "integrated loudness needs at least 400 ms".to_owned(),
         |lufs| format!("{lufs:.1} LUFS integrated"),
@@ -9139,6 +9142,20 @@ mod tests {
             "no placeholder loudness number is shown: {ungated}"
         );
         assert!(ungated.contains("true peak -10.5 dBTP"), "{ungated}");
+
+        let silent = export_summary(&OfflineExportReport {
+            frame_count: 48_000,
+            sample_rate_hz: 48_000,
+            sample_peak: 0.0,
+            true_peak: 0.0,
+            integrated_lufs: None,
+        });
+        assert_eq!(
+            silent, "1.00 s  ·  silent",
+            "silence is reported as silence, not as material too short to gate"
+        );
+        assert!(!silent.contains("400 ms"), "{silent}");
+        assert!(!silent.contains("-inf"), "{silent}");
     }
 
     #[test]

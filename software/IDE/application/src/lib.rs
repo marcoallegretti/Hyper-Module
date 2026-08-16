@@ -32,7 +32,7 @@ use hyper_desktop_audio::{
     DesktopPlaybackSession, DesktopProjectOpenError, DesktopTestToneConfig, DesktopTestToneSession,
     MonitoringSnapshot, OfflineExportError, OfflineExportSpec, OutputStreamSnapshot,
     OutputStreamState, PendingNativeShutdown, PendingNativeShutdownWait, StreamState,
-    discover_desktop_input_targets, discover_desktop_output_targets, export_project_wav,
+    discover_desktop_input_targets, discover_desktop_output_targets, export_project_wav_with_mixer,
 };
 pub use hyper_desktop_audio::OfflineExportReport;
 pub use hyper_desktop_audio::{
@@ -67,8 +67,8 @@ use hyper_playback_json::{
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
     AutomationTakeAddition, AutomationTakeAdditionSerializationError,
     AutomationTakeEditSerializationError, AutomationTargetSelection,
-    CompiledMixerTap, CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits,
-    MixerBaseState, MixerChannelBaseState,
+    CompiledMixerGraph, CompiledMixerTap, CompiledMixerTrackKind,
+    LoadError as PlaybackDocumentLoadError, LoaderLimits, MixerBaseState, MixerChannelBaseState,
     MixerSendBaseState, MixerStateSerializationError, SceneAdditionSerializationError,
     SceneDocumentSerializationError, SceneDuplicationSerializationError,
     SceneRenameSerializationError, SceneSlotEdit, SceneSlotEditSerializationError,
@@ -99,6 +99,7 @@ pub use hyper_playback_session::{
     PlaybackAutomationLane as IdePlaybackAutomationLane, PlaybackExtent as IdePlaybackExtent,
 };
 use hyper_mapping_compiler::{ControlMappingResolver, MixerSendAddress};
+use hyper_mixer_runtime::MixerParameterStateSnapshot;
 use hyper_mapping_editor::{
     MappingEditor, MappingEditorMutationError, MappingEditorPreviewError,
     MappingEditorPublicationError,
@@ -3339,7 +3340,17 @@ pub enum IdeControlMappingEdit {
 pub enum IdeProjectExportError {
     ProjectSnapshotUnavailable,
     DestinationUnavailable,
+    LiveMixerUnavailable,
     Export(Box<OfflineExportError>),
+}
+
+/// Places the staging journal beside the destination without ever colliding
+/// with it, including when the destination is itself named `.journal`.
+#[must_use]
+pub fn export_journal_path(wav_path: &Path) -> Option<std::path::PathBuf> {
+    let file_name = wav_path.file_name()?.to_str()?;
+    let journal = wav_path.with_file_name(format!("{file_name}.export-journal"));
+    (journal != wav_path).then_some(journal)
 }
 
 impl fmt::Display for IdeProjectExportError {
@@ -3349,7 +3360,10 @@ impl fmt::Display for IdeProjectExportError {
                 formatter.write_str("no open project is available to export")
             }
             Self::DestinationUnavailable => {
-                formatter.write_str("the export destination has no usable parent directory")
+                formatter.write_str("the export destination is not a usable file path")
+            }
+            Self::LiveMixerUnavailable => {
+                formatter.write_str("the audible mixer state could not be compiled for export")
             }
             Self::Export(source) => source.fmt(formatter),
         }
@@ -3360,7 +3374,9 @@ impl Error for IdeProjectExportError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Export(source) => Some(source.as_ref()),
-            Self::ProjectSnapshotUnavailable | Self::DestinationUnavailable => None,
+            Self::ProjectSnapshotUnavailable
+            | Self::DestinationUnavailable
+            | Self::LiveMixerUnavailable => None,
         }
     }
 }
@@ -5820,33 +5836,15 @@ impl RunningDesktopIdeApplication {
         }
     }
 
-    fn prepare_mixer_save(
-        application: &DesktopIdeApplication,
-        recovery: &DesktopPlaybackRecovery,
-    ) -> Result<IdeMixerSavePlan, IdeProjectSaveError> {
-        let project = recovery
-            .prepared_project()
-            .ok_or(IdeProjectSaveError::ProjectSnapshotUnavailable)?;
-        let package = project.package();
-        let mut mixer_descriptors = package
-            .manifest()
-            .resources()
-            .iter()
-            .filter(|descriptor| descriptor.role() == ResourceRole::Mixer);
-        let descriptor = mixer_descriptors
-            .next()
-            .ok_or(IdeProjectSaveError::MixerResourceMissing)?;
-        if mixer_descriptors.next().is_some() {
-            return Err(IdeProjectSaveError::MixerResourceAmbiguous);
-        }
-        let source = package
-            .read_resource(descriptor.id())
-            .map_err(IdeProjectSaveError::Storage)?;
-        let live = recovery
-            .checkpoint()
-            .mixer_parameter_state()
-            .ok_or(IdeProjectSaveError::MixerStateUnavailable)?;
-        let (_, mixer, _, _) = project.session().parts();
+    /// Folds the audio thread's live parameter values onto the compiled graph.
+    ///
+    /// Live gain, pan, mute, solo, send, and main values are applied to the
+    /// runtime and reach the project only through this fold, so anything that
+    /// must reflect what is audible has to use it.
+    fn live_mixer_base_state(
+        mixer: &CompiledMixerGraph,
+        live: &MixerParameterStateSnapshot,
+    ) -> Result<MixerBaseState, IdeProjectSaveError> {
         if live.channel_count() != mixer.slots().len() {
             return Err(IdeProjectSaveError::MixerLayoutMismatch);
         }
@@ -5887,11 +5885,44 @@ impl RunningDesktopIdeApplication {
                 sends,
             });
         }
-        let state = MixerBaseState {
+        Ok(MixerBaseState {
             channels,
             main_gain: live.main_gain(),
             main_muted: live.main_muted(),
-        };
+        })
+    }
+
+    fn prepare_mixer_save(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+    ) -> Result<IdeMixerSavePlan, IdeProjectSaveError> {
+        let project = recovery
+            .prepared_project()
+            .ok_or(IdeProjectSaveError::ProjectSnapshotUnavailable)?;
+        let package = project.package();
+        let mut mixer_descriptors = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::Mixer);
+        let descriptor = mixer_descriptors
+            .next()
+            .ok_or(IdeProjectSaveError::MixerResourceMissing)?;
+        if mixer_descriptors.next().is_some() {
+            return Err(IdeProjectSaveError::MixerResourceAmbiguous);
+        }
+        let source = package
+            .read_resource(descriptor.id())
+            .map_err(IdeProjectSaveError::Storage)?;
+        let live = recovery
+            .checkpoint()
+            .mixer_parameter_state()
+            .ok_or(IdeProjectSaveError::MixerStateUnavailable)?;
+        let (_, mixer, _, _) = project.session().parts();
+        if live.channel_count() != mixer.slots().len() {
+            return Err(IdeProjectSaveError::MixerLayoutMismatch);
+        }
+        let state = Self::live_mixer_base_state(mixer, &live)?;
         let resource_bytes = serialize_mixer_base_state(
             &source,
             package.manifest().project_id(),
@@ -6910,19 +6941,69 @@ impl RunningDesktopIdeApplication {
             IdePlaybackSessionOwner::Test(_) => None,
         }
         .ok_or(IdeProjectExportError::ProjectSnapshotUnavailable)?;
-        let journal_path = wav_path.with_extension("journal");
-        if journal_path == wav_path || wav_path.parent().is_none() {
-            return Err(IdeProjectExportError::DestinationUnavailable);
-        }
-        let report = export_project_wav(
+        let journal_path = export_journal_path(wav_path)
+            .ok_or(IdeProjectExportError::DestinationUnavailable)?;
+        let live_mixer = self.live_compiled_mixer(prepared)?;
+        let report = export_project_wav_with_mixer(
             prepared.session(),
             OfflineExportSpec { block_frames },
+            live_mixer.as_ref(),
             &journal_path,
             wav_path,
         )
         .map_err(|source| IdeProjectExportError::Export(Box::new(source)))?;
-        let _ = std::fs::remove_file(&journal_path);
         Ok(report)
+    }
+
+    /// Compiles the graph the audio thread is actually rendering with.
+    ///
+    /// Returns `None` only when no live parameter state exists yet, in which
+    /// case the prepared graph already is the audible one.
+    fn live_compiled_mixer(
+        &self,
+        prepared: &PreparedProjectPlayback,
+    ) -> Result<Option<CompiledMixerGraph>, IdeProjectExportError> {
+        let Some(live) = (match &self.session {
+            IdePlaybackSessionOwner::Native(session) => {
+                session.recovery_checkpoint().snapshot().mixer_parameter_state()
+            }
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => None,
+        }) else {
+            return Ok(None);
+        };
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .ok_or(IdeProjectExportError::LiveMixerUnavailable)?;
+        let source = package
+            .read_resource(descriptor.id())
+            .map_err(|_| IdeProjectExportError::LiveMixerUnavailable)?;
+        let (project, mixer, _, media) = prepared.session().parts();
+        let state = Self::live_mixer_base_state(mixer, &live)
+            .map_err(|_| IdeProjectExportError::LiveMixerUnavailable)?;
+        let bytes = serialize_mixer_base_state(
+            &source,
+            package.manifest().project_id(),
+            descriptor.id(),
+            &state,
+            self.application.config.project_limits.session.documents,
+        )
+        .map_err(|_| IdeProjectExportError::LiveMixerUnavailable)?;
+        let assets: Vec<_> = media.media_asset_facts().collect();
+        project
+            .load_mixer(
+                &bytes,
+                &assets,
+                self.application.config.project_limits.session.documents,
+            )
+            .map_err(|_| IdeProjectExportError::LiveMixerUnavailable)?
+            .compile_main_graph()
+            .map(Some)
+            .map_err(|_| IdeProjectExportError::LiveMixerUnavailable)
     }
 
     fn prepare_control_mapping_edit(
