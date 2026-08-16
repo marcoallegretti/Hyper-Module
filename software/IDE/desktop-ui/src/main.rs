@@ -17,6 +17,9 @@ use hyper_desktop_ide::{
     IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
     IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelKind, IdeMixerCommand,
     IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeOutputSelection,
+    ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
+    IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
+    IdeControlMappingEdit, SceneAction, TransportAction, TriggerBehavior,
     IdeAutomationTakeRequest, IdeAutomationTarget, IdeOutputTestState, IdePlaybackArrangement,
     IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent, IdeRecordingAbortOutcome,
     IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation,
@@ -64,6 +67,7 @@ struct ProjectUiState {
     scenes: RefCell<Vec<IdeScene>>,
     scene_launch_evidence: RefCell<SceneLaunchEvidence>,
     automation_channels: RefCell<Vec<AutomationChannelFacts>>,
+    control_targets: RefCell<Vec<ControlTargetChoice>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1538,6 +1542,7 @@ fn bind_arrangement_scene_launch_callback(
     bind_arrangement_scene_launch_move_callback(ui, worker, project_state);
     bind_automation_take_callback(ui, worker, project_state);
     bind_automation_take_activation_callback(ui, worker);
+    bind_control_mapping_callbacks(ui, worker, project_state);
     bind_arrangement_scene_launch_locate_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_scene_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_removal_callback(ui, worker, project_state);
@@ -2929,6 +2934,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::SetAutomationTakeActive => {
             AppMode::ChangingAutomationTakeActivation
         }
+        IdeWorkerCommandKind::EditControlMapping => AppMode::EditingControlMapping,
         IdeWorkerCommandKind::MoveArrangementSceneLaunch => AppMode::MovingArrangementSceneLaunch,
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => {
             AppMode::ChangingArrangementSceneLaunchScene
@@ -3066,6 +3072,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetAutomationTakeActive => {
             "Preserving mixer state, editing the automation take, and reopening project..."
+        }
+        IdeWorkerCommandKind::EditControlMapping => {
+            "Preserving mixer state, editing control mappings, and reopening project..."
         }
         IdeWorkerCommandKind::DuplicateScene => {
             "Preserving mixer state, duplicating the scene, and reopening project..."
@@ -3280,6 +3289,11 @@ fn apply_event(
         | IdeWorkerEvent::AutomationTakeActivationCommittedWithWarning { .. }
         | IdeWorkerEvent::AutomationTakeActivationChanging { .. }) => {
             apply_automation_take_activation_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ControlMappingEdited { .. }
+        | IdeWorkerEvent::ControlMappingEditCommittedWithWarning { .. }
+        | IdeWorkerEvent::ControlMappingEditing { .. }) => {
+            apply_control_mapping_event(ui, &event);
         }
         event @ (IdeWorkerEvent::SceneDuplicated { .. }
         | IdeWorkerEvent::SceneDuplicationCommittedWithWarning { .. }
@@ -4686,6 +4700,7 @@ fn apply_running_event(
     set_playback_extent(ui, project_state, observation);
     set_arrangement(ui, project_state, observation);
     set_automation(ui, project_state, observation);
+    set_control_mappings(ui, project_state, observation);
     let clips_changed = set_audio_clips(ui, project_state, observation.audio_clips());
     refresh_scene_slots_if_changed(ui, project_state, scenes_changed || clips_changed);
     ui.set_stream_state(format!("{:?}", observation.output_state()).into());
@@ -5506,6 +5521,7 @@ fn reset_project(
     project_state.audio_clips.borrow_mut().clear();
     project_state.scenes.borrow_mut().clear();
     project_state.automation_channels.borrow_mut().clear();
+    project_state.control_targets.borrow_mut().clear();
     project_state.scene_launch_evidence.borrow_mut().clear();
     ui.set_transport_extent_bounded(false);
     ui.set_transport_seek_available(false);
@@ -5537,6 +5553,15 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_automation_target_domain(ModelRc::default());
     ui.set_mixer_automation_visible(false);
     reset_automation_creation_form(ui);
+    ui.set_control_bindings(ModelRc::default());
+    ui.set_control_source_names(ModelRc::default());
+    ui.set_control_source_continuous(ModelRc::default());
+    ui.set_control_target_names(ModelRc::default());
+    ui.set_control_target_continuous(ModelRc::default());
+    ui.set_control_target_boolean(ModelRc::default());
+    ui.set_control_target_range(ModelRc::default());
+    ui.set_mixer_control_visible(false);
+    ui.set_control_create_visible(false);
     reset_arrangement_scene_launch_addition_form(ui);
     reset_arrangement_scene_launch_move_form(ui);
     reset_arrangement_scene_launch_scene_form(ui);
@@ -5623,6 +5648,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::SetAutomationTakeActive
             if current == AppMode::ChangingAutomationTakeActivation =>
         {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::EditControlMapping if current == AppMode::EditingControlMapping => {
             AppMode::Running
         }
         IdeWorkerCommandKind::MoveArrangementSceneLaunch
@@ -6896,6 +6924,445 @@ fn apply_automation_take_creation_event(ui: &MainWindow, event: &IdeWorkerEvent)
             );
         }
         _ => unreachable!("automation take event dispatcher received another event"),
+    }
+}
+
+
+const CONTROL_CV_DOMAIN: &str = "0-1000000";
+const CONTROL_PAN_DOMAIN: &str = "0-1000000 (500000 = centre)";
+
+/// Which transform a source admits, fixed by the version 1 binding domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlSourceKind {
+    Continuous,
+    Edge,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ControlSourceChoice {
+    label: String,
+    kind: ControlSourceKind,
+    source: ControlSource,
+}
+
+/// The domain a target admits, fixed by `target_domain` in the contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlTargetDomain {
+    Continuous,
+    Boolean,
+    Action,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ControlTargetChoice {
+    label: String,
+    domain: ControlTargetDomain,
+    range_hint: String,
+    target: ControlTarget,
+}
+
+fn control_source_choices() -> Vec<ControlSourceChoice> {
+    let mut choices = Vec::new();
+    for index in 0..4_u8 {
+        choices.push(ControlSourceChoice {
+            label: format!("CV {}", index + 1),
+            kind: ControlSourceKind::Continuous,
+            source: ControlSource::CvInput { input_index: index },
+        });
+    }
+    for (label, source) in [
+        ("Clock rising", ControlSource::ClockInput { edge: Edge::Rising }),
+        (
+            "Clock falling",
+            ControlSource::ClockInput {
+                edge: Edge::Falling,
+            },
+        ),
+        ("Reset rising", ControlSource::ResetInput { edge: Edge::Rising }),
+        (
+            "Reset falling",
+            ControlSource::ResetInput {
+                edge: Edge::Falling,
+            },
+        ),
+    ] {
+        choices.push(ControlSourceChoice {
+            label: label.to_owned(),
+            kind: ControlSourceKind::Edge,
+            source,
+        });
+    }
+    choices
+}
+
+fn control_target_choices(
+    channels: &[IdeMixerChannel],
+    scenes: &[IdeScene],
+) -> Vec<ControlTargetChoice> {
+    let mut choices = vec![
+        ControlTargetChoice {
+            label: "Main gain".to_owned(),
+            domain: ControlTargetDomain::Continuous,
+            range_hint: CONTROL_CV_DOMAIN.to_owned(),
+            target: ControlTarget::MixerMain {
+                parameter: IdeControlMainParameter::Gain,
+            },
+        },
+        ControlTargetChoice {
+            label: "Main mute".to_owned(),
+            domain: ControlTargetDomain::Boolean,
+            range_hint: String::new(),
+            target: ControlTarget::MixerMain {
+                parameter: IdeControlMainParameter::Mute,
+            },
+        },
+    ];
+    for channel in channels {
+        for (suffix, domain, hint, parameter) in [
+            (
+                "gain",
+                ControlTargetDomain::Continuous,
+                CONTROL_CV_DOMAIN,
+                IdeControlChannelParameter::Gain,
+            ),
+            (
+                "pan",
+                ControlTargetDomain::Continuous,
+                CONTROL_PAN_DOMAIN,
+                IdeControlChannelParameter::Pan,
+            ),
+            (
+                "mute",
+                ControlTargetDomain::Boolean,
+                "",
+                IdeControlChannelParameter::Mute,
+            ),
+            (
+                "solo",
+                ControlTargetDomain::Boolean,
+                "",
+                IdeControlChannelParameter::Solo,
+            ),
+        ] {
+            choices.push(ControlTargetChoice {
+                label: format!("{} {suffix}", channel.name()),
+                domain,
+                range_hint: hint.to_owned(),
+                target: ControlTarget::MixerChannel {
+                    track_id: channel.id().to_owned(),
+                    parameter,
+                },
+            });
+        }
+    }
+    for scene in scenes {
+        choices.push(ControlTargetChoice {
+            label: format!("Launch scene {}", scene.name()),
+            domain: ControlTargetDomain::Action,
+            range_hint: String::new(),
+            target: ControlTarget::Scene {
+                scene_id: scene.id().to_owned(),
+                action: SceneAction::Launch,
+            },
+        });
+    }
+    for (label, action) in [
+        ("Transport play", TransportAction::Play),
+        ("Transport stop", TransportAction::Stop),
+        ("Transport toggle", TransportAction::Toggle),
+        ("Transport reset", TransportAction::Reset),
+    ] {
+        choices.push(ControlTargetChoice {
+            label: label.to_owned(),
+            domain: ControlTargetDomain::Action,
+            range_hint: String::new(),
+            target: ControlTarget::Transport { action },
+        });
+    }
+    choices
+}
+
+/// A continuous source drives only continuous targets; an edge source drives
+/// only Boolean and action targets. Both rules come from the contract, so a
+/// combination the loader would reject is never offered.
+const fn control_target_admits(kind: ControlSourceKind, domain: ControlTargetDomain) -> bool {
+    match kind {
+        ControlSourceKind::Continuous => matches!(domain, ControlTargetDomain::Continuous),
+        ControlSourceKind::Edge => matches!(
+            domain,
+            ControlTargetDomain::Boolean | ControlTargetDomain::Action
+        ),
+    }
+}
+
+fn admitted_control_targets(
+    kind: ControlSourceKind,
+    targets: &[ControlTargetChoice],
+) -> Vec<usize> {
+    targets
+        .iter()
+        .enumerate()
+        .filter(|(_, choice)| control_target_admits(kind, choice.domain))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Builds one insertion request from the form. The transform is derived, not
+/// chosen: an action target forces `Invoke`, a Boolean target offers only
+/// toggle or momentary, and a continuous target keeps the full CV input range.
+fn control_binding_request(
+    sources: &[ControlSourceChoice],
+    targets: &[ControlTargetChoice],
+    source_index: i32,
+    target_index: i32,
+    momentary: bool,
+    output_min: &str,
+    output_max: &str,
+) -> Result<IdeControlBindingRequest, &'static str> {
+    let source = usize::try_from(source_index)
+        .ok()
+        .and_then(|index| sources.get(index))
+        .ok_or("The selected control source is unavailable")?;
+    let target = usize::try_from(target_index)
+        .ok()
+        .and_then(|index| targets.get(index))
+        .ok_or("The selected control target is unavailable")?;
+    let admitted = admitted_control_targets(source.kind, targets);
+    let selected = usize::try_from(target_index).map_err(|_| "The selected control target is unavailable")?;
+    if !admitted.contains(&selected) {
+        return Err("That source cannot drive that target");
+    }
+    let transform = match target.domain {
+        ControlTargetDomain::Continuous => {
+            let output_min = parse_control_millionths(output_min)?;
+            let output_max = parse_control_millionths(output_max)?;
+            ControlTransform::Linear {
+                input_min: -1_000_000,
+                input_max: 1_000_000,
+                output_min,
+                output_max,
+            }
+        }
+        ControlTargetDomain::Boolean => ControlTransform::Trigger {
+            behavior: if momentary {
+                TriggerBehavior::Momentary
+            } else {
+                TriggerBehavior::Toggle
+            },
+        },
+        ControlTargetDomain::Action => ControlTransform::Trigger {
+            behavior: TriggerBehavior::Invoke,
+        },
+    };
+    Ok(IdeControlBindingRequest {
+        source: source.source.clone(),
+        scope: ControlScope::Global,
+        transform,
+        target: target.target.clone(),
+    })
+}
+
+fn set_control_mappings(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    observation: &IdeRunningObservation,
+) {
+    let targets = control_target_choices(observation.mixer_channels(), observation.scenes());
+    if *project_state.control_targets.borrow() != targets {
+        let sources = control_source_choices();
+        ui.set_control_source_names(ModelRc::from(Rc::new(VecModel::from(
+            sources
+                .iter()
+                .map(|choice| SharedString::from(choice.label.as_str()))
+                .collect::<Vec<_>>(),
+        ))));
+        ui.set_control_source_continuous(ModelRc::from(Rc::new(VecModel::from(
+            sources
+                .iter()
+                .map(|choice| choice.kind == ControlSourceKind::Continuous)
+                .collect::<Vec<_>>(),
+        ))));
+        ui.set_control_target_names(ModelRc::from(Rc::new(VecModel::from(
+            targets
+                .iter()
+                .map(|choice| SharedString::from(choice.label.as_str()))
+                .collect::<Vec<_>>(),
+        ))));
+        ui.set_control_target_continuous(ModelRc::from(Rc::new(VecModel::from(
+            targets
+                .iter()
+                .map(|choice| choice.domain == ControlTargetDomain::Continuous)
+                .collect::<Vec<_>>(),
+        ))));
+        ui.set_control_target_boolean(ModelRc::from(Rc::new(VecModel::from(
+            targets
+                .iter()
+                .map(|choice| choice.domain == ControlTargetDomain::Boolean)
+                .collect::<Vec<_>>(),
+        ))));
+        ui.set_control_target_range(ModelRc::from(Rc::new(VecModel::from(
+            targets
+                .iter()
+                .map(|choice| SharedString::from(choice.range_hint.as_str()))
+                .collect::<Vec<_>>(),
+        ))));
+        if ui.get_control_create_target_index() >= i32::try_from(targets.len()).unwrap_or(0) {
+            ui.set_control_create_target_index(0);
+        }
+        *project_state.control_targets.borrow_mut() = targets;
+    }
+    ui.set_control_bindings(ModelRc::from(Rc::new(VecModel::from(
+        observation
+            .control_bindings()
+            .iter()
+            .map(|binding| ControlBindingRow {
+                id: binding.id().into(),
+                enabled: binding.enabled(),
+                source: binding.source().into(),
+                scope: binding.scope().into(),
+                target: binding.target().into(),
+                transform: binding.transform().into(),
+            })
+            .collect::<Vec<_>>(),
+    ))));
+}
+
+fn apply_control_mapping_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ControlMappingEdited { revision, edit } => {
+            ui.set_control_create_visible(false);
+            ui.set_status_text(
+                match edit {
+                    IdeControlMappingEdit::Insert(_) => {
+                        format!("Control binding added in project revision {revision}")
+                    }
+                    IdeControlMappingEdit::SetEnabled { enabled: true, .. } => {
+                        format!("Control binding enabled in project revision {revision}")
+                    }
+                    IdeControlMappingEdit::SetEnabled { enabled: false, .. } => {
+                        format!("Control binding disabled in project revision {revision}")
+                    }
+                    IdeControlMappingEdit::Remove { .. } => {
+                        format!("Control binding removed in project revision {revision}")
+                    }
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ControlMappingEditCommittedWithWarning { warning } => {
+            ui.set_control_create_visible(false);
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), "Control mapping edit").into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        IdeWorkerEvent::ControlMappingEditing { .. } => {
+            ui.set_app_mode(AppMode::EditingControlMapping);
+            ui.set_status_text(
+                "Waiting for native output before editing control mappings\u{2026}".into(),
+            );
+        }
+        _ => unreachable!("control mapping event dispatcher received another event"),
+    }
+}
+
+fn bind_control_mapping_callbacks(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_add = Rc::clone(worker);
+    let project_state_for_add = Rc::clone(project_state);
+    actions.on_add_control_binding(
+        move |source_index, target_index, momentary, output_min, output_max| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::Running || !ui.get_control_create_visible() {
+                ui.set_error_text("Control binding request is no longer current".into());
+                return;
+            }
+            let request = match control_binding_request(
+                &control_source_choices(),
+                &project_state_for_add.control_targets.borrow(),
+                source_index,
+                target_index,
+                momentary,
+                output_min.as_str(),
+                output_max.as_str(),
+            ) {
+                Ok(request) => request,
+                Err(message) => {
+                    ui.set_error_text(message.into());
+                    return;
+                }
+            };
+            submit_to_ui(
+                &ui,
+                &worker_for_add,
+                IdeWorkerCommand::EditControlMapping {
+                    edit: IdeControlMappingEdit::Insert(request),
+                },
+            );
+        },
+    );
+
+    let weak = ui.as_weak();
+    let worker_for_active = Rc::clone(worker);
+    actions.on_set_control_binding_active(move |binding_id, enabled| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || binding_id.is_empty() {
+            ui.set_error_text("Control binding request is no longer current".into());
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_active,
+            IdeWorkerCommand::EditControlMapping {
+                edit: IdeControlMappingEdit::SetEnabled {
+                    binding_id: binding_id.to_string(),
+                    enabled,
+                },
+            },
+        );
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_remove = Rc::clone(worker);
+    actions.on_remove_control_binding(move |binding_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || binding_id.is_empty() {
+            ui.set_error_text("Control binding request is no longer current".into());
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_remove,
+            IdeWorkerCommand::EditControlMapping {
+                edit: IdeControlMappingEdit::Remove {
+                    binding_id: binding_id.to_string(),
+                },
+            },
+        );
+    });
+}
+
+fn parse_control_millionths(value: &str) -> Result<i32, &'static str> {
+    let parsed = value
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| "Control output values must be whole millionths")?;
+    if (0..=1_000_000).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err("Control output values must be between 0 and 1000000")
     }
 }
 
@@ -8348,6 +8815,88 @@ mod tests {
                 sends: Vec::new(),
             },
         ]
+    }
+
+    #[test]
+    fn control_binding_requests_follow_the_contract_domain_rules() {
+        let sources = control_source_choices();
+        assert_eq!(sources.len(), 8, "four CV inputs plus clock and reset edges");
+        let targets = vec![
+            ControlTargetChoice {
+                label: "Main gain".to_owned(),
+                domain: ControlTargetDomain::Continuous,
+                range_hint: CONTROL_CV_DOMAIN.to_owned(),
+                target: ControlTarget::MixerMain {
+                    parameter: IdeControlMainParameter::Gain,
+                },
+            },
+            ControlTargetChoice {
+                label: "Main mute".to_owned(),
+                domain: ControlTargetDomain::Boolean,
+                range_hint: String::new(),
+                target: ControlTarget::MixerMain {
+                    parameter: IdeControlMainParameter::Mute,
+                },
+            },
+            ControlTargetChoice {
+                label: "Transport play".to_owned(),
+                domain: ControlTargetDomain::Action,
+                range_hint: String::new(),
+                target: ControlTarget::Transport {
+                    action: TransportAction::Play,
+                },
+            },
+        ];
+
+        let cv = control_binding_request(&sources, &targets, 0, 0, false, "0", "1000000").unwrap();
+        assert_eq!(cv.source, ControlSource::CvInput { input_index: 0 });
+        assert_eq!(
+            cv.transform,
+            ControlTransform::Linear {
+                input_min: -1_000_000,
+                input_max: 1_000_000,
+                output_min: 0,
+                output_max: 1_000_000,
+            },
+            "a CV source keeps the full normalized input range"
+        );
+
+        let toggled = control_binding_request(&sources, &targets, 4, 1, false, "", "").unwrap();
+        assert_eq!(
+            toggled.transform,
+            ControlTransform::Trigger {
+                behavior: TriggerBehavior::Toggle
+            }
+        );
+        let momentary = control_binding_request(&sources, &targets, 4, 1, true, "", "").unwrap();
+        assert_eq!(
+            momentary.transform,
+            ControlTransform::Trigger {
+                behavior: TriggerBehavior::Momentary
+            }
+        );
+
+        let action = control_binding_request(&sources, &targets, 6, 2, true, "", "").unwrap();
+        assert_eq!(
+            action.transform,
+            ControlTransform::Trigger {
+                behavior: TriggerBehavior::Invoke
+            },
+            "an action target forces invoke regardless of the momentary control"
+        );
+
+        assert!(
+            control_binding_request(&sources, &targets, 0, 1, false, "0", "1000000").is_err(),
+            "a CV source may not drive a switch target"
+        );
+        assert!(
+            control_binding_request(&sources, &targets, 4, 0, false, "0", "1000000").is_err(),
+            "an edge source may not drive a value target"
+        );
+        assert!(control_binding_request(&sources, &targets, 0, 0, false, "0", "1000001").is_err());
+        assert!(control_binding_request(&sources, &targets, 0, 0, false, "-1", "10").is_err());
+        assert!(control_binding_request(&sources, &targets, 99, 0, false, "0", "10").is_err());
+        assert!(control_binding_request(&sources, &targets, -1, 0, false, "0", "10").is_err());
     }
 
     #[test]

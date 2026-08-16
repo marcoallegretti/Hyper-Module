@@ -27,7 +27,9 @@ use super::{
     IdeAudioClipLoopEditError, IdeAudioClipRenameEditError, IdeAudioClipReverseEditError,
     IdeAudioClipSourceSlipEditError, IdeAudioInputInventory, IdeAudioOutputInventory,
     IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioTrackAdditionError,
+    ControlBinding, ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
     IdeAudioTrackEditError, IdeAudioTrackRemovalError, IdeAutomationTakeCreationError,
+    IdeControlMappingEdit, IdeControlMappingEditError,
     IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
     IdeInputDiscoveryError,
     IdeInputSelection, IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError,
@@ -43,6 +45,7 @@ use super::{
     IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError, IdeTransportSeekError,
     InputInventoryError, LocateState, OutputInventoryError, OutputStreamSnapshot,
     OutputStreamState, OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication,
+    RunningIdeSnapshot,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -159,6 +162,7 @@ pub enum IdeWorkerCommandKind {
     SetSceneActive,
     AddAutomationTake,
     SetAutomationTakeActive,
+    EditControlMapping,
     StartRecording,
     StopRecording,
     AbortRecording,
@@ -317,6 +321,9 @@ pub enum IdeWorkerCommand {
         take_id: String,
         enabled: bool,
     },
+    EditControlMapping {
+        edit: IdeControlMappingEdit,
+    },
     DuplicateScene {
         scene_id: String,
         name: String,
@@ -421,6 +428,7 @@ impl IdeWorkerCommand {
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
+            Self::EditControlMapping { .. } => IdeWorkerCommandKind::EditControlMapping,
             Self::DuplicateScene { .. } => IdeWorkerCommandKind::DuplicateScene,
             Self::SetSceneSlot { .. } => IdeWorkerCommandKind::SetSceneSlot,
             Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
@@ -601,6 +609,7 @@ pub struct IdeRunningObservation {
     playback_extent: super::IdePlaybackExtent,
     arrangement: Arc<super::IdePlaybackArrangement>,
     automation: Arc<super::IdePlaybackAutomation>,
+    control_bindings: Vec<IdeControlBinding>,
     audio_clips: Vec<IdeAudioClip>,
     recording_takes: Vec<IdeRecordingTake>,
     preview: IdeAudioPreviewObservation,
@@ -806,6 +815,175 @@ pub struct IdeMixerChannel {
     sends: Vec<IdeMixerSend>,
 }
 
+/// One persisted control binding with the labels its identities resolve to in
+/// the current project.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdeControlBinding {
+    id: String,
+    enabled: bool,
+    source: String,
+    scope: String,
+    target: String,
+    transform: String,
+}
+
+impl IdeControlBinding {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    #[must_use]
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    #[must_use]
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    #[must_use]
+    pub fn transform(&self) -> &str {
+        &self.transform
+    }
+}
+
+const fn control_edge_name(edge: Edge) -> &'static str {
+    match edge {
+        Edge::Rising => "rising",
+        Edge::Falling => "falling",
+    }
+}
+
+fn control_source_label(source: &ControlSource) -> String {
+    match source {
+        ControlSource::CvInput { input_index } => format!("CV {}", input_index + 1),
+        ControlSource::ClockInput { edge } => {
+            format!("Clock {}", control_edge_name(*edge))
+        }
+        ControlSource::ResetInput { edge } => {
+            format!("Reset {}", control_edge_name(*edge))
+        }
+    }
+}
+
+fn control_scope_label(scope: &ControlScope, snapshot: &RunningIdeSnapshot<'_>) -> String {
+    match scope {
+        ControlScope::Global => "Global".to_owned(),
+        ControlScope::MixerPage => "Mixer page".to_owned(),
+        ControlScope::Track { track_id } => {
+            format!("Track {}", control_track_label(track_id, snapshot))
+        }
+        ControlScope::Scene { scene_id } => {
+            format!("Scene {}", control_scene_label(scene_id, snapshot))
+        }
+    }
+}
+
+fn control_track_label(track_id: &str, snapshot: &RunningIdeSnapshot<'_>) -> String {
+    snapshot
+        .loaded
+        .track_name(track_id)
+        .unwrap_or(track_id)
+        .to_owned()
+}
+
+fn control_scene_label(scene_id: &str, snapshot: &RunningIdeSnapshot<'_>) -> String {
+    snapshot.scene_ids[..snapshot.scene_count]
+        .iter()
+        .position(|id| *id == scene_id)
+        .map_or_else(|| scene_id.to_owned(), |index| {
+            snapshot.scene_names[index].to_owned()
+        })
+}
+
+fn control_send_label(send_id: &str, snapshot: &RunningIdeSnapshot<'_>) -> String {
+    for channel_index in 0..snapshot.mixer_channel_count {
+        for send_index in 0..snapshot.mixer_send_counts[channel_index] {
+            if snapshot.mixer_send_ids[channel_index][send_index] == send_id {
+                return format!(
+                    "{} to {}",
+                    snapshot.mixer_channel_names[channel_index],
+                    snapshot.mixer_send_target_names[channel_index][send_index]
+                );
+            }
+        }
+    }
+    send_id.to_owned()
+}
+
+fn control_target_label(target: &ControlTarget, snapshot: &RunningIdeSnapshot<'_>) -> String {
+    match target {
+        ControlTarget::MixerChannel {
+            track_id,
+            parameter,
+        } => format!(
+            "{} {}",
+            control_track_label(track_id, snapshot),
+            format!("{parameter:?}").to_lowercase()
+        ),
+        ControlTarget::MixerSend {
+            send_id,
+            parameter,
+        } => format!(
+            "{} send {}",
+            control_send_label(send_id, snapshot),
+            format!("{parameter:?}").to_lowercase()
+        ),
+        ControlTarget::MixerMain { parameter } => {
+            format!("Main {}", format!("{parameter:?}").to_lowercase())
+        }
+        ControlTarget::MixerCue { parameter } => {
+            format!("Cue {}", format!("{parameter:?}").to_lowercase())
+        }
+        ControlTarget::Scene { scene_id, action } => format!(
+            "Scene {} {}",
+            control_scene_label(scene_id, snapshot),
+            format!("{action:?}").to_lowercase()
+        ),
+        ControlTarget::Transport { action } => {
+            format!("Transport {}", format!("{action:?}").to_lowercase())
+        }
+    }
+}
+
+fn control_transform_label(transform: ControlTransform) -> String {
+    match transform {
+        ControlTransform::Linear {
+            input_min,
+            input_max,
+            output_min,
+            output_max,
+        } => format!("Linear {input_min}..{input_max} to {output_min}..{output_max}"),
+        ControlTransform::Trigger { behavior } => format!("{behavior:?}"),
+    }
+}
+
+fn ide_control_binding(
+    binding: &ControlBinding,
+    snapshot: &RunningIdeSnapshot<'_>,
+) -> Result<IdeControlBinding, IdeWorkerCommandFailure> {
+    Ok(IdeControlBinding {
+        id: try_project_owned(binding.id())?,
+        enabled: binding.enabled(),
+        source: control_source_label(binding.source()),
+        scope: control_scope_label(binding.scope(), snapshot),
+        target: control_target_label(binding.target(), snapshot),
+        transform: control_transform_label(binding.transform()),
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct IdeMixerSend {
     id: String,
@@ -954,6 +1132,11 @@ impl IdeRunningObservation {
     #[must_use]
     pub fn automation(&self) -> &Arc<super::IdePlaybackAutomation> {
         &self.automation
+    }
+
+    #[must_use]
+    pub fn control_bindings(&self) -> &[IdeControlBinding] {
+        &self.control_bindings
     }
 
     #[must_use]
@@ -1131,6 +1314,7 @@ pub enum IdeWorkerCommandFailure {
     SceneCreation(Box<IdeSceneCreationError>),
     AutomationTakeCreation(Box<IdeAutomationTakeCreationError>),
     AutomationTakeActivation(Box<IdeAutomationTakeEditError>),
+    ControlMappingEdit(Box<IdeControlMappingEditError>),
     SceneDuplication(Box<IdeSceneDuplicationError>),
     SceneSlotEdit(Box<IdeSceneSlotEditError>),
     SceneRename(Box<IdeSceneRenameError>),
@@ -1190,6 +1374,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::SceneCreation(source) => source.fmt(formatter),
             Self::AutomationTakeCreation(source) => source.fmt(formatter),
             Self::AutomationTakeActivation(source) => source.fmt(formatter),
+            Self::ControlMappingEdit(source) => source.fmt(formatter),
             Self::SceneDuplication(source) => source.fmt(formatter),
             Self::SceneSlotEdit(source) => source.fmt(formatter),
             Self::SceneRename(source) | Self::SceneActivation(source) => source.fmt(formatter),
@@ -1254,6 +1439,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::SceneCreation(source) => Some(source),
             Self::AutomationTakeCreation(source) => Some(source),
             Self::AutomationTakeActivation(source) => Some(source),
+            Self::ControlMappingEdit(source) => Some(source),
             Self::SceneDuplication(source) => Some(source),
             Self::SceneSlotEdit(source) => Some(source),
             Self::SceneRename(source) | Self::SceneActivation(source) => Some(source),
@@ -1486,6 +1672,13 @@ pub enum IdeWorkerEvent {
     AutomationTakeActivationCommittedWithWarning {
         warning: Box<IdeAutomationTakeEditError>,
     },
+    ControlMappingEdited {
+        revision: u64,
+        edit: IdeControlMappingEdit,
+    },
+    ControlMappingEditCommittedWithWarning {
+        warning: Box<IdeControlMappingEditError>,
+    },
     SceneDuplicated {
         revision: u64,
         scene_id: String,
@@ -1595,6 +1788,9 @@ pub enum IdeWorkerEvent {
     AutomationTakeAdding,
     AutomationTakeActivationChanging {
         enabled: bool,
+    },
+    ControlMappingEditing {
+        edit: IdeControlMappingEdit,
     },
     SceneDuplicating,
     SceneSlotChanging {
@@ -2035,6 +2231,9 @@ enum ProjectMutation {
         take_id: String,
         enabled: bool,
     },
+    EditControlMapping {
+        edit: IdeControlMappingEdit,
+    },
     DuplicateScene {
         scene_id: String,
         name: String,
@@ -2106,6 +2305,7 @@ impl ProjectMutation {
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
+            Self::EditControlMapping { .. } => IdeWorkerCommandKind::EditControlMapping,
             Self::DuplicateScene { .. } => IdeWorkerCommandKind::DuplicateScene,
             Self::SetSceneSlot { .. } => IdeWorkerCommandKind::SetSceneSlot,
             Self::RenameScene { .. } => IdeWorkerCommandKind::RenameScene,
@@ -2211,6 +2411,9 @@ impl ProjectMutation {
             Self::AddAutomationTake { .. } => IdeWorkerEvent::AutomationTakeAdding,
             Self::SetAutomationTakeActive { enabled, .. } => {
                 IdeWorkerEvent::AutomationTakeActivationChanging { enabled: *enabled }
+            }
+            Self::EditControlMapping { edit } => {
+                IdeWorkerEvent::ControlMappingEditing { edit: edit.clone() }
             }
             Self::DuplicateScene { .. } => IdeWorkerEvent::SceneDuplicating,
             Self::SetSceneSlot { edit, .. } => {
@@ -2453,6 +2656,7 @@ fn process_command(
         | IdeWorkerCommand::AddScene { .. }
         | IdeWorkerCommand::AddAutomationTake { .. }
         | IdeWorkerCommand::SetAutomationTakeActive { .. }
+        | IdeWorkerCommand::EditControlMapping { .. }
         | IdeWorkerCommand::DuplicateScene { .. }
         | IdeWorkerCommand::SetSceneSlot { .. }
         | IdeWorkerCommand::RenameScene { .. }
@@ -2599,6 +2803,9 @@ fn process_project_mutation_command(
         }
         IdeWorkerCommand::SetAutomationTakeActive { take_id, enabled } => {
             set_automation_take_active(state, events, &take_id, enabled)
+        }
+        IdeWorkerCommand::EditControlMapping { edit } => {
+            edit_control_mapping(state, events, edit)
         }
         IdeWorkerCommand::DuplicateScene { scene_id, name } => {
             duplicate_scene(state, events, &scene_id, &name)
@@ -4542,6 +4749,87 @@ fn add_automation_take(
     begin_project_mutation_request(state, events, ProjectMutation::AddAutomationTake { request })
 }
 
+fn edit_control_mapping(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    edit: IdeControlMappingEdit,
+) -> bool {
+    let empty_identity = match &edit {
+        IdeControlMappingEdit::Insert(_) => false,
+        IdeControlMappingEdit::SetEnabled { binding_id, .. }
+        | IdeControlMappingEdit::Remove { binding_id } => binding_id.is_empty(),
+    };
+    if empty_identity {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::EditControlMapping,
+            IdeWorkerCommandFailure::ControlMappingEdit(Box::new(
+                IdeControlMappingEditError::InvalidBindingIdentity,
+            )),
+        );
+    }
+    begin_project_mutation_request(state, events, ProjectMutation::EditControlMapping { edit })
+}
+
+fn control_mapping_edit_failure_event(reason: IdeControlMappingEditError) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::ControlMappingEditCommittedWithWarning {
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::EditControlMapping,
+            reason: IdeWorkerCommandFailure::ControlMappingEdit(Box::new(reason)),
+        }
+    }
+}
+
+fn attempt_control_mapping_edit(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    edit: &IdeControlMappingEdit,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<u64, IdeControlMappingEditError> {
+    if let Some(failure) = native_failure {
+        return Err(IdeControlMappingEditError::NativeClose(failure));
+    }
+    RunningDesktopIdeApplication::prepare_control_mapping_edit(application, recovery, edit).and_then(
+        |plan| {
+            plan.publish()
+                .map_err(|source| IdeControlMappingEditError::Publication(Box::new(source)))
+        },
+    )
+}
+
+fn control_mapping_edit_reopen_failure(
+    result: Result<u64, IdeControlMappingEditError>,
+    reopen: IdeProjectOpenError,
+) -> IdeWorkerCommandFailure {
+    let reason = match result {
+        Ok(revision) => IdeControlMappingEditError::ReopenAfterPublication {
+            revision,
+            source: Box::new(reopen),
+        },
+        Err(IdeControlMappingEditError::Publication(publication)) => {
+            IdeControlMappingEditError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(IdeControlMappingEditError::NativeClose(close)) => {
+            IdeControlMappingEditError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(preparation) => IdeControlMappingEditError::ReopenAfterPreparation {
+            preparation: Box::new(preparation),
+            reopen: Box::new(reopen),
+        },
+    };
+    IdeWorkerCommandFailure::ControlMappingEdit(Box::new(reason))
+}
+
 fn set_automation_take_active(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -5129,6 +5417,9 @@ fn project_mutation_save_failure(
                 IdeAutomationTakeEditError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::EditControlMapping { .. } => IdeWorkerCommandFailure::ControlMappingEdit(
+            Box::new(IdeControlMappingEditError::MixerSave(Box::new(reason))),
+        ),
         ProjectMutation::DuplicateScene { .. } => IdeWorkerCommandFailure::SceneDuplication(
             Box::new(IdeSceneDuplicationError::MixerSave(Box::new(reason))),
         ),
@@ -5332,6 +5623,9 @@ fn project_mutation_native_close_failure(
                 IdeAutomationTakeEditError::NativeClose(failure),
             ))
         }
+        ProjectMutation::EditControlMapping { .. } => IdeWorkerCommandFailure::ControlMappingEdit(
+            Box::new(IdeControlMappingEditError::NativeClose(failure)),
+        ),
         ProjectMutation::DuplicateScene { .. } => IdeWorkerCommandFailure::SceneDuplication(
             Box::new(IdeSceneDuplicationError::NativeClose(failure)),
         ),
@@ -5528,6 +5822,10 @@ enum ProjectMutationAttempt {
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeAutomationTakeEditError,
         >,
+    },
+    EditControlMapping {
+        edit: IdeControlMappingEdit,
+        result: Result<u64, IdeControlMappingEditError>,
     },
     DuplicateScene {
         name: String,
@@ -6326,6 +6624,17 @@ fn complete_project_mutation(
                     result: Err(reason),
                     ..
                 } => send_event(events, automation_take_activation_failure_event(reason)),
+                ProjectMutationAttempt::EditControlMapping {
+                    edit,
+                    result: Ok(revision),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::ControlMappingEdited { revision, edit },
+                ),
+                ProjectMutationAttempt::EditControlMapping {
+                    result: Err(reason),
+                    ..
+                } => send_event(events, control_mapping_edit_failure_event(reason)),
                 ProjectMutationAttempt::DuplicateScene {
                     name,
                     result: Ok(outcome),
@@ -6771,6 +7080,12 @@ fn attempt_project_mutation(
                 native_failure,
             ),
         },
+        ProjectMutation::EditControlMapping { edit } => {
+            ProjectMutationAttempt::EditControlMapping {
+                edit: edit.clone(),
+                result: attempt_control_mapping_edit(application, recovery, &edit, native_failure),
+            }
+        }
         ProjectMutation::SetAutomationTakeActive { take_id, enabled } => {
             ProjectMutationAttempt::SetAutomationTakeActive {
                 enabled,
@@ -7572,6 +7887,9 @@ fn project_mutation_reopen_failure(
         }
         ProjectMutationAttempt::SetAutomationTakeActive { result, .. } => {
             automation_take_activation_reopen_failure(result, reopen)
+        }
+        ProjectMutationAttempt::EditControlMapping { result, .. } => {
+            control_mapping_edit_reopen_failure(result, reopen)
         }
         ProjectMutationAttempt::DuplicateScene { result, .. } => {
             scene_duplication_reopen_failure(result, reopen)
@@ -8674,6 +8992,13 @@ fn running_observation(
             sends,
         });
     }
+    let mut control_bindings = Vec::new();
+    control_bindings
+        .try_reserve_exact(snapshot.control_bindings.len())
+        .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
+    for binding in snapshot.control_bindings {
+        control_bindings.push(ide_control_binding(binding, &snapshot)?);
+    }
     Ok(IdeRunningObservation {
         playback_session_generation: snapshot.playback_session_generation,
         project_id,
@@ -8682,6 +9007,7 @@ fn running_observation(
         playback_extent: snapshot.playback_extent,
         arrangement: snapshot.arrangement,
         automation: snapshot.automation,
+        control_bindings,
         audio_clips,
         recording_takes,
         preview: IdeAudioPreviewObservation {
@@ -10902,6 +11228,66 @@ mod tests {
                 command: IdeWorkerCommandKind::AddAutomationTake,
                 reason: IdeWorkerCommandFailure::AutomationTakeCreation(reason),
             } if matches!(reason.as_ref(), IdeAutomationTakeCreationError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn control_mapping_edit_validates_identity_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::EditControlMapping {
+                edit: IdeControlMappingEdit::Remove {
+                    binding_id: String::new(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::EditControlMapping,
+                reason: IdeWorkerCommandFailure::ControlMappingEdit(reason),
+            } if matches!(reason.as_ref(), IdeControlMappingEditError::InvalidBindingIdentity)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::EditControlMapping {
+                edit: IdeControlMappingEdit::SetEnabled {
+                    binding_id: "018f47a2-6b2d-7c11-8a44-001122334475".to_owned(),
+                    enabled: false,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ControlMappingEditing {
+                edit: IdeControlMappingEdit::SetEnabled { enabled: false, .. }
+            }
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::EditControlMapping,
+                reason: IdeWorkerCommandFailure::ControlMappingEdit(reason),
+            } if matches!(reason.as_ref(), IdeControlMappingEditError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);

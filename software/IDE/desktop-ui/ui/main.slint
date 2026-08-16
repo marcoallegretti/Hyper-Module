@@ -34,6 +34,7 @@ export enum AppMode {
     changing-clip-reverse,
     changing-clip-source,
     adding-automation-take,
+    editing-control-mapping,
     changing-automation-take-activation,
     renaming-scene,
     duplicating-scene,
@@ -124,6 +125,15 @@ export struct ArrangementRow {
     width-percent: float,
     enabled: bool,
     active: bool,
+}
+
+export struct ControlBindingRow {
+    id: string,
+    enabled: bool,
+    source: string,
+    scope: string,
+    target: string,
+    transform: string,
 }
 
 export struct AutomationTakeRow {
@@ -227,6 +237,9 @@ export global IdeActions {
     callback mixer-send-enabled(int);
     callback add-automation-take(string, int, int, string, string, string);
     callback set-automation-take-active(string, bool);
+    callback add-control-binding(int, int, bool, string, string);
+    callback set-control-binding-active(string, bool);
+    callback remove-control-binding(string);
     callback save-project();
     callback add-audio-track(string);
     callback remove-audio-track(string);
@@ -472,6 +485,20 @@ export component MainWindow inherits Window {
     in property <[MixerChannelRow]> mixer-channels: [];
     in property <[MixerSendRow]> mixer-sends: [];
     in property <[AutomationTakeRow]> automation-takes: [];
+    in property <[ControlBindingRow]> control-bindings: [];
+    in property <[string]> control-source-names: [];
+    in property <[bool]> control-source-continuous: [];
+    in property <[string]> control-target-names: [];
+    in property <[bool]> control-target-continuous: [];
+    in property <[bool]> control-target-boolean: [];
+    in property <[string]> control-target-range: [];
+    in-out property <bool> mixer-control-visible: false;
+    in-out property <bool> control-create-visible: false;
+    in-out property <int> control-create-source-index: 0;
+    in-out property <int> control-create-target-index: 0;
+    in-out property <bool> control-create-momentary: false;
+    in-out property <string> control-create-output-min: "0";
+    in-out property <string> control-create-output-max: "1000000";
     in property <[string]> automation-target-names: [];
     in property <[bool]> automation-target-boolean: [];
     in property <[string]> automation-target-domain: [];
@@ -1428,7 +1455,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && !root.rename-track-visible && !root.remove-track-visible && !root.mixer-sends-visible && !root.mixer-automation-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && !root.rename-track-visible && !root.remove-track-visible && !root.mixer-sends-visible && !root.mixer-automation-visible && !root.mixer-control-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1445,6 +1472,14 @@ export component MainWindow inherits Window {
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         Button { text: "Performance"; clicked => { root.mixer-visible = false; } }
                         Button { text: "Sends"; enabled: root.mixer-sends.length > 0; clicked => { root.mixer-sends-visible = true; } }
+                        Button {
+                            text: "Control (" + root.control-bindings.length + ")";
+                            enabled: root.control-source-names.length > 0;
+                            clicked => {
+                                root.control-create-visible = false;
+                                root.mixer-control-visible = true;
+                            }
+                        }
                         Button {
                             text: "Automation (" + root.automation-takes.length + ")";
                             enabled: root.automation-target-names.length > 0;
@@ -1563,7 +1598,215 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && root.mixer-automation-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && root.mixer-control-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                    padding: 16px;
+                    spacing: 10px;
+
+                    HorizontalLayout {
+                        height: 48px;
+                        spacing: 8px;
+                        VerticalLayout {
+                            Text { text: "CONTROL MAPPINGS"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            Text { text: "Front-panel CV, clock, and reset inputs drive project targets"; color: #aebccc; font-size: 12px; }
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Button {
+                            text: "Channels";
+                            clicked => { root.control-create-visible = false; root.mixer-control-visible = false; }
+                        }
+                        Button {
+                            text: "Performance";
+                            clicked => {
+                                root.control-create-visible = false;
+                                root.mixer-control-visible = false;
+                                root.mixer-sends-visible = false;
+                                root.mixer-visible = false;
+                            }
+                        }
+                        Button {
+                            text: "Add binding";
+                            enabled: root.app-mode == AppMode.running && !root.control-create-visible && root.control-target-names.length > 0;
+                            clicked => {
+                                root.control-create-source-index = 0;
+                                root.control-create-target-index = 0;
+                                root.control-create-momentary = false;
+                                root.control-create-output-min = "0";
+                                root.control-create-output-max = "1000000";
+                                root.control-create-visible = true;
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: #27313d; }
+
+                    if root.control-create-visible : VerticalLayout {
+                        spacing: 8px;
+                        Text { height: 16px; text: "ADD CONTROL BINDING"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        HorizontalLayout {
+                            height: 48px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                width: 150px;
+                                Text { text: "Source"; color: #8fa0b4; font-size: 9px; }
+                                ComboBox {
+                                    model: root.control-source-names;
+                                    current-index <=> root.control-create-source-index;
+                                    enabled: root.app-mode == AppMode.running;
+                                }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                Text { text: "Target"; color: #8fa0b4; font-size: 9px; }
+                                ComboBox {
+                                    model: root.control-target-names;
+                                    current-index <=> root.control-create-target-index;
+                                    enabled: root.app-mode == AppMode.running;
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            height: 48px;
+                            spacing: 8px;
+                            if root.control-target-continuous[root.control-create-target-index] : VerticalLayout {
+                                width: 140px;
+                                Text { text: "Output min"; color: #8fa0b4; font-size: 9px; }
+                                LineEdit {
+                                    text <=> root.control-create-output-min;
+                                    input-type: number;
+                                    enabled: root.app-mode == AppMode.running;
+                                }
+                            }
+                            if root.control-target-continuous[root.control-create-target-index] : VerticalLayout {
+                                width: 140px;
+                                Text { text: "Output max"; color: #8fa0b4; font-size: 9px; }
+                                LineEdit {
+                                    text <=> root.control-create-output-max;
+                                    input-type: number;
+                                    enabled: root.app-mode == AppMode.running;
+                                }
+                            }
+                            if root.control-target-boolean[root.control-create-target-index] : VerticalLayout {
+                                width: 150px;
+                                Text { text: "Edge behaviour"; color: #8fa0b4; font-size: 9px; }
+                                Button {
+                                    text: root.control-create-momentary ? "Momentary" : "Toggle";
+                                    enabled: root.app-mode == AppMode.running;
+                                    clicked => { root.control-create-momentary = !root.control-create-momentary; }
+                                }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                Text { text: "Domain"; color: #8fa0b4; font-size: 9px; }
+                                Text {
+                                    text: root.control-source-continuous[root.control-create-source-index]
+                                            != root.control-target-continuous[root.control-create-target-index]
+                                        ? "A CV source drives only value targets; clock and reset drive only switch and action targets."
+                                        : root.control-target-range[root.control-create-target-index] != ""
+                                            ? root.control-target-range[root.control-create-target-index]
+                                            : "This target is driven by an edge, not a value.";
+                                    color: #728196;
+                                    font-size: 10px;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            height: 34px;
+                            spacing: 8px;
+                            Button {
+                                text: "Cancel";
+                                enabled: root.app-mode == AppMode.running;
+                                clicked => { root.control-create-visible = false; }
+                            }
+                            Button {
+                                horizontal-stretch: 1;
+                                text: root.app-mode == AppMode.editing-control-mapping ? "Adding binding..." : "Add control binding";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.control-source-continuous[root.control-create-source-index]
+                                        == root.control-target-continuous[root.control-create-target-index];
+                                clicked => {
+                                    IdeActions.add-control-binding(
+                                        root.control-create-source-index,
+                                        root.control-create-target-index,
+                                        root.control-create-momentary,
+                                        root.control-create-output-min,
+                                        root.control-create-output-max
+                                    );
+                                }
+                            }
+                        }
+                        Rectangle { height: 1px; background: #27313d; }
+                    }
+
+                    if root.control-bindings.length == 0 : Text {
+                        text: "This project has no control bindings.";
+                        color: #8fa0b4;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        vertical-stretch: 1;
+                    }
+
+                    if root.control-bindings.length > 0 : ListView {
+                        vertical-stretch: 1;
+                        for binding in root.control-bindings : Rectangle {
+                            height: 52px;
+                            width: parent.width;
+                            background: #101820;
+                            border-color: #27313d;
+                            border-width: 1px;
+                            border-radius: 4px;
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 10px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    padding-top: 8px;
+                                    padding-bottom: 8px;
+                                    Text { text: binding.source + "  to  " + binding.target; color: #dce5ef; font-size: 12px; font-weight: 600; overflow: elide; }
+                                    Text { text: binding.scope + " - " + binding.transform; color: #8fa0b4; font-size: 9px; overflow: elide; }
+                                }
+                                Text {
+                                    width: 72px;
+                                    text: binding.enabled ? "ENABLED" : "DISABLED";
+                                    color: binding.enabled ? #63e6b5 : #728196;
+                                    font-size: 9px;
+                                    vertical-alignment: center;
+                                }
+                                VerticalLayout {
+                                    width: 76px;
+                                    padding-top: 9px;
+                                    padding-bottom: 9px;
+                                    Button {
+                                        text: binding.enabled ? "Disable" : "Enable";
+                                        accessible-label: (binding.enabled ? "Disable " : "Enable ") + binding.source + " control binding";
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => { IdeActions.set-control-binding-active(binding.id, !binding.enabled); }
+                                    }
+                                }
+                                VerticalLayout {
+                                    width: 76px;
+                                    padding-top: 9px;
+                                    padding-bottom: 9px;
+                                    Button {
+                                        text: "Remove";
+                                        accessible-label: "Remove " + binding.source + " control binding";
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => { IdeActions.remove-control-binding(binding.id); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    }
+                }
+
+                if root.mixer-visible && root.mixer-automation-visible && !root.mixer-control-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1774,7 +2017,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && root.mixer-sends-visible && !root.mixer-automation-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && root.mixer-sends-visible && !root.mixer-automation-visible && !root.mixer-control-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {

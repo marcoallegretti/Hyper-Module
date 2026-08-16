@@ -43,6 +43,7 @@ pub struct PreparedProjectPlayback {
     control_mapping: Option<ControlMappingDocument>,
     compiled_control_mapping: Option<CompiledControlMappingTable>,
     recording_metadata: Vec<RecordingMetadataDocument>,
+    nested_playback_ids: BTreeSet<String>,
 }
 
 impl PreparedProjectPlayback {
@@ -54,6 +55,17 @@ impl PreparedProjectPlayback {
     #[must_use]
     pub const fn session(&self) -> &PreparedPlaybackSession {
         &self.session
+    }
+
+    /// Borrows the same resolver that compiled this project's control
+    /// mappings, so editor previews resolve identities identically.
+    #[must_use]
+    pub const fn mapping_project(&self) -> LoadedMappingProject<'_> {
+        LoadedMappingProject {
+            package: &self.package,
+            session: &self.session,
+            nested_playback_ids: &self.nested_playback_ids,
+        }
     }
 
     #[must_use]
@@ -428,6 +440,7 @@ pub fn prepare_project_playback(
             .into_iter()
             .map(|record| record.document)
             .collect(),
+        nested_playback_ids: captured.nested_playback_ids,
     })
 }
 
@@ -730,7 +743,8 @@ struct CapturedRecordingMetadata {
     document: RecordingMetadataDocument,
 }
 
-struct LoadedMappingProject<'project> {
+/// Resolves control-mapping identities against one verified prepared project.
+pub struct LoadedMappingProject<'project> {
     package: &'project StructurallyVerifiedProject,
     session: &'project PreparedPlaybackSession,
     nested_playback_ids: &'project BTreeSet<String>,

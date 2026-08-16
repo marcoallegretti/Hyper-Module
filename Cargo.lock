@@ -2139,6 +2139,8 @@ dependencies = [
  "hyper-clip-engine",
  "hyper-control-mappings",
  "hyper-desktop-audio",
+ "hyper-mapping-compiler",
+ "hyper-mapping-editor",
  "hyper-media-cache",
  "hyper-mixer-runtime",
  "hyper-playback-compiler",

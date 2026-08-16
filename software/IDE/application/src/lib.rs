@@ -13,7 +13,14 @@ use hyper_audio_engine::{
     LinearGain, LoudnessMeasurementCommand, Pan, ParameterError, StereoSineTestToneConfigError,
 };
 use hyper_audio_source::{DecodeError, DecodeLimits};
-use hyper_control_mappings::{ControlBinding, ControlScope, ControlTarget};
+pub use hyper_control_mappings::{
+    ChannelParameter as IdeControlChannelParameter, ControlBinding, ControlMappingDocument,
+    ControlMappingParseError, ControlMappingProject,
+    ControlScope, ControlSource, ControlTarget, ControlTransform,
+    CueParameter as IdeControlCueParameter, Edge,
+    MainParameter as IdeControlMainParameter, SceneAction, SendParameter as IdeControlSendParameter,
+    TransportAction, TriggerBehavior,
+};
 use hyper_desktop_audio::{
     CaptureStreamSnapshot, DesktopAudioPreviewCommandError, DesktopAudioPreviewControlError,
     DesktopAudioPreviewSnapshot, DesktopDirectControlError, DesktopInputConfig,
@@ -90,15 +97,22 @@ pub use hyper_playback_session::{
     PlaybackArrangement as IdePlaybackArrangement, PlaybackAutomation as IdePlaybackAutomation,
     PlaybackAutomationLane as IdePlaybackAutomationLane, PlaybackExtent as IdePlaybackExtent,
 };
+use hyper_mapping_compiler::{ControlMappingResolver, MixerSendAddress};
+use hyper_mapping_editor::{
+    MappingEditor, MappingEditorMutationError, MappingEditorPreviewError,
+    MappingEditorPublicationError,
+};
 use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackLimits};
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
     AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
-    AudioTrackRemovalRequest, AutomationTakePublicationRequest, ProjectResourcePublicationError,
+    AudioTrackRemovalRequest, AutomationTakePublicationRequest, ControlMappingPublicationRequest,
+    ProjectResourcePublicationError,
     ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest, ScenePublicationRequest,
     StorageError, publish_arrangement, publish_audio_clip, publish_audio_track,
-    publish_automation_take, publish_project_resource, publish_scene, remove_audio_track,
+    publish_automation_take, publish_control_mapping, publish_project_resource, publish_scene,
+    remove_audio_track,
 };
 
 mod recording;
@@ -3298,6 +3312,198 @@ impl Error for IdeAutomationTakeEditError {
     }
 }
 
+/// One control binding the desktop IDE asks the mapping editor to insert.
+///
+/// Identity and enabled state are owned by the transaction; every other field
+/// is validated by the version 1 binding domain before the edit is previewed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdeControlBindingRequest {
+    pub source: ControlSource,
+    pub scope: ControlScope,
+    pub transform: ControlTransform,
+    pub target: ControlTarget,
+}
+
+/// One control-mapping mutation the desktop IDE submits as a single durable
+/// transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdeControlMappingEdit {
+    Insert(IdeControlBindingRequest),
+    SetEnabled { binding_id: String, enabled: bool },
+    Remove { binding_id: String },
+}
+
+#[derive(Debug)]
+pub enum IdeControlMappingEditError {
+    InvalidBindingIdentity,
+    MixerSave(Box<IdeProjectSaveError>),
+    MappingResourceMissing,
+    CapacityUnavailable,
+    Binding(ControlMappingParseError),
+    Mutation(MappingEditorMutationError),
+    Preview(Box<MappingEditorPreviewError>),
+    StalePreview,
+    Publication(Box<IdeControlMappingPublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeControlMappingEditError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        revision: u64,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<IdeControlMappingPublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeControlMappingEditError {
+    #[must_use]
+    pub const fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication(source) => source.mapping_published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. } => publication.mapping_published(),
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeControlMappingEditError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBindingIdentity => {
+                formatter.write_str("the control binding identity is empty")
+            }
+            Self::MixerSave(source) => {
+                write!(
+                    formatter,
+                    "live mixer state could not be preserved: {source}"
+                )
+            }
+            Self::MappingResourceMissing => {
+                formatter.write_str("this project declares no control mapping to edit")
+            }
+            Self::CapacityUnavailable => {
+                formatter.write_str("control mapping edit capacity is unavailable")
+            }
+            Self::Binding(source) => source.fmt(formatter),
+            Self::Mutation(source) => source.fmt(formatter),
+            Self::Preview(source) => source.fmt(formatter),
+            Self::StalePreview => {
+                formatter.write_str("the control mapping changed while it was being confirmed")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before editing control mappings: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before editing control mappings ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "control mapping edit preparation failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { revision, source } => write!(
+                formatter,
+                "control mappings were published in project revision {revision} but the project could not be reopened: {source}"
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } if publication.mapping_published() => write!(
+                formatter,
+                "control mapping edit committed with incomplete verification or recovery ({publication}) and the project could not be reopened ({reopen})"
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "control mapping edit failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeControlMappingEditError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Binding(source) => Some(source),
+            Self::Mutation(source) => Some(source),
+            Self::Preview(source) => Some(source.as_ref()),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidBindingIdentity
+            | Self::MappingResourceMissing
+            | Self::CapacityUnavailable
+            | Self::StalePreview
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeControlMappingPublicationError {
+    Mixer(Box<ProjectResourcePublicationError>),
+    Mapping {
+        mixer: Box<ProjectResourcePublicationOutcome>,
+        source: Box<MappingEditorPublicationError>,
+    },
+}
+
+impl IdeControlMappingPublicationError {
+    #[must_use]
+    pub const fn mapping_published(&self) -> bool {
+        false
+    }
+}
+
+impl fmt::Display for IdeControlMappingPublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mixer(source) if source.published() => write!(
+                formatter,
+                "live mixer was preserved, but its project transaction cleanup is incomplete: {source}"
+            ),
+            Self::Mixer(source) => write!(
+                formatter,
+                "live mixer could not be preserved before publishing control mappings: {source}"
+            ),
+            Self::Mapping { mixer, source } if mixer.changed() => write!(
+                formatter,
+                "live mixer was preserved in project revision {} but control mapping publication failed: {source}",
+                mixer.project_revision()
+            ),
+            Self::Mapping { source, .. } => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for IdeControlMappingPublicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Mixer(source) => Some(source.as_ref()),
+            Self::Mapping { source, .. } => Some(source.as_ref()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum IdeSceneDuplicationError {
     InvalidSourceSceneIdentity,
@@ -4739,6 +4945,141 @@ struct IdeAutomationTakePublicationPlan {
     take_bytes: Vec<u8>,
 }
 
+/// Resolves an edited mapping against the capability record its publication
+/// will commit.
+///
+/// The capability raise and the mapping land in one transaction, so the
+/// preview must compile against the raised record. Compiling against the
+/// current record would reject a binding the same transaction is about to make
+/// valid.
+struct RaisedCapabilityProject<'project> {
+    project: hyper_project_loader::LoadedMappingProject<'project>,
+    cv_inputs: u8,
+    has_clock_input: bool,
+    has_reset_input: bool,
+}
+
+impl<'project> RaisedCapabilityProject<'project> {
+    fn new(
+        project: hyper_project_loader::LoadedMappingProject<'project>,
+        bindings: &[ControlBinding],
+    ) -> Self {
+        let mut raised = Self {
+            cv_inputs: project.cv_inputs(),
+            has_clock_input: project.has_clock_input(),
+            has_reset_input: project.has_reset_input(),
+            project,
+        };
+        for binding in bindings {
+            match binding.source() {
+                ControlSource::CvInput { input_index } => {
+                    raised.cv_inputs = raised.cv_inputs.max(input_index.saturating_add(1));
+                }
+                ControlSource::ClockInput { .. } => raised.has_clock_input = true,
+                ControlSource::ResetInput { .. } => raised.has_reset_input = true,
+            }
+        }
+        raised
+    }
+}
+
+impl ControlMappingProject for RaisedCapabilityProject<'_> {
+    fn project_id(&self) -> &str {
+        self.project.project_id()
+    }
+
+    fn cv_inputs(&self) -> u8 {
+        self.cv_inputs
+    }
+
+    fn has_clock_input(&self) -> bool {
+        self.has_clock_input
+    }
+
+    fn has_reset_input(&self) -> bool {
+        self.has_reset_input
+    }
+
+    fn has_mixer(&self) -> bool {
+        self.project.has_mixer()
+    }
+
+    fn contains_nested_entity(&self, id: &str) -> bool {
+        self.project.contains_nested_entity(id)
+    }
+
+    fn contains_entity(&self, id: &str) -> bool {
+        self.project.contains_entity(id)
+    }
+
+    fn contains_track(&self, id: &str) -> bool {
+        self.project.contains_track(id)
+    }
+
+    fn contains_scene(&self, id: &str) -> bool {
+        self.project.contains_scene(id)
+    }
+
+    fn contains_mixer_channel(&self, track_id: &str) -> bool {
+        self.project.contains_mixer_channel(track_id)
+    }
+
+    fn contains_mixer_send(&self, send_id: &str) -> bool {
+        self.project.contains_mixer_send(send_id)
+    }
+
+    fn is_solo_source_track(&self, track_id: &str) -> bool {
+        self.project.is_solo_source_track(track_id)
+    }
+}
+
+impl ControlMappingResolver for RaisedCapabilityProject<'_> {
+    fn track_index(&self, track_id: &str) -> Option<usize> {
+        self.project.track_index(track_id)
+    }
+
+    fn scene_index(&self, scene_id: &str) -> Option<usize> {
+        self.project.scene_index(scene_id)
+    }
+
+    fn mixer_channel_index(&self, track_id: &str) -> Option<usize> {
+        self.project.mixer_channel_index(track_id)
+    }
+
+    fn mixer_send_address(&self, send_id: &str) -> Option<MixerSendAddress> {
+        self.project.mixer_send_address(send_id)
+    }
+}
+
+#[derive(Debug)]
+struct IdeControlMappingEditPlan {
+    mixer: IdeMixerSavePlan,
+    mapping_bytes: Vec<u8>,
+}
+
+impl IdeControlMappingEditPlan {
+    fn publish(&self) -> Result<u64, IdeControlMappingPublicationError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeControlMappingPublicationError::Mixer(Box::new(source)))?;
+        publish_control_mapping(
+            &self.mixer.project_path,
+            ControlMappingPublicationRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                mapping_bytes: &self.mapping_bytes,
+            },
+        )
+        .map(|outcome| outcome.project_revision())
+        .map_err(
+            |source| IdeControlMappingPublicationError::Mapping {
+                mixer: Box::new(mixer),
+                source: Box::new(MappingEditorPublicationError::Storage(source)),
+            },
+        )
+    }
+}
+
 #[derive(Debug)]
 struct IdeAutomationTakeEditPlan {
     mixer: IdeMixerSavePlan,
@@ -5340,6 +5681,7 @@ pub struct RunningIdeSnapshot<'a> {
         hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT];
         MAX_IDE_MIXER_CHANNELS],
     pub mixer_main_state: Option<IdeMixerMainState>,
+    pub control_bindings: &'a [ControlBinding],
     pub output_state: OutputStreamState,
     pub output: OutputStreamSnapshot,
     pub monitoring: Option<IdeMonitoringState>,
@@ -6518,6 +6860,148 @@ impl RunningDesktopIdeApplication {
         })
     }
 
+    fn prepare_control_mapping_edit(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        edit: &IdeControlMappingEdit,
+    ) -> Result<IdeControlMappingEditPlan, IdeControlMappingEditError> {
+        match edit {
+            IdeControlMappingEdit::Insert(request) => {
+                Self::prepare_control_binding_insertion(application, recovery, request)
+            }
+            IdeControlMappingEdit::SetEnabled {
+                binding_id,
+                enabled,
+            } => Self::prepare_control_binding_activation(
+                application,
+                recovery,
+                binding_id,
+                *enabled,
+            ),
+            IdeControlMappingEdit::Remove { binding_id } => {
+                Self::prepare_control_binding_removal(application, recovery, binding_id)
+            }
+        }
+    }
+
+    fn prepare_control_binding_insertion(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        request: &IdeControlBindingRequest,
+    ) -> Result<IdeControlMappingEditPlan, IdeControlMappingEditError> {
+        let (mixer, prepared) = Self::prepare_control_mapping_fence(application, recovery)?;
+        Self::prepare_control_mapping_edit_from_project(mixer, prepared, true, |editor| {
+            let binding = ControlBinding::try_new(
+                uuid::Uuid::new_v4().to_string(),
+                true,
+                request.source.clone(),
+                request.scope.clone(),
+                request.transform,
+                request.target.clone(),
+            )
+            .map_err(IdeControlMappingEditError::Binding)?;
+            editor
+                .insert_binding(binding)
+                .map_err(IdeControlMappingEditError::Mutation)
+        })
+    }
+
+    fn prepare_control_binding_activation(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        binding_id: &str,
+        enabled: bool,
+    ) -> Result<IdeControlMappingEditPlan, IdeControlMappingEditError> {
+        if binding_id.is_empty() {
+            return Err(IdeControlMappingEditError::InvalidBindingIdentity);
+        }
+        let (mixer, prepared) = Self::prepare_control_mapping_fence(application, recovery)?;
+        Self::prepare_control_mapping_edit_from_project(mixer, prepared, false, |editor| {
+            editor
+                .set_binding_enabled(binding_id, enabled)
+                .map_err(IdeControlMappingEditError::Mutation)
+        })
+    }
+
+    fn prepare_control_binding_removal(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        binding_id: &str,
+    ) -> Result<IdeControlMappingEditPlan, IdeControlMappingEditError> {
+        if binding_id.is_empty() {
+            return Err(IdeControlMappingEditError::InvalidBindingIdentity);
+        }
+        let (mixer, prepared) = Self::prepare_control_mapping_fence(application, recovery)?;
+        Self::prepare_control_mapping_edit_from_project(mixer, prepared, false, |editor| {
+            editor
+                .remove_binding(binding_id)
+                .map(|_| ())
+                .map_err(IdeControlMappingEditError::Mutation)
+        })
+    }
+
+    fn prepare_control_mapping_fence<'recovery>(
+        application: &DesktopIdeApplication,
+        recovery: &'recovery DesktopPlaybackRecovery,
+    ) -> Result<(IdeMixerSavePlan, &'recovery PreparedProjectPlayback), IdeControlMappingEditError>
+    {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeControlMappingEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeControlMappingEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        Ok((mixer, prepared))
+    }
+
+    /// Applies one mutation through the mapping editor and returns the exact
+    /// canonical document the editor confirmed.
+    ///
+    /// The preview is bound to the project identity that resolved it, which
+    /// proves the compile used the current graph. Publication then chains the
+    /// identity produced by the mixer save, because the mixer is committed
+    /// first and only rewrites base-state values over an unchanged topology.
+    fn prepare_control_mapping_edit_from_project(
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        create_missing: bool,
+        mutate: impl FnOnce(&mut MappingEditor) -> Result<(), IdeControlMappingEditError>,
+    ) -> Result<IdeControlMappingEditPlan, IdeControlMappingEditError> {
+        let document = match prepared.control_mapping() {
+            Some(document) => document.clone(),
+            None if create_missing => ControlMappingDocument::try_new(
+                uuid::Uuid::new_v4().to_string(),
+                prepared.package().manifest().project_id().to_owned(),
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+            )
+            .map_err(IdeControlMappingEditError::Binding)?,
+            None => return Err(IdeControlMappingEditError::MappingResourceMissing),
+        };
+        let mut editor = MappingEditor::new(document);
+        mutate(&mut editor)?;
+        let resolver = RaisedCapabilityProject::new(prepared.mapping_project(), editor.bindings());
+        let preview = editor
+            .preview_for_project(&resolver, *prepared.package().manifest_sha256())
+            .map_err(|source| IdeControlMappingEditError::Preview(Box::new(source)))?;
+        let confirmed = editor
+            .confirm(preview)
+            .map_err(|_| IdeControlMappingEditError::StalePreview)?;
+        if confirmed.expected_project_sha256().is_none() {
+            return Err(IdeControlMappingEditError::StalePreview);
+        }
+        let mut mapping_bytes = Vec::new();
+        mapping_bytes
+            .try_reserve_exact(confirmed.canonical_json().len())
+            .map_err(|_| IdeControlMappingEditError::CapacityUnavailable)?;
+        mapping_bytes.extend_from_slice(confirmed.canonical_json());
+        Ok(IdeControlMappingEditPlan {
+            mixer,
+            mapping_bytes,
+        })
+    }
+
     fn prepare_automation_take_creation(
         application: &DesktopIdeApplication,
         recovery: &DesktopPlaybackRecovery,
@@ -7201,6 +7685,9 @@ impl RunningDesktopIdeApplication {
             mixer_send_taps,
             mixer_send_states,
             mixer_main_state,
+            control_bindings: project
+                .control_mapping()
+                .map_or(&[] as &[ControlBinding], ControlMappingDocument::bindings),
             output_state: session.output_status().state(),
             output: session.counters().snapshot(),
             monitoring,
@@ -10551,6 +11038,238 @@ mod tests {
         let document: Value = serde_json::from_slice(&plan.take_bytes).unwrap();
         assert_eq!(document["id"].as_str(), Some(take_id));
         assert_eq!(document["enabled"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn control_binding_insertion_publishes_and_compiles_into_the_runtime() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert!(
+            prepared.control_mapping().is_none(),
+            "a freshly created project declares no control mapping"
+        );
+        let package = prepared.package();
+        let mixer_id = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap()
+            .id()
+            .to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let mixer_plan = IdeMixerSavePlan {
+            project_path: project_path.clone(),
+            expected_project_sha256: *package.manifest_sha256(),
+            resource_id: mixer_id,
+            resource_bytes: mixer_bytes,
+        };
+        let request = IdeControlBindingRequest {
+            source: ControlSource::CvInput { input_index: 2 },
+            scope: ControlScope::Global,
+            transform: ControlTransform::Linear {
+                input_min: -1_000_000,
+                input_max: 1_000_000,
+                output_min: 0,
+                output_max: 1_000_000,
+            },
+            target: ControlTarget::MixerMain {
+                parameter: IdeControlMainParameter::Gain,
+            },
+        };
+        let plan = RunningDesktopIdeApplication::prepare_control_mapping_edit_from_project(
+            mixer_plan,
+            &prepared,
+            true,
+            |editor| {
+                let binding = ControlBinding::try_new(
+                    "018f47a2-6b2d-7c11-8a44-0011223344c0".to_owned(),
+                    true,
+                    request.source.clone(),
+                    request.scope.clone(),
+                    request.transform,
+                    request.target.clone(),
+                )
+                .map_err(IdeControlMappingEditError::Binding)?;
+                editor
+                    .insert_binding(binding)
+                    .map_err(IdeControlMappingEditError::Mutation)
+            },
+        )
+        .unwrap();
+        drop(prepared);
+
+        let revision = plan.publish().unwrap();
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert_eq!(
+            reopened.package().manifest().revision(),
+            revision,
+            "the reported revision is the one the reopened project carries"
+        );
+        let document = reopened.control_mapping().expect("mapping is persisted");
+        assert_eq!(document.bindings().len(), 1);
+        assert_eq!(
+            document.bindings()[0].id(),
+            "018f47a2-6b2d-7c11-8a44-0011223344c0"
+        );
+        assert!(document.bindings()[0].enabled());
+        assert_eq!(
+            reopened
+                .package()
+                .manifest()
+                .required_capabilities()
+                .cv_inputs(),
+            3,
+            "publication raised the capability the binding requires"
+        );
+        assert!(
+            reopened.compiled_control_mapping().is_some(),
+            "the published binding compiles into the runtime table"
+        );
+    }
+
+    #[test]
+    fn control_binding_activation_and_removal_round_trip_through_the_editor() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let binding_id = "018f47a2-6b2d-7c11-8a44-0011223344c0";
+        publish_first_control_binding(&project_path, limits, binding_id);
+
+        for (edit, expect_bindings, expect_enabled) in [
+            (
+                IdeControlMappingEdit::SetEnabled {
+                    binding_id: binding_id.to_owned(),
+                    enabled: false,
+                },
+                1,
+                Some(false),
+            ),
+            (
+                IdeControlMappingEdit::Remove {
+                    binding_id: binding_id.to_owned(),
+                },
+                0,
+                None,
+            ),
+        ] {
+            let prepared =
+                hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+            let package = prepared.package();
+            let mixer_id = package
+                .manifest()
+                .resources()
+                .iter()
+                .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+                .unwrap()
+                .id()
+                .to_owned();
+            let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+            let mixer_plan = IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: *package.manifest_sha256(),
+                resource_id: mixer_id,
+                resource_bytes: mixer_bytes,
+            };
+            let plan = RunningDesktopIdeApplication::prepare_control_mapping_edit_from_project(
+                mixer_plan,
+                &prepared,
+                false,
+                |editor| match &edit {
+                    IdeControlMappingEdit::SetEnabled {
+                        binding_id,
+                        enabled,
+                    } => editor
+                        .set_binding_enabled(binding_id, *enabled)
+                        .map_err(IdeControlMappingEditError::Mutation),
+                    IdeControlMappingEdit::Remove { binding_id } => editor
+                        .remove_binding(binding_id)
+                        .map(|_| ())
+                        .map_err(IdeControlMappingEditError::Mutation),
+                    IdeControlMappingEdit::Insert(_) => unreachable!("not exercised here"),
+                },
+            )
+            .unwrap();
+            drop(prepared);
+            plan.publish().unwrap();
+
+            let reopened =
+                hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+            let document = reopened.control_mapping().expect("mapping is retained");
+            assert_eq!(document.bindings().len(), expect_bindings);
+            if let Some(expected) = expect_enabled {
+                assert_eq!(document.bindings()[0].enabled(), expected);
+            }
+            assert_eq!(
+                reopened
+                    .package()
+                    .manifest()
+                    .required_capabilities()
+                    .cv_inputs(),
+                3,
+                "a capability already required is never lowered"
+            );
+        }
+    }
+
+    fn publish_first_control_binding(
+        project_path: &Path,
+        limits: ProjectPlaybackLimits,
+        binding_id: &str,
+    ) {
+        let prepared = hyper_project_loader::prepare_project_playback(project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer_id = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap()
+            .id()
+            .to_owned();
+        let mixer_bytes = package.read_resource(&mixer_id).unwrap();
+        let mixer_plan = IdeMixerSavePlan {
+            project_path: project_path.to_path_buf(),
+            expected_project_sha256: *package.manifest_sha256(),
+            resource_id: mixer_id,
+            resource_bytes: mixer_bytes,
+        };
+        let plan = RunningDesktopIdeApplication::prepare_control_mapping_edit_from_project(
+            mixer_plan,
+            &prepared,
+            true,
+            |editor| {
+                let binding = ControlBinding::try_new(
+                    binding_id.to_owned(),
+                    true,
+                    ControlSource::CvInput { input_index: 2 },
+                    ControlScope::Global,
+                    ControlTransform::Linear {
+                        input_min: -1_000_000,
+                        input_max: 1_000_000,
+                        output_min: 0,
+                        output_max: 1_000_000,
+                    },
+                    ControlTarget::MixerMain {
+                        parameter: IdeControlMainParameter::Gain,
+                    },
+                )
+                .map_err(IdeControlMappingEditError::Binding)?;
+                editor
+                    .insert_binding(binding)
+                    .map_err(IdeControlMappingEditError::Mutation)
+            },
+        )
+        .unwrap();
+        drop(prepared);
+        plan.publish().unwrap();
     }
 
     fn publish_main_gain_automation(
