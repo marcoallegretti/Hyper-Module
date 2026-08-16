@@ -2507,11 +2507,24 @@ impl UndoHistory {
         }
     }
 
-    fn pop(&mut self, redo: bool) -> Option<UndoEntry> {
+    fn peek(&self, redo: bool) -> Option<&UndoEntry> {
         if redo {
-            self.redo.pop()
+            self.redo.last()
         } else {
-            self.undo.pop()
+            self.undo.last()
+        }
+    }
+
+    /// Consumes the entry a committed restore just applied and records the
+    /// state it displaced on the opposite stack.
+    fn complete_restore(&mut self, redo: bool, displaced: Option<UndoEntry>) {
+        if redo {
+            self.redo.pop();
+        } else {
+            self.undo.pop();
+        }
+        if let Some(entry) = displaced {
+            self.record_restore(redo, entry);
         }
     }
 
@@ -4944,10 +4957,6 @@ fn export_project(
     }
 }
 
-const fn undo_label_of_restore(redo: bool) -> &'static str {
-    if redo { "redo" } else { "undo" }
-}
-
 /// The single capture point: any successful replacement that carried previous
 /// bytes becomes a history entry. A restore's own outcome feeds the opposite
 /// stack, so undoing an undo is redo.
@@ -4963,16 +4972,14 @@ fn observe_history(
             redo,
             result: Ok(outcome),
         } => {
-            if let Some(previous) = outcome.previous_resource() {
-                history.record_restore(
-                    *redo,
-                    UndoEntry {
-                        resource_id: entry.resource_id.clone(),
-                        bytes: previous.to_vec(),
-                        label: entry.label,
-                    },
-                );
-            }
+            history.complete_restore(
+                *redo,
+                outcome.previous_resource().map(|previous| UndoEntry {
+                    resource_id: entry.resource_id.clone(),
+                    bytes: previous.to_vec(),
+                    label: entry.label,
+                }),
+            );
             true
         }
         other => match replacement_outcome(other) {
@@ -5041,12 +5048,9 @@ fn restore_edit(
     } else {
         IdeWorkerCommandKind::Undo
     };
-    let Some(entry) = history.pop(redo) else {
+    let Some(entry) = history.peek(redo).cloned() else {
         return publish_failure(events, command, IdeWorkerCommandFailure::NothingToRestore);
     };
-    if !send_event(events, history.state_event()) {
-        return false;
-    }
     begin_project_mutation_request(state, events, ProjectMutation::RestoreResource { entry, redo })
 }
 
@@ -6965,38 +6969,29 @@ fn complete_project_mutation(
                     entry,
                     redo,
                     result: Ok(outcome),
-                } => {
-                    let _ = (entry, &outcome);
-                    send_event(
-                        events,
-                        IdeWorkerEvent::EditRestored {
-                            revision: outcome.project_revision(),
-                            redo,
-                            label: undo_label_of_restore(redo),
-                        },
-                    ) && send_event(events, history.state_event())
-                }
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::EditRestored {
+                        revision: outcome.project_revision(),
+                        redo,
+                        label: entry.label,
+                    },
+                ),
                 ProjectMutationAttempt::RestoreResource {
-                    entry,
                     redo,
                     result: Err(reason),
-                } => {
-                    if !reason.publication_committed() {
-                        history.record_restore(!redo, entry);
-                    }
-                    send_event(events, history.state_event())
-                        && send_event(
-                            events,
-                            IdeWorkerEvent::CommandFailed {
-                                command: if redo {
-                                    IdeWorkerCommandKind::Redo
-                                } else {
-                                    IdeWorkerCommandKind::Undo
-                                },
-                                reason: IdeWorkerCommandFailure::EditRestore(Box::new(reason)),
-                            },
-                        )
-                }
+                    ..
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::CommandFailed {
+                        command: if redo {
+                            IdeWorkerCommandKind::Redo
+                        } else {
+                            IdeWorkerCommandKind::Undo
+                        },
+                        reason: IdeWorkerCommandFailure::EditRestore(Box::new(reason)),
+                    },
+                ),
                 ProjectMutationAttempt::DuplicateScene {
                     name,
                     result: Ok(outcome),
@@ -11662,13 +11657,23 @@ mod tests {
             "the oldest entries are dropped first"
         );
 
-        let popped = history.pop(false).unwrap();
+        let peeked = history.peek(false).unwrap().clone();
         assert_eq!(
-            popped.resource_id,
+            peeked.resource_id,
             format!("edit-{}", MAX_UNDO_DEPTH + 4),
-            "undo pops the newest entry"
+            "undo targets the newest entry"
         );
-        history.record_restore(false, entry("inverse"));
+        assert_eq!(
+            history.undo.len(),
+            MAX_UNDO_DEPTH,
+            "peeking leaves the entry in place until the restore commits"
+        );
+        history.complete_restore(false, Some(entry("inverse")));
+        assert_eq!(
+            history.undo.len(),
+            MAX_UNDO_DEPTH - 1,
+            "a committed restore consumes its entry"
+        );
         assert_eq!(history.redo.len(), 1, "an undo feeds the redo stack");
         assert!(matches!(
             history.state_event(),
@@ -11780,7 +11785,7 @@ mod tests {
             })
         ));
 
-        let entry = history.pop(false).unwrap();
+        let entry = history.peek(false).unwrap().clone();
         observe_history(
             &mut history,
             &ProjectMutationAttempt::RestoreResource {
@@ -11790,6 +11795,10 @@ mod tests {
             },
             IdeWorkerCommandKind::Undo,
             &events,
+        );
+        assert!(
+            history.undo.is_empty(),
+            "the applied entry is consumed only once the restore commits"
         );
         assert_eq!(
             history.redo.len(),
@@ -11834,6 +11843,40 @@ mod tests {
             receiver.try_recv().is_err(),
             "and announces no history change"
         );
+    }
+
+    #[test]
+    fn a_refused_undo_keeps_its_entry_for_a_later_attempt() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: false,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let (events, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut state = WorkerState::Running(running);
+        let mut history = UndoHistory::default();
+        history.record_edit(entry("scene"));
+        while receiver.try_recv().is_ok() {}
+
+        assert!(restore_edit(&mut state, &events, &mut history, false));
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Ok(IdeWorkerEvent::CommandFailed {
+                    command: IdeWorkerCommandKind::Undo,
+                    ..
+                })
+            ),
+            "an undo that never reaches the project is reported as a failure"
+        );
+        assert_eq!(
+            history.undo.len(),
+            1,
+            "and the entry survives so the user can retry"
+        );
+        assert_eq!(history.peek(false).unwrap().resource_id, "scene");
     }
 
     #[test]
