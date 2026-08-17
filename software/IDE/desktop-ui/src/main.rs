@@ -8430,6 +8430,11 @@ mod tests {
             end: Some(48_000),
         };
         assert!(empty.range().is_none(), "a zero-length range is refused");
+        assert!(
+            empty.summary(48_000).contains("IS NOT AFTER IN"),
+            "and is never shown as a loop the transport would run: {}",
+            empty.summary(48_000)
+        );
 
         let usable = LoopMarks {
             start: Some(48_000),
