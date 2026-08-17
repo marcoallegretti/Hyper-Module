@@ -295,6 +295,10 @@ pub enum TransportCommandSendError {
         command: TransportCommand,
         available: usize,
     },
+    LoopRangeShorterThanBlock {
+        command: TransportCommand,
+        block_frames: usize,
+    },
     SceneUnavailable {
         command: TransportCommand,
         reason: PreparedSceneAvailability,
@@ -308,6 +312,7 @@ impl TransportCommandSendError {
             Self::Full(command)
             | Self::Disconnected(command)
             | Self::MissingScene { command, .. }
+            | Self::LoopRangeShorterThanBlock { command, .. }
             | Self::SceneUnavailable { command, .. } => command,
         }
     }
@@ -323,6 +328,10 @@ impl fmt::Display for TransportCommandSendError {
             Self::MissingScene { available, .. } => write!(
                 formatter,
                 "scene launch target is missing; {available} scenes are available"
+            ),
+            Self::LoopRangeShorterThanBlock { block_frames, .. } => write!(
+                formatter,
+                "loop range is shorter than the {block_frames}-frame callback block"
             ),
             Self::SceneUnavailable { reason, .. } => match reason {
                 PreparedSceneAvailability::Disabled => formatter.write_str("scene is disabled"),
@@ -1070,6 +1079,7 @@ pub fn loudness_command_channel() -> (LoudnessCommandSender, LoudnessCommandRece
 #[derive(Debug)]
 pub struct TransportCommandSender {
     producer: Producer<TransportCommand>,
+    max_block_frames: usize,
     scene_count: usize,
     scene_ready_mask: u8,
     scene_disabled_mask: u8,
@@ -1124,6 +1134,17 @@ impl TransportCommandSender {
         &self,
         command: TransportCommand,
     ) -> Result<(), TransportCommandSendError> {
+        // A range shorter than one callback would force a full graph render and
+        // a scene seek for every `range` frames of every block. The bound is the
+        // block the runtime was built for, not an invented constant.
+        if let TransportCommand::SetLoopRange(Some(range)) = command
+            && range.frame_count() < self.max_block_frames
+        {
+            return Err(TransportCommandSendError::LoopRangeShorterThanBlock {
+                command,
+                block_frames: self.max_block_frames,
+            });
+        }
         if let TransportCommand::LaunchScene { scene_index } = command {
             let Some(reason) = self.scene_availability(scene_index) else {
                 return Err(TransportCommandSendError::MissingScene {
@@ -2873,6 +2894,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         (
             TransportCommandSender {
                 producer,
+                max_block_frames: runtime.max_block_frames(),
                 scene_count,
                 scene_ready_mask,
                 scene_disabled_mask,
@@ -2913,6 +2935,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         (
             TransportCommandSender {
                 producer: transport_producer,
+                max_block_frames: runtime.max_block_frames(),
                 scene_count,
                 scene_ready_mask,
                 scene_disabled_mask,

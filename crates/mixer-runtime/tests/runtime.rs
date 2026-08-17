@@ -515,6 +515,41 @@ fn a_range_shorter_than_the_block_wraps_repeatedly_within_one_callback() {
 }
 
 #[test]
+fn a_loop_shorter_than_the_callback_block_is_refused_at_the_sender() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 64)
+            .unwrap();
+    let (mut sender, _transport) = PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+
+    let short = TransportLoopRange::new(0, 63).unwrap();
+    assert!(
+        matches!(
+            sender.try_send(TransportCommand::SetLoopRange(Some(short))),
+            Err(TransportCommandSendError::LoopRangeShorterThanBlock {
+                block_frames: 64,
+                ..
+            })
+        ),
+        "a range shorter than one callback would force a full graph render per          range of frames, so it is refused rather than armed"
+    );
+
+    let exact = TransportLoopRange::new(0, 64).unwrap();
+    assert!(
+        sender
+            .try_send(TransportCommand::SetLoopRange(Some(exact)))
+            .is_ok(),
+        "a range exactly one block long wraps at most once per callback"
+    );
+    assert!(
+        sender.try_send(TransportCommand::SetLoopRange(None)).is_ok(),
+        "and clearing the range is never refused"
+    );
+}
+
+#[test]
 fn an_empty_or_inverted_loop_range_is_refused() {
     assert_eq!(
         TransportLoopRange::new(50, 50),

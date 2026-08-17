@@ -384,6 +384,7 @@ impl RuntimeControlSink for DesktopControlSink {
             }
             Err(
                 TransportCommandSendError::MissingScene { .. }
+                | TransportCommandSendError::LoopRangeShorterThanBlock { .. }
                 | TransportCommandSendError::Full(_)
                 | TransportCommandSendError::Disconnected(_),
             ) => ControlBindingAvailability::Unavailable(
