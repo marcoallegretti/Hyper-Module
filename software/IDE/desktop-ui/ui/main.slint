@@ -194,6 +194,10 @@ export global IdeActions {
     callback transport-stop();
     callback transport-return-start();
     callback transport-seek(float);
+    callback loop-mark-in();
+    callback loop-mark-out();
+    callback loop-toggle();
+    callback loop-clear();
     callback locate-placement(int);
     callback set-arrangement-placement-active(int, bool);
     callback move-arrangement-placement(string, string);
@@ -547,6 +551,10 @@ export component MainWindow inherits Window {
     in property <string> transport-clock: "00:00:00.000";
     in property <bool> transport-extent-bounded: false;
     in property <bool> transport-seek-available: false;
+    in property <string> loop-summary: "";
+    in property <bool> loop-marking-available: false;
+    in property <bool> loop-toggle-available: false;
+    in property <bool> loop-engaged: false;
     in property <float> transport-progress-percent: 0;
     in property <string> transport-end-clock: "—";
     in property <string> callback-count: "0";
@@ -1045,6 +1053,39 @@ export component MainWindow inherits Window {
                                     enabled: root.app-mode == AppMode.running && root.transport-seek-available;
                                     accessible-label: "Locate within finite compiled playback range";
                                     released(value) => { IdeActions.transport-seek(value); }
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Button {
+                                        text: "Loop in";
+                                        enabled: root.loop-marking-available;
+                                        accessible-label: "Set the loop start to the playhead";
+                                        clicked => { IdeActions.loop-mark-in(); }
+                                    }
+                                    Button {
+                                        text: "Loop out";
+                                        enabled: root.loop-marking-available;
+                                        accessible-label: "Set the loop end to the playhead";
+                                        clicked => { IdeActions.loop-mark-out(); }
+                                    }
+                                    Button {
+                                        text: root.loop-engaged ? "Looping" : "Loop";
+                                        enabled: root.loop-toggle-available;
+                                        accessible-label: "Repeat the marked range while the transport rolls";
+                                        clicked => { IdeActions.loop-toggle(); }
+                                    }
+                                    Button {
+                                        text: "Clear";
+                                        enabled: root.loop-summary != "";
+                                        accessible-label: "Discard the marked loop range";
+                                        clicked => { IdeActions.loop-clear(); }
+                                    }
+                                }
+                                Text {
+                                    text: root.loop-summary;
+                                    color: root.loop-engaged ? #7fd6a2 : #8fa0b4;
+                                    font-size: 9px;
+                                    horizontal-alignment: center;
                                 }
                                 Text {
                                     text: root.transport-extent-bounded ? "0:00  ·  COMPILED PLAYBACK RANGE  ·  " + root.transport-end-clock : "OPEN-ENDED RECORDED SCENE AUTHORITY · SEEK RANGE UNAVAILABLE";

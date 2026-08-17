@@ -2,7 +2,7 @@
 
 use core::error::Error;
 use core::fmt;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -28,7 +28,8 @@ use hyper_desktop_ide::{
     IdeSceneLaunchState, IdeSceneSlotEdit, IdeSceneTrackAction, IdeWorkerCommand,
     IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError,
     IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState, MAX_IDE_SCENES,
-    PlaybackRecoveryTransportState, TransportCommand, desktop_ide_application_config,
+    PlaybackRecoveryTransportState, TransportCommand, TransportLoopRange,
+    desktop_ide_application_config,
     ide_audio_clip_gain_is_supported,
 };
 #[cfg(test)]
@@ -64,12 +65,54 @@ type ProjectUiStateCell = Rc<ProjectUiState>;
 #[derive(Default)]
 struct ProjectUiState {
     playback_end_frame: RefCell<Option<usize>>,
+    playhead_frame: Cell<usize>,
+    loop_marks: Cell<LoopMarks>,
+    sample_rate_hz: Cell<u32>,
     arrangement: RefCell<Option<ArrangementBinding>>,
     audio_clips: RefCell<Vec<IdeAudioClip>>,
     scenes: RefCell<Vec<IdeScene>>,
     scene_launch_evidence: RefCell<SceneLaunchEvidence>,
     automation_channels: RefCell<Vec<MixerChannelFacts>>,
     control_targets: RefCell<Vec<ControlTargetChoice>>,
+}
+
+/// The two marks a user sets independently. They only become a transport range
+/// once both exist and the end is beyond the start, which is why the marks are
+/// kept rather than a range: marking out before in must not silently discard
+/// the first mark.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LoopMarks {
+    start: Option<usize>,
+    end: Option<usize>,
+}
+
+impl LoopMarks {
+    fn range(self) -> Option<TransportLoopRange> {
+        let (start, end) = (self.start?, self.end?);
+        TransportLoopRange::new(start, end).ok()
+    }
+
+    fn summary(self, sample_rate_hz: u32) -> String {
+        match (self.start, self.end) {
+            (None, None) => String::new(),
+            (Some(start), None) => format!("LOOP IN {}", format_transport_clock_frames(start, sample_rate_hz)),
+            (None, Some(end)) => format!("LOOP OUT {}", format_transport_clock_frames(end, sample_rate_hz)),
+            (Some(start), Some(end)) if end > start => format!(
+                "LOOP {} → {}",
+                format_transport_clock_frames(start, sample_rate_hz),
+                format_transport_clock_frames(end, sample_rate_hz)
+            ),
+            (Some(start), Some(end)) => format!(
+                "LOOP OUT {} IS NOT AFTER IN {}",
+                format_transport_clock_frames(end, sample_rate_hz),
+                format_transport_clock_frames(start, sample_rate_hz)
+            ),
+        }
+    }
+}
+
+fn format_transport_clock_frames(frame: usize, sample_rate_hz: u32) -> String {
+    format_transport_clock(u64::try_from(frame).unwrap_or(u64::MAX), sample_rate_hz)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1554,6 +1597,7 @@ fn bind_arrangement_scene_launch_callback(
     bind_control_mapping_callbacks(ui, worker, project_state);
     bind_project_export_callback(ui, worker);
     bind_undo_callbacks(ui, worker);
+    bind_loop_callbacks(ui, worker, project_state);
     bind_arrangement_scene_launch_locate_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_scene_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_removal_callback(ui, worker, project_state);
@@ -4752,6 +4796,7 @@ fn apply_running_event(
     set_recording_targets(ui, recording_routes, observation.mixer_channels());
     set_recording_takes(ui, take_routes, observation);
     set_playback_extent(ui, project_state, observation);
+    refresh_loop_controls(ui, project_state, observation.sample_rate_hz());
     set_arrangement(ui, project_state, observation);
     set_automation(ui, project_state, observation);
     set_control_mappings(ui, project_state, observation);
@@ -4792,6 +4837,7 @@ fn apply_running_event(
     );
     let position_frame = observation.recovery().position_frame();
     ui.set_frame_position(position_frame.to_string().into());
+    project_state.playhead_frame.set(position_frame);
     ui.set_transport_clock(
         format_transport_clock(
             u64::try_from(position_frame).unwrap_or(u64::MAX),
@@ -5625,6 +5671,10 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_redo_label(SharedString::default());
     ui.set_undo_available(false);
     ui.set_redo_available(false);
+    ui.set_loop_summary(SharedString::default());
+    ui.set_loop_marking_available(false);
+    ui.set_loop_toggle_available(false);
+    ui.set_loop_engaged(false);
     reset_arrangement_scene_launch_addition_form(ui);
     reset_arrangement_scene_launch_move_form(ui);
     reset_arrangement_scene_launch_scene_form(ui);
@@ -7553,6 +7603,113 @@ fn apply_restore_result(ui: &MainWindow, status: String, error: String) {
     refresh_restore_availability(ui);
 }
 
+/// Marking is possible only while the project is idle; engaging the loop also
+/// needs both marks to form a usable range. The controls read these, and the
+/// callbacks refuse on the same rules.
+const fn loop_marking_available(mode: AppMode) -> bool {
+    matches!(mode, AppMode::Running)
+}
+
+fn loop_toggle_available(mode: AppMode, marks: LoopMarks) -> bool {
+    loop_marking_available(mode) && marks.range().is_some()
+}
+
+fn refresh_loop_controls(ui: &MainWindow, state: &ProjectUiStateCell, sample_rate_hz: u32) {
+    state.sample_rate_hz.set(sample_rate_hz);
+    let marks = state.loop_marks.get();
+    let mode = ui.get_app_mode();
+    ui.set_loop_summary(marks.summary(sample_rate_hz).into());
+    ui.set_loop_marking_available(loop_marking_available(mode));
+    ui.set_loop_toggle_available(loop_toggle_available(mode, marks));
+    if marks.range().is_none() {
+        ui.set_loop_engaged(false);
+    }
+}
+
+fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiStateCell) {
+    let actions = ui.global::<IdeActions>();
+    let mark = |end: bool| {
+        let weak = ui.as_weak();
+        let worker = Rc::clone(worker);
+        let state = Rc::clone(state);
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if !loop_marking_available(ui.get_app_mode()) {
+                return;
+            }
+            let frame = state.playhead_frame.get();
+            let mut marks = state.loop_marks.get();
+            if end {
+                marks.end = Some(frame);
+            } else {
+                marks.start = Some(frame);
+            }
+            state.loop_marks.set(marks);
+            ui.set_loop_summary(marks.summary(state.sample_rate_hz.get()).into());
+            ui.set_loop_toggle_available(loop_toggle_available(ui.get_app_mode(), marks));
+            submit_to_ui(
+                &ui,
+                &worker,
+                IdeWorkerCommand::Transport(TransportCommand::SetLoopRange(marks.range())),
+            );
+            if marks.range().is_none() && ui.get_loop_engaged() {
+                ui.set_loop_engaged(false);
+                submit_to_ui(
+                    &ui,
+                    &worker,
+                    IdeWorkerCommand::Transport(TransportCommand::SetLoopEnabled(false)),
+                );
+            }
+        }
+    };
+    actions.on_loop_mark_in(mark(false));
+    actions.on_loop_mark_out(mark(true));
+
+    let weak = ui.as_weak();
+    let toggle_worker = Rc::clone(worker);
+    let toggle_state = Rc::clone(state);
+    actions.on_loop_toggle(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if !loop_toggle_available(ui.get_app_mode(), toggle_state.loop_marks.get()) {
+            return;
+        }
+        let engaged = !ui.get_loop_engaged();
+        ui.set_loop_engaged(engaged);
+        submit_to_ui(
+            &ui,
+            &toggle_worker,
+            IdeWorkerCommand::Transport(TransportCommand::SetLoopEnabled(engaged)),
+        );
+    });
+
+    let weak = ui.as_weak();
+    let clear_worker = Rc::clone(worker);
+    let clear_state = Rc::clone(state);
+    actions.on_loop_clear(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        clear_state.loop_marks.set(LoopMarks::default());
+        ui.set_loop_summary(SharedString::default());
+        ui.set_loop_toggle_available(false);
+        ui.set_loop_engaged(false);
+        submit_to_ui(
+            &ui,
+            &clear_worker,
+            IdeWorkerCommand::Transport(TransportCommand::SetLoopEnabled(false)),
+        );
+        submit_to_ui(
+            &ui,
+            &clear_worker,
+            IdeWorkerCommand::Transport(TransportCommand::SetLoopRange(None)),
+        );
+    });
+}
+
 fn bind_undo_callbacks(ui: &MainWindow, worker: &WorkerCell) {
     let restore = |redo: bool| {
         let weak = ui.as_weak();
@@ -8231,6 +8388,89 @@ mod tests {
         assert_eq!(
             mode_after_failure(AppMode::RenamingScene, IdeWorkerCommandKind::RenameScene),
             AppMode::Running
+        );
+    }
+
+    #[test]
+    fn loop_marks_only_become_a_range_once_both_exist_and_the_end_is_later() {
+        let none = LoopMarks::default();
+        assert!(none.range().is_none());
+        assert_eq!(none.summary(48_000), "");
+
+        let in_only = LoopMarks {
+            start: Some(48_000),
+            end: None,
+        };
+        assert!(in_only.range().is_none(), "one mark is not a range");
+        assert!(in_only.summary(48_000).starts_with("LOOP IN"));
+
+        let out_only = LoopMarks {
+            start: None,
+            end: Some(96_000),
+        };
+        assert!(out_only.range().is_none());
+        assert!(out_only.summary(48_000).starts_with("LOOP OUT"));
+
+        let inverted = LoopMarks {
+            start: Some(96_000),
+            end: Some(48_000),
+        };
+        assert!(
+            inverted.range().is_none(),
+            "an end before the start is refused rather than swapped"
+        );
+        assert!(
+            inverted.summary(48_000).contains("IS NOT AFTER IN"),
+            "and says so instead of showing a range that will not engage: {}",
+            inverted.summary(48_000)
+        );
+
+        let empty = LoopMarks {
+            start: Some(48_000),
+            end: Some(48_000),
+        };
+        assert!(empty.range().is_none(), "a zero-length range is refused");
+
+        let usable = LoopMarks {
+            start: Some(48_000),
+            end: Some(96_000),
+        };
+        let range = usable.range().expect("both marks, end after start");
+        assert_eq!(range.start_frame(), 48_000);
+        assert_eq!(range.end_frame(), 96_000);
+        assert!(usable.summary(48_000).contains('→'));
+    }
+
+    #[test]
+    fn the_loop_controls_follow_the_mode_and_the_marks() {
+        let usable = LoopMarks {
+            start: Some(0),
+            end: Some(100),
+        };
+        let partial = LoopMarks {
+            start: Some(0),
+            end: None,
+        };
+
+        assert!(loop_marking_available(AppMode::Running));
+        assert!(
+            !loop_marking_available(AppMode::Saving),
+            "marking is refused while a project mutation is in flight"
+        );
+        assert!(!loop_marking_available(AppMode::RestoringEdit));
+
+        assert!(loop_toggle_available(AppMode::Running, usable));
+        assert!(
+            !loop_toggle_available(AppMode::Running, partial),
+            "a single mark cannot engage a loop"
+        );
+        assert!(
+            !loop_toggle_available(AppMode::Running, LoopMarks::default()),
+            "and neither can no marks at all"
+        );
+        assert!(
+            !loop_toggle_available(AppMode::Saving, usable),
+            "a usable range still waits for the project to be idle"
         );
     }
 
