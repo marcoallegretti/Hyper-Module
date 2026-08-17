@@ -7860,6 +7860,11 @@ fn project_save_command(state: &ProjectUiStateCell) -> IdeWorkerCommand {
     }
 }
 
+/// A time signature reads numerator over denominator, in that order.
+fn format_meter(numerator: u16, denominator: u16) -> String {
+    format!("{numerator}/{denominator}")
+}
+
 fn tempo_editable(placement_count: usize) -> bool {
     placement_count == 0
 }
@@ -7881,9 +7886,7 @@ fn set_tempo_and_loop(
         observation
             .meter_events()
             .first()
-            .map_or_else(String::new, |meter| {
-                format!("{}/{}", meter.numerator, meter.denominator)
-            })
+            .map_or_else(String::new, |meter| format_meter(meter.numerator, meter.denominator))
             .into(),
     );
     ui.set_meter_available(true);
@@ -8856,6 +8859,19 @@ mod tests {
             ),
             "one mark clears any stored range rather than writing half of one"
         );
+    }
+
+    #[test]
+    fn a_time_signature_reads_numerator_over_denominator() {
+        assert_eq!(format_meter(6, 4), "6/4");
+        assert_eq!(format_meter(4, 6), "4/6");
+        assert_ne!(
+            format_meter(6, 4),
+            format_meter(4, 6),
+            "a 6/4 project must not display as 4/6"
+        );
+        assert_eq!(format_meter(3, 4), "3/4");
+        assert_eq!(format_meter(6, 8), "6/8");
     }
 
     #[test]

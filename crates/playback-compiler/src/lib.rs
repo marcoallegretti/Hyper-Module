@@ -1252,6 +1252,45 @@ mod tests {
         assert_eq!((third_beat.bar(), third_beat.beat()), (3, 3));
     }
 
+    /// A meter change is only required to sit on a strictly increasing tick, not
+    /// on a bar line. The bar-boundary case above cannot distinguish whether the
+    /// walk stops at or before the change, so this places one mid-bar.
+    #[test]
+    fn a_meter_change_off_a_bar_line_takes_effect_at_its_own_tick() {
+        let events = [
+            MeterEvent {
+                tick: 0,
+                numerator: 4,
+                denominator: 4,
+            },
+            MeterEvent {
+                tick: 3_840,
+                numerator: 3,
+                denominator: 4,
+            },
+        ];
+        let at = |tick| musical_position(&events, tick).unwrap();
+
+        let change = at(3_840);
+        assert_eq!(
+            (change.bar(), change.beat(), change.tick()),
+            (1, 1, 0),
+            "half a 4/4 bar elapsed is zero whole bars, so the new meter starts              bar one again at its own tick"
+        );
+        let before = at(3_839);
+        assert_eq!(
+            (before.bar(), before.beat()),
+            (1, 2),
+            "and the tick before it is still counted by the old meter"
+        );
+        let after = at(3_840 + 5_760);
+        assert_eq!(
+            (after.bar(), after.beat()),
+            (2, 1),
+            "the first 3/4 bar completes three quarters after the change"
+        );
+    }
+
     #[test]
     fn a_frame_reads_as_the_bar_and_beat_the_tempo_places_it_on() {
         let tempo = [TempoEvent {

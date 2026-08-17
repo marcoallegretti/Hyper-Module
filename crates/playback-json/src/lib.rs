@@ -13903,6 +13903,28 @@ mod tests {
         assert_eq!((range.start_tick(), range.end_tick()), (1920, 7680));
         assert!(range.enabled());
 
+        let disengaged = serialize_arrangement_loop_range(
+            &reloaded,
+            &assets,
+            &written,
+            Some((1920, 7680, false)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let reread = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&disengaged)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(
+            !reread.arrangement_loop_range().unwrap().enabled(),
+            "a disengaged loop is written as disengaged, not silently re-engaged"
+        );
+        assert_ne!(
+            disengaged, written,
+            "and the two differ on disk, so the flag is really carried"
+        );
+
         let cleared = serialize_arrangement_loop_range(
             &reloaded,
             &assets,
