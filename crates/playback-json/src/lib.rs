@@ -30,7 +30,8 @@ use hyper_playback_compiler::scene::{
 };
 use hyper_playback_compiler::{
     ClipCompileSpec, CompileError, CompiledPlacement, CompiledSceneAudioClip, FrameTimeline,
-    FrameTimelineError, PlacementCompileSpec, TempoEvent, TickRange, Timeline, TimelineError,
+    FrameTimelineError, MeterEvent, PlacementCompileSpec, TempoEvent, TickRange, Timeline,
+    TimelineError,
     WarpMarker, compile_interactive_scene_audio_clip, compile_placement, compile_scene_audio_clip,
 };
 use hyper_project_model::{is_valid_entity_id, is_valid_extension_key};
@@ -394,6 +395,7 @@ pub struct LoadedPlaybackProject {
     sample_rate_hz: u32,
     timeline_id: String,
     tempo_events: Vec<TempoEvent>,
+    meter_events: Vec<MeterEvent>,
     tracks: Vec<LoadedTrack>,
     clips: Vec<LoadedClip>,
     scenes: Vec<LoadedScene>,
@@ -4807,6 +4809,13 @@ impl LoadedPlaybackProject {
         self.sample_rate_hz
     }
 
+    /// The step meter map, which groups the tempo's pulse into bars. It does
+    /// not affect playback timing.
+    #[must_use]
+    pub fn meter_events(&self) -> &[MeterEvent] {
+        &self.meter_events
+    }
+
     /// Returns the validated version-1 step-tempo map in project order.
     #[must_use]
     pub fn tempo_events(&self) -> &[TempoEvent] {
@@ -5482,6 +5491,7 @@ pub fn load(
                 microseconds_per_quarter: event.microseconds_per_quarter,
             })
             .collect(),
+        meter_events: loaded_meter_events(timeline_document.meter_events),
         tracks,
         clips,
         scenes,
@@ -6359,6 +6369,17 @@ fn validate_entity_reference(id: &str, location: DocumentLocation) -> Result<(),
         );
     }
     Ok(())
+}
+
+fn loaded_meter_events(documents: Vec<MeterEventDocument>) -> Vec<MeterEvent> {
+    documents
+        .into_iter()
+        .map(|event| MeterEvent {
+            tick: event.tick,
+            numerator: event.numerator,
+            denominator: event.denominator,
+        })
+        .collect()
 }
 
 fn validate_meter_events(events: &[MeterEventDocument]) -> Result<(), LoadError> {

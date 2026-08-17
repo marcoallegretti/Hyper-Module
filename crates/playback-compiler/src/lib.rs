@@ -23,8 +23,105 @@ pub struct TempoEvent {
     pub microseconds_per_quarter: u32,
 }
 
+/// One entry of the step meter map. Validated by the loader: the first sits at
+/// tick zero, ticks strictly increase, the numerator is `1..=255`, and the
+/// denominator is a power of two up to 256.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MeterEvent {
+    pub tick: u64,
+    pub numerator: u16,
+    pub denominator: u16,
+}
+
+impl MeterEvent {
+    /// Ticks in one beat. A 4/4 bar counts quarters, a 6/8 bar counts eighths,
+    /// which follows from the denominator alone.
+    #[must_use]
+    pub const fn ticks_per_beat(self) -> u64 {
+        TICKS_PER_QUARTER * 4 / self.denominator as u64
+    }
+
+    #[must_use]
+    pub const fn ticks_per_bar(self) -> u64 {
+        self.ticks_per_beat() * self.numerator as u64
+    }
+}
+
+/// Where the playhead sits musically. Bars and beats are one-based, as every
+/// digital audio workstation presents them; the tick remainder is zero-based.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MusicalPosition {
+    bar: u64,
+    beat: u64,
+    tick: u64,
+}
+
+impl MusicalPosition {
+    #[must_use]
+    pub const fn bar(self) -> u64 {
+        self.bar
+    }
+
+    #[must_use]
+    pub const fn beat(self) -> u64 {
+        self.beat
+    }
+
+    #[must_use]
+    pub const fn tick(self) -> u64 {
+        self.tick
+    }
+}
+
+/// Converts a project tick to bars and beats through the step meter map.
+///
+/// Meter does not affect playback timing; it groups a tempo's pulse into bars,
+/// so this is a presentation conversion only.
+///
+/// # Errors
+///
+/// Returns [`TimelineError::EmptyMeterMap`] when the map is empty and
+/// [`TimelineError::ArithmeticOverflow`] when the arithmetic would overflow.
+pub fn musical_position(
+    meter_events: &[MeterEvent],
+    tick: u64,
+) -> Result<MusicalPosition, TimelineError> {
+    let first = *meter_events.first().ok_or(TimelineError::EmptyMeterMap)?;
+    let mut bars_before = 0_u64;
+    let mut cursor_tick = 0_u64;
+    let mut current = first;
+    for &next in meter_events.iter().skip(1) {
+        if next.tick > tick {
+            break;
+        }
+        let span = next
+            .tick
+            .checked_sub(cursor_tick)
+            .ok_or(TimelineError::ArithmeticOverflow)?;
+        bars_before = bars_before
+            .checked_add(span / current.ticks_per_bar())
+            .ok_or(TimelineError::ArithmeticOverflow)?;
+        cursor_tick = next.tick;
+        current = next;
+    }
+    let elapsed = tick
+        .checked_sub(cursor_tick)
+        .ok_or(TimelineError::ArithmeticOverflow)?;
+    let bar_offset = elapsed / current.ticks_per_bar();
+    let within_bar = elapsed % current.ticks_per_bar();
+    Ok(MusicalPosition {
+        bar: bars_before
+            .checked_add(bar_offset)
+            .and_then(|bars| bars.checked_add(1))
+            .ok_or(TimelineError::ArithmeticOverflow)?,
+        beat: within_bar / current.ticks_per_beat() + 1,
+        tick: within_bar % current.ticks_per_beat(),
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimelineError {
+    EmptyMeterMap,
     InvalidSampleRate,
     EmptyTempoMap,
     FirstTempoNotAtOrigin,
@@ -39,6 +136,7 @@ impl fmt::Display for TimelineError {
         match self {
             Self::InvalidSampleRate => formatter.write_str("sample rate must be positive"),
             Self::EmptyTempoMap => formatter.write_str("tempo map must not be empty"),
+            Self::EmptyMeterMap => formatter.write_str("meter map must not be empty"),
             Self::FirstTempoNotAtOrigin => formatter.write_str("tempo map must begin at tick zero"),
             Self::InvalidTempo => formatter.write_str("tempo is outside the version 1 domain"),
             Self::TempoNotStrictlyIncreasing => {
@@ -545,7 +643,8 @@ impl From<TimelineError> for CompileError {
             | TimelineError::EmptyTempoMap
             | TimelineError::FirstTempoNotAtOrigin
             | TimelineError::InvalidTempo
-            | TimelineError::TempoNotStrictlyIncreasing => Self::InvalidTimeline(error),
+            | TimelineError::TempoNotStrictlyIncreasing
+            | TimelineError::EmptyMeterMap => Self::InvalidTimeline(error),
         }
     }
 }
@@ -1068,6 +1167,94 @@ fn tempo_matches_clip_rate(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_musical_position_counts_bars_and_beats_from_one() {
+        let four_four = [MeterEvent {
+            tick: 0,
+            numerator: 4,
+            denominator: 4,
+        }];
+        assert_eq!(four_four[0].ticks_per_beat(), 1_920);
+        assert_eq!(four_four[0].ticks_per_bar(), 7_680);
+
+        let at = |tick| musical_position(&four_four, tick).unwrap();
+        let origin = at(0);
+        assert_eq!(
+            (origin.bar(), origin.beat(), origin.tick()),
+            (1, 1, 0),
+            "the origin is bar one beat one, not bar zero"
+        );
+        let second_beat = at(1_920);
+        assert_eq!((second_beat.bar(), second_beat.beat(), second_beat.tick()), (1, 2, 0));
+        let second_bar = at(7_680);
+        assert_eq!((second_bar.bar(), second_bar.beat(), second_bar.tick()), (2, 1, 0));
+        let inside = at(7_680 + 1_920 + 960);
+        assert_eq!(
+            (inside.bar(), inside.beat(), inside.tick()),
+            (2, 2, 960),
+            "the tick remainder inside a beat is zero-based"
+        );
+    }
+
+    #[test]
+    fn a_musical_position_follows_the_meter_map_across_a_change() {
+        let events = [
+            MeterEvent {
+                tick: 0,
+                numerator: 4,
+                denominator: 4,
+            },
+            MeterEvent {
+                tick: 15_360,
+                numerator: 3,
+                denominator: 4,
+            },
+        ];
+        assert_eq!(events[1].ticks_per_bar(), 5_760, "a 3/4 bar is three quarters");
+
+        let at = |tick| musical_position(&events, tick).unwrap();
+        let boundary = at(15_360);
+        assert_eq!(
+            (boundary.bar(), boundary.beat()),
+            (3, 1),
+            "two 4/4 bars precede the change, so it begins bar three"
+        );
+        let after = at(15_360 + 5_760);
+        assert_eq!(
+            (after.bar(), after.beat()),
+            (4, 1),
+            "and the next bar arrives three quarters later, not four"
+        );
+        let third_beat = at(15_360 + 3_840);
+        assert_eq!((third_beat.bar(), third_beat.beat()), (3, 3));
+    }
+
+    #[test]
+    fn a_compound_meter_counts_the_denominator_as_the_beat() {
+        let six_eight = [MeterEvent {
+            tick: 0,
+            numerator: 6,
+            denominator: 8,
+        }];
+        assert_eq!(
+            six_eight[0].ticks_per_beat(),
+            960,
+            "an eighth is half a quarter"
+        );
+        assert_eq!(six_eight[0].ticks_per_bar(), 5_760);
+
+        let sixth = musical_position(&six_eight, 4_800).unwrap();
+        assert_eq!((sixth.bar(), sixth.beat()), (1, 6));
+        let next_bar = musical_position(&six_eight, 5_760).unwrap();
+        assert_eq!((next_bar.bar(), next_bar.beat()), (2, 1));
+
+        assert_eq!(
+            musical_position(&[], 0),
+            Err(TimelineError::EmptyMeterMap),
+            "a project with no meter has no musical position to show"
+        );
+    }
+
     use super::*;
 
     fn timeline(events: &[TempoEvent]) -> Timeline<'_> {
