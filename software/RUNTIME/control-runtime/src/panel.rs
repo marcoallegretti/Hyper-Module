@@ -58,7 +58,10 @@ pub enum PanelBinding {
         behavior: PanelButtonBehavior,
     },
     /// A button invokes an action on press.
-    ActionButton { index: u8, action: PanelActionTarget },
+    ActionButton {
+        index: u8,
+        action: PanelActionTarget,
+    },
 }
 
 impl PanelBinding {
@@ -417,7 +420,8 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
                     return PanelCommand::StateUnavailable;
                 };
                 let (minimum, maximum) = target.domain();
-                let moved = i64::from(current) + i64::from(delta) * i64::from(step_millionths.get());
+                let moved =
+                    i64::from(current) + i64::from(delta) * i64::from(step_millionths.get());
                 let next = moved.clamp(i64::from(minimum), i64::from(maximum));
                 let next = i32::try_from(next)
                     .expect("a value clamped into its target's domain fits that domain's type");
@@ -446,8 +450,9 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
                     };
                     PanelCommand::Send(boolean_command(target, !current))
                 }
-                (PanelButtonBehavior::Toggle, PanelEdge::Release)
-                | (_, PanelEdge::Turn(_)) => PanelCommand::Idle,
+                (PanelButtonBehavior::Toggle, PanelEdge::Release) | (_, PanelEdge::Turn(_)) => {
+                    PanelCommand::Idle
+                }
             },
             PanelBinding::ActionButton { action, .. } => {
                 if !matches!(edge, PanelEdge::Press) {
@@ -572,9 +577,8 @@ const fn boolean_runtime_target(target: BooleanControlTarget) -> RuntimeControlT
 }
 
 fn value_command(target: ValueControlTarget, value: i32) -> RuntimeControlCommand {
-    let gain = || {
-        u32::try_from(value).expect("a value clamped into the gain domain is not negative")
-    };
+    let gain =
+        || u32::try_from(value).expect("a value clamped into the gain domain is not negative");
     match target {
         ValueControlTarget::ChannelGain { channel_index } => RuntimeControlCommand::ChannelGain {
             channel_index,
@@ -608,18 +612,14 @@ fn value_command(target: ValueControlTarget, value: i32) -> RuntimeControlComman
 
 const fn boolean_command(target: BooleanControlTarget, value: bool) -> RuntimeControlCommand {
     match target {
-        BooleanControlTarget::ChannelMute { channel_index } => {
-            RuntimeControlCommand::ChannelMute {
-                channel_index,
-                muted: value,
-            }
-        }
-        BooleanControlTarget::ChannelSolo { channel_index } => {
-            RuntimeControlCommand::ChannelSolo {
-                channel_index,
-                solo: value,
-            }
-        }
+        BooleanControlTarget::ChannelMute { channel_index } => RuntimeControlCommand::ChannelMute {
+            channel_index,
+            muted: value,
+        },
+        BooleanControlTarget::ChannelSolo { channel_index } => RuntimeControlCommand::ChannelSolo {
+            channel_index,
+            solo: value,
+        },
         BooleanControlTarget::SendEnabled {
             channel_index,
             send_index,

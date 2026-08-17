@@ -463,9 +463,13 @@ impl RuntimeControlSink for DesktopControlSink {
             ValueControlTarget::ChannelGain { channel_index } => Some(gain_millionths(
                 state.channel(channel_index)?.parameters().gain,
             )),
-            ValueControlTarget::ChannelPan { channel_index } => {
-                Some(state.channel(channel_index)?.parameters().pan.to_millionths())
-            }
+            ValueControlTarget::ChannelPan { channel_index } => Some(
+                state
+                    .channel(channel_index)?
+                    .parameters()
+                    .pan
+                    .to_millionths(),
+            ),
             ValueControlTarget::SendGain {
                 channel_index,
                 send_index,

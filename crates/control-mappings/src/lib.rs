@@ -187,7 +187,9 @@ pub fn map_continuous_value(
             u32::try_from(normalized).ok()?.checked_mul(2)?,
         )),
         ContinuousControlTarget::Pan => Some(ContinuousControlValue::PanMillionths(
-            normalized.checked_mul(2)?.checked_sub(NORMALIZED_UNSIGNED_MAX)?,
+            normalized
+                .checked_mul(2)?
+                .checked_sub(NORMALIZED_UNSIGNED_MAX)?,
         )),
     }
 }

@@ -1093,7 +1093,10 @@ fn connect_refuses_bindings_the_panel_cannot_serve_and_installs_the_rest() {
             channel_index: 3,
             parameter: ChannelParameter::Gain,
         }),
-        values: vec![(ValueControlTarget::ChannelGain { channel_index: 0 }, 1_000_000)],
+        values: vec![(
+            ValueControlTarget::ChannelGain { channel_index: 0 },
+            1_000_000,
+        )],
         ..Sink::default()
     });
 
@@ -1216,8 +1219,14 @@ fn encoder_deltas_move_the_bound_target_in_the_turned_direction_and_stop_at_its_
 fn a_momentary_and_a_toggle_button_answer_the_same_press_release_pair_differently() {
     let mut runtime = panel_runtime(Sink {
         booleans: vec![
-            (BooleanControlTarget::ChannelMute { channel_index: 0 }, false),
-            (BooleanControlTarget::ChannelSolo { channel_index: 0 }, false),
+            (
+                BooleanControlTarget::ChannelMute { channel_index: 0 },
+                false,
+            ),
+            (
+                BooleanControlTarget::ChannelSolo { channel_index: 0 },
+                false,
+            ),
         ],
         ..Sink::default()
     });
@@ -1345,8 +1354,14 @@ fn bindings_survive_a_reconnect_only_while_the_new_descriptor_still_has_the_cont
         },
     ];
     let mut runtime = panel_runtime(Sink {
-        values: vec![(ValueControlTarget::ChannelGain { channel_index: 0 }, 1_000_000)],
-        booleans: vec![(BooleanControlTarget::ChannelMute { channel_index: 0 }, false)],
+        values: vec![(
+            ValueControlTarget::ChannelGain { channel_index: 0 },
+            1_000_000,
+        )],
+        booleans: vec![(
+            BooleanControlTarget::ChannelMute { channel_index: 0 },
+            false,
+        )],
         ..Sink::default()
     });
 
@@ -1409,9 +1424,7 @@ fn bindings_survive_a_reconnect_only_while_the_new_descriptor_still_has_the_cont
 
 #[test]
 fn disconnecting_releases_only_the_momentary_control_still_held() {
-    let mut runtime = panel_runtime(Sink {
-        ..Sink::default()
-    });
+    let mut runtime = panel_runtime(Sink { ..Sink::default() });
     runtime
         .connect_panel(
             panel_descriptor(0, 2),
@@ -1465,7 +1478,10 @@ fn disconnecting_releases_only_the_momentary_control_still_held() {
 fn a_relative_move_fails_closed_until_the_target_value_can_be_read() {
     let ready = Arc::new(AtomicBool::new(false));
     let mut runtime = panel_runtime(Sink {
-        values: vec![(ValueControlTarget::ChannelGain { channel_index: 0 }, 1_000_000)],
+        values: vec![(
+            ValueControlTarget::ChannelGain { channel_index: 0 },
+            1_000_000,
+        )],
         state_ready: Some(Arc::clone(&ready)),
         ..Sink::default()
     });
