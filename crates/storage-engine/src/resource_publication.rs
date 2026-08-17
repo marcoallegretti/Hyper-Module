@@ -1211,7 +1211,8 @@ fn publish_project_resource_observed(
                     Err(operation_error)
                 }
                 Ok(ProjectResourcePublicationRecoveryDisposition::Committed) => {
-                    let outcome = outcome_from_transaction(&tx, true)?;
+                    let mut outcome = outcome_from_transaction(&tx, true)?;
+                    outcome.previous_resource = previous;
                     clear_and_remove_transaction(&backups, transaction, &transaction_name)
                         .map_err(|error| ProjectResourcePublicationError {
                             kind: ProjectResourcePublicationErrorKind::Recovery,

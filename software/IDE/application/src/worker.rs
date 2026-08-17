@@ -11958,6 +11958,10 @@ mod tests {
             1,
             "an undo's own previous bytes become the redo entry"
         );
+        assert_eq!(
+            &history.redo[0].resource_id, mixer_id,
+            "aimed at the same resource, so the redo can actually be applied"
+        );
         assert_eq!(&history.redo[0].bytes, original);
         assert_eq!(history.redo[0].label, "mixer save");
     }
