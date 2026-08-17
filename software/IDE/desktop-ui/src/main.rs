@@ -3185,6 +3185,18 @@ fn apply_event(
                     TransportCommand::LaunchScene { .. } => {
                         "Scene launch queued for the audio runtime"
                     }
+                    TransportCommand::SetLoopRange(Some(_)) => {
+                        "Loop range queued for the audio runtime"
+                    }
+                    TransportCommand::SetLoopRange(None) => {
+                        "Loop range cleared for the audio runtime"
+                    }
+                    TransportCommand::SetLoopEnabled(true) => {
+                        "Loop queued for the audio runtime"
+                    }
+                    TransportCommand::SetLoopEnabled(false) => {
+                        "Loop release queued for the audio runtime"
+                    }
                 }
                 .into(),
             );

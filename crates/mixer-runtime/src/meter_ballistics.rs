@@ -257,7 +257,7 @@ impl StereoSamplePeakBallistics {
     pub(crate) fn update(
         &mut self,
         channel_id: u64,
-        snapshot: OutputMeterSnapshot,
+        snapshot: &OutputMeterSnapshot,
     ) -> SamplePeakBallisticsUpdate {
         let frame_end = snapshot.processed_frame_end();
         let channel_changed = self
@@ -355,6 +355,7 @@ mod tests {
                 state: TransportState::Rolling,
                 start_frame: 0,
                 frame_count,
+                loop_wrap_count: 0,
                 active_slot_count: 1,
                 scene_launch_state: SceneLaunchState::default(),
                 applied_command_count: 0,
@@ -407,16 +408,16 @@ mod tests {
     fn falloff_depends_on_elapsed_frames_not_snapshot_partitioning() {
         let policy = config(20.0, 0);
         let mut one_block = StereoSamplePeakBallistics::new(policy);
-        let _ = one_block.update(1, snapshot(10, 10, 1.0, 1.0));
-        let one_block_result = one_block.update(1, snapshot(60, 50, 0.0, 0.0)).snapshot();
+        let _ = one_block.update(1, &snapshot(10, 10, 1.0, 1.0));
+        let one_block_result = one_block.update(1, &snapshot(60, 50, 0.0, 0.0)).snapshot();
 
         let mut partitioned = StereoSamplePeakBallistics::new(policy);
-        let _ = partitioned.update(1, snapshot(10, 10, 1.0, 1.0));
+        let _ = partitioned.update(1, &snapshot(10, 10, 1.0, 1.0));
         let mut partitioned_result = None;
         for frame_end in [20, 30, 40, 50, 60] {
             partitioned_result = Some(
                 partitioned
-                    .update(1, snapshot(frame_end, 10, 0.0, 0.0))
+                    .update(1, &snapshot(frame_end, 10, 0.0, 0.0))
                     .snapshot(),
             );
         }
@@ -433,13 +434,13 @@ mod tests {
     #[test]
     fn peak_hold_expires_in_frame_time_before_falling() {
         let mut ballistics = StereoSamplePeakBallistics::new(config(20.0, 50));
-        let _ = ballistics.update(1, snapshot(10, 10, 1.0, 1.0));
+        let _ = ballistics.update(1, &snapshot(10, 10, 1.0, 1.0));
 
-        let during_hold = ballistics.update(1, snapshot(40, 30, 0.0, 0.0)).snapshot();
+        let during_hold = ballistics.update(1, &snapshot(40, 30, 0.0, 0.0)).snapshot();
         assert_near(during_hold.left().level_dbfs(), -6.0);
         assert_near(during_hold.left().held_peak_dbfs(), 0.0);
 
-        let after_hold = ballistics.update(1, snapshot(80, 40, 0.0, 0.0)).snapshot();
+        let after_hold = ballistics.update(1, &snapshot(80, 40, 0.0, 0.0)).snapshot();
         assert_near(after_hold.left().level_dbfs(), -14.0);
         assert_near(after_hold.left().held_peak_dbfs(), -4.0);
     }
@@ -447,9 +448,9 @@ mod tests {
     #[test]
     fn regressed_frame_clock_resets_state_and_reports_the_new_epoch() {
         let mut ballistics = StereoSamplePeakBallistics::new(config(20.0, 50));
-        let _ = ballistics.update(1, snapshot(100, 10, 1.0, 1.0));
+        let _ = ballistics.update(1, &snapshot(100, 10, 1.0, 1.0));
 
-        let update = ballistics.update(1, snapshot(10, 10, 0.1, 0.1));
+        let update = ballistics.update(1, &snapshot(10, 10, 0.1, 0.1));
 
         assert!(update.ballistics_reset());
         assert_eq!(update.snapshot().processed_frame_end(), 10);
@@ -460,9 +461,9 @@ mod tests {
     #[test]
     fn different_meter_channel_resets_even_when_its_clock_is_newer() {
         let mut ballistics = StereoSamplePeakBallistics::new(config(20.0, 50));
-        let _ = ballistics.update(1, snapshot(10, 10, 1.0, 1.0));
+        let _ = ballistics.update(1, &snapshot(10, 10, 1.0, 1.0));
 
-        let update = ballistics.update(2, snapshot(1_000, 10, 0.1, 0.1));
+        let update = ballistics.update(2, &snapshot(1_000, 10, 0.1, 0.1));
 
         assert!(update.ballistics_reset());
         assert_eq!(update.snapshot().processed_frame_end(), 1_000);

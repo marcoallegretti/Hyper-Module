@@ -211,7 +211,81 @@ pub enum TransportCommand {
     Stop,
     Locate { frame: usize, state: LocateState },
     LaunchScene { scene_index: usize },
+    SetLoopRange(Option<TransportLoopRange>),
+    SetLoopEnabled(bool),
 }
+
+/// A half-open `[start, end)` span the transport repeats while looping.
+/// Ardour and Maolan both keep the range separate from whether looping is
+/// engaged, so a user can arm a range without the playhead moving.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransportLoopRange {
+    start_frame: usize,
+    end_frame: usize,
+}
+
+impl TransportLoopRange {
+    /// # Errors
+    ///
+    /// Returns [`TransportLoopRangeError`] when the span is empty or inverted.
+    /// An unusable range is refused rather than clamped, so a caller cannot
+    /// believe it armed a loop the transport silently ignored.
+    pub const fn new(
+        start_frame: usize,
+        end_frame: usize,
+    ) -> Result<Self, TransportLoopRangeError> {
+        if end_frame <= start_frame {
+            return Err(TransportLoopRangeError::EmptyRange {
+                start_frame,
+                end_frame,
+            });
+        }
+        Ok(Self {
+            start_frame,
+            end_frame,
+        })
+    }
+
+    #[must_use]
+    pub const fn start_frame(self) -> usize {
+        self.start_frame
+    }
+
+    #[must_use]
+    pub const fn end_frame(self) -> usize {
+        self.end_frame
+    }
+
+    #[must_use]
+    pub const fn frame_count(self) -> usize {
+        self.end_frame - self.start_frame
+    }
+
+    #[must_use]
+    pub const fn contains(self, frame: usize) -> bool {
+        frame >= self.start_frame && frame < self.end_frame
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportLoopRangeError {
+    EmptyRange { start_frame: usize, end_frame: usize },
+}
+
+impl fmt::Display for TransportLoopRangeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self::EmptyRange {
+            start_frame,
+            end_frame,
+        } = self;
+        write!(
+            formatter,
+            "loop range [{start_frame}, {end_frame}) is empty or inverted"
+        )
+    }
+}
+
+impl std::error::Error for TransportLoopRangeError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportCommandSendError {
@@ -1089,6 +1163,7 @@ pub struct TransportCycle {
     state: TransportState,
     start_frame: usize,
     frame_count: usize,
+    loop_wrap_count: usize,
     active_slot_count: usize,
     scene_launch_state: SceneLaunchState,
     applied_command_count: usize,
@@ -1098,6 +1173,13 @@ pub struct TransportCycle {
 }
 
 impl TransportCycle {
+    /// How many times the playhead returned to the loop start during this
+    /// callback. Zero for a linear cycle.
+    #[must_use]
+    pub const fn loop_wrap_count(self) -> usize {
+        self.loop_wrap_count
+    }
+
     #[must_use]
     pub const fn state(self) -> TransportState {
         self.state
@@ -1376,7 +1458,7 @@ impl OutputMeterReceiver {
         let mut ballistics_reset = false;
         let channel_id = self.channel_id;
         let latest = self.drain_with(|snapshot| {
-            let update = ballistics.update(channel_id, snapshot);
+            let update = ballistics.update(channel_id, &snapshot);
             ballistics_reset |= update.ballistics_reset();
             latest_ballistics = Some(update.snapshot());
         });
@@ -2739,6 +2821,8 @@ pub struct RoutedTransportRuntime<R> {
     runtime: RoutedMainRuntime<R>,
     state: TransportState,
     position_frame: usize,
+    loop_range: Option<TransportLoopRange>,
+    loop_enabled: bool,
     command_consumer: Option<Consumer<TransportCommand>>,
     mixer_parameter_command_consumer: Option<Consumer<MixerParameterCommand>>,
     mixer_parameter_fence: Option<Arc<AtomicU64>>,
@@ -2769,6 +2853,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             runtime,
             state: TransportState::Stopped,
             position_frame: 0,
+            loop_range: None,
+            loop_enabled: false,
             command_consumer: None,
             mixer_parameter_command_consumer: None,
             mixer_parameter_fence: None,
@@ -2796,6 +2882,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 runtime,
                 state: TransportState::Stopped,
                 position_frame: 0,
+                loop_range: None,
+                loop_enabled: false,
                 command_consumer: Some(consumer),
                 mixer_parameter_command_consumer: None,
                 mixer_parameter_fence: None,
@@ -2840,6 +2928,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 runtime,
                 state: TransportState::Stopped,
                 position_frame: 0,
+                loop_range: None,
+                loop_enabled: false,
                 command_consumer: Some(transport_consumer),
                 mixer_parameter_command_consumer: Some(parameter_consumer),
                 mixer_parameter_fence: Some(committed_fence),
@@ -2913,9 +3003,76 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             TransportCommand::LaunchScene { scene_index } => {
                 self.runtime.queue_scene_launch(scene_index)?;
             }
+            TransportCommand::SetLoopRange(range) => self.loop_range = range,
+            TransportCommand::SetLoopEnabled(enabled) => self.loop_enabled = enabled,
         }
         Ok(())
     }
+    /// Renders one callback, splitting the window every time it reaches the
+    /// loop end so the remainder continues from the loop start. A range shorter
+    /// than the block wraps more than once, so this repeats until the block is
+    /// filled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeProcessError`] when an underlying window fails or the
+    /// playhead would overflow.
+    fn render_cycle(
+        &mut self,
+        start_frame: usize,
+        frame_count: usize,
+        scratch: &mut [RenderScratchSlot<'_>],
+        output: StereoOutput<'_>,
+    ) -> Result<(usize, RenderedWindow, usize), RuntimeProcessError> {
+        let StereoOutput { left, right } = output;
+        if start_frame.checked_add(frame_count).is_none() {
+            return Err(RuntimeProcessError::FrameRangeOverflow);
+        }
+        let mut position = start_frame;
+        let mut written = 0;
+        let mut wraps = 0;
+        let mut active_slot_count = 0;
+        while written < frame_count {
+            let remaining = frame_count - written;
+            let span = match self.active_loop_range() {
+                Some(range) if range.contains(position) => {
+                    remaining.min(range.end_frame() - position)
+                }
+                _ => remaining,
+            };
+            let rendered = self.runtime.process_window(
+                position,
+                scratch,
+                StereoOutput {
+                    left: &mut left[written..written + span],
+                    right: &mut right[written..written + span],
+                },
+            )?;
+            active_slot_count = active_slot_count.max(rendered.active_slot_count);
+            written += span;
+            position = position
+                .checked_add(span)
+                .ok_or(RuntimeProcessError::FrameRangeOverflow)?;
+            if let Some(range) = self.active_loop_range()
+                && position == range.end_frame()
+            {
+                position = range.start_frame();
+                self.runtime.seek(position);
+                wraps += 1;
+            }
+        }
+        Ok((position, RenderedWindow { active_slot_count }, wraps))
+    }
+
+    /// The range the transport is currently repeating, if looping is engaged.
+    const fn active_loop_range(&self) -> Option<TransportLoopRange> {
+        if self.loop_enabled {
+            self.loop_range
+        } else {
+            None
+        }
+    }
+
 
     /// Processes the next transport-owned callback window.
     ///
@@ -2984,6 +3141,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 state: self.state,
                 start_frame,
                 frame_count,
+                loop_wrap_count: 0,
                 active_slot_count: 0,
                 scene_launch_state: self.runtime.scene_launch_state(),
                 applied_command_count,
@@ -2992,14 +3150,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 mixer_parameter_command_sender_disconnected,
             });
         }
-        let rendered = (|| {
-            let next_frame = start_frame
-                .checked_add(frame_count)
-                .ok_or(RuntimeProcessError::FrameRangeOverflow)?;
-            let rendered = self.runtime.process_window(start_frame, scratch, output)?;
-            Ok((next_frame, rendered))
-        })();
-        let (next_frame, rendered) = match rendered {
+        let rendered = self.render_cycle(start_frame, frame_count, scratch, output);
+        let (next_frame, rendered, loop_wrap_count) = match rendered {
             Ok(rendered) => rendered,
             Err(source) => {
                 self.state = committed_state;
@@ -3016,6 +3168,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             state: self.state,
             start_frame,
             frame_count,
+            loop_wrap_count,
             active_slot_count: rendered.active_slot_count,
             scene_launch_state: self.runtime.scene_launch_state(),
             applied_command_count,

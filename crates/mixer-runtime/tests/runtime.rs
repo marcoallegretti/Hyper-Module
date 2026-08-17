@@ -16,11 +16,12 @@ use hyper_mixer_runtime::{
     OutputMeterSnapshot, PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime,
     RuntimeCreationError, RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig,
     StereoSamplePeakBallistics, TransportCommand, TransportCommandSendError, TransportCycle,
-    TransportOutputCreationError, TransportOutputProcessor, TransportState,
+    TransportLoopRange, TransportLoopRangeError, TransportOutputCreationError,
+    TransportOutputProcessor, TransportState,
     loudness_command_channel, output_meter_channel,
 };
 
-use common::{fixture, graph_fixture, playback_fixture};
+use common::{PlaybackFixture, fixture, graph_fixture, playback_fixture};
 
 const GRAPH_SOURCE_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336421";
 const GRAPH_GROUP_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336423";
@@ -58,7 +59,7 @@ fn queue_loudness_restart(sender: &mut LoudnessCommandSender) {
         .unwrap();
 }
 
-fn assert_started_loudness(snapshot: OutputMeterSnapshot, frame_count: u64) {
+fn assert_started_loudness(snapshot: &OutputMeterSnapshot, frame_count: u64) {
     assert_eq!(snapshot.applied_loudness_command_count(), 3);
     assert!(!snapshot.loudness_command_sender_disconnected());
     assert_eq!(
@@ -78,10 +79,10 @@ fn assert_meter_delivery_and_backpressure(
     interleaved: &mut [f32],
     meter_sender: &mut OutputMeterSender,
     mut meter_receiver: OutputMeterReceiver,
-    first_snapshot: OutputMeterSnapshot,
+    first_snapshot: &OutputMeterSnapshot,
 ) {
     let first_read = meter_receiver.read_latest();
-    assert_eq!(first_read.snapshot(), Some(first_snapshot));
+    assert_eq!(first_read.snapshot().as_ref(), Some(first_snapshot));
     assert_eq!(first_read.coalesced_snapshot_count(), 0);
     assert_eq!(first_read.dropped_snapshot_count(), 0);
     assert!(!first_read.sender_disconnected());
@@ -349,6 +350,257 @@ fn verified_documents_render_through_fixed_main_mixer_slots() {
         output_right
             .iter()
             .all(|sample| sample.abs() <= f32::EPSILON)
+    );
+}
+
+/// Renders `frames` from `start`, driving the transport by hand so the result
+/// is independent of any looping decision the runtime makes.
+fn render_linear(fixture: &PlaybackFixture, start: usize, frames: usize) -> (Vec<f32>, Vec<f32>) {
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 100)
+            .unwrap();
+    let mut transport = PreparedPlaybackTransportRuntime::new(runtime);
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: start,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    let mut arrangement_left = [9.0_f32; 100];
+    let mut arrangement_right = [9.0_f32; 100];
+    let mut scene_left = [9.0_f32; 100];
+    let mut scene_right = [9.0_f32; 100];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut left = vec![9.0_f32; frames];
+    let mut right = vec![9.0_f32; frames];
+    transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+    (left, right)
+}
+
+#[test]
+fn a_looped_cycle_matches_the_two_linear_cycles_it_replaces() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 100)
+            .unwrap();
+    let mut transport = PreparedPlaybackTransportRuntime::new(runtime);
+    transport
+        .apply_command(TransportCommand::SetLoopRange(Some(
+            TransportLoopRange::new(20, 50).unwrap(),
+        )))
+        .unwrap();
+    transport
+        .apply_command(TransportCommand::SetLoopEnabled(true))
+        .unwrap();
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: 40,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+
+    let mut arrangement_left = [9.0_f32; 100];
+    let mut arrangement_right = [9.0_f32; 100];
+    let mut scene_left = [9.0_f32; 100];
+    let mut scene_right = [9.0_f32; 100];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut left = [9.0_f32; 30];
+    let mut right = [9.0_f32; 30];
+    let cycle = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(cycle.loop_wrap_count(), 1);
+    assert_eq!(
+        cycle.frame_count(),
+        30,
+        "the callback still describes the whole block"
+    );
+    assert_eq!(
+        transport.position_frame(),
+        40,
+        "10 frames to the loop end, then 20 more from the loop start"
+    );
+
+    let (head_left, head_right) = render_linear(&fixture, 40, 10);
+    let (tail_left, tail_right) = render_linear(&fixture, 20, 20);
+    let expected_left: Vec<f32> = head_left.iter().chain(&tail_left).copied().collect();
+    let expected_right: Vec<f32> = head_right.iter().chain(&tail_right).copied().collect();
+    assert_samples(&left, &expected_left);
+    assert_samples(&right, &expected_right);
+    assert!(
+        expected_left.iter().any(|sample| sample.abs() > 0.0),
+        "the fixture actually produces audio across the wrap"
+    );
+}
+
+#[test]
+fn a_range_shorter_than_the_block_wraps_repeatedly_within_one_callback() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 100)
+            .unwrap();
+    let mut transport = PreparedPlaybackTransportRuntime::new(runtime);
+    transport
+        .apply_command(TransportCommand::SetLoopRange(Some(
+            TransportLoopRange::new(10, 20).unwrap(),
+        )))
+        .unwrap();
+    transport
+        .apply_command(TransportCommand::SetLoopEnabled(true))
+        .unwrap();
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: 10,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+
+    let mut arrangement_left = [9.0_f32; 100];
+    let mut arrangement_right = [9.0_f32; 100];
+    let mut scene_left = [9.0_f32; 100];
+    let mut scene_right = [9.0_f32; 100];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut left = [9.0_f32; 35];
+    let mut right = [9.0_f32; 35];
+    let cycle = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(cycle.loop_wrap_count(), 3, "35 frames over a 10-frame range");
+    assert_eq!(transport.position_frame(), 15);
+    let (segment_left, _) = render_linear(&fixture, 10, 10);
+    for (index, sample) in left.iter().enumerate() {
+        let expected = segment_left[index % 10];
+        assert!(
+            (sample - expected).abs() <= f32::EPSILON,
+            "frame {index} repeats the range: {sample} vs {expected}"
+        );
+    }
+}
+
+#[test]
+fn an_empty_or_inverted_loop_range_is_refused() {
+    assert_eq!(
+        TransportLoopRange::new(50, 50),
+        Err(TransportLoopRangeError::EmptyRange {
+            start_frame: 50,
+            end_frame: 50
+        })
+    );
+    assert_eq!(
+        TransportLoopRange::new(80, 20),
+        Err(TransportLoopRangeError::EmptyRange {
+            start_frame: 80,
+            end_frame: 20
+        })
+    );
+    let range = TransportLoopRange::new(20, 50).unwrap();
+    assert_eq!(range.frame_count(), 30);
+    assert!(range.contains(20) && range.contains(49));
+    assert!(
+        !range.contains(50),
+        "the range is half-open, so the end frame belongs to the next pass"
+    );
+}
+
+#[test]
+fn arming_a_range_does_not_move_the_playhead_and_disabling_leaves_it_where_it_is() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 100)
+            .unwrap();
+    let mut transport = PreparedPlaybackTransportRuntime::new(runtime);
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: 70,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    transport
+        .apply_command(TransportCommand::SetLoopRange(Some(
+            TransportLoopRange::new(10, 20).unwrap(),
+        )))
+        .unwrap();
+    transport
+        .apply_command(TransportCommand::SetLoopEnabled(true))
+        .unwrap();
+    assert_eq!(
+        transport.position_frame(),
+        70,
+        "engaging a loop the playhead is outside of does not yank it"
+    );
+
+    let mut arrangement_left = [9.0_f32; 100];
+    let mut arrangement_right = [9.0_f32; 100];
+    let mut scene_left = [9.0_f32; 100];
+    let mut scene_right = [9.0_f32; 100];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut left = [9.0_f32; 10];
+    let mut right = [9.0_f32; 10];
+    let outside = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+    assert_eq!(outside.loop_wrap_count(), 0);
+    assert_eq!(
+        transport.position_frame(),
+        80,
+        "and playback outside the range stays linear"
+    );
+
+    transport
+        .apply_command(TransportCommand::SetLoopEnabled(false))
+        .unwrap();
+    assert_eq!(
+        transport.position_frame(),
+        80,
+        "disabling the loop leaves the playhead alone"
     );
 }
 
@@ -642,7 +894,7 @@ fn transport_output_processor_reuses_maximum_scratch_for_variable_quanta() {
     assert_eq!(first_cycle.snapshot().cycle().start_frame(), 0);
     assert_eq!(first_cycle.snapshot().cycle().frame_count(), 50);
     assert_eq!(first_cycle.snapshot().cycle().active_slot_count(), 2);
-    assert_started_loudness(first_cycle.snapshot(), 50);
+    assert_started_loudness(&first_cycle.snapshot(), 50);
     for (actual, expected) in first
         .chunks_exact(2)
         .map(|frame| frame[0])
@@ -1847,7 +2099,7 @@ fn interleaved_callback_executes_the_transport_runtime() {
         &mut interleaved,
         &mut meter_sender,
         meter_receiver,
-        snapshot,
+        &snapshot,
     );
 }
 

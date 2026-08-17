@@ -488,7 +488,9 @@ impl RuntimeControlSink for DesktopControlSink {
                         state: LocateState::Preserve,
                         ..
                     }
-                    | TransportCommand::LaunchScene { .. } => DirectControlStateUpdate::Unchanged,
+                    | TransportCommand::LaunchScene { .. }
+                    | TransportCommand::SetLoopRange(_)
+                    | TransportCommand::SetLoopEnabled(_) => DirectControlStateUpdate::Unchanged,
                 })
             }
         }
