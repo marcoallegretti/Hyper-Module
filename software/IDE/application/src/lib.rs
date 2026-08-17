@@ -3356,6 +3356,24 @@ pub struct IdeLoopRangeFrames {
     pub enabled: bool,
 }
 
+/// The transport commands a reopened project needs so the runtime loops where
+/// the controls say it loops. A project with no usable range arms nothing.
+fn persisted_loop_commands(
+    range: Option<hyper_playback_session::PlaybackArrangementLoopRange>,
+) -> Vec<TransportCommand> {
+    let Some(range) = range else {
+        return Vec::new();
+    };
+    let Ok(transport_range) = TransportLoopRange::new(range.start_frame(), range.end_frame())
+    else {
+        return Vec::new();
+    };
+    vec![
+        TransportCommand::SetLoopRange(Some(transport_range)),
+        TransportCommand::SetLoopEnabled(range.enabled()),
+    ]
+}
+
 #[derive(Debug)]
 pub enum IdeTempoEditError {
     TimelineResourceMissing,
@@ -6801,34 +6819,10 @@ impl RunningDesktopIdeApplication {
         recovery: &DesktopPlaybackRecovery,
         range: Option<IdeLoopRangeFrames>,
     ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
-        let ticks = match range {
-            None => None,
-            Some(frames) => {
-                let prepared = recovery
-                    .prepared_project()
-                    .ok_or(IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
-                let (project, _, _, media) = prepared.session().parts();
-                let facts: Vec<_> = media.media_asset_facts().collect();
-                let graph = project
-                    .compile_playback(
-                        &facts,
-                        hyper_playback_compiler::graph::GraphLimits::VERSION_1,
-                        hyper_playback_compiler::scene::SceneLimits::VERSION_1,
-                    )
-                    .map_err(|_| IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
-                let authority = graph.scene_authority();
-                let start_tick = authority
-                    .frame_to_tick(frames.start_frame)
-                    .map_err(|_| IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
-                let end_tick = authority
-                    .frame_to_tick(frames.end_frame)
-                    .map_err(|_| IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
-                if end_tick <= start_tick {
-                    return Err(IdeArrangementPlacementEditError::ArrangementResourceMissing);
-                }
-                Some((start_tick, end_tick, frames.enabled))
-            }
-        };
+        let prepared = recovery
+            .prepared_project()
+            .ok_or(IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
+        let ticks = Self::loop_range_ticks(prepared, range)?;
         Self::prepare_arrangement_scene_launch_edit(
             application,
             recovery,
@@ -6836,6 +6830,38 @@ impl RunningDesktopIdeApplication {
                 serialize_arrangement_loop_range(project, assets, source, ticks, limits)
             },
         )
+    }
+
+    /// Converts the frames a user marked into the ticks the arrangement stores,
+    /// through the project's own timeline. Marks closer together than one tick
+    /// collapse, and a collapsed range is refused rather than written.
+    fn loop_range_ticks(
+        prepared: &PreparedProjectPlayback,
+        range: Option<IdeLoopRangeFrames>,
+    ) -> Result<Option<(u64, u64, bool)>, IdeArrangementPlacementEditError> {
+        let Some(frames) = range else {
+            return Ok(None);
+        };
+        let (project, _, _, media) = prepared.session().parts();
+        let facts: Vec<_> = media.media_asset_facts().collect();
+        let graph = project
+            .compile_playback(
+                &facts,
+                hyper_playback_compiler::graph::GraphLimits::VERSION_1,
+                hyper_playback_compiler::scene::SceneLimits::VERSION_1,
+            )
+            .map_err(|_| IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
+        let authority = graph.scene_authority();
+        let start_tick = authority
+            .frame_to_tick(frames.start_frame)
+            .map_err(|_| IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
+        let end_tick = authority
+            .frame_to_tick(frames.end_frame)
+            .map_err(|_| IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
+        if end_tick <= start_tick {
+            return Err(IdeArrangementPlacementEditError::ArrangementResourceMissing);
+        }
+        Ok(Some((start_tick, end_tick, frames.enabled)))
     }
 
     fn prepare_arrangement_scene_launch_scene_edit(
@@ -8403,16 +8429,9 @@ impl RunningDesktopIdeApplication {
             #[cfg(test)]
             IdePlaybackSessionOwner::Test(_) => None,
         };
-        let Some(range) = range else {
-            return;
-        };
-        let Ok(transport_range) =
-            TransportLoopRange::new(range.start_frame(), range.end_frame())
-        else {
-            return;
-        };
-        let _ = self.try_send_transport(TransportCommand::SetLoopRange(Some(transport_range)));
-        let _ = self.try_send_transport(TransportCommand::SetLoopEnabled(range.enabled()));
+        for command in persisted_loop_commands(range) {
+            let _ = self.try_send_transport(command);
+        }
     }
 
     /// Sends a bounded transport or scene command through the only live owner.
@@ -12103,6 +12122,153 @@ mod tests {
     /// that the round trip is lossy by construction: saving floors to the tick
     /// at or before the frame, seeding ceils back. This pins how far it can
     /// drift and that the drift never inverts the range.
+    /// The seam the review found untested twice over: the frames a user marks
+    /// must become the ticks the arrangement stores, in that order, and a
+    /// reopened project must arm the runtime it displays.
+    #[test]
+    fn marked_frames_become_the_ticks_the_arrangement_stores() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(fixture.root(), limits).unwrap();
+
+        assert_eq!(
+            RunningDesktopIdeApplication::loop_range_ticks(&prepared, None).unwrap(),
+            None,
+            "no marks writes no range"
+        );
+
+        let (start_tick, end_tick, enabled) =
+            RunningDesktopIdeApplication::loop_range_ticks(
+                &prepared,
+                Some(IdeLoopRangeFrames {
+                    start_frame: 24_000,
+                    end_frame: 96_000,
+                    enabled: true,
+                }),
+            )
+            .unwrap()
+            .expect("a usable range converts");
+        assert!(
+            start_tick < end_tick,
+            "the start mark becomes the start tick, not the end"
+        );
+        assert!(enabled, "and whether it was engaged survives the conversion");
+
+        let disengaged = RunningDesktopIdeApplication::loop_range_ticks(
+            &prepared,
+            Some(IdeLoopRangeFrames {
+                start_frame: 24_000,
+                end_frame: 96_000,
+                enabled: false,
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!disengaged.2, "a disengaged mark converts as disengaged");
+        assert_eq!(
+            (disengaged.0, disengaged.1),
+            (start_tick, end_tick),
+            "and the flag does not disturb the ticks"
+        );
+
+        assert!(
+            RunningDesktopIdeApplication::loop_range_ticks(
+                &prepared,
+                Some(IdeLoopRangeFrames {
+                    start_frame: 96_000,
+                    end_frame: 24_000,
+                    enabled: true,
+                }),
+            )
+            .is_err(),
+            "an inverted mark pair is refused rather than written"
+        );
+        assert!(
+            RunningDesktopIdeApplication::loop_range_ticks(
+                &prepared,
+                Some(IdeLoopRangeFrames {
+                    start_frame: 24_000,
+                    end_frame: 24_001,
+                    enabled: true,
+                }),
+            )
+            .is_err(),
+            "and so is a pair that collapses to one tick"
+        );
+    }
+
+    #[test]
+    fn a_reopened_project_arms_the_loop_it_displays() {
+        assert!(
+            persisted_loop_commands(None).is_empty(),
+            "a project with no loop arms nothing"
+        );
+
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert!(prepared.session().arrangement().loop_range().is_none());
+
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Arrangement)
+            .unwrap();
+        let arrangement_id = descriptor.id().to_owned();
+        let source = package.read_resource(&arrangement_id).unwrap();
+        let sha = *package.manifest_sha256();
+        let (project, _, _, media) = prepared.session().parts();
+        let facts: Vec<_> = media.media_asset_facts().collect();
+        let written = serialize_arrangement_loop_range(
+            project,
+            &facts,
+            &source,
+            Some((1_920, 7_680, true)),
+            limits.session.documents,
+        )
+        .unwrap();
+        drop(prepared);
+        publish_project_resource(
+            &project_path,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: sha,
+                resource_id: &arrangement_id,
+                expected_role: ResourceRole::Arrangement,
+                resource_bytes: &written,
+            },
+        )
+        .unwrap();
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let range = reopened
+            .session()
+            .arrangement()
+            .loop_range()
+            .expect("the reopened project carries the loop");
+        let commands = persisted_loop_commands(Some(range));
+        assert_eq!(
+            commands.len(),
+            2,
+            "a reopened loop arms both the range and whether it is engaged"
+        );
+        assert!(matches!(
+            commands[0],
+            TransportCommand::SetLoopRange(Some(_))
+        ));
+        assert!(
+            matches!(commands[1], TransportCommand::SetLoopEnabled(true)),
+            "a loop saved as engaged is armed as engaged, not merely displayed"
+        );
+    }
+
     #[test]
     fn a_loop_mark_round_trips_through_ticks_within_one_tick() {
         let fixture = ArrangementProjectFixture::with_two_scenes();
