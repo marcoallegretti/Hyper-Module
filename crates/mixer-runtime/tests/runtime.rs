@@ -540,6 +540,71 @@ fn an_empty_or_inverted_loop_range_is_refused() {
 }
 
 #[test]
+fn a_playhead_entering_from_before_a_short_range_still_loops() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 100)
+            .unwrap();
+    let mut transport = PreparedPlaybackTransportRuntime::new(runtime);
+    transport
+        .apply_command(TransportCommand::SetLoopRange(Some(
+            TransportLoopRange::new(40, 48).unwrap(),
+        )))
+        .unwrap();
+    transport
+        .apply_command(TransportCommand::SetLoopEnabled(true))
+        .unwrap();
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: 30,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+
+    let mut arrangement_left = [9.0_f32; 100];
+    let mut arrangement_right = [9.0_f32; 100];
+    let mut scene_left = [9.0_f32; 100];
+    let mut scene_right = [9.0_f32; 100];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut left = [9.0_f32; 40];
+    let mut right = [9.0_f32; 40];
+    let cycle = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+
+    assert!(
+        cycle.loop_wrap_count() > 0,
+        "a block that reaches a range shorter than itself must wrap, not step over it"
+    );
+    assert!(
+        transport.position_frame() >= 40 && transport.position_frame() < 48,
+        "and the playhead must end inside the range, not past it: {}",
+        transport.position_frame()
+    );
+
+    let (approach, _) = render_linear(&fixture, 30, 10);
+    assert_samples(&left[..10], &approach);
+    let (inside, _) = render_linear(&fixture, 40, 8);
+    for (index, sample) in left[10..18].iter().enumerate() {
+        assert!(
+            (sample - inside[index]).abs() <= f32::EPSILON,
+            "frame {index} after the range start replays the range"
+        );
+    }
+}
+
+#[test]
 fn a_range_that_is_armed_but_not_enabled_does_nothing() {
     let fixture = playback_fixture();
     let graph = fixture.compile_playback();

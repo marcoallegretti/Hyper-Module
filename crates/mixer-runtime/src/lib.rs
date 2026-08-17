@@ -3038,6 +3038,12 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 Some(range) if range.contains(position) => {
                     remaining.min(range.end_frame() - position)
                 }
+                // Approaching the range from before it: stop at the start so the
+                // next sub-window begins inside it. Without this the block runs
+                // straight over a range shorter than itself and never wraps.
+                Some(range) if position < range.start_frame() => {
+                    remaining.min(range.start_frame() - position)
+                }
                 _ => remaining,
             };
             let rendered = self.runtime.process_window(
