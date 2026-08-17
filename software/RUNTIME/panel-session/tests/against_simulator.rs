@@ -177,6 +177,39 @@ fn a_panel_that_stops_answering_times_out_without_stopping_the_runtime() {
 }
 
 #[test]
+fn a_link_fault_stops_the_session_driving_the_panel() {
+    // A panel frame arriving before the runtime has offered its versions is a
+    // protocol fault, not input.
+    let mut source = Peers::new();
+    source.connect();
+    source.panel.encoder_delta(0, 1, 5).unwrap();
+    source.panel.poll(5).unwrap();
+    let read = source.panel.read_panel_bytes(&mut source.buffer);
+    assert!(read > 0);
+    let stray = source.buffer[..read].to_vec();
+
+    let config = LinkConfig::new(HEARTBEAT_INTERVAL_MS, HEARTBEAT_TIMEOUT_MS).unwrap();
+    let mut session = PanelSession::new(config);
+    let events = session.receive(&stray, 1);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, PanelEvent::Fault(_))),
+        "a frame arriving before the handshake is a fault: {events:?}"
+    );
+    assert!(session.is_faulted());
+    assert!(!session.is_connected());
+    assert!(
+        session.take_transmit().is_empty(),
+        "a faulted session queues nothing further for the panel"
+    );
+    assert!(
+        session.receive(&stray, 2).is_empty(),
+        "and ignores anything more that arrives"
+    );
+}
+
+#[test]
 fn a_corrupted_frame_is_reported_and_the_link_survives_it() {
     let mut peers = Peers::new();
     peers.connect();
