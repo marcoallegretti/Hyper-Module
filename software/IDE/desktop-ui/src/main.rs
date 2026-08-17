@@ -7649,20 +7649,34 @@ fn loop_toggle_available(mode: AppMode, marks: LoopMarks) -> bool {
     loop_marking_available(mode) && marks.range().is_some()
 }
 
-/// Restores the marks a reopened project already carries. The user's own marks
-/// win once they have set any, so reopening seeds but never overwrites.
-fn seed_loop_marks(state: &ProjectUiStateCell, observation: &IdeRunningObservation) {
-    if state.loop_marks.get() != LoopMarks::default() {
-        return;
+/// The marks a reopened project should show. The user's own marks win once they
+/// have set any, so reopening seeds but never overwrites.
+fn seeded_loop_marks(
+    current: LoopMarks,
+    persisted: Option<(usize, usize, bool)>,
+) -> Option<(LoopMarks, bool)> {
+    if current != LoopMarks::default() {
+        return None;
     }
-    let Some(range) = observation.arrangement().loop_range() else {
-        return;
-    };
-    state.loop_marks.set(LoopMarks {
-        start: Some(range.start_frame()),
-        end: Some(range.end_frame()),
-    });
-    state.loop_engaged.set(range.enabled());
+    let (start, end, enabled) = persisted?;
+    Some((
+        LoopMarks {
+            start: Some(start),
+            end: Some(end),
+        },
+        enabled,
+    ))
+}
+
+fn seed_loop_marks(state: &ProjectUiStateCell, observation: &IdeRunningObservation) {
+    let persisted = observation
+        .arrangement()
+        .loop_range()
+        .map(|range| (range.start_frame(), range.end_frame(), range.enabled()));
+    if let Some((marks, enabled)) = seeded_loop_marks(state.loop_marks.get(), persisted) {
+        state.loop_marks.set(marks);
+        state.loop_engaged.set(enabled);
+    }
 }
 
 fn refresh_loop_controls(ui: &MainWindow, state: &ProjectUiStateCell, sample_rate_hz: u32) {
@@ -8559,6 +8573,42 @@ mod tests {
                 "a range the transport would refuse is never written"
             );
         }
+    }
+
+    #[test]
+    fn reopening_seeds_the_saved_loop_but_never_overwrites_the_users_marks() {
+        assert_eq!(
+            seeded_loop_marks(LoopMarks::default(), Some((48_000, 96_000, true))),
+            Some((
+                LoopMarks {
+                    start: Some(48_000),
+                    end: Some(96_000)
+                },
+                true
+            )),
+            "a saved loop comes back with the project"
+        );
+        assert_eq!(
+            seeded_loop_marks(LoopMarks::default(), Some((0, 1_920, false)))
+                .map(|(_, enabled)| enabled),
+            Some(false),
+            "including whether it was engaged"
+        );
+        assert_eq!(
+            seeded_loop_marks(LoopMarks::default(), None),
+            None,
+            "a project with no saved loop seeds nothing"
+        );
+
+        let user_marks = LoopMarks {
+            start: Some(10),
+            end: None,
+        };
+        assert_eq!(
+            seeded_loop_marks(user_marks, Some((48_000, 96_000, true))),
+            None,
+            "and a mark the user already set is never overwritten by an observation"
+        );
     }
 
     #[test]

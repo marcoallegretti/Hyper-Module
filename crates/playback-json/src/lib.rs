@@ -13396,16 +13396,21 @@ mod tests {
             "clearing removes the field rather than writing an empty one"
         );
 
-        assert!(matches!(
-            serialize_arrangement_loop_range(
-                &project,
-                &assets,
-                &source,
-                Some((7680, 1920, true)),
-                LoaderLimits::VERSION_1,
-            ),
-            Err(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)
-        ));
+        for unusable in [(7680, 1920, true), (1920, 1920, true)] {
+            assert!(
+                matches!(
+                    serialize_arrangement_loop_range(
+                        &project,
+                        &assets,
+                        &source,
+                        Some(unusable),
+                        LoaderLimits::VERSION_1,
+                    ),
+                    Err(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)
+                ),
+                "a range the transport could never run is refused before writing: {unusable:?}"
+            );
+        }
         assert!(matches!(
             serialize_arrangement_loop_range(
                 &project,
