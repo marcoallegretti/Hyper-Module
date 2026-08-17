@@ -5734,6 +5734,7 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_loop_summary(SharedString::default());
     ui.set_tempo_bpm(SharedString::default());
     ui.set_tempo_available(false);
+    ui.set_tempo_locked_reason(SharedString::default());
     ui.set_loop_marking_available(false);
     ui.set_loop_toggle_available(false);
     ui.set_loop_engaged(false);
@@ -7725,13 +7726,27 @@ fn refresh_loop_controls(ui: &MainWindow, state: &ProjectUiStateCell, sample_rat
 
 /// The tempo a stored value represents. Shown to at most two decimals because
 /// the stored integer is exact and the beats-per-minute figure is derived.
+/// Hyper does not time-stretch, so a placed audio clip pins the tempo: changing
+/// it would leave the audio no longer fitting its authored duration and the
+/// compiler refuses. The control is therefore offered only while the
+/// arrangement is still empty, rather than accepting an edit that would fail.
+fn tempo_editable(placement_count: usize) -> bool {
+    placement_count == 0
+}
+
 fn set_tempo_and_loop(
     ui: &MainWindow,
     project_state: &ProjectUiStateCell,
     observation: &IdeRunningObservation,
 ) {
+    let editable = tempo_editable(observation.arrangement().placements().len());
     ui.set_tempo_bpm(format_tempo_bpm(observation.microseconds_per_quarter()).into());
-    ui.set_tempo_available(true);
+    ui.set_tempo_available(editable);
+    ui.set_tempo_locked_reason(if editable {
+        SharedString::default()
+    } else {
+        "TEMPO IS FIXED WHILE AUDIO IS PLACED".into()
+    });
     seed_loop_marks(project_state, observation);
     refresh_loop_controls(ui, project_state, observation.sample_rate_hz());
 }
@@ -8589,6 +8604,19 @@ mod tests {
             "\"abc\" is not a tempo",
             "and the message names what was typed"
         );
+    }
+
+    #[test]
+    fn the_tempo_control_closes_once_audio_is_placed() {
+        assert!(
+            tempo_editable(0),
+            "an empty arrangement can still choose its tempo"
+        );
+        assert!(
+            !tempo_editable(1),
+            "one placed clip pins the tempo, because Hyper does not time-stretch"
+        );
+        assert!(!tempo_editable(9));
     }
 
     #[test]

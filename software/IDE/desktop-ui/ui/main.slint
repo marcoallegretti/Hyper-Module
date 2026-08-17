@@ -558,6 +558,7 @@ export component MainWindow inherits Window {
     in property <bool> loop-engaged: false;
     in property <string> tempo-bpm: "";
     in property <bool> tempo-available: false;
+    in property <string> tempo-locked-reason: "";
     in property <float> transport-progress-percent: 0;
     in property <string> transport-end-clock: "—";
     in property <string> callback-count: "0";
@@ -1078,6 +1079,12 @@ export component MainWindow inherits Window {
                                         enabled: root.tempo-available;
                                         accessible-label: "Apply the typed tempo to the project";
                                         clicked => { IdeActions.set-tempo(tempo-input.text); }
+                                    }
+                                    Text {
+                                        text: root.tempo-locked-reason;
+                                        color: #b58a67;
+                                        font-size: 9px;
+                                        vertical-alignment: center;
                                     }
                                 }
                                 HorizontalLayout {

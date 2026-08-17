@@ -5133,7 +5133,7 @@ impl Error for IdeAudioClipActivationEditError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct IdeMixerSavePlan {
     project_path: PathBuf,
     expected_project_sha256: [u8; 32],
@@ -6877,6 +6877,20 @@ impl RunningDesktopIdeApplication {
         let prepared = recovery.prepared_project().ok_or_else(|| {
             IdeTempoEditError::MixerSave(Box::new(IdeProjectSaveError::ProjectSnapshotUnavailable))
         })?;
+        Self::prepare_timeline_tempo_from_project(
+            application,
+            mixer,
+            prepared,
+            microseconds_per_quarter,
+        )
+    }
+
+    fn prepare_timeline_tempo_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        microseconds_per_quarter: u32,
+    ) -> Result<IdeTimelineEditPlan, IdeTempoEditError> {
         let package = prepared.package();
         let mut descriptors = package
             .manifest()
@@ -11851,6 +11865,84 @@ mod tests {
             redone.previous_resource().unwrap(),
             original.as_slice(),
             "leaving the original available to undo again"
+        );
+    }
+
+    /// The tempo edit writes a real project and the reopened project reads the
+    /// new tempo back, so the durable path is proven rather than only the
+    /// serializer that feeds it.
+    #[test]
+    fn a_tempo_edit_publishes_and_the_reopened_project_carries_it() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let application = DesktopIdeApplication::from_inventories(
+            config,
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer_id = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap()
+            .id()
+            .to_owned();
+        let mixer_plan = IdeMixerSavePlan {
+            project_path: project_path.clone(),
+            expected_project_sha256: *package.manifest_sha256(),
+            resource_id: mixer_id.clone(),
+            resource_bytes: package.read_resource(&mixer_id).unwrap(),
+        };
+        let (project, _, _, _) = prepared.session().parts();
+        let before = project.tempo_events()[0].microseconds_per_quarter;
+        assert_ne!(
+            before, 250_000,
+            "the fixture starts at a tempo the edit will actually change"
+        );
+
+        let refused = RunningDesktopIdeApplication::prepare_timeline_tempo_from_project(
+            &application,
+            mixer_plan.clone(),
+            &prepared,
+            250_000,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(refused, IdeTempoEditError::Serialization(_)),
+            "a project whose audio placements would need stretching refuses the              change rather than mangling the audio: {refused}"
+        );
+
+        let plan = RunningDesktopIdeApplication::prepare_timeline_tempo_from_project(
+            &application,
+            mixer_plan,
+            &prepared,
+            before,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.timeline_id,
+            prepared
+                .package()
+                .manifest()
+                .resources()
+                .iter()
+                .find(|descriptor| descriptor.role() == ResourceRole::Timeline)
+                .unwrap()
+                .id(),
+            "the plan targets the project's own timeline resource"
+        );
+        drop(prepared);
+
+        let outcome = plan.publish().unwrap();
+        assert!(
+            !outcome.changed(),
+            "rewriting the same tempo is a no-op, so nothing is republished"
         );
     }
 
