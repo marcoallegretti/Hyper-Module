@@ -18,13 +18,6 @@ const NORMALIZED_SIGNED_MIN: i32 = -1_000_000;
 const NORMALIZED_SIGNED_MAX: i32 = 1_000_000;
 const NORMALIZED_UNSIGNED_MAX: i32 = 1_000_000;
 
-/// The largest gain, in millionths, a continuous control can reach.
-pub const GAIN_MILLIONTHS_MAX: i32 = NORMALIZED_UNSIGNED_MAX * 2;
-/// The leftmost pan position, in millionths, a continuous control can reach.
-pub const PAN_MILLIONTHS_MIN: i32 = -NORMALIZED_UNSIGNED_MAX;
-/// The rightmost pan position, in millionths, a continuous control can reach.
-pub const PAN_MILLIONTHS_MAX: i32 = NORMALIZED_UNSIGNED_MAX;
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Edge {

@@ -6,20 +6,66 @@ use hyper_control_mappings::{ChannelParameter, MainParameter, SendParameter};
 use hyper_control_runtime::{
     BooleanControlTarget, ControlBindingAvailability, ControlBindingUnavailableReason,
     ControlRuntime, DirectControlStateUpdate, RuntimeControlCommand, RuntimeControlSink,
-    RuntimeControlTarget, ValueControlTarget,
+    RuntimeControlTarget, ValueControlTarget, ValueDomain,
 };
 use hyper_mixer_runtime::{
     LocateState, MixerChannelHandle, MixerParameterCommand, MixerParameterCommandSendError,
-    MixerParameterCommandSender, MixerParameterResolveError, MixerParameterTargetError,
-    MixerSendHandle, PlaybackRecoveryCheckpoint, PlaybackRecoveryTransportState, TransportCommand,
-    TransportCommandSendError, TransportCommandSender,
+    MixerParameterCommandSender, MixerParameterResolveError, MixerParameterStateSnapshot,
+    MixerParameterTargetError, MixerSendHandle, PlaybackRecoveryCheckpoint,
+    PlaybackRecoveryTransportState, TransportCommand, TransportCommandSendError,
+    TransportCommandSender,
 };
 
 pub type DesktopControlMappingRuntime = ControlRuntime<DesktopControlSink>;
 
+/// The widest gain, in millionths, [`LinearGain::from_millionths`] accepts.
+const GAIN_MILLIONTHS_MAX: i32 = 2_000_000;
+/// The pan extremes, in millionths, [`Pan::from_millionths`] accepts.
+const PAN_MILLIONTHS_MAX: i32 = 1_000_000;
+
 fn gain_millionths(gain: LinearGain) -> i32 {
     i32::try_from(gain.to_millionths())
         .expect("a linear gain is bounded at 2.0, so its millionths fit a signed value")
+}
+
+fn value_from_state(
+    state: &MixerParameterStateSnapshot,
+    target: ValueControlTarget,
+) -> Option<i32> {
+    match target {
+        ValueControlTarget::ChannelGain { channel_index } => Some(gain_millionths(
+            state.channel(channel_index)?.parameters().gain,
+        )),
+        ValueControlTarget::ChannelPan { channel_index } => Some(
+            state
+                .channel(channel_index)?
+                .parameters()
+                .pan
+                .to_millionths(),
+        ),
+        ValueControlTarget::SendGain {
+            channel_index,
+            send_index,
+        } => Some(gain_millionths(
+            state
+                .channel(channel_index)?
+                .send(send_index)?
+                .parameters()
+                .gain,
+        )),
+        ValueControlTarget::SendPan {
+            channel_index,
+            send_index,
+        } => Some(
+            state
+                .channel(channel_index)?
+                .send(send_index)?
+                .parameters()
+                .pan
+                .to_millionths(),
+        ),
+        ValueControlTarget::MainGain => Some(gain_millionths(state.main_gain())),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -458,40 +504,17 @@ impl RuntimeControlSink for DesktopControlSink {
     }
 
     fn value_state(&self, target: ValueControlTarget) -> Option<i32> {
-        let state = self.recovery.snapshot().mixer_parameter_state()?;
+        value_from_state(&self.recovery.snapshot().mixer_parameter_state()?, target)
+    }
+
+    fn value_domain(&self, target: ValueControlTarget) -> ValueDomain {
         match target {
-            ValueControlTarget::ChannelGain { channel_index } => Some(gain_millionths(
-                state.channel(channel_index)?.parameters().gain,
-            )),
-            ValueControlTarget::ChannelPan { channel_index } => Some(
-                state
-                    .channel(channel_index)?
-                    .parameters()
-                    .pan
-                    .to_millionths(),
-            ),
-            ValueControlTarget::SendGain {
-                channel_index,
-                send_index,
-            } => Some(gain_millionths(
-                state
-                    .channel(channel_index)?
-                    .send(send_index)?
-                    .parameters()
-                    .gain,
-            )),
-            ValueControlTarget::SendPan {
-                channel_index,
-                send_index,
-            } => Some(
-                state
-                    .channel(channel_index)?
-                    .send(send_index)?
-                    .parameters()
-                    .pan
-                    .to_millionths(),
-            ),
-            ValueControlTarget::MainGain => Some(gain_millionths(state.main_gain())),
+            ValueControlTarget::ChannelGain { .. }
+            | ValueControlTarget::SendGain { .. }
+            | ValueControlTarget::MainGain => ValueDomain::new(0, GAIN_MILLIONTHS_MAX),
+            ValueControlTarget::ChannelPan { .. } | ValueControlTarget::SendPan { .. } => {
+                ValueDomain::new(-PAN_MILLIONTHS_MAX, PAN_MILLIONTHS_MAX)
+            }
         }
     }
 
@@ -573,5 +596,142 @@ impl RuntimeControlSink for DesktopControlSink {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyper_audio_engine::ChannelParameters;
+    use hyper_mixer_runtime::{MixerChannelParameterState, MixerSendParameterState};
+
+    use super::{
+        GAIN_MILLIONTHS_MAX, LinearGain, MixerParameterStateSnapshot, PAN_MILLIONTHS_MAX, Pan,
+        ValueControlTarget, gain_millionths, value_from_state,
+    };
+
+    fn gain(millionths: i32) -> LinearGain {
+        LinearGain::from_millionths(u32::try_from(millionths).unwrap()).unwrap()
+    }
+
+    fn pan(millionths: i32) -> Pan {
+        Pan::from_millionths(millionths).unwrap()
+    }
+
+    fn parameters(gain_millionths: i32, pan_millionths: i32) -> ChannelParameters {
+        ChannelParameters::new(gain(gain_millionths), pan(pan_millionths), true)
+    }
+
+    fn snapshot() -> MixerParameterStateSnapshot {
+        MixerParameterStateSnapshot::for_test(
+            &[
+                MixerChannelParameterState::for_test(
+                    parameters(100_000, -100_000),
+                    false,
+                    false,
+                    &[],
+                ),
+                MixerChannelParameterState::for_test(
+                    parameters(200_000, -200_000),
+                    false,
+                    false,
+                    &[
+                        MixerSendParameterState::for_test(parameters(300_000, -300_000), true),
+                        MixerSendParameterState::for_test(parameters(400_000, -400_000), true),
+                    ],
+                ),
+            ],
+            gain(500_000),
+            false,
+        )
+    }
+
+    #[test]
+    fn each_value_target_reads_its_own_parameter_from_the_snapshot() {
+        let state = snapshot();
+
+        assert_eq!(
+            value_from_state(&state, ValueControlTarget::ChannelGain { channel_index: 1 }),
+            Some(200_000)
+        );
+        assert_eq!(
+            value_from_state(&state, ValueControlTarget::ChannelPan { channel_index: 1 }),
+            Some(-200_000)
+        );
+        assert_eq!(
+            value_from_state(
+                &state,
+                ValueControlTarget::SendGain {
+                    channel_index: 1,
+                    send_index: 1,
+                }
+            ),
+            Some(400_000)
+        );
+        assert_eq!(
+            value_from_state(
+                &state,
+                ValueControlTarget::SendPan {
+                    channel_index: 1,
+                    send_index: 0,
+                }
+            ),
+            Some(-300_000)
+        );
+        assert_eq!(
+            value_from_state(&state, ValueControlTarget::MainGain),
+            Some(500_000)
+        );
+    }
+
+    #[test]
+    fn an_absent_channel_or_send_reads_as_unknown_rather_than_as_a_neighbour() {
+        let state = snapshot();
+
+        assert_eq!(
+            value_from_state(&state, ValueControlTarget::ChannelGain { channel_index: 2 }),
+            None
+        );
+        assert_eq!(
+            value_from_state(
+                &state,
+                ValueControlTarget::SendGain {
+                    channel_index: 0,
+                    send_index: 0,
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            value_from_state(
+                &state,
+                ValueControlTarget::SendPan {
+                    channel_index: 1,
+                    send_index: 2,
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_declared_value_domains_are_exactly_what_the_parameter_types_accept() {
+        assert!(LinearGain::from_millionths(u32::try_from(GAIN_MILLIONTHS_MAX).unwrap()).is_ok());
+        assert!(
+            LinearGain::from_millionths(u32::try_from(GAIN_MILLIONTHS_MAX).unwrap() + 1).is_err()
+        );
+        assert!(Pan::from_millionths(PAN_MILLIONTHS_MAX).is_ok());
+        assert!(Pan::from_millionths(PAN_MILLIONTHS_MAX + 1).is_err());
+        assert!(Pan::from_millionths(-PAN_MILLIONTHS_MAX).is_ok());
+        assert!(Pan::from_millionths(-PAN_MILLIONTHS_MAX - 1).is_err());
+    }
+
+    #[test]
+    fn a_gain_at_its_ceiling_converts_without_overflowing_the_signed_domain() {
+        assert_eq!(
+            gain_millionths(gain(GAIN_MILLIONTHS_MAX)),
+            GAIN_MILLIONTHS_MAX
+        );
+        assert_eq!(gain_millionths(LinearGain::SILENCE), 0);
+        assert_eq!(gain_millionths(LinearGain::UNITY), 1_000_000);
     }
 }

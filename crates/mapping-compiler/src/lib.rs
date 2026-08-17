@@ -162,6 +162,18 @@ pub struct CompiledControlMappingTable {
 }
 
 impl CompiledControlMappingTable {
+    /// A table with no bindings, for a project that maps no control input.
+    ///
+    /// The runtime that owns this table also owns panel bindings and the sole
+    /// shadow of live mixer state, so it exists for every project rather than
+    /// only for those carrying a control-mapping document.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            bindings: Vec::new(),
+        }
+    }
+
     #[must_use]
     pub fn bindings(&self) -> &[CompiledControlBinding] {
         &self.bindings

@@ -2,9 +2,8 @@
 #![forbid(unsafe_code)]
 
 use hyper_control_mappings::{
-    ChannelParameter, ContinuousControlValue, CueParameter, Edge, GAIN_MILLIONTHS_MAX,
-    MainParameter, PAN_MILLIONTHS_MAX, PAN_MILLIONTHS_MIN, SceneAction, SendParameter,
-    TransportAction, TriggerBehavior,
+    ChannelParameter, ContinuousControlValue, CueParameter, Edge, MainParameter, SceneAction,
+    SendParameter, TransportAction, TriggerBehavior,
 };
 use hyper_mapping_compiler::{
     CompiledControlBinding, CompiledControlMappingTable, CompiledControlScope,
@@ -14,9 +13,9 @@ use hyper_mapping_compiler::{
 mod panel;
 
 pub use panel::{
-    PanelActionTarget, PanelAlreadyConnected, PanelBinding, PanelBindingRefusal,
-    PanelBindingRefusalReason, PanelButtonBehavior, PanelControl, PanelDispatchError,
-    PanelDispatchOutcome, PanelReleaseFailure,
+    PanelActionTarget, PanelBinding, PanelBindingRefusal, PanelBindingRefusalReason,
+    PanelButtonBehavior, PanelConnectError, PanelConnection, PanelControl, PanelDispatchError,
+    PanelDispatchOutcome, PanelReleaseFailure, UnboundReason,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,16 +133,51 @@ pub enum ValueControlTarget {
     MainGain,
 }
 
-impl ValueControlTarget {
-    const fn domain(self) -> (i32, i32) {
-        match self {
-            Self::ChannelGain { .. } | Self::SendGain { .. } | Self::MainGain => {
-                (0, GAIN_MILLIONTHS_MAX)
-            }
-            Self::ChannelPan { .. } | Self::SendPan { .. } => {
-                (PAN_MILLIONTHS_MIN, PAN_MILLIONTHS_MAX)
-            }
-        }
+/// The inclusive range of positions one continuous target accepts, reported by
+/// the sink that will accept or reject the command rather than inferred from
+/// the range some other producer happens to reach.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValueDomain {
+    minimum: i32,
+    maximum: i32,
+}
+
+impl ValueDomain {
+    /// Declares one target's accepted range.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `minimum` is not below `maximum`. A domain that cannot hold
+    /// a value is a sink defect, and every relative move clamps into it.
+    #[must_use]
+    pub const fn new(minimum: i32, maximum: i32) -> Self {
+        assert!(
+            minimum < maximum,
+            "a value domain holds at least two values"
+        );
+        Self { minimum, maximum }
+    }
+
+    #[must_use]
+    pub const fn minimum(self) -> i32 {
+        self.minimum
+    }
+
+    #[must_use]
+    pub const fn maximum(self) -> i32 {
+        self.maximum
+    }
+
+    /// Brings one relative move into the accepted range. Total: a move that
+    /// overflows `i32` saturates before it is clamped.
+    #[must_use]
+    pub fn clamp(self, value: i64) -> i32 {
+        let saturated = i32::try_from(value).unwrap_or(if value.is_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        });
+        saturated.clamp(self.minimum, self.maximum)
     }
 }
 
@@ -259,6 +293,13 @@ pub trait RuntimeControlSink {
     /// accumulated itself, so it has to be able to read that position back.
     fn value_state(&self, target: ValueControlTarget) -> Option<i32>;
 
+    /// Reports the range this sink will accept for one continuous target.
+    ///
+    /// Declared here because this is the object that rejects an out-of-range
+    /// command; a relative move clamps into it rather than into a range some
+    /// other producer happens to reach.
+    fn value_domain(&self, target: ValueControlTarget) -> ValueDomain;
+
     /// Sends one already mapped runtime command.
     ///
     /// # Errors
@@ -326,12 +367,16 @@ impl<S: RuntimeControlSink> ControlRuntimeBuildError<S> {
 struct BooleanShadow {
     target: BooleanControlTarget,
     value: Option<bool>,
+    /// Created for a panel binding rather than a compiled one, so the matching
+    /// disconnect removes exactly what the connect added.
+    panel_seeded: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ValueShadow {
     target: ValueControlTarget,
     value: Option<i32>,
+    panel_seeded: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -464,6 +509,7 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
                     boolean_shadows.push(BooleanShadow {
                         target,
                         value: sink.boolean_state(target),
+                        panel_seeded: false,
                     });
                 }
             }

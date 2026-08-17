@@ -440,6 +440,17 @@ impl MixerSendParameterState {
         }
     }
 
+    /// Builds one send's parameter state for tests. See
+    /// [`MixerParameterStateSnapshot::for_test`].
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn for_test(parameters: ChannelParameters, enabled: bool) -> Self {
+        Self {
+            parameters,
+            enabled,
+        }
+    }
+
     #[must_use]
     pub const fn parameters(self) -> ChannelParameters {
         self.parameters
@@ -482,6 +493,38 @@ impl MixerChannelParameterState {
             })
         } else {
             None
+        }
+    }
+
+    /// Builds one channel's parameter state for tests. See
+    /// [`MixerParameterStateSnapshot::for_test`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when more sends are supplied than a channel slot can hold.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn for_test(
+        parameters: ChannelParameters,
+        muted: bool,
+        solo: bool,
+        sends: &[MixerSendParameterState],
+    ) -> Self {
+        assert!(
+            sends.len() <= MAX_MIXER_SENDS_PER_SLOT,
+            "a channel holds at most {MAX_MIXER_SENDS_PER_SLOT} sends"
+        );
+        let mut slots = [MixerSendParameterState::for_test(
+            ChannelParameters::new(LinearGain::UNITY, Pan::CENTER, true),
+            false,
+        ); MAX_MIXER_SENDS_PER_SLOT];
+        slots[..sends.len()].copy_from_slice(sends);
+        Self {
+            parameters,
+            muted,
+            solo,
+            sends: slots,
+            send_count: sends.len(),
         }
     }
 
@@ -577,6 +620,43 @@ impl MixerParameterStateSnapshot {
             Some(self.channels[index])
         } else {
             None
+        }
+    }
+
+    /// Builds one snapshot for tests in crates that read mixer state but cannot
+    /// run a mixer.
+    ///
+    /// The layout signature is zeroed, so a snapshot built here is not
+    /// restorable against any real runtime — it carries parameter values for
+    /// readers to inspect and nothing more.
+    ///
+    /// # Panics
+    ///
+    /// Panics when more channels are supplied than a mixer can hold.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn for_test(
+        channels: &[MixerChannelParameterState],
+        main_gain: LinearGain,
+        main_muted: bool,
+    ) -> Self {
+        assert!(
+            channels.len() <= MAX_MAIN_MIXER_SLOTS,
+            "a mixer holds at most {MAX_MAIN_MIXER_SLOTS} channels"
+        );
+        let mut slots = [MixerChannelParameterState::for_test(
+            ChannelParameters::new(LinearGain::UNITY, Pan::CENTER, true),
+            false,
+            false,
+            &[],
+        ); MAX_MAIN_MIXER_SLOTS];
+        slots[..channels.len()].copy_from_slice(channels);
+        Self {
+            layout_signature: [0; 32],
+            channels: slots,
+            channel_count: channels.len(),
+            main_gain,
+            main_muted,
         }
     }
 

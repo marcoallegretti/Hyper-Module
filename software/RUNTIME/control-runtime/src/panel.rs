@@ -120,17 +120,55 @@ impl<E> PanelBindingRefusal<E> {
     pub const fn reason(&self) -> &PanelBindingRefusalReason<E> {
         &self.reason
     }
-
-    #[must_use]
-    pub fn into_reason(self) -> PanelBindingRefusalReason<E> {
-        self.reason
-    }
 }
 
-/// A panel is already connected. Disconnect it first so anything held is
-/// released rather than stranded.
+/// Why a panel's bindings could not be installed at all.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PanelAlreadyConnected;
+pub enum PanelConnectError {
+    /// A panel is already connected. Disconnect it first so anything held is
+    /// released rather than stranded.
+    AlreadyConnected,
+    /// Shadow state for the bindings could not be allocated.
+    CapacityUnavailable,
+}
+
+/// The outcome of installing one panel's bindings.
+///
+/// Carries the bindings the panel refused. It is `#[must_use]` because
+/// reporting a refusal rather than silently ignoring it is the point of the
+/// refusal — a caller that drops this has turned the guarantee back into
+/// silent ignoring.
+#[must_use = "a refused binding is silently ignored unless the caller reads it"]
+#[derive(Debug, Eq, PartialEq)]
+pub struct PanelConnection<E> {
+    refused: Vec<PanelBindingRefusal<E>>,
+    installed: usize,
+}
+
+impl<E> PanelConnection<E> {
+    #[must_use]
+    pub fn refused(&self) -> &[PanelBindingRefusal<E>] {
+        &self.refused
+    }
+
+    /// Whether every offered binding installed.
+    #[must_use]
+    pub fn is_fully_installed(&self) -> bool {
+        self.refused.is_empty()
+    }
+
+    /// How many bindings the connected panel can actually serve. Zero means the
+    /// panel is connected but inert.
+    #[must_use]
+    pub const fn installed(&self) -> usize {
+        self.installed
+    }
+
+    #[must_use]
+    pub fn into_refused(self) -> Vec<PanelBindingRefusal<E>> {
+        self.refused
+    }
+}
 
 /// One held control the sink refused to release at disconnect.
 #[derive(Debug, Eq, PartialEq)]
@@ -169,12 +207,31 @@ pub enum PanelDispatchError<E> {
     },
 }
 
+/// Why a message commanded nothing, distinguished so an operator debugging a
+/// silent panel is not told the same thing in every case.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnboundReason {
+    /// Link upkeep, an input kind nothing binds, or a message addressed to the
+    /// panel rather than sent by it.
+    MessageBindsNothing,
+    /// A control id no descriptor can name.
+    ControlOutOfRange,
+    /// No panel is connected.
+    NoPanelConnected,
+    /// The panel is connected but nothing claims this control.
+    NoBinding { control: PanelControl },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PanelDispatchOutcome {
-    /// No binding claims the control, or the message binds nothing.
-    Unbound,
+    /// Nothing claims this message.
+    Unbound(UnboundReason),
     /// A binding claims the control but this edge commands nothing.
     Idle { control: PanelControl },
+    /// A relative move that the target's domain absorbed, so the position did
+    /// not change. Distinct from [`Self::Idle`] because a control sitting at
+    /// its limit is a state worth showing.
+    AtLimit { control: PanelControl },
     Unavailable {
         control: PanelControl,
         reason: ControlBindingUnavailableReason,
@@ -206,6 +263,7 @@ enum PanelEdge {
 
 enum PanelCommand {
     Idle,
+    AtLimit,
     StateUnavailable,
     Send(RuntimeControlCommand),
 }
@@ -225,9 +283,9 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
         &mut self,
         descriptor: PanelDescriptor,
         bindings: &[PanelBinding],
-    ) -> Result<Vec<PanelBindingRefusal<S::Error>>, PanelAlreadyConnected> {
+    ) -> Result<PanelConnection<S::Error>, PanelConnectError> {
         if self.panel.is_some() {
-            return Err(PanelAlreadyConnected);
+            return Err(PanelConnectError::AlreadyConnected);
         }
         let mut installed: Vec<InstalledBinding> = Vec::new();
         let mut refused = Vec::new();
@@ -271,40 +329,71 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
             });
         }
         for installed in &installed {
-            self.seed_shadow(installed.binding);
+            if self.seed_shadow(installed.binding).is_err() {
+                self.value_shadows.retain(|shadow| !shadow.panel_seeded);
+                self.boolean_shadows.retain(|shadow| !shadow.panel_seeded);
+                return Err(PanelConnectError::CapacityUnavailable);
+            }
         }
+        let count = installed.len();
         self.panel = Some(PanelBindings {
             bindings: installed,
         });
-        Ok(refused)
+        Ok(PanelConnection {
+            refused,
+            installed: count,
+        })
     }
 
-    /// Forgets the panel's bindings, releasing any momentary control still held
-    /// so a link lost mid-press cannot strand its target.
+    /// Releases any momentary control still held, then forgets the panel's
+    /// bindings, so a link lost mid-press cannot strand its target.
+    ///
+    /// A binding whose release the sink refuses stays installed and stays held,
+    /// so the panel is *not* forgotten and a later call retries it. Check the
+    /// returned failures rather than assuming the panel is gone —
+    /// [`Self::panel_connected`] still reports true while any release is
+    /// outstanding.
     #[must_use]
     pub fn disconnect_panel(&mut self) -> Vec<PanelReleaseFailure<S::Error>> {
         let mut failures = Vec::new();
-        let Some(panel) = self.panel.take() else {
+        let Some(panel) = self.panel.as_ref() else {
             return failures;
         };
-        for installed in &panel.bindings {
-            if !installed.held {
-                continue;
-            }
-            let PanelBinding::Button { target, .. } = installed.binding else {
-                continue;
-            };
+        let held: Vec<(usize, PanelControl, BooleanControlTarget)> = panel
+            .bindings
+            .iter()
+            .enumerate()
+            .filter_map(
+                |(position, installed)| match (installed.binding, installed.held) {
+                    (PanelBinding::Button { target, .. }, true) => {
+                        Some((position, installed.binding.control(), target))
+                    }
+                    _ => None,
+                },
+            )
+            .collect();
+        for (position, control, target) in held {
             let command = boolean_command(target, false);
             match self.sink.try_send(command) {
-                Ok(()) => self.commit_shadow(command),
+                Ok(()) => {
+                    self.commit_shadow(command);
+                    if let Some(panel) = self.panel.as_mut() {
+                        panel.bindings[position].held = false;
+                    }
+                }
                 Err(source) => failures.push(PanelReleaseFailure {
-                    control: installed.binding.control(),
+                    control,
                     command,
                     source,
                 }),
             }
         }
-        self.value_shadows.clear();
+        if !failures.is_empty() {
+            return failures;
+        }
+        self.panel = None;
+        self.value_shadows.retain(|shadow| !shadow.panel_seeded);
+        self.boolean_shadows.retain(|shadow| !shadow.panel_seeded);
         failures
     }
 
@@ -324,26 +413,44 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
         &mut self,
         message: Message,
     ) -> Result<PanelDispatchOutcome, PanelDispatchError<S::Error>> {
-        let Some((control, edge)) = panel_input(message) else {
-            return Ok(PanelDispatchOutcome::Unbound);
+        let (control, edge) = match panel_input(message) {
+            Ok(input) => input,
+            Err(reason) => return Ok(PanelDispatchOutcome::Unbound(reason)),
         };
         let Some(panel) = self.panel.as_ref() else {
-            return Ok(PanelDispatchOutcome::Unbound);
+            return Ok(PanelDispatchOutcome::Unbound(
+                UnboundReason::NoPanelConnected,
+            ));
         };
         let Some(position) = panel
             .bindings
             .iter()
             .position(|installed| installed.binding.control() == control)
         else {
-            return Ok(PanelDispatchOutcome::Unbound);
+            return Ok(PanelDispatchOutcome::Unbound(UnboundReason::NoBinding {
+                control,
+            }));
         };
         let installed = panel.bindings[position];
-        if let ControlBindingAvailability::Unavailable(reason) = installed.availability {
-            return Ok(PanelDispatchOutcome::Unavailable { control, reason });
+        if let ControlBindingAvailability::Unavailable(_) = installed.availability {
+            // A panel connection outlasts the conditions checked at connect: a
+            // scene gets prepared, a full queue drains. Re-ask for the control
+            // the operator just pressed rather than reporting the answer from
+            // when they plugged the panel in.
+            let availability = self
+                .sink
+                .target_availability(installed.binding.runtime_target());
+            if let ControlBindingAvailability::Unavailable(reason) = availability {
+                return Ok(PanelDispatchOutcome::Unavailable { control, reason });
+            }
+            if let Some(panel) = self.panel.as_mut() {
+                panel.bindings[position].availability = availability;
+            }
         }
         self.refresh_missing_state();
         let command = match self.panel_command(installed.binding, edge) {
             PanelCommand::Idle => return Ok(PanelDispatchOutcome::Idle { control }),
+            PanelCommand::AtLimit => return Ok(PanelDispatchOutcome::AtLimit { control }),
             PanelCommand::StateUnavailable => {
                 return Err(PanelDispatchError::StateUnavailable { control });
             }
@@ -371,7 +478,14 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
         Ok(PanelDispatchOutcome::Sent { control, command })
     }
 
-    fn seed_shadow(&mut self, binding: PanelBinding) {
+    /// Makes room for one binding's shadow without reading it.
+    ///
+    /// The value is left unknown so [`Self::refresh_missing_state`] reads it at
+    /// first use rather than at connect — the sink's snapshot lags what the
+    /// audio thread has been sent, and reading late is reading less stale. A
+    /// shadow an existing binding already owns is left alone; one created here
+    /// is marked so the matching disconnect removes exactly what it added.
+    fn seed_shadow(&mut self, binding: PanelBinding) -> Result<(), ()> {
         match binding {
             PanelBinding::Encoder { target, .. } => {
                 if !self
@@ -379,8 +493,12 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
                     .iter()
                     .any(|shadow| shadow.target == target)
                 {
-                    let value = self.sink.value_state(target);
-                    self.value_shadows.push(ValueShadow { target, value });
+                    self.value_shadows.try_reserve(1).map_err(|_| ())?;
+                    self.value_shadows.push(ValueShadow {
+                        target,
+                        value: None,
+                        panel_seeded: true,
+                    });
                 }
             }
             PanelBinding::Button {
@@ -393,12 +511,17 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
                     .iter()
                     .any(|shadow| shadow.target == target)
                 {
-                    let value = self.sink.boolean_state(target);
-                    self.boolean_shadows.push(BooleanShadow { target, value });
+                    self.boolean_shadows.try_reserve(1).map_err(|_| ())?;
+                    self.boolean_shadows.push(BooleanShadow {
+                        target,
+                        value: None,
+                        panel_seeded: true,
+                    });
                 }
             }
             PanelBinding::Button { .. } | PanelBinding::ActionButton { .. } => {}
         }
+        Ok(())
     }
 
     fn panel_command(&self, binding: PanelBinding, edge: PanelEdge) -> PanelCommand {
@@ -419,14 +542,15 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
                 else {
                     return PanelCommand::StateUnavailable;
                 };
-                let (minimum, maximum) = target.domain();
                 let moved =
                     i64::from(current) + i64::from(delta) * i64::from(step_millionths.get());
-                let next = moved.clamp(i64::from(minimum), i64::from(maximum));
-                let next = i32::try_from(next)
-                    .expect("a value clamped into its target's domain fits that domain's type");
+                let next = self.sink.value_domain(target).clamp(moved);
                 if next == current {
-                    return PanelCommand::Idle;
+                    return if moved == i64::from(next) {
+                        PanelCommand::Idle
+                    } else {
+                        PanelCommand::AtLimit
+                    };
                 }
                 PanelCommand::Send(value_command(target, next))
             }
@@ -494,30 +618,47 @@ const fn descriptor_has(descriptor: PanelDescriptor, control: PanelControl) -> b
     }
 }
 
-fn panel_input(message: Message) -> Option<(PanelControl, PanelEdge)> {
-    match message {
-        Message::EncoderDelta {
-            control_id, delta, ..
-        } => Some((
-            PanelControl::Encoder {
-                index: u8::try_from(control_id).ok()?,
-            },
-            PanelEdge::Turn(delta),
-        )),
-        Message::ButtonPress { control_id, .. } => Some((
-            PanelControl::Button {
-                index: u8::try_from(control_id).ok()?,
-            },
-            PanelEdge::Press,
-        )),
-        Message::ButtonRelease { control_id, .. } => Some((
-            PanelControl::Button {
-                index: u8::try_from(control_id).ok()?,
-            },
-            PanelEdge::Release,
-        )),
-        _ => None,
-    }
+/// Separates a panel message into the control it names and what that control
+/// did, or reports why it names no bindable control.
+///
+/// Enumerated rather than wildcarded: the whole reason this crate depends on
+/// the protocol is that the wire vocabulary and the binding vocabulary stay in
+/// step, and a new panel-to-runtime input kind should stop the build here
+/// rather than be silently ignored.
+fn panel_input(message: Message) -> Result<(PanelControl, PanelEdge), UnboundReason> {
+    let (control_id, control): (u16, fn(u8) -> PanelControl) = match message {
+        Message::EncoderDelta { control_id, .. } => {
+            (control_id, |index| PanelControl::Encoder { index })
+        }
+        Message::ButtonPress { control_id, .. } | Message::ButtonRelease { control_id, .. } => {
+            (control_id, |index| PanelControl::Button { index })
+        }
+        Message::InputSnapshot(_)
+        | Message::EncoderPress { .. }
+        | Message::EncoderRelease { .. }
+        | Message::ButtonLongPress { .. }
+        | Message::ButtonDoublePress { .. }
+        | Message::PanelError { .. }
+        | Message::Heartbeat { .. }
+        | Message::RuntimeHello { .. }
+        | Message::PanelHello { .. }
+        | Message::VersionRejected { .. }
+        | Message::SetLed { .. }
+        | Message::SetLedBrightness { .. }
+        | Message::SetLedBlink(_)
+        | Message::SetRingSegment(_)
+        | Message::SetRingValue { .. }
+        | Message::SetRingAnimation { .. }
+        | Message::SetGlobalBrightness { .. }
+        | Message::EnterBootloader { .. } => return Err(UnboundReason::MessageBindsNothing),
+    };
+    let index = u8::try_from(control_id).map_err(|_| UnboundReason::ControlOutOfRange)?;
+    let edge = match message {
+        Message::EncoderDelta { delta, .. } => PanelEdge::Turn(delta),
+        Message::ButtonRelease { .. } => PanelEdge::Release,
+        _ => PanelEdge::Press,
+    };
+    Ok((control(index), edge))
 }
 
 const fn value_runtime_target(target: ValueControlTarget) -> RuntimeControlTarget {
@@ -577,8 +718,7 @@ const fn boolean_runtime_target(target: BooleanControlTarget) -> RuntimeControlT
 }
 
 fn value_command(target: ValueControlTarget, value: i32) -> RuntimeControlCommand {
-    let gain =
-        || u32::try_from(value).expect("a value clamped into the gain domain is not negative");
+    let gain = || value.max(0).unsigned_abs();
     match target {
         ValueControlTarget::ChannelGain { channel_index } => RuntimeControlCommand::ChannelGain {
             channel_index,

@@ -460,14 +460,13 @@ struct SessionHandles {
     preview: super::DesktopAudioPreviewControl,
 }
 
+/// The session's sole control owner.
+///
+/// Every project has one, with or without a control-mapping document: it owns
+/// the live mixer shadow state and any panel bindings, and a panel is
+/// discovered hardware rather than something a project declares.
 #[derive(Debug)]
-enum SessionControlHandles {
-    Direct {
-        transport: TransportCommandSender,
-        mixer: MixerParameterCommandSender,
-    },
-    Mapping(Vec<DesktopControlMappingRuntime>),
-}
+struct SessionControlHandles(Vec<DesktopControlMappingRuntime>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Desktop-facing launch status for one validated project scene.
@@ -496,97 +495,54 @@ impl From<hyper_media_cache::PreparedSceneAvailability> for DesktopSceneAvailabi
 }
 
 impl SessionControlHandles {
+    fn runtime(&self) -> &DesktopControlMappingRuntime {
+        self.0
+            .first()
+            .expect("a control owner contains exactly one runtime")
+    }
+
+    fn runtime_mut(&mut self) -> &mut DesktopControlMappingRuntime {
+        self.0
+            .first_mut()
+            .expect("a control owner contains exactly one runtime")
+    }
+
     fn transport(&self) -> &TransportCommandSender {
-        match self {
-            Self::Direct { transport, .. } => transport,
-            Self::Mapping(runtimes) => runtimes
-                .first()
-                .expect("mapping owner contains exactly one runtime")
-                .sink()
-                .transport_sender(),
-        }
+        self.runtime().sink().transport_sender()
     }
 
     fn mixer(&self) -> &MixerParameterCommandSender {
-        match self {
-            Self::Direct { mixer, .. } => mixer,
-            Self::Mapping(runtimes) => runtimes
-                .first()
-                .expect("mapping owner contains exactly one runtime")
-                .sink()
-                .mixer_sender(),
-        }
+        self.runtime().sink().mixer_sender()
     }
 
-    fn mapping(&self) -> Option<&DesktopControlMappingRuntime> {
-        match self {
-            Self::Mapping(runtimes) => Some(
-                runtimes
-                    .first()
-                    .expect("mapping owner contains exactly one runtime"),
-            ),
-            Self::Direct { .. } => None,
-        }
-    }
-
-    fn mapping_mut(&mut self) -> Option<&mut DesktopControlMappingRuntime> {
-        match self {
-            Self::Mapping(runtimes) => Some(
-                runtimes
-                    .first_mut()
-                    .expect("mapping owner contains exactly one runtime"),
-            ),
-            Self::Direct { .. } => None,
-        }
-    }
-
-    fn mapping_statuses(&self) -> Option<&[hyper_control_runtime::ControlBindingStatus]> {
-        self.mapping().map(DesktopControlMappingRuntime::statuses)
+    fn mapping_statuses(&self) -> &[hyper_control_runtime::ControlBindingStatus] {
+        self.runtime().statuses()
     }
 
     fn dispatch_mapping_event(
         &mut self,
         event: hyper_control_runtime::ControlEvent,
         context: hyper_control_runtime::ControlContext,
-    ) -> Option<
-        Result<
-            hyper_control_runtime::ControlDispatchOutcome,
-            hyper_control_runtime::ControlDispatchError<DesktopControlSinkError>,
-        >,
+    ) -> Result<
+        hyper_control_runtime::ControlDispatchOutcome,
+        hyper_control_runtime::ControlDispatchError<DesktopControlSinkError>,
     > {
-        self.mapping_mut()
-            .map(|runtime| runtime.dispatch(event, context))
+        self.runtime_mut().dispatch(event, context)
     }
 
     fn try_send_transport(
         &mut self,
         command: TransportCommand,
     ) -> Result<(), DesktopDirectControlError> {
-        match self {
-            Self::Direct { transport, .. } => transport
-                .try_send(command)
-                .map_err(DesktopDirectControlError::Transport),
-            Self::Mapping(runtimes) => {
-                let runtime = runtimes
-                    .first_mut()
-                    .expect("mapping owner contains exactly one runtime");
-                runtime.try_send_direct(DesktopDirectControlCommand::Transport(command))
-            }
-        }
+        self.runtime_mut()
+            .try_send_direct(DesktopDirectControlCommand::Transport(command))
     }
 
     fn resolve_channel(
         &self,
         track_id: &str,
     ) -> Result<MixerChannelHandle, MixerParameterResolveError> {
-        match self {
-            Self::Direct { mixer, .. } => mixer.resolve_channel(track_id),
-            Self::Mapping(runtimes) => runtimes
-                .first()
-                .expect("mapping owner contains exactly one runtime")
-                .sink()
-                .resolve_channel(track_id),
-        }
+        self.runtime().sink().resolve_channel(track_id)
     }
 
     fn resolve_channel_index(
@@ -597,14 +553,7 @@ impl SessionControlHandles {
     }
 
     fn resolve_send(&self, send_id: &str) -> Result<MixerSendHandle, MixerParameterResolveError> {
-        match self {
-            Self::Direct { mixer, .. } => mixer.resolve_send(send_id),
-            Self::Mapping(runtimes) => runtimes
-                .first()
-                .expect("mapping owner contains exactly one runtime")
-                .sink()
-                .resolve_send(send_id),
-        }
+        self.runtime().sink().resolve_send(send_id)
     }
 
     fn resolve_send_address(
@@ -619,30 +568,12 @@ impl SessionControlHandles {
         &mut self,
         command: MixerParameterCommand,
     ) -> Result<(), DesktopDirectControlError> {
-        match self {
-            Self::Direct { mixer, .. } => mixer
-                .try_send(command)
-                .map_err(DesktopDirectControlError::Mixer),
-            Self::Mapping(runtimes) => {
-                let runtime = runtimes
-                    .first_mut()
-                    .expect("mapping owner contains exactly one runtime");
-                runtime.try_send_direct(DesktopDirectControlCommand::Mixer(command))
-            }
-        }
+        self.runtime_mut()
+            .try_send_direct(DesktopDirectControlCommand::Mixer(command))
     }
 
     fn try_send_mixer_fence(&mut self) -> Result<Option<u64>, DesktopDirectControlError> {
-        match self {
-            Self::Direct { mixer, .. } => mixer
-                .try_send_fence()
-                .map_err(DesktopDirectControlError::Mixer),
-            Self::Mapping(runtimes) => runtimes
-                .first_mut()
-                .expect("mapping owner contains exactly one runtime")
-                .sink_mut()
-                .try_send_mixer_fence(),
-        }
+        self.runtime_mut().sink_mut().try_send_mixer_fence()
     }
 
     fn committed_mixer_fence(&self) -> u64 {
@@ -1717,28 +1648,29 @@ impl DesktopPlaybackSession {
     }
 
     /// Returns immutable availability evidence for every enabled compiled
-    /// control binding, or `None` when the project has no mapping table.
+    /// control binding. Empty when the project has no mapping table.
     #[must_use]
-    pub fn control_mapping_statuses(
-        &self,
-    ) -> Option<&[hyper_control_runtime::ControlBindingStatus]> {
+    pub fn control_mapping_statuses(&self) -> &[hyper_control_runtime::ControlBindingStatus] {
         self.controls.mapping_statuses()
     }
 
     /// Dispatches one software-supplied source event through this session's
     /// exclusive mapping owner.
     ///
-    /// `None` means the project has no compiled mapping table. This method does
-    /// not imply physical input ingestion or select an IDE context implicitly.
+    /// A project with no compiled mapping table matches no binding rather than
+    /// having no owner. This method does not imply physical input ingestion or
+    /// select an IDE context implicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns the mapping owner's dispatch rejection.
     pub fn dispatch_control_event(
         &mut self,
         event: hyper_control_runtime::ControlEvent,
         context: hyper_control_runtime::ControlContext,
-    ) -> Option<
-        Result<
-            hyper_control_runtime::ControlDispatchOutcome,
-            hyper_control_runtime::ControlDispatchError<DesktopControlSinkError>,
-        >,
+    ) -> Result<
+        hyper_control_runtime::ControlDispatchOutcome,
+        hyper_control_runtime::ControlDispatchError<DesktopControlSinkError>,
     > {
         self.controls.dispatch_mapping_event(event, context)
     }
@@ -2136,9 +2068,10 @@ fn build_session_controls(
     recovery: PlaybackRecoveryCheckpoint,
     control_mapping: Option<CompiledControlMappingTable>,
 ) -> Result<SessionControlHandles, DesktopPlaybackSessionBuildError> {
-    let Some(table) = control_mapping else {
-        return Ok(SessionControlHandles::Direct { transport, mixer });
-    };
+    // Every project gets a control runtime, mapping document or not: it is the
+    // sole owner of live mixer shadow state and of any panel bindings, and a
+    // panel is discovered hardware rather than something a project declares.
+    let table = control_mapping.unwrap_or_else(CompiledControlMappingTable::empty);
     let sink = DesktopControlSink::new(transport, mixer, recovery);
     let runtime =
         ControlRuntime::try_new(table, sink).map_err(classify_control_mapping_build_error)?;
@@ -2147,7 +2080,7 @@ fn build_session_controls(
         .try_reserve_exact(1)
         .map_err(|_| DesktopPlaybackSessionBuildError::ControlMappingOwnerCapacityUnavailable)?;
     runtimes.push(runtime);
-    Ok(SessionControlHandles::Mapping(runtimes))
+    Ok(SessionControlHandles(runtimes))
 }
 
 fn classify_control_mapping_build_error(
@@ -2692,14 +2625,13 @@ mod tests {
             .unwrap();
         assert_eq!(controls.try_send_mixer_fence().unwrap(), Some(1));
         assert_eq!(controls.committed_mixer_fence(), 0);
-        assert_eq!(controls.mapping_statuses().unwrap().len(), 1);
+        assert_eq!(controls.mapping_statuses().len(), 1);
         assert_eq!(
             controls
                 .dispatch_mapping_event(
                     hyper_control_runtime::ControlEvent::Clock { edge: Edge::Rising },
                     hyper_control_runtime::ControlContext::default(),
                 )
-                .unwrap()
                 .unwrap(),
             hyper_control_runtime::ControlDispatchOutcome::Sent {
                 binding_index: 0,
@@ -2732,7 +2664,7 @@ mod tests {
             )),
         )
         .unwrap();
-        assert_eq!(controls.mapping_statuses().unwrap().len(), 1);
+        assert_eq!(controls.mapping_statuses().len(), 1);
 
         for (edge, muted) in [(Edge::Rising, true), (Edge::Falling, false)] {
             assert_eq!(
@@ -2741,7 +2673,6 @@ mod tests {
                         hyper_control_runtime::ControlEvent::Clock { edge },
                         hyper_control_runtime::ControlContext::default(),
                     )
-                    .unwrap()
                     .unwrap(),
                 hyper_control_runtime::ControlDispatchOutcome::Sent {
                     binding_index: 0,

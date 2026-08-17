@@ -14,6 +14,12 @@ hyper-playback-json = { path = "../playback-json" }
 rtrb = "=0.3.4"
 sha2 = "=0.10.9"
 
+[features]
+# Exposes constructors for mixer state that only a running mixer can otherwise
+# produce, so crates that read that state can be tested without one. Off by
+# default, so a production build still cannot forge restorable state.
+test-support = []
+
 [dev-dependencies]
 hyper-audio-source = { path = "../audio-source" }
 
