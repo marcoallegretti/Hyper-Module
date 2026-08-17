@@ -51,6 +51,9 @@
     },
     "extensions": {
       "$ref": "common.schema.json#/$defs/extensions"
+    },
+    "loop_range": {
+      "$ref": "#/$defs/loop_range"
     }
   },
   "$defs": {
@@ -92,7 +95,11 @@
     },
     "scene_launch": {
       "type": "object",
-      "required": ["id", "tick", "scene_id"],
+      "required": [
+        "id",
+        "tick",
+        "scene_id"
+      ],
       "properties": {
         "id": {
           "$ref": "common.schema.json#/$defs/entity_id"
@@ -102,6 +109,26 @@
         },
         "scene_id": {
           "$ref": "common.schema.json#/$defs/entity_id"
+        }
+      },
+      "additionalProperties": false
+    },
+    "loop_range": {
+      "type": "object",
+      "required": [
+        "start_tick",
+        "end_tick",
+        "enabled"
+      ],
+      "properties": {
+        "start_tick": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "end_tick": {
+          "$ref": "common.schema.json#/$defs/safe_nonnegative_integer"
+        },
+        "enabled": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false

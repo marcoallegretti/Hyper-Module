@@ -358,7 +358,34 @@ struct LoadedArrangement {
     enabled: bool,
     placements: Vec<LoadedPlacement>,
     scene_launches: Vec<LoadedSceneLaunch>,
+    loop_range: Option<LoadedLoopRange>,
     canonical_source: Arc<[u8]>,
+}
+
+/// A persisted transport loop, addressed in ticks like every other arrangement
+/// position so it survives tempo edits the way placements do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoadedLoopRange {
+    start_tick: u64,
+    end_tick: u64,
+    enabled: bool,
+}
+
+impl LoadedLoopRange {
+    #[must_use]
+    pub const fn start_tick(self) -> u64 {
+        self.start_tick
+    }
+
+    #[must_use]
+    pub const fn end_tick(self) -> u64 {
+        self.end_tick
+    }
+
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        self.enabled
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -4790,6 +4817,12 @@ impl LoadedPlaybackProject {
             .map_or(0, |arrangement| arrangement.placements.len())
     }
 
+    /// The transport loop persisted with the arrangement, in ticks.
+    #[must_use]
+    pub fn arrangement_loop_range(&self) -> Option<LoadedLoopRange> {
+        self.arrangement.as_ref().and_then(|a| a.loop_range)
+    }
+
     #[must_use]
     pub fn scene_launch_count(&self) -> usize {
         self.arrangement
@@ -5572,11 +5605,23 @@ fn load_arrangement(
             scene_id: launch.scene_id,
         })
         .collect();
+    let loop_range = match document.loop_range {
+        Some(range) if range.end_tick <= range.start_tick => {
+            return domain_error(location, "loop range end tick must be after its start tick");
+        }
+        Some(range) => Some(LoadedLoopRange {
+            start_tick: range.start_tick,
+            end_tick: range.end_tick,
+            enabled: range.enabled,
+        }),
+        None => None,
+    };
     Ok(LoadedArrangement {
         id: document.id,
         enabled: document.enabled,
         placements,
         scene_launches,
+        loop_range,
         canonical_source: canonical_source.into(),
     })
 }
@@ -7021,7 +7066,17 @@ struct ArrangementDocument {
     enabled: bool,
     placements: Vec<PlacementDocument>,
     scene_launches: Vec<SceneLaunchDocument>,
+    #[serde(default)]
+    loop_range: Option<LoopRangeDocument>,
     extensions: ExtensionsDocument,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoopRangeDocument {
+    start_tick: u64,
+    end_tick: u64,
+    enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -13200,6 +13255,76 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn an_arrangement_loop_range_round_trips_and_rejects_an_unusable_span() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let arrangement = |loop_field: &str| {
+            format!(
+                r#"{{
+            "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334463",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Main","enabled":true,"placements":[],
+            "scene_launches":[{{"id":"018f47a2-6b2d-7c11-8a44-001122334465","tick":0,"scene_id":"018f47a2-6b2d-7c11-8a44-001122334461"}}]{loop_field},
+            "extensions":{{}}
+        }}"#
+            )
+            .into_bytes()
+        };
+
+        let without = arrangement("");
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&without)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.arrangement_loop_range(),
+            None,
+            "arrangements written before this field keep loading"
+        );
+
+        let with = arrangement(r#","loop_range":{"start_tick":1920,"end_tick":7680,"enabled":true}"#);
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&with)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let range = loaded.arrangement_loop_range().expect("the field loads");
+        assert_eq!(range.start_tick(), 1920);
+        assert_eq!(range.end_tick(), 7680);
+        assert!(
+            range.enabled(),
+            "whether the loop was engaged is restored, not just where it was"
+        );
+
+        let disengaged =
+            arrangement(r#","loop_range":{"start_tick":0,"end_tick":1920,"enabled":false}"#);
+        let loaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&disengaged)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(!loaded.arrangement_loop_range().unwrap().enabled());
+
+        for unusable in [
+            r#","loop_range":{"start_tick":1920,"end_tick":1920,"enabled":true}"#,
+            r#","loop_range":{"start_tick":7680,"end_tick":1920,"enabled":true}"#,
+        ] {
+            let document = arrangement(unusable);
+            assert_eq!(
+                load(
+                    input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&document)),
+                    LoaderLimits::VERSION_1,
+                )
+                .unwrap_err()
+                .kind,
+                LoadErrorKind::InvalidVersionOneDomain,
+                "a range the transport could never run is refused, not clamped"
+            );
+        }
     }
 
     #[test]

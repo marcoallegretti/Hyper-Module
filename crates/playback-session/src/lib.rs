@@ -403,7 +403,46 @@ pub struct PlaybackArrangement {
     scene_names: Vec<String>,
     placements: Vec<PlaybackArrangementPlacement>,
     scene_launches: Vec<PlaybackArrangementSceneLaunch>,
+    loop_range: Option<PlaybackArrangementLoopRange>,
     end_frame: usize,
+}
+
+/// The persisted transport loop, carrying both the authored ticks and the
+/// frames the runtime needs, converted the same way scene launches are.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaybackArrangementLoopRange {
+    start_tick: u64,
+    end_tick: u64,
+    start_frame: usize,
+    end_frame: usize,
+    enabled: bool,
+}
+
+impl PlaybackArrangementLoopRange {
+    #[must_use]
+    pub const fn start_tick(self) -> u64 {
+        self.start_tick
+    }
+
+    #[must_use]
+    pub const fn end_tick(self) -> u64 {
+        self.end_tick
+    }
+
+    #[must_use]
+    pub const fn start_frame(self) -> usize {
+        self.start_frame
+    }
+
+    #[must_use]
+    pub const fn end_frame(self) -> usize {
+        self.end_frame
+    }
+
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        self.enabled
+    }
 }
 
 impl PlaybackArrangement {
@@ -430,6 +469,11 @@ impl PlaybackArrangement {
     #[must_use]
     pub fn scene_launches(&self) -> &[PlaybackArrangementSceneLaunch] {
         &self.scene_launches
+    }
+
+    #[must_use]
+    pub const fn loop_range(&self) -> Option<PlaybackArrangementLoopRange> {
+        self.loop_range
     }
 
     #[must_use]
@@ -739,6 +783,7 @@ fn build_playback_arrangement(
     project: &LoadedPlaybackProject,
     schedule: hyper_playback_json::OwnedCompiledSchedule,
     scene_launch_frames: &[usize],
+    loop_range: Option<PlaybackArrangementLoopRange>,
 ) -> Result<PlaybackArrangement, PlaybackSessionAssemblyError> {
     let mut track_names = Vec::new();
     track_names
@@ -826,6 +871,7 @@ fn build_playback_arrangement(
         scene_names,
         placements,
         scene_launches,
+        loop_range,
         end_frame,
     })
 }
@@ -854,10 +900,28 @@ fn bind_and_retain_arrangement(
                 .map_err(PlaybackSessionAssemblyError::ArrangementTimeline)?,
         );
     }
+    let loop_range = project
+        .arrangement_loop_range()
+        .map(|range| {
+            let authority = graph.scene_authority();
+            Ok::<_, PlaybackSessionAssemblyError>(PlaybackArrangementLoopRange {
+                start_tick: range.start_tick(),
+                end_tick: range.end_tick(),
+                start_frame: authority
+                    .tick_to_frame_ceil(range.start_tick())
+                    .map_err(PlaybackSessionAssemblyError::ArrangementTimeline)?,
+                end_frame: authority
+                    .tick_to_frame_ceil(range.end_tick())
+                    .map_err(PlaybackSessionAssemblyError::ArrangementTimeline)?,
+                enabled: range.enabled(),
+            })
+        })
+        .transpose()?;
     Ok(Arc::new(build_playback_arrangement(
         project,
         graph.into_arrangement(),
         &scene_launch_frames,
+        loop_range,
     )?))
 }
 
