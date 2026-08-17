@@ -10,5 +10,9 @@ hyper-control-mappings = { path = "../../../crates/control-mappings" }
 hyper-mapping-compiler = { path = "../../../crates/mapping-compiler" }
 hyper-panel-protocol = { path = "../../../crates/panel-protocol" }
 
+[dev-dependencies]
+hyper-panel-simulator = { path = "../../IDE/panel-simulator" }
+hyper-runtime-panel-session = { path = "../panel-session" }
+
 [lints]
 workspace = true

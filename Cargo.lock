@@ -2098,6 +2098,8 @@ dependencies = [
  "hyper-control-mappings",
  "hyper-mapping-compiler",
  "hyper-panel-protocol",
+ "hyper-panel-simulator",
+ "hyper-runtime-panel-session",
 ]
 
 [[package]]

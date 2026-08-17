@@ -22,7 +22,9 @@ use hyper_control_runtime::{
     ValueControlTarget,
 };
 use hyper_mapping_compiler::{ControlMappingResolver, MixerSendAddress, compile_control_mapping};
-use hyper_panel_protocol::{FirmwareVersion, Message, PanelDescriptor};
+use hyper_panel_protocol::{FirmwareVersion, LinkConfig, Message, PanelDescriptor};
+use hyper_panel_simulator::{PanelSimulator, PanelSimulatorConfig};
+use hyper_runtime_panel_session::{PanelEvent, PanelSession};
 use realtime_allocator::HeapMeasurement;
 
 const PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334455";
@@ -1598,4 +1600,131 @@ fn panel_dispatch_performs_zero_heap_operations() {
     let heap_operations = measurement.finish();
 
     assert_eq!(heap_operations, 0);
+}
+
+struct PanelPeers {
+    session: PanelSession,
+    panel: PanelSimulator,
+    buffer: [u8; 1024],
+}
+
+impl PanelPeers {
+    fn new(descriptor: PanelDescriptor) -> Self {
+        Self {
+            session: PanelSession::new(LinkConfig::new(50, 200).unwrap()),
+            panel: PanelSimulator::new(PanelSimulatorConfig {
+                descriptor,
+                bootloader_available: false,
+            })
+            .unwrap(),
+            buffer: [0; 1024],
+        }
+    }
+
+    fn exchange(&mut self, now_ms: u64) -> Vec<PanelEvent> {
+        let outbound = self.session.take_transmit();
+        if !outbound.is_empty() {
+            self.panel.receive_runtime_bytes(&outbound, now_ms);
+        }
+        self.panel.poll(now_ms).unwrap();
+        let read = self.panel.read_panel_bytes(&mut self.buffer);
+        if read == 0 {
+            return Vec::new();
+        }
+        let inbound = self.buffer[..read].to_vec();
+        self.session.receive(&inbound, now_ms)
+    }
+
+    fn drive(&mut self, runtime: &mut ControlRuntime<Sink>, now_ms: u64) {
+        for event in self.exchange(now_ms) {
+            if let PanelEvent::Input(message) = event {
+                runtime.dispatch_panel(message).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn a_real_panel_link_reaches_the_bound_targets_through_encoded_frames() {
+    let descriptor = PanelDescriptor {
+        firmware: FirmwareVersion {
+            major: 1,
+            minor: 0,
+            patch: 0,
+            build: 7,
+        },
+        boot_id: 0x00AB_CDEF,
+        encoders: 4,
+        buttons: 8,
+        leds: 8,
+        rings: 2,
+        ring_segments: 16,
+    };
+    let mut peers = PanelPeers::new(descriptor);
+    let mut runtime = panel_runtime(Sink {
+        values: vec![(ValueControlTarget::MainGain, 1_000_000)],
+        booleans: vec![(BooleanControlTarget::MainMute, false)],
+        transport_rolling: Some(false),
+        ..Sink::default()
+    });
+
+    peers.session.start(0x5EED, 0).unwrap();
+    let events = peers.exchange(1);
+    let Some(PanelEvent::Connected(found)) = events
+        .iter()
+        .find(|event| matches!(event, PanelEvent::Connected(_)))
+        .copied()
+    else {
+        panic!("expected the handshake to complete, saw {events:?}");
+    };
+
+    let refusals = runtime
+        .connect_panel(
+            found,
+            &[
+                PanelBinding::Encoder {
+                    index: 0,
+                    target: ValueControlTarget::MainGain,
+                    step_millionths: step(50_000),
+                },
+                PanelBinding::Button {
+                    index: 1,
+                    target: BooleanControlTarget::MainMute,
+                    behavior: PanelButtonBehavior::Toggle,
+                },
+                PanelBinding::ActionButton {
+                    index: 2,
+                    action: PanelActionTarget::TransportStart,
+                },
+                PanelBinding::Encoder {
+                    index: 9,
+                    target: ValueControlTarget::MainGain,
+                    step_millionths: step(50_000),
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(refusals.len(), 1);
+    assert_eq!(refusals[0].binding_index(), 3);
+
+    peers.panel.encoder_delta(0, 3, 2).unwrap();
+    peers.drive(&mut runtime, 2);
+    peers.panel.button_press(1, 3).unwrap();
+    peers.drive(&mut runtime, 3);
+    peers.panel.button_release(1, 4).unwrap();
+    peers.drive(&mut runtime, 4);
+    peers.panel.button_press(2, 5).unwrap();
+    peers.drive(&mut runtime, 5);
+
+    assert_eq!(
+        runtime.sink().commands,
+        [
+            RuntimeControlCommand::MainGain {
+                gain_millionths: 1_150_000,
+            },
+            RuntimeControlCommand::MainMute { muted: true },
+            RuntimeControlCommand::TransportStart,
+        ]
+    );
+    assert!(!peers.session.is_faulted());
 }
