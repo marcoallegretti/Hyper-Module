@@ -11946,6 +11946,81 @@ mod tests {
         );
     }
 
+    /// The workflow the feature exists for: create a project, set its tempo,
+    /// reopen it and find the new tempo. A fresh project has no placements, so
+    /// nothing pins the tempo yet.
+    #[test]
+    fn a_fresh_project_accepts_a_new_tempo_that_survives_reopening() {
+        let parent = std::env::temp_dir().join(format!("hyper-tempo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir(&parent).unwrap();
+        let created = hyper_storage_engine::create_project(
+            &parent,
+            hyper_storage_engine::ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project_path = created.project().root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let application = DesktopIdeApplication::from_inventories(
+            config,
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let (project, _, _, _) = prepared.session().parts();
+        assert_eq!(
+            project.tempo_events()[0].microseconds_per_quarter,
+            500_000,
+            "projects are created at 120 bpm"
+        );
+        let package = prepared.package();
+        let mixer_id = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap()
+            .id()
+            .to_owned();
+        let plan = RunningDesktopIdeApplication::prepare_timeline_tempo_from_project(
+            &application,
+            IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: *package.manifest_sha256(),
+                resource_id: mixer_id.clone(),
+                resource_bytes: package.read_resource(&mixer_id).unwrap(),
+            },
+            &prepared,
+            250_000,
+        )
+        .unwrap();
+        drop(prepared);
+
+        let outcome = plan.publish().unwrap();
+        assert!(outcome.changed(), "a real tempo change is published");
+        assert!(
+            outcome.previous_resource().is_some(),
+            "so it is undoable like every other replacement"
+        );
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let (reloaded, _, _, _) = reopened.session().parts();
+        assert_eq!(
+            reloaded.tempo_events()[0].microseconds_per_quarter,
+            250_000,
+            "the reopened project plays at the tempo that was saved"
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
     #[test]
     fn a_restore_reads_its_role_from_the_manifest() {
         let fixture = ArrangementProjectFixture::with_two_scenes();
