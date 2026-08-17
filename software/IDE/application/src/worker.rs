@@ -12068,6 +12068,119 @@ mod tests {
         );
     }
 
+    /// The rule the previous hand-maintained list broke: adding, duplicating,
+    /// or splitting a placement rewrites the same arrangement document as
+    /// moving one, so it must be captured or an undo reverts work it never saw.
+    #[test]
+    fn placement_creation_is_captured_because_it_replaces_the_arrangement() {
+        let edit = captured_mixer_edit("placement-capture");
+        let publication = || ArrangementPlacementCreationPublication {
+            outcome: edit.outcome.clone(),
+            placement_id: "placement".to_owned(),
+        };
+        for attempt in [
+            ProjectMutationAttempt::AddArrangementPlacement {
+                start_tick: 0,
+                result: Ok(publication()),
+            },
+            ProjectMutationAttempt::DuplicateArrangementPlacement {
+                start_tick: 480,
+                result: Ok(publication()),
+            },
+            ProjectMutationAttempt::SplitArrangementPlacement {
+                split_tick: 240,
+                result: Ok(publication()),
+            },
+        ] {
+            assert!(
+                matches!(history_effect(&attempt), HistoryEffect::Replacement(_)),
+                "creating a placement replaces the arrangement document"
+            );
+        }
+
+        let (events, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut history = UndoHistory::default();
+        observe_history(
+            &mut history,
+            &ProjectMutationAttempt::AddArrangementPlacement {
+                start_tick: 0,
+                result: Ok(publication()),
+            },
+            IdeWorkerCommandKind::AddArrangementPlacement,
+            &events,
+        );
+        assert_eq!(history.undo.len(), 1, "and reaches the history");
+        assert_eq!(history.undo[0].bytes, edit.original);
+        assert_eq!(history.undo[0].label, "placement");
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    /// A change no stored document can express must drop the history rather
+    /// than leave entries that would silently revert it.
+    #[test]
+    fn a_structural_change_invalidates_the_retained_history() {
+        assert!(matches!(
+            history_effect(&ProjectMutationAttempt::EditControlMapping {
+                edit: IdeControlMappingEdit::Remove {
+                    binding_id: "binding".to_owned()
+                },
+                result: Ok(7),
+            }),
+            HistoryEffect::Invalidate
+        ));
+
+        let (events, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut history = UndoHistory::default();
+        history.record_edit(labelled("scene", "scene rename"));
+        history.record_restore(false, labelled("undone", "clip gain"));
+        while receiver.try_recv().is_ok() {}
+
+        observe_history(
+            &mut history,
+            &ProjectMutationAttempt::EditControlMapping {
+                edit: IdeControlMappingEdit::Remove {
+                    binding_id: "binding".to_owned(),
+                },
+                result: Ok(7),
+            },
+            IdeWorkerCommandKind::EditControlMapping,
+            &events,
+        );
+        assert!(
+            history.undo.is_empty() && history.redo.is_empty(),
+            "both stacks are dropped, not just the undo side"
+        );
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Ok(IdeWorkerEvent::UndoStateChanged {
+                    undo_label: None,
+                    redo_label: None,
+                })
+            ),
+            "and the controls stop offering an undo that no longer fits"
+        );
+
+        let mut untouched = UndoHistory::default();
+        untouched.record_edit(labelled("scene", "scene rename"));
+        observe_history(
+            &mut untouched,
+            &ProjectMutationAttempt::EditControlMapping {
+                edit: IdeControlMappingEdit::Remove {
+                    binding_id: "binding".to_owned(),
+                },
+                result: Err(IdeControlMappingEditError::InvalidBindingIdentity),
+            },
+            IdeWorkerCommandKind::EditControlMapping,
+            &events,
+        );
+        assert_eq!(
+            untouched.undo.len(),
+            1,
+            "a failed mutation changed nothing, so history stands"
+        );
+    }
+
     #[test]
     fn the_controls_report_the_newest_entry_on_each_stack() {
         let mut history = UndoHistory::default();
