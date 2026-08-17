@@ -12440,6 +12440,76 @@ mod tests {
 
     /// A change no stored document can express must drop the history rather
     /// than leave entries that would silently revert it.
+    /// Exhaustiveness proves every mutation is listed, not that it is classified
+    /// correctly. These three were listed and never checked.
+    #[test]
+    fn the_timeline_and_loop_edits_are_classified_as_undoable_replacements() {
+        let edit = captured_mixer_edit("classified");
+        let outcome = edit.outcome.clone();
+        for (attempt, label, kind) in [
+            (
+                ProjectMutationAttempt::SetTempo {
+                    microseconds_per_quarter: 250_000,
+                    result: Ok(outcome.clone()),
+                },
+                "tempo",
+                IdeWorkerCommandKind::SetTempo,
+            ),
+            (
+                ProjectMutationAttempt::SetMeter {
+                    numerator: 3,
+                    denominator: 4,
+                    result: Ok(outcome.clone()),
+                },
+                "time signature",
+                IdeWorkerCommandKind::SetMeter,
+            ),
+            (
+                ProjectMutationAttempt::SetArrangementLoopRange {
+                    result: Ok(outcome.clone()),
+                },
+                "loop range",
+                IdeWorkerCommandKind::SetArrangementLoopRange,
+            ),
+        ] {
+            assert!(
+                matches!(history_effect(&attempt), HistoryEffect::Replacement(_)),
+                "{label} replaces a resource, so it must be undoable"
+            );
+            assert_eq!(
+                undo_label(kind),
+                label,
+                "and the button must name the edit it reverses"
+            );
+
+            let (events, receiver) = std::sync::mpsc::sync_channel(8);
+            let mut history = UndoHistory::default();
+            observe_history(&mut history, &attempt, kind, &events);
+            assert_eq!(
+                history.undo.len(),
+                1,
+                "{label} reaches the history through observe_history"
+            );
+            assert_eq!(history.undo[0].label, label);
+            assert!(receiver.try_recv().is_ok());
+        }
+
+        for failed in [
+            ProjectMutationAttempt::SetTempo {
+                microseconds_per_quarter: 250_000,
+                result: Err(IdeTempoEditError::TimelineResourceMissing),
+            },
+            ProjectMutationAttempt::SetArrangementLoopRange {
+                result: Err(IdeArrangementPlacementEditError::ArrangementResourceMissing),
+            },
+        ] {
+            assert!(
+                matches!(history_effect(&failed), HistoryEffect::None),
+                "a failed edit changed nothing, so history stands"
+            );
+        }
+    }
+
     #[test]
     fn a_structural_change_invalidates_the_retained_history() {
         assert!(matches!(

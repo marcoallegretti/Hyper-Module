@@ -938,10 +938,12 @@ impl DesktopIdeApplication {
         match opened {
             Ok(session) => {
                 self.playback_session_generation = next_playback_session_generation;
-                Ok(RunningDesktopIdeApplication {
+                let mut running = RunningDesktopIdeApplication {
                     application: self,
                     session: IdePlaybackSessionOwner::Native(session),
-                })
+                };
+                running.arm_persisted_loop();
+                Ok(running)
             }
             Err(source) => Err(IdeProjectOpenFailure {
                 application: self,
@@ -8390,6 +8392,29 @@ impl RunningDesktopIdeApplication {
         })
     }
 
+    /// Arms the runtime with the loop the project carries, so a reopened
+    /// project loops where it says it loops. Without this the controls would
+    /// show a range the transport never received.
+    fn arm_persisted_loop(&mut self) {
+        let range = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session
+                .prepared_project()
+                .and_then(|prepared| prepared.session().arrangement().loop_range()),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => None,
+        };
+        let Some(range) = range else {
+            return;
+        };
+        let Ok(transport_range) =
+            TransportLoopRange::new(range.start_frame(), range.end_frame())
+        else {
+            return;
+        };
+        let _ = self.try_send_transport(TransportCommand::SetLoopRange(Some(transport_range)));
+        let _ = self.try_send_transport(TransportCommand::SetLoopEnabled(range.enabled()));
+    }
+
     /// Sends a bounded transport or scene command through the only live owner.
     ///
     /// # Errors
@@ -12072,6 +12097,66 @@ mod tests {
         );
         drop(reopened);
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// The review found the frame→tick conversion had no coverage at all, and
+    /// that the round trip is lossy by construction: saving floors to the tick
+    /// at or before the frame, seeding ceils back. This pins how far it can
+    /// drift and that the drift never inverts the range.
+    #[test]
+    fn a_loop_mark_round_trips_through_ticks_within_one_tick() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let (project, _, _, media) = prepared.session().parts();
+        let facts: Vec<_> = media.media_asset_facts().collect();
+        let graph = project
+            .compile_playback(
+                &facts,
+                hyper_playback_compiler::graph::GraphLimits::VERSION_1,
+                hyper_playback_compiler::scene::SceneLimits::VERSION_1,
+            )
+            .unwrap();
+        let authority = graph.scene_authority();
+
+        // The drift bound is one tick, derived from this project's own tempo
+        // rather than assumed, because a tick is a different number of frames
+        // at every tempo.
+        let frames_per_tick = authority.tick_to_frame_ceil(1).unwrap();
+        assert!(frames_per_tick > 0);
+
+        for (start_frame, end_frame) in [(0_usize, 48_000_usize), (1, 24_001), (12_345, 67_890)] {
+            let start_tick = authority.frame_to_tick(start_frame).unwrap();
+            let end_tick = authority.frame_to_tick(end_frame).unwrap();
+            assert!(
+                end_tick > start_tick,
+                "frames {start_frame}..{end_frame} stay a usable range in ticks"
+            );
+
+            let seeded_start = authority.tick_to_frame_ceil(start_tick).unwrap();
+            let seeded_end = authority.tick_to_frame_ceil(end_tick).unwrap();
+            assert!(
+                seeded_start.abs_diff(start_frame) < frames_per_tick,
+                "a reopened start mark lands within one tick of where it was set:                  {seeded_start} vs {start_frame}"
+            );
+            assert!(
+                seeded_end.abs_diff(end_frame) < frames_per_tick,
+                "and so does the end: {seeded_end} vs {end_frame}"
+            );
+            assert!(
+                seeded_end > seeded_start,
+                "the reopened range never inverts, whatever the rounding does"
+            );
+        }
+
+        assert_eq!(
+            authority.frame_to_tick(0).unwrap(),
+            authority.frame_to_tick(frames_per_tick - 1).unwrap(),
+            "marks closer together than a tick collapse, which the edit refuses"
+        );
     }
 
     #[test]

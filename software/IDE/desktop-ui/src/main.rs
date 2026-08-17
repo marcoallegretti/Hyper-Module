@@ -943,6 +943,7 @@ fn bind_playback_callbacks(
 
     let weak = ui.as_weak();
     let worker_for_save = Rc::clone(worker);
+    let state_for_save = Rc::clone(project_state);
     actions.on_save_project(move || {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -951,7 +952,7 @@ fn bind_playback_callbacks(
             ui.set_error_text("Committed mixer state is not available to save".into());
             return;
         }
-        submit_to_ui(&ui, &worker_for_save, IdeWorkerCommand::SaveProject);
+        submit_to_ui(&ui, &worker_for_save, project_save_command(&state_for_save));
     });
 
     bind_audio_track_callback(ui, worker);
@@ -7845,6 +7846,20 @@ fn bind_meter_callback(ui: &MainWindow, worker: &WorkerCell) {
     });
 }
 
+/// Saving the project writes the loop range alongside the mixer, because the
+/// loop plan publishes both in one transaction. Marking a loop point is session
+/// state and must never close the audio device on its own.
+fn project_save_command(state: &ProjectUiStateCell) -> IdeWorkerCommand {
+    let marks = state.loop_marks.get();
+    if marks == LoopMarks::default() {
+        IdeWorkerCommand::SaveProject
+    } else {
+        IdeWorkerCommand::SetArrangementLoopRange {
+            range: marks.persisted(state.loop_engaged.get()),
+        }
+    }
+}
+
 fn tempo_editable(placement_count: usize) -> bool {
     placement_count == 0
 }
@@ -7947,13 +7962,6 @@ fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiSt
                 &worker,
                 IdeWorkerCommand::Transport(TransportCommand::SetLoopRange(marks.range())),
             );
-            submit_to_ui(
-                &ui,
-                &worker,
-                IdeWorkerCommand::SetArrangementLoopRange {
-                    range: marks.persisted(state.loop_engaged.get()),
-                },
-            );
             if marks.range().is_none() && ui.get_loop_engaged() {
                 ui.set_loop_engaged(false);
                 submit_to_ui(
@@ -7985,13 +7993,6 @@ fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiSt
             &toggle_worker,
             IdeWorkerCommand::Transport(TransportCommand::SetLoopEnabled(engaged)),
         );
-        submit_to_ui(
-            &ui,
-            &toggle_worker,
-            IdeWorkerCommand::SetArrangementLoopRange {
-                range: toggle_state.loop_marks.get().persisted(engaged),
-            },
-        );
     });
 
     let weak = ui.as_weak();
@@ -8015,11 +8016,6 @@ fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiSt
             &ui,
             &clear_worker,
             IdeWorkerCommand::Transport(TransportCommand::SetLoopRange(None)),
-        );
-        submit_to_ui(
-            &ui,
-            &clear_worker,
-            IdeWorkerCommand::SetArrangementLoopRange { range: None },
         );
     });
 }
@@ -8803,6 +8799,62 @@ mod tests {
             meter_command("4/3").unwrap_err(),
             "4/3 is not a time signature this project can hold",
             "a well-formed but unsupported denominator says so specifically"
+        );
+    }
+
+    /// The seam the review found untested: saving must write the marks the
+    /// session holds, and marking must never be a durable transaction.
+    #[test]
+    fn saving_writes_the_loop_the_session_holds_and_marking_does_not() {
+        let state: ProjectUiStateCell = Rc::new(ProjectUiState::default());
+        assert!(
+            matches!(
+                project_save_command(&state),
+                IdeWorkerCommand::SaveProject
+            ),
+            "a project with no marks saves the mixer alone"
+        );
+
+        state.loop_marks.set(LoopMarks {
+            start: Some(48_000),
+            end: Some(96_000),
+        });
+        state.loop_engaged.set(true);
+        assert!(
+            matches!(
+                project_save_command(&state),
+                IdeWorkerCommand::SetArrangementLoopRange {
+                    range: Some(IdeLoopRangeFrames {
+                        start_frame: 48_000,
+                        end_frame: 96_000,
+                        enabled: true,
+                    })
+                }
+            ),
+            "and a marked loop is written with the mixer in one transaction"
+        );
+
+        state.loop_engaged.set(false);
+        assert!(
+            matches!(
+                project_save_command(&state),
+                IdeWorkerCommand::SetArrangementLoopRange {
+                    range: Some(IdeLoopRangeFrames { enabled: false, .. })
+                }
+            ),
+            "a disengaged loop is saved as disengaged"
+        );
+
+        state.loop_marks.set(LoopMarks {
+            start: Some(48_000),
+            end: None,
+        });
+        assert!(
+            matches!(
+                project_save_command(&state),
+                IdeWorkerCommand::SetArrangementLoopRange { range: None }
+            ),
+            "one mark clears any stored range rather than writing half of one"
         );
     }
 
