@@ -540,6 +540,58 @@ fn an_empty_or_inverted_loop_range_is_refused() {
 }
 
 #[test]
+fn a_range_that_is_armed_but_not_enabled_does_nothing() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 100)
+            .unwrap();
+    let mut transport = PreparedPlaybackTransportRuntime::new(runtime);
+    transport
+        .apply_command(TransportCommand::SetLoopRange(Some(
+            TransportLoopRange::new(20, 50).unwrap(),
+        )))
+        .unwrap();
+    transport
+        .apply_command(TransportCommand::Locate {
+            frame: 40,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+
+    let mut arrangement_left = [9.0_f32; 100];
+    let mut arrangement_right = [9.0_f32; 100];
+    let mut scene_left = [9.0_f32; 100];
+    let mut scene_right = [9.0_f32; 100];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut left = [9.0_f32; 30];
+    let mut right = [9.0_f32; 30];
+    let cycle = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        cycle.loop_wrap_count(),
+        0,
+        "a range alone does not loop; the enabled flag is what engages it"
+    );
+    assert_eq!(transport.position_frame(), 70, "playback ran straight past 50");
+    let (expected_left, expected_right) = render_linear(&fixture, 40, 30);
+    assert_samples(&left, &expected_left);
+    assert_samples(&right, &expected_right);
+}
+
+#[test]
 fn arming_a_range_does_not_move_the_playhead_and_disabling_leaves_it_where_it_is() {
     let fixture = playback_fixture();
     let graph = fixture.compile_playback();
