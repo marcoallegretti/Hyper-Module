@@ -549,6 +549,7 @@ export component MainWindow inherits Window {
     in property <string> transport-state: "Stopped";
     in property <string> stream-state: "No stream";
     in property <string> frame-position: "0";
+    in property <string> musical-position: "";
     in property <string> transport-clock: "00:00:00.000";
     in property <bool> transport-extent-bounded: false;
     in property <bool> transport-seek-available: false;
@@ -1047,6 +1048,7 @@ export component MainWindow inherits Window {
                                 }
                             }
                             Text { text: root.transport-clock; color: #dce5ef; font-size: 18px; font-weight: 600; horizontal-alignment: center; }
+                            Text { text: root.musical-position; color: #7fd6a2; font-size: 12px; font-weight: 600; horizontal-alignment: center; }
                             Text { text: "Frame  " + root.frame-position; color: #8fa0b4; font-size: 11px; horizontal-alignment: center; }
                             VerticalLayout {
                                 spacing: 2px;

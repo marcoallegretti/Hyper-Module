@@ -19,7 +19,8 @@ use hyper_desktop_ide::{
     IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeOutputSelection,
     ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
     IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
-    IdeControlMappingEdit, IdeLoopRangeFrames, IdeResourceRestoreError, SceneAction,
+    IdeControlMappingEdit, IdeLoopRangeFrames, IdeResourceRestoreError, MeterEvent, SceneAction,
+    TempoEvent, musical_position_at_frame,
     bpm_for_microseconds_per_quarter, microseconds_per_quarter_for_bpm,
     TransportAction, TriggerBehavior,
     IdeAutomationTakeRequest, IdeAutomationTarget, IdeOutputTestState, IdePlaybackArrangement,
@@ -70,6 +71,7 @@ struct ProjectUiState {
     playhead_frame: Cell<usize>,
     loop_marks: Cell<LoopMarks>,
     loop_engaged: Cell<bool>,
+    timeline: RefCell<ProjectTimeline>,
     sample_rate_hz: Cell<u32>,
     arrangement: RefCell<Option<ArrangementBinding>>,
     audio_clips: RefCell<Vec<IdeAudioClip>>,
@@ -4894,8 +4896,7 @@ fn apply_running_event(
             .into(),
     );
     let position_frame = observation.recovery().position_frame();
-    ui.set_frame_position(position_frame.to_string().into());
-    project_state.playhead_frame.set(position_frame);
+    set_playhead(ui, project_state, position_frame);
     ui.set_transport_clock(
         format_transport_clock(
             u64::try_from(position_frame).unwrap_or(u64::MAX),
@@ -7730,6 +7731,45 @@ fn refresh_loop_controls(ui: &MainWindow, state: &ProjectUiStateCell, sample_rat
 /// it would leave the audio no longer fitting its authored duration and the
 /// compiler refuses. The control is therefore offered only while the
 /// arrangement is still empty, rather than accepting an edit that would fail.
+/// The playhead's musical position, or empty when the timeline cannot place it.
+/// Shown as bar|beat|tick, the notation both references use.
+fn set_playhead(ui: &MainWindow, project_state: &ProjectUiStateCell, position_frame: usize) {
+    ui.set_frame_position(position_frame.to_string().into());
+    project_state.playhead_frame.set(position_frame);
+    ui.set_musical_position(
+        format_musical_position(&project_state.timeline.borrow(), position_frame).into(),
+    );
+}
+
+fn format_musical_position(timeline: &ProjectTimeline, frame: usize) -> String {
+    musical_position_at_frame(
+        timeline.sample_rate_hz,
+        &timeline.tempo_events,
+        &timeline.meter_events,
+        frame,
+    )
+    .map_or_else(
+        |_| String::new(),
+        |position| {
+            format!(
+                "{}|{}|{:03}",
+                position.bar(),
+                position.beat(),
+                position.tick()
+            )
+        },
+    )
+}
+
+/// The two maps the musical readout needs, cached because they change only when
+/// the project does while the playhead moves every callback.
+#[derive(Clone, Debug, Default)]
+struct ProjectTimeline {
+    sample_rate_hz: u32,
+    tempo_events: Vec<TempoEvent>,
+    meter_events: Vec<MeterEvent>,
+}
+
 fn tempo_editable(placement_count: usize) -> bool {
     placement_count == 0
 }
@@ -7739,6 +7779,11 @@ fn set_tempo_and_loop(
     project_state: &ProjectUiStateCell,
     observation: &IdeRunningObservation,
 ) {
+    *project_state.timeline.borrow_mut() = ProjectTimeline {
+        sample_rate_hz: observation.sample_rate_hz(),
+        tempo_events: observation.tempo_events().to_vec(),
+        meter_events: observation.meter_events().to_vec(),
+    };
     let editable = tempo_editable(observation.arrangement().placements().len());
     ui.set_tempo_bpm(format_tempo_bpm(observation.microseconds_per_quarter()).into());
     ui.set_tempo_available(editable);
@@ -8603,6 +8648,39 @@ mod tests {
             tempo_command("abc").unwrap_err(),
             "\"abc\" is not a tempo",
             "and the message names what was typed"
+        );
+    }
+
+    #[test]
+    fn the_musical_readout_names_the_bar_and_beat_under_the_playhead() {
+        let timeline = ProjectTimeline {
+            sample_rate_hz: 48_000,
+            tempo_events: vec![TempoEvent {
+                tick: 0,
+                microseconds_per_quarter: 500_000,
+            }],
+            meter_events: vec![MeterEvent {
+                tick: 0,
+                numerator: 4,
+                denominator: 4,
+            }],
+        };
+        assert_eq!(format_musical_position(&timeline, 0), "1|1|000");
+        assert_eq!(
+            format_musical_position(&timeline, 24_000),
+            "1|2|000",
+            "one beat at 120 bpm is 24000 frames at 48 kHz"
+        );
+        assert_eq!(format_musical_position(&timeline, 96_000), "2|1|000");
+        assert!(
+            format_musical_position(&timeline, 25_000).starts_with("1|2|"),
+            "a frame between beats still names the beat it is inside"
+        );
+
+        assert_eq!(
+            format_musical_position(&ProjectTimeline::default(), 0),
+            "",
+            "a project whose timeline is not loaded shows nothing rather than a wrong bar"
         );
     }
 

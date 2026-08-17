@@ -73,6 +73,29 @@ impl MusicalPosition {
     }
 }
 
+/// The musical position of a sample frame, combining both halves of the
+/// timeline: the tempo map places the frame on a tick, and the meter map groups
+/// that tick into bars and beats.
+///
+/// # Errors
+///
+/// Returns [`TimelineError`] when either map is unusable or the arithmetic
+/// would overflow.
+pub fn musical_position_at_frame(
+    sample_rate_hz: u32,
+    tempo_events: &[TempoEvent],
+    meter_events: &[MeterEvent],
+    frame: usize,
+) -> Result<MusicalPosition, TimelineError> {
+    let timeline = FrameTimeline::try_new(sample_rate_hz, tempo_events)
+        .map_err(|_| TimelineError::ArithmeticOverflow)?;
+    let tick = timeline
+        .position_at_frame(frame)
+        .map_err(|_| TimelineError::ArithmeticOverflow)?
+        .whole_tick();
+    musical_position(meter_events, tick)
+}
+
 /// Converts a project tick to bars and beats through the step meter map.
 ///
 /// Meter does not affect playback timing; it groups a tempo's pulse into bars,
@@ -1227,6 +1250,48 @@ mod tests {
         );
         let third_beat = at(15_360 + 3_840);
         assert_eq!((third_beat.bar(), third_beat.beat()), (3, 3));
+    }
+
+    #[test]
+    fn a_frame_reads_as_the_bar_and_beat_the_tempo_places_it_on() {
+        let tempo = [TempoEvent {
+            tick: 0,
+            microseconds_per_quarter: 500_000,
+        }];
+        let meter = [MeterEvent {
+            tick: 0,
+            numerator: 4,
+            denominator: 4,
+        }];
+        let at = |frame| musical_position_at_frame(48_000, &tempo, &meter, frame).unwrap();
+
+        let origin = at(0);
+        assert_eq!((origin.bar(), origin.beat()), (1, 1));
+
+        // 120 bpm: a quarter is half a second, so 24000 frames is one beat.
+        let beat_two = at(24_000);
+        assert_eq!(
+            (beat_two.bar(), beat_two.beat()),
+            (1, 2),
+            "one beat at 120 bpm is 24000 frames at 48 kHz"
+        );
+        let bar_two = at(96_000);
+        assert_eq!(
+            (bar_two.bar(), bar_two.beat()),
+            (2, 1),
+            "and a 4/4 bar is four of them"
+        );
+
+        let faster = [TempoEvent {
+            tick: 0,
+            microseconds_per_quarter: 250_000,
+        }];
+        let doubled = musical_position_at_frame(48_000, &faster, &meter, 96_000).unwrap();
+        assert_eq!(
+            (doubled.bar(), doubled.beat()),
+            (3, 1),
+            "at twice the tempo the same frame is twice as far through the music"
+        );
     }
 
     #[test]

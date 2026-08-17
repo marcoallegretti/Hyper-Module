@@ -89,6 +89,9 @@ use hyper_playback_json::{
     serialize_recording_audio_clip_addition, serialize_scene_activation, serialize_scene_addition,
     serialize_scene_duplication, serialize_scene_rename, serialize_scene_slot_edit,
 };
+pub use hyper_playback_compiler::{
+    MeterEvent, MusicalPosition, TempoEvent, musical_position_at_frame,
+};
 pub use hyper_playback_json::{
     bpm_for_microseconds_per_quarter, microseconds_per_quarter_for_bpm,
 };

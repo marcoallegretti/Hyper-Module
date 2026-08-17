@@ -632,6 +632,8 @@ pub struct IdeRunningObservation {
     project_name: String,
     sample_rate_hz: u32,
     microseconds_per_quarter: u32,
+    meter_events: Vec<hyper_playback_compiler::MeterEvent>,
+    tempo_events: Vec<hyper_playback_compiler::TempoEvent>,
     playback_extent: super::IdePlaybackExtent,
     arrangement: Arc<super::IdePlaybackArrangement>,
     automation: Arc<super::IdePlaybackAutomation>,
@@ -1144,6 +1146,18 @@ impl IdeRunningObservation {
     #[must_use]
     pub const fn microseconds_per_quarter(&self) -> u32 {
         self.microseconds_per_quarter
+    }
+
+    /// The step meter map that groups the tempo's pulse into bars.
+    #[must_use]
+    pub fn meter_events(&self) -> &[hyper_playback_compiler::MeterEvent] {
+        &self.meter_events
+    }
+
+    /// The step tempo map that places a frame on a tick.
+    #[must_use]
+    pub fn tempo_events(&self) -> &[hyper_playback_compiler::TempoEvent] {
+        &self.tempo_events
     }
 
     #[must_use]
@@ -9764,6 +9778,8 @@ fn running_observation(
             .tempo_events()
             .first()
             .map_or(500_000, |event| event.microseconds_per_quarter),
+        meter_events: snapshot.loaded.meter_events().to_vec(),
+        tempo_events: snapshot.loaded.tempo_events().to_vec(),
         playback_extent: snapshot.playback_extent,
         arrangement: snapshot.arrangement,
         automation: snapshot.automation,
