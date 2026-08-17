@@ -30,6 +30,9 @@ hyper-storage-engine = { path = "../../../crates/storage-engine" }
 hyper-thread-supervisor = { path = "../../../crates/thread-supervisor" }
 uuid = { version = "=1.24.0", features = ["v4"] }
 
+[features]
+ui-test-support = []
+
 [dev-dependencies]
 hyper-clip-engine = { path = "../../../crates/clip-engine" }
 serde_json = "=1.0.151"

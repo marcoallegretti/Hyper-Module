@@ -1105,6 +1105,18 @@ impl IdeScene {
         self.availability
     }
 
+    #[cfg(any(test, feature = "ui-test-support"))]
+    #[must_use]
+    pub fn for_test(id: &str, name: &str, track_slots: Vec<IdeSceneTrackSlot>) -> Self {
+        Self {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            active: true,
+            availability: IdeSceneAvailability::Ready,
+            track_slots,
+        }
+    }
+
     #[must_use]
     pub fn track_slots(&self) -> &[IdeSceneTrackSlot] {
         &self.track_slots
@@ -1120,6 +1132,16 @@ impl IdeSceneTrackSlot {
     #[must_use]
     pub fn track_name(&self) -> &str {
         &self.track_name
+    }
+
+    #[cfg(any(test, feature = "ui-test-support"))]
+    #[must_use]
+    pub fn for_test(track_id: &str, track_name: &str, action: IdeSceneTrackAction) -> Self {
+        Self {
+            track_id: track_id.to_owned(),
+            track_name: track_name.to_owned(),
+            action,
+        }
     }
 
     #[must_use]

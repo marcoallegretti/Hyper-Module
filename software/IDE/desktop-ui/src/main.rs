@@ -7865,8 +7865,23 @@ fn format_meter(numerator: u16, denominator: u16) -> String {
     format!("{numerator}/{denominator}")
 }
 
-fn tempo_editable(placement_count: usize) -> bool {
-    placement_count == 0
+/// Hyper does not time-stretch, so any audio bound to the timeline pins the
+/// tempo. Placements are the obvious case; scene slots that play a clip are the
+/// less obvious one, and they fail differently — a scene launch marker makes the
+/// edit fail outright, while an interactive scene clip lets the edit succeed and
+/// silently marks the clip unavailable. Both are refused here rather than
+/// offering a control that breaks the project.
+fn tempo_editable(placement_count: usize, scene_clip_count: usize) -> bool {
+    placement_count == 0 && scene_clip_count == 0
+}
+
+/// How many scene slots play a clip, across every scene.
+fn scene_clip_count(scenes: &[IdeScene]) -> usize {
+    scenes
+        .iter()
+        .flat_map(IdeScene::track_slots)
+        .filter(|slot| matches!(slot.action(), IdeSceneTrackAction::Play { .. }))
+        .count()
 }
 
 fn set_tempo_and_loop(
@@ -7879,7 +7894,10 @@ fn set_tempo_and_loop(
         tempo_events: observation.tempo_events().to_vec(),
         meter_events: observation.meter_events().to_vec(),
     };
-    let editable = tempo_editable(observation.arrangement().placements().len());
+    let editable = tempo_editable(
+        observation.arrangement().placements().len(),
+        scene_clip_count(observation.scenes()),
+    );
     ui.set_tempo_bpm(format_tempo_bpm(observation.microseconds_per_quarter()).into());
     ui.set_tempo_available(editable);
     ui.set_meter_signature(
@@ -7893,7 +7911,7 @@ fn set_tempo_and_loop(
     ui.set_tempo_locked_reason(if editable {
         SharedString::default()
     } else {
-        "TEMPO IS FIXED WHILE AUDIO IS PLACED".into()
+        "TEMPO IS FIXED WHILE AUDIO IS PLACED OR IN A SCENE".into()
     });
     seed_loop_marks(project_state, observation);
     refresh_loop_controls(ui, project_state, observation.sample_rate_hz());
@@ -8875,16 +8893,71 @@ mod tests {
     }
 
     #[test]
-    fn the_tempo_control_closes_once_audio_is_placed() {
+    fn the_tempo_control_closes_once_any_audio_is_bound_to_the_timeline() {
         assert!(
-            tempo_editable(0),
-            "an empty arrangement can still choose its tempo"
+            tempo_editable(0, 0),
+            "a project with no audio on the timeline can still choose its tempo"
         );
         assert!(
-            !tempo_editable(1),
+            !tempo_editable(1, 0),
             "one placed clip pins the tempo, because Hyper does not time-stretch"
         );
-        assert!(!tempo_editable(9));
+        assert!(
+            !tempo_editable(0, 1),
+            "and so does one scene slot that plays a clip, which the compiler              either refuses outright or silently marks unavailable"
+        );
+        assert!(!tempo_editable(9, 9));
+    }
+
+    #[test]
+    fn only_scene_slots_that_play_a_clip_pin_the_tempo() {
+        use hyper_desktop_ide::IdeSceneTrackSlot;
+
+        assert_eq!(scene_clip_count(&[]), 0);
+
+        let scene = |slots: Vec<IdeSceneTrackSlot>| IdeScene::for_test("scene", "Scene", slots);
+        assert_eq!(
+            scene_clip_count(&[scene(vec![
+                IdeSceneTrackSlot::for_test("t1", "Track 1", IdeSceneTrackAction::Stop),
+                IdeSceneTrackSlot::for_test("t2", "Track 2", IdeSceneTrackAction::Continue),
+            ])]),
+            0,
+            "stop and continue slots carry no audio, so they do not pin the tempo"
+        );
+        assert_eq!(
+            scene_clip_count(&[scene(vec![
+                IdeSceneTrackSlot::for_test("t1", "Track 1", IdeSceneTrackAction::Stop),
+                IdeSceneTrackSlot::for_test(
+                    "t2",
+                    "Track 2",
+                    IdeSceneTrackAction::Play {
+                        clip_id: "clip".to_owned()
+                    }
+                ),
+            ])]),
+            1,
+            "a slot that plays a clip does"
+        );
+        assert_eq!(
+            scene_clip_count(&[
+                scene(vec![IdeSceneTrackSlot::for_test(
+                    "t1",
+                    "Track 1",
+                    IdeSceneTrackAction::Play {
+                        clip_id: "a".to_owned()
+                    }
+                )]),
+                scene(vec![IdeSceneTrackSlot::for_test(
+                    "t2",
+                    "Track 2",
+                    IdeSceneTrackAction::Play {
+                        clip_id: "b".to_owned()
+                    }
+                )]),
+            ]),
+            2,
+            "and they are counted across every scene, not just the first"
+        );
     }
 
     #[test]

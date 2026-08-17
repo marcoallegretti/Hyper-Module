@@ -9,6 +9,9 @@ build = "build.rs"
 [lints]
 workspace = true
 
+[dev-dependencies]
+hyper-desktop-ide = { path = "../application", features = ["ui-test-support"] }
+
 [dependencies]
 hyper-desktop-ide = { path = "../application" }
 rfd = { version = "=0.17.2" }
