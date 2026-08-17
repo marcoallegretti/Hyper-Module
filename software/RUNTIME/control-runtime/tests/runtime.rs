@@ -1107,12 +1107,12 @@ fn connect_refuses_bindings_the_panel_cannot_serve_and_installs_the_rest() {
                     step_millionths: step(50_000),
                 },
                 PanelBinding::Encoder {
-                    index: 7,
+                    index: 2,
                     target: ValueControlTarget::ChannelGain { channel_index: 0 },
                     step_millionths: step(50_000),
                 },
                 PanelBinding::Button {
-                    index: 5,
+                    index: 2,
                     target: BooleanControlTarget::ChannelMute { channel_index: 0 },
                     behavior: PanelButtonBehavior::Toggle,
                 },
@@ -1155,11 +1155,11 @@ fn connect_refuses_bindings_the_panel_cannot_serve_and_installs_the_rest() {
     ));
 
     assert_eq!(
-        runtime.dispatch_panel(turn(7, 1)),
+        runtime.dispatch_panel(turn(2, 1)),
         Ok(PanelDispatchOutcome::Unbound)
     );
     assert_eq!(
-        runtime.dispatch_panel(press(5)),
+        runtime.dispatch_panel(press(2)),
         Ok(PanelDispatchOutcome::Unbound)
     );
     assert_eq!(
@@ -1204,7 +1204,7 @@ fn encoder_deltas_move_the_bound_target_in_the_turned_direction_and_stop_at_its_
 
     assert_eq!(runtime.dispatch_panel(turn(0, 3)), moved_to(750_000));
     assert_eq!(runtime.dispatch_panel(turn(0, -1)), moved_to(500_000));
-    assert_eq!(runtime.dispatch_panel(turn(0, -6)), moved_to(-1_000_000));
+    assert_eq!(runtime.dispatch_panel(turn(0, -8)), moved_to(-1_000_000));
     assert_eq!(
         runtime.dispatch_panel(turn(0, -1)),
         Ok(PanelDispatchOutcome::Idle { control })
@@ -1364,6 +1364,16 @@ fn bindings_survive_a_reconnect_only_while_the_new_descriptor_still_has_the_cont
         runtime.dispatch_panel(press(3)),
         Ok(PanelDispatchOutcome::Sent { .. })
     ));
+    assert_eq!(
+        runtime.dispatch_panel(turn(0, 2)),
+        Ok(PanelDispatchOutcome::Sent {
+            control: PanelControl::Encoder { index: 0 },
+            command: RuntimeControlCommand::ChannelGain {
+                channel_index: 0,
+                gain_millionths: 1_100_000,
+            },
+        })
+    );
 
     assert!(runtime.disconnect_panel().is_empty());
     assert!(!runtime.panel_connected());
