@@ -503,6 +503,8 @@ export component MainWindow inherits Window {
     in property <string> export-summary: "";
     in property <string> undo-label: "";
     in property <string> redo-label: "";
+    in property <bool> undo-available: false;
+    in property <bool> redo-available: false;
     in-out property <bool> control-create-visible: false;
     in-out property <int> control-create-source-index: 0;
     in-out property <int> control-create-target-index: 0;
@@ -889,14 +891,14 @@ export component MainWindow inherits Window {
                             Button {
                                 horizontal-stretch: 1;
                                 text: root.undo-label == "" ? "Undo" : "Undo " + root.undo-label;
-                                enabled: root.app-mode == AppMode.running && root.undo-label != "";
+                                enabled: root.undo-available;
                                 accessible-label: "Undo the last durable edit";
                                 clicked => { IdeActions.undo-edit(); }
                             }
                             Button {
                                 horizontal-stretch: 1;
                                 text: root.redo-label == "" ? "Redo" : "Redo " + root.redo-label;
-                                enabled: root.app-mode == AppMode.running && root.redo-label != "";
+                                enabled: root.redo-available;
                                 accessible-label: "Redo the last undone edit";
                                 clicked => { IdeActions.redo-edit(); }
                             }

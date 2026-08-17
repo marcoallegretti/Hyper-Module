@@ -19,7 +19,7 @@ use hyper_desktop_ide::{
     IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeOutputSelection,
     ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
     IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
-    IdeControlMappingEdit, SceneAction, TransportAction, TriggerBehavior,
+    IdeControlMappingEdit, IdeResourceRestoreError, SceneAction, TransportAction, TriggerBehavior,
     IdeAutomationTakeRequest, IdeAutomationTarget, IdeOutputTestState, IdePlaybackArrangement,
     OfflineExportReport,
     IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent, IdeRecordingAbortOutcome,
@@ -3320,10 +3320,23 @@ fn apply_event(
         event @ (IdeWorkerEvent::ProjectExporting | IdeWorkerEvent::ProjectExported { .. }) => {
             apply_project_export_event(ui, &event);
         }
-        event @ (IdeWorkerEvent::UndoStateChanged { .. }
-        | IdeWorkerEvent::EditRestored { .. }
-        | IdeWorkerEvent::EditRestoring { .. }
-        | IdeWorkerEvent::EditRestoreCommittedWithWarning { .. }) => apply_undo_event(ui, &event),
+        IdeWorkerEvent::UndoStateChanged {
+            undo_label,
+            redo_label,
+        } => apply_undo_state(ui, undo_label, redo_label),
+        IdeWorkerEvent::EditRestoring { redo, label } => apply_restore_progress(ui, redo, label),
+        IdeWorkerEvent::EditRestored { revision, redo, .. } => {
+            apply_restore_result(ui, restored_status_text(redo, revision), String::new());
+        }
+        IdeWorkerEvent::EditRestoreCommittedWithWarning {
+            redo,
+            label,
+            warning,
+        } => apply_restore_result(
+            ui,
+            String::new(),
+            restore_warning_text(redo, label, warning.as_ref()),
+        ),
         event @ (IdeWorkerEvent::SceneDuplicated { .. }
         | IdeWorkerEvent::SceneDuplicationCommittedWithWarning { .. }
         | IdeWorkerEvent::SceneDuplicating) => apply_scene_duplication_event(ui, &event),
@@ -5598,6 +5611,8 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_export_summary(SharedString::default());
     ui.set_undo_label(SharedString::default());
     ui.set_redo_label(SharedString::default());
+    ui.set_undo_available(false);
+    ui.set_redo_available(false);
     reset_arrangement_scene_launch_addition_form(ui);
     reset_arrangement_scene_launch_move_form(ui);
     reset_arrangement_scene_launch_scene_form(ui);
@@ -7469,59 +7484,61 @@ fn apply_project_export_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     }
 }
 
-fn apply_undo_event(ui: &MainWindow, event: &IdeWorkerEvent) {
-    match event {
-        IdeWorkerEvent::UndoStateChanged {
-            undo_label,
-            redo_label,
-        } => {
-            ui.set_undo_label(undo_label.unwrap_or_default().into());
-            ui.set_redo_label(redo_label.unwrap_or_default().into());
-        }
-        IdeWorkerEvent::EditRestored {
-            revision,
-            redo,
-            label: _,
-        } => {
-            ui.set_app_mode(AppMode::Running);
-            ui.set_status_text(
-                if *redo {
-                    format!("Edit reapplied in project revision {revision}")
-                } else {
-                    format!("Edit undone in project revision {revision}")
-                }
-                .into(),
-            );
-            ui.set_error_text(SharedString::default());
-        }
-        IdeWorkerEvent::EditRestoreCommittedWithWarning {
-            redo,
-            label,
-            warning,
-        } => {
-            ui.set_app_mode(AppMode::Running);
-            ui.set_status_text(SharedString::default());
-            ui.set_error_text(
-                format!(
-                    "The {label} was {} but the project may need attention: {warning}",
-                    if *redo { "reapplied" } else { "undone" }
-                )
-                .into(),
-            );
-        }
-        IdeWorkerEvent::EditRestoring { redo, label } => {
-            ui.set_app_mode(AppMode::RestoringEdit);
-            ui.set_status_text(
-                if *redo {
-                    format!("Reapplying the undone {label}…")
-                } else {
-                    format!("Undoing the {label}…")
-                }
-                .into(),
-            );
-        }
-        _ => unreachable!("undo event dispatcher received another event"),
+fn restoring_status_text(redo: bool, label: &str) -> String {
+    if redo {
+        format!("Reapplying the undone {label}…")
+    } else {
+        format!("Undoing the {label}…")
     }
+}
+
+fn restored_status_text(redo: bool, revision: u64) -> String {
+    if redo {
+        format!("Edit reapplied in project revision {revision}")
+    } else {
+        format!("Edit undone in project revision {revision}")
+    }
+}
+
+fn restore_warning_text(redo: bool, label: &str, warning: &IdeResourceRestoreError) -> String {
+    format!(
+        "The {label} was {} but the project may need attention: {warning}",
+        if redo { "reapplied" } else { "undone" }
+    )
+}
+
+/// A restore can be offered only while the project is idle and the matching
+/// stack holds an entry. The controls read this, and the callback refuses on
+/// the same rule, so the button cannot be a different promise from the action.
+fn restore_available(mode: AppMode, label: Option<&str>) -> bool {
+    mode == AppMode::Running && label.is_some_and(|label| !label.is_empty())
+}
+
+fn apply_undo_state(ui: &MainWindow, undo_label: Option<&str>, redo_label: Option<&str>) {
+    ui.set_undo_label(undo_label.unwrap_or_default().into());
+    ui.set_redo_label(redo_label.unwrap_or_default().into());
+    refresh_restore_availability(ui);
+}
+
+fn refresh_restore_availability(ui: &MainWindow) {
+    let mode = ui.get_app_mode();
+    let undo = ui.get_undo_label();
+    let redo = ui.get_redo_label();
+    ui.set_undo_available(restore_available(mode, Some(undo.as_str())));
+    ui.set_redo_available(restore_available(mode, Some(redo.as_str())));
+}
+
+fn apply_restore_progress(ui: &MainWindow, redo: bool, label: &str) {
+    ui.set_app_mode(AppMode::RestoringEdit);
+    ui.set_status_text(restoring_status_text(redo, label).into());
+    refresh_restore_availability(ui);
+}
+
+fn apply_restore_result(ui: &MainWindow, status: String, error: String) {
+    ui.set_app_mode(AppMode::Running);
+    ui.set_status_text(status.into());
+    ui.set_error_text(error.into());
+    refresh_restore_availability(ui);
 }
 
 fn bind_undo_callbacks(ui: &MainWindow, worker: &WorkerCell) {
@@ -7532,7 +7549,12 @@ fn bind_undo_callbacks(ui: &MainWindow, worker: &WorkerCell) {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
-            if ui.get_app_mode() != AppMode::Running {
+            let label = if redo {
+                ui.get_redo_label()
+            } else {
+                ui.get_undo_label()
+            };
+            if !restore_available(ui.get_app_mode(), Some(label.as_str())) {
                 return;
             }
             submit_to_ui(
@@ -8197,6 +8219,73 @@ mod tests {
         assert_eq!(
             mode_after_failure(AppMode::RenamingScene, IdeWorkerCommandKind::RenameScene),
             AppMode::Running
+        );
+    }
+
+    #[test]
+    fn undo_and_redo_use_one_pending_mode_and_name_the_direction() {
+        for command in [IdeWorkerCommandKind::Undo, IdeWorkerCommandKind::Redo] {
+            assert_eq!(
+                mode_after_successful_submission(AppMode::Running, command),
+                AppMode::RestoringEdit
+            );
+            assert_eq!(
+                mode_after_failure(AppMode::RestoringEdit, command),
+                AppMode::Running
+            );
+            assert_eq!(
+                mode_after_failure(AppMode::Saving, command),
+                AppMode::Saving,
+                "a failure that did not come from a restore leaves the mode alone"
+            );
+        }
+
+        assert_eq!(
+            restoring_status_text(false, "clip gain"),
+            "Undoing the clip gain…"
+        );
+        assert_eq!(
+            restoring_status_text(true, "clip gain"),
+            "Reapplying the undone clip gain…"
+        );
+        assert_eq!(
+            restored_status_text(false, 7),
+            "Edit undone in project revision 7"
+        );
+        assert_eq!(
+            restored_status_text(true, 8),
+            "Edit reapplied in project revision 8"
+        );
+
+        assert!(restore_available(AppMode::Running, Some("clip gain")));
+        assert!(
+            !restore_available(AppMode::Running, Some("")),
+            "an empty stack offers nothing, whatever the mode"
+        );
+        assert!(!restore_available(AppMode::Running, None));
+        assert!(
+            !restore_available(AppMode::RestoringEdit, Some("clip gain")),
+            "a restore in flight cannot start another"
+        );
+        assert!(
+            !restore_available(AppMode::Saving, Some("clip gain")),
+            "and neither can any other pending project mutation"
+        );
+
+        let warning = restore_warning_text(
+            false,
+            "scene rename",
+            &IdeResourceRestoreError::ResourceMissing,
+        );
+        assert!(
+            warning.starts_with("The scene rename was undone but the project may need attention:"),
+            "a committed restore that then failed says so rather than reporting plain failure: \
+             {warning}"
+        );
+        assert!(
+            restore_warning_text(true, "clip loop", &IdeResourceRestoreError::ResourceMissing)
+                .contains("was reapplied but"),
+            "and names the direction it went"
         );
     }
 
