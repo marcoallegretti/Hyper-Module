@@ -5624,6 +5624,40 @@ mod tests {
         );
     }
 
+    /// A publication that fails after the manifest is committed recovers
+    /// forward. The replaced bytes must survive that path too, or an undo
+    /// captured through recovery would have nothing to restore.
+    #[test]
+    fn a_publication_recovered_as_committed_still_reports_what_it_replaced() {
+        let fixture = Fixture::new();
+        let outcome = publish_project_resource_observed(
+            &fixture.root,
+            fixture.request(),
+            ProjectResourcePublicationMode::Replacement,
+            |phase, _| {
+                if phase == PublicationPhase::Manifest {
+                    return Err(failure(
+                        ProjectResourcePublicationErrorKind::Io,
+                        "simulated post-manifest failure",
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(outcome.changed());
+        assert_eq!(
+            outcome.previous_resource(),
+            Some(fixture.original.as_slice()),
+            "the recovered publication carries the bytes it replaced"
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("mixer/mixer.json")).unwrap(),
+            fixture.replacement
+        );
+    }
+
     #[test]
     fn committed_resource_manifest_retains_publication_authority_during_recovery_failure() {
         let fixture = Fixture::new();
