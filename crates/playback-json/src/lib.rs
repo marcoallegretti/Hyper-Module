@@ -3108,6 +3108,7 @@ const MAX_MICROSECONDS_PER_QUARTER: u32 = 16_777_215;
 #[derive(Debug)]
 pub enum TempoSerializationError {
     TempoOutOfRange,
+    MeterOutOfRange,
     TimelineMissing,
     SourceTimelineMismatch,
     NonCanonicalSource,
@@ -3122,6 +3123,9 @@ impl fmt::Display for TempoSerializationError {
         match self {
             Self::TempoOutOfRange => formatter.write_str(
                 "tempo must convert to between 1 and 16777215 microseconds per quarter note",
+            ),
+            Self::MeterOutOfRange => formatter.write_str(
+                "time signature is outside the version 1 domain",
             ),
             Self::TimelineMissing => formatter.write_str("the project has no timeline"),
             Self::SourceTimelineMismatch => {
@@ -3147,6 +3151,7 @@ impl Error for TempoSerializationError {
             Self::ProjectCompilation(source) => Some(source),
             Self::Serialization(source) => Some(source),
             Self::TempoOutOfRange
+            | Self::MeterOutOfRange
             | Self::TimelineMissing
             | Self::SourceTimelineMismatch
             | Self::NonCanonicalSource
@@ -3175,6 +3180,75 @@ pub fn serialize_timeline_tempo(
     if microseconds_per_quarter == 0 || microseconds_per_quarter > MAX_MICROSECONDS_PER_QUARTER {
         return Err(TempoSerializationError::TempoOutOfRange);
     }
+    serialize_timeline_origin_edit(
+        project,
+        assets,
+        source_timeline,
+        limits,
+        "tempo_events",
+        |origin| {
+            origin.insert(
+                "microseconds_per_quarter".to_owned(),
+                microseconds_per_quarter.into(),
+            );
+        },
+    )
+}
+
+/// Rewrites the meter at the origin, the event the contract guarantees exists.
+///
+/// Unlike a tempo change this cannot make a placement's audio disagree with its
+/// authored duration: the meter is not part of the tick-to-frame conversion. It
+/// changes bar numbering only.
+///
+/// # Errors
+///
+/// Returns [`TempoSerializationError`] when the time signature falls outside the
+/// version 1 domain, the source is not the loaded timeline or is non-canonical,
+/// or the edited document would not load or compile.
+pub fn serialize_timeline_meter(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_timeline: &[u8],
+    numerator: u16,
+    denominator: u16,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, TempoSerializationError> {
+    if !meter_is_in_version_one_domain(numerator, denominator) {
+        return Err(TempoSerializationError::MeterOutOfRange);
+    }
+    serialize_timeline_origin_edit(
+        project,
+        assets,
+        source_timeline,
+        limits,
+        "meter_events",
+        |origin| {
+            origin.insert("numerator".to_owned(), numerator.into());
+            origin.insert("denominator".to_owned(), denominator.into());
+        },
+    )
+}
+
+/// Whether a time signature is one the version 1 contract accepts.
+#[must_use]
+pub fn meter_is_in_version_one_domain(numerator: u16, denominator: u16) -> bool {
+    (1..=255).contains(&numerator)
+        && [1_u16, 2, 4, 8, 16, 32, 64, 128, 256].contains(&denominator)
+}
+
+/// The shared timeline write path: verify the source is the loaded, canonical
+/// timeline, rewrite the event at the origin of one map, then reload and
+/// recompile before returning. Tempo and meter differ only in which map they
+/// address and which fields they set.
+fn serialize_timeline_origin_edit(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_timeline: &[u8],
+    limits: LoaderLimits,
+    map: &str,
+    edit: impl FnOnce(&mut serde_json::Map<String, Value>),
+) -> Result<Vec<u8>, TempoSerializationError> {
     let mut value: Value = serde_json::from_slice(source_timeline)
         .map_err(TempoSerializationError::Serialization)?;
     let canonical_source = serde_json_canonicalizer::to_vec(&value)
@@ -3188,21 +3262,17 @@ pub fn serialize_timeline_tempo(
     if document.get("id").and_then(Value::as_str) != Some(project.timeline_id.as_str()) {
         return Err(TempoSerializationError::SourceTimelineMismatch);
     }
-    let events = document
-        .get_mut("tempo_events")
+    let origin = document
+        .get_mut(map)
         .and_then(Value::as_array_mut)
-        .ok_or(TempoSerializationError::InvalidDocumentShape)?;
-    let origin = events
+        .ok_or(TempoSerializationError::InvalidDocumentShape)?
         .first_mut()
         .and_then(Value::as_object_mut)
         .ok_or(TempoSerializationError::TimelineMissing)?;
     if origin.get("tick").and_then(Value::as_u64) != Some(0) {
         return Err(TempoSerializationError::InvalidDocumentShape);
     }
-    origin.insert(
-        "microseconds_per_quarter".to_owned(),
-        microseconds_per_quarter.into(),
-    );
+    edit(origin);
 
     let output =
         serde_json_canonicalizer::to_vec(&value).map_err(TempoSerializationError::Serialization)?;
@@ -3219,6 +3289,7 @@ pub fn serialize_timeline_tempo(
     {
         return Err(TempoSerializationError::SourceTimelineMismatch);
     }
+    validate_meter_events(&edited.meter_events).map_err(TempoSerializationError::Source)?;
     let mut edited_project = project.clone();
     edited_project.tempo_events = edited
         .tempo_events
@@ -3228,6 +3299,7 @@ pub fn serialize_timeline_tempo(
             microseconds_per_quarter: event.microseconds_per_quarter,
         })
         .collect();
+    edited_project.meter_events = loaded_meter_events(edited.meter_events);
     edited_project
         .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
         .map_err(TempoSerializationError::ProjectCompilation)?;
@@ -13617,6 +13689,88 @@ mod tests {
             "halving the microseconds per quarter halves the frame a tick lands on"
         );
 
+    }
+
+    #[test]
+    fn setting_the_meter_renumbers_bars_without_moving_a_frame() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let source = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<serde_json::Value>(TIMELINE).unwrap(),
+        )
+        .unwrap();
+        let project = load(
+            input_with_scenes(&source, &tracks, &clips, &scenes, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let assets = [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
+            sample_rate_hz: 48_000,
+            frame_count: 100,
+        }];
+
+        let three_four = serialize_timeline_meter(
+            &project,
+            &assets,
+            &source,
+            3,
+            4,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let edited = load(
+            input_with_scenes(&three_four, &tracks, &clips, &scenes, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(edited.meter_events()[0].numerator, 3);
+        assert_eq!(edited.meter_events()[0].denominator, 4);
+
+        let tick = 11_520;
+        assert_eq!(
+            hyper_playback_compiler::musical_position(project.meter_events(), tick)
+                .unwrap()
+                .bar(),
+            2,
+            "four quarters to a bar puts this tick in bar two, beat three"
+        );
+        assert_eq!(
+            hyper_playback_compiler::musical_position(edited.meter_events(), tick)
+                .unwrap()
+                .bar(),
+            3,
+            "three quarters to a bar puts the same tick in bar three"
+        );
+        assert_eq!(
+            Timeline::try_new(48_000, project.tempo_events())
+                .unwrap()
+                .tick_to_frame(tick)
+                .unwrap(),
+            Timeline::try_new(48_000, edited.tempo_events())
+                .unwrap()
+                .tick_to_frame(tick)
+                .unwrap(),
+            "and the frame that tick lands on is untouched, because meter is not              part of the tempo map"
+        );
+
+        for refused in [(0_u16, 4_u16), (256, 4), (4, 3), (4, 0), (4, 512)] {
+            assert!(
+                matches!(
+                    serialize_timeline_meter(
+                        &project,
+                        &assets,
+                        &source,
+                        refused.0,
+                        refused.1,
+                        LoaderLimits::VERSION_1,
+                    ),
+                    Err(TempoSerializationError::MeterOutOfRange)
+                ),
+                "{refused:?} is outside the version 1 domain"
+            );
+        }
     }
 
     #[test]

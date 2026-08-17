@@ -78,7 +78,8 @@ use hyper_playback_json::{
     serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
     TempoSerializationError, serialize_arrangement_loop_range,
     serialize_arrangement_scene_launch_addition,
-    serialize_arrangement_scene_launch_move, serialize_timeline_tempo,
+    serialize_arrangement_scene_launch_move, serialize_timeline_meter,
+    serialize_timeline_tempo,
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_arrangement_scene_launch_removal, serialize_arrangement_scene_launch_scene_edit,
     serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
@@ -93,7 +94,8 @@ pub use hyper_playback_compiler::{
     MeterEvent, MusicalPosition, TempoEvent, musical_position_at_frame,
 };
 pub use hyper_playback_json::{
-    bpm_for_microseconds_per_quarter, microseconds_per_quarter_for_bpm,
+    bpm_for_microseconds_per_quarter, meter_is_in_version_one_domain,
+    microseconds_per_quarter_for_bpm,
 };
 pub use hyper_playback_json::{
     AutomationChannelParameter, AutomationInterpolation, AutomationMainParameter, AutomationPoint,
@@ -6888,11 +6890,60 @@ impl RunningDesktopIdeApplication {
         )
     }
 
+    fn prepare_timeline_meter(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        numerator: u16,
+        denominator: u16,
+    ) -> Result<IdeTimelineEditPlan, IdeTempoEditError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeTempoEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeTempoEditError::MixerSave(Box::new(IdeProjectSaveError::ProjectSnapshotUnavailable))
+        })?;
+        Self::prepare_timeline_edit_from_project(
+            application,
+            mixer,
+            prepared,
+            |project, facts, source, limits| {
+                serialize_timeline_meter(
+                    project,
+                    facts,
+                    source,
+                    numerator,
+                    denominator,
+                    limits,
+                )
+            },
+        )
+    }
+
     fn prepare_timeline_tempo_from_project(
         application: &DesktopIdeApplication,
         mixer: IdeMixerSavePlan,
         prepared: &PreparedProjectPlayback,
         microseconds_per_quarter: u32,
+    ) -> Result<IdeTimelineEditPlan, IdeTempoEditError> {
+        Self::prepare_timeline_edit_from_project(
+            application,
+            mixer,
+            prepared,
+            |project, facts, source, limits| {
+                serialize_timeline_tempo(project, facts, source, microseconds_per_quarter, limits)
+            },
+        )
+    }
+
+    fn prepare_timeline_edit_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        serialize: impl FnOnce(
+            &hyper_playback_json::LoadedPlaybackProject,
+            &[hyper_playback_json::MediaAssetFact<'_>],
+            &[u8],
+            LoaderLimits,
+        ) -> Result<Vec<u8>, TempoSerializationError>,
     ) -> Result<IdeTimelineEditPlan, IdeTempoEditError> {
         let package = prepared.package();
         let mut descriptors = package
@@ -6911,11 +6962,10 @@ impl RunningDesktopIdeApplication {
             .map_err(IdeTempoEditError::Storage)?;
         let (project, _, _, media) = prepared.session().parts();
         let facts: Vec<_> = media.media_asset_facts().collect();
-        let timeline_bytes = serialize_timeline_tempo(
+        let timeline_bytes = serialize(
             project,
             &facts,
             &source,
-            microseconds_per_quarter,
             application.config.project_limits.session.documents,
         )
         .map_err(|source| IdeTempoEditError::Serialization(Box::new(source)))?;

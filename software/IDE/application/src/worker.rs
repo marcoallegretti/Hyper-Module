@@ -142,6 +142,7 @@ pub enum IdeWorkerCommandKind {
     MoveArrangementSceneLaunch,
     SetArrangementLoopRange,
     SetTempo,
+    SetMeter,
     SetArrangementSceneLaunchScene,
     RemoveArrangementSceneLaunch,
     DuplicateArrangementPlacement,
@@ -250,6 +251,10 @@ pub enum IdeWorkerCommand {
     MoveArrangementSceneLaunch {
         launch_id: String,
         tick: u64,
+    },
+    SetMeter {
+        numerator: u16,
+        denominator: u16,
     },
     SetTempo {
         microseconds_per_quarter: u32,
@@ -415,6 +420,7 @@ impl IdeWorkerCommand {
                 IdeWorkerCommandKind::SetArrangementLoopRange
             }
             Self::SetTempo { .. } => IdeWorkerCommandKind::SetTempo,
+            Self::SetMeter { .. } => IdeWorkerCommandKind::SetMeter,
             Self::SetArrangementSceneLaunchScene { .. } => {
                 IdeWorkerCommandKind::SetArrangementSceneLaunchScene
             }
@@ -1828,6 +1834,15 @@ pub enum IdeWorkerEvent {
     ArrangementSceneLaunchRemoving,
     ArrangementLoopRangeChanging,
     TempoChanging,
+    MeterChanging,
+    MeterChanged {
+        revision: u64,
+        numerator: u16,
+        denominator: u16,
+    },
+    MeterCommittedWithWarning {
+        warning: Box<IdeTempoEditError>,
+    },
     TempoChanged {
         revision: u64,
         microseconds_per_quarter: u32,
@@ -2253,6 +2268,10 @@ enum ProjectMutation {
         launch_id: String,
         tick: u64,
     },
+    SetMeter {
+        numerator: u16,
+        denominator: u16,
+    },
     SetTempo {
         microseconds_per_quarter: u32,
     },
@@ -2368,6 +2387,7 @@ impl ProjectMutation {
                 IdeWorkerCommandKind::SetArrangementLoopRange
             }
             Self::SetTempo { .. } => IdeWorkerCommandKind::SetTempo,
+            Self::SetMeter { .. } => IdeWorkerCommandKind::SetMeter,
             Self::SaveMixer => IdeWorkerCommandKind::SaveProject,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
@@ -2458,6 +2478,7 @@ impl ProjectMutation {
             }
             Self::SetArrangementLoopRange { .. } => IdeWorkerEvent::ArrangementLoopRangeChanging,
             Self::SetTempo { .. } => IdeWorkerEvent::TempoChanging,
+            Self::SetMeter { .. } => IdeWorkerEvent::MeterChanging,
             Self::RemoveArrangementSceneLaunch { .. } => {
                 IdeWorkerEvent::ArrangementSceneLaunchRemoving
             }
@@ -2635,6 +2656,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::MoveArrangementSceneLaunch => "scene marker move",
         IdeWorkerCommandKind::SetArrangementLoopRange => "loop range",
         IdeWorkerCommandKind::SetTempo => "tempo",
+        IdeWorkerCommandKind::SetMeter => "time signature",
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => "scene marker reassignment",
         IdeWorkerCommandKind::RemoveArrangementSceneLaunch => "scene marker removal",
         IdeWorkerCommandKind::RenameAudioClip => "clip rename",
@@ -2926,6 +2948,7 @@ fn process_command(
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
         | IdeWorkerCommand::SetArrangementLoopRange { .. }
         | IdeWorkerCommand::SetTempo { .. }
+        | IdeWorkerCommand::SetMeter { .. }
         | IdeWorkerCommand::SetArrangementSceneLaunchScene { .. }
         | IdeWorkerCommand::RemoveArrangementSceneLaunch { .. }
         | IdeWorkerCommand::DuplicateArrangementPlacement { .. }
@@ -3054,6 +3077,7 @@ fn process_project_mutation_command(
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
         | IdeWorkerCommand::SetArrangementLoopRange { .. }
         | IdeWorkerCommand::SetTempo { .. }
+        | IdeWorkerCommand::SetMeter { .. }
         | IdeWorkerCommand::SetArrangementSceneLaunchScene { .. }
         | IdeWorkerCommand::RemoveArrangementSceneLaunch { .. }
         | IdeWorkerCommand::DuplicateArrangementPlacement { .. }
@@ -3150,6 +3174,17 @@ fn process_arrangement_mutation_command(
             events,
             ProjectMutation::SetTempo {
                 microseconds_per_quarter,
+            },
+        ),
+        IdeWorkerCommand::SetMeter {
+            numerator,
+            denominator,
+        } => begin_project_mutation_request(
+            state,
+            events,
+            ProjectMutation::SetMeter {
+                numerator,
+                denominator,
             },
         ),
         IdeWorkerCommand::MoveArrangementSceneLaunch { launch_id, tick } => {
@@ -5203,6 +5238,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Ok(outcome), .. }
         | ProjectMutationAttempt::SetArrangementLoopRange { result: Ok(outcome) }
         | ProjectMutationAttempt::SetTempo { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetMeter { result: Ok(outcome), .. }
         | ProjectMutationAttempt::SetArrangementSceneLaunchScene { result: Ok(outcome), .. }
         | ProjectMutationAttempt::RemoveArrangementSceneLaunch { result: Ok(outcome), .. }
         | ProjectMutationAttempt::SetArrangementPlacementActive { result: Ok(outcome), .. }
@@ -5251,6 +5287,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::SetArrangementLoopRange { result: Err(_) }
         | ProjectMutationAttempt::SetTempo { result: Err(_), .. }
+        | ProjectMutationAttempt::SetMeter { result: Err(_), .. }
         | ProjectMutationAttempt::SetArrangementSceneLaunchScene { result: Err(_), .. }
         | ProjectMutationAttempt::RemoveArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::DuplicateArrangementPlacement { result: Err(_), .. }
@@ -5887,7 +5924,7 @@ fn project_mutation_save_failure(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
             ))
         }
-        ProjectMutation::SetTempo { .. } => {
+        ProjectMutation::SetTempo { .. } | ProjectMutation::SetMeter { .. } => {
             IdeWorkerCommandFailure::Tempo(Box::new(IdeTempoEditError::MixerSave(Box::new(reason))))
         }
         ProjectMutation::SetArrangementSceneLaunchScene { .. } => {
@@ -6113,7 +6150,7 @@ fn project_mutation_native_close_failure(
                 IdeArrangementPlacementEditError::NativeClose(failure),
             ))
         }
-        ProjectMutation::SetTempo { .. } => {
+        ProjectMutation::SetTempo { .. } | ProjectMutation::SetMeter { .. } => {
             IdeWorkerCommandFailure::Tempo(Box::new(IdeTempoEditError::NativeClose(failure)))
         }
         ProjectMutation::SetArrangementSceneLaunchScene { .. } => {
@@ -6257,6 +6294,14 @@ enum ProjectMutationAttempt {
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeArrangementPlacementEditError,
+        >,
+    },
+    SetMeter {
+        numerator: u16,
+        denominator: u16,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeTempoEditError,
         >,
     },
     SetTempo {
@@ -6879,6 +6924,34 @@ fn complete_project_mutation(
                     IdeWorkerCommandKind::AddArrangementSceneLaunch,
                     reason,
                     IdeWorkerCommandFailure::ArrangementSceneLaunchAddition,
+                ),
+                ProjectMutationAttempt::SetMeter {
+                    numerator,
+                    denominator,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::MeterChanged {
+                        revision: outcome.project_revision(),
+                        numerator,
+                        denominator,
+                    },
+                ),
+                ProjectMutationAttempt::SetMeter {
+                    result: Err(reason),
+                    ..
+                } => send_event(
+                    events,
+                    if reason.publication_committed() {
+                        IdeWorkerEvent::MeterCommittedWithWarning {
+                            warning: Box::new(reason),
+                        }
+                    } else {
+                        IdeWorkerEvent::CommandFailed {
+                            command: IdeWorkerCommandKind::SetMeter,
+                            reason: IdeWorkerCommandFailure::Tempo(Box::new(reason)),
+                        }
+                    },
                 ),
                 ProjectMutationAttempt::SetTempo {
                     microseconds_per_quarter,
@@ -7521,6 +7594,24 @@ fn attempt_project_mutation(
                 ),
             }
         }
+        ProjectMutation::SetMeter {
+            numerator,
+            denominator,
+        } => ProjectMutationAttempt::SetMeter {
+            numerator,
+            denominator,
+            result: if let Some(failure) = native_failure {
+                Err(IdeTempoEditError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_timeline_meter(
+                    application,
+                    recovery,
+                    numerator,
+                    denominator,
+                )
+                .and_then(|plan| plan.publish())
+            },
+        },
         ProjectMutation::SetTempo {
             microseconds_per_quarter,
         } => ProjectMutationAttempt::SetTempo {
@@ -8509,7 +8600,8 @@ fn project_mutation_reopen_failure(
                 IdeWorkerCommandFailure::ArrangementSceneLaunchAddition,
             )
         }
-        ProjectMutationAttempt::SetTempo { result, .. } => {
+        ProjectMutationAttempt::SetMeter { result, .. }
+        | ProjectMutationAttempt::SetTempo { result, .. } => {
             let reason = match result {
                 Ok(outcome) => IdeTempoEditError::ReopenAfterPublication {
                     outcome: Box::new(outcome),

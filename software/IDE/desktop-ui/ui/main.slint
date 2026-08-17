@@ -199,6 +199,7 @@ export global IdeActions {
     callback loop-toggle();
     callback loop-clear();
     callback set-tempo(string);
+    callback set-meter(string);
     callback locate-placement(int);
     callback set-arrangement-placement-active(int, bool);
     callback move-arrangement-placement(string, string);
@@ -560,6 +561,8 @@ export component MainWindow inherits Window {
     in property <string> tempo-bpm: "";
     in property <bool> tempo-available: false;
     in property <string> tempo-locked-reason: "";
+    in property <string> meter-signature: "";
+    in property <bool> meter-available: false;
     in property <float> transport-progress-percent: 0;
     in property <string> transport-end-clock: "—";
     in property <string> callback-count: "0";
@@ -1081,6 +1084,26 @@ export component MainWindow inherits Window {
                                         enabled: root.tempo-available;
                                         accessible-label: "Apply the typed tempo to the project";
                                         clicked => { IdeActions.set-tempo(tempo-input.text); }
+                                    }
+                                    Text {
+                                        text: "METER";
+                                        color: #65758a;
+                                        font-size: 9px;
+                                        vertical-alignment: center;
+                                    }
+                                    meter-input := LineEdit {
+                                        width: 62px;
+                                        text: root.meter-signature;
+                                        enabled: root.meter-available;
+                                        placeholder-text: "4/4";
+                                        accessible-label: "Project time signature";
+                                        accepted => { IdeActions.set-meter(self.text); }
+                                    }
+                                    Button {
+                                        text: "Set";
+                                        enabled: root.meter-available;
+                                        accessible-label: "Apply the typed time signature";
+                                        clicked => { IdeActions.set-meter(meter-input.text); }
                                     }
                                     Text {
                                         text: root.tempo-locked-reason;

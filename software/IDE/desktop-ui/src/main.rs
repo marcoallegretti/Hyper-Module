@@ -20,7 +20,7 @@ use hyper_desktop_ide::{
     ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
     IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
     IdeControlMappingEdit, IdeLoopRangeFrames, IdeResourceRestoreError, MeterEvent, SceneAction,
-    TempoEvent, musical_position_at_frame,
+    TempoEvent, meter_is_in_version_one_domain, musical_position_at_frame,
     bpm_for_microseconds_per_quarter, microseconds_per_quarter_for_bpm,
     TransportAction, TriggerBehavior,
     IdeAutomationTakeRequest, IdeAutomationTarget, IdeOutputTestState, IdePlaybackArrangement,
@@ -1615,6 +1615,7 @@ fn bind_arrangement_scene_launch_callback(
     bind_undo_callbacks(ui, worker);
     bind_loop_callbacks(ui, worker, project_state);
     bind_tempo_callback(ui, worker);
+    bind_meter_callback(ui, worker);
     bind_arrangement_scene_launch_locate_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_scene_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_removal_callback(ui, worker, project_state);
@@ -2988,7 +2989,8 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         | IdeWorkerCommandKind::AddScene
         | IdeWorkerCommandKind::SetSceneSlot
         | IdeWorkerCommandKind::SetArrangementLoopRange
-        | IdeWorkerCommandKind::SetTempo => AppMode::Saving,
+        | IdeWorkerCommandKind::SetTempo
+        | IdeWorkerCommandKind::SetMeter => AppMode::Saving,
         IdeWorkerCommandKind::AddAudioTrack => AppMode::AddingTrack,
         IdeWorkerCommandKind::RemoveAudioTrack => AppMode::RemovingTrack,
         IdeWorkerCommandKind::RenameAudioTrack => AppMode::RenamingTrack,
@@ -3082,6 +3084,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetTempo => {
             "Preserving mixer state, saving the tempo, and reopening project..."
+        }
+        IdeWorkerCommandKind::SetMeter => {
+            "Preserving mixer state, saving the time signature, and reopening project..."
         }
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => {
             "Preserving mixer state, changing the marker scene, and reopening project..."
@@ -3400,6 +3405,31 @@ fn apply_event(
         }
         event @ (IdeWorkerEvent::ProjectExporting | IdeWorkerEvent::ProjectExported { .. }) => {
             apply_project_export_event(ui, &event);
+        }
+        IdeWorkerEvent::MeterChanging => {
+            ui.set_status_text("Saving the time signature...".into());
+        }
+        IdeWorkerEvent::MeterChanged {
+            revision,
+            numerator,
+            denominator,
+        } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_meter_signature(format!("{numerator}/{denominator}").into());
+            ui.set_status_text(
+                format!("Time signature saved in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::MeterCommittedWithWarning { warning } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text(SharedString::default());
+            ui.set_error_text(
+                format!(
+                    "The time signature was saved but the project may need attention: {warning}"
+                )
+                .into(),
+            );
         }
         IdeWorkerEvent::TempoChanging => {
             ui.set_status_text("Saving the tempo...".into());
@@ -5736,6 +5766,8 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_tempo_bpm(SharedString::default());
     ui.set_tempo_available(false);
     ui.set_tempo_locked_reason(SharedString::default());
+    ui.set_meter_signature(SharedString::default());
+    ui.set_meter_available(false);
     ui.set_loop_marking_available(false);
     ui.set_loop_toggle_available(false);
     ui.set_loop_engaged(false);
@@ -5774,6 +5806,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         | IdeWorkerCommandKind::SetSceneSlot
         | IdeWorkerCommandKind::SetArrangementLoopRange
         | IdeWorkerCommandKind::SetTempo
+        | IdeWorkerCommandKind::SetMeter
             if current == AppMode::Saving =>
         {
             AppMode::Running
@@ -7770,6 +7803,48 @@ struct ProjectTimeline {
     meter_events: Vec<MeterEvent>,
 }
 
+/// A typed time signature becomes a command only when the contract accepts it.
+/// `4/4` and `6/8` are the shapes users type; anything else is reported.
+fn meter_command(typed: &str) -> Result<IdeWorkerCommand, String> {
+    let trimmed = typed.trim();
+    let (numerator, denominator) = trimmed
+        .split_once('/')
+        .ok_or_else(|| format!("\"{trimmed}\" is not a time signature"))?;
+    let numerator: u16 = numerator
+        .trim()
+        .parse()
+        .map_err(|_| format!("\"{trimmed}\" is not a time signature"))?;
+    let denominator: u16 = denominator
+        .trim()
+        .parse()
+        .map_err(|_| format!("\"{trimmed}\" is not a time signature"))?;
+    if meter_is_in_version_one_domain(numerator, denominator) {
+        Ok(IdeWorkerCommand::SetMeter {
+            numerator,
+            denominator,
+        })
+    } else {
+        Err(format!("{trimmed} is not a time signature this project can hold"))
+    }
+}
+
+fn bind_meter_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    ui.global::<IdeActions>().on_set_meter(move |typed| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        match meter_command(typed.as_str()) {
+            Ok(command) => submit_to_ui(&ui, &worker, command),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+}
+
 fn tempo_editable(placement_count: usize) -> bool {
     placement_count == 0
 }
@@ -7787,6 +7862,16 @@ fn set_tempo_and_loop(
     let editable = tempo_editable(observation.arrangement().placements().len());
     ui.set_tempo_bpm(format_tempo_bpm(observation.microseconds_per_quarter()).into());
     ui.set_tempo_available(editable);
+    ui.set_meter_signature(
+        observation
+            .meter_events()
+            .first()
+            .map_or_else(String::new, |meter| {
+                format!("{}/{}", meter.numerator, meter.denominator)
+            })
+            .into(),
+    );
+    ui.set_meter_available(true);
     ui.set_tempo_locked_reason(if editable {
         SharedString::default()
     } else {
@@ -8681,6 +8766,43 @@ mod tests {
             format_musical_position(&ProjectTimeline::default(), 0),
             "",
             "a project whose timeline is not loaded shows nothing rather than a wrong bar"
+        );
+    }
+
+    #[test]
+    fn a_typed_time_signature_becomes_a_command_only_when_the_contract_accepts_it() {
+        assert!(matches!(
+            meter_command("3/4"),
+            Ok(IdeWorkerCommand::SetMeter {
+                numerator: 3,
+                denominator: 4
+            })
+        ));
+        assert!(
+            matches!(
+                meter_command("  6 / 8 "),
+                Ok(IdeWorkerCommand::SetMeter {
+                    numerator: 6,
+                    denominator: 8
+                })
+            ),
+            "surrounding space is trimmed on both sides of the slash"
+        );
+
+        for refused in ["", "4", "4-4", "0/4", "256/4", "4/3", "4/0", "4/512", "x/y"] {
+            assert!(
+                meter_command(refused).is_err(),
+                "{refused:?} is reported rather than accepted"
+            );
+        }
+        assert_eq!(
+            meter_command("4-4").unwrap_err(),
+            "\"4-4\" is not a time signature"
+        );
+        assert_eq!(
+            meter_command("4/3").unwrap_err(),
+            "4/3 is not a time signature this project can hold",
+            "a well-formed but unsupported denominator says so specifically"
         );
     }
 
