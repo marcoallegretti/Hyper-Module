@@ -3065,6 +3065,87 @@ pub fn serialize_arrangement_scene_launch_removal(
     )
 }
 
+/// Writes the transport loop into the arrangement, or removes it when `range`
+/// is `None`. The result is validated by reloading and recompiling, exactly as
+/// every other arrangement edit is, so a loop that would not load cannot be
+/// published.
+///
+/// # Errors
+///
+/// Returns [`ArrangementPlacementDocumentSerializationError`] when the source
+/// is not the loaded arrangement, is non-canonical, or the edited document
+/// would not load or compile.
+pub fn serialize_arrangement_loop_range(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_arrangement: &[u8],
+    range: Option<(u64, u64, bool)>,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, ArrangementPlacementDocumentSerializationError> {
+    if let Some((start_tick, end_tick, _)) = range
+        && end_tick <= start_tick
+    {
+        return Err(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape);
+    }
+    let current = project
+        .arrangement
+        .as_ref()
+        .ok_or(ArrangementPlacementDocumentSerializationError::ArrangementMissing)?;
+    let source = load_arrangement(
+        source_arrangement,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_placements,
+        limits.max_scene_launches,
+    )
+    .map_err(ArrangementPlacementDocumentSerializationError::Source)?;
+    if &source != current {
+        return Err(ArrangementPlacementDocumentSerializationError::SourceArrangementMismatch);
+    }
+
+    let mut value: Value = serde_json::from_slice(source_arrangement)
+        .map_err(ArrangementPlacementDocumentSerializationError::Serialization)?;
+    let canonical_source = serde_json_canonicalizer::to_vec(&value)
+        .map_err(ArrangementPlacementDocumentSerializationError::Serialization)?;
+    if canonical_source != source_arrangement {
+        return Err(ArrangementPlacementDocumentSerializationError::NonCanonicalSource);
+    }
+    let document = value
+        .as_object_mut()
+        .ok_or(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)?;
+    match range {
+        Some((start_tick, end_tick, enabled)) => {
+            let mut object = serde_json::Map::new();
+            object.insert("start_tick".to_owned(), start_tick.into());
+            object.insert("end_tick".to_owned(), end_tick.into());
+            object.insert("enabled".to_owned(), enabled.into());
+            document.insert("loop_range".to_owned(), Value::Object(object));
+        }
+        None => {
+            document.remove("loop_range");
+        }
+    }
+
+    let output = serde_json_canonicalizer::to_vec(&value)
+        .map_err(ArrangementPlacementDocumentSerializationError::Serialization)?;
+    let edited = load_arrangement(
+        &output,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_placements,
+        limits.max_scene_launches,
+    )
+    .map_err(ArrangementPlacementDocumentSerializationError::Source)?;
+    let mut edited_project = project.clone();
+    edited_project.arrangement = Some(edited);
+    validate_loaded_identities(&edited_project)
+        .map_err(ArrangementPlacementDocumentSerializationError::Source)?;
+    edited_project
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(ArrangementPlacementDocumentSerializationError::ProjectCompilation)?;
+    Ok(output)
+}
+
 fn serialize_arrangement_scene_launch_document_edit(
     project: &LoadedPlaybackProject,
     assets: &[MediaAssetFact<'_>],
@@ -13254,6 +13335,86 @@ mod tests {
                 rejection: JsonRejection::DuplicateObjectName,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn writing_a_loop_range_survives_a_reload_and_clearing_removes_the_field() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let source = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<serde_json::Value>(
+                br#"{
+            "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122334463",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","name":"Main","enabled":true,"placements":[],
+            "scene_launches":[{"id":"018f47a2-6b2d-7c11-8a44-001122334465","tick":0,"scene_id":"018f47a2-6b2d-7c11-8a44-001122334461"}],
+            "extensions":{}
+        }"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let project = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&source)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let assets = [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
+            sample_rate_hz: 48_000,
+            frame_count: 100,
+        }];
+
+        let written = serialize_arrangement_loop_range(
+            &project,
+            &assets,
+            &source,
+            Some((1920, 7680, true)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let reloaded = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(&written)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let range = reloaded.arrangement_loop_range().expect("the loop persists");
+        assert_eq!((range.start_tick(), range.end_tick()), (1920, 7680));
+        assert!(range.enabled());
+
+        let cleared = serialize_arrangement_loop_range(
+            &reloaded,
+            &assets,
+            &written,
+            None,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(
+            cleared, source,
+            "clearing removes the field rather than writing an empty one"
+        );
+
+        assert!(matches!(
+            serialize_arrangement_loop_range(
+                &project,
+                &assets,
+                &source,
+                Some((7680, 1920, true)),
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementDocumentSerializationError::InvalidDocumentShape)
+        ));
+        assert!(matches!(
+            serialize_arrangement_loop_range(
+                &project,
+                &assets,
+                &written,
+                Some((0, 1920, true)),
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ArrangementPlacementDocumentSerializationError::SourceArrangementMismatch),
         ));
     }
 
