@@ -29,6 +29,7 @@ members = [
     "software/IDE/mapping-editor",
     "software/IDE/panel-simulator",
     "software/RUNTIME/control-runtime",
+    "software/RUNTIME/panel-session",
 ]
 exclude = ["third_party/pipewire"]
 resolver = "3"

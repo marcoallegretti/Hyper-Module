@@ -2354,6 +2354,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-runtime-panel-session"
+version = "0.1.0"
+dependencies = [
+ "hyper-panel-protocol",
+ "hyper-panel-simulator",
+]
+
+[[package]]
 name = "hyper-storage-engine"
 version = "0.1.0"
 dependencies = [
