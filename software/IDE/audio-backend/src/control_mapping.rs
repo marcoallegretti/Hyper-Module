@@ -6,7 +6,7 @@ use hyper_control_mappings::{ChannelParameter, MainParameter, SendParameter};
 use hyper_control_runtime::{
     BooleanControlTarget, ControlBindingAvailability, ControlBindingUnavailableReason,
     ControlRuntime, DirectControlStateUpdate, RuntimeControlCommand, RuntimeControlSink,
-    RuntimeControlTarget,
+    RuntimeControlTarget, ValueControlTarget,
 };
 use hyper_mixer_runtime::{
     LocateState, MixerChannelHandle, MixerParameterCommand, MixerParameterCommandSendError,
@@ -16,6 +16,11 @@ use hyper_mixer_runtime::{
 };
 
 pub type DesktopControlMappingRuntime = ControlRuntime<DesktopControlSink>;
+
+fn gain_millionths(gain: LinearGain) -> i32 {
+    i32::try_from(gain.to_millionths())
+        .expect("a linear gain is bounded at 2.0, so its millionths fit a signed value")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DesktopDirectControlCommand {
@@ -179,12 +184,47 @@ impl DesktopControlSink {
                 target: BooleanControlTarget::MainMute,
                 value: muted,
             }),
-            MixerParameterCommand::ChannelGain { .. }
-            | MixerParameterCommand::ChannelPan { .. }
-            | MixerParameterCommand::SendGain { .. }
-            | MixerParameterCommand::SendPan { .. }
-            | MixerParameterCommand::MainGain { .. }
-            | MixerParameterCommand::Fence(_) => Ok(DirectControlStateUpdate::Unchanged),
+            MixerParameterCommand::ChannelGain { channel, gain } => {
+                Ok(DirectControlStateUpdate::Value {
+                    target: ValueControlTarget::ChannelGain {
+                        channel_index: self.mixer.channel_index(channel)?,
+                    },
+                    value: gain_millionths(gain),
+                })
+            }
+            MixerParameterCommand::ChannelPan { channel, pan } => {
+                Ok(DirectControlStateUpdate::Value {
+                    target: ValueControlTarget::ChannelPan {
+                        channel_index: self.mixer.channel_index(channel)?,
+                    },
+                    value: pan.to_millionths(),
+                })
+            }
+            MixerParameterCommand::SendGain { send, gain } => {
+                let (channel_index, send_index) = self.mixer.send_address(send)?;
+                Ok(DirectControlStateUpdate::Value {
+                    target: ValueControlTarget::SendGain {
+                        channel_index,
+                        send_index,
+                    },
+                    value: gain_millionths(gain),
+                })
+            }
+            MixerParameterCommand::SendPan { send, pan } => {
+                let (channel_index, send_index) = self.mixer.send_address(send)?;
+                Ok(DirectControlStateUpdate::Value {
+                    target: ValueControlTarget::SendPan {
+                        channel_index,
+                        send_index,
+                    },
+                    value: pan.to_millionths(),
+                })
+            }
+            MixerParameterCommand::MainGain { gain } => Ok(DirectControlStateUpdate::Value {
+                target: ValueControlTarget::MainGain,
+                value: gain_millionths(gain),
+            }),
+            MixerParameterCommand::Fence(_) => Ok(DirectControlStateUpdate::Unchanged),
         }
     }
 
@@ -415,6 +455,40 @@ impl RuntimeControlSink for DesktopControlSink {
             self.recovery.snapshot().state(),
             PlaybackRecoveryTransportState::Rolling
         ))
+    }
+
+    fn value_state(&self, target: ValueControlTarget) -> Option<i32> {
+        let state = self.recovery.snapshot().mixer_parameter_state()?;
+        match target {
+            ValueControlTarget::ChannelGain { channel_index } => Some(gain_millionths(
+                state.channel(channel_index)?.parameters().gain,
+            )),
+            ValueControlTarget::ChannelPan { channel_index } => {
+                Some(state.channel(channel_index)?.parameters().pan.to_millionths())
+            }
+            ValueControlTarget::SendGain {
+                channel_index,
+                send_index,
+            } => Some(gain_millionths(
+                state
+                    .channel(channel_index)?
+                    .send(send_index)?
+                    .parameters()
+                    .gain,
+            )),
+            ValueControlTarget::SendPan {
+                channel_index,
+                send_index,
+            } => Some(
+                state
+                    .channel(channel_index)?
+                    .send(send_index)?
+                    .parameters()
+                    .pan
+                    .to_millionths(),
+            ),
+            ValueControlTarget::MainGain => Some(gain_millionths(state.main_gain())),
+        }
     }
 
     fn try_send(&mut self, command: RuntimeControlCommand) -> Result<(), Self::Error> {

@@ -1,3 +1,4 @@
+use core::num::NonZeroU32;
 use std::collections::BTreeMap;
 use std::sync::{
     Arc,
@@ -15,10 +16,13 @@ use hyper_control_mappings::{
 use hyper_control_runtime::{
     BooleanControlTarget, ControlBindingAvailability, ControlBindingUnavailableReason,
     ControlContext, ControlDispatchError, ControlDispatchOutcome, ControlEvent, ControlRuntime,
-    ControlRuntimeBuildErrorReason, DirectControlStateUpdate, RuntimeControlCommand,
-    RuntimeControlSink, RuntimeControlTarget,
+    ControlRuntimeBuildErrorReason, DirectControlStateUpdate, PanelActionTarget, PanelBinding,
+    PanelBindingRefusalReason, PanelButtonBehavior, PanelControl, PanelDispatchError,
+    PanelDispatchOutcome, RuntimeControlCommand, RuntimeControlSink, RuntimeControlTarget,
+    ValueControlTarget,
 };
 use hyper_mapping_compiler::{ControlMappingResolver, MixerSendAddress, compile_control_mapping};
+use hyper_panel_protocol::{FirmwareVersion, Message, PanelDescriptor};
 use realtime_allocator::HeapMeasurement;
 
 const PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334455";
@@ -109,6 +113,7 @@ struct Sink {
     reject_on_attempt: Option<usize>,
     attempts: usize,
     booleans: Vec<(BooleanControlTarget, bool)>,
+    values: Vec<(ValueControlTarget, i32)>,
     state_ready: Option<Arc<AtomicBool>>,
     transport_rolling: Option<bool>,
     scene_ready: bool,
@@ -155,6 +160,19 @@ impl RuntimeControlSink for Sink {
 
     fn transport_rolling(&self) -> Option<bool> {
         self.transport_rolling
+    }
+
+    fn value_state(&self, target: ValueControlTarget) -> Option<i32> {
+        if self
+            .state_ready
+            .as_ref()
+            .is_some_and(|ready| !ready.load(Ordering::Acquire))
+        {
+            return None;
+        }
+        self.values
+            .iter()
+            .find_map(|(candidate, value)| (*candidate == target).then_some(*value))
     }
 
     fn try_send(&mut self, command: RuntimeControlCommand) -> Result<(), Self::Error> {
@@ -1011,6 +1029,544 @@ fn momentary_dispatch_performs_zero_heap_operations() {
         assert!(matches!(
             runtime.dispatch(ControlEvent::Clock { edge }, ControlContext::default()),
             Ok(ControlDispatchOutcome::Sent { .. })
+        ));
+    }
+    let heap_operations = measurement.finish();
+
+    assert_eq!(heap_operations, 0);
+}
+
+fn panel_descriptor(encoders: u8, buttons: u8) -> PanelDescriptor {
+    PanelDescriptor {
+        firmware: FirmwareVersion {
+            major: 1,
+            minor: 0,
+            patch: 0,
+            build: 7,
+        },
+        boot_id: 0x00AB_CDEF,
+        encoders,
+        buttons,
+        leds: 0,
+        rings: 0,
+        ring_segments: 0,
+    }
+}
+
+fn panel_runtime(sink: Sink) -> ControlRuntime<Sink> {
+    ControlRuntime::try_new(table(Vec::new()), sink).unwrap()
+}
+
+fn step(millionths: u32) -> NonZeroU32 {
+    NonZeroU32::new(millionths).unwrap()
+}
+
+fn turn(control_id: u16, delta: i16) -> Message {
+    Message::EncoderDelta {
+        control_id,
+        delta,
+        timestamp_us: 0,
+        modifiers: 0,
+    }
+}
+
+fn press(control_id: u16) -> Message {
+    Message::ButtonPress {
+        control_id,
+        timestamp_us: 0,
+        modifiers: 0,
+    }
+}
+
+fn release(control_id: u16) -> Message {
+    Message::ButtonRelease {
+        control_id,
+        timestamp_us: 0,
+        modifiers: 0,
+    }
+}
+
+#[test]
+fn connect_refuses_bindings_the_panel_cannot_serve_and_installs_the_rest() {
+    let mut runtime = panel_runtime(Sink {
+        invalid_target: Some(RuntimeControlTarget::Channel {
+            channel_index: 3,
+            parameter: ChannelParameter::Gain,
+        }),
+        values: vec![(ValueControlTarget::ChannelGain { channel_index: 0 }, 1_000_000)],
+        ..Sink::default()
+    });
+
+    let refusals = runtime
+        .connect_panel(
+            panel_descriptor(2, 2),
+            &[
+                PanelBinding::Encoder {
+                    index: 0,
+                    target: ValueControlTarget::ChannelGain { channel_index: 0 },
+                    step_millionths: step(50_000),
+                },
+                PanelBinding::Encoder {
+                    index: 7,
+                    target: ValueControlTarget::ChannelGain { channel_index: 0 },
+                    step_millionths: step(50_000),
+                },
+                PanelBinding::Button {
+                    index: 5,
+                    target: BooleanControlTarget::ChannelMute { channel_index: 0 },
+                    behavior: PanelButtonBehavior::Toggle,
+                },
+                PanelBinding::Encoder {
+                    index: 0,
+                    target: ValueControlTarget::ChannelPan { channel_index: 0 },
+                    step_millionths: step(1),
+                },
+                PanelBinding::Encoder {
+                    index: 1,
+                    target: ValueControlTarget::ChannelGain { channel_index: 3 },
+                    step_millionths: step(1),
+                },
+            ],
+        )
+        .unwrap();
+
+    let reported: Vec<usize> = refusals
+        .iter()
+        .map(hyper_control_runtime::PanelBindingRefusal::binding_index)
+        .collect();
+    assert_eq!(reported, [1, 2, 3, 4]);
+    assert!(matches!(
+        refusals[0].reason(),
+        PanelBindingRefusalReason::ControlAbsent
+    ));
+    assert!(matches!(
+        refusals[1].reason(),
+        PanelBindingRefusalReason::ControlAbsent
+    ));
+    assert!(matches!(
+        refusals[2].reason(),
+        PanelBindingRefusalReason::ControlAlreadyBound {
+            first_binding_index: 0
+        }
+    ));
+    assert!(matches!(
+        refusals[3].reason(),
+        PanelBindingRefusalReason::TargetRejected(SinkError::InvalidTarget)
+    ));
+
+    assert_eq!(
+        runtime.dispatch_panel(turn(7, 1)),
+        Ok(PanelDispatchOutcome::Unbound)
+    );
+    assert_eq!(
+        runtime.dispatch_panel(press(5)),
+        Ok(PanelDispatchOutcome::Unbound)
+    );
+    assert_eq!(
+        runtime.dispatch_panel(turn(0, 1)),
+        Ok(PanelDispatchOutcome::Sent {
+            control: PanelControl::Encoder { index: 0 },
+            command: RuntimeControlCommand::ChannelGain {
+                channel_index: 0,
+                gain_millionths: 1_050_000,
+            },
+        })
+    );
+}
+
+#[test]
+fn encoder_deltas_move_the_bound_target_in_the_turned_direction_and_stop_at_its_limit() {
+    let mut runtime = panel_runtime(Sink {
+        values: vec![(ValueControlTarget::ChannelPan { channel_index: 0 }, 0)],
+        ..Sink::default()
+    });
+    runtime
+        .connect_panel(
+            panel_descriptor(1, 0),
+            &[PanelBinding::Encoder {
+                index: 0,
+                target: ValueControlTarget::ChannelPan { channel_index: 0 },
+                step_millionths: step(250_000),
+            }],
+        )
+        .unwrap();
+
+    let control = PanelControl::Encoder { index: 0 };
+    let moved_to = |pan_millionths| {
+        Ok(PanelDispatchOutcome::Sent {
+            control,
+            command: RuntimeControlCommand::ChannelPan {
+                channel_index: 0,
+                pan_millionths,
+            },
+        })
+    };
+
+    assert_eq!(runtime.dispatch_panel(turn(0, 3)), moved_to(750_000));
+    assert_eq!(runtime.dispatch_panel(turn(0, -1)), moved_to(500_000));
+    assert_eq!(runtime.dispatch_panel(turn(0, -6)), moved_to(-1_000_000));
+    assert_eq!(
+        runtime.dispatch_panel(turn(0, -1)),
+        Ok(PanelDispatchOutcome::Idle { control })
+    );
+    assert_eq!(runtime.sink().commands.len(), 3);
+}
+
+#[test]
+fn a_momentary_and_a_toggle_button_answer_the_same_press_release_pair_differently() {
+    let mut runtime = panel_runtime(Sink {
+        booleans: vec![
+            (BooleanControlTarget::ChannelMute { channel_index: 0 }, false),
+            (BooleanControlTarget::ChannelSolo { channel_index: 0 }, false),
+        ],
+        ..Sink::default()
+    });
+    runtime
+        .connect_panel(
+            panel_descriptor(0, 2),
+            &[
+                PanelBinding::Button {
+                    index: 0,
+                    target: BooleanControlTarget::ChannelMute { channel_index: 0 },
+                    behavior: PanelButtonBehavior::Momentary,
+                },
+                PanelBinding::Button {
+                    index: 1,
+                    target: BooleanControlTarget::ChannelSolo { channel_index: 0 },
+                    behavior: PanelButtonBehavior::Toggle,
+                },
+            ],
+        )
+        .unwrap();
+
+    for control_id in [0, 1] {
+        assert!(matches!(
+            runtime.dispatch_panel(press(control_id)),
+            Ok(PanelDispatchOutcome::Sent { .. })
+        ));
+    }
+    assert!(matches!(
+        runtime.dispatch_panel(release(0)),
+        Ok(PanelDispatchOutcome::Sent { .. })
+    ));
+    assert_eq!(
+        runtime.dispatch_panel(release(1)),
+        Ok(PanelDispatchOutcome::Idle {
+            control: PanelControl::Button { index: 1 }
+        })
+    );
+
+    assert_eq!(
+        runtime.sink().commands,
+        [
+            RuntimeControlCommand::ChannelMute {
+                channel_index: 0,
+                muted: true,
+            },
+            RuntimeControlCommand::ChannelSolo {
+                channel_index: 0,
+                solo: true,
+            },
+            RuntimeControlCommand::ChannelMute {
+                channel_index: 0,
+                muted: false,
+            },
+        ]
+    );
+}
+
+#[test]
+fn action_buttons_invoke_on_press_and_command_nothing_on_release() {
+    let mut runtime = panel_runtime(Sink {
+        transport_rolling: Some(false),
+        scene_ready: true,
+        ..Sink::default()
+    });
+    runtime
+        .connect_panel(
+            panel_descriptor(0, 3),
+            &[
+                PanelBinding::ActionButton {
+                    index: 0,
+                    action: PanelActionTarget::TransportToggle,
+                },
+                PanelBinding::ActionButton {
+                    index: 1,
+                    action: PanelActionTarget::TransportLocateStart,
+                },
+                PanelBinding::ActionButton {
+                    index: 2,
+                    action: PanelActionTarget::SceneLaunch { scene_index: 0 },
+                },
+            ],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        runtime.dispatch_panel(press(0)),
+        Ok(PanelDispatchOutcome::Sent { .. })
+    ));
+    assert_eq!(
+        runtime.dispatch_panel(release(0)),
+        Ok(PanelDispatchOutcome::Idle {
+            control: PanelControl::Button { index: 0 }
+        })
+    );
+    for control_id in [0, 1, 2] {
+        assert!(matches!(
+            runtime.dispatch_panel(press(control_id)),
+            Ok(PanelDispatchOutcome::Sent { .. })
+        ));
+    }
+
+    assert_eq!(
+        runtime.sink().commands,
+        [
+            RuntimeControlCommand::TransportStart,
+            RuntimeControlCommand::TransportStop,
+            RuntimeControlCommand::TransportLocateStartPreserve,
+            RuntimeControlCommand::SceneLaunch { scene_index: 0 },
+        ]
+    );
+}
+
+#[test]
+fn bindings_survive_a_reconnect_only_while_the_new_descriptor_still_has_the_control() {
+    let bindings = [
+        PanelBinding::Encoder {
+            index: 0,
+            target: ValueControlTarget::ChannelGain { channel_index: 0 },
+            step_millionths: step(50_000),
+        },
+        PanelBinding::Button {
+            index: 3,
+            target: BooleanControlTarget::ChannelMute { channel_index: 0 },
+            behavior: PanelButtonBehavior::Toggle,
+        },
+    ];
+    let mut runtime = panel_runtime(Sink {
+        values: vec![(ValueControlTarget::ChannelGain { channel_index: 0 }, 1_000_000)],
+        booleans: vec![(BooleanControlTarget::ChannelMute { channel_index: 0 }, false)],
+        ..Sink::default()
+    });
+
+    assert!(
+        runtime
+            .connect_panel(panel_descriptor(4, 8), &bindings)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        runtime.connect_panel(panel_descriptor(4, 8), &bindings),
+        Err(hyper_control_runtime::PanelAlreadyConnected)
+    );
+    assert!(matches!(
+        runtime.dispatch_panel(press(3)),
+        Ok(PanelDispatchOutcome::Sent { .. })
+    ));
+
+    assert!(runtime.disconnect_panel().is_empty());
+    assert!(!runtime.panel_connected());
+    assert_eq!(
+        runtime.dispatch_panel(turn(0, 1)),
+        Ok(PanelDispatchOutcome::Unbound)
+    );
+
+    let refusals = runtime
+        .connect_panel(panel_descriptor(1, 2), &bindings)
+        .unwrap();
+    assert_eq!(refusals.len(), 1);
+    assert_eq!(refusals[0].binding_index(), 1);
+    assert!(matches!(
+        refusals[0].reason(),
+        PanelBindingRefusalReason::ControlAbsent
+    ));
+    assert_eq!(
+        runtime.dispatch_panel(press(3)),
+        Ok(PanelDispatchOutcome::Unbound)
+    );
+    assert_eq!(
+        runtime.dispatch_panel(turn(0, 1)),
+        Ok(PanelDispatchOutcome::Sent {
+            control: PanelControl::Encoder { index: 0 },
+            command: RuntimeControlCommand::ChannelGain {
+                channel_index: 0,
+                gain_millionths: 1_050_000,
+            },
+        })
+    );
+}
+
+#[test]
+fn disconnecting_releases_only_the_momentary_control_still_held() {
+    let mut runtime = panel_runtime(Sink {
+        ..Sink::default()
+    });
+    runtime
+        .connect_panel(
+            panel_descriptor(0, 2),
+            &[
+                PanelBinding::Button {
+                    index: 0,
+                    target: BooleanControlTarget::ChannelMute { channel_index: 0 },
+                    behavior: PanelButtonBehavior::Momentary,
+                },
+                PanelBinding::Button {
+                    index: 1,
+                    target: BooleanControlTarget::ChannelSolo { channel_index: 0 },
+                    behavior: PanelButtonBehavior::Momentary,
+                },
+            ],
+        )
+        .unwrap();
+
+    for message in [press(0), release(0), press(1)] {
+        assert!(matches!(
+            runtime.dispatch_panel(message),
+            Ok(PanelDispatchOutcome::Sent { .. })
+        ));
+    }
+    assert!(runtime.disconnect_panel().is_empty());
+
+    assert_eq!(
+        runtime.sink().commands,
+        [
+            RuntimeControlCommand::ChannelMute {
+                channel_index: 0,
+                muted: true,
+            },
+            RuntimeControlCommand::ChannelMute {
+                channel_index: 0,
+                muted: false,
+            },
+            RuntimeControlCommand::ChannelSolo {
+                channel_index: 0,
+                solo: true,
+            },
+            RuntimeControlCommand::ChannelSolo {
+                channel_index: 0,
+                solo: false,
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_relative_move_fails_closed_until_the_target_value_can_be_read() {
+    let ready = Arc::new(AtomicBool::new(false));
+    let mut runtime = panel_runtime(Sink {
+        values: vec![(ValueControlTarget::ChannelGain { channel_index: 0 }, 1_000_000)],
+        state_ready: Some(Arc::clone(&ready)),
+        ..Sink::default()
+    });
+    runtime
+        .connect_panel(
+            panel_descriptor(1, 0),
+            &[PanelBinding::Encoder {
+                index: 0,
+                target: ValueControlTarget::ChannelGain { channel_index: 0 },
+                step_millionths: step(50_000),
+            }],
+        )
+        .unwrap();
+
+    assert_eq!(
+        runtime.dispatch_panel(turn(0, 1)),
+        Err(PanelDispatchError::StateUnavailable {
+            control: PanelControl::Encoder { index: 0 }
+        })
+    );
+    assert!(runtime.sink().commands.is_empty());
+
+    ready.store(true, Ordering::Release);
+    assert_eq!(
+        runtime.dispatch_panel(turn(0, 1)),
+        Ok(PanelDispatchOutcome::Sent {
+            control: PanelControl::Encoder { index: 0 },
+            command: RuntimeControlCommand::ChannelGain {
+                channel_index: 0,
+                gain_millionths: 1_050_000,
+            },
+        })
+    );
+}
+
+#[test]
+fn panel_messages_that_bind_nothing_command_nothing() {
+    let mut runtime = panel_runtime(Sink::default());
+    assert_eq!(
+        runtime.dispatch_panel(press(0)),
+        Ok(PanelDispatchOutcome::Unbound)
+    );
+
+    runtime
+        .connect_panel(
+            panel_descriptor(1, 1),
+            &[PanelBinding::ActionButton {
+                index: 0,
+                action: PanelActionTarget::TransportStart,
+            }],
+        )
+        .unwrap();
+
+    for message in [
+        Message::EncoderPress {
+            control_id: 0,
+            timestamp_us: 0,
+            modifiers: 0,
+        },
+        Message::ButtonLongPress {
+            control_id: 0,
+            held_ms: 900,
+            timestamp_us: 0,
+            modifiers: 0,
+        },
+        Message::ButtonDoublePress {
+            control_id: 0,
+            timestamp_us: 0,
+            modifiers: 0,
+        },
+        turn(0, 1),
+    ] {
+        assert_eq!(
+            runtime.dispatch_panel(message),
+            Ok(PanelDispatchOutcome::Unbound)
+        );
+    }
+    assert!(runtime.sink().commands.is_empty());
+}
+
+#[test]
+fn panel_dispatch_performs_zero_heap_operations() {
+    let mut runtime = panel_runtime(Sink {
+        commands: Vec::with_capacity(2),
+        booleans: vec![(BooleanControlTarget::MainMute, false)],
+        values: vec![(ValueControlTarget::MainGain, 1_000_000)],
+        ..Sink::default()
+    });
+    runtime
+        .connect_panel(
+            panel_descriptor(1, 1),
+            &[
+                PanelBinding::Encoder {
+                    index: 0,
+                    target: ValueControlTarget::MainGain,
+                    step_millionths: step(50_000),
+                },
+                PanelBinding::Button {
+                    index: 0,
+                    target: BooleanControlTarget::MainMute,
+                    behavior: PanelButtonBehavior::Toggle,
+                },
+            ],
+        )
+        .unwrap();
+
+    let measurement = HeapMeasurement::start_verified();
+    for message in [turn(0, 1), press(0)] {
+        assert!(matches!(
+            runtime.dispatch_panel(message),
+            Ok(PanelDispatchOutcome::Sent { .. })
         ));
     }
     let heap_operations = measurement.finish();

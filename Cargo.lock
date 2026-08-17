@@ -2097,6 +2097,7 @@ version = "0.1.0"
 dependencies = [
  "hyper-control-mappings",
  "hyper-mapping-compiler",
+ "hyper-panel-protocol",
 ]
 
 [[package]]

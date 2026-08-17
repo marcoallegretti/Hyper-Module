@@ -2,12 +2,21 @@
 #![forbid(unsafe_code)]
 
 use hyper_control_mappings::{
-    ChannelParameter, ContinuousControlValue, CueParameter, Edge, MainParameter, SceneAction,
-    SendParameter, TransportAction, TriggerBehavior,
+    ChannelParameter, ContinuousControlValue, CueParameter, Edge, GAIN_MILLIONTHS_MAX,
+    MainParameter, PAN_MILLIONTHS_MAX, PAN_MILLIONTHS_MIN, SceneAction, SendParameter,
+    TransportAction, TriggerBehavior,
 };
 use hyper_mapping_compiler::{
     CompiledControlBinding, CompiledControlMappingTable, CompiledControlScope,
     CompiledControlSource, CompiledControlTarget,
+};
+
+mod panel;
+
+pub use panel::{
+    PanelActionTarget, PanelAlreadyConnected, PanelBinding, PanelBindingRefusal,
+    PanelBindingRefusalReason, PanelButtonBehavior, PanelControl, PanelDispatchError,
+    PanelDispatchOutcome, PanelReleaseFailure,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +114,39 @@ pub enum BooleanControlTarget {
     MainMute,
 }
 
+/// One continuous target a relative control moves rather than sets outright.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueControlTarget {
+    ChannelGain {
+        channel_index: usize,
+    },
+    ChannelPan {
+        channel_index: usize,
+    },
+    SendGain {
+        channel_index: usize,
+        send_index: usize,
+    },
+    SendPan {
+        channel_index: usize,
+        send_index: usize,
+    },
+    MainGain,
+}
+
+impl ValueControlTarget {
+    const fn domain(self) -> (i32, i32) {
+        match self {
+            Self::ChannelGain { .. } | Self::SendGain { .. } | Self::MainGain => {
+                (0, GAIN_MILLIONTHS_MAX)
+            }
+            Self::ChannelPan { .. } | Self::SendPan { .. } => {
+                (PAN_MILLIONTHS_MIN, PAN_MILLIONTHS_MAX)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeControlTarget {
     Channel {
@@ -182,6 +224,10 @@ pub enum DirectControlStateUpdate {
     Transport {
         rolling: bool,
     },
+    Value {
+        target: ValueControlTarget,
+        value: i32,
+    },
 }
 
 pub trait RuntimeControlSink {
@@ -206,6 +252,12 @@ pub trait RuntimeControlSink {
     }
     fn boolean_state(&self, target: BooleanControlTarget) -> Option<bool>;
     fn transport_rolling(&self) -> Option<bool>;
+
+    /// Reports one continuous target's present position in millionths.
+    ///
+    /// A relative control edits the target's own position rather than one it
+    /// accumulated itself, so it has to be able to read that position back.
+    fn value_state(&self, target: ValueControlTarget) -> Option<i32>;
 
     /// Sends one already mapped runtime command.
     ///
@@ -276,6 +328,12 @@ struct BooleanShadow {
     value: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValueShadow {
+    target: ValueControlTarget,
+    value: Option<i32>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MomentaryCapture(Option<u8>);
 
@@ -297,9 +355,11 @@ pub struct ControlRuntime<S: RuntimeControlSink> {
     table: CompiledControlMappingTable,
     statuses: Vec<ControlBindingStatus>,
     boolean_shadows: Vec<BooleanShadow>,
+    value_shadows: Vec<ValueShadow>,
     transport_rolling: Option<bool>,
     clock_capture: MomentaryCapture,
     reset_capture: MomentaryCapture,
+    panel: Option<panel::PanelBindings>,
     sink: S,
 }
 
@@ -417,9 +477,11 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
             table,
             statuses,
             boolean_shadows,
+            value_shadows: Vec::new(),
             transport_rolling,
             clock_capture: MomentaryCapture::default(),
             reset_capture: MomentaryCapture::default(),
+            panel: None,
             sink,
         })
     }
@@ -533,6 +595,11 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
                 shadow.value = self.sink.boolean_state(shadow.target);
             }
         }
+        for shadow in &mut self.value_shadows {
+            if shadow.value.is_none() {
+                shadow.value = self.sink.value_state(shadow.target);
+            }
+        }
         if self.transport_rolling.is_none() {
             self.transport_rolling = self.sink.transport_rolling();
         }
@@ -562,6 +629,9 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
                 .find(|shadow| shadow.target == target)
         {
             shadow.value = Some(value);
+        }
+        if let Some((target, value)) = command_value_state(command) {
+            self.commit_value_shadow(target, value);
         }
         match command {
             RuntimeControlCommand::TransportStart => self.transport_rolling = Some(true),
@@ -595,6 +665,19 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
             DirectControlStateUpdate::Transport { rolling } => {
                 self.transport_rolling = Some(rolling);
             }
+            DirectControlStateUpdate::Value { target, value } => {
+                self.commit_value_shadow(target, value);
+            }
+        }
+    }
+
+    fn commit_value_shadow(&mut self, target: ValueControlTarget, value: i32) {
+        if let Some(shadow) = self
+            .value_shadows
+            .iter_mut()
+            .find(|shadow| shadow.target == target)
+        {
+            shadow.value = Some(value);
         }
     }
 
@@ -861,6 +944,59 @@ fn command_boolean_state(command: RuntimeControlCommand) -> Option<(BooleanContr
         | RuntimeControlCommand::SendGain { .. }
         | RuntimeControlCommand::SendPan { .. }
         | RuntimeControlCommand::MainGain { .. }
+        | RuntimeControlCommand::TransportStart
+        | RuntimeControlCommand::TransportStop
+        | RuntimeControlCommand::TransportLocateStartPreserve
+        | RuntimeControlCommand::SceneLaunch { .. } => None,
+    }
+}
+
+fn command_value_state(command: RuntimeControlCommand) -> Option<(ValueControlTarget, i32)> {
+    match command {
+        RuntimeControlCommand::ChannelGain {
+            channel_index,
+            gain_millionths,
+        } => Some((
+            ValueControlTarget::ChannelGain { channel_index },
+            i32::try_from(gain_millionths).ok()?,
+        )),
+        RuntimeControlCommand::ChannelPan {
+            channel_index,
+            pan_millionths,
+        } => Some((
+            ValueControlTarget::ChannelPan { channel_index },
+            pan_millionths,
+        )),
+        RuntimeControlCommand::SendGain {
+            channel_index,
+            send_index,
+            gain_millionths,
+        } => Some((
+            ValueControlTarget::SendGain {
+                channel_index,
+                send_index,
+            },
+            i32::try_from(gain_millionths).ok()?,
+        )),
+        RuntimeControlCommand::SendPan {
+            channel_index,
+            send_index,
+            pan_millionths,
+        } => Some((
+            ValueControlTarget::SendPan {
+                channel_index,
+                send_index,
+            },
+            pan_millionths,
+        )),
+        RuntimeControlCommand::MainGain { gain_millionths } => Some((
+            ValueControlTarget::MainGain,
+            i32::try_from(gain_millionths).ok()?,
+        )),
+        RuntimeControlCommand::ChannelMute { .. }
+        | RuntimeControlCommand::ChannelSolo { .. }
+        | RuntimeControlCommand::SendEnabled { .. }
+        | RuntimeControlCommand::MainMute { .. }
         | RuntimeControlCommand::TransportStart
         | RuntimeControlCommand::TransportStop
         | RuntimeControlCommand::TransportLocateStartPreserve

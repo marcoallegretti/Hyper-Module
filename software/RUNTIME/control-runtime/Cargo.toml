@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 hyper-control-mappings = { path = "../../../crates/control-mappings" }
 hyper-mapping-compiler = { path = "../../../crates/mapping-compiler" }
+hyper-panel-protocol = { path = "../../../crates/panel-protocol" }
 
 [lints]
 workspace = true
