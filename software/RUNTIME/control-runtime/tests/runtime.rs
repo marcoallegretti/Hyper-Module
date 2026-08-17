@@ -2240,3 +2240,34 @@ fn a_link_lost_while_a_control_is_held_releases_it_over_the_real_link() {
         "the held control is released rather than left latched"
     );
 }
+
+#[test]
+fn a_send_binding_is_validated_against_the_parameter_it_actually_drives() {
+    let send_gain = ValueControlTarget::SendGain {
+        channel_index: 2,
+        send_index: 1,
+    };
+    let mut runtime = panel_runtime(Sink {
+        invalid_target: Some(RuntimeControlTarget::Send {
+            channel_index: 2,
+            send_index: 1,
+            parameter: SendParameter::Gain,
+        }),
+        values: vec![(send_gain, 1_000_000)],
+        ..Sink::default()
+    });
+
+    let connection = runtime
+        .connect_panel(panel_descriptor(1, 0), &[encoder(0, send_gain, 100_000)])
+        .unwrap();
+
+    assert_eq!(
+        connection.refused().len(),
+        1,
+        "a send gain binding is offered to the sink as a send gain target, not as some other send parameter"
+    );
+    assert!(matches!(
+        connection.refused()[0].reason(),
+        PanelBindingRefusalReason::TargetRejected(SinkError::InvalidTarget)
+    ));
+}

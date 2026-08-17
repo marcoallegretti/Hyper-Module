@@ -28,6 +28,17 @@ fn gain_millionths(gain: LinearGain) -> i32 {
         .expect("a linear gain is bounded at 2.0, so its millionths fit a signed value")
 }
 
+fn value_domain_for(target: ValueControlTarget) -> ValueDomain {
+    match target {
+        ValueControlTarget::ChannelGain { .. }
+        | ValueControlTarget::SendGain { .. }
+        | ValueControlTarget::MainGain => ValueDomain::new(0, GAIN_MILLIONTHS_MAX),
+        ValueControlTarget::ChannelPan { .. } | ValueControlTarget::SendPan { .. } => {
+            ValueDomain::new(-PAN_MILLIONTHS_MAX, PAN_MILLIONTHS_MAX)
+        }
+    }
+}
+
 fn value_from_state(
     state: &MixerParameterStateSnapshot,
     target: ValueControlTarget,
@@ -508,14 +519,7 @@ impl RuntimeControlSink for DesktopControlSink {
     }
 
     fn value_domain(&self, target: ValueControlTarget) -> ValueDomain {
-        match target {
-            ValueControlTarget::ChannelGain { .. }
-            | ValueControlTarget::SendGain { .. }
-            | ValueControlTarget::MainGain => ValueDomain::new(0, GAIN_MILLIONTHS_MAX),
-            ValueControlTarget::ChannelPan { .. } | ValueControlTarget::SendPan { .. } => {
-                ValueDomain::new(-PAN_MILLIONTHS_MAX, PAN_MILLIONTHS_MAX)
-            }
-        }
+        value_domain_for(target)
     }
 
     fn try_send(&mut self, command: RuntimeControlCommand) -> Result<(), Self::Error> {
@@ -606,7 +610,7 @@ mod tests {
 
     use super::{
         GAIN_MILLIONTHS_MAX, LinearGain, MixerParameterStateSnapshot, PAN_MILLIONTHS_MAX, Pan,
-        ValueControlTarget, gain_millionths, value_from_state,
+        ValueControlTarget, gain_millionths, value_domain_for, value_from_state,
     };
 
     fn gain(millionths: i32) -> LinearGain {
@@ -711,6 +715,33 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn every_value_target_declares_the_domain_its_parameter_type_accepts() {
+        for target in [
+            ValueControlTarget::ChannelGain { channel_index: 0 },
+            ValueControlTarget::SendGain {
+                channel_index: 0,
+                send_index: 0,
+            },
+            ValueControlTarget::MainGain,
+        ] {
+            let domain = value_domain_for(target);
+            assert_eq!(domain.minimum(), 0);
+            assert_eq!(domain.maximum(), GAIN_MILLIONTHS_MAX);
+        }
+        for target in [
+            ValueControlTarget::ChannelPan { channel_index: 0 },
+            ValueControlTarget::SendPan {
+                channel_index: 0,
+                send_index: 0,
+            },
+        ] {
+            let domain = value_domain_for(target);
+            assert_eq!(domain.minimum(), -PAN_MILLIONTHS_MAX);
+            assert_eq!(domain.maximum(), PAN_MILLIONTHS_MAX);
+        }
     }
 
     #[test]
