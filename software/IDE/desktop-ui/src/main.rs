@@ -3058,6 +3058,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::MoveArrangementSceneLaunch => {
             "Preserving mixer state, moving the scene marker, and reopening project..."
         }
+        IdeWorkerCommandKind::SetArrangementLoopRange => {
+            "Preserving mixer state, saving the loop range, and reopening project..."
+        }
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => {
             "Preserving mixer state, changing the marker scene, and reopening project..."
         }
@@ -3375,6 +3378,22 @@ fn apply_event(
         }
         event @ (IdeWorkerEvent::ProjectExporting | IdeWorkerEvent::ProjectExported { .. }) => {
             apply_project_export_event(ui, &event);
+        }
+        IdeWorkerEvent::ArrangementLoopRangeChanging => {
+            ui.set_status_text("Saving the loop range...".into());
+        }
+        IdeWorkerEvent::ArrangementLoopRangeChanged { revision } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text(format!("Loop range saved in project revision {revision}").into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ArrangementLoopRangeCommittedWithWarning { warning } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text(SharedString::default());
+            ui.set_error_text(
+                format!("The loop range was saved but the project may need attention: {warning}")
+                    .into(),
+            );
         }
         IdeWorkerEvent::UndoStateChanged {
             undo_label,

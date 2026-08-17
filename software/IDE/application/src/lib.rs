@@ -76,7 +76,8 @@ use hyper_playback_json::{
     serialize_arrangement_placement_duplication, serialize_arrangement_placement_duration,
     serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
     serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
-    serialize_arrangement_scene_launch_addition, serialize_arrangement_scene_launch_move,
+    serialize_arrangement_loop_range, serialize_arrangement_scene_launch_addition,
+    serialize_arrangement_scene_launch_move,
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_arrangement_scene_launch_removal, serialize_arrangement_scene_launch_scene_edit,
     serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
@@ -6645,6 +6646,20 @@ impl RunningDesktopIdeApplication {
                 serialize_arrangement_scene_launch_move(
                     project, assets, source, launch_id, tick, limits,
                 )
+            },
+        )
+    }
+
+    fn prepare_arrangement_loop_range(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        range: Option<(u64, u64, bool)>,
+    ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        Self::prepare_arrangement_scene_launch_edit(
+            application,
+            recovery,
+            |project, assets, source, limits| {
+                serialize_arrangement_loop_range(project, assets, source, range, limits)
             },
         )
     }

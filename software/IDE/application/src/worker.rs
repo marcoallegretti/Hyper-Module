@@ -140,6 +140,7 @@ pub enum IdeWorkerCommandKind {
     AddArrangementPlacement,
     AddArrangementSceneLaunch,
     MoveArrangementSceneLaunch,
+    SetArrangementLoopRange,
     SetArrangementSceneLaunchScene,
     RemoveArrangementSceneLaunch,
     DuplicateArrangementPlacement,
@@ -248,6 +249,9 @@ pub enum IdeWorkerCommand {
     MoveArrangementSceneLaunch {
         launch_id: String,
         tick: u64,
+    },
+    SetArrangementLoopRange {
+        range: Option<(u64, u64, bool)>,
     },
     SetArrangementSceneLaunchScene {
         launch_id: String,
@@ -402,6 +406,9 @@ impl IdeWorkerCommand {
             }
             Self::MoveArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::MoveArrangementSceneLaunch
+            }
+            Self::SetArrangementLoopRange { .. } => {
+                IdeWorkerCommandKind::SetArrangementLoopRange
             }
             Self::SetArrangementSceneLaunchScene { .. } => {
                 IdeWorkerCommandKind::SetArrangementSceneLaunchScene
@@ -1308,6 +1315,7 @@ pub enum IdeWorkerCommandFailure {
     ArrangementPlacementAddition(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchAddition(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchMove(Box<IdeArrangementPlacementEditError>),
+    ArrangementLoopRange(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchSceneEdit(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchRemoval(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementDuplication(Box<IdeArrangementPlacementEditError>),
@@ -1371,6 +1379,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::ArrangementPlacementAddition(source)
             | Self::ArrangementSceneLaunchAddition(source)
             | Self::ArrangementSceneLaunchMove(source)
+            | Self::ArrangementLoopRange(source)
             | Self::ArrangementSceneLaunchSceneEdit(source)
             | Self::ArrangementSceneLaunchRemoval(source)
             | Self::ArrangementPlacementDuplication(source)
@@ -1439,6 +1448,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::ArrangementPlacementAddition(source)
             | Self::ArrangementSceneLaunchAddition(source)
             | Self::ArrangementSceneLaunchMove(source)
+            | Self::ArrangementLoopRange(source)
             | Self::ArrangementSceneLaunchSceneEdit(source)
             | Self::ArrangementSceneLaunchRemoval(source)
             | Self::ArrangementPlacementDuplication(source)
@@ -1787,6 +1797,13 @@ pub enum IdeWorkerEvent {
     },
     ArrangementSceneLaunchSceneChanging,
     ArrangementSceneLaunchRemoving,
+    ArrangementLoopRangeChanging,
+    ArrangementLoopRangeChanged {
+        revision: u64,
+    },
+    ArrangementLoopRangeCommittedWithWarning {
+        warning: Box<IdeArrangementPlacementEditError>,
+    },
     ArrangementPlacementDuplicating {
         start_tick: u64,
     },
@@ -2199,6 +2216,9 @@ enum ProjectMutation {
         launch_id: String,
         tick: u64,
     },
+    SetArrangementLoopRange {
+        range: Option<(u64, u64, bool)>,
+    },
     SetArrangementSceneLaunchScene {
         launch_id: String,
         scene_id: String,
@@ -2304,6 +2324,9 @@ enum ProjectMutation {
 impl ProjectMutation {
     const fn command(&self) -> IdeWorkerCommandKind {
         match self {
+            Self::SetArrangementLoopRange { .. } => {
+                IdeWorkerCommandKind::SetArrangementLoopRange
+            }
             Self::SaveMixer => IdeWorkerCommandKind::SaveProject,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
@@ -2392,6 +2415,7 @@ impl ProjectMutation {
             Self::SetArrangementSceneLaunchScene { .. } => {
                 IdeWorkerEvent::ArrangementSceneLaunchSceneChanging
             }
+            Self::SetArrangementLoopRange { .. } => IdeWorkerEvent::ArrangementLoopRangeChanging,
             Self::RemoveArrangementSceneLaunch { .. } => {
                 IdeWorkerEvent::ArrangementSceneLaunchRemoving
             }
@@ -2567,6 +2591,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::RemoveArrangementPlacement => "placement removal",
         IdeWorkerCommandKind::SetArrangementPlacementActive => "placement activation",
         IdeWorkerCommandKind::MoveArrangementSceneLaunch => "scene marker move",
+        IdeWorkerCommandKind::SetArrangementLoopRange => "loop range",
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => "scene marker reassignment",
         IdeWorkerCommandKind::RemoveArrangementSceneLaunch => "scene marker removal",
         IdeWorkerCommandKind::RenameAudioClip => "clip rename",
@@ -2856,6 +2881,7 @@ fn process_command(
         | IdeWorkerCommand::AddArrangementPlacement { .. }
         | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
+        | IdeWorkerCommand::SetArrangementLoopRange { .. }
         | IdeWorkerCommand::SetArrangementSceneLaunchScene { .. }
         | IdeWorkerCommand::RemoveArrangementSceneLaunch { .. }
         | IdeWorkerCommand::DuplicateArrangementPlacement { .. }
@@ -2982,6 +3008,7 @@ fn process_project_mutation_command(
         command @ (IdeWorkerCommand::AddArrangementPlacement { .. }
         | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
+        | IdeWorkerCommand::SetArrangementLoopRange { .. }
         | IdeWorkerCommand::SetArrangementSceneLaunchScene { .. }
         | IdeWorkerCommand::RemoveArrangementSceneLaunch { .. }
         | IdeWorkerCommand::DuplicateArrangementPlacement { .. }
@@ -3066,6 +3093,11 @@ fn process_arrangement_mutation_command(
         IdeWorkerCommand::AddArrangementSceneLaunch { scene_id, tick } => {
             add_arrangement_scene_launch(state, events, &scene_id, tick)
         }
+        IdeWorkerCommand::SetArrangementLoopRange { range } => begin_project_mutation_request(
+            state,
+            events,
+            ProjectMutation::SetArrangementLoopRange { range },
+        ),
         IdeWorkerCommand::MoveArrangementSceneLaunch { launch_id, tick } => {
             move_arrangement_scene_launch(state, events, &launch_id, tick)
         }
@@ -5115,6 +5147,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::SetAudioTrackActive { result: Ok(outcome), .. }
         | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Ok(outcome), .. }
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetArrangementLoopRange { result: Ok(outcome) }
         | ProjectMutationAttempt::SetArrangementSceneLaunchScene { result: Ok(outcome), .. }
         | ProjectMutationAttempt::RemoveArrangementSceneLaunch { result: Ok(outcome), .. }
         | ProjectMutationAttempt::SetArrangementPlacementActive { result: Ok(outcome), .. }
@@ -5161,6 +5194,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::AddArrangementPlacement { result: Err(_), .. }
         | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Err(_), .. }
+        | ProjectMutationAttempt::SetArrangementLoopRange { result: Err(_) }
         | ProjectMutationAttempt::SetArrangementSceneLaunchScene { result: Err(_), .. }
         | ProjectMutationAttempt::RemoveArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::DuplicateArrangementPlacement { result: Err(_), .. }
@@ -5792,6 +5826,11 @@ fn project_mutation_save_failure(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::SetArrangementLoopRange { .. } => {
+            IdeWorkerCommandFailure::ArrangementLoopRange(Box::new(
+                IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
+            ))
+        }
         ProjectMutation::SetArrangementSceneLaunchScene { .. } => {
             IdeWorkerCommandFailure::ArrangementSceneLaunchSceneEdit(Box::new(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
@@ -6010,6 +6049,11 @@ fn project_mutation_native_close_failure(
                 IdeArrangementPlacementEditError::NativeClose(failure),
             ))
         }
+        ProjectMutation::SetArrangementLoopRange { .. } => {
+            IdeWorkerCommandFailure::ArrangementLoopRange(Box::new(
+                IdeArrangementPlacementEditError::NativeClose(failure),
+            ))
+        }
         ProjectMutation::SetArrangementSceneLaunchScene { .. } => {
             IdeWorkerCommandFailure::ArrangementSceneLaunchSceneEdit(Box::new(
                 IdeArrangementPlacementEditError::NativeClose(failure),
@@ -6148,6 +6192,12 @@ enum ProjectMutationAttempt {
     AddArrangementSceneLaunch {
         scene_id: String,
         tick: u64,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeArrangementPlacementEditError,
+        >,
+    },
+    SetArrangementLoopRange {
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeArrangementPlacementEditError,
@@ -6761,6 +6811,22 @@ fn complete_project_mutation(
                     reason,
                     IdeWorkerCommandFailure::ArrangementSceneLaunchAddition,
                 ),
+                ProjectMutationAttempt::SetArrangementLoopRange { result: Ok(outcome) } => {
+                    send_event(
+                        events,
+                        IdeWorkerEvent::ArrangementLoopRangeChanged {
+                            revision: outcome.project_revision(),
+                        },
+                    )
+                }
+                ProjectMutationAttempt::SetArrangementLoopRange { result: Err(reason) } => {
+                    publish_arrangement_edit_failure(
+                        events,
+                        IdeWorkerCommandKind::SetArrangementLoopRange,
+                        reason,
+                        IdeWorkerCommandFailure::ArrangementLoopRange,
+                    )
+                }
                 ProjectMutationAttempt::MoveArrangementSceneLaunch {
                     launch_id,
                     tick,
@@ -7360,6 +7426,16 @@ fn attempt_project_mutation(
                 ),
             }
         }
+        ProjectMutation::SetArrangementLoopRange { range } => {
+            ProjectMutationAttempt::SetArrangementLoopRange {
+                result: attempt_arrangement_loop_range(
+                    application,
+                    recovery,
+                    range,
+                    native_failure,
+                ),
+            }
+        }
         ProjectMutation::MoveArrangementSceneLaunch { launch_id, tick } => {
             ProjectMutationAttempt::MoveArrangementSceneLaunch {
                 launch_id: launch_id.clone(),
@@ -7858,6 +7934,20 @@ fn attempt_arrangement_scene_launch_addition(
     .and_then(publish_arrangement_placement_edit_plan)
 }
 
+fn attempt_arrangement_loop_range(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    range: Option<(u64, u64, bool)>,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeArrangementPlacementEditError>
+{
+    if let Some(failure) = native_failure {
+        return Err(IdeArrangementPlacementEditError::NativeClose(failure));
+    }
+    RunningDesktopIdeApplication::prepare_arrangement_loop_range(application, recovery, range)
+        .and_then(publish_arrangement_placement_edit_plan)
+}
+
 fn attempt_arrangement_scene_launch_move(
     application: &DesktopIdeApplication,
     recovery: &DesktopPlaybackRecovery,
@@ -8307,6 +8397,13 @@ fn project_mutation_reopen_failure(
                 result,
                 reopen,
                 IdeWorkerCommandFailure::ArrangementSceneLaunchAddition,
+            )
+        }
+        ProjectMutationAttempt::SetArrangementLoopRange { result } => {
+            arrangement_placement_edit_reopen_failure(
+                result,
+                reopen,
+                IdeWorkerCommandFailure::ArrangementLoopRange,
             )
         }
         ProjectMutationAttempt::MoveArrangementSceneLaunch { result, .. } => {
