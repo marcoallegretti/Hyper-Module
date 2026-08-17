@@ -9347,7 +9347,9 @@ mod tests {
 
     impl Drop for TestDirectory {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
+            // A panic here would unwind through Drop and abort the whole test
+            // binary, taking unrelated tests with it. Teardown reports nothing.
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -12235,6 +12237,7 @@ mod tests {
             LoopMarkFailure::MarkOutOfRange.to_string(),
             "each loop failure reads differently, so the user can tell them apart"
         );
+        drop(prepared);
     }
 
     #[test]
@@ -12305,6 +12308,7 @@ mod tests {
             matches!(commands[1], TransportCommand::SetLoopEnabled(true)),
             "a loop saved as engaged is armed as engaged, not merely displayed"
         );
+        drop(reopened);
     }
 
     #[test]
@@ -12361,6 +12365,8 @@ mod tests {
             authority.frame_to_tick(frames_per_tick - 1).unwrap(),
             "marks closer together than a tick collapse, which the edit refuses"
         );
+        drop(graph);
+        drop(prepared);
     }
 
     #[test]
@@ -12413,6 +12419,7 @@ mod tests {
             ResourceRole::Scene,
             "the role follows the resource, so it cannot be a hardcoded constant"
         );
+        drop(prepared);
     }
 
     #[test]
