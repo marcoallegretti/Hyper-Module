@@ -370,55 +370,6 @@ impl<'a> Timeline<'a> {
         usize::try_from(rounded).map_err(|_| TimelineError::FrameOutOfRange)
     }
 
-    /// The greatest tick whose frame is at or before `frame`.
-    ///
-    /// The exact inverse of [`Self::tick_to_frame`] for a step tempo map: the
-    /// accumulated numerator is walked segment by segment and the remainder is
-    /// divided inside the segment that contains the frame. Flooring is the
-    /// right semantic for a playhead — the tick the transport has reached, not
-    /// the one it is about to.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TimelineError`] when the arithmetic would overflow.
-    pub fn frame_to_tick(self, frame: usize) -> Result<u64, TimelineError> {
-        let denominator = u128::from(TICKS_PER_QUARTER) * MICROSECONDS_PER_SECOND;
-        let target = u128::try_from(frame)
-            .map_err(|_| TimelineError::ArithmeticOverflow)?
-            .checked_mul(denominator)
-            .ok_or(TimelineError::ArithmeticOverflow)?;
-        let mut numerator = 0_u128;
-        let mut cursor_tick = 0_u64;
-        let mut tempo_index = 0_usize;
-        while tempo_index + 1 < self.tempo_events.len() {
-            let current = self.tempo_events[tempo_index];
-            let next_tick = self.tempo_events[tempo_index + 1].tick;
-            let candidate = add_timeline_segment(
-                numerator,
-                next_tick - cursor_tick,
-                current.microseconds_per_quarter,
-                self.sample_rate_hz,
-            )?;
-            if candidate > target {
-                break;
-            }
-            numerator = candidate;
-            cursor_tick = next_tick;
-            tempo_index += 1;
-        }
-        let rate = u128::from(self.tempo_events[tempo_index].microseconds_per_quarter)
-            .checked_mul(u128::from(self.sample_rate_hz))
-            .ok_or(TimelineError::ArithmeticOverflow)?;
-        if rate == 0 {
-            return Err(TimelineError::ArithmeticOverflow);
-        }
-        let offset = u64::try_from((target - numerator) / rate)
-            .map_err(|_| TimelineError::ArithmeticOverflow)?;
-        cursor_tick
-            .checked_add(offset)
-            .ok_or(TimelineError::ArithmeticOverflow)
-    }
-
     fn exact_frame_numerator(self, tick: u64) -> Result<u128, TimelineError> {
         let mut numerator = 0_u128;
         let mut cursor_tick = 0_u64;
@@ -1117,65 +1068,6 @@ fn tempo_matches_clip_rate(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn frame_to_tick_inverts_tick_to_frame_across_a_tempo_change() {
-        let events = [
-            TempoEvent {
-                tick: 0,
-                microseconds_per_quarter: 500_000,
-            },
-            TempoEvent {
-                tick: 3_840,
-                microseconds_per_quarter: 300_000,
-            },
-        ];
-        let timeline = Timeline::try_new(48_000, &events).unwrap();
-
-        // `tick_to_frame` floors, so several ticks share a frame and the map is
-        // not injective. The inverse is defined exactly: the greatest tick whose
-        // exact position is at or before the frame.
-        for frame in [0_usize, 1, 11, 12, 13, 1_000, 47_999, 48_000, 96_000, 200_000] {
-            let tick = timeline.frame_to_tick(frame).unwrap();
-            assert!(
-                timeline.tick_to_frame(tick).unwrap() <= frame,
-                "frame {frame} -> tick {tick} must not sit after the frame"
-            );
-            let next_numerator = timeline.exact_frame_numerator(tick + 1).unwrap();
-            let denominator = u128::from(TICKS_PER_QUARTER) * MICROSECONDS_PER_SECOND;
-            assert!(
-                next_numerator > u128::try_from(frame).unwrap() * denominator,
-                "and is the greatest such tick: {} is still at or before {frame}",
-                tick + 1
-            );
-        }
-
-        for tick in [0_u64, 960, 1_920, 3_840, 7_680, 19_200] {
-            let frame = timeline.tick_to_frame(tick).unwrap();
-            let recovered = timeline.frame_to_tick(frame).unwrap();
-            assert!(
-                recovered <= tick,
-                "the inverse never overshoots: {recovered} > {tick}"
-            );
-            assert!(
-                timeline.tick_to_frame(recovered).unwrap() <= frame,
-                "and lands at or before the frame it was given"
-            );
-        }
-
-        assert_eq!(timeline.frame_to_tick(0).unwrap(), 0);
-        assert!(
-            timeline.frame_to_tick(timeline.tick_to_frame(3_840).unwrap()).unwrap() == 3_840,
-            "the tempo change boundary is exact"
-        );
-
-        let before = timeline.tick_to_frame(3_840).unwrap();
-        let after = timeline.tick_to_frame(4_800).unwrap();
-        assert!(
-            after - before < before,
-            "the second segment really is faster, so the test is not tempo-blind"
-        );
-    }
-
     use super::*;
 
     fn timeline(events: &[TempoEvent]) -> Timeline<'_> {

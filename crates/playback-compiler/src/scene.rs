@@ -475,6 +475,16 @@ impl<'resource> CompiledScenePerformance<'resource> {
         self.timeline.tick_to_frame_ceil(tick)
     }
 
+    /// The tick at or before `frame`, using the same timeline the project was
+    /// compiled with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameTimelineError`] if checked arithmetic fails.
+    pub fn frame_to_tick(&self, frame: usize) -> Result<u64, FrameTimelineError> {
+        Ok(self.timeline.position_at_frame(frame)?.whole_tick())
+    }
+
     #[must_use]
     pub fn scene_enabled(&self, index: usize) -> Option<bool> {
         self.scenes.get(index).map(|scene| scene.enabled)
