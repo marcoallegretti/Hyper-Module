@@ -30,7 +30,7 @@ use super::{
     ControlBinding, ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
     IdeAudioTrackEditError, IdeAudioTrackRemovalError, IdeAutomationTakeCreationError,
     IdeControlMappingEdit, IdeControlMappingEditError, IdeProjectExportError,
-    IdeLoopRangeFrames, IdeResourceRestoreError,
+    IdeLoopRangeFrames, IdeResourceRestoreError, IdeTempoEditError,
     IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
     IdeInputDiscoveryError,
     IdeInputSelection, IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError,
@@ -141,6 +141,7 @@ pub enum IdeWorkerCommandKind {
     AddArrangementSceneLaunch,
     MoveArrangementSceneLaunch,
     SetArrangementLoopRange,
+    SetTempo,
     SetArrangementSceneLaunchScene,
     RemoveArrangementSceneLaunch,
     DuplicateArrangementPlacement,
@@ -249,6 +250,9 @@ pub enum IdeWorkerCommand {
     MoveArrangementSceneLaunch {
         launch_id: String,
         tick: u64,
+    },
+    SetTempo {
+        microseconds_per_quarter: u32,
     },
     SetArrangementLoopRange {
         range: Option<IdeLoopRangeFrames>,
@@ -410,6 +414,7 @@ impl IdeWorkerCommand {
             Self::SetArrangementLoopRange { .. } => {
                 IdeWorkerCommandKind::SetArrangementLoopRange
             }
+            Self::SetTempo { .. } => IdeWorkerCommandKind::SetTempo,
             Self::SetArrangementSceneLaunchScene { .. } => {
                 IdeWorkerCommandKind::SetArrangementSceneLaunchScene
             }
@@ -626,6 +631,7 @@ pub struct IdeRunningObservation {
     project_id: String,
     project_name: String,
     sample_rate_hz: u32,
+    microseconds_per_quarter: u32,
     playback_extent: super::IdePlaybackExtent,
     arrangement: Arc<super::IdePlaybackArrangement>,
     automation: Arc<super::IdePlaybackAutomation>,
@@ -1134,6 +1140,12 @@ impl IdeRunningObservation {
         &self.project_name
     }
 
+    /// The exact stored tempo at the project origin.
+    #[must_use]
+    pub const fn microseconds_per_quarter(&self) -> u32 {
+        self.microseconds_per_quarter
+    }
+
     #[must_use]
     pub const fn sample_rate_hz(&self) -> u32 {
         self.sample_rate_hz
@@ -1316,6 +1328,7 @@ pub enum IdeWorkerCommandFailure {
     ArrangementSceneLaunchAddition(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchMove(Box<IdeArrangementPlacementEditError>),
     ArrangementLoopRange(Box<IdeArrangementPlacementEditError>),
+    Tempo(Box<IdeTempoEditError>),
     ArrangementSceneLaunchSceneEdit(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchRemoval(Box<IdeArrangementPlacementEditError>),
     ArrangementPlacementDuplication(Box<IdeArrangementPlacementEditError>),
@@ -1356,6 +1369,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Discovery(source) => source.fmt(formatter),
+            Self::Tempo(source) => source.fmt(formatter),
             Self::InputDiscovery(source) => source.fmt(formatter),
             Self::OutputSelection(source) => source.fmt(formatter),
             Self::InputSelection(source) => source.fmt(formatter),
@@ -1427,6 +1441,7 @@ impl Error for IdeWorkerCommandFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Discovery(source) => Some(source),
+            Self::Tempo(source) => Some(source),
             Self::InputDiscovery(source) => Some(source),
             Self::OutputSelection(source) => Some(source),
             Self::InputSelection(source) => Some(source),
@@ -1798,6 +1813,14 @@ pub enum IdeWorkerEvent {
     ArrangementSceneLaunchSceneChanging,
     ArrangementSceneLaunchRemoving,
     ArrangementLoopRangeChanging,
+    TempoChanging,
+    TempoChanged {
+        revision: u64,
+        microseconds_per_quarter: u32,
+    },
+    TempoCommittedWithWarning {
+        warning: Box<IdeTempoEditError>,
+    },
     ArrangementLoopRangeChanged {
         revision: u64,
     },
@@ -2216,6 +2239,9 @@ enum ProjectMutation {
         launch_id: String,
         tick: u64,
     },
+    SetTempo {
+        microseconds_per_quarter: u32,
+    },
     SetArrangementLoopRange {
         range: Option<IdeLoopRangeFrames>,
     },
@@ -2327,6 +2353,7 @@ impl ProjectMutation {
             Self::SetArrangementLoopRange { .. } => {
                 IdeWorkerCommandKind::SetArrangementLoopRange
             }
+            Self::SetTempo { .. } => IdeWorkerCommandKind::SetTempo,
             Self::SaveMixer => IdeWorkerCommandKind::SaveProject,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
@@ -2416,6 +2443,7 @@ impl ProjectMutation {
                 IdeWorkerEvent::ArrangementSceneLaunchSceneChanging
             }
             Self::SetArrangementLoopRange { .. } => IdeWorkerEvent::ArrangementLoopRangeChanging,
+            Self::SetTempo { .. } => IdeWorkerEvent::TempoChanging,
             Self::RemoveArrangementSceneLaunch { .. } => {
                 IdeWorkerEvent::ArrangementSceneLaunchRemoving
             }
@@ -2592,6 +2620,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SetArrangementPlacementActive => "placement activation",
         IdeWorkerCommandKind::MoveArrangementSceneLaunch => "scene marker move",
         IdeWorkerCommandKind::SetArrangementLoopRange => "loop range",
+        IdeWorkerCommandKind::SetTempo => "tempo",
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => "scene marker reassignment",
         IdeWorkerCommandKind::RemoveArrangementSceneLaunch => "scene marker removal",
         IdeWorkerCommandKind::RenameAudioClip => "clip rename",
@@ -2882,6 +2911,7 @@ fn process_command(
         | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
         | IdeWorkerCommand::SetArrangementLoopRange { .. }
+        | IdeWorkerCommand::SetTempo { .. }
         | IdeWorkerCommand::SetArrangementSceneLaunchScene { .. }
         | IdeWorkerCommand::RemoveArrangementSceneLaunch { .. }
         | IdeWorkerCommand::DuplicateArrangementPlacement { .. }
@@ -3009,6 +3039,7 @@ fn process_project_mutation_command(
         | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
         | IdeWorkerCommand::SetArrangementLoopRange { .. }
+        | IdeWorkerCommand::SetTempo { .. }
         | IdeWorkerCommand::SetArrangementSceneLaunchScene { .. }
         | IdeWorkerCommand::RemoveArrangementSceneLaunch { .. }
         | IdeWorkerCommand::DuplicateArrangementPlacement { .. }
@@ -3097,6 +3128,15 @@ fn process_arrangement_mutation_command(
             state,
             events,
             ProjectMutation::SetArrangementLoopRange { range },
+        ),
+        IdeWorkerCommand::SetTempo {
+            microseconds_per_quarter,
+        } => begin_project_mutation_request(
+            state,
+            events,
+            ProjectMutation::SetTempo {
+                microseconds_per_quarter,
+            },
         ),
         IdeWorkerCommand::MoveArrangementSceneLaunch { launch_id, tick } => {
             move_arrangement_scene_launch(state, events, &launch_id, tick)
@@ -5148,6 +5188,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Ok(outcome), .. }
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Ok(outcome), .. }
         | ProjectMutationAttempt::SetArrangementLoopRange { result: Ok(outcome) }
+        | ProjectMutationAttempt::SetTempo { result: Ok(outcome), .. }
         | ProjectMutationAttempt::SetArrangementSceneLaunchScene { result: Ok(outcome), .. }
         | ProjectMutationAttempt::RemoveArrangementSceneLaunch { result: Ok(outcome), .. }
         | ProjectMutationAttempt::SetArrangementPlacementActive { result: Ok(outcome), .. }
@@ -5195,6 +5236,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::SetArrangementLoopRange { result: Err(_) }
+        | ProjectMutationAttempt::SetTempo { result: Err(_), .. }
         | ProjectMutationAttempt::SetArrangementSceneLaunchScene { result: Err(_), .. }
         | ProjectMutationAttempt::RemoveArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::DuplicateArrangementPlacement { result: Err(_), .. }
@@ -5831,6 +5873,9 @@ fn project_mutation_save_failure(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::SetTempo { .. } => {
+            IdeWorkerCommandFailure::Tempo(Box::new(IdeTempoEditError::MixerSave(Box::new(reason))))
+        }
         ProjectMutation::SetArrangementSceneLaunchScene { .. } => {
             IdeWorkerCommandFailure::ArrangementSceneLaunchSceneEdit(Box::new(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
@@ -6054,6 +6099,9 @@ fn project_mutation_native_close_failure(
                 IdeArrangementPlacementEditError::NativeClose(failure),
             ))
         }
+        ProjectMutation::SetTempo { .. } => {
+            IdeWorkerCommandFailure::Tempo(Box::new(IdeTempoEditError::NativeClose(failure)))
+        }
         ProjectMutation::SetArrangementSceneLaunchScene { .. } => {
             IdeWorkerCommandFailure::ArrangementSceneLaunchSceneEdit(Box::new(
                 IdeArrangementPlacementEditError::NativeClose(failure),
@@ -6195,6 +6243,13 @@ enum ProjectMutationAttempt {
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeArrangementPlacementEditError,
+        >,
+    },
+    SetTempo {
+        microseconds_per_quarter: u32,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeTempoEditError,
         >,
     },
     SetArrangementLoopRange {
@@ -6811,6 +6866,32 @@ fn complete_project_mutation(
                     reason,
                     IdeWorkerCommandFailure::ArrangementSceneLaunchAddition,
                 ),
+                ProjectMutationAttempt::SetTempo {
+                    microseconds_per_quarter,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::TempoChanged {
+                        revision: outcome.project_revision(),
+                        microseconds_per_quarter,
+                    },
+                ),
+                ProjectMutationAttempt::SetTempo {
+                    result: Err(reason),
+                    ..
+                } => send_event(
+                    events,
+                    if reason.publication_committed() {
+                        IdeWorkerEvent::TempoCommittedWithWarning {
+                            warning: Box::new(reason),
+                        }
+                    } else {
+                        IdeWorkerEvent::CommandFailed {
+                            command: IdeWorkerCommandKind::SetTempo,
+                            reason: IdeWorkerCommandFailure::Tempo(Box::new(reason)),
+                        }
+                    },
+                ),
                 ProjectMutationAttempt::SetArrangementLoopRange { result: Ok(outcome) } => {
                     send_event(
                         events,
@@ -7426,6 +7507,21 @@ fn attempt_project_mutation(
                 ),
             }
         }
+        ProjectMutation::SetTempo {
+            microseconds_per_quarter,
+        } => ProjectMutationAttempt::SetTempo {
+            microseconds_per_quarter,
+            result: if let Some(failure) = native_failure {
+                Err(IdeTempoEditError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_timeline_tempo(
+                    application,
+                    recovery,
+                    microseconds_per_quarter,
+                )
+                .and_then(|plan| plan.publish())
+            },
+        },
         ProjectMutation::SetArrangementLoopRange { range } => {
             ProjectMutationAttempt::SetArrangementLoopRange {
                 result: attempt_arrangement_loop_range(
@@ -8398,6 +8494,19 @@ fn project_mutation_reopen_failure(
                 reopen,
                 IdeWorkerCommandFailure::ArrangementSceneLaunchAddition,
             )
+        }
+        ProjectMutationAttempt::SetTempo { result, .. } => {
+            let reason = match result {
+                Ok(outcome) => IdeTempoEditError::ReopenAfterPublication {
+                    outcome: Box::new(outcome),
+                    source: Box::new(reopen),
+                },
+                Err(preparation) => IdeTempoEditError::ReopenAfterPreparation {
+                    preparation: Box::new(preparation),
+                    reopen: Box::new(reopen),
+                },
+            };
+            IdeWorkerCommandFailure::Tempo(Box::new(reason))
         }
         ProjectMutationAttempt::SetArrangementLoopRange { result } => {
             arrangement_placement_edit_reopen_failure(
@@ -9650,6 +9759,11 @@ fn running_observation(
         project_id,
         project_name,
         sample_rate_hz: snapshot.sample_rate_hz,
+        microseconds_per_quarter: snapshot
+            .loaded
+            .tempo_events()
+            .first()
+            .map_or(500_000, |event| event.microseconds_per_quarter),
         playback_extent: snapshot.playback_extent,
         arrangement: snapshot.arrangement,
         automation: snapshot.automation,

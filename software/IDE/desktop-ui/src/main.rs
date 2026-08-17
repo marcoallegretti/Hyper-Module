@@ -20,6 +20,7 @@ use hyper_desktop_ide::{
     ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
     IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
     IdeControlMappingEdit, IdeLoopRangeFrames, IdeResourceRestoreError, SceneAction,
+    bpm_for_microseconds_per_quarter, microseconds_per_quarter_for_bpm,
     TransportAction, TriggerBehavior,
     IdeAutomationTakeRequest, IdeAutomationTarget, IdeOutputTestState, IdePlaybackArrangement,
     OfflineExportReport,
@@ -1611,6 +1612,7 @@ fn bind_arrangement_scene_launch_callback(
     bind_project_export_callback(ui, worker);
     bind_undo_callbacks(ui, worker);
     bind_loop_callbacks(ui, worker, project_state);
+    bind_tempo_callback(ui, worker);
     bind_arrangement_scene_launch_locate_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_scene_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_removal_callback(ui, worker, project_state);
@@ -2982,7 +2984,9 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::CreateProject => AppMode::Creating,
         IdeWorkerCommandKind::SaveProject
         | IdeWorkerCommandKind::AddScene
-        | IdeWorkerCommandKind::SetSceneSlot => AppMode::Saving,
+        | IdeWorkerCommandKind::SetSceneSlot
+        | IdeWorkerCommandKind::SetArrangementLoopRange
+        | IdeWorkerCommandKind::SetTempo => AppMode::Saving,
         IdeWorkerCommandKind::AddAudioTrack => AppMode::AddingTrack,
         IdeWorkerCommandKind::RemoveAudioTrack => AppMode::RemovingTrack,
         IdeWorkerCommandKind::RenameAudioTrack => AppMode::RenamingTrack,
@@ -3073,6 +3077,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetArrangementLoopRange => {
             "Preserving mixer state, saving the loop range, and reopening project..."
+        }
+        IdeWorkerCommandKind::SetTempo => {
+            "Preserving mixer state, saving the tempo, and reopening project..."
         }
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => {
             "Preserving mixer state, changing the marker scene, and reopening project..."
@@ -3391,6 +3398,25 @@ fn apply_event(
         }
         event @ (IdeWorkerEvent::ProjectExporting | IdeWorkerEvent::ProjectExported { .. }) => {
             apply_project_export_event(ui, &event);
+        }
+        IdeWorkerEvent::TempoChanging => {
+            ui.set_status_text("Saving the tempo...".into());
+        }
+        IdeWorkerEvent::TempoChanged {
+            revision,
+            microseconds_per_quarter,
+        } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_tempo_bpm(format_tempo_bpm(microseconds_per_quarter).into());
+            ui.set_status_text(format!("Tempo saved in project revision {revision}").into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::TempoCommittedWithWarning { warning } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text(SharedString::default());
+            ui.set_error_text(
+                format!("The tempo was saved but the project may need attention: {warning}").into(),
+            );
         }
         IdeWorkerEvent::ArrangementLoopRangeChanging => {
             ui.set_status_text("Saving the loop range...".into());
@@ -4828,8 +4854,7 @@ fn apply_running_event(
     set_recording_targets(ui, recording_routes, observation.mixer_channels());
     set_recording_takes(ui, take_routes, observation);
     set_playback_extent(ui, project_state, observation);
-    seed_loop_marks(project_state, observation);
-    refresh_loop_controls(ui, project_state, observation.sample_rate_hz());
+    set_tempo_and_loop(ui, project_state, observation);
     set_arrangement(ui, project_state, observation);
     set_automation(ui, project_state, observation);
     set_control_mappings(ui, project_state, observation);
@@ -5707,6 +5732,8 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_undo_available(false);
     ui.set_redo_available(false);
     ui.set_loop_summary(SharedString::default());
+    ui.set_tempo_bpm(SharedString::default());
+    ui.set_tempo_available(false);
     ui.set_loop_marking_available(false);
     ui.set_loop_toggle_available(false);
     ui.set_loop_engaged(false);
@@ -5743,6 +5770,8 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::SaveProject
         | IdeWorkerCommandKind::AddScene
         | IdeWorkerCommandKind::SetSceneSlot
+        | IdeWorkerCommandKind::SetArrangementLoopRange
+        | IdeWorkerCommandKind::SetTempo
             if current == AppMode::Saving =>
         {
             AppMode::Running
@@ -7694,6 +7723,57 @@ fn refresh_loop_controls(ui: &MainWindow, state: &ProjectUiStateCell, sample_rat
     }
 }
 
+/// The tempo a stored value represents. Shown to at most two decimals because
+/// the stored integer is exact and the beats-per-minute figure is derived.
+fn set_tempo_and_loop(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    observation: &IdeRunningObservation,
+) {
+    ui.set_tempo_bpm(format_tempo_bpm(observation.microseconds_per_quarter()).into());
+    ui.set_tempo_available(true);
+    seed_loop_marks(project_state, observation);
+    refresh_loop_controls(ui, project_state, observation.sample_rate_hz());
+}
+
+fn format_tempo_bpm(microseconds_per_quarter: u32) -> String {
+    format!("{:.2}", bpm_for_microseconds_per_quarter(microseconds_per_quarter))
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
+/// A typed tempo becomes a command only when it converts to a value the
+/// contract accepts. Anything else is reported rather than clamped.
+fn tempo_command(typed: &str) -> Result<IdeWorkerCommand, String> {
+    let trimmed = typed.trim();
+    let bpm: f64 = trimmed
+        .parse()
+        .map_err(|_| format!("\"{trimmed}\" is not a tempo"))?;
+    microseconds_per_quarter_for_bpm(bpm)
+        .map(|microseconds_per_quarter| IdeWorkerCommand::SetTempo {
+            microseconds_per_quarter,
+        })
+        .map_err(|source| source.to_string())
+}
+
+fn bind_tempo_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    ui.global::<IdeActions>().on_set_tempo(move |typed| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        match tempo_command(typed.as_str()) {
+            Ok(command) => submit_to_ui(&ui, &worker, command),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+}
+
 fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiStateCell) {
     let actions = ui.global::<IdeActions>();
     let mark = |end: bool| {
@@ -8477,6 +8557,58 @@ mod tests {
         assert_eq!(
             mode_after_failure(AppMode::RenamingScene, IdeWorkerCommandKind::RenameScene),
             AppMode::Running
+        );
+    }
+
+    #[test]
+    fn a_typed_tempo_becomes_a_command_only_when_the_contract_accepts_it() {
+        assert!(matches!(
+            tempo_command("120"),
+            Ok(IdeWorkerCommand::SetTempo {
+                microseconds_per_quarter: 500_000
+            })
+        ));
+        assert!(
+            matches!(
+                tempo_command("  140.5  "),
+                Ok(IdeWorkerCommand::SetTempo {
+                    microseconds_per_quarter: 427_046
+                })
+            ),
+            "surrounding space is trimmed and the figure rounds to the stored integer"
+        );
+
+        for refused in ["", "fast", "0", "-120", "0.001"] {
+            assert!(
+                tempo_command(refused).is_err(),
+                "{refused:?} is reported rather than clamped"
+            );
+        }
+        assert_eq!(
+            tempo_command("abc").unwrap_err(),
+            "\"abc\" is not a tempo",
+            "and the message names what was typed"
+        );
+    }
+
+    #[test]
+    fn the_displayed_tempo_comes_from_the_stored_integer() {
+        assert_eq!(format_tempo_bpm(500_000), "120");
+        assert_eq!(format_tempo_bpm(1_000_000), "60");
+        assert_eq!(
+            format_tempo_bpm(427_046),
+            "140.5",
+            "a tempo that does not divide evenly still reads back as what was asked"
+        );
+        assert_eq!(
+            format_tempo_bpm(499_999),
+            "120",
+            "and a neighbouring integer rounds to the same two decimals"
+        );
+        assert_ne!(
+            format_tempo_bpm(400_000),
+            format_tempo_bpm(500_000),
+            "different stored tempos display differently"
         );
     }
 

@@ -3065,6 +3065,173 @@ pub fn serialize_arrangement_scene_launch_removal(
     )
 }
 
+/// The microseconds per quarter note a beats-per-minute figure asks for.
+///
+/// Tempo is stored as an exact integer, as Ardour stores note-types-per-minute
+/// rather than a float; beats per minute is the figure users think in and is
+/// converted here once, before anything durable happens.
+///
+/// # Errors
+///
+/// Returns [`TempoSerializationError`] when the figure is not a positive finite
+/// number or does not land inside the contract's range.
+pub fn microseconds_per_quarter_for_bpm(bpm: f64) -> Result<u32, TempoSerializationError> {
+    if !bpm.is_finite() {
+        return Err(TempoSerializationError::TempoOutOfRange);
+    }
+    let exact = 60_000_000.0_f64 / bpm;
+    if !exact.is_finite() {
+        return Err(TempoSerializationError::TempoOutOfRange);
+    }
+    let rounded = exact.round();
+    if rounded < 1.0 || rounded > f64::from(MAX_MICROSECONDS_PER_QUARTER) {
+        return Err(TempoSerializationError::TempoOutOfRange);
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the value is a whole number inside 1..=16777215, checked immediately above"
+    )]
+    Ok(rounded as u32)
+}
+
+/// The beats per minute an exact stored tempo represents.
+#[must_use]
+pub fn bpm_for_microseconds_per_quarter(microseconds_per_quarter: u32) -> f64 {
+    60_000_000.0_f64 / f64::from(microseconds_per_quarter)
+}
+
+const MAX_MICROSECONDS_PER_QUARTER: u32 = 16_777_215;
+
+#[derive(Debug)]
+pub enum TempoSerializationError {
+    TempoOutOfRange,
+    TimelineMissing,
+    SourceTimelineMismatch,
+    NonCanonicalSource,
+    InvalidDocumentShape,
+    Source(LoadError),
+    ProjectCompilation(AdapterCompileError),
+    Serialization(serde_json::Error),
+}
+
+impl fmt::Display for TempoSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TempoOutOfRange => formatter.write_str(
+                "tempo must convert to between 1 and 16777215 microseconds per quarter note",
+            ),
+            Self::TimelineMissing => formatter.write_str("the project has no timeline"),
+            Self::SourceTimelineMismatch => {
+                formatter.write_str("the source timeline is not the loaded one")
+            }
+            Self::NonCanonicalSource => {
+                formatter.write_str("the source timeline is not canonical JSON")
+            }
+            Self::InvalidDocumentShape => {
+                formatter.write_str("the timeline document shape is invalid")
+            }
+            Self::Source(source) => source.fmt(formatter),
+            Self::ProjectCompilation(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for TempoSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::TempoOutOfRange
+            | Self::TimelineMissing
+            | Self::SourceTimelineMismatch
+            | Self::NonCanonicalSource
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
+/// Rewrites the tempo at the origin, the event the contract guarantees exists.
+///
+/// The edited document is reloaded and recompiled before it is returned, so a
+/// tempo that would not produce a playable project cannot be published.
+///
+/// # Errors
+///
+/// Returns [`TempoSerializationError`] when the figure is out of range, the
+/// source is not the loaded timeline or is non-canonical, or the edited
+/// document would not load or compile.
+pub fn serialize_timeline_tempo(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_timeline: &[u8],
+    microseconds_per_quarter: u32,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, TempoSerializationError> {
+    if microseconds_per_quarter == 0 || microseconds_per_quarter > MAX_MICROSECONDS_PER_QUARTER {
+        return Err(TempoSerializationError::TempoOutOfRange);
+    }
+    let mut value: Value = serde_json::from_slice(source_timeline)
+        .map_err(TempoSerializationError::Serialization)?;
+    let canonical_source = serde_json_canonicalizer::to_vec(&value)
+        .map_err(TempoSerializationError::Serialization)?;
+    if canonical_source != source_timeline {
+        return Err(TempoSerializationError::NonCanonicalSource);
+    }
+    let document = value
+        .as_object_mut()
+        .ok_or(TempoSerializationError::InvalidDocumentShape)?;
+    if document.get("id").and_then(Value::as_str) != Some(project.timeline_id.as_str()) {
+        return Err(TempoSerializationError::SourceTimelineMismatch);
+    }
+    let events = document
+        .get_mut("tempo_events")
+        .and_then(Value::as_array_mut)
+        .ok_or(TempoSerializationError::InvalidDocumentShape)?;
+    let origin = events
+        .first_mut()
+        .and_then(Value::as_object_mut)
+        .ok_or(TempoSerializationError::TimelineMissing)?;
+    if origin.get("tick").and_then(Value::as_u64) != Some(0) {
+        return Err(TempoSerializationError::InvalidDocumentShape);
+    }
+    origin.insert(
+        "microseconds_per_quarter".to_owned(),
+        microseconds_per_quarter.into(),
+    );
+
+    let output =
+        serde_json_canonicalizer::to_vec(&value).map_err(TempoSerializationError::Serialization)?;
+    let location = DocumentLocation {
+        kind: DocumentKind::Timeline,
+        index: 0,
+    };
+    let edited: TimelineDocument = parse_document(&output, location, limits.max_document_bytes)
+        .map_err(TempoSerializationError::Source)?;
+    if edited.format != "hyper-timeline"
+        || edited.format_version != 1
+        || edited.project_id != project.project_id()
+        || edited.id != project.timeline_id
+    {
+        return Err(TempoSerializationError::SourceTimelineMismatch);
+    }
+    let mut edited_project = project.clone();
+    edited_project.tempo_events = edited
+        .tempo_events
+        .into_iter()
+        .map(|event| TempoEvent {
+            tick: event.tick,
+            microseconds_per_quarter: event.microseconds_per_quarter,
+        })
+        .collect();
+    edited_project
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(TempoSerializationError::ProjectCompilation)?;
+    Ok(output)
+}
+
 /// Writes the transport loop into the arrangement, or removes it when `range`
 /// is `None`. The result is validated by reloading and recompiling, exactly as
 /// every other arrangement edit is, so a loop that would not load cannot be
@@ -13336,6 +13503,184 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn beats_per_minute_convert_to_the_stored_integer_and_refuse_what_the_contract_rejects() {
+        assert_eq!(microseconds_per_quarter_for_bpm(120.0).unwrap(), 500_000);
+        assert_eq!(microseconds_per_quarter_for_bpm(60.0).unwrap(), 1_000_000);
+        assert_eq!(microseconds_per_quarter_for_bpm(240.0).unwrap(), 250_000);
+        assert!(
+            (bpm_for_microseconds_per_quarter(500_000) - 120.0).abs() < f64::EPSILON,
+            "the stored integer reads back as the tempo it represents"
+        );
+
+        let rounded = microseconds_per_quarter_for_bpm(140.5).unwrap();
+        assert_eq!(rounded, 427_046, "conversion rounds to the nearest microsecond");
+        assert!(
+            (bpm_for_microseconds_per_quarter(rounded) - 140.5).abs() < 0.001,
+            "and the displayed tempo stays within a thousandth of what was asked"
+        );
+
+        for refused in [0.0, -120.0, f64::NAN, f64::INFINITY, 0.001, 200_000_000.0] {
+            assert!(
+                matches!(
+                    microseconds_per_quarter_for_bpm(refused),
+                    Err(TempoSerializationError::TempoOutOfRange)
+                ),
+                "{refused} does not land inside the contract range"
+            );
+        }
+        assert_eq!(
+            microseconds_per_quarter_for_bpm(3.6).unwrap(),
+            16_666_667,
+            "the slowest useful tempo still fits the contract"
+        );
+        assert!(
+            microseconds_per_quarter_for_bpm(3.5).is_err(),
+            "and just below it the contract's own bound refuses"
+        );
+        assert_eq!(
+            microseconds_per_quarter_for_bpm(60_000_000.0).unwrap(),
+            1,
+            "the bound is the contract's, not an invented musical range"
+        );
+    }
+
+    #[test]
+    fn setting_the_tempo_moves_tick_addressed_material_in_time() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let source = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<serde_json::Value>(TIMELINE).unwrap(),
+        )
+        .unwrap();
+        let project = load(
+            input_with_scenes(&source, &tracks, &clips, &scenes, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let assets = [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
+            sample_rate_hz: 48_000,
+            frame_count: 100,
+        }];
+
+        let doubled = serialize_timeline_tempo(
+            &project,
+            &assets,
+            &source,
+            500_000,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let faster = load(
+            input_with_scenes(&doubled, &tracks, &clips, &scenes, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(faster.tempo_events()[0].microseconds_per_quarter, 500_000);
+
+        let before = Timeline::try_new(48_000, project.tempo_events())
+            .unwrap()
+            .tick_to_frame(1_920)
+            .unwrap();
+        let after = Timeline::try_new(48_000, faster.tempo_events())
+            .unwrap()
+            .tick_to_frame(1_920)
+            .unwrap();
+        assert_eq!(
+            before,
+            after * 2,
+            "halving the microseconds per quarter halves the frame a tick lands on"
+        );
+
+    }
+
+    #[test]
+    fn a_tempo_edit_refuses_a_document_it_cannot_write() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let source = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<serde_json::Value>(TIMELINE).unwrap(),
+        )
+        .unwrap();
+        let project = load(
+            input_with_scenes(&source, &tracks, &clips, &scenes, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let assets = [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
+            sample_rate_hz: 48_000,
+            frame_count: 100,
+        }];
+
+        assert!(matches!(
+            serialize_timeline_tempo(&project, &assets, &source, 0, LoaderLimits::VERSION_1),
+            Err(TempoSerializationError::TempoOutOfRange)
+        ));
+        assert!(matches!(
+            serialize_timeline_tempo(
+                &project,
+                &assets,
+                &source,
+                16_777_216,
+                LoaderLimits::VERSION_1
+            ),
+            Err(TempoSerializationError::TempoOutOfRange)
+        ));
+        let foreign = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<serde_json::Value>(
+                br#"{"format":"hyper-timeline","format_version":1,
+                "id":"018f47a2-6b2d-7c11-8a44-0011223344ee",
+                "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","ticks_per_quarter":1920,
+                "tempo_events":[{"tick":0,"microseconds_per_quarter":1000000}],
+                "meter_events":[{"tick":0,"numerator":4,"denominator":4}],"extensions":{}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                serialize_timeline_tempo(
+                    &project,
+                    &assets,
+                    &foreign,
+                    400_000,
+                    LoaderLimits::VERSION_1
+                ),
+                Err(TempoSerializationError::SourceTimelineMismatch)
+            ),
+            "a timeline that is not the loaded one is refused"
+        );
+
+        let off_origin = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<serde_json::Value>(
+                br#"{"format":"hyper-timeline","format_version":1,
+                "id":"018f47a2-6b2d-7c11-8a44-001122334458",
+                "project_id":"018f47a2-6b2d-7c11-8a44-001122334455","ticks_per_quarter":1920,
+                "tempo_events":[{"tick":960,"microseconds_per_quarter":1000000}],
+                "meter_events":[{"tick":0,"numerator":4,"denominator":4}],"extensions":{}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                serialize_timeline_tempo(
+                    &project,
+                    &assets,
+                    &off_origin,
+                    400_000,
+                    LoaderLimits::VERSION_1
+                ),
+                Err(TempoSerializationError::InvalidDocumentShape)
+            ),
+            "the tempo is only ever written into the event at the origin"
+        );
     }
 
     #[test]

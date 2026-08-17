@@ -76,8 +76,9 @@ use hyper_playback_json::{
     serialize_arrangement_placement_duplication, serialize_arrangement_placement_duration,
     serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
     serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
-    serialize_arrangement_loop_range, serialize_arrangement_scene_launch_addition,
-    serialize_arrangement_scene_launch_move,
+    TempoSerializationError, serialize_arrangement_loop_range,
+    serialize_arrangement_scene_launch_addition,
+    serialize_arrangement_scene_launch_move, serialize_timeline_tempo,
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_arrangement_scene_launch_removal, serialize_arrangement_scene_launch_scene_edit,
     serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
@@ -87,6 +88,9 @@ use hyper_playback_json::{
     serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
     serialize_recording_audio_clip_addition, serialize_scene_activation, serialize_scene_addition,
     serialize_scene_duplication, serialize_scene_rename, serialize_scene_slot_edit,
+};
+pub use hyper_playback_json::{
+    bpm_for_microseconds_per_quarter, microseconds_per_quarter_for_bpm,
 };
 pub use hyper_playback_json::{
     AutomationChannelParameter, AutomationInterpolation, AutomationMainParameter, AutomationPoint,
@@ -3346,6 +3350,104 @@ pub struct IdeLoopRangeFrames {
 }
 
 #[derive(Debug)]
+pub enum IdeTempoEditError {
+    TimelineResourceMissing,
+    TimelineResourceAmbiguous,
+    MixerSave(Box<IdeProjectSaveError>),
+    Storage(StorageError),
+    CapacityUnavailable,
+    Serialization(Box<TempoSerializationError>),
+    MixerPublication(Box<ProjectResourcePublicationError>),
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    ReopenAfterPublication {
+        outcome: Box<ProjectResourcePublicationOutcome>,
+        source: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeTempoEditError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeTempoEditError {
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        match self {
+            Self::ReopenAfterPublication { .. } => true,
+            Self::Publication(source) => source.published(),
+            Self::ReopenAfterPreparation { preparation, .. } => preparation.publication_committed(),
+            Self::TimelineResourceMissing
+            | Self::TimelineResourceAmbiguous
+            | Self::MixerSave(_)
+            | Self::Storage(_)
+            | Self::CapacityUnavailable
+            | Self::Serialization(_)
+            | Self::MixerPublication(_)
+            | Self::NativeClose(_) => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeTempoEditError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimelineResourceMissing => {
+                formatter.write_str("the project has no timeline resource")
+            }
+            Self::TimelineResourceAmbiguous => {
+                formatter.write_str("the project has more than one timeline resource")
+            }
+            Self::MixerSave(source) => write!(
+                formatter,
+                "live mixer state could not be preserved: {source}"
+            ),
+            Self::Storage(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => formatter.write_str("tempo edit capacity is unavailable"),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::MixerPublication(source) => write!(
+                formatter,
+                "live mixer state could not be published before the tempo change: {source}"
+            ),
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before the tempo change: {source:?}"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "the tempo was saved in project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "the tempo change failed ({preparation}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeTempoEditError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source.as_ref()),
+            Self::MixerPublication(source) | Self::Publication(source) => Some(source.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::TimelineResourceMissing
+            | Self::TimelineResourceAmbiguous
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum IdeResourceRestoreError {
     ResourceMissing,
     MixerSave(Box<IdeProjectSaveError>),
@@ -5099,6 +5201,13 @@ struct IdeArrangementPlacementEditPlan {
 }
 
 #[derive(Debug)]
+struct IdeTimelineEditPlan {
+    mixer: IdeMixerSavePlan,
+    timeline_id: String,
+    timeline_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
 struct IdeAudioClipEditPlan {
     mixer: IdeMixerSavePlan,
     clip_id: String,
@@ -5707,6 +5816,25 @@ impl IdeAudioClipCreationPlan {
             mixer: Box::new(mixer),
             source: Box::new(source),
         })
+    }
+}
+
+impl IdeTimelineEditPlan {
+    fn publish(&self) -> Result<ProjectResourcePublicationOutcome, IdeTempoEditError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeTempoEditError::MixerPublication(Box::new(source)))?;
+        publish_project_resource(
+            &self.mixer.project_path,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                resource_id: &self.timeline_id,
+                expected_role: ResourceRole::Timeline,
+                resource_bytes: &self.timeline_bytes,
+            },
+        )
+        .map_err(|source| IdeTempoEditError::Publication(Box::new(source)))
     }
 }
 
@@ -6734,6 +6862,56 @@ impl RunningDesktopIdeApplication {
                 )
             },
         )
+    }
+
+    /// Rewrites the tempo at the origin. The edited timeline is validated by
+    /// reloading and recompiling inside the serializer before anything durable
+    /// happens, exactly as every other resource edit is.
+    fn prepare_timeline_tempo(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        microseconds_per_quarter: u32,
+    ) -> Result<IdeTimelineEditPlan, IdeTempoEditError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeTempoEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeTempoEditError::MixerSave(Box::new(IdeProjectSaveError::ProjectSnapshotUnavailable))
+        })?;
+        let package = prepared.package();
+        let mut descriptors = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::Timeline);
+        let descriptor = descriptors
+            .next()
+            .ok_or(IdeTempoEditError::TimelineResourceMissing)?;
+        if descriptors.next().is_some() {
+            return Err(IdeTempoEditError::TimelineResourceAmbiguous);
+        }
+        let source = package
+            .read_resource(descriptor.id())
+            .map_err(IdeTempoEditError::Storage)?;
+        let (project, _, _, media) = prepared.session().parts();
+        let facts: Vec<_> = media.media_asset_facts().collect();
+        let timeline_bytes = serialize_timeline_tempo(
+            project,
+            &facts,
+            &source,
+            microseconds_per_quarter,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(|source| IdeTempoEditError::Serialization(Box::new(source)))?;
+        let mut timeline_id = String::new();
+        timeline_id
+            .try_reserve_exact(descriptor.id().len())
+            .map_err(|_| IdeTempoEditError::CapacityUnavailable)?;
+        timeline_id.push_str(descriptor.id());
+        Ok(IdeTimelineEditPlan {
+            mixer,
+            timeline_id,
+            timeline_bytes,
+        })
     }
 
     fn prepare_arrangement_scene_launch_edit(

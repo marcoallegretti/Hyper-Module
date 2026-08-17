@@ -198,6 +198,7 @@ export global IdeActions {
     callback loop-mark-out();
     callback loop-toggle();
     callback loop-clear();
+    callback set-tempo(string);
     callback locate-placement(int);
     callback set-arrangement-placement-active(int, bool);
     callback move-arrangement-placement(string, string);
@@ -555,6 +556,8 @@ export component MainWindow inherits Window {
     in property <bool> loop-marking-available: false;
     in property <bool> loop-toggle-available: false;
     in property <bool> loop-engaged: false;
+    in property <string> tempo-bpm: "";
+    in property <bool> tempo-available: false;
     in property <float> transport-progress-percent: 0;
     in property <string> transport-end-clock: "—";
     in property <string> callback-count: "0";
@@ -1053,6 +1056,29 @@ export component MainWindow inherits Window {
                                     enabled: root.app-mode == AppMode.running && root.transport-seek-available;
                                     accessible-label: "Locate within finite compiled playback range";
                                     released(value) => { IdeActions.transport-seek(value); }
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Text {
+                                        text: "TEMPO";
+                                        color: #65758a;
+                                        font-size: 9px;
+                                        vertical-alignment: center;
+                                    }
+                                    tempo-input := LineEdit {
+                                        width: 74px;
+                                        text: root.tempo-bpm;
+                                        enabled: root.tempo-available;
+                                        placeholder-text: "120";
+                                        accessible-label: "Project tempo in beats per minute";
+                                        accepted => { IdeActions.set-tempo(self.text); }
+                                    }
+                                    Button {
+                                        text: "Set";
+                                        enabled: root.tempo-available;
+                                        accessible-label: "Apply the typed tempo to the project";
+                                        clicked => { IdeActions.set-tempo(tempo-input.text); }
+                                    }
                                 }
                                 HorizontalLayout {
                                     spacing: 6px;
