@@ -3337,6 +3337,14 @@ pub enum IdeControlMappingEdit {
     Remove { binding_id: String },
 }
 
+/// A loop the user marked with the playhead, in frames.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdeLoopRangeFrames {
+    pub start_frame: usize,
+    pub end_frame: usize,
+    pub enabled: bool,
+}
+
 #[derive(Debug)]
 pub enum IdeResourceRestoreError {
     ResourceMissing,
@@ -6650,16 +6658,47 @@ impl RunningDesktopIdeApplication {
         )
     }
 
+    /// Converts the marks the user set in frames into the ticks the arrangement
+    /// stores, using the timeline the project was compiled with rather than an
+    /// approximation made in the UI.
     fn prepare_arrangement_loop_range(
         application: &DesktopIdeApplication,
         recovery: &DesktopPlaybackRecovery,
-        range: Option<(u64, u64, bool)>,
+        range: Option<IdeLoopRangeFrames>,
     ) -> Result<IdeArrangementPlacementEditPlan, IdeArrangementPlacementEditError> {
+        let ticks = match range {
+            None => None,
+            Some(frames) => {
+                let prepared = recovery
+                    .prepared_project()
+                    .ok_or(IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
+                let (project, _, _, media) = prepared.session().parts();
+                let facts: Vec<_> = media.media_asset_facts().collect();
+                let graph = project
+                    .compile_playback(
+                        &facts,
+                        hyper_playback_compiler::graph::GraphLimits::VERSION_1,
+                        hyper_playback_compiler::scene::SceneLimits::VERSION_1,
+                    )
+                    .map_err(|_| IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
+                let authority = graph.scene_authority();
+                let start_tick = authority
+                    .frame_to_tick(frames.start_frame)
+                    .map_err(|_| IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
+                let end_tick = authority
+                    .frame_to_tick(frames.end_frame)
+                    .map_err(|_| IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
+                if end_tick <= start_tick {
+                    return Err(IdeArrangementPlacementEditError::ArrangementResourceMissing);
+                }
+                Some((start_tick, end_tick, frames.enabled))
+            }
+        };
         Self::prepare_arrangement_scene_launch_edit(
             application,
             recovery,
             |project, assets, source, limits| {
-                serialize_arrangement_loop_range(project, assets, source, range, limits)
+                serialize_arrangement_loop_range(project, assets, source, ticks, limits)
             },
         )
     }

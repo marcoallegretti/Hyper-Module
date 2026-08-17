@@ -19,7 +19,8 @@ use hyper_desktop_ide::{
     IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeOutputSelection,
     ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
     IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
-    IdeControlMappingEdit, IdeResourceRestoreError, SceneAction, TransportAction, TriggerBehavior,
+    IdeControlMappingEdit, IdeLoopRangeFrames, IdeResourceRestoreError, SceneAction,
+    TransportAction, TriggerBehavior,
     IdeAutomationTakeRequest, IdeAutomationTarget, IdeOutputTestState, IdePlaybackArrangement,
     OfflineExportReport,
     IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent, IdeRecordingAbortOutcome,
@@ -67,6 +68,7 @@ struct ProjectUiState {
     playback_end_frame: RefCell<Option<usize>>,
     playhead_frame: Cell<usize>,
     loop_marks: Cell<LoopMarks>,
+    loop_engaged: Cell<bool>,
     sample_rate_hz: Cell<u32>,
     arrangement: RefCell<Option<ArrangementBinding>>,
     audio_clips: RefCell<Vec<IdeAudioClip>>,
@@ -87,6 +89,17 @@ struct LoopMarks {
 }
 
 impl LoopMarks {
+    /// The durable form of these marks: frames, which the application converts
+    /// to ticks through the project's own timeline.
+    fn persisted(self, enabled: bool) -> Option<IdeLoopRangeFrames> {
+        let range = self.range()?;
+        Some(IdeLoopRangeFrames {
+            start_frame: range.start_frame(),
+            end_frame: range.end_frame(),
+            enabled,
+        })
+    }
+
     fn range(self) -> Option<TransportLoopRange> {
         let (start, end) = (self.start?, self.end?);
         TransportLoopRange::new(start, end).ok()
@@ -4815,6 +4828,7 @@ fn apply_running_event(
     set_recording_targets(ui, recording_routes, observation.mixer_channels());
     set_recording_takes(ui, take_routes, observation);
     set_playback_extent(ui, project_state, observation);
+    seed_loop_marks(project_state, observation);
     refresh_loop_controls(ui, project_state, observation.sample_rate_hz());
     set_arrangement(ui, project_state, observation);
     set_automation(ui, project_state, observation);
@@ -5614,6 +5628,8 @@ fn reset_project(
     ui.set_take_clip_name(SharedString::default());
     ui.set_takes_visible(false);
     reset_arrangement_ui(ui);
+    project_state.loop_marks.set(LoopMarks::default());
+    project_state.loop_engaged.set(false);
     ui.set_clips_visible(false);
     ui.set_clip_rename_visible(false);
     ui.set_clip_rename_id(SharedString::default());
@@ -7633,6 +7649,22 @@ fn loop_toggle_available(mode: AppMode, marks: LoopMarks) -> bool {
     loop_marking_available(mode) && marks.range().is_some()
 }
 
+/// Restores the marks a reopened project already carries. The user's own marks
+/// win once they have set any, so reopening seeds but never overwrites.
+fn seed_loop_marks(state: &ProjectUiStateCell, observation: &IdeRunningObservation) {
+    if state.loop_marks.get() != LoopMarks::default() {
+        return;
+    }
+    let Some(range) = observation.arrangement().loop_range() else {
+        return;
+    };
+    state.loop_marks.set(LoopMarks {
+        start: Some(range.start_frame()),
+        end: Some(range.end_frame()),
+    });
+    state.loop_engaged.set(range.enabled());
+}
+
 fn refresh_loop_controls(ui: &MainWindow, state: &ProjectUiStateCell, sample_rate_hz: u32) {
     state.sample_rate_hz.set(sample_rate_hz);
     let marks = state.loop_marks.get();
@@ -7642,6 +7674,9 @@ fn refresh_loop_controls(ui: &MainWindow, state: &ProjectUiStateCell, sample_rat
     ui.set_loop_toggle_available(loop_toggle_available(mode, marks));
     if marks.range().is_none() {
         ui.set_loop_engaged(false);
+        state.loop_engaged.set(false);
+    } else {
+        ui.set_loop_engaged(state.loop_engaged.get());
     }
 }
 
@@ -7673,6 +7708,13 @@ fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiSt
                 &worker,
                 IdeWorkerCommand::Transport(TransportCommand::SetLoopRange(marks.range())),
             );
+            submit_to_ui(
+                &ui,
+                &worker,
+                IdeWorkerCommand::SetArrangementLoopRange {
+                    range: marks.persisted(state.loop_engaged.get()),
+                },
+            );
             if marks.range().is_none() && ui.get_loop_engaged() {
                 ui.set_loop_engaged(false);
                 submit_to_ui(
@@ -7698,10 +7740,18 @@ fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiSt
         }
         let engaged = !ui.get_loop_engaged();
         ui.set_loop_engaged(engaged);
+        toggle_state.loop_engaged.set(engaged);
         submit_to_ui(
             &ui,
             &toggle_worker,
             IdeWorkerCommand::Transport(TransportCommand::SetLoopEnabled(engaged)),
+        );
+        submit_to_ui(
+            &ui,
+            &toggle_worker,
+            IdeWorkerCommand::SetArrangementLoopRange {
+                range: toggle_state.loop_marks.get().persisted(engaged),
+            },
         );
     });
 
@@ -7713,6 +7763,7 @@ fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiSt
             return;
         };
         clear_state.loop_marks.set(LoopMarks::default());
+        clear_state.loop_engaged.set(false);
         ui.set_loop_summary(SharedString::default());
         ui.set_loop_toggle_available(false);
         ui.set_loop_engaged(false);
@@ -7725,6 +7776,11 @@ fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiSt
             &ui,
             &clear_worker,
             IdeWorkerCommand::Transport(TransportCommand::SetLoopRange(None)),
+        );
+        submit_to_ui(
+            &ui,
+            &clear_worker,
+            IdeWorkerCommand::SetArrangementLoopRange { range: None },
         );
     });
 }
@@ -8463,6 +8519,46 @@ mod tests {
         assert_eq!(range.start_frame(), 48_000);
         assert_eq!(range.end_frame(), 96_000);
         assert!(usable.summary(48_000).contains('→'));
+    }
+
+    #[test]
+    fn marks_persist_as_frames_and_carry_whether_the_loop_was_engaged() {
+        let usable = LoopMarks {
+            start: Some(48_000),
+            end: Some(96_000),
+        };
+        assert_eq!(
+            usable.persisted(true),
+            Some(IdeLoopRangeFrames {
+                start_frame: 48_000,
+                end_frame: 96_000,
+                enabled: true,
+            }),
+            "the durable form is frames; the application converts to ticks"
+        );
+        assert_eq!(
+            usable.persisted(false).map(|range| range.enabled),
+            Some(false),
+            "and carries whether the loop was engaged, not only where it was"
+        );
+
+        for unusable in [
+            LoopMarks::default(),
+            LoopMarks {
+                start: Some(48_000),
+                end: None,
+            },
+            LoopMarks {
+                start: Some(96_000),
+                end: Some(48_000),
+            },
+        ] {
+            assert_eq!(
+                unusable.persisted(true),
+                None,
+                "a range the transport would refuse is never written"
+            );
+        }
     }
 
     #[test]

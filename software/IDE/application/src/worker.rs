@@ -30,7 +30,7 @@ use super::{
     ControlBinding, ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
     IdeAudioTrackEditError, IdeAudioTrackRemovalError, IdeAutomationTakeCreationError,
     IdeControlMappingEdit, IdeControlMappingEditError, IdeProjectExportError,
-    IdeResourceRestoreError,
+    IdeLoopRangeFrames, IdeResourceRestoreError,
     IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
     IdeInputDiscoveryError,
     IdeInputSelection, IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError,
@@ -251,7 +251,7 @@ pub enum IdeWorkerCommand {
         tick: u64,
     },
     SetArrangementLoopRange {
-        range: Option<(u64, u64, bool)>,
+        range: Option<IdeLoopRangeFrames>,
     },
     SetArrangementSceneLaunchScene {
         launch_id: String,
@@ -2217,7 +2217,7 @@ enum ProjectMutation {
         tick: u64,
     },
     SetArrangementLoopRange {
-        range: Option<(u64, u64, bool)>,
+        range: Option<IdeLoopRangeFrames>,
     },
     SetArrangementSceneLaunchScene {
         launch_id: String,
@@ -7937,7 +7937,7 @@ fn attempt_arrangement_scene_launch_addition(
 fn attempt_arrangement_loop_range(
     application: &DesktopIdeApplication,
     recovery: &DesktopPlaybackRecovery,
-    range: Option<(u64, u64, bool)>,
+    range: Option<IdeLoopRangeFrames>,
     native_failure: Option<IdeNativeCloseFailure>,
 ) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeArrangementPlacementEditError>
 {
