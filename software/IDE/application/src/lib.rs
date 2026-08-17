@@ -2609,6 +2609,10 @@ pub enum IdeArrangementPlacementEditError {
     MixerSave(Box<IdeProjectSaveError>),
     ArrangementResourceMissing,
     ArrangementResourceAmbiguous,
+    /// A marked loop could not be placed on the timeline. Each reason is
+    /// distinct and diagnosable; they used to share one message that told the
+    /// user their project had no arrangement.
+    LoopMark(LoopMarkFailure),
     Storage(StorageError),
     Serialization(ArrangementPlacementDocumentSerializationError),
     CapacityUnavailable,
@@ -2689,6 +2693,7 @@ impl fmt::Display for IdeArrangementPlacementEditError {
                     "live mixer state could not be preserved: {source}"
                 )
             }
+            Self::LoopMark(reason) => reason.fmt(formatter),
             Self::ArrangementResourceMissing => {
                 formatter.write_str("the verified project has no arrangement resource")
             }
@@ -2770,6 +2775,32 @@ impl fmt::Display for IdeArrangementPlacementEditError {
     }
 }
 
+/// Why a marked loop could not be placed on the timeline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoopMarkFailure {
+    /// The project could not be compiled, so the timeline that converts a
+    /// marked frame to a tick is unavailable.
+    TimelineUnavailable,
+    /// A marked frame lies outside the timeline's tick domain.
+    MarkOutOfRange,
+    /// Both marks resolve to the same tick, so the range would be empty.
+    MarksCollapse,
+}
+
+impl fmt::Display for LoopMarkFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TimelineUnavailable => {
+                "the project timeline could not be compiled to place the loop"
+            }
+            Self::MarkOutOfRange => "a loop mark lies outside the project timeline",
+            Self::MarksCollapse => {
+                "the loop marks are closer together than one tick, so the range would be empty"
+            }
+        })
+    }
+}
+
 impl Error for IdeArrangementPlacementEditError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -2787,6 +2818,7 @@ impl Error for IdeArrangementPlacementEditError {
             | Self::InvalidSceneLaunchIdentity
             | Self::ArrangementResourceMissing
             | Self::ArrangementResourceAmbiguous
+            | Self::LoopMark(_)
             | Self::CapacityUnavailable
             | Self::NativeClose(_) => None,
         }
@@ -6850,16 +6882,16 @@ impl RunningDesktopIdeApplication {
                 hyper_playback_compiler::graph::GraphLimits::VERSION_1,
                 hyper_playback_compiler::scene::SceneLimits::VERSION_1,
             )
-            .map_err(|_| IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
+            .map_err(|_| IdeArrangementPlacementEditError::LoopMark(LoopMarkFailure::TimelineUnavailable))?;
         let authority = graph.scene_authority();
         let start_tick = authority
             .frame_to_tick(frames.start_frame)
-            .map_err(|_| IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
+            .map_err(|_| IdeArrangementPlacementEditError::LoopMark(LoopMarkFailure::MarkOutOfRange))?;
         let end_tick = authority
             .frame_to_tick(frames.end_frame)
-            .map_err(|_| IdeArrangementPlacementEditError::ArrangementResourceMissing)?;
+            .map_err(|_| IdeArrangementPlacementEditError::LoopMark(LoopMarkFailure::MarkOutOfRange))?;
         if end_tick <= start_tick {
-            return Err(IdeArrangementPlacementEditError::ArrangementResourceMissing);
+            return Err(IdeArrangementPlacementEditError::LoopMark(LoopMarkFailure::MarksCollapse));
         }
         Ok(Some((start_tick, end_tick, frames.enabled)))
     }
@@ -12173,29 +12205,35 @@ mod tests {
             "and the flag does not disturb the ticks"
         );
 
-        assert!(
-            RunningDesktopIdeApplication::loop_range_ticks(
-                &prepared,
-                Some(IdeLoopRangeFrames {
-                    start_frame: 96_000,
-                    end_frame: 24_000,
-                    enabled: true,
-                }),
-            )
-            .is_err(),
-            "an inverted mark pair is refused rather than written"
+        for (start_frame, end_frame, why) in [
+            (96_000, 24_000, "an inverted mark pair"),
+            (24_000, 24_001, "a pair that collapses to one tick"),
+        ] {
+            assert!(
+                matches!(
+                    RunningDesktopIdeApplication::loop_range_ticks(
+                        &prepared,
+                        Some(IdeLoopRangeFrames {
+                            start_frame,
+                            end_frame,
+                            enabled: true,
+                        }),
+                    ),
+                    Err(IdeArrangementPlacementEditError::LoopMark(
+                        LoopMarkFailure::MarksCollapse
+                    ))
+                ),
+                "{why} is refused by its own name, not as a missing arrangement"
+            );
+        }
+        assert_eq!(
+            LoopMarkFailure::MarksCollapse.to_string(),
+            "the loop marks are closer together than one tick, so the range would be empty"
         );
-        assert!(
-            RunningDesktopIdeApplication::loop_range_ticks(
-                &prepared,
-                Some(IdeLoopRangeFrames {
-                    start_frame: 24_000,
-                    end_frame: 24_001,
-                    enabled: true,
-                }),
-            )
-            .is_err(),
-            "and so is a pair that collapses to one tick"
+        assert_ne!(
+            LoopMarkFailure::TimelineUnavailable.to_string(),
+            LoopMarkFailure::MarkOutOfRange.to_string(),
+            "each loop failure reads differently, so the user can tell them apart"
         );
     }
 
