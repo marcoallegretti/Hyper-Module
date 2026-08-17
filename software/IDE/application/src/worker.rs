@@ -12069,6 +12069,27 @@ mod tests {
     }
 
     #[test]
+    fn the_controls_report_the_newest_entry_on_each_stack() {
+        let mut history = UndoHistory::default();
+        history.record_edit(labelled("first", "scene rename"));
+        history.record_edit(labelled("second", "clip gain"));
+        history.record_restore(false, labelled("older-undone", "track rename"));
+        history.record_restore(false, labelled("newest-undone", "clip loop"));
+
+        assert!(
+            matches!(
+                history.state_event(),
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: Some("clip gain"),
+                    redo_label: Some("clip loop"),
+                }
+            ),
+            "each button names the entry it would apply, not the oldest one              still retained: {:?}",
+            history.state_event()
+        );
+    }
+
+    #[test]
     fn the_depth_bound_is_twenty() {
         assert_eq!(MAX_UNDO_DEPTH, 20);
         let mut history = UndoHistory::default();
