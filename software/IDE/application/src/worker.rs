@@ -1718,6 +1718,11 @@ pub enum IdeWorkerEvent {
         redo: bool,
         label: &'static str,
     },
+    EditRestoreCommittedWithWarning {
+        redo: bool,
+        label: &'static str,
+        warning: Box<IdeResourceRestoreError>,
+    },
     SceneDuplicated {
         revision: u64,
         scene_id: String,
@@ -2575,7 +2580,50 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SetSceneSlot => "scene slot edit",
         IdeWorkerCommandKind::SetSceneActive => "scene activation",
         IdeWorkerCommandKind::SetAutomationTakeActive => "automation activation",
-        _ => "edit",
+        IdeWorkerCommandKind::AddArrangementPlacement => "placement",
+        IdeWorkerCommandKind::AddArrangementSceneLaunch => "scene marker",
+        IdeWorkerCommandKind::DuplicateArrangementPlacement => "placement duplication",
+        IdeWorkerCommandKind::SplitArrangementPlacement => "placement split",
+        IdeWorkerCommandKind::AddScene => "scene",
+        IdeWorkerCommandKind::DuplicateScene => "scene duplication",
+        IdeWorkerCommandKind::AddAutomationTake => "automation take",
+        IdeWorkerCommandKind::Initialize
+        | IdeWorkerCommandKind::RetryDiscovery
+        | IdeWorkerCommandKind::RefreshOutputs
+        | IdeWorkerCommandKind::RefreshInputs
+        | IdeWorkerCommandKind::SelectSystemDefault
+        | IdeWorkerCommandKind::SelectOutput
+        | IdeWorkerCommandKind::DisableInputMonitoring
+        | IdeWorkerCommandKind::SelectSystemDefaultInput
+        | IdeWorkerCommandKind::SelectInput
+        | IdeWorkerCommandKind::StartOutputTest
+        | IdeWorkerCommandKind::StopOutputTest
+        | IdeWorkerCommandKind::CreateProject
+        | IdeWorkerCommandKind::OpenProject
+        | IdeWorkerCommandKind::Transport
+        | IdeWorkerCommandKind::Seek
+        | IdeWorkerCommandKind::LocatePlacement
+        | IdeWorkerCommandKind::LocateSceneLaunch
+        | IdeWorkerCommandKind::Loudness
+        | IdeWorkerCommandKind::Mixer
+        | IdeWorkerCommandKind::Monitoring
+        | IdeWorkerCommandKind::AddAudioTrack
+        | IdeWorkerCommandKind::RemoveAudioTrack
+        | IdeWorkerCommandKind::CreateAudioClipFromTake
+        | IdeWorkerCommandKind::DuplicateAudioClip
+        | IdeWorkerCommandKind::EditControlMapping
+        | IdeWorkerCommandKind::ExportProject
+        | IdeWorkerCommandKind::Undo
+        | IdeWorkerCommandKind::Redo
+        | IdeWorkerCommandKind::StartRecording
+        | IdeWorkerCommandKind::StopRecording
+        | IdeWorkerCommandKind::AbortRecording
+        | IdeWorkerCommandKind::StartAudioPreview
+        | IdeWorkerCommandKind::StopAudioPreview
+        | IdeWorkerCommandKind::AudioPreviewControl
+        | IdeWorkerCommandKind::Observe
+        | IdeWorkerCommandKind::CloseProject
+        | IdeWorkerCommandKind::Shutdown => "edit",
     }
 }
 
@@ -4957,9 +5005,48 @@ fn export_project(
     }
 }
 
-/// The single capture point: any successful replacement that carried previous
-/// bytes becomes a history entry. A restore's own outcome feeds the opposite
-/// stack, so undoing an undo is redo.
+/// A restore that failed still has to leave history agreeing with disk. A
+/// committed publication consumes its entry exactly as a clean one would; a
+/// refusal that can never succeed is discarded so it cannot wedge the entries
+/// behind it; anything retryable is left in place.
+fn restore_failure_event(
+    history: &mut UndoHistory,
+    entry: &UndoEntry,
+    redo: bool,
+    reason: IdeResourceRestoreError,
+) -> (IdeWorkerEvent, bool) {
+    if reason.publication_committed() {
+        history.complete_restore(redo, None);
+        return (
+            IdeWorkerEvent::EditRestoreCommittedWithWarning {
+                redo,
+                label: entry.label,
+                warning: Box::new(reason),
+            },
+            true,
+        );
+    }
+    let consumed = reason.is_permanent_refusal();
+    if consumed {
+        history.complete_restore(redo, None);
+    }
+    (
+        IdeWorkerEvent::CommandFailed {
+            command: if redo {
+                IdeWorkerCommandKind::Redo
+            } else {
+                IdeWorkerCommandKind::Undo
+            },
+            reason: IdeWorkerCommandFailure::EditRestore(Box::new(reason)),
+        },
+        consumed,
+    )
+}
+
+/// The single capture point. A restore's own outcome feeds the opposite stack,
+/// so undoing an undo is redo. A structural change no stored document can
+/// express drops the history rather than leaving entries that would silently
+/// revert later work.
 fn observe_history(
     history: &mut UndoHistory,
     attempt: &ProjectMutationAttempt,
@@ -4982,20 +5069,20 @@ fn observe_history(
             );
             true
         }
-        other => match replacement_outcome(other) {
-            Some(outcome) => {
-                if let Some(previous) = outcome.previous_resource() {
+        other => match history_effect(other) {
+            HistoryEffect::Replacement(outcome) => match outcome.previous_resource() {
+                Some(previous) => {
                     history.record_edit(UndoEntry {
                         resource_id: outcome.resource_id().to_owned(),
                         bytes: previous.to_vec(),
                         label: undo_label(command),
                     });
                     true
-                } else {
-                    false
                 }
-            }
-            None => false,
+                None => false,
+            },
+            HistoryEffect::Invalidate => history.clear(),
+            HistoryEffect::None => false,
         },
     };
     if changed {
@@ -5003,23 +5090,38 @@ fn observe_history(
     }
 }
 
-/// Every attempt whose success is one replacement publication outcome.
-fn replacement_outcome(
-    attempt: &ProjectMutationAttempt,
-) -> Option<&hyper_storage_engine::ProjectResourcePublicationOutcome> {
+/// What a completed mutation does to the undo history.
+enum HistoryEffect<'a> {
+    /// The mutation replaced one resource; the storage layer decides whether
+    /// anything was actually displaced.
+    Replacement(&'a hyper_storage_engine::ProjectResourcePublicationOutcome),
+    /// The mutation changed the project's structure in a way a stored document
+    /// cannot express, so every retained entry may no longer fit.
+    Invalidate,
+    /// The mutation failed, so the project is unchanged.
+    None,
+}
+
+/// Exhaustive by construction: a new mutation variant will not compile until
+/// its history effect is stated. The previous hand-maintained list silently
+/// omitted `AddArrangementPlacement`, `DuplicateArrangementPlacement`, and
+/// `SplitArrangementPlacement`, which replace the same arrangement document as
+/// the operations it did list, so an undo reverted work it never captured.
+fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
     match attempt {
         ProjectMutationAttempt::Save(Ok(outcome))
         | ProjectMutationAttempt::RenameAudioTrack(Ok(outcome))
-        | ProjectMutationAttempt::SetAudioTrackActive { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetArrangementPlacementActive { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::MoveArrangementPlacement { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetArrangementPlacementDuration { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::TrimArrangementPlacementFront { result: Ok(outcome), .. }
         | ProjectMutationAttempt::RemoveArrangementPlacement(Ok(outcome))
+        | ProjectMutationAttempt::SetAudioTrackActive { result: Ok(outcome), .. }
         | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Ok(outcome), .. }
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Ok(outcome), .. }
         | ProjectMutationAttempt::SetArrangementSceneLaunchScene { result: Ok(outcome), .. }
         | ProjectMutationAttempt::RemoveArrangementSceneLaunch { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetArrangementPlacementActive { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetSceneSlot { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::MoveArrangementPlacement { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetArrangementPlacementDuration { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::TrimArrangementPlacementFront { result: Ok(outcome), .. }
         | ProjectMutationAttempt::RenameAudioClip { result: Ok(outcome), .. }
         | ProjectMutationAttempt::SetAudioClipActive { result: Ok(outcome), .. }
         | ProjectMutationAttempt::SetAudioClipGain { result: Ok(outcome), .. }
@@ -5027,13 +5129,62 @@ fn replacement_outcome(
         | ProjectMutationAttempt::SetAudioClipLoop { result: Ok(outcome), .. }
         | ProjectMutationAttempt::SetAudioClipReverse { result: Ok(outcome), .. }
         | ProjectMutationAttempt::SetAudioClipSourceStart { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::AddScene { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::AddAutomationTake { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::SetAutomationTakeActive { result: Ok(outcome), .. }
+        | ProjectMutationAttempt::DuplicateScene { result: Ok(outcome), .. }
         | ProjectMutationAttempt::RenameScene { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetSceneSlot { result: Ok(outcome), .. }
         | ProjectMutationAttempt::SetSceneActive { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetAutomationTakeActive { result: Ok(outcome), .. } => {
-            Some(outcome)
+        | ProjectMutationAttempt::RestoreResource { result: Ok(outcome), .. } => {
+            HistoryEffect::Replacement(outcome)
         }
-        _ => None,
+        ProjectMutationAttempt::AddArrangementPlacement { result: Ok(publication), .. }
+        | ProjectMutationAttempt::DuplicateArrangementPlacement { result: Ok(publication), .. }
+        | ProjectMutationAttempt::SplitArrangementPlacement { result: Ok(publication), .. } => {
+            HistoryEffect::Replacement(&publication.outcome)
+        }
+        ProjectMutationAttempt::AddAudioTrack(Ok(_))
+        | ProjectMutationAttempt::RemoveAudioTrack(Ok(_))
+        | ProjectMutationAttempt::CreateAudioClipFromTake(Ok(_))
+        | ProjectMutationAttempt::DuplicateAudioClip { result: Ok(_), .. }
+        | ProjectMutationAttempt::EditControlMapping { result: Ok(_), .. } => {
+            HistoryEffect::Invalidate
+        }
+        ProjectMutationAttempt::Save(Err(_))
+        | ProjectMutationAttempt::AddAudioTrack(Err(_))
+        | ProjectMutationAttempt::RemoveAudioTrack(Err(_))
+        | ProjectMutationAttempt::RenameAudioTrack(Err(_))
+        | ProjectMutationAttempt::CreateAudioClipFromTake(Err(_))
+        | ProjectMutationAttempt::RemoveArrangementPlacement(Err(_))
+        | ProjectMutationAttempt::SetAudioTrackActive { result: Err(_), .. }
+        | ProjectMutationAttempt::DuplicateAudioClip { result: Err(_), .. }
+        | ProjectMutationAttempt::AddArrangementPlacement { result: Err(_), .. }
+        | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Err(_), .. }
+        | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Err(_), .. }
+        | ProjectMutationAttempt::SetArrangementSceneLaunchScene { result: Err(_), .. }
+        | ProjectMutationAttempt::RemoveArrangementSceneLaunch { result: Err(_), .. }
+        | ProjectMutationAttempt::DuplicateArrangementPlacement { result: Err(_), .. }
+        | ProjectMutationAttempt::SplitArrangementPlacement { result: Err(_), .. }
+        | ProjectMutationAttempt::SetArrangementPlacementActive { result: Err(_), .. }
+        | ProjectMutationAttempt::SetSceneSlot { result: Err(_), .. }
+        | ProjectMutationAttempt::MoveArrangementPlacement { result: Err(_), .. }
+        | ProjectMutationAttempt::SetArrangementPlacementDuration { result: Err(_), .. }
+        | ProjectMutationAttempt::TrimArrangementPlacementFront { result: Err(_), .. }
+        | ProjectMutationAttempt::RenameAudioClip { result: Err(_), .. }
+        | ProjectMutationAttempt::SetAudioClipActive { result: Err(_), .. }
+        | ProjectMutationAttempt::SetAudioClipGain { result: Err(_), .. }
+        | ProjectMutationAttempt::SetAudioClipFades { result: Err(_), .. }
+        | ProjectMutationAttempt::SetAudioClipLoop { result: Err(_), .. }
+        | ProjectMutationAttempt::SetAudioClipReverse { result: Err(_), .. }
+        | ProjectMutationAttempt::SetAudioClipSourceStart { result: Err(_), .. }
+        | ProjectMutationAttempt::AddScene { result: Err(_), .. }
+        | ProjectMutationAttempt::AddAutomationTake { result: Err(_), .. }
+        | ProjectMutationAttempt::SetAutomationTakeActive { result: Err(_), .. }
+        | ProjectMutationAttempt::EditControlMapping { result: Err(_), .. }
+        | ProjectMutationAttempt::DuplicateScene { result: Err(_), .. }
+        | ProjectMutationAttempt::RenameScene { result: Err(_), .. }
+        | ProjectMutationAttempt::SetSceneActive { result: Err(_), .. }
+        | ProjectMutationAttempt::RestoreResource { result: Err(_), .. } => HistoryEffect::None,
     }
 }
 
@@ -6978,20 +7129,15 @@ fn complete_project_mutation(
                     },
                 ),
                 ProjectMutationAttempt::RestoreResource {
+                    entry,
                     redo,
                     result: Err(reason),
-                    ..
-                } => send_event(
-                    events,
-                    IdeWorkerEvent::CommandFailed {
-                        command: if redo {
-                            IdeWorkerCommandKind::Redo
-                        } else {
-                            IdeWorkerCommandKind::Undo
-                        },
-                        reason: IdeWorkerCommandFailure::EditRestore(Box::new(reason)),
-                    },
-                ),
+                } => {
+                    let (event, consumed) =
+                        restore_failure_event(&mut *history, &entry, redo, reason);
+                    (!consumed || send_event(events, history.state_event()))
+                        && send_event(events, event)
+                }
                 ProjectMutationAttempt::DuplicateScene {
                     name,
                     result: Ok(outcome),
@@ -11636,12 +11782,16 @@ mod tests {
         assert_eq!(shutdown_report(worker).native_failure(), None);
     }
 
-    fn entry(id: &str) -> UndoEntry {
+    fn labelled(id: &str, label: &'static str) -> UndoEntry {
         UndoEntry {
             resource_id: id.to_owned(),
             bytes: id.as_bytes().to_vec(),
-            label: "clip gain",
+            label,
         }
+    }
+
+    fn entry(id: &str) -> UndoEntry {
+        labelled(id, "clip gain")
     }
 
     #[test]
@@ -11668,20 +11818,23 @@ mod tests {
             MAX_UNDO_DEPTH,
             "peeking leaves the entry in place until the restore commits"
         );
-        history.complete_restore(false, Some(entry("inverse")));
+        history.complete_restore(false, Some(labelled("inverse", "scene rename")));
         assert_eq!(
             history.undo.len(),
             MAX_UNDO_DEPTH - 1,
             "a committed restore consumes its entry"
         );
         assert_eq!(history.redo.len(), 1, "an undo feeds the redo stack");
-        assert!(matches!(
-            history.state_event(),
-            IdeWorkerEvent::UndoStateChanged {
-                undo_label: Some("clip gain"),
-                redo_label: Some("clip gain"),
-            }
-        ));
+        assert!(
+            matches!(
+                history.state_event(),
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: Some("clip gain"),
+                    redo_label: Some("scene rename"),
+                }
+            ),
+            "each stack reports its own newest label"
+        );
 
         history.record_edit(entry("new-edit"));
         assert!(history.redo.is_empty(), "a new edit invalidates redo");
@@ -11877,6 +12030,313 @@ mod tests {
             "and the entry survives so the user can retry"
         );
         assert_eq!(history.peek(false).unwrap().resource_id, "scene");
+    }
+
+    #[test]
+    fn closing_a_project_drops_its_history_through_the_dispatcher() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        let (events, receiver) = std::sync::mpsc::sync_channel(16);
+        let mut state = WorkerState::Running(running);
+        let mut history = UndoHistory::default();
+        let mut native = None;
+        history.record_edit(labelled("scene", "scene rename"));
+        while receiver.try_recv().is_ok() {}
+
+        assert!(process_command(
+            &mut state,
+            IdeWorkerCommand::CloseProject,
+            &events,
+            &mut native,
+            &mut history,
+        ));
+        assert!(
+            history.undo.is_empty() && history.redo.is_empty(),
+            "entries from the closed project cannot target the next one"
+        );
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Ok(IdeWorkerEvent::UndoStateChanged {
+                    undo_label: None,
+                    redo_label: None,
+                })
+            ),
+            "and the controls are told before anything else happens"
+        );
+    }
+
+    #[test]
+    fn the_depth_bound_is_twenty() {
+        assert_eq!(MAX_UNDO_DEPTH, 20);
+        let mut history = UndoHistory::default();
+        for index in 0..25 {
+            history.record_edit(entry(&format!("edit-{index}")));
+        }
+        assert_eq!(history.undo.len(), 20);
+        assert_eq!(history.undo.first().unwrap().resource_id, "edit-5");
+
+        let mut redo_side = UndoHistory::default();
+        for index in 0..25 {
+            redo_side.record_restore(false, entry(&format!("undone-{index}")));
+        }
+        assert_eq!(
+            redo_side.redo.len(),
+            20,
+            "the bound holds on the redo stack too"
+        );
+        assert_eq!(redo_side.redo.first().unwrap().resource_id, "undone-5");
+    }
+
+    #[test]
+    fn the_redo_direction_reads_and_feeds_the_opposite_stacks() {
+        let mut history = UndoHistory::default();
+        history.record_restore(false, labelled("undone", "scene rename"));
+        history.record_edit(labelled("edited", "clip gain"));
+        assert!(
+            history.redo.is_empty(),
+            "the edit cleared redo, so only the undo stack is populated"
+        );
+
+        history.record_restore(false, labelled("displaced", "scene rename"));
+        assert_eq!(history.peek(false).unwrap().resource_id, "edited");
+        assert_eq!(
+            history.peek(true).unwrap().resource_id,
+            "displaced",
+            "redo reads the redo stack, not the undo stack"
+        );
+
+        history.complete_restore(true, Some(labelled("back", "scene rename")));
+        assert!(
+            history.redo.is_empty(),
+            "a committed redo consumes from the redo stack"
+        );
+        assert_eq!(
+            history.undo.len(),
+            2,
+            "and feeds the undo stack with what it displaced"
+        );
+        assert_eq!(history.peek(false).unwrap().resource_id, "back");
+    }
+
+    #[test]
+    fn a_redo_reports_itself_as_a_redo() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: false,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let (events, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut state = WorkerState::Running(running);
+        let mut history = UndoHistory::default();
+        history.record_restore(false, labelled("scene", "scene rename"));
+        while receiver.try_recv().is_ok() {}
+
+        assert!(restore_edit(&mut state, &events, &mut history, true));
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Ok(IdeWorkerEvent::CommandFailed {
+                    command: IdeWorkerCommandKind::Redo,
+                    reason: IdeWorkerCommandFailure::EditRestore(_),
+                })
+            ),
+            "a redo that never reaches the project is reported as a redo, \
+             classified as a restore failure"
+        );
+        assert_eq!(history.redo.len(), 1, "and keeps its entry");
+        assert!(history.undo.is_empty());
+    }
+
+    #[test]
+    fn a_permanently_refused_restore_is_discarded_so_older_entries_stay_reachable() {
+        let mut history = UndoHistory::default();
+        history.record_edit(labelled("older", "clip gain"));
+        history.record_edit(labelled("dead", "track rename"));
+
+        let (event, consumed) = restore_failure_event(
+            &mut history,
+            &labelled("dead", "track rename"),
+            false,
+            IdeResourceRestoreError::ResourceMissing,
+        );
+        assert!(consumed, "a refusal that can never succeed is discarded");
+        assert!(matches!(
+            event,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Undo,
+                ..
+            }
+        ));
+        assert_eq!(
+            history.peek(false).unwrap().resource_id,
+            "older",
+            "the entry behind it becomes reachable"
+        );
+
+        let (retryable, kept) = restore_failure_event(
+            &mut history,
+            &labelled("older", "clip gain"),
+            false,
+            IdeResourceRestoreError::CapacityUnavailable,
+        );
+        assert!(!kept, "a retryable refusal keeps its entry");
+        assert!(matches!(retryable, IdeWorkerEvent::CommandFailed { .. }));
+        assert_eq!(history.undo.len(), 1);
+    }
+
+    #[test]
+    fn a_restore_that_committed_before_failing_consumes_its_entry() {
+        let mut history = UndoHistory::default();
+        history.record_edit(labelled("scene", "scene rename"));
+        let edit = captured_mixer_edit("committed");
+        let reason = IdeResourceRestoreError::ReopenAfterPreparation {
+            preparation: Box::new(IdeResourceRestoreError::ReopenAfterPublication {
+                outcome: Box::new(edit.outcome.clone()),
+                source: Box::new(IdeProjectOpenError::PlaybackSessionGenerationExhausted),
+            }),
+            reopen: Box::new(IdeProjectOpenError::PlaybackSessionGenerationExhausted),
+        };
+        assert!(
+            reason.publication_committed(),
+            "a committed publication is visible through the reopen wrapper"
+        );
+
+        let (event, consumed) =
+            restore_failure_event(&mut history, &labelled("scene", "scene rename"), false, reason);
+        assert!(consumed);
+        assert!(
+            matches!(
+                event,
+                IdeWorkerEvent::EditRestoreCommittedWithWarning {
+                    redo: false,
+                    label: "scene rename",
+                    ..
+                }
+            ),
+            "the user is told the restore reached the project"
+        );
+        assert!(
+            history.undo.is_empty(),
+            "history agrees with disk rather than offering the undo again"
+        );
+    }
+
+    #[test]
+    fn the_restore_error_taxonomy_separates_committed_from_permanent() {
+        let edit = captured_mixer_edit("taxonomy");
+        let committed = IdeResourceRestoreError::ReopenAfterPublication {
+            outcome: Box::new(edit.outcome.clone()),
+            source: Box::new(IdeProjectOpenError::PlaybackSessionGenerationExhausted),
+        };
+        assert!(committed.publication_committed());
+        assert!(!committed.is_permanent_refusal());
+
+        for retryable in [
+            IdeResourceRestoreError::CapacityUnavailable,
+            IdeResourceRestoreError::NativeClose(IdeNativeCloseFailure::RuntimeFailed),
+            IdeResourceRestoreError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            )),
+        ] {
+            assert!(
+                !retryable.publication_committed(),
+                "{retryable} did not reach the project"
+            );
+            assert!(
+                !retryable.is_permanent_refusal(),
+                "{retryable} may succeed later"
+            );
+        }
+
+        for permanent in [
+            IdeResourceRestoreError::ResourceMissing,
+            IdeResourceRestoreError::CandidateInvalid(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            )),
+        ] {
+            assert!(permanent.is_permanent_refusal(), "{permanent} cannot succeed later");
+            assert!(!permanent.publication_committed());
+        }
+    }
+
+    #[test]
+    fn every_undoable_command_names_the_edit_it_reverses() {
+        for (command, expected) in [
+            (IdeWorkerCommandKind::SaveProject, "mixer save"),
+            (IdeWorkerCommandKind::RenameAudioTrack, "track rename"),
+            (IdeWorkerCommandKind::SetAudioTrackActive, "track activation"),
+            (IdeWorkerCommandKind::AddArrangementPlacement, "placement"),
+            (IdeWorkerCommandKind::MoveArrangementPlacement, "placement move"),
+            (
+                IdeWorkerCommandKind::SetArrangementPlacementDuration,
+                "placement duration",
+            ),
+            (
+                IdeWorkerCommandKind::TrimArrangementPlacementFront,
+                "placement trim",
+            ),
+            (
+                IdeWorkerCommandKind::RemoveArrangementPlacement,
+                "placement removal",
+            ),
+            (
+                IdeWorkerCommandKind::SetArrangementPlacementActive,
+                "placement activation",
+            ),
+            (
+                IdeWorkerCommandKind::DuplicateArrangementPlacement,
+                "placement duplication",
+            ),
+            (
+                IdeWorkerCommandKind::SplitArrangementPlacement,
+                "placement split",
+            ),
+            (IdeWorkerCommandKind::AddArrangementSceneLaunch, "scene marker"),
+            (
+                IdeWorkerCommandKind::MoveArrangementSceneLaunch,
+                "scene marker move",
+            ),
+            (
+                IdeWorkerCommandKind::SetArrangementSceneLaunchScene,
+                "scene marker reassignment",
+            ),
+            (
+                IdeWorkerCommandKind::RemoveArrangementSceneLaunch,
+                "scene marker removal",
+            ),
+            (IdeWorkerCommandKind::RenameAudioClip, "clip rename"),
+            (IdeWorkerCommandKind::SetAudioClipActive, "clip activation"),
+            (IdeWorkerCommandKind::SetAudioClipGain, "clip gain"),
+            (IdeWorkerCommandKind::SetAudioClipFades, "clip fades"),
+            (IdeWorkerCommandKind::SetAudioClipLoop, "clip loop"),
+            (IdeWorkerCommandKind::SetAudioClipReverse, "clip direction"),
+            (
+                IdeWorkerCommandKind::SetAudioClipSourceStart,
+                "clip source slip",
+            ),
+            (IdeWorkerCommandKind::AddScene, "scene"),
+            (IdeWorkerCommandKind::DuplicateScene, "scene duplication"),
+            (IdeWorkerCommandKind::RenameScene, "scene rename"),
+            (IdeWorkerCommandKind::SetSceneSlot, "scene slot edit"),
+            (IdeWorkerCommandKind::SetSceneActive, "scene activation"),
+            (IdeWorkerCommandKind::AddAutomationTake, "automation take"),
+            (
+                IdeWorkerCommandKind::SetAutomationTakeActive,
+                "automation activation",
+            ),
+        ] {
+            assert_eq!(undo_label(command), expected, "label for {command:?}");
+        }
+        assert_eq!(
+            undo_label(IdeWorkerCommandKind::Transport),
+            "edit",
+            "commands that never produce history share one fallback"
+        );
     }
 
     #[test]

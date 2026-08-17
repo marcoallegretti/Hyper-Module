@@ -3343,6 +3343,7 @@ pub enum IdeResourceRestoreError {
     Storage(StorageError),
     CapacityUnavailable,
     CandidateInvalid(Box<dyn Error + Send + Sync>),
+    MixerPublication(Box<ProjectResourcePublicationError>),
     Publication(Box<ProjectResourcePublicationError>),
     NativeClose(IdeNativeCloseFailure),
     NativeCloseAndReopen {
@@ -3360,13 +3361,31 @@ pub enum IdeResourceRestoreError {
 }
 
 impl IdeResourceRestoreError {
+    /// Whether the restored bytes reached the project despite the failure.
+    /// A committed mixer publication does not count: the entry's own resource
+    /// was never written.
     #[must_use]
-    pub const fn publication_committed(&self) -> bool {
+    pub fn publication_committed(&self) -> bool {
         match self {
             Self::ReopenAfterPublication { .. } => true,
             Self::Publication(source) => source.published(),
-            _ => false,
+            Self::ReopenAfterPreparation { preparation, .. } => preparation.publication_committed(),
+            Self::MixerPublication(_)
+            | Self::ResourceMissing
+            | Self::MixerSave(_)
+            | Self::Storage(_)
+            | Self::CapacityUnavailable
+            | Self::CandidateInvalid(_)
+            | Self::NativeClose(_)
+            | Self::NativeCloseAndReopen { .. } => false,
         }
+    }
+
+    /// A refusal that cannot succeed on a later attempt, so retaining the
+    /// entry would wedge every older entry behind it.
+    #[must_use]
+    pub const fn is_permanent_refusal(&self) -> bool {
+        matches!(self, Self::ResourceMissing | Self::CandidateInvalid(_))
     }
 }
 
@@ -3382,6 +3401,10 @@ impl fmt::Display for IdeResourceRestoreError {
                     "live mixer state could not be preserved: {source}"
                 )
             }
+            Self::MixerPublication(source) => write!(
+                formatter,
+                "live mixer state could not be published before the undo: {source}"
+            ),
             Self::Storage(source) => source.fmt(formatter),
             Self::CapacityUnavailable => {
                 formatter.write_str("undo capacity is unavailable")
@@ -3422,7 +3445,7 @@ impl Error for IdeResourceRestoreError {
             Self::MixerSave(source) => Some(source.as_ref()),
             Self::Storage(source) => Some(source),
             Self::CandidateInvalid(source) => Some(source.as_ref()),
-            Self::Publication(source) => Some(source.as_ref()),
+            Self::MixerPublication(source) | Self::Publication(source) => Some(source.as_ref()),
             Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
             Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
@@ -5204,7 +5227,7 @@ impl IdeResourceRestorePlan {
         let mixer = self
             .mixer
             .publish()
-            .map_err(|source| IdeResourceRestoreError::Publication(Box::new(source)))?;
+            .map_err(|source| IdeResourceRestoreError::MixerPublication(Box::new(source)))?;
         publish_project_resource(
             &self.mixer.project_path,
             ProjectResourcePublicationRequest {
@@ -11498,6 +11521,156 @@ mod tests {
             verified.package().read_resource(ARRANGEMENT_TEST_SCENE_ID).unwrap(),
             scene_bytes,
             "the undone edit is byte-identical to the original"
+        );
+    }
+
+    /// Joins the seam the type system alone leaves open: the bytes history
+    /// captures from a publication must be exactly the bytes a restore
+    /// consumes, and restoring twice must return the file to where it began.
+    #[test]
+    fn an_undo_then_a_redo_return_the_project_to_the_edited_state() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let application = DesktopIdeApplication::from_inventories(
+            config,
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let read_scene = || {
+            hyper_storage_engine::verify_project_package(&project_path)
+                .unwrap()
+                .read_resource(ARRANGEMENT_TEST_SCENE_ID)
+                .unwrap()
+        };
+
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let original = read_scene();
+        let mixer_id = prepared
+            .package()
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap()
+            .id()
+            .to_owned();
+        let mixer_bytes = prepared.package().read_resource(&mixer_id).unwrap();
+        let mixer_plan = |sha: [u8; 32]| IdeMixerSavePlan {
+            project_path: project_path.clone(),
+            expected_project_sha256: sha,
+            resource_id: mixer_id.clone(),
+            resource_bytes: mixer_bytes.clone(),
+        };
+        let (project, _, _, _) = prepared.session().parts();
+        let renamed = serialize_scene_rename(
+            project,
+            &original,
+            ARRANGEMENT_TEST_SCENE_ID,
+            "Renamed",
+            limits.session.documents,
+        )
+        .unwrap();
+        let sha = *prepared.package().manifest_sha256();
+        drop(prepared);
+
+        let edit = publish_project_resource(
+            &project_path,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: sha,
+                resource_id: ARRANGEMENT_TEST_SCENE_ID,
+                expected_role: ResourceRole::Scene,
+                resource_bytes: &renamed,
+            },
+        )
+        .unwrap();
+        let edited = read_scene();
+        assert_eq!(edited, renamed);
+
+        let undo_bytes = edit.previous_resource().unwrap().to_vec();
+        let restore = |bytes: &[u8]| {
+            let reopened =
+                hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+            let plan = RunningDesktopIdeApplication::prepare_resource_restore_from_project(
+                &application,
+                mixer_plan(*reopened.package().manifest_sha256()),
+                &reopened,
+                ARRANGEMENT_TEST_SCENE_ID,
+                bytes,
+            )
+            .unwrap();
+            drop(reopened);
+            plan.publish().unwrap()
+        };
+
+        let undone = restore(&undo_bytes);
+        assert_eq!(read_scene(), original, "the undo restores the original bytes");
+        let redo_bytes = undone.previous_resource().unwrap().to_vec();
+        assert_eq!(
+            redo_bytes, edited,
+            "and displaces exactly the edited bytes, which become the redo entry"
+        );
+
+        let redone = restore(&redo_bytes);
+        assert_eq!(read_scene(), edited, "the redo reapplies the edit");
+        assert_eq!(
+            redone.previous_resource().unwrap(),
+            original.as_slice(),
+            "leaving the original available to undo again"
+        );
+    }
+
+    #[test]
+    fn a_restore_reads_its_role_from_the_manifest() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let application = DesktopIdeApplication::from_inventories(
+            config,
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let package = prepared.package();
+        let mixer_id = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap()
+            .id()
+            .to_owned();
+        let plan_for = |resource_id: &str, bytes: &[u8]| {
+            RunningDesktopIdeApplication::prepare_resource_restore_from_project(
+                &application,
+                IdeMixerSavePlan {
+                    project_path: project_path.clone(),
+                    expected_project_sha256: *package.manifest_sha256(),
+                    resource_id: mixer_id.clone(),
+                    resource_bytes: package.read_resource(&mixer_id).unwrap(),
+                },
+                &prepared,
+                resource_id,
+                bytes,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            plan_for(&mixer_id, &package.read_resource(&mixer_id).unwrap()).role,
+            ResourceRole::Mixer
+        );
+        assert_eq!(
+            plan_for(
+                ARRANGEMENT_TEST_SCENE_ID,
+                &package.read_resource(ARRANGEMENT_TEST_SCENE_ID).unwrap(),
+            )
+            .role,
+            ResourceRole::Scene,
+            "the role follows the resource, so it cannot be a hardcoded constant"
         );
     }
 

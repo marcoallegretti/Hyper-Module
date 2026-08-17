@@ -3322,7 +3322,8 @@ fn apply_event(
         }
         event @ (IdeWorkerEvent::UndoStateChanged { .. }
         | IdeWorkerEvent::EditRestored { .. }
-        | IdeWorkerEvent::EditRestoring { .. }) => apply_undo_event(ui, &event),
+        | IdeWorkerEvent::EditRestoring { .. }
+        | IdeWorkerEvent::EditRestoreCommittedWithWarning { .. }) => apply_undo_event(ui, &event),
         event @ (IdeWorkerEvent::SceneDuplicated { .. }
         | IdeWorkerEvent::SceneDuplicationCommittedWithWarning { .. }
         | IdeWorkerEvent::SceneDuplicating) => apply_scene_duplication_event(ui, &event),
@@ -7492,6 +7493,21 @@ fn apply_undo_event(ui: &MainWindow, event: &IdeWorkerEvent) {
                 .into(),
             );
             ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::EditRestoreCommittedWithWarning {
+            redo,
+            label,
+            warning,
+        } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text(SharedString::default());
+            ui.set_error_text(
+                format!(
+                    "The {label} was {} but the project may need attention: {warning}",
+                    if *redo { "reapplied" } else { "undone" }
+                )
+                .into(),
+            );
         }
         IdeWorkerEvent::EditRestoring { redo, label } => {
             ui.set_app_mode(AppMode::RestoringEdit);
