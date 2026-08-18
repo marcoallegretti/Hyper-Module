@@ -13,6 +13,7 @@ hyper-arrangement-renderer = { path = "../../../crates/arrangement-renderer" }
 hyper-audio-source = { path = "../../../crates/audio-source" }
 hyper-audio-engine = { path = "../../../crates/audio-engine" }
 hyper-control-runtime = { path = "../../RUNTIME/control-runtime" }
+hyper-panel-protocol = { path = "../../../crates/panel-protocol" }
 hyper-control-mappings = { path = "../../../crates/control-mappings" }
 hyper-media-cache = { path = "../../../crates/media-cache" }
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }

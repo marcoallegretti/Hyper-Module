@@ -2115,6 +2115,7 @@ dependencies = [
  "hyper-mapping-compiler",
  "hyper-media-cache",
  "hyper-mixer-runtime",
+ "hyper-panel-protocol",
  "hyper-playback-compiler",
  "hyper-playback-json",
  "hyper-playback-session",
@@ -2354,6 +2355,23 @@ dependencies = [
  "hyper-recording-journal",
  "hyper-recording-transport",
  "hyper-thread-supervisor",
+]
+
+[[package]]
+name = "hyper-runtime-host"
+version = "0.1.0"
+dependencies = [
+ "hyper-audio-source",
+ "hyper-control-runtime",
+ "hyper-desktop-audio",
+ "hyper-mapping-compiler",
+ "hyper-media-cache",
+ "hyper-panel-protocol",
+ "hyper-panel-simulator",
+ "hyper-playback-json",
+ "hyper-playback-session",
+ "hyper-project-loader",
+ "hyper-runtime-panel-session",
 ]
 
 [[package]]

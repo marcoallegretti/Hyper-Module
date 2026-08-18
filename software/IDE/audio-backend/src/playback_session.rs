@@ -1675,6 +1675,58 @@ impl DesktopPlaybackSession {
         self.controls.dispatch_mapping_event(event, context)
     }
 
+    /// Installs one discovered panel's bindings against this session's sole
+    /// control owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`hyper_control_runtime::PanelConnectError`] when a panel is
+    /// still connected or shadow state cannot be allocated.
+    pub fn connect_panel(
+        &mut self,
+        descriptor: hyper_panel_protocol::PanelDescriptor,
+        bindings: &[hyper_control_runtime::PanelBinding],
+    ) -> Result<
+        hyper_control_runtime::PanelConnection<DesktopControlSinkError>,
+        hyper_control_runtime::PanelConnectError,
+    > {
+        self.controls
+            .runtime_mut()
+            .connect_panel(descriptor, bindings)
+    }
+
+    /// Releases anything the panel still holds and forgets its bindings.
+    ///
+    /// A non-empty result means a release was refused and the panel is still
+    /// installed so a later call retries it.
+    #[must_use]
+    pub fn disconnect_panel(
+        &mut self,
+    ) -> Vec<hyper_control_runtime::PanelReleaseFailure<DesktopControlSinkError>> {
+        self.controls.runtime_mut().disconnect_panel()
+    }
+
+    #[must_use]
+    pub fn panel_connected(&self) -> bool {
+        self.controls.runtime().panel_connected()
+    }
+
+    /// Dispatches one panel message against the installed bindings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sink's rejection, or reports that the target's present state
+    /// could not be read.
+    pub fn dispatch_panel(
+        &mut self,
+        message: hyper_panel_protocol::Message,
+    ) -> Result<
+        hyper_control_runtime::PanelDispatchOutcome,
+        hyper_control_runtime::PanelDispatchError<DesktopControlSinkError>,
+    > {
+        self.controls.runtime_mut().dispatch_panel(message)
+    }
+
     #[must_use]
     pub fn loudness_command_sender(&mut self) -> &mut LoudnessCommandSender {
         &mut self.loudness_commands

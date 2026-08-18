@@ -30,6 +30,7 @@ members = [
     "software/IDE/panel-simulator",
     "software/RUNTIME/control-runtime",
     "software/RUNTIME/panel-session",
+    "software/RUNTIME/runtime-host",
 ]
 exclude = ["third_party/pipewire"]
 resolver = "3"
