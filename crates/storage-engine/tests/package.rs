@@ -87,7 +87,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        fs::remove_dir_all(&self.root).unwrap();
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
