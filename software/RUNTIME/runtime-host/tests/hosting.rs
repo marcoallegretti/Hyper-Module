@@ -84,6 +84,7 @@ impl RuntimeControlSink for Sink {
 struct Host {
     runtime: ControlRuntime<Sink>,
     channels: usize,
+    refuse_connect: bool,
 }
 
 impl Host {
@@ -92,6 +93,7 @@ impl Host {
             runtime: ControlRuntime::try_new(CompiledControlMappingTable::empty(), Sink::default())
                 .expect("an empty table needs no capacity"),
             channels,
+            refuse_connect: false,
         }
     }
 
@@ -112,6 +114,9 @@ impl PanelHost for Host {
         descriptor: PanelDescriptor,
         bindings: &[PanelBinding],
     ) -> Result<PanelConnection<Self::Error>, PanelConnectError> {
+        if self.refuse_connect {
+            return Err(PanelConnectError::AlreadyConnected);
+        }
         self.runtime.connect_panel(descriptor, bindings)
     }
 
@@ -441,5 +446,37 @@ fn a_malformed_argument_list_is_reported_rather_than_assumed() {
             "127.0.0.1:2".to_owned(),
         ]),
         Err(ArgumentError::Repeated("--panel-listen"))
+    );
+}
+
+#[test]
+fn a_panel_the_owner_will_not_accept_is_dropped_rather_than_driven() {
+    let mut peers = Peers::new(descriptor(2, 4));
+    let mut link = PanelLink::new(config());
+    let mut host = Host::new(CHANNELS);
+    host.refuse_connect = true;
+    link.start(0x5EED, 0).unwrap();
+
+    let mut closed = None;
+    for now_ms in 1..8 {
+        if let PanelStep::Closed(closure) = peers.pump(&mut link, &mut host, now_ms) {
+            closed = Some(closure);
+            break;
+        }
+    }
+
+    assert_eq!(
+        closed,
+        Some(PanelClosure::LinkLost),
+        "an owner that will not take the bindings ends the connection"
+    );
+    assert!(!link.is_connected());
+    assert!(!host.panel_connected());
+
+    peers.panel.encoder_delta(0, 4, 20).unwrap();
+    let _ = peers.pump(&mut link, &mut host, 20);
+    assert!(
+        host.commands().is_empty(),
+        "a panel that was never accepted commands nothing"
     );
 }
