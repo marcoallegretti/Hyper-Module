@@ -32,6 +32,9 @@ const CHANNELS: usize = 3;
 /// so a silent panel is noticed after fifty reads and no test waits on a wall
 /// clock to get there.
 const CLOCK_STEP_MS: u64 = 10;
+/// The link's own heartbeat timeout, which bounds how long any socket-level
+/// wait may be before it starts making the link's decisions for it.
+const HEARTBEAT_TIMEOUT_MS: u32 = 500;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum SinkError {
@@ -382,7 +385,7 @@ fn watchdog(stop: &std::sync::Arc<AtomicBool>, after: std::time::Duration) -> Wa
 const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn config() -> LinkConfig {
-    LinkConfig::new(50, 500).unwrap()
+    LinkConfig::new(50, HEARTBEAT_TIMEOUT_MS).unwrap()
 }
 
 /// Runs the shipped `serve_panel` against a real panel until it returns.
@@ -596,10 +599,19 @@ fn preparing_an_accepted_stream_makes_it_wait_rather_than_spin() {
         Some(PANEL_READ_TIMEOUT),
         "a quiet panel must not stall the loop"
     );
-    assert_eq!(
-        accepted.write_timeout().unwrap(),
-        Some(hyper_runtime_host::PANEL_WRITE_TIMEOUT),
-        "a panel that stops reading must not stall it either"
+    let write_timeout = accepted
+        .write_timeout()
+        .unwrap()
+        .expect("a panel that stops reading must not stall the loop either");
+    // Compared against the link's own budget rather than against the constant
+    // the code just read, which would compare a value with itself.
+    assert!(
+        write_timeout > PANEL_READ_TIMEOUT,
+        "a write that is merely slow must not be mistaken for a panel that has gone: {write_timeout:?}"
+    );
+    assert!(
+        write_timeout <= std::time::Duration::from_millis(HEARTBEAT_TIMEOUT_MS.into()),
+        "whether a panel has gone is the link's call, not the socket's: {write_timeout:?}"
     );
 
     let mut buffer = [0_u8; 16];
