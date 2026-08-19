@@ -44,6 +44,10 @@ struct Sink {
     commands: Vec<RuntimeControlCommand>,
     invalid_target: Option<RuntimeControlTarget>,
     reject_release: bool,
+    /// Refuses this many releases and then accepts, so a retry that would have
+    /// succeeded is distinguishable from one that never happens.
+    refuse_releases_first: usize,
+    reject_gain: bool,
 }
 
 impl RuntimeControlSink for Sink {
@@ -85,12 +89,18 @@ impl RuntimeControlSink for Sink {
     }
 
     fn try_send(&mut self, command: RuntimeControlCommand) -> Result<(), Self::Error> {
-        if self.reject_release
-            && matches!(
-                command,
-                RuntimeControlCommand::ChannelMute { muted: false, .. }
-            )
-        {
+        let is_release = matches!(
+            command,
+            RuntimeControlCommand::ChannelMute { muted: false, .. }
+        );
+        if is_release && self.refuse_releases_first > 0 {
+            self.refuse_releases_first -= 1;
+            return Err(SinkError::Rejected);
+        }
+        if self.reject_gain && matches!(command, RuntimeControlCommand::ChannelGain { .. }) {
+            return Err(SinkError::Rejected);
+        }
+        if self.reject_release && is_release {
             return Err(SinkError::Rejected);
         }
         self.commands.push(command);
@@ -1215,4 +1225,71 @@ fn a_write_failure_still_reports_the_control_it_could_not_release() {
             .any(|notice| matches!(notice, PanelNotice::ReleaseFailed { .. })),
         "a control left held must survive the error path: {notices:?}"
     );
+}
+
+#[test]
+fn a_release_that_succeeds_on_a_later_attempt_is_not_reported_as_stranded() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    host.momentary_layout = true;
+    // Refused twice, accepted on the third attempt — within the retry budget.
+    host.runtime.sink_mut().refuse_releases_first = 2;
+
+    let (outcome, notices) = serve(
+        &mut host,
+        vec![(6, PanelAction::Press(0)), (10, PanelAction::ClosePeer)],
+        &stop,
+    );
+
+    assert_eq!(outcome.unwrap(), PanelClosure::PeerClosed);
+    assert!(
+        !notices
+            .iter()
+            .any(|notice| matches!(notice, PanelNotice::ReleaseFailed { .. })),
+        "a release the sink eventually took is not a control left held: {notices:?}"
+    );
+    assert_eq!(
+        host.commands(),
+        [
+            RuntimeControlCommand::ChannelMute {
+                channel_index: 0,
+                muted: true,
+            },
+            RuntimeControlCommand::ChannelMute {
+                channel_index: 0,
+                muted: false,
+            },
+        ],
+        "the retry is what got the control released"
+    );
+}
+
+#[test]
+fn a_command_the_owner_rejects_is_reported_rather_than_swallowed() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    host.runtime.sink_mut().reject_gain = true;
+
+    let (_, notices) = serve(
+        &mut host,
+        vec![
+            (
+                6,
+                PanelAction::Turn {
+                    control_id: 1,
+                    delta: 4,
+                },
+            ),
+            (10, PanelAction::ClosePeer),
+        ],
+        &stop,
+    );
+
+    assert!(
+        notices
+            .iter()
+            .any(|notice| matches!(notice, PanelNotice::Rejected { .. })),
+        "a refused command reaches the operator instead of vanishing: {notices:?}"
+    );
+    assert!(host.commands().is_empty());
 }
