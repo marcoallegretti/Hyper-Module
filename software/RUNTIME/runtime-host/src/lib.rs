@@ -47,11 +47,16 @@ const RELEASE_ATTEMPTS: usize = 3;
 /// and the stop flag have a turn.
 pub const PANEL_READ_TIMEOUT: Duration = Duration::from_millis(20);
 
-/// How long the accept loop waits between polls when no panel is connected.
 /// How long a serving loop waits on a panel that has stopped reading before it
 /// gives up on the write and lets the stop flag have a turn.
-pub const PANEL_WRITE_TIMEOUT: Duration = Duration::from_millis(200);
+///
+/// Deliberately longer than [`PANEL_READ_TIMEOUT`] and no longer than the link's
+/// own heartbeat timeout: a write that is merely slow must not be mistaken for a
+/// panel that has gone, and a panel that has gone is the link's call, not the
+/// socket's.
+pub const PANEL_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How long the accept loop waits between polls when no panel is connected.
 pub const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// What the runtime was asked to host.
@@ -330,8 +335,8 @@ impl PanelLink {
             match event {
                 PanelEvent::Connected(descriptor) => {
                     let bindings = default_layout(descriptor, host.mixer_channel_count());
+                    // Nothing is bound yet, so there is nothing to release.
                     let Ok(connection) = host.connect_panel(descriptor, &bindings) else {
-                        self.release(host);
                         return PanelStep::Closed(PanelClosure::LinkLost);
                     };
                     if !connection.is_fully_installed() {
@@ -411,21 +416,31 @@ impl PanelLink {
 /// Notices come back on **both** paths. An error is exactly when the operator
 /// most needs to know a control was left held, so the notices are returned
 /// beside the result rather than inside it.
-pub fn serve_panel<S, H, C>(
+pub fn serve_panel<S, H, C, I>(
     stream: &mut S,
     host: &mut H,
     config: LinkConfig,
     session_id: u64,
     stop: &AtomicBool,
     mut clock: C,
+    mut while_idle: I,
 ) -> (io::Result<PanelClosure>, Vec<PanelNotice>)
 where
     S: Read + Write,
     H: PanelHost,
     C: FnMut() -> u64,
+    I: FnMut(),
 {
     let mut link = PanelLink::new(config);
-    let outcome = drive_panel(&mut link, stream, host, session_id, stop, &mut clock);
+    let outcome = drive_panel(
+        &mut link,
+        stream,
+        host,
+        session_id,
+        stop,
+        &mut clock,
+        &mut while_idle,
+    );
     link.release(host);
     let notices = link.take_notices();
     (outcome, notices)
@@ -433,18 +448,20 @@ where
 
 /// The loop itself, which never tears down — [`serve_panel`] does that once for
 /// every way out of here.
-fn drive_panel<S, H, C>(
+fn drive_panel<S, H, C, I>(
     link: &mut PanelLink,
     stream: &mut S,
     host: &mut H,
     session_id: u64,
     stop: &AtomicBool,
     clock: &mut C,
+    while_idle: &mut I,
 ) -> io::Result<PanelClosure>
 where
     S: Read + Write,
     H: PanelHost,
     C: FnMut() -> u64,
+    I: FnMut(),
 {
     if link.start(session_id, clock()).is_err() {
         return Ok(PanelClosure::LinkLost);
@@ -465,7 +482,12 @@ where
             // quiet read reports is platform-dependent: a socket with
             // `SO_RCVTIMEO` set reports `TimedOut`, a non-blocking one reports
             // `WouldBlock`. Both mean the same thing here.
-            Err(error) if is_quiet(error.kind()) => 0,
+            // A quiet moment is the only safe place to do anything other than
+            // serve this panel, so it is where a second one gets turned away.
+            Err(error) if is_quiet(error.kind()) => {
+                while_idle();
+                0
+            }
             Err(error) => return Err(error),
         };
         if let PanelStep::Closed(closure) = link.step(&buffer[..read], clock(), host) {
@@ -527,10 +549,15 @@ impl Error for ServeError {}
 /// accepting: a control surface is an accessory, and losing one must not stop
 /// the project the runtime is hosting.
 ///
-/// The backlog is drained immediately after a panel is accepted, so anything
-/// queued behind it is turned away rather than promoted stale later. Draining
-/// then rather than after the session means a panel that resets and reconnects
-/// during the next idle period is served normally.
+/// The backlog is drained immediately after a panel is accepted **and** on every
+/// quiet moment of the session that follows, so a second panel is turned away
+/// promptly rather than left with an established connection and total silence —
+/// which a reconnect state machine cannot tell apart from a slow runtime.
+///
+/// A panel that resets and redials inside the link's timeout is refused too,
+/// because until that timeout expires the runtime genuinely still holds a
+/// panel. It can redial once the session ends; draining only after the session
+/// would instead leave every mid-session arrival queued for its whole duration.
 ///
 /// # Errors
 ///
@@ -565,7 +592,15 @@ where
         // same panel reconnecting after a reset.
         refuse_waiting_panels(listener);
         let (outcome, notices) = match prepare_panel_stream(&stream) {
-            Ok(()) => serve_panel(&mut stream, host, config, session_id, stop, &mut clock),
+            Ok(()) => serve_panel(
+                &mut stream,
+                host,
+                config,
+                session_id,
+                stop,
+                &mut clock,
+                || refuse_waiting_panels(listener),
+            ),
             Err(error) => (Err(error), Vec::new()),
         };
         served(&ServedPanel {

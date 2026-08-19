@@ -329,6 +329,48 @@ impl Write for PanelDriver<'_> {
     }
 }
 
+/// Raises `stop` after a deadline, so a loop that would otherwise wedge the
+/// whole suite fails with a test name and a line number instead of hanging.
+///
+/// Dropping it stops the watchdog, so a test that ends normally does not wait.
+struct Watchdog {
+    finished: std::sync::Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.finished.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn watchdog(stop: &std::sync::Arc<AtomicBool>, after: std::time::Duration) -> Watchdog {
+    let stop = std::sync::Arc::clone(stop);
+    let finished = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&finished);
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + after;
+        while !flag.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                stop.store(true, Ordering::Release);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+    Watchdog {
+        finished,
+        handle: Some(handle),
+    }
+}
+
+/// How long an accept-loop test may run before the watchdog ends it. Generous
+/// against the observed ~250 ms these tests need.
+const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
 fn config() -> LinkConfig {
     LinkConfig::new(50, 500).unwrap()
 }
@@ -352,9 +394,15 @@ fn serve_with(
     let mut driver = PanelDriver::new(descriptor(2, 4), Rc::clone(&now), stop, actions);
     driver.idle_kind = idle_kind;
     let clock = Rc::clone(&now);
-    serve_panel(&mut driver, host, config(), 0x5EED, stop, move || {
-        clock.get()
-    })
+    serve_panel(
+        &mut driver,
+        host,
+        config(),
+        0x5EED,
+        stop,
+        move || clock.get(),
+        || {},
+    )
 }
 
 #[test]
@@ -601,7 +649,8 @@ fn the_accept_loop_serves_one_panel_reports_it_and_then_turns_away_a_second() {
     drop(TcpStream::connect(address).unwrap());
     let mut second = TcpStream::connect(address).unwrap();
 
-    let stop = AtomicBool::new(false);
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let _watchdog = watchdog(&stop, TEST_DEADLINE);
     let mut host = Host::new(CHANNELS);
     let mut reported: Vec<(u64, String)> = Vec::new();
 
@@ -642,7 +691,8 @@ fn the_accept_loop_stops_serving_when_a_teardown_leaves_controls_held() {
     listener.set_nonblocking(true).unwrap();
     drop(TcpStream::connect(address).unwrap());
 
-    let stop = AtomicBool::new(false);
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let _watchdog = watchdog(&stop, TEST_DEADLINE);
     let mut host = Host::new(CHANNELS);
     host.controls_stuck = true;
     let mut reported = 0_usize;
@@ -903,7 +953,8 @@ fn each_accepted_panel_gets_its_own_session_identifier() {
     let address = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
 
-    let stop = AtomicBool::new(false);
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let _watchdog = watchdog(&stop, TEST_DEADLINE);
     let mut host = Host::new(CHANNELS);
     let mut sessions = Vec::new();
     let mut connected = 0_usize;
@@ -979,9 +1030,16 @@ fn the_accept_loop_really_serves_the_panel_it_accepted() {
         drop(stream);
     });
 
-    let stop = AtomicBool::new(false);
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let _watchdog = watchdog(&stop, TEST_DEADLINE);
     let mut host = Host::new(CHANNELS);
-    let mut reported = 0_usize;
+    // One binding the owner will not take, so the refusal has to reach the
+    // callback as well as being counted inside the link.
+    host.runtime.sink_mut().invalid_target = Some(RuntimeControlTarget::Channel {
+        channel_index: 2,
+        parameter: hyper_control_mappings::ChannelParameter::Mute,
+    });
+    let mut seen: Vec<(u64, bool, usize)> = Vec::new();
     serve_panels(
         &listener,
         &mut host,
@@ -991,14 +1049,30 @@ fn the_accept_loop_really_serves_the_panel_it_accepted() {
             static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             TICK.fetch_add(10, Ordering::Relaxed)
         },
-        |_| {
-            reported += 1;
+        |served| {
+            seen.push((
+                served.session_id,
+                served.outcome.is_ok(),
+                served.notices.len(),
+            ));
+            assert_eq!(
+                served.peer.ip(),
+                std::net::IpAddr::from([127, 0, 0, 1]),
+                "the reported peer is the panel that connected, not a placeholder"
+            );
             stop.store(true, Ordering::Release);
         },
     )
     .unwrap();
     panel.join().unwrap();
 
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, 1, "the first connection is session one");
+    assert!(
+        seen[0].2 >= 1,
+        "the refused binding reaches the operator through the callback: {seen:?}"
+    );
+    let reported = seen.len();
     assert_eq!(reported, 1);
     assert_eq!(
         host.commands(),
@@ -1026,7 +1100,8 @@ fn a_panel_that_dies_mid_connection_costs_one_panel_and_not_the_service() {
         drop(stream);
     });
 
-    let stop = AtomicBool::new(false);
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let _watchdog = watchdog(&stop, TEST_DEADLINE);
     let mut host = Host::new(CHANNELS);
     let mut reported: Vec<bool> = Vec::new();
     let mut second_offered = false;
@@ -1051,8 +1126,69 @@ fn a_panel_that_dies_mid_connection_costs_one_panel_and_not_the_service() {
     dying.join().unwrap();
 
     assert_eq!(
-        reported.len(),
-        2,
-        "a panel dying mid-connection must not stop the service: {reported:?}"
+        reported,
+        vec![true, true],
+        "a panel that dies mid-connection is reported as a failure, not as a clean close: {reported:?}"
     );
+}
+
+#[test]
+fn a_panel_arriving_during_a_session_is_turned_away_rather_than_left_silent() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let _watchdog = watchdog(&stop, TEST_DEADLINE);
+
+    // The first panel holds the session open until the late one has had its
+    // answer, so this tests the live case rather than the pre-queued one.
+    let held = std::sync::Arc::new(AtomicBool::new(false));
+    let holding = std::sync::Arc::clone(&held);
+    let first = std::thread::spawn(move || {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(PANEL_READ_TIMEOUT)).unwrap();
+        let mut sink = [0_u8; 512];
+        while !holding.load(Ordering::Acquire) {
+            let _ = stream.read(&mut sink);
+        }
+        drop(stream);
+    });
+
+    let late = std::thread::spawn(move || {
+        // Connect once the session is genuinely under way.
+        std::thread::sleep(hyper_runtime_host::ACCEPT_POLL_INTERVAL * 4);
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(PANEL_READ_TIMEOUT * 40))
+            .unwrap();
+        let mut buffer = [0_u8; 8];
+        let answer = stream.read(&mut buffer);
+        held.store(true, Ordering::Release);
+        matches!(answer, Ok(0))
+    });
+
+    let mut host = Host::new(CHANNELS);
+    let mut reported = 0_usize;
+    serve_panels(
+        &listener,
+        &mut host,
+        config(),
+        &stop,
+        || 0,
+        |_| {
+            reported += 1;
+            stop.store(true, Ordering::Release);
+        },
+    )
+    .unwrap();
+
+    let refused = late.join().unwrap();
+    first.join().unwrap();
+
+    assert!(
+        refused,
+        "a panel arriving mid-session must be told, not left holding an open connection in silence"
+    );
+    assert_eq!(reported, 1, "only the first panel was served");
 }

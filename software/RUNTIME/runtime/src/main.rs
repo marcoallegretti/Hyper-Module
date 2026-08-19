@@ -130,15 +130,26 @@ fn run() -> Result<(), String> {
     // Panel service ending is not the project ending. Whatever stops the
     // listener, the audio the runtime exists to host keeps running until the
     // operator asks it to stop.
-    if let Err(error) = serve_panels(
+    let service = serve_panels(
         &listener,
         &mut host,
         config,
         &stop,
         || millis_since(started),
         report,
-    ) {
+    );
+    // The port goes back whatever happened: nothing else will be accepted on it,
+    // and leaving it bound and unattended invites a panel to connect to silence.
+    drop(listener);
+
+    if let Err(error) = service {
         eprintln!("hyper-runtime: panel service ended: {error}");
+        for failure in host.disconnect_panel() {
+            eprintln!(
+                "hyper-runtime: {:?} could not be released and stays held",
+                failure.control()
+            );
+        }
         eprintln!("hyper-runtime: the project stays hosted; send quit to stop it");
         while !stop.load(Ordering::Acquire) {
             std::thread::sleep(hyper_runtime_host::ACCEPT_POLL_INTERVAL);
