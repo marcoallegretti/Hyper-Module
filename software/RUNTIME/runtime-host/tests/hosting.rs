@@ -1192,3 +1192,27 @@ fn a_panel_arriving_during_a_session_is_turned_away_rather_than_left_silent() {
     );
     assert_eq!(reported, 1, "only the first panel was served");
 }
+
+#[test]
+fn a_write_failure_still_reports_the_control_it_could_not_release() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    host.momentary_layout = true;
+    host.runtime.sink_mut().reject_release = true;
+
+    // The error path is exactly when the operator most needs to know a control
+    // was left held, so it must carry notices too.
+    let (outcome, notices) = serve(
+        &mut host,
+        vec![(6, PanelAction::Press(0)), (9, PanelAction::FailWrites)],
+        &stop,
+    );
+
+    assert!(outcome.is_err(), "the write failure is reported");
+    assert!(
+        notices
+            .iter()
+            .any(|notice| matches!(notice, PanelNotice::ReleaseFailed { .. })),
+        "a control left held must survive the error path: {notices:?}"
+    );
+}
