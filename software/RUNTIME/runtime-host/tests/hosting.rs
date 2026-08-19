@@ -22,9 +22,9 @@ use hyper_mapping_compiler::CompiledControlMappingTable;
 use hyper_panel_protocol::{FirmwareVersion, LinkConfig, Message, PanelDescriptor};
 use hyper_panel_simulator::{PanelSimulator, PanelSimulatorConfig};
 use hyper_runtime_host::{
-    ACCEPT_POLL_INTERVAL, ArgumentError, DEFAULT_GAIN_STEP_MILLIONTHS, PANEL_READ_TIMEOUT,
-    PanelClosure, PanelHost, PanelLink, PanelNotice, RuntimeArguments, default_layout,
-    prepare_panel_stream, refuse_waiting_panels, serve_panel, serve_panels,
+    ArgumentError, DEFAULT_GAIN_STEP_MILLIONTHS, PANEL_READ_TIMEOUT, PanelClosure, PanelHost,
+    PanelLink, PanelNotice, RuntimeArguments, ServeError, default_layout, prepare_panel_stream,
+    refuse_waiting_panels, serve_panel, serve_panels,
 };
 
 const CHANNELS: usize = 3;
@@ -113,6 +113,10 @@ struct Host {
     /// default layout deliberately is not: a momentary button is the only way a
     /// panel ever holds a control.
     momentary_layout: bool,
+    /// Models a teardown that could not release everything — the state
+    /// `ServeError::ControlsStillHeld` exists for.
+    controls_stuck: bool,
+    disconnects: usize,
 }
 
 impl Host {
@@ -122,6 +126,8 @@ impl Host {
                 .expect("an empty table needs no capacity"),
             channels,
             momentary_layout: false,
+            controls_stuck: false,
+            disconnects: 0,
         }
     }
 
@@ -156,11 +162,12 @@ impl PanelHost for Host {
     }
 
     fn disconnect_panel(&mut self) -> Vec<PanelReleaseFailure<Self::Error>> {
+        self.disconnects += 1;
         self.runtime.disconnect_panel()
     }
 
     fn panel_connected(&self) -> bool {
-        self.runtime.panel_connected()
+        self.controls_stuck || self.runtime.panel_connected()
     }
 
     fn dispatch_panel(
@@ -212,6 +219,11 @@ enum PanelAction {
 /// A real socket with a real panel simulator on the far end, presented to
 /// `serve_panel` as an ordinary stream.
 struct PanelDriver<'stop> {
+    /// Which kind a quiet read reports. A prepared socket reports `TimedOut`;
+    /// a non-blocking one reports `WouldBlock`. Production sees the former on
+    /// this platform, so it is the default here — the previous harness reported
+    /// only `WouldBlock`, which left the shipped branch untested.
+    idle_kind: ErrorKind,
     runtime_side: TcpStream,
     panel_side: Option<TcpStream>,
     panel: PanelSimulator,
@@ -232,6 +244,7 @@ impl<'stop> PanelDriver<'stop> {
     ) -> Self {
         let (runtime_side, panel_side) = loopback();
         Self {
+            idle_kind: ErrorKind::TimedOut,
             runtime_side,
             panel_side: Some(panel_side),
             panel: PanelSimulator::new(PanelSimulatorConfig {
@@ -297,9 +310,7 @@ impl Read for PanelDriver<'_> {
         }
         match self.runtime_side.read(buffer) {
             Ok(read) => Ok(read),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                Err(ErrorKind::WouldBlock.into())
-            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Err(self.idle_kind.into()),
             Err(error) => Err(error),
         }
     }
@@ -327,9 +338,19 @@ fn serve(
     host: &mut Host,
     actions: Vec<(usize, PanelAction)>,
     stop: &AtomicBool,
-) -> std::io::Result<(PanelClosure, Vec<PanelNotice>)> {
+) -> (std::io::Result<PanelClosure>, Vec<PanelNotice>) {
+    serve_with(host, actions, stop, ErrorKind::TimedOut)
+}
+
+fn serve_with(
+    host: &mut Host,
+    actions: Vec<(usize, PanelAction)>,
+    stop: &AtomicBool,
+    idle_kind: ErrorKind,
+) -> (std::io::Result<PanelClosure>, Vec<PanelNotice>) {
     let now = Rc::new(Cell::new(0_u64));
     let mut driver = PanelDriver::new(descriptor(2, 4), Rc::clone(&now), stop, actions);
+    driver.idle_kind = idle_kind;
     let clock = Rc::clone(&now);
     serve_panel(&mut driver, host, config(), 0x5EED, stop, move || {
         clock.get()
@@ -340,7 +361,7 @@ fn serve(
 fn the_shipped_loop_carries_a_panel_turn_to_a_mixer_command() {
     let stop = AtomicBool::new(false);
     let mut host = Host::new(CHANNELS);
-    let (closure, notices) = serve(
+    let (outcome, notices) = serve(
         &mut host,
         vec![
             (
@@ -353,10 +374,9 @@ fn the_shipped_loop_carries_a_panel_turn_to_a_mixer_command() {
             (10, PanelAction::ClosePeer),
         ],
         &stop,
-    )
-    .unwrap();
+    );
 
-    assert_eq!(closure, PanelClosure::PeerClosed);
+    assert_eq!(outcome.unwrap(), PanelClosure::PeerClosed);
     assert_eq!(notices, Vec::new());
     assert_eq!(
         host.commands(),
@@ -373,8 +393,8 @@ fn the_shipped_loop_carries_a_panel_turn_to_a_mixer_command() {
 fn a_failed_write_tears_the_panel_down_instead_of_leaking_it() {
     let stop = AtomicBool::new(false);
     let mut host = Host::new(CHANNELS);
-    let error = serve(&mut host, vec![(4, PanelAction::FailWrites)], &stop)
-        .expect_err("a stream that will not take bytes is an error");
+    let (outcome, _) = serve(&mut host, vec![(4, PanelAction::FailWrites)], &stop);
+    let error = outcome.expect_err("a stream that will not take bytes is an error");
 
     assert_eq!(error.kind(), ErrorKind::Other);
     assert!(
@@ -387,7 +407,8 @@ fn a_failed_write_tears_the_panel_down_instead_of_leaking_it() {
 fn a_panel_that_stops_answering_is_reported_as_a_lost_link() {
     let stop = AtomicBool::new(false);
     let mut host = Host::new(CHANNELS);
-    let (closure, _) = serve(&mut host, vec![(5, PanelAction::GoSilent)], &stop).unwrap();
+    let (outcome, _) = serve(&mut host, vec![(5, PanelAction::GoSilent)], &stop);
+    let closure = outcome.unwrap();
 
     assert_eq!(closure, PanelClosure::LinkLost);
     assert!(!host.panel_connected());
@@ -397,7 +418,8 @@ fn a_panel_that_stops_answering_is_reported_as_a_lost_link() {
 fn the_stop_flag_ends_a_connection_that_is_still_live() {
     let stop = AtomicBool::new(false);
     let mut host = Host::new(CHANNELS);
-    let (closure, _) = serve(&mut host, vec![(6, PanelAction::RequestStop)], &stop).unwrap();
+    let (outcome, _) = serve(&mut host, vec![(6, PanelAction::RequestStop)], &stop);
+    let closure = outcome.unwrap();
 
     assert_eq!(
         closure,
@@ -415,12 +437,12 @@ fn a_release_the_sink_keeps_refusing_is_bounded_and_reported() {
     host.runtime.sink_mut().reject_release = true;
 
     let started = Instant::now();
-    let (closure, notices) = serve(
+    let (outcome, notices) = serve(
         &mut host,
         vec![(6, PanelAction::Press(0)), (10, PanelAction::ClosePeer)],
         &stop,
-    )
-    .unwrap();
+    );
+    let closure = outcome.unwrap();
 
     assert_eq!(closure, PanelClosure::PeerClosed);
     assert!(
@@ -449,12 +471,12 @@ fn a_configured_momentary_control_is_released_when_the_link_drops_mid_press() {
     let mut host = Host::new(CHANNELS);
     host.momentary_layout = true;
 
-    let (closure, notices) = serve(
+    let (outcome, notices) = serve(
         &mut host,
         vec![(6, PanelAction::Press(0)), (10, PanelAction::GoSilent)],
         &stop,
-    )
-    .unwrap();
+    );
+    let closure = outcome.unwrap();
 
     assert_eq!(closure, PanelClosure::LinkLost);
     assert!(notices.is_empty(), "nothing to report: {notices:?}");
@@ -484,7 +506,7 @@ fn a_binding_the_owner_refuses_is_reported_rather_than_dropped() {
         parameter: hyper_control_mappings::ChannelParameter::Gain,
     });
 
-    let (_, notices) = serve(&mut host, vec![(8, PanelAction::ClosePeer)], &stop).unwrap();
+    let (_, notices) = serve(&mut host, vec![(8, PanelAction::ClosePeer)], &stop);
 
     assert!(
         notices
@@ -559,20 +581,145 @@ fn a_second_panel_is_turned_away_while_one_is_being_served() {
 }
 
 #[test]
-fn the_accept_loop_returns_when_asked_to_stop_before_a_panel_arrives() {
+fn the_accept_loop_serves_one_panel_reports_it_and_then_turns_away_a_second() {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    let address = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
-    let stop = AtomicBool::new(true);
+    // The first panel is gone before it is served, which is the cheapest way to
+    // reach the end of one connection without a second thread.
+    drop(TcpStream::connect(address).unwrap());
+    let mut second = TcpStream::connect(address).unwrap();
+
+    let stop = AtomicBool::new(false);
     let mut host = Host::new(CHANNELS);
-    let mut served = 0_usize;
+    let mut reported: Vec<(u64, String)> = Vec::new();
 
-    let started = Instant::now();
-    serve_panels(&listener, &mut host, config(), &stop, || 0, |_| served += 1).unwrap();
+    serve_panels(
+        &listener,
+        &mut host,
+        config(),
+        &stop,
+        || 0,
+        |served| {
+            reported.push((served.session_id, format!("{:?}", served.outcome)));
+            stop.store(true, Ordering::Release);
+        },
+    )
+    .unwrap();
 
-    assert_eq!(served, 0);
+    assert_eq!(
+        reported.len(),
+        1,
+        "the loop accepted, prepared, served, and reported one panel: {reported:?}"
+    );
+    assert_eq!(reported[0].0, 1, "the first connection is session one");
+
+    second
+        .set_read_timeout(Some(PANEL_READ_TIMEOUT * 20))
+        .unwrap();
+    let mut buffer = [0_u8; 8];
     assert!(
-        started.elapsed() < ACCEPT_POLL_INTERVAL * 10,
-        "a stopped host does not linger in the accept loop"
+        matches!(second.read(&mut buffer), Ok(0)),
+        "the panel that waited while another was served is turned away"
+    );
+}
+
+#[test]
+fn the_accept_loop_stops_serving_when_a_teardown_leaves_controls_held() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    drop(TcpStream::connect(address).unwrap());
+
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    host.controls_stuck = true;
+    let mut reported = 0_usize;
+
+    let error = serve_panels(
+        &listener,
+        &mut host,
+        config(),
+        &stop,
+        || 0,
+        |_| reported += 1,
+    )
+    .expect_err("an owner still holding controls cannot take another panel");
+
+    assert!(matches!(error, ServeError::ControlsStillHeld));
+    assert_eq!(reported, 1, "the panel that ended is still reported first");
+    assert!(
+        error.to_string().contains("controls held"),
+        "the operator is told why: {error}"
+    );
+}
+
+#[test]
+fn a_listener_failure_is_the_only_stream_problem_that_ends_the_service() {
+    assert!(
+        ServeError::Listener(std::io::Error::other("bind lost"))
+            .to_string()
+            .contains("bind lost"),
+        "a listener failure names its cause"
+    );
+}
+
+#[test]
+fn a_quiet_read_is_recognised_whichever_kind_the_platform_reports() {
+    assert!(hyper_runtime_host::is_quiet(ErrorKind::TimedOut));
+    assert!(hyper_runtime_host::is_quiet(ErrorKind::WouldBlock));
+    assert!(!hyper_runtime_host::is_quiet(ErrorKind::ConnectionReset));
+    assert!(!hyper_runtime_host::is_quiet(ErrorKind::BrokenPipe));
+
+    // Both kinds must carry a live connection to the same place.
+    for kind in [ErrorKind::TimedOut, ErrorKind::WouldBlock] {
+        let stop = AtomicBool::new(false);
+        let mut host = Host::new(CHANNELS);
+        let (outcome, _) = serve_with(
+            &mut host,
+            vec![
+                (
+                    6,
+                    PanelAction::Turn {
+                        control_id: 0,
+                        delta: 1,
+                    },
+                ),
+                (10, PanelAction::ClosePeer),
+            ],
+            &stop,
+            kind,
+        );
+        assert_eq!(outcome.unwrap(), PanelClosure::PeerClosed, "kind {kind:?}");
+        assert_eq!(host.commands().len(), 1, "kind {kind:?}");
+    }
+}
+
+#[test]
+fn the_handshake_completes_before_any_scheduled_action_runs() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    // Nothing is scheduled before read 6; if the handshake needed more reads
+    // than that, every scheduled action in this suite would be testing nothing.
+    let (outcome, _) = serve(&mut host, vec![(2, PanelAction::ClosePeer)], &stop);
+
+    assert_eq!(outcome.unwrap(), PanelClosure::PeerClosed);
+    assert_eq!(
+        host.disconnects, 1,
+        "the panel was bound within two reads, so the scheduled-action indices are safe"
+    );
+}
+
+#[test]
+fn a_teardown_runs_once_however_many_times_it_is_asked() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    let (outcome, _) = serve(&mut host, vec![(5, PanelAction::GoSilent)], &stop);
+
+    assert_eq!(outcome.unwrap(), PanelClosure::LinkLost);
+    assert_eq!(
+        host.disconnects, 1,
+        "the fault closes the link and the outer teardown must not release again"
     );
 }
 

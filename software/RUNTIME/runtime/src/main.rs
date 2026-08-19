@@ -127,22 +127,39 @@ fn run() -> Result<(), String> {
     let config = LinkConfig::new(HEARTBEAT_INTERVAL_MS, HEARTBEAT_TIMEOUT_MS)
         .map_err(|error| format!("panel link configuration is invalid: {error:?}"))?;
     let started = Instant::now();
-    serve_panels(
+    // Panel service ending is not the project ending. Whatever stops the
+    // listener, the audio the runtime exists to host keeps running until the
+    // operator asks it to stop.
+    if let Err(error) = serve_panels(
         &listener,
         &mut host,
         config,
         &stop,
         || millis_since(started),
         report,
-    )
-    .map_err(|error| error.to_string())?;
+    ) {
+        eprintln!("hyper-runtime: panel service ended: {error}");
+        eprintln!("hyper-runtime: the project stays hosted; send quit to stop it");
+        while !stop.load(Ordering::Acquire) {
+            std::thread::sleep(hyper_runtime_host::ACCEPT_POLL_INTERVAL);
+        }
+    }
 
     println!("stopping");
     Ok(())
 }
 
 fn report(served: &ServedPanel) {
-    println!("panel {} ended: {:?}", served.peer, served.closure);
+    match &served.outcome {
+        Ok(closure) => println!(
+            "panel {} (#{}) ended: {closure:?}",
+            served.peer, served.session_id
+        ),
+        Err(error) => println!(
+            "panel {} (#{}) failed: {error}",
+            served.peer, served.session_id
+        ),
+    }
     for notice in &served.notices {
         println!("  {notice:?}");
     }

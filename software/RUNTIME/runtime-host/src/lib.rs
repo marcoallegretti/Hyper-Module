@@ -48,6 +48,10 @@ const RELEASE_ATTEMPTS: usize = 3;
 pub const PANEL_READ_TIMEOUT: Duration = Duration::from_millis(20);
 
 /// How long the accept loop waits between polls when no panel is connected.
+/// How long a serving loop waits on a panel that has stopped reading before it
+/// gives up on the write and lets the stop flag have a turn.
+pub const PANEL_WRITE_TIMEOUT: Duration = Duration::from_millis(200);
+
 pub const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// What the runtime was asked to host.
@@ -379,16 +383,19 @@ impl PanelLink {
     /// as fatal rather than as a panel it can replace.
     pub fn close<H: PanelHost>(&mut self, host: &mut H, closure: PanelClosure) -> PanelStep {
         if self.bound {
+            let mut outstanding = Vec::new();
             for _ in 0..RELEASE_ATTEMPTS {
-                let failures = host.disconnect_panel();
-                if failures.is_empty() {
+                outstanding = host.disconnect_panel();
+                if outstanding.is_empty() {
                     break;
                 }
-                for failure in &failures {
-                    self.notices.push(PanelNotice::ReleaseFailed {
-                        control: failure.control(),
-                    });
-                }
+            }
+            // Reported once, after the retries are spent: a release that
+            // succeeded on a later attempt is not a control left held.
+            for failure in &outstanding {
+                self.notices.push(PanelNotice::ReleaseFailed {
+                    control: failure.control(),
+                });
             }
             self.bound = false;
         }
@@ -399,13 +406,12 @@ impl PanelLink {
 /// Drives one panel connection over a stream until it closes.
 ///
 /// The link is torn down on **every** exit, including a failed write: the
-/// teardown happens once, at the end, rather than at each early return, so a
-/// later branch cannot forget it.
+/// teardown happens once, after the loop, rather than at each early return, so
+/// a later branch cannot forget it.
 ///
-/// # Errors
-///
-/// Returns the stream's own failure. A read that would block is not a failure;
-/// it is how link upkeep and the stop flag get a turn.
+/// Notices come back on **both** paths. An error is exactly when the operator
+/// most needs to know a control was left held, so the notices are returned
+/// beside the result rather than inside it.
 pub fn serve_panel<S, H, C>(
     stream: &mut S,
     host: &mut H,
@@ -413,7 +419,7 @@ pub fn serve_panel<S, H, C>(
     session_id: u64,
     stop: &AtomicBool,
     mut clock: C,
-) -> io::Result<(PanelClosure, Vec<PanelNotice>)>
+) -> (io::Result<PanelClosure>, Vec<PanelNotice>)
 where
     S: Read + Write,
     H: PanelHost,
@@ -421,13 +427,15 @@ where
 {
     let mut link = PanelLink::new(config);
     let outcome = drive_panel(&mut link, stream, host, session_id, stop, &mut clock);
-    let closure = match &outcome {
-        Ok(closure) => *closure,
-        Err(_) => PanelClosure::LinkLost,
-    };
-    link.close(host, closure);
+    link.close(
+        host,
+        match &outcome {
+            Ok(closure) => *closure,
+            Err(_) => PanelClosure::LinkLost,
+        },
+    );
     let notices = link.take_notices();
-    outcome.map(|closure| (closure, notices))
+    (outcome, notices)
 }
 
 /// The loop itself, which never tears down — [`serve_panel`] does that once for
@@ -460,14 +468,11 @@ where
         let read = match stream.read(&mut buffer) {
             Ok(0) => return Ok(PanelClosure::PeerClosed),
             Ok(read) => read,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                0
-            }
+            // A quiet panel is the common case, not a failure. Which kind a
+            // quiet read reports is platform-dependent: a socket with
+            // `SO_RCVTIMEO` set reports `TimedOut`, a non-blocking one reports
+            // `WouldBlock`. Both mean the same thing here.
+            Err(error) if is_quiet(error.kind()) => 0,
             Err(error) => return Err(error),
         };
         if let PanelStep::Closed(closure) = link.step(&buffer[..read], clock(), host) {
@@ -476,19 +481,32 @@ where
     }
 }
 
+/// Whether a read reporting this kind means "no bytes yet" rather than "this
+/// connection is broken".
+#[must_use]
+pub const fn is_quiet(kind: io::ErrorKind) -> bool {
+    matches!(kind, io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+}
+
 /// What one accepted panel connection produced.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct ServedPanel {
     pub peer: SocketAddr,
-    pub closure: PanelClosure,
+    /// Which connection this was, so a run of failures is distinguishable from
+    /// one failure reported repeatedly.
+    pub session_id: u64,
+    /// How the connection ended, or the stream failure that ended it. One bad
+    /// panel costs one panel: this is reported, and the runtime accepts the
+    /// next.
+    pub outcome: io::Result<PanelClosure>,
     pub notices: Vec<PanelNotice>,
 }
 
-/// Why the accept loop gave up.
+/// Why the accept loop stopped serving.
 #[derive(Debug)]
 pub enum ServeError {
-    /// The listener or a panel stream failed.
-    Io(io::Error),
+    /// The listener itself failed. Nothing further can be accepted.
+    Listener(io::Error),
     /// A teardown left controls held, so the owner cannot take another panel.
     /// Serving on would produce an endless run of immediately-refused panels.
     ControlsStillHeld,
@@ -497,7 +515,7 @@ pub enum ServeError {
 impl fmt::Display for ServeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(error) => write!(formatter, "panel link failed: {error}"),
+            Self::Listener(error) => write!(formatter, "the panel listener failed: {error}"),
             Self::ControlsStillHeld => formatter.write_str(
                 "a panel teardown left controls held, so no further panel can be served",
             ),
@@ -507,28 +525,24 @@ impl fmt::Display for ServeError {
 
 impl Error for ServeError {}
 
-impl From<io::Error> for ServeError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
 /// Accepts and serves panels, one at a time, until asked to stop.
 ///
 /// The listener must be non-blocking so the stop flag is observed while idle.
-/// Each accepted stream is put **back** into blocking mode before its read
-/// timeout is set: on Windows an accepted socket inherits the listener's
-/// non-blocking mode, which makes `SO_RCVTIMEO` inert and turns the serving
-/// loop into a spin.
 ///
-/// While one panel is being served, any further connection is accepted and
-/// dropped immediately, so a second panel is refused rather than left queued in
-/// the backlog to be promoted stale later.
+/// **One bad panel costs one panel.** A stream that fails to prepare or fails
+/// mid-connection is reported through `served` and the loop goes back to
+/// accepting: a control surface is an accessory, and losing one must not stop
+/// the project the runtime is hosting.
+///
+/// Between panels the backlog is drained, so a second panel that connected
+/// while one was being served is turned away rather than promoted stale. It is
+/// drained *after* a panel ends rather than during, so a panel that resets and
+/// reconnects is not destroyed by its own replacement being refused.
 ///
 /// # Errors
 ///
-/// Returns [`ServeError`] when the listener fails or a teardown leaves controls
-/// held.
+/// Returns [`ServeError`] only for what genuinely ends the service: the
+/// listener failing, or a teardown leaving controls held.
 pub fn serve_panels<H, C, R>(
     listener: &TcpListener,
     host: &mut H,
@@ -550,29 +564,23 @@ where
                 std::thread::sleep(ACCEPT_POLL_INTERVAL);
                 continue;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(ServeError::Listener(error)),
         };
-        prepare_panel_stream(&stream)?;
-        let (closure, notices) = serve_panel(
-            &mut RefusingStream {
-                stream: &mut stream,
-                listener,
-            },
-            host,
-            config,
-            session_id,
-            stop,
-            &mut clock,
-        )?;
-        session_id = session_id.wrapping_add(1);
+        let (outcome, notices) = match prepare_panel_stream(&stream) {
+            Ok(()) => serve_panel(&mut stream, host, config, session_id, stop, &mut clock),
+            Err(error) => (Err(error), Vec::new()),
+        };
         served(&ServedPanel {
             peer,
-            closure,
+            session_id,
+            outcome,
             notices,
         });
+        session_id = session_id.wrapping_add(1);
         if host.panel_connected() {
             return Err(ServeError::ControlsStillHeld);
         }
+        refuse_waiting_panels(listener);
     }
     Ok(())
 }
@@ -584,44 +592,33 @@ where
 /// mode, which makes `SO_RCVTIMEO` inert and turns every read into an immediate
 /// `WouldBlock` — a spin for the whole life of the connection.
 ///
+/// The write timeout matters for the same reason the read one does: without it
+/// a panel that stops reading blocks the serving loop indefinitely, and the
+/// stop flag is checked between reads.
+///
 /// # Errors
 ///
 /// Returns the socket's own refusal to change mode.
 pub fn prepare_panel_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(PANEL_READ_TIMEOUT))
+    stream.set_read_timeout(Some(PANEL_READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(PANEL_WRITE_TIMEOUT))
 }
 
-/// Accepts and immediately drops anything else waiting on the listener.
+/// Accepts and immediately drops anything waiting on the listener.
 ///
 /// One panel at a time: a second one is turned away where it can see that it
 /// was, rather than left in the backlog to be promoted stale once the first
-/// disconnects. The listener must be non-blocking.
+/// disconnects.
+///
+/// # Panics
+///
+/// Does not panic, but **will not return** if given a blocking listener — it
+/// accepts until the queue is empty, and a blocking `accept` waits instead of
+/// reporting an empty queue. [`serve_panels`] only calls it on the non-blocking
+/// listener it requires.
 pub fn refuse_waiting_panels(listener: &TcpListener) {
     while let Ok((extra, _)) = listener.accept() {
         drop(extra);
-    }
-}
-
-/// A panel stream that turns away any other panel each time it is read.
-struct RefusingStream<'stream, 'listener> {
-    stream: &'stream mut TcpStream,
-    listener: &'listener TcpListener,
-}
-
-impl Read for RefusingStream<'_, '_> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        refuse_waiting_panels(self.listener);
-        self.stream.read(buffer)
-    }
-}
-
-impl Write for RefusingStream<'_, '_> {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.stream.write(buffer)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
     }
 }
