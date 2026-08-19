@@ -189,6 +189,10 @@ impl PanelHost for Host {
     ) -> Result<PanelDispatchOutcome, PanelDispatchError<Self::Error>> {
         self.runtime.dispatch_panel(message)
     }
+
+    fn panel_display(&mut self, out: &mut Vec<hyper_control_runtime::PanelDisplay>) {
+        self.runtime.panel_display(out);
+    }
 }
 
 fn descriptor(encoders: u8, buttons: u8) -> PanelDescriptor {
@@ -1304,4 +1308,178 @@ fn a_command_the_owner_rejects_is_reported_rather_than_swallowed() {
         "a refused command reaches the operator instead of vanishing: {notices:?}"
     );
     assert!(host.commands().is_empty());
+}
+
+/// A panel with rings and LEDs, which the default fixture deliberately lacks.
+fn display_descriptor(encoders: u8, buttons: u8) -> PanelDescriptor {
+    PanelDescriptor {
+        firmware: FirmwareVersion {
+            major: 1,
+            minor: 0,
+            patch: 0,
+            build: 7,
+        },
+        boot_id: 0x00AB_CDEF,
+        encoders,
+        buttons,
+        leds: 2,
+        rings: 2,
+        ring_segments: 16,
+    }
+}
+
+fn serve_display(
+    host: &mut Host,
+    actions: Vec<(usize, PanelAction)>,
+    stop: &AtomicBool,
+) -> (std::io::Result<PanelClosure>, PanelSimulatorSnapshot) {
+    let now = Rc::new(Cell::new(0_u64));
+    let mut driver = PanelDriver::new(display_descriptor(2, 4), Rc::clone(&now), stop, actions);
+    let clock = Rc::clone(&now);
+    let (outcome, _) = serve_panel(
+        &mut driver,
+        host,
+        config(),
+        0x5EED,
+        stop,
+        move || clock.get(),
+        || {},
+    );
+    let snapshot = PanelSimulatorSnapshot {
+        rings: (0..2)
+            .map(|index| {
+                driver
+                    .panel
+                    .output_state()
+                    .ring(index)
+                    .map(|ring| ring.value)
+            })
+            .collect(),
+        leds: (0..2)
+            .map(|index| {
+                driver
+                    .panel
+                    .output_state()
+                    .led(index)
+                    .map(|led| led.enabled)
+            })
+            .collect(),
+    };
+    (outcome, snapshot)
+}
+
+struct PanelSimulatorSnapshot {
+    rings: Vec<Option<u16>>,
+    leds: Vec<Option<bool>>,
+}
+
+#[test]
+fn a_bound_channel_gain_reaches_the_matching_ring_on_a_real_panel() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+
+    let (outcome, panel) = serve_display(
+        &mut host,
+        vec![
+            (
+                6,
+                PanelAction::Turn {
+                    control_id: 1,
+                    delta: 20,
+                },
+            ),
+            (30, PanelAction::ClosePeer),
+        ],
+        &stop,
+    );
+
+    assert_eq!(outcome.unwrap(), PanelClosure::PeerClosed);
+    // Unity is 1_000_000 in a 0..=2_000_000 domain, so the ring sits at half
+    // scale before the turn and above it after twenty detents.
+    let half = u16::MAX / 2;
+    let shown = panel.rings[1].expect("the second encoder drives the second ring");
+    assert!(
+        shown > half,
+        "the ring followed the gain the encoder moved: {shown} should exceed {half}"
+    );
+    assert_eq!(
+        panel.rings[0],
+        Some(half),
+        "an untouched channel still shows its own position"
+    );
+}
+
+#[test]
+fn a_bound_mute_reaches_the_matching_led_on_a_real_panel() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+
+    let (_, panel) = serve_display(
+        &mut host,
+        vec![(6, PanelAction::Press(1)), (30, PanelAction::ClosePeer)],
+        &stop,
+    );
+
+    assert_eq!(
+        panel.leds[1],
+        Some(true),
+        "the second button drives the second light"
+    );
+    assert_eq!(
+        panel.leds[0],
+        Some(false),
+        "an untouched channel is shown unmuted rather than left dark by accident"
+    );
+}
+
+#[test]
+fn a_display_that_has_not_changed_sends_nothing_more() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    let now = Rc::new(Cell::new(0_u64));
+    let mut driver = PanelDriver::new(display_descriptor(2, 4), Rc::clone(&now), &stop, Vec::new());
+    let clock = Rc::clone(&now);
+    let mut link = PanelLink::new(config());
+    link.start(0x5EED, 0).unwrap();
+    // Reach a connected link by driving the handshake through the same loop
+    // the production code uses, then stop it.
+    stop.store(true, Ordering::Release);
+    let _ = serve_panel(
+        &mut driver,
+        &mut host,
+        config(),
+        0x5EED,
+        &stop,
+        move || clock.get(),
+        || {},
+    );
+    drop(link);
+
+    // A fresh link, connected, then refreshed twice with nothing moving.
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    let now = Rc::new(Cell::new(0_u64));
+    let mut driver = PanelDriver::new(display_descriptor(2, 4), Rc::clone(&now), &stop, Vec::new());
+    let clock = Rc::clone(&now);
+    let mut link = PanelLink::new(config());
+    link.start(0x5EED, 0).unwrap();
+    let mut buffer = [0_u8; 1024];
+    for _ in 0..6 {
+        let outbound = link.take_transmit();
+        if !outbound.is_empty() {
+            driver.write_all(&outbound).unwrap();
+        }
+        let read = driver.read(&mut buffer).unwrap_or_default();
+        link.step(&buffer[..read], clock.get(), &mut host);
+    }
+    assert!(link.holds_bindings(), "the handshake completed");
+
+    let first = link.refresh_display(&mut host, clock.get());
+    let second = link.refresh_display(&mut host, clock.get());
+
+    assert!(first > 0, "the first refresh has everything to say");
+    assert_eq!(
+        second, 0,
+        "nothing moved, so the second refresh says nothing at all"
+    );
 }

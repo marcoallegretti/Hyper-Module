@@ -242,6 +242,17 @@ pub enum PanelDispatchOutcome {
     },
 }
 
+/// One thing a panel can show about a target it is bound to.
+///
+/// A ring value is normalised over the whole `u16` range: the panel reports its
+/// own `ring_segments` at handshake precisely because resolution is its
+/// business, so the runtime sends a position rather than a segment count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PanelDisplay {
+    Ring { index: u8, value: u16 },
+    Led { index: u8, enabled: bool },
+}
+
 #[derive(Clone, Copy, Debug)]
 struct InstalledBinding {
     binding: PanelBinding,
@@ -485,6 +496,56 @@ impl<S: RuntimeControlSink> ControlRuntime<S> {
     /// audio thread has been sent, and reading late is reading less stale. A
     /// shadow an existing binding already owns is left alone; one created here
     /// is marked so the matching disconnect removes exactly what it added.
+    /// Collects what the connected panel should be showing.
+    ///
+    /// Reads the shadows rather than the sink: the sink's snapshot lags what
+    /// the audio thread has been sent, and a display built from it would show
+    /// the previous position of the very control the operator is turning.
+    ///
+    /// Unknown state is read from the sink first. That is the one moment the
+    /// sink is the right source: nothing has been sent yet, so there is no
+    /// pending command for it to lag behind — and without it a freshly
+    /// connected panel would stay dark until the operator touched something,
+    /// which is the opposite of what a display is for.
+    pub fn panel_display(&mut self, out: &mut Vec<PanelDisplay>) {
+        out.clear();
+        if self.panel.is_none() {
+            return;
+        }
+        self.refresh_missing_state();
+        let Some(panel) = self.panel.as_ref() else {
+            return;
+        };
+        for installed in &panel.bindings {
+            match installed.binding {
+                PanelBinding::Encoder { index, target, .. } => {
+                    if let Some(value) = self
+                        .value_shadows
+                        .iter()
+                        .find(|shadow| shadow.target == target)
+                        .and_then(|shadow| shadow.value)
+                    {
+                        out.push(PanelDisplay::Ring {
+                            index,
+                            value: self.sink.value_domain(target).normalize(value),
+                        });
+                    }
+                }
+                PanelBinding::Button { index, target, .. } => {
+                    if let Some(enabled) = self
+                        .boolean_shadows
+                        .iter()
+                        .find(|shadow| shadow.target == target)
+                        .and_then(|shadow| shadow.value)
+                    {
+                        out.push(PanelDisplay::Led { index, enabled });
+                    }
+                }
+                PanelBinding::ActionButton { .. } => {}
+            }
+        }
+    }
+
     fn seed_shadow(&mut self, binding: PanelBinding) -> Result<(), ()> {
         match binding {
             PanelBinding::Encoder { target, .. } => {

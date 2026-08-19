@@ -1706,6 +1706,11 @@ impl DesktopPlaybackSession {
         self.controls.runtime_mut().disconnect_panel()
     }
 
+    /// Collects what the connected panel should be showing.
+    pub fn panel_display(&mut self, out: &mut Vec<hyper_control_runtime::PanelDisplay>) {
+        self.controls.runtime_mut().panel_display(out);
+    }
+
     #[must_use]
     pub fn has_panel(&self) -> bool {
         self.controls.runtime().panel_connected()

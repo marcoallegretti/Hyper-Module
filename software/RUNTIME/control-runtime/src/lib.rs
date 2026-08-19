@@ -15,7 +15,7 @@ mod panel;
 pub use panel::{
     PanelActionTarget, PanelBinding, PanelBindingRefusal, PanelBindingRefusalReason,
     PanelButtonBehavior, PanelConnectError, PanelConnection, PanelControl, PanelDispatchError,
-    PanelDispatchOutcome, PanelReleaseFailure, UnboundReason,
+    PanelDispatchOutcome, PanelDisplay, PanelReleaseFailure, UnboundReason,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,6 +166,15 @@ impl ValueDomain {
     #[must_use]
     pub const fn maximum(self) -> i32 {
         self.maximum
+    }
+
+    /// Maps one accepted position onto the whole `u16` range, for a display
+    /// whose resolution is its own business.
+    #[must_use]
+    pub fn normalize(self, value: i32) -> u16 {
+        let span = i64::from(self.maximum) - i64::from(self.minimum);
+        let offset = i64::from(value.clamp(self.minimum, self.maximum)) - i64::from(self.minimum);
+        u16::try_from(offset * i64::from(u16::MAX) / span).unwrap_or(u16::MAX)
     }
 
     /// Brings one relative move into the accepted range. Total: a move that

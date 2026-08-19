@@ -12,7 +12,7 @@ use std::time::Instant;
 use hyper_audio_source::DecodeLimits;
 use hyper_control_runtime::{
     PanelBinding, PanelConnectError, PanelConnection, PanelDispatchError, PanelDispatchOutcome,
-    PanelReleaseFailure,
+    PanelDisplay, PanelReleaseFailure,
 };
 use hyper_desktop_audio::{DesktopControlSinkError, DesktopOutputConfig, DesktopPlaybackSession};
 use hyper_media_cache::CacheLimits;
@@ -68,6 +68,10 @@ impl PanelHost for SessionHost {
         message: Message,
     ) -> Result<PanelDispatchOutcome, PanelDispatchError<Self::Error>> {
         self.0.deliver_panel_message(message)
+    }
+
+    fn panel_display(&mut self, out: &mut Vec<PanelDisplay>) {
+        self.0.panel_display(out);
     }
 }
 

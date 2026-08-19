@@ -13,7 +13,7 @@ use std::time::Duration;
 use hyper_control_runtime::{
     BooleanControlTarget, ControlBindingUnavailableReason, PanelActionTarget, PanelBinding,
     PanelButtonBehavior, PanelConnectError, PanelConnection, PanelControl, PanelDispatchError,
-    PanelDispatchOutcome, PanelReleaseFailure, UnboundReason, ValueControlTarget,
+    PanelDispatchOutcome, PanelDisplay, PanelReleaseFailure, UnboundReason, ValueControlTarget,
 };
 use hyper_panel_protocol::{LinkConfig, LinkFault, Message, PanelDescriptor};
 use hyper_runtime_panel_session::{PanelEvent, PanelSession};
@@ -42,6 +42,13 @@ const READ_CHUNK: usize = 1024;
 /// fault in its own right, and spinning on it stops the process from ever
 /// getting on with anything else.
 const RELEASE_ATTEMPTS: usize = 3;
+
+/// How many display messages leave in one quiet moment.
+///
+/// Bounded so a burst of change cannot starve input or the stop flag; whatever
+/// is not sent this tick is sent on the next. With a 20 ms tick this still
+/// refreshes an entire panel several times a second.
+const FEEDBACK_PER_TICK: usize = 4;
 
 /// How long a serving loop waits on a quiet panel before letting link upkeep
 /// and the stop flag have a turn.
@@ -179,6 +186,9 @@ pub trait PanelHost {
         &mut self,
         message: Message,
     ) -> Result<PanelDispatchOutcome, PanelDispatchError<Self::Error>>;
+
+    /// Collects what the connected panel should currently be showing.
+    fn panel_display(&mut self, out: &mut Vec<PanelDisplay>);
 }
 
 /// Something worth telling the operator about, which would otherwise be
@@ -280,6 +290,12 @@ pub struct PanelLink {
     session: PanelSession,
     bound: bool,
     notices: Vec<PanelNotice>,
+    descriptor: Option<PanelDescriptor>,
+    /// What the panel was last told, so an unchanged value costs nothing. With
+    /// a 20 ms tick and up to 32 LEDs, this deduplication is what makes
+    /// feedback affordable at all.
+    shown: Vec<PanelDisplay>,
+    wanted: Vec<PanelDisplay>,
 }
 
 impl PanelLink {
@@ -289,6 +305,9 @@ impl PanelLink {
             session: PanelSession::new(config),
             bound: false,
             notices: Vec::new(),
+            descriptor: None,
+            shown: Vec::new(),
+            wanted: Vec::new(),
         }
     }
 
@@ -344,6 +363,8 @@ impl PanelLink {
                             count: connection.refused().len(),
                         });
                     }
+                    self.descriptor = Some(descriptor);
+                    self.shown.clear();
                     self.bound = true;
                 }
                 PanelEvent::Input(message) => self.deliver(message, host),
@@ -378,6 +399,43 @@ impl PanelLink {
                 self.notices.push(PanelNotice::Rejected { control });
             }
         }
+    }
+
+    /// Sends what has changed on the panel's display, bounded per call.
+    ///
+    /// Only differences leave: a value the panel was already shown costs
+    /// nothing. Nothing is addressed that the descriptor did not declare, for
+    /// the same reason a binding to an absent control is refused.
+    ///
+    /// Returns how many messages were queued, so a caller can tell a quiet
+    /// panel from a busy one.
+    pub fn refresh_display<H: PanelHost>(&mut self, host: &mut H, now_ms: u64) -> usize {
+        if !self.bound {
+            return 0;
+        }
+        let Some(descriptor) = self.descriptor else {
+            return 0;
+        };
+        host.panel_display(&mut self.wanted);
+        let mut sent = 0;
+        for display in &self.wanted {
+            if sent == FEEDBACK_PER_TICK {
+                break;
+            }
+            if !descriptor_shows(descriptor, *display) {
+                continue;
+            }
+            if self.shown.contains(display) {
+                continue;
+            }
+            if self.session.send(message_for(*display), now_ms).is_err() {
+                break;
+            }
+            self.shown.retain(|known| !same_control(*known, *display));
+            self.shown.push(*display);
+            sent += 1;
+        }
+        sent
     }
 
     /// Releases anything the panel still holds and forgets its bindings.
@@ -486,6 +544,7 @@ where
             // serve this panel, so it is where a second one gets turned away.
             Err(error) if is_quiet(error.kind()) => {
                 while_idle();
+                link.refresh_display(host, clock());
                 0
             }
             Err(error) => return Err(error),
@@ -493,6 +552,37 @@ where
         if let PanelStep::Closed(closure) = link.step(&buffer[..read], clock(), host) {
             return Ok(closure);
         }
+    }
+}
+
+/// Whether the panel declared the control this display addresses.
+const fn descriptor_shows(descriptor: PanelDescriptor, display: PanelDisplay) -> bool {
+    match display {
+        PanelDisplay::Ring { index, .. } => index < descriptor.rings,
+        PanelDisplay::Led { index, .. } => index < descriptor.leds,
+    }
+}
+
+/// Whether two displays address the same physical control, so the newer one
+/// replaces the older rather than accumulating beside it.
+const fn same_control(left: PanelDisplay, right: PanelDisplay) -> bool {
+    match (left, right) {
+        (PanelDisplay::Ring { index: a, .. }, PanelDisplay::Ring { index: b, .. })
+        | (PanelDisplay::Led { index: a, .. }, PanelDisplay::Led { index: b, .. }) => a == b,
+        _ => false,
+    }
+}
+
+const fn message_for(display: PanelDisplay) -> Message {
+    match display {
+        PanelDisplay::Ring { index, value } => Message::SetRingValue {
+            ring_id: index,
+            value,
+        },
+        PanelDisplay::Led { index, enabled } => Message::SetLed {
+            control_id: index as u16,
+            enabled,
+        },
     }
 }
 
