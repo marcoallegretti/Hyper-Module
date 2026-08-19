@@ -48,7 +48,7 @@ const RELEASE_ATTEMPTS: usize = 3;
 /// Bounded so a burst of change cannot starve input or the stop flag; whatever
 /// is not sent this tick is sent on the next. With a 20 ms tick this still
 /// refreshes an entire panel several times a second.
-const FEEDBACK_PER_TICK: usize = 4;
+pub const FEEDBACK_PER_TICK: usize = 4;
 
 /// How long a serving loop waits on a quiet panel before letting link upkeep
 /// and the stop flag have a turn.

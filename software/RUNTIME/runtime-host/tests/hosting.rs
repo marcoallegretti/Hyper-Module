@@ -1407,6 +1407,13 @@ fn a_bound_channel_gain_reaches_the_matching_ring_on_a_real_panel() {
         Some(half),
         "an untouched channel still shows its own position"
     );
+    assert_eq!(
+        host.runtime
+            .sink()
+            .value_state(ValueControlTarget::ChannelGain { channel_index: 1 }),
+        Some(1_000_000),
+        "the sink never moved, so a display built from it would still read half scale —          this ring followed the shadow"
+    );
 }
 
 #[test]
@@ -1481,5 +1488,89 @@ fn a_display_that_has_not_changed_sends_nothing_more() {
     assert_eq!(
         second, 0,
         "nothing moved, so the second refresh says nothing at all"
+    );
+}
+
+/// Connects a link through the shipped loop and hands it back, so a test can
+/// call `refresh_display` directly against a real panel.
+fn connected_link<'a>(
+    host: &mut Host,
+    descriptor: PanelDescriptor,
+    stop: &'a AtomicBool,
+    now: &Rc<Cell<u64>>,
+) -> (PanelLink, PanelDriver<'a>) {
+    let mut driver = PanelDriver::new(descriptor, Rc::clone(now), stop, Vec::new());
+    let mut link = PanelLink::new(config());
+    link.start(0x5EED, 0).unwrap();
+    let mut buffer = [0_u8; 1024];
+    for _ in 0..6 {
+        let outbound = link.take_transmit();
+        if !outbound.is_empty() {
+            driver.write_all(&outbound).unwrap();
+        }
+        let read = driver.read(&mut buffer).unwrap_or_default();
+        link.step(&buffer[..read], now.get(), host);
+    }
+    assert!(link.holds_bindings(), "the handshake completed");
+    (link, driver)
+}
+
+#[test]
+fn a_refresh_sends_no_more_than_its_budget_however_much_has_changed() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(8);
+    let now = Rc::new(Cell::new(0_u64));
+    let wide = PanelDescriptor {
+        encoders: 8,
+        buttons: 8,
+        leds: 8,
+        rings: 8,
+        ..display_descriptor(8, 8)
+    };
+    let (mut link, _driver) = connected_link(&mut host, wide, &stop, &now);
+
+    // Sixteen controls have something to say and the budget is four.
+    let sent = link.refresh_display(&mut host, now.get());
+
+    assert_eq!(
+        sent,
+        hyper_runtime_host::FEEDBACK_PER_TICK,
+        "a burst of change must not starve input or the stop flag"
+    );
+    let rest = link.refresh_display(&mut host, now.get());
+    assert!(
+        rest > 0,
+        "what did not fit this tick goes out on the next: {rest}"
+    );
+}
+
+#[test]
+fn a_panel_is_never_told_about_a_light_or_ring_it_did_not_declare() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(4);
+    let now = Rc::new(Cell::new(0_u64));
+    // Four controls bound, but the panel reports one ring and one light.
+    let narrow = PanelDescriptor {
+        encoders: 4,
+        buttons: 4,
+        leds: 1,
+        rings: 1,
+        ring_segments: 16,
+        ..display_descriptor(4, 4)
+    };
+    let (mut link, driver) = connected_link(&mut host, narrow, &stop, &now);
+
+    for _ in 0..8 {
+        link.refresh_display(&mut host, now.get());
+    }
+
+    let outputs = driver.panel.output_state();
+    assert!(
+        outputs.ring(0).is_some() && outputs.led(0).is_some(),
+        "what the panel declared is addressed"
+    );
+    assert!(
+        outputs.ring(1).is_none() && outputs.led(1).is_none(),
+        "and what it did not declare is never written, exactly as a binding to an absent control is refused"
     );
 }
