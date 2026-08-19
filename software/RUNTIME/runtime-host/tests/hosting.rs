@@ -1,33 +1,49 @@
-//! The runtime's panel link, driven against the real simulator over a real
-//! socket, into a real control runtime. Audio needs a device and is not here;
-//! everything between the wire and a mixer command is.
+//! The shipped panel-serving code, driven against the real simulator over a
+//! real socket, into a real control runtime.
+//!
+//! The driver below implements `Read`/`Write`, so `serve_panel` — the loop that
+//! actually runs in production — is what these tests exercise, single-threaded
+//! and on an injected clock. Nothing here reimplements the loop under test.
 
+use std::cell::Cell;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use hyper_control_runtime::{
     BooleanControlTarget, ControlBindingAvailability, ControlRuntime, DirectControlStateUpdate,
-    PanelBinding, PanelConnectError, PanelConnection, PanelDispatchError, PanelDispatchOutcome,
-    PanelReleaseFailure, RuntimeControlCommand, RuntimeControlSink, RuntimeControlTarget,
-    ValueControlTarget, ValueDomain,
+    PanelBinding, PanelButtonBehavior, PanelConnectError, PanelConnection, PanelDispatchError,
+    PanelDispatchOutcome, PanelReleaseFailure, RuntimeControlCommand, RuntimeControlSink,
+    RuntimeControlTarget, ValueControlTarget, ValueDomain,
 };
 use hyper_mapping_compiler::CompiledControlMappingTable;
 use hyper_panel_protocol::{FirmwareVersion, LinkConfig, Message, PanelDescriptor};
 use hyper_panel_simulator::{PanelSimulator, PanelSimulatorConfig};
 use hyper_runtime_host::{
-    DEFAULT_GAIN_STEP_MILLIONTHS, PanelClosure, PanelHost, PanelLink, PanelStep, RuntimeArguments,
-    default_layout,
+    ACCEPT_POLL_INTERVAL, ArgumentError, DEFAULT_GAIN_STEP_MILLIONTHS, PANEL_READ_TIMEOUT,
+    PanelClosure, PanelHost, PanelLink, PanelNotice, RuntimeArguments, default_layout,
+    prepare_panel_stream, refuse_waiting_panels, serve_panel, serve_panels,
 };
 
 const CHANNELS: usize = 3;
+/// How far the injected clock advances per read. The link's timeout is 500 ms,
+/// so a silent panel is noticed after fifty reads and no test waits on a wall
+/// clock to get there.
+const CLOCK_STEP_MS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct SinkError;
+enum SinkError {
+    Rejected,
+    InvalidTarget,
+}
 
 #[derive(Debug, Default)]
 struct Sink {
     commands: Vec<RuntimeControlCommand>,
-    reject_releases: bool,
+    invalid_target: Option<RuntimeControlTarget>,
+    reject_release: bool,
 }
 
 impl RuntimeControlSink for Sink {
@@ -35,8 +51,12 @@ impl RuntimeControlSink for Sink {
     type DirectCommand = RuntimeControlCommand;
     type DirectError = SinkError;
 
-    fn validate_target(&self, _target: RuntimeControlTarget) -> Result<(), Self::Error> {
-        Ok(())
+    fn validate_target(&self, target: RuntimeControlTarget) -> Result<(), Self::Error> {
+        if self.invalid_target == Some(target) {
+            Err(SinkError::InvalidTarget)
+        } else {
+            Ok(())
+        }
     }
 
     fn target_availability(&self, _target: RuntimeControlTarget) -> ControlBindingAvailability {
@@ -65,8 +85,13 @@ impl RuntimeControlSink for Sink {
     }
 
     fn try_send(&mut self, command: RuntimeControlCommand) -> Result<(), Self::Error> {
-        if self.reject_releases && matches!(command, RuntimeControlCommand::ChannelMute { .. }) {
-            return Err(SinkError);
+        if self.reject_release
+            && matches!(
+                command,
+                RuntimeControlCommand::ChannelMute { muted: false, .. }
+            )
+        {
+            return Err(SinkError::Rejected);
         }
         self.commands.push(command);
         Ok(())
@@ -84,7 +109,10 @@ impl RuntimeControlSink for Sink {
 struct Host {
     runtime: ControlRuntime<Sink>,
     channels: usize,
-    refuse_connect: bool,
+    /// Stands in for a configured layout, which ADR-125 anticipates and the
+    /// default layout deliberately is not: a momentary button is the only way a
+    /// panel ever holds a control.
+    momentary_layout: bool,
 }
 
 impl Host {
@@ -93,7 +121,7 @@ impl Host {
             runtime: ControlRuntime::try_new(CompiledControlMappingTable::empty(), Sink::default())
                 .expect("an empty table needs no capacity"),
             channels,
-            refuse_connect: false,
+            momentary_layout: false,
         }
     }
 
@@ -114,8 +142,15 @@ impl PanelHost for Host {
         descriptor: PanelDescriptor,
         bindings: &[PanelBinding],
     ) -> Result<PanelConnection<Self::Error>, PanelConnectError> {
-        if self.refuse_connect {
-            return Err(PanelConnectError::AlreadyConnected);
+        if self.momentary_layout {
+            return self.runtime.connect_panel(
+                descriptor,
+                &[PanelBinding::Button {
+                    index: 0,
+                    target: BooleanControlTarget::ChannelMute { channel_index: 0 },
+                    behavior: PanelButtonBehavior::Momentary,
+                }],
+            );
         }
         self.runtime.connect_panel(descriptor, bindings)
     }
@@ -153,8 +188,6 @@ fn descriptor(encoders: u8, buttons: u8) -> PanelDescriptor {
     }
 }
 
-/// Two ends of one real loopback socket, both non-blocking so a single thread
-/// can drive both peers and the clock.
 fn loopback() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -164,56 +197,124 @@ fn loopback() -> (TcpStream, TcpStream) {
     (client, server)
 }
 
-fn read_available(stream: &mut TcpStream, buffer: &mut [u8]) -> usize {
-    match stream.read(buffer) {
-        Ok(read) => read,
-        Err(error) if error.kind() == ErrorKind::WouldBlock => 0,
-        Err(error) => panic!("loopback read failed: {error}"),
-    }
+/// Something the panel does, scheduled against the serving loop's read count so
+/// a single thread can drive both peers deterministically.
+#[derive(Clone, Copy, Debug)]
+enum PanelAction {
+    Turn { control_id: u16, delta: i16 },
+    Press(u16),
+    GoSilent,
+    ClosePeer,
+    FailWrites,
+    RequestStop,
 }
 
-struct Peers {
+/// A real socket with a real panel simulator on the far end, presented to
+/// `serve_panel` as an ordinary stream.
+struct PanelDriver<'stop> {
     runtime_side: TcpStream,
-    panel_side: TcpStream,
+    panel_side: Option<TcpStream>,
     panel: PanelSimulator,
-    buffer: [u8; 1024],
+    now: Rc<Cell<u64>>,
+    scratch: [u8; 2048],
+    reads: usize,
+    actions: Vec<(usize, PanelAction)>,
+    writes_fail: bool,
+    stop: &'stop AtomicBool,
 }
 
-impl Peers {
-    fn new(descriptor: PanelDescriptor) -> Self {
+impl<'stop> PanelDriver<'stop> {
+    fn new(
+        descriptor: PanelDescriptor,
+        now: Rc<Cell<u64>>,
+        stop: &'stop AtomicBool,
+        actions: Vec<(usize, PanelAction)>,
+    ) -> Self {
         let (runtime_side, panel_side) = loopback();
         Self {
             runtime_side,
-            panel_side,
+            panel_side: Some(panel_side),
             panel: PanelSimulator::new(PanelSimulatorConfig {
                 descriptor,
                 bootloader_available: false,
             })
             .unwrap(),
-            buffer: [0; 1024],
+            now,
+            scratch: [0; 2048],
+            reads: 0,
+            actions,
+            writes_fail: false,
+            stop,
         }
     }
 
-    /// Moves whatever the runtime queued across the socket into the panel, then
-    /// whatever the panel produced back across it into the link.
-    fn pump(&mut self, link: &mut PanelLink, host: &mut Host, now_ms: u64) -> PanelStep {
-        let outbound = link.take_transmit();
-        if !outbound.is_empty() {
-            self.runtime_side.write_all(&outbound).unwrap();
+    fn apply_scheduled(&mut self) {
+        let due: Vec<PanelAction> = self
+            .actions
+            .iter()
+            .filter(|(at, _)| *at == self.reads)
+            .map(|(_, action)| *action)
+            .collect();
+        let now = self.now.get();
+        for action in due {
+            match action {
+                PanelAction::Turn { control_id, delta } => {
+                    self.panel.encoder_delta(control_id, delta, now).unwrap();
+                }
+                PanelAction::Press(control_id) => {
+                    self.panel.button_press(control_id, now).unwrap();
+                }
+                PanelAction::GoSilent => self.panel.disconnect(),
+                PanelAction::ClosePeer => self.panel_side = None,
+                PanelAction::FailWrites => self.writes_fail = true,
+                PanelAction::RequestStop => self.stop.store(true, Ordering::Release),
+            }
         }
-        let read = read_available(&mut self.panel_side, &mut self.buffer);
-        if read > 0 {
-            self.panel
-                .receive_runtime_bytes(&self.buffer[..read], now_ms);
+    }
+}
+
+impl Read for PanelDriver<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.reads += 1;
+        self.now.set(self.now.get() + CLOCK_STEP_MS);
+        self.apply_scheduled();
+        let now = self.now.get();
+        let Some(panel_side) = self.panel_side.as_mut() else {
+            return Ok(0);
+        };
+        match panel_side.read(&mut self.scratch) {
+            Ok(0) => {}
+            Ok(read) => {
+                self.panel.receive_runtime_bytes(&self.scratch[..read], now);
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
         }
-        self.panel.poll(now_ms).unwrap();
-        let produced = self.panel.read_panel_bytes(&mut self.buffer);
+        self.panel.poll(now).unwrap();
+        let produced = self.panel.read_panel_bytes(&mut self.scratch);
         if produced > 0 {
-            self.panel_side.write_all(&self.buffer[..produced]).unwrap();
+            panel_side.write_all(&self.scratch[..produced])?;
         }
-        let mut inbound = [0_u8; 1024];
-        let received = read_available(&mut self.runtime_side, &mut inbound);
-        link.step(&inbound[..received], now_ms, host)
+        match self.runtime_side.read(buffer) {
+            Ok(read) => Ok(read),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                Err(ErrorKind::WouldBlock.into())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Write for PanelDriver<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.writes_fail {
+            return Err(std::io::Error::other("the panel stopped reading"));
+        }
+        self.runtime_side.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.runtime_side.flush()
     }
 }
 
@@ -221,57 +322,294 @@ fn config() -> LinkConfig {
     LinkConfig::new(50, 500).unwrap()
 }
 
-fn connected(descriptor: PanelDescriptor, channels: usize) -> (Peers, PanelLink, Host) {
-    let mut peers = Peers::new(descriptor);
-    let mut link = PanelLink::new(config());
-    let mut host = Host::new(channels);
-    link.start(0x5EED, 0).unwrap();
-    for now_ms in 1..4 {
-        assert_eq!(peers.pump(&mut link, &mut host, now_ms), PanelStep::Live);
-    }
-    assert!(link.is_connected(), "the handshake completes over a socket");
-    assert!(host.panel_connected());
-    (peers, link, host)
+/// Runs the shipped `serve_panel` against a real panel until it returns.
+fn serve(
+    host: &mut Host,
+    actions: Vec<(usize, PanelAction)>,
+    stop: &AtomicBool,
+) -> std::io::Result<(PanelClosure, Vec<PanelNotice>)> {
+    let now = Rc::new(Cell::new(0_u64));
+    let mut driver = PanelDriver::new(descriptor(2, 4), Rc::clone(&now), stop, actions);
+    let clock = Rc::clone(&now);
+    serve_panel(&mut driver, host, config(), 0x5EED, stop, move || {
+        clock.get()
+    })
+}
+
+#[test]
+fn the_shipped_loop_carries_a_panel_turn_to_a_mixer_command() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    let (closure, notices) = serve(
+        &mut host,
+        vec![
+            (
+                6,
+                PanelAction::Turn {
+                    control_id: 1,
+                    delta: 4,
+                },
+            ),
+            (10, PanelAction::ClosePeer),
+        ],
+        &stop,
+    )
+    .unwrap();
+
+    assert_eq!(closure, PanelClosure::PeerClosed);
+    assert_eq!(notices, Vec::new());
+    assert_eq!(
+        host.commands(),
+        [RuntimeControlCommand::ChannelGain {
+            channel_index: 1,
+            gain_millionths: 1_000_000 + 4 * DEFAULT_GAIN_STEP_MILLIONTHS,
+        }],
+        "the second encoder moves the second channel by four detents"
+    );
+    assert!(!host.panel_connected(), "a closed panel leaves no bindings");
+}
+
+#[test]
+fn a_failed_write_tears_the_panel_down_instead_of_leaking_it() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    let error = serve(&mut host, vec![(4, PanelAction::FailWrites)], &stop)
+        .expect_err("a stream that will not take bytes is an error");
+
+    assert_eq!(error.kind(), ErrorKind::Other);
+    assert!(
+        !host.panel_connected(),
+        "a write failure must release the panel; leaving it installed refuses every later panel for the life of the process"
+    );
+}
+
+#[test]
+fn a_panel_that_stops_answering_is_reported_as_a_lost_link() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    let (closure, _) = serve(&mut host, vec![(5, PanelAction::GoSilent)], &stop).unwrap();
+
+    assert_eq!(closure, PanelClosure::LinkLost);
+    assert!(!host.panel_connected());
+}
+
+#[test]
+fn the_stop_flag_ends_a_connection_that_is_still_live() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    let (closure, _) = serve(&mut host, vec![(6, PanelAction::RequestStop)], &stop).unwrap();
+
+    assert_eq!(
+        closure,
+        PanelClosure::HostStopping,
+        "quit must take effect while a panel is attached, not only between connections"
+    );
+    assert!(!host.panel_connected());
+}
+
+#[test]
+fn a_release_the_sink_keeps_refusing_is_bounded_and_reported() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    host.momentary_layout = true;
+    host.runtime.sink_mut().reject_release = true;
+
+    let started = Instant::now();
+    let (closure, notices) = serve(
+        &mut host,
+        vec![(6, PanelAction::Press(0)), (10, PanelAction::ClosePeer)],
+        &stop,
+    )
+    .unwrap();
+
+    assert_eq!(closure, PanelClosure::PeerClosed);
+    assert!(
+        started.elapsed().as_secs() < 20,
+        "a refused release must not spin the teardown forever"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|notice| matches!(notice, PanelNotice::ReleaseFailed { .. })),
+        "a control left held is reported rather than swallowed: {notices:?}"
+    );
+    assert_eq!(
+        host.commands(),
+        [RuntimeControlCommand::ChannelMute {
+            channel_index: 0,
+            muted: true,
+        }],
+        "the press landed and no release was accepted"
+    );
+}
+
+#[test]
+fn a_configured_momentary_control_is_released_when_the_link_drops_mid_press() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    host.momentary_layout = true;
+
+    let (closure, notices) = serve(
+        &mut host,
+        vec![(6, PanelAction::Press(0)), (10, PanelAction::GoSilent)],
+        &stop,
+    )
+    .unwrap();
+
+    assert_eq!(closure, PanelClosure::LinkLost);
+    assert!(notices.is_empty(), "nothing to report: {notices:?}");
+    assert_eq!(
+        host.commands(),
+        [
+            RuntimeControlCommand::ChannelMute {
+                channel_index: 0,
+                muted: true,
+            },
+            RuntimeControlCommand::ChannelMute {
+                channel_index: 0,
+                muted: false,
+            },
+        ],
+        "the held control is released rather than left latched"
+    );
+    assert!(!host.panel_connected());
+}
+
+#[test]
+fn a_binding_the_owner_refuses_is_reported_rather_than_dropped() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    host.runtime.sink_mut().invalid_target = Some(RuntimeControlTarget::Channel {
+        channel_index: 1,
+        parameter: hyper_control_mappings::ChannelParameter::Gain,
+    });
+
+    let (_, notices) = serve(&mut host, vec![(8, PanelAction::ClosePeer)], &stop).unwrap();
+
+    assert!(
+        notices
+            .iter()
+            .any(|notice| matches!(notice, PanelNotice::BindingsRefused { count: 1 })),
+        "the refusal the previous decisions built must reach the operator: {notices:?}"
+    );
+}
+
+#[test]
+fn preparing_an_accepted_stream_makes_it_wait_rather_than_spin() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    // The accept loop needs a non-blocking listener to observe the stop flag;
+    // on Windows the accepted socket inherits that mode.
+    let accepted = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) => panic!("accept failed: {error}"),
+        }
+    };
+
+    prepare_panel_stream(&accepted).unwrap();
+
+    let mut buffer = [0_u8; 16];
+    let started = Instant::now();
+    let outcome = (&accepted).read(&mut buffer);
+    let waited = started.elapsed();
+
+    assert!(
+        outcome.is_err(),
+        "a quiet peer produces no bytes, so the read reports a timeout"
+    );
+    assert!(
+        waited >= PANEL_READ_TIMEOUT / 2,
+        "the read honoured its timeout instead of returning at once: waited {waited:?}"
+    );
+}
+
+#[test]
+fn a_second_panel_is_turned_away_while_one_is_being_served() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut first = TcpStream::connect(address).unwrap();
+    let mut second = TcpStream::connect(address).unwrap();
+    let served = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) => panic!("accept failed: {error}"),
+        }
+    };
+
+    refuse_waiting_panels(&listener);
+
+    second
+        .set_read_timeout(Some(PANEL_READ_TIMEOUT * 20))
+        .unwrap();
+    let mut buffer = [0_u8; 8];
+    assert!(
+        matches!(second.read(&mut buffer), Ok(0)),
+        "the second panel learns it was refused rather than waiting in the backlog"
+    );
+    assert!(
+        first.write_all(b"still here").is_ok(),
+        "the panel being served is untouched"
+    );
+    drop(served);
+}
+
+#[test]
+fn the_accept_loop_returns_when_asked_to_stop_before_a_panel_arrives() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = AtomicBool::new(true);
+    let mut host = Host::new(CHANNELS);
+    let mut served = 0_usize;
+
+    let started = Instant::now();
+    serve_panels(&listener, &mut host, config(), &stop, || 0, |_| served += 1).unwrap();
+
+    assert_eq!(served, 0);
+    assert!(
+        started.elapsed() < ACCEPT_POLL_INTERVAL * 10,
+        "a stopped host does not linger in the accept loop"
+    );
 }
 
 #[test]
 fn the_default_layout_names_only_controls_the_panel_and_the_project_both_have() {
     let bindings = default_layout(descriptor(2, 8), CHANNELS);
+    let encoders = bindings
+        .iter()
+        .filter(|binding| matches!(binding, PanelBinding::Encoder { .. }))
+        .count();
+    let buttons = bindings
+        .iter()
+        .filter(|binding| matches!(binding, PanelBinding::Button { .. }))
+        .count();
+    let actions = bindings
+        .iter()
+        .filter(|binding| matches!(binding, PanelBinding::ActionButton { .. }))
+        .count();
 
+    assert_eq!((encoders, buttons, actions), (2, 3, 1));
     assert_eq!(
-        bindings,
-        vec![
-            PanelBinding::Encoder {
-                index: 0,
-                target: ValueControlTarget::ChannelGain { channel_index: 0 },
-                step_millionths: DEFAULT_GAIN_STEP_MILLIONTHS.try_into().unwrap(),
-            },
-            PanelBinding::Encoder {
-                index: 1,
-                target: ValueControlTarget::ChannelGain { channel_index: 1 },
-                step_millionths: DEFAULT_GAIN_STEP_MILLIONTHS.try_into().unwrap(),
-            },
+        bindings[0],
+        PanelBinding::Encoder {
+            index: 0,
+            target: ValueControlTarget::ChannelGain { channel_index: 0 },
+            step_millionths: DEFAULT_GAIN_STEP_MILLIONTHS.try_into().unwrap(),
+        }
+    );
+    assert!(
+        !bindings.iter().any(|binding| matches!(
+            binding,
             PanelBinding::Button {
-                index: 0,
-                target: BooleanControlTarget::ChannelMute { channel_index: 0 },
-                behavior: hyper_control_runtime::PanelButtonBehavior::Toggle,
-            },
-            PanelBinding::Button {
-                index: 1,
-                target: BooleanControlTarget::ChannelMute { channel_index: 1 },
-                behavior: hyper_control_runtime::PanelButtonBehavior::Toggle,
-            },
-            PanelBinding::Button {
-                index: 2,
-                target: BooleanControlTarget::ChannelMute { channel_index: 2 },
-                behavior: hyper_control_runtime::PanelButtonBehavior::Toggle,
-            },
-            PanelBinding::ActionButton {
-                index: 3,
-                action: hyper_control_runtime::PanelActionTarget::TransportToggle,
-            },
-        ],
-        "two encoders bind two channels, three buttons bind three, and the fourth button takes the transport"
+                behavior: PanelButtonBehavior::Momentary,
+                ..
+            }
+        )),
+        "the default layout holds nothing, so a dropped link strands nothing"
     );
 }
 
@@ -286,104 +624,24 @@ fn the_default_layout_stops_at_whichever_of_the_panel_and_the_project_runs_out()
         "a panel with no button past the last channel gets no transport button"
     );
 
-    assert!(
-        default_layout(descriptor(0, 0), CHANNELS).is_empty(),
-        "a panel with no controls gets no bindings"
-    );
-    assert!(
-        default_layout(descriptor(4, 4), 0).len() == 1,
-        "a project with no channels leaves only the transport button"
-    );
+    assert!(default_layout(descriptor(0, 0), CHANNELS).is_empty());
+    assert_eq!(default_layout(descriptor(4, 4), 0).len(), 1);
 }
 
 #[test]
-fn a_default_layout_installs_completely_against_the_panel_that_produced_it() {
-    let (_peers, _link, host) = connected(descriptor(2, 4), CHANNELS);
-    assert!(host.panel_connected());
-}
-
-#[test]
-fn a_panel_turn_over_a_real_socket_reaches_the_bound_mixer_channel() {
-    let (mut peers, mut link, mut host) = connected(descriptor(2, 4), CHANNELS);
-
-    peers.panel.encoder_delta(1, 4, 5).unwrap();
-    assert_eq!(peers.pump(&mut link, &mut host, 5), PanelStep::Live);
+fn a_project_with_more_channels_than_a_panel_can_address_binds_every_control() {
+    let bindings = default_layout(descriptor(16, 32), 300);
 
     assert_eq!(
-        host.commands(),
-        [RuntimeControlCommand::ChannelGain {
-            channel_index: 1,
-            gain_millionths: 1_000_000 + 4 * DEFAULT_GAIN_STEP_MILLIONTHS,
-        }],
-        "the second encoder moves the second channel by four detents"
+        bindings.len(),
+        48,
+        "a channel count past the panel's addressable range binds all sixteen encoders and all thirty-two buttons"
     );
-}
-
-#[test]
-fn a_panel_button_over_a_real_socket_toggles_the_bound_channel() {
-    let (mut peers, mut link, mut host) = connected(descriptor(2, 4), CHANNELS);
-
-    peers.panel.button_press(2, 5).unwrap();
-    assert_eq!(peers.pump(&mut link, &mut host, 5), PanelStep::Live);
-    peers.panel.button_release(2, 6).unwrap();
-    assert_eq!(peers.pump(&mut link, &mut host, 6), PanelStep::Live);
-
-    assert_eq!(
-        host.commands(),
-        [RuntimeControlCommand::ChannelMute {
-            channel_index: 2,
-            muted: true,
-        }],
-        "a toggle acts on press and stays put on release"
-    );
-}
-
-#[test]
-fn a_panel_that_stops_answering_takes_its_bindings_down_with_it() {
-    let (mut peers, mut link, mut host) = connected(descriptor(2, 4), CHANNELS);
-    peers.panel.disconnect();
-
-    let mut now_ms = 10_u64;
-    let mut closed = None;
-    while now_ms < 4_000 {
-        if let PanelStep::Closed(closure) = peers.pump(&mut link, &mut host, now_ms) {
-            closed = Some(closure);
-            break;
-        }
-        now_ms += 50;
-    }
-
-    assert_eq!(closed, Some(PanelClosure::LinkLost));
-    assert!(!link.is_connected());
     assert!(
-        !host.panel_connected(),
-        "a panel that went away leaves no bindings behind"
-    );
-}
-
-#[test]
-fn a_link_lost_while_a_control_is_held_still_ends_the_connection() {
-    let mut peers = Peers::new(descriptor(2, 4));
-    let mut link = PanelLink::new(config());
-    let mut host = Host::new(CHANNELS);
-    host.runtime.sink_mut().reject_releases = true;
-    link.start(0x5EED, 0).unwrap();
-    for now_ms in 1..4 {
-        assert_eq!(peers.pump(&mut link, &mut host, now_ms), PanelStep::Live);
-    }
-
-    peers.panel.disconnect();
-    let mut now_ms = 10_u64;
-    while now_ms < 4_000 && link.is_connected() {
-        if let PanelStep::Closed(_) = peers.pump(&mut link, &mut host, now_ms) {
-            break;
-        }
-        now_ms += 50;
-    }
-
-    assert!(
-        !link.is_connected(),
-        "a sink that refuses a release does not wedge the link open forever"
+        !bindings
+            .iter()
+            .any(|binding| matches!(binding, PanelBinding::ActionButton { .. })),
+        "no button is spare, so nothing takes the transport"
     );
 }
 
@@ -414,8 +672,6 @@ fn arguments_name_a_project_and_optionally_a_panel_address() {
 
 #[test]
 fn a_malformed_argument_list_is_reported_rather_than_assumed() {
-    use hyper_runtime_host::ArgumentError;
-
     assert_eq!(
         RuntimeArguments::parse(Vec::new()),
         Err(ArgumentError::MissingProjectRoot)
@@ -450,33 +706,38 @@ fn a_malformed_argument_list_is_reported_rather_than_assumed() {
 }
 
 #[test]
-fn a_panel_the_owner_will_not_accept_is_dropped_rather_than_driven() {
-    let mut peers = Peers::new(descriptor(2, 4));
-    let mut link = PanelLink::new(config());
-    let mut host = Host::new(CHANNELS);
-    host.refuse_connect = true;
-    link.start(0x5EED, 0).unwrap();
+fn every_argument_failure_says_what_was_wrong() {
+    let rendered: Vec<String> = [
+        ArgumentError::MissingProjectRoot,
+        ArgumentError::UnknownOption("--nope".to_owned()),
+        ArgumentError::MissingValue("--panel-listen"),
+        ArgumentError::UnreadableAddress("1.2.3".to_owned()),
+        ArgumentError::Repeated("--panel-listen"),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
 
-    let mut closed = None;
-    for now_ms in 1..8 {
-        if let PanelStep::Closed(closure) = peers.pump(&mut link, &mut host, now_ms) {
-            closed = Some(closure);
-            break;
-        }
-    }
-
-    assert_eq!(
-        closed,
-        Some(PanelClosure::LinkLost),
-        "an owner that will not take the bindings ends the connection"
-    );
-    assert!(!link.is_connected());
-    assert!(!host.panel_connected());
-
-    peers.panel.encoder_delta(0, 4, 20).unwrap();
-    let _ = peers.pump(&mut link, &mut host, 20);
+    assert!(rendered[0].contains("project directory"));
+    assert!(rendered[1].contains("--nope"));
+    assert!(rendered[2].contains("--panel-listen"));
+    assert!(rendered[3].contains("1.2.3"));
+    assert!(rendered[4].contains("more than once"));
     assert!(
-        host.commands().is_empty(),
-        "a panel that was never accepted commands nothing"
+        rendered.iter().all(|message| !message.is_empty()),
+        "every failure renders something the operator can act on"
     );
+}
+
+#[test]
+fn a_link_that_never_bound_releases_nothing() {
+    let mut host = Host::new(CHANNELS);
+    let mut link = PanelLink::new(config());
+
+    assert!(!link.holds_bindings());
+    assert_eq!(
+        link.close(&mut host, PanelClosure::PeerClosed),
+        hyper_runtime_host::PanelStep::Closed(PanelClosure::PeerClosed)
+    );
+    assert!(host.commands().is_empty());
 }

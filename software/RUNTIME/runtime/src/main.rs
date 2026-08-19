@@ -7,16 +7,20 @@ use std::net::TcpListener;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use hyper_audio_source::DecodeLimits;
-use hyper_desktop_audio::{DesktopOutputConfig, DesktopPlaybackSession};
+use hyper_control_runtime::{
+    PanelBinding, PanelConnectError, PanelConnection, PanelDispatchError, PanelDispatchOutcome,
+    PanelReleaseFailure,
+};
+use hyper_desktop_audio::{DesktopControlSinkError, DesktopOutputConfig, DesktopPlaybackSession};
 use hyper_media_cache::CacheLimits;
-use hyper_panel_protocol::LinkConfig;
+use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
 use hyper_playback_json::LoaderLimits;
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::ProjectPlaybackLimits;
-use hyper_runtime_host::{PanelClosure, RuntimeArguments, serve_panel};
+use hyper_runtime_host::{PanelHost, RuntimeArguments, ServedPanel, serve_panels};
 
 /// The runtime's own hosting policy. Stated here rather than borrowed from the
 /// IDE: these are the limits this process accepts, and they are software
@@ -31,8 +35,41 @@ const MAX_PROJECT_DECODED_BYTES: usize = 1_024 * 1_024 * 1_024;
 
 const HEARTBEAT_INTERVAL_MS: u32 = 50;
 const HEARTBEAT_TIMEOUT_MS: u32 = 500;
-const PANEL_READ_TIMEOUT: Duration = Duration::from_millis(20);
-const IDLE_POLL: Duration = Duration::from_millis(50);
+
+/// The runtime's control owner. Every method forwards; the session owns the
+/// sole control runtime, so it is the only thing that can answer these.
+struct SessionHost(DesktopPlaybackSession);
+
+impl PanelHost for SessionHost {
+    type Error = DesktopControlSinkError;
+
+    fn mixer_channel_count(&self) -> usize {
+        self.0.mixer_channel_count()
+    }
+
+    fn connect_panel(
+        &mut self,
+        descriptor: PanelDescriptor,
+        bindings: &[PanelBinding],
+    ) -> Result<PanelConnection<Self::Error>, PanelConnectError> {
+        self.0.attach_panel(descriptor, bindings)
+    }
+
+    fn disconnect_panel(&mut self) -> Vec<PanelReleaseFailure<Self::Error>> {
+        self.0.detach_panel()
+    }
+
+    fn panel_connected(&self) -> bool {
+        self.0.has_panel()
+    }
+
+    fn dispatch_panel(
+        &mut self,
+        message: Message,
+    ) -> Result<PanelDispatchOutcome, PanelDispatchError<Self::Error>> {
+        self.0.deliver_panel_message(message)
+    }
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -51,75 +88,64 @@ fn run() -> Result<(), String> {
 
     let output = DesktopOutputConfig::try_new(SAMPLE_RATE_HZ, MAXIMUM_BLOCK_FRAMES)
         .map_err(|error| format!("output configuration is invalid: {error}"))?;
-    let mut session =
-        DesktopPlaybackSession::open_project(output, arguments.project_root(), limits()?).map_err(
-            |error| {
-                format!(
-                    "{} could not be hosted: {error}",
-                    arguments.project_root().display()
-                )
-            },
-        )?;
+    let session = DesktopPlaybackSession::open_project(output, arguments.project_root(), limits()?)
+        .map_err(|error| {
+            format!(
+                "{} could not be hosted: {error}",
+                arguments.project_root().display()
+            )
+        })?;
+    let mut host = SessionHost(session);
     println!(
         "hosting {} with {} mixer channels",
         arguments.project_root().display(),
-        session.mixer_channel_count()
+        host.mixer_channel_count()
     );
 
     let stop = Arc::new(AtomicBool::new(false));
     watch_for_quit(Arc::clone(&stop));
 
-    let listener = if let Some(address) = arguments.panel_listen() {
-        let listener = TcpListener::bind(address)
-            .map_err(|error| format!("cannot listen on {address}: {error}"))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| format!("cannot poll {address}: {error}"))?;
-        println!(
-            "panel link listening on {}",
-            listener.local_addr().unwrap_or(address)
-        );
-        Some(listener)
-    } else {
+    let Some(address) = arguments.panel_listen() else {
         println!("no panel link requested");
-        None
+        while !stop.load(Ordering::Acquire) {
+            std::thread::sleep(hyper_runtime_host::ACCEPT_POLL_INTERVAL);
+        }
+        println!("stopping");
+        return Ok(());
     };
 
-    let started = Instant::now();
+    let listener = TcpListener::bind(address)
+        .map_err(|error| format!("cannot listen on {address}: {error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("cannot poll {address}: {error}"))?;
+    println!(
+        "panel link listening on {}",
+        listener.local_addr().unwrap_or(address)
+    );
+
     let config = LinkConfig::new(HEARTBEAT_INTERVAL_MS, HEARTBEAT_TIMEOUT_MS)
         .map_err(|error| format!("panel link configuration is invalid: {error:?}"))?;
-    let mut session_id = 1_u64;
-    while !stop.load(Ordering::Acquire) {
-        let Some(listener) = listener.as_ref() else {
-            std::thread::sleep(IDLE_POLL);
-            continue;
-        };
-        match listener.accept() {
-            Ok((mut stream, peer)) => {
-                println!("panel connected from {peer}");
-                if let Err(error) = stream.set_read_timeout(Some(PANEL_READ_TIMEOUT)) {
-                    eprintln!("hyper-runtime: cannot pace {peer}: {error}");
-                    continue;
-                }
-                let closure = serve_panel(&mut stream, &mut session, config, session_id, || {
-                    millis_since(started)
-                });
-                session_id = session_id.wrapping_add(1);
-                match closure {
-                    Ok(PanelClosure::PeerClosed) => println!("panel {peer} disconnected"),
-                    Ok(PanelClosure::LinkLost) => println!("panel {peer} link lost"),
-                    Err(error) => eprintln!("hyper-runtime: panel {peer} failed: {error}"),
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(IDLE_POLL);
-            }
-            Err(error) => return Err(format!("cannot accept a panel: {error}")),
-        }
-    }
+    let started = Instant::now();
+    serve_panels(
+        &listener,
+        &mut host,
+        config,
+        &stop,
+        || millis_since(started),
+        report,
+    )
+    .map_err(|error| error.to_string())?;
 
     println!("stopping");
     Ok(())
+}
+
+fn report(served: &ServedPanel) {
+    println!("panel {} ended: {:?}", served.peer, served.closure);
+    for notice in &served.notices {
+        println!("  {notice:?}");
+    }
 }
 
 fn limits() -> Result<ProjectPlaybackLimits, String> {
@@ -148,7 +174,9 @@ fn limits() -> Result<ProjectPlaybackLimits, String> {
 /// Ends the process when standard input closes or asks it to.
 ///
 /// `std` has no signal handling, so the process is stopped the way a headless
-/// process is driven: through the stream it was started with.
+/// process is driven: through the stream it was started with. The serving loop
+/// observes this flag between reads, so it takes effect while a panel is
+/// connected rather than only between connections.
 fn watch_for_quit(stop: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let mut line = String::new();

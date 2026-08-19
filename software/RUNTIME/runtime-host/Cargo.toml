@@ -5,24 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
-[[bin]]
-name = "hyper-runtime"
-path = "src/main.rs"
-
 [lints]
 workspace = true
 
 [dependencies]
 hyper-control-runtime = { path = "../control-runtime" }
-hyper-desktop-audio = { path = "../../IDE/audio-backend" }
 hyper-panel-protocol = { path = "../../../crates/panel-protocol" }
 hyper-runtime-panel-session = { path = "../panel-session" }
-hyper-audio-source = { path = "../../../crates/audio-source" }
-hyper-media-cache = { path = "../../../crates/media-cache" }
-hyper-playback-json = { path = "../../../crates/playback-json" }
-hyper-playback-session = { path = "../../../crates/playback-session" }
-hyper-project-loader = { path = "../../../crates/project-loader" }
 
 [dev-dependencies]
-hyper-panel-simulator = { path = "../../IDE/panel-simulator" }
 hyper-mapping-compiler = { path = "../../../crates/mapping-compiler" }
+hyper-control-mappings = { path = "../../../crates/control-mappings" }
+hyper-panel-simulator = { path = "../../IDE/panel-simulator" }

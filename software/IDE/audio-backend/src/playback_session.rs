@@ -1682,7 +1682,7 @@ impl DesktopPlaybackSession {
     ///
     /// Returns [`hyper_control_runtime::PanelConnectError`] when a panel is
     /// still connected or shadow state cannot be allocated.
-    pub fn connect_panel(
+    pub fn attach_panel(
         &mut self,
         descriptor: hyper_panel_protocol::PanelDescriptor,
         bindings: &[hyper_control_runtime::PanelBinding],
@@ -1700,14 +1700,14 @@ impl DesktopPlaybackSession {
     /// A non-empty result means a release was refused and the panel is still
     /// installed so a later call retries it.
     #[must_use]
-    pub fn disconnect_panel(
+    pub fn detach_panel(
         &mut self,
     ) -> Vec<hyper_control_runtime::PanelReleaseFailure<DesktopControlSinkError>> {
         self.controls.runtime_mut().disconnect_panel()
     }
 
     #[must_use]
-    pub fn panel_connected(&self) -> bool {
+    pub fn has_panel(&self) -> bool {
         self.controls.runtime().panel_connected()
     }
 
@@ -1717,7 +1717,7 @@ impl DesktopPlaybackSession {
     ///
     /// Returns the sink's rejection, or reports that the target's present state
     /// could not be read.
-    pub fn dispatch_panel(
+    pub fn deliver_panel_message(
         &mut self,
         message: hyper_panel_protocol::Message,
     ) -> Result<

@@ -2358,19 +2358,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyper-runtime-host"
+name = "hyper-runtime"
 version = "0.1.0"
 dependencies = [
  "hyper-audio-source",
  "hyper-control-runtime",
  "hyper-desktop-audio",
- "hyper-mapping-compiler",
  "hyper-media-cache",
  "hyper-panel-protocol",
- "hyper-panel-simulator",
  "hyper-playback-json",
  "hyper-playback-session",
  "hyper-project-loader",
+ "hyper-runtime-host",
+]
+
+[[package]]
+name = "hyper-runtime-host"
+version = "0.1.0"
+dependencies = [
+ "hyper-control-mappings",
+ "hyper-control-runtime",
+ "hyper-mapping-compiler",
+ "hyper-panel-protocol",
+ "hyper-panel-simulator",
  "hyper-runtime-panel-session",
 ]
 
