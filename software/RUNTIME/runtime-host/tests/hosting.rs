@@ -533,6 +533,17 @@ fn preparing_an_accepted_stream_makes_it_wait_rather_than_spin() {
 
     prepare_panel_stream(&accepted).unwrap();
 
+    assert_eq!(
+        accepted.read_timeout().unwrap(),
+        Some(PANEL_READ_TIMEOUT),
+        "a quiet panel must not stall the loop"
+    );
+    assert_eq!(
+        accepted.write_timeout().unwrap(),
+        Some(hyper_runtime_host::PANEL_WRITE_TIMEOUT),
+        "a panel that stops reading must not stall it either"
+    );
+
     let mut buffer = [0_u8; 16];
     let started = Instant::now();
     let outcome = (&accepted).read(&mut buffer);
@@ -882,9 +893,119 @@ fn a_link_that_never_bound_releases_nothing() {
     let mut link = PanelLink::new(config());
 
     assert!(!link.holds_bindings());
-    assert_eq!(
-        link.close(&mut host, PanelClosure::PeerClosed),
-        hyper_runtime_host::PanelStep::Closed(PanelClosure::PeerClosed)
-    );
+    link.release(&mut host);
     assert!(host.commands().is_empty());
+}
+
+#[test]
+fn each_accepted_panel_gets_its_own_session_identifier() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    let mut sessions = Vec::new();
+    let mut connected = 0_usize;
+
+    // A fresh peer is offered for each pass; the callback stops after two.
+    drop(TcpStream::connect(address).unwrap());
+    serve_panels(
+        &listener,
+        &mut host,
+        config(),
+        &stop,
+        || 0,
+        |served| {
+            sessions.push(served.session_id);
+            connected += 1;
+            if connected < 2 {
+                drop(TcpStream::connect(address).unwrap());
+            } else {
+                stop.store(true, Ordering::Release);
+            }
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        sessions,
+        vec![1, 2],
+        "a run of failures must be distinguishable from one failure reported twice"
+    );
+}
+
+#[test]
+fn the_accept_loop_really_serves_the_panel_it_accepted() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    // A real panel on the far end of a real connection, driven from its own
+    // thread because `serve_panels` owns the accept loop on this one.
+    let panel = std::thread::spawn(move || {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(PANEL_READ_TIMEOUT)).unwrap();
+        let mut simulator = PanelSimulator::new(PanelSimulatorConfig {
+            descriptor: descriptor(2, 4),
+            bootloader_available: false,
+        })
+        .unwrap();
+        let mut scratch = [0_u8; 2048];
+        let mut turned = false;
+        for step in 0..200_u64 {
+            let now = step * 10;
+            match stream.read(&mut scratch) {
+                Ok(0) => break,
+                Ok(read) => {
+                    simulator.receive_runtime_bytes(&scratch[..read], now);
+                }
+                Err(error) if hyper_runtime_host::is_quiet(error.kind()) => {}
+                Err(_) => break,
+            }
+            if !turned && simulator.is_connected() {
+                simulator.encoder_delta(1, 4, now).unwrap();
+                turned = true;
+            }
+            simulator.poll(now).unwrap();
+            let produced = simulator.read_panel_bytes(&mut scratch);
+            if produced > 0 && stream.write_all(&scratch[..produced]).is_err() {
+                break;
+            }
+            if turned && step > 20 {
+                break;
+            }
+        }
+        drop(stream);
+    });
+
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    let mut reported = 0_usize;
+    serve_panels(
+        &listener,
+        &mut host,
+        config(),
+        &stop,
+        || {
+            static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            TICK.fetch_add(10, Ordering::Relaxed)
+        },
+        |_| {
+            reported += 1;
+            stop.store(true, Ordering::Release);
+        },
+    )
+    .unwrap();
+    panel.join().unwrap();
+
+    assert_eq!(reported, 1);
+    assert_eq!(
+        host.commands(),
+        [RuntimeControlCommand::ChannelGain {
+            channel_index: 1,
+            gain_millionths: 1_000_000 + 4 * DEFAULT_GAIN_STEP_MILLIONTHS,
+        }],
+        "the loop did not merely accept the panel, it served it"
+    );
 }

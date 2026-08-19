@@ -330,24 +330,24 @@ impl PanelLink {
             match event {
                 PanelEvent::Connected(descriptor) => {
                     let bindings = default_layout(descriptor, host.mixer_channel_count());
-                    match host.connect_panel(descriptor, &bindings) {
-                        Ok(connection) => {
-                            if !connection.is_fully_installed() {
-                                self.notices.push(PanelNotice::BindingsRefused {
-                                    count: connection.refused().len(),
-                                });
-                            }
-                            self.bound = true;
-                        }
-                        Err(_) => return self.close(host, PanelClosure::LinkLost),
+                    let Ok(connection) = host.connect_panel(descriptor, &bindings) else {
+                        self.release(host);
+                        return PanelStep::Closed(PanelClosure::LinkLost);
+                    };
+                    if !connection.is_fully_installed() {
+                        self.notices.push(PanelNotice::BindingsRefused {
+                            count: connection.refused().len(),
+                        });
                     }
+                    self.bound = true;
                 }
                 PanelEvent::Input(message) => self.deliver(message, host),
                 PanelEvent::Fault(_)
                 | PanelEvent::TimedOut
                 | PanelEvent::VersionRejected
                 | PanelEvent::Undecodable(_) => {
-                    return self.close(host, PanelClosure::LinkLost);
+                    self.release(host);
+                    return PanelStep::Closed(PanelClosure::LinkLost);
                 }
             }
         }
@@ -375,13 +375,13 @@ impl PanelLink {
         }
     }
 
-    /// Ends the connection, releasing anything the panel still holds.
+    /// Releases anything the panel still holds and forgets its bindings.
     ///
     /// Releases are retried a bounded number of times. A control the sink keeps
     /// refusing is reported and left held rather than spun on — the host's own
     /// `panel_connected` stays true in that case, which the caller must treat
     /// as fatal rather than as a panel it can replace.
-    pub fn close<H: PanelHost>(&mut self, host: &mut H, closure: PanelClosure) -> PanelStep {
+    pub fn release<H: PanelHost>(&mut self, host: &mut H) {
         if self.bound {
             let mut outstanding = Vec::new();
             for _ in 0..RELEASE_ATTEMPTS {
@@ -399,7 +399,6 @@ impl PanelLink {
             }
             self.bound = false;
         }
-        PanelStep::Closed(closure)
     }
 }
 
@@ -427,13 +426,7 @@ where
 {
     let mut link = PanelLink::new(config);
     let outcome = drive_panel(&mut link, stream, host, session_id, stop, &mut clock);
-    link.close(
-        host,
-        match &outcome {
-            Ok(closure) => *closure,
-            Err(_) => PanelClosure::LinkLost,
-        },
-    );
+    link.release(host);
     let notices = link.take_notices();
     (outcome, notices)
 }
@@ -534,10 +527,10 @@ impl Error for ServeError {}
 /// accepting: a control surface is an accessory, and losing one must not stop
 /// the project the runtime is hosting.
 ///
-/// Between panels the backlog is drained, so a second panel that connected
-/// while one was being served is turned away rather than promoted stale. It is
-/// drained *after* a panel ends rather than during, so a panel that resets and
-/// reconnects is not destroyed by its own replacement being refused.
+/// The backlog is drained immediately after a panel is accepted, so anything
+/// queued behind it is turned away rather than promoted stale later. Draining
+/// then rather than after the session means a panel that resets and reconnects
+/// during the next idle period is served normally.
 ///
 /// # Errors
 ///
@@ -566,6 +559,11 @@ where
             }
             Err(error) => return Err(ServeError::Listener(error)),
         };
+        // Anything queued behind the panel just taken is turned away now, at
+        // the moment one panel is committed to. Draining after the session
+        // instead would also refuse panels that arrived later — including the
+        // same panel reconnecting after a reset.
+        refuse_waiting_panels(listener);
         let (outcome, notices) = match prepare_panel_stream(&stream) {
             Ok(()) => serve_panel(&mut stream, host, config, session_id, stop, &mut clock),
             Err(error) => (Err(error), Vec::new()),
@@ -580,7 +578,6 @@ where
         if host.panel_connected() {
             return Err(ServeError::ControlsStillHeld);
         }
-        refuse_waiting_panels(listener);
     }
     Ok(())
 }
