@@ -1009,3 +1009,50 @@ fn the_accept_loop_really_serves_the_panel_it_accepted() {
         "the loop did not merely accept the panel, it served it"
     );
 }
+
+#[test]
+fn a_panel_that_dies_mid_connection_costs_one_panel_and_not_the_service() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    // Reading one byte proves the offer arrived; dropping with the rest still
+    // unread is what a panel losing power looks like on the wire — a reset
+    // rather than an orderly close.
+    let dying = std::thread::spawn(move || {
+        let mut stream = TcpStream::connect(address).unwrap();
+        let mut one = [0_u8; 1];
+        let _ = stream.read(&mut one);
+        drop(stream);
+    });
+
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    let mut reported: Vec<bool> = Vec::new();
+    let mut second_offered = false;
+
+    serve_panels(
+        &listener,
+        &mut host,
+        config(),
+        &stop,
+        || 0,
+        |served| {
+            reported.push(served.outcome.is_err());
+            if second_offered {
+                stop.store(true, Ordering::Release);
+            } else {
+                second_offered = true;
+                drop(TcpStream::connect(address).unwrap());
+            }
+        },
+    )
+    .unwrap();
+    dying.join().unwrap();
+
+    assert_eq!(
+        reported.len(),
+        2,
+        "a panel dying mid-connection must not stop the service: {reported:?}"
+    );
+}
