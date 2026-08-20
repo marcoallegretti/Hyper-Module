@@ -385,6 +385,59 @@ fn bind_callbacks(
 fn bind_project_callbacks(ui: &MainWindow, worker: &WorkerCell) {
     bind_project_creation_callback(ui, worker);
     bind_project_open_callback(ui, worker);
+    bind_runtime_preparation_callback(ui, worker);
+}
+
+fn bind_runtime_preparation_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_preparation = Rc::clone(worker);
+    actions.on_prepare_runtime(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_mixer_main_state_available() {
+            ui.set_error_text(
+                "Committed mixer state is not available for Runtime preparation".into(),
+            );
+            return;
+        }
+        ui.set_app_mode(AppMode::PreparingRuntime);
+        ui.set_error_text(SharedString::default());
+        ui.set_status_text("Waiting for the Runtime bundle destination…".into());
+        let weak_for_dialog = weak.clone();
+        let worker = Rc::clone(&worker_for_preparation);
+        let spawn_result = slint::spawn_local(async move {
+            let selection = rfd::AsyncFileDialog::new()
+                .set_title("Prepare verified Runtime bundle")
+                .set_file_name("project.runtime")
+                .save_file()
+                .await;
+            let Some(ui) = weak_for_dialog.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::PreparingRuntime {
+                return;
+            }
+            let Some(selection) = selection else {
+                ui.set_app_mode(AppMode::Running);
+                ui.set_status_text("Runtime preparation cancelled".into());
+                return;
+            };
+            let output_path = selection.path().to_path_buf();
+            ui.set_runtime_bundle_destination(output_path.display().to_string().into());
+            ui.set_runtime_bundle_summary(SharedString::default());
+            submit_to_ui(
+                &ui,
+                &worker,
+                IdeWorkerCommand::PrepareRuntime { output_path },
+            );
+        });
+        if spawn_result.is_err() {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Runtime bundle destination selection is unavailable".into());
+        }
+    });
 }
 
 fn bind_project_creation_callback(ui: &MainWindow, worker: &WorkerCell) {
@@ -3013,6 +3066,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         }
         IdeWorkerCommandKind::EditControlMapping => AppMode::EditingControlMapping,
         IdeWorkerCommandKind::ExportProject => AppMode::ExportingProject,
+        IdeWorkerCommandKind::PrepareRuntime => AppMode::PreparingRuntime,
         IdeWorkerCommandKind::Undo | IdeWorkerCommandKind::Redo => AppMode::RestoringEdit,
         IdeWorkerCommandKind::MoveArrangementSceneLaunch => AppMode::MovingArrangementSceneLaunch,
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => {
@@ -3074,6 +3128,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::Mixer => "Mixer command queued…",
         IdeWorkerCommandKind::Monitoring => "Applying input cue control…",
         IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
+        IdeWorkerCommandKind::PrepareRuntime => {
+            "Saving the project and compiling a verified Runtime bundle…"
+        }
         IdeWorkerCommandKind::AddArrangementSceneLaunch => {
             "Preserving mixer state, adding the scene marker, and reopening project..."
         }
@@ -3406,6 +3463,31 @@ fn apply_event(
         }
         event @ (IdeWorkerEvent::ProjectExporting | IdeWorkerEvent::ProjectExported { .. }) => {
             apply_project_export_event(ui, &event);
+        }
+        IdeWorkerEvent::RuntimePreparing => {
+            ui.set_app_mode(AppMode::PreparingRuntime);
+            ui.set_status_text("Saving the project before compiling its Runtime bundle…".into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RuntimePrepared { bundle } => {
+            let identity = encode_sha256(bundle.bundle_sha256());
+            ui.set_app_mode(AppMode::Running);
+            ui.set_runtime_bundle_destination(bundle.output_path().display().to_string().into());
+            ui.set_runtime_bundle_summary(
+                format!(
+                    "{} Runtime bundle · {} bytes · SHA-256 {}",
+                    if bundle.reused() {
+                        "Reused verified"
+                    } else {
+                        "Prepared"
+                    },
+                    bundle.bundle_byte_length(),
+                    identity
+                )
+                .into(),
+            );
+            ui.set_status_text("Runtime bundle is ready".into());
+            ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::MeterChanging => {
             ui.set_status_text("Saving the time signature...".into());
@@ -5759,6 +5841,8 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_export_available(false);
     ui.set_export_destination(SharedString::default());
     ui.set_export_summary(SharedString::default());
+    ui.set_runtime_bundle_destination(SharedString::default());
+    ui.set_runtime_bundle_summary(SharedString::default());
     ui.set_undo_label(SharedString::default());
     ui.set_redo_label(SharedString::default());
     ui.set_undo_available(false);
@@ -5867,6 +5951,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::ExportProject if current == AppMode::ExportingProject => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::PrepareRuntime if current == AppMode::PreparingRuntime => {
             AppMode::Running
         }
         IdeWorkerCommandKind::Undo | IdeWorkerCommandKind::Redo
@@ -8141,6 +8228,16 @@ fn compact_name(name: &str, maximum_chars: usize) -> String {
     display
 }
 
+fn encode_sha256(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
 fn set_mixer(ui: &MainWindow, channels: &[IdeMixerChannel]) {
     let current = ui.get_mixer_channels();
     let unchanged = current.row_count() == channels.len()
@@ -9484,6 +9581,26 @@ mod tests {
             ),
             AppMode::OutputTesting
         );
+    }
+
+    #[test]
+    fn runtime_preparation_has_a_dedicated_recoverable_mode() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::PreparingRuntime,
+                IdeWorkerCommandKind::PrepareRuntime,
+            ),
+            AppMode::PreparingRuntime
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::PreparingRuntime,
+                IdeWorkerCommandKind::PrepareRuntime,
+            ),
+            AppMode::Running
+        );
+        assert!(command_status(IdeWorkerCommandKind::PrepareRuntime).contains("Runtime bundle"));
+        assert_eq!(encode_sha256(&[0xab; 32]), "ab".repeat(32));
     }
 
     #[test]

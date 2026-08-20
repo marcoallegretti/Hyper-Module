@@ -26,6 +26,7 @@ hyper-project-model = { path = "../../../crates/project-model" }
 hyper-recording-journal = { path = "../../../crates/recording-journal" }
 hyper-recording-metadata = { path = "../../../crates/recording-metadata" }
 hyper-recording-worker = { path = "../../../crates/recording-worker" }
+hyper-runtime-bundle-builder = { path = "../runtime-bundle-builder" }
 hyper-storage-engine = { path = "../../../crates/storage-engine" }
 hyper-thread-supervisor = { path = "../../../crates/thread-supervisor" }
 uuid = { version = "=1.24.0", features = ["v4"] }
