@@ -209,6 +209,15 @@ pub fn identity(metadata: &Metadata) -> (u64, u64) {
 /// Returns an I/O or validation error when the entry is linked, non-regular,
 /// oversized, replaced, or changes while it is read.
 pub fn read_stable_file(directory: &Dir, name: &str, maximum_bytes: u64) -> io::Result<Vec<u8>> {
+    read_stable_file_observed(directory, name, maximum_bytes, || Ok(()))
+}
+
+fn read_stable_file_observed(
+    directory: &Dir,
+    name: &str,
+    maximum_bytes: u64,
+    after_first_read: impl FnOnce() -> io::Result<()>,
+) -> io::Result<Vec<u8>> {
     let published = directory.symlink_metadata(name)?;
     if published.file_type().is_symlink() || !published.is_file() {
         return Err(invalid_argument(
@@ -231,7 +240,9 @@ pub fn read_stable_file(directory: &Dir, name: &str, maximum_bytes: u64) -> io::
             "stable file identity changed before reading",
         ));
     }
+    let before_stamp = metadata_stamp(&file)?;
     let first = read_bounded(&mut file, before.len(), maximum_bytes)?;
+    after_first_read()?;
     file.seek(SeekFrom::Start(0))?;
     let second = read_bounded(&mut file, before.len(), maximum_bytes)?;
     let after = file.metadata()?;
@@ -240,6 +251,7 @@ pub fn read_stable_file(directory: &Dir, name: &str, maximum_bytes: u64) -> io::
         || !after.is_file()
         || after.len() != first.len() as u64
         || identity(&after) != published_identity
+        || metadata_stamp(&file)? != before_stamp
         || republished.file_type().is_symlink()
         || !republished.is_file()
         || identity(&republished) != published_identity
@@ -247,6 +259,31 @@ pub fn read_stable_file(directory: &Dir, name: &str, maximum_bytes: u64) -> io::
         return Err(invalid_argument("stable file changed while being read"));
     }
     Ok(first)
+}
+
+#[cfg(unix)]
+fn metadata_stamp(file: &File) -> io::Result<(i64, i64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.try_clone()?.into_std().metadata()?;
+    Ok((
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    ))
+}
+
+#[cfg(windows)]
+fn metadata_stamp(file: &File) -> io::Result<(u64, u64, u32)> {
+    use std::os::windows::fs::MetadataExt;
+
+    let metadata = file.try_clone()?.into_std().metadata()?;
+    Ok((
+        metadata.last_write_time(),
+        metadata.creation_time(),
+        metadata.file_attributes(),
+    ))
 }
 
 /// Synchronizes a retained directory authority.
@@ -502,6 +539,28 @@ fn create_verified_directory(
     Ok(())
 }
 
+/// Removes an identity-bound child directory without following replacement
+/// entries.
+///
+/// # Errors
+///
+/// Returns an I/O or validation error when the published child is not the
+/// expected retained directory identity.
+pub fn remove_directory_entry(
+    parent: &Dir,
+    name: &str,
+    expected_identity: (u64, u64),
+) -> io::Result<()> {
+    let directory = parent.open_dir_nofollow(name)?;
+    let metadata = directory.dir_metadata()?;
+    if !metadata.is_dir() || identity(&metadata) != expected_identity {
+        return Err(invalid_argument(
+            "directory entry identity does not match retained authority",
+        ));
+    }
+    directory.remove_open_dir_all()
+}
+
 fn remove_verified_directory_entry(
     arguments: &mut impl Iterator<Item = String>,
 ) -> Result<(), Box<dyn Error>> {
@@ -518,14 +577,7 @@ fn remove_verified_directory_entry(
     }
 
     let parent = open_verified_directory(&parent, (expected_device, expected_file))?;
-    let directory = parent.open_dir_nofollow(&name)?;
-    let metadata = directory.dir_metadata()?;
-    if !metadata.is_dir() || identity(&metadata) != (entry_device, entry_file) {
-        return Err(
-            invalid_argument("directory entry identity does not match retained authority").into(),
-        );
-    }
-    directory.remove_open_dir_all()?;
+    remove_directory_entry(&parent, &name, (entry_device, entry_file))?;
     Ok(())
 }
 
@@ -965,7 +1017,10 @@ mod stable_file_tests {
     use cap_std::ambient_authority;
     use cap_std::fs::Dir;
 
-    use super::{open_syncable_directory_ambient, read_stable_file, sync_directory};
+    use super::{
+        open_syncable_directory_ambient, read_stable_file, read_stable_file_observed,
+        sync_directory,
+    };
 
     struct TemporaryDirectory(PathBuf);
 
@@ -1013,5 +1068,76 @@ mod stable_file_tests {
         let directory = open_syncable_directory_ambient(temporary.path()).unwrap();
 
         sync_directory(&directory).unwrap();
+    }
+
+    #[test]
+    fn stable_read_rejects_a_same_byte_rewrite() {
+        let temporary = TemporaryDirectory::new();
+        let path = temporary.path().join("state.json");
+        fs::write(&path, b"stable").unwrap();
+        let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+
+        let result =
+            read_stable_file_observed(&directory, "state.json", 6, || fs::write(&path, b"stable"));
+
+        assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod directory_entry_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+
+    use super::{identity, remove_directory_entry};
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl TemporaryDirectory {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "hyper-fs-authority-entry-{}-{nonce}",
+                std::process::id(),
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn identity_bound_removal_preserves_a_replacement() {
+        let temporary = TemporaryDirectory::new();
+        let original = temporary.path().join("entry");
+        let displaced = temporary.path().join("displaced");
+        fs::create_dir(&original).unwrap();
+        let parent = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+        let original_identity = identity(&parent.symlink_metadata("entry").unwrap());
+        fs::rename(&original, &displaced).unwrap();
+        fs::create_dir(&original).unwrap();
+        fs::write(original.join("replacement"), b"preserve").unwrap();
+
+        let result = remove_directory_entry(&parent, "entry", original_identity);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(original.join("replacement")).unwrap(), b"preserve");
+        assert!(displaced.is_dir());
     }
 }
