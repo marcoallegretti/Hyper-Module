@@ -78,13 +78,13 @@ pub const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// What the runtime was asked to host.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeArguments {
-    project_root: PathBuf,
+    bundle_root: PathBuf,
     panel_listen: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArgumentError {
-    MissingProjectRoot,
+    MissingBundleRoot,
     UnknownOption(String),
     MissingValue(&'static str),
     UnreadableAddress(String),
@@ -94,7 +94,7 @@ pub enum ArgumentError {
 impl fmt::Display for ArgumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingProjectRoot => formatter.write_str("no project directory was given"),
+            Self::MissingBundleRoot => formatter.write_str("no runtime bundle directory was given"),
             Self::UnknownOption(option) => write!(formatter, "unknown option {option}"),
             Self::MissingValue(option) => write!(formatter, "{option} needs a value"),
             Self::UnreadableAddress(value) => {
@@ -121,7 +121,7 @@ impl RuntimeArguments {
     where
         I: IntoIterator<Item = String>,
     {
-        let mut project_root = None;
+        let mut bundle_root = None;
         let mut panel_listen = None;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
@@ -142,21 +142,21 @@ impl RuntimeArguments {
                 option if option.starts_with("--") => {
                     return Err(ArgumentError::UnknownOption(option.to_owned()));
                 }
-                _ if project_root.is_some() => {
-                    return Err(ArgumentError::Repeated("the project directory"));
+                _ if bundle_root.is_some() => {
+                    return Err(ArgumentError::Repeated("the runtime bundle directory"));
                 }
-                _ => project_root = Some(PathBuf::from(argument)),
+                _ => bundle_root = Some(PathBuf::from(argument)),
             }
         }
         Ok(Self {
-            project_root: project_root.ok_or(ArgumentError::MissingProjectRoot)?,
+            bundle_root: bundle_root.ok_or(ArgumentError::MissingBundleRoot)?,
             panel_listen,
         })
     }
 
     #[must_use]
-    pub fn project_root(&self) -> &Path {
-        &self.project_root
+    pub fn bundle_root(&self) -> &Path {
+        &self.bundle_root
     }
 
     #[must_use]

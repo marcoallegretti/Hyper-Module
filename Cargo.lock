@@ -2369,6 +2369,7 @@ dependencies = [
  "hyper-playback-json",
  "hyper-playback-session",
  "hyper-project-loader",
+ "hyper-runtime-bundle",
  "hyper-runtime-host",
 ]
 

@@ -930,24 +930,18 @@ fn a_project_with_more_channels_than_a_panel_can_address_binds_every_control() {
 }
 
 #[test]
-fn arguments_name_a_project_and_optionally_a_panel_address() {
-    let parsed = RuntimeArguments::parse(["/projects/demo".to_owned()]).unwrap();
-    assert_eq!(
-        parsed.project_root(),
-        std::path::Path::new("/projects/demo")
-    );
+fn arguments_name_a_runtime_bundle_and_optionally_a_panel_address() {
+    let parsed = RuntimeArguments::parse(["/bundles/demo".to_owned()]).unwrap();
+    assert_eq!(parsed.bundle_root(), std::path::Path::new("/bundles/demo"));
     assert_eq!(parsed.panel_listen(), None);
 
     let parsed = RuntimeArguments::parse([
         "--panel-listen".to_owned(),
         "127.0.0.1:9000".to_owned(),
-        "/projects/demo".to_owned(),
+        "/bundles/demo".to_owned(),
     ])
     .unwrap();
-    assert_eq!(
-        parsed.project_root(),
-        std::path::Path::new("/projects/demo")
-    );
+    assert_eq!(parsed.bundle_root(), std::path::Path::new("/bundles/demo"));
     assert_eq!(
         parsed.panel_listen(),
         Some("127.0.0.1:9000".parse::<SocketAddr>().unwrap())
@@ -958,7 +952,7 @@ fn arguments_name_a_project_and_optionally_a_panel_address() {
 fn a_malformed_argument_list_is_reported_rather_than_assumed() {
     assert_eq!(
         RuntimeArguments::parse(Vec::new()),
-        Err(ArgumentError::MissingProjectRoot)
+        Err(ArgumentError::MissingBundleRoot)
     );
     assert_eq!(
         RuntimeArguments::parse(["--panel-listen".to_owned()]),
@@ -976,7 +970,7 @@ fn a_malformed_argument_list_is_reported_rather_than_assumed() {
     );
     assert_eq!(
         RuntimeArguments::parse(["one".to_owned(), "two".to_owned()]),
-        Err(ArgumentError::Repeated("the project directory"))
+        Err(ArgumentError::Repeated("the runtime bundle directory"))
     );
     assert_eq!(
         RuntimeArguments::parse([
@@ -992,7 +986,7 @@ fn a_malformed_argument_list_is_reported_rather_than_assumed() {
 #[test]
 fn every_argument_failure_says_what_was_wrong() {
     let rendered: Vec<String> = [
-        ArgumentError::MissingProjectRoot,
+        ArgumentError::MissingBundleRoot,
         ArgumentError::UnknownOption("--nope".to_owned()),
         ArgumentError::MissingValue("--panel-listen"),
         ArgumentError::UnreadableAddress("1.2.3".to_owned()),
@@ -1002,7 +996,7 @@ fn every_argument_failure_says_what_was_wrong() {
     .map(ToString::to_string)
     .collect();
 
-    assert!(rendered[0].contains("project directory"));
+    assert!(rendered[0].contains("runtime bundle directory"));
     assert!(rendered[1].contains("--nope"));
     assert!(rendered[2].contains("--panel-listen"));
     assert!(rendered[3].contains("1.2.3"));
@@ -1494,8 +1488,7 @@ fn a_display_that_has_not_changed_sends_nothing_more() {
     let stop = AtomicBool::new(false);
     let mut host = Host::new(CHANNELS);
     let now = Rc::new(Cell::new(0_u64));
-    let (mut link, _driver) =
-        connected_link(&mut host, display_descriptor(2, 4), &stop, &now);
+    let (mut link, _driver) = connected_link(&mut host, display_descriptor(2, 4), &stop, &now);
 
     let first = link.refresh_display(&mut host, now.get());
     let second = link.refresh_display(&mut host, now.get());

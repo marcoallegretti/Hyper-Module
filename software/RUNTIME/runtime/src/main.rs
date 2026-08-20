@@ -1,4 +1,4 @@
-//! The runtime process: hosts one project and serves one panel.
+//! The runtime process: hosts one verified bundle and serves one panel.
 
 #![forbid(unsafe_code)]
 
@@ -20,6 +20,7 @@ use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
 use hyper_playback_json::LoaderLimits;
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::ProjectPlaybackLimits;
+use hyper_runtime_bundle::prepare_runtime_bundle;
 use hyper_runtime_host::{PanelHost, RuntimeArguments, ServeError, ServedPanel, serve_panels};
 
 /// The runtime's own hosting policy. Stated here rather than borrowed from the
@@ -32,6 +33,7 @@ const MAX_AUDIO_FRAMES: u64 = 43_200_000;
 const MAX_AUDIO_DECODED_BYTES: usize = 1_024 * 1_024 * 1_024;
 const MAX_PROJECT_RESOURCE_BYTES: usize = 1_024 * 1_024 * 1_024;
 const MAX_PROJECT_DECODED_BYTES: usize = 1_024 * 1_024 * 1_024;
+const MAX_RUNTIME_BUNDLE_BYTES: u64 = 1_024 * 1_024 * 1_024;
 
 const HEARTBEAT_INTERVAL_MS: u32 = 50;
 const HEARTBEAT_TIMEOUT_MS: u32 = 500;
@@ -87,22 +89,30 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let arguments = RuntimeArguments::parse(std::env::args().skip(1)).map_err(|error| {
-        format!("{error}\nusage: hyper-runtime <project-directory> [--panel-listen ADDRESS]")
+        format!("{error}\nusage: hyper-runtime <runtime-bundle-directory> [--panel-listen ADDRESS]")
     })?;
 
+    let bundle = prepare_runtime_bundle(
+        arguments.bundle_root(),
+        env!("CARGO_PKG_VERSION"),
+        MAX_RUNTIME_BUNDLE_BYTES,
+        limits()?,
+    )
+    .map_err(|error| {
+        format!(
+            "{} could not be verified and prepared: {error}",
+            arguments.bundle_root().display()
+        )
+    })?;
+    let bundle_identity = hex_digest(bundle.bundle_sha256());
     let output = DesktopOutputConfig::try_new(SAMPLE_RATE_HZ, MAXIMUM_BLOCK_FRAMES)
         .map_err(|error| format!("output configuration is invalid: {error}"))?;
-    let session = DesktopPlaybackSession::open_project(output, arguments.project_root(), limits()?)
-        .map_err(|error| {
-            format!(
-                "{} could not be hosted: {error}",
-                arguments.project_root().display()
-            )
-        })?;
+    let session = DesktopPlaybackSession::start_project(output, bundle.into_project())
+        .map_err(|error| format!("verified bundle could not be hosted: {error}"))?;
     let mut host = SessionHost(session);
     println!(
-        "hosting {} with {} mixer channels",
-        arguments.project_root().display(),
+        "hosting bundle {bundle_identity} from {} with {} mixer channels",
+        arguments.bundle_root().display(),
         host.mixer_channel_count()
     );
 
@@ -279,6 +289,15 @@ fn watch_for_quit(stop: Arc<AtomicBool>) {
 
 fn millis_since(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn hex_digest(value: &[u8; 32]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in value {
+        use core::fmt::Write;
+        write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    output
 }
 
 #[cfg(test)]
