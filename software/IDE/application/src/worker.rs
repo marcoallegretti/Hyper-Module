@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use hyper_desktop_audio::{DesktopAudioPreviewSnapshot, DesktopAudioPreviewState};
 use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, TransportCommand};
 use hyper_playback_json::SceneTrackAction;
+use hyper_project_history::{ProjectHistory, ProjectHistoryError, RecentProject};
 use hyper_recording_metadata::RecordingCaptureKind;
 use hyper_runtime_bundle_builder::{
     DEFAULT_MAXIMUM_RUNTIME_BUNDLE_BYTES, PublishedRuntimeBundle, RuntimeBundleBuildError,
@@ -204,6 +205,7 @@ pub enum IdeWorkerCommand {
         project_name: String,
     },
     OpenProject(PathBuf),
+    OpenRecentProject(PathBuf),
     Transport(TransportCommand),
     Seek {
         frame: usize,
@@ -402,7 +404,7 @@ impl IdeWorkerCommand {
             Self::StartOutputTest => IdeWorkerCommandKind::StartOutputTest,
             Self::StopOutputTest => IdeWorkerCommandKind::StopOutputTest,
             Self::CreateProject { .. } => IdeWorkerCommandKind::CreateProject,
-            Self::OpenProject(_) => IdeWorkerCommandKind::OpenProject,
+            Self::OpenProject(_) | Self::OpenRecentProject(_) => IdeWorkerCommandKind::OpenProject,
             Self::Transport(_) => IdeWorkerCommandKind::Transport,
             Self::Seek { .. } => IdeWorkerCommandKind::Seek,
             Self::LocatePlacement { .. } => IdeWorkerCommandKind::LocatePlacement,
@@ -1426,6 +1428,7 @@ pub enum IdeWorkerCommandFailure {
     InputSelection(IdeInputSelectionError),
     ProjectCreation(Box<IdeProjectCreationError>),
     ProjectOpen(IdeProjectOpenError),
+    RecentProjectMissing(PathBuf),
     Transport(super::DesktopDirectControlError),
     Seek(IdeTransportSeekError),
     ArrangementLocate(IdeArrangementLocateError),
@@ -1492,6 +1495,9 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::InputSelection(source) => source.fmt(formatter),
             Self::ProjectCreation(source) => source.fmt(formatter),
             Self::ProjectOpen(source) => source.fmt(formatter),
+            Self::RecentProjectMissing(path) => {
+                write!(formatter, "recent project no longer exists at {}", path.display())
+            }
             Self::Transport(source) => source.fmt(formatter),
             Self::Seek(source) => source.fmt(formatter),
             Self::ArrangementLocate(source) => source.fmt(formatter),
@@ -1613,6 +1619,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::Publication(source) => Some(source),
             Self::InputPublication(source) => Some(source),
             Self::InvalidState
+            | Self::RecentProjectMissing(_)
             | Self::ProjectPublicationCapacityUnavailable
             | Self::ProjectSnapshotUnavailable
             | Self::NothingToRestore => None,
@@ -1665,6 +1672,10 @@ impl Error for IdeAudioClipEditCommittedWarning {
     reason = "events transfer fixed-size owned observations without an additional infallible allocation"
 )]
 pub enum IdeWorkerEvent {
+    RecentProjectsChanged {
+        projects: Vec<RecentProject>,
+    },
+    ProjectHistoryWarning(ProjectHistoryError),
     Closed {
         snapshot: IdeClosedSnapshot,
         native_failure: Option<IdeNativeCloseFailure>,
@@ -2135,15 +2146,45 @@ impl DesktopIdeWorker {
         command_capacity: usize,
         event_capacity: usize,
     ) -> Result<Self, IdeWorkerStartError> {
-        Self::start_state(
+        Self::start_state_with_history(
             WorkerState::Undiscovered(application),
+            None,
             command_capacity,
             event_capacity,
         )
     }
 
+    /// Starts the sole blocking application owner with a persistent recent-project authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, supervisor-capacity, or thread-spawn failure.
+    pub fn start_with_project_history(
+        application: IdeApplicationConfig,
+        project_history: ProjectHistory,
+        command_capacity: usize,
+        event_capacity: usize,
+    ) -> Result<Self, IdeWorkerStartError> {
+        Self::start_state_with_history(
+            WorkerState::Undiscovered(application),
+            Some(project_history),
+            command_capacity,
+            event_capacity,
+        )
+    }
+
+    #[cfg(test)]
     fn start_state(
         state: WorkerState,
+        command_capacity: usize,
+        event_capacity: usize,
+    ) -> Result<Self, IdeWorkerStartError> {
+        Self::start_state_with_history(state, None, command_capacity, event_capacity)
+    }
+
+    fn start_state_with_history(
+        state: WorkerState,
+        project_history: Option<ProjectHistory>,
         command_capacity: usize,
         event_capacity: usize,
     ) -> Result<Self, IdeWorkerStartError> {
@@ -2167,7 +2208,12 @@ impl DesktopIdeWorker {
             .name("hyper-desktop-ide".to_owned())
             .spawn(move || {
                 let _completion = CompletionSignal(completion_sender);
-                run_worker(state, &command_receiver, &event_sender)
+                run_worker(
+                    state,
+                    project_history.as_ref(),
+                    &command_receiver,
+                    &event_sender,
+                )
             })
             .map_err(IdeWorkerStartError::ThreadSpawn)?;
         Ok(Self {
@@ -2828,11 +2874,15 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
 
 fn run_worker(
     mut state: WorkerState,
+    project_history: Option<&ProjectHistory>,
     commands: &Receiver<IdeWorkerCommand>,
     events: &SyncSender<IdeWorkerEvent>,
 ) -> IdeWorkerShutdownReport {
     let mut unpublished_native_failure = None;
     let mut history = UndoHistory::default();
+    if !publish_project_history(project_history, events) {
+        return finish_worker(state, unpublished_native_failure);
+    }
     if !initialize_state(&mut state, events, &mut unpublished_native_failure) {
         return finish_worker(state, unpublished_native_failure);
     }
@@ -2871,11 +2921,39 @@ fn run_worker(
             events,
             &mut unpublished_native_failure,
             &mut history,
+            project_history,
         ) {
             break;
         }
     }
     finish_worker(state, unpublished_native_failure)
+}
+
+fn publish_project_history(
+    project_history: Option<&ProjectHistory>,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    let Some(project_history) = project_history else {
+        return true;
+    };
+    match project_history.load() {
+        Ok(projects) => send_event(events, IdeWorkerEvent::RecentProjectsChanged { projects }),
+        Err(reason) => send_event(events, IdeWorkerEvent::ProjectHistoryWarning(reason)),
+    }
+}
+
+fn remember_running_project(
+    project_history: Option<&ProjectHistory>,
+    application: &RunningDesktopIdeApplication,
+    events: &SyncSender<IdeWorkerEvent>,
+) -> bool {
+    let (Some(project_history), Some(snapshot)) = (project_history, application.snapshot()) else {
+        return true;
+    };
+    match project_history.remember(snapshot.project_name, snapshot.project_path) {
+        Ok(projects) => send_event(events, IdeWorkerEvent::RecentProjectsChanged { projects }),
+        Err(reason) => send_event(events, IdeWorkerEvent::ProjectHistoryWarning(reason)),
+    }
 }
 
 fn initialize_state(
@@ -2970,12 +3048,14 @@ fn process_command(
     events: &SyncSender<IdeWorkerEvent>,
     unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
     history: &mut UndoHistory,
+    project_history: Option<&ProjectHistory>,
 ) -> bool {
     let kind = command.kind();
     if matches!(
         command,
         IdeWorkerCommand::CloseProject
             | IdeWorkerCommand::OpenProject(_)
+            | IdeWorkerCommand::OpenRecentProject(_)
             | IdeWorkerCommand::CreateProject { .. }
     ) && history.clear()
         && !send_event(events, history.state_event())
@@ -3010,10 +3090,24 @@ fn process_command(
             &project_name,
             events,
             unpublished_native_failure,
+            project_history,
         ),
         IdeWorkerCommand::OpenProject(path) => {
-            open_project(state, path, events, unpublished_native_failure)
+            open_project(
+                state,
+                path,
+                events,
+                unpublished_native_failure,
+                project_history,
+            )
         }
+        IdeWorkerCommand::OpenRecentProject(path) => open_recent_project(
+            state,
+            path,
+            events,
+            unpublished_native_failure,
+            project_history,
+        ),
         IdeWorkerCommand::Transport(command) => process_transport_command(state, command, events),
         IdeWorkerCommand::Seek { frame } => process_seek_command(state, frame, events),
         IdeWorkerCommand::LocatePlacement {
@@ -3350,6 +3444,7 @@ fn create_project(
     project_name: &str,
     events: &SyncSender<IdeWorkerEvent>,
     unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+    project_history: Option<&ProjectHistory>,
 ) -> bool {
     if !matches!(state, WorkerState::Closed(_)) {
         return publish_failure(
@@ -3384,8 +3479,9 @@ fn create_project(
     drop(creation);
     match application.open_project(&project_path) {
         Ok(running) => {
+            let history_published = remember_running_project(project_history, &running, events);
             *state = WorkerState::Running(running);
-            publish_state(state, events, unpublished_native_failure)
+            history_published && publish_state(state, events, unpublished_native_failure)
         }
         Err(failure) => {
             let (application, source) = failure.into_parts();
@@ -3409,6 +3505,7 @@ fn open_project(
     path: PathBuf,
     events: &SyncSender<IdeWorkerEvent>,
     unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+    project_history: Option<&ProjectHistory>,
 ) -> bool {
     if !matches!(state, WorkerState::Closed(_)) {
         return publish_failure(
@@ -3422,8 +3519,9 @@ fn open_project(
     };
     match application.open_project(path) {
         Ok(running) => {
+            let history_published = remember_running_project(project_history, &running, events);
             *state = WorkerState::Running(running);
-            publish_state(state, events, unpublished_native_failure)
+            history_published && publish_state(state, events, unpublished_native_failure)
         }
         Err(failure) => {
             let (application, reason) = failure.into_parts();
@@ -3434,6 +3532,40 @@ fn open_project(
                 IdeWorkerCommandFailure::ProjectOpen(reason),
             )
         }
+    }
+}
+
+fn open_recent_project(
+    state: &mut WorkerState,
+    path: PathBuf,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+    project_history: Option<&ProjectHistory>,
+) -> bool {
+    match std::fs::symlink_metadata(&path) {
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(project_history) = project_history {
+                let history_event = match project_history.forget(&path) {
+                    Ok(projects) => IdeWorkerEvent::RecentProjectsChanged { projects },
+                    Err(reason) => IdeWorkerEvent::ProjectHistoryWarning(reason),
+                };
+                if !send_event(events, history_event) {
+                    return false;
+                }
+            }
+            publish_failure(
+                events,
+                IdeWorkerCommandKind::OpenProject,
+                IdeWorkerCommandFailure::RecentProjectMissing(path),
+            )
+        }
+        Ok(_) | Err(_) => open_project(
+            state,
+            path,
+            events,
+            unpublished_native_failure,
+            project_history,
+        ),
     }
 }
 
@@ -10349,6 +10481,59 @@ mod tests {
     }
 
     #[test]
+    fn recent_project_history_is_loaded_and_proven_missing_entry_is_forgotten() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-history-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = fixture.join("config");
+        let project = fixture.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let history = ProjectHistory::at(&config);
+        history.remember("Daily Session", &project).unwrap();
+        let canonical_project = std::fs::canonicalize(&project).unwrap();
+
+        let worker = DesktopIdeWorker::start_state_with_history(
+            WorkerState::Closed(closed_application()),
+            Some(history.clone()),
+            3,
+            4,
+        )
+        .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RecentProjectsChanged { projects }
+                if projects.len() == 1
+                    && projects[0].name() == "Daily Session"
+                    && projects[0].path() == canonical_project
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+
+        std::fs::remove_dir(&project).unwrap();
+        worker
+            .try_send(IdeWorkerCommand::OpenRecentProject(canonical_project.clone()))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RecentProjectsChanged { projects } if projects.is_empty()
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::OpenProject,
+                reason: IdeWorkerCommandFailure::RecentProjectMissing(path),
+            } if path == canonical_project
+        ));
+        assert!(history.load().unwrap().is_empty());
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+
+        std::fs::remove_file(history.document_path()).unwrap();
+        std::fs::remove_file(config.join("recent-projects.lock")).unwrap();
+        std::fs::remove_dir(config).unwrap();
+        std::fs::remove_dir(fixture).unwrap();
+    }
+
+    #[test]
     fn closed_worker_publishes_selection_and_retains_failed_project_open() {
         let worker =
             DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 4, 4).unwrap();
@@ -12608,6 +12793,7 @@ mod tests {
             &events,
             &mut native,
             &mut history,
+            None,
         ));
         assert!(
             history.undo.is_empty() && history.redo.is_empty(),

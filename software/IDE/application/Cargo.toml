@@ -23,6 +23,7 @@ hyper-playback-json = { path = "../../../crates/playback-json" }
 hyper-playback-session = { path = "../../../crates/playback-session" }
 hyper-project-loader = { path = "../../../crates/project-loader" }
 hyper-project-model = { path = "../../../crates/project-model" }
+hyper-project-history = { path = "../project-history" }
 hyper-recording-journal = { path = "../../../crates/recording-journal" }
 hyper-recording-metadata = { path = "../../../crates/recording-metadata" }
 hyper-recording-worker = { path = "../../../crates/recording-worker" }

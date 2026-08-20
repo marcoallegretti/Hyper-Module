@@ -28,6 +28,7 @@ members = [
     "software/IDE/desktop-ui",
     "software/IDE/mapping-editor",
     "software/IDE/panel-simulator",
+    "software/IDE/project-history",
     "software/IDE/runtime-bundle-builder",
     "software/RUNTIME/control-runtime",
     "software/RUNTIME/deployment",

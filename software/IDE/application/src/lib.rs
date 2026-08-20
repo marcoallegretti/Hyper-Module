@@ -115,6 +115,10 @@ use hyper_mapping_editor::{
     MappingEditorPublicationError,
 };
 use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackLimits};
+pub use hyper_project_history::{
+    MAX_RECENT_PROJECTS, ProjectHistory, ProjectHistoryError, ProjectHistoryErrorKind,
+    RecentProject,
+};
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
