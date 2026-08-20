@@ -1155,7 +1155,7 @@ fn the_accept_loop_really_serves_the_panel_it_accepted() {
         parameter: hyper_control_mappings::ChannelParameter::Mute,
     });
     let mut seen: Vec<(u64, bool, usize)> = Vec::new();
-    serve_panels(
+    serve_panels_with_idle(
         &listener,
         &mut host,
         config(),
@@ -1177,12 +1177,21 @@ fn the_accept_loop_really_serves_the_panel_it_accepted() {
             );
             stop.store(true, Ordering::Release);
         },
+        |host| {
+            if host.panel_connected() {
+                host.idle_turns += 1;
+            }
+        },
     )
     .unwrap();
     panel.join().unwrap();
 
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].0, 1, "the first connection is session one");
+    assert!(
+        host.idle_turns > 0,
+        "the sole owner receives finite command turns while a live panel is quiet"
+    );
     assert!(
         seen[0].2 >= 1,
         "the refused binding reaches the operator through the callback: {seen:?}"
