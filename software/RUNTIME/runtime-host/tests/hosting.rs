@@ -115,7 +115,26 @@ impl RuntimeControlSink for Sink {
         command: Self::DirectCommand,
     ) -> Result<DirectControlStateUpdate, Self::DirectError> {
         self.try_send(command)?;
-        Ok(DirectControlStateUpdate::Unchanged)
+        // Reports the state effect the real sink reports; a double that always
+        // answers `Unchanged` cannot show a shadow following an edit made
+        // anywhere but the panel.
+        Ok(match command {
+            RuntimeControlCommand::ChannelGain {
+                channel_index,
+                gain_millionths,
+            } => DirectControlStateUpdate::Value {
+                target: ValueControlTarget::ChannelGain { channel_index },
+                value: i32::try_from(gain_millionths).unwrap(),
+            },
+            RuntimeControlCommand::ChannelMute {
+                channel_index,
+                muted,
+            } => DirectControlStateUpdate::Boolean {
+                target: BooleanControlTarget::ChannelMute { channel_index },
+                value: muted,
+            },
+            _ => DirectControlStateUpdate::Unchanged,
+        })
     }
 }
 
@@ -275,6 +294,24 @@ impl<'stop> PanelDriver<'stop> {
             actions,
             writes_fail: false,
             stop,
+        }
+    }
+
+    /// Moves whatever the link queued into the panel, so its display can be
+    /// read back off the simulator.
+    fn deliver(&mut self, link: &mut PanelLink) {
+        let outbound = link.take_transmit();
+        if outbound.is_empty() {
+            return;
+        }
+        self.runtime_side.write_all(&outbound).unwrap();
+        let now = self.now.get();
+        let read = match self.panel_side.as_mut() {
+            Some(panel_side) => panel_side.read(&mut self.scratch).unwrap_or_default(),
+            None => 0,
+        };
+        if read > 0 {
+            self.panel.receive_runtime_bytes(&self.scratch[..read], now);
         }
     }
 
@@ -1586,5 +1623,57 @@ fn a_panel_is_never_told_about_a_light_or_ring_it_did_not_declare() {
     assert!(
         outputs.ring(1).is_none() && outputs.led(1).is_none(),
         "and what it did not declare is never written, exactly as a binding to an absent control is refused"
+    );
+}
+
+#[test]
+fn a_link_with_no_bindings_shows_nothing() {
+    let mut host = Host::new(CHANNELS);
+    let mut link = PanelLink::new(config());
+
+    assert!(!link.holds_bindings());
+    assert_eq!(
+        link.refresh_display(&mut host, 0),
+        0,
+        "a link that never bound has nothing to say and no panel to say it to"
+    );
+}
+
+#[test]
+fn a_value_that_returns_to_where_it_was_is_shown_again() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    let now = Rc::new(Cell::new(0_u64));
+    let (mut link, mut driver) = connected_link(&mut host, display_descriptor(2, 4), &stop, &now);
+
+    // Settle the display, then move a channel away and back.
+    while link.refresh_display(&mut host, now.get()) > 0 {}
+    driver.deliver(&mut link);
+    let original = driver.panel.output_state().ring(1).unwrap().value;
+
+    host.runtime
+        .try_send_direct(RuntimeControlCommand::ChannelGain {
+            channel_index: 1,
+            gain_millionths: 1_500_000,
+        })
+        .unwrap();
+    while link.refresh_display(&mut host, now.get()) > 0 {}
+    driver.deliver(&mut link);
+    let moved = driver.panel.output_state().ring(1).unwrap().value;
+    assert_ne!(moved, original, "the display followed the change");
+
+    host.runtime
+        .try_send_direct(RuntimeControlCommand::ChannelGain {
+            channel_index: 1,
+            gain_millionths: 1_000_000,
+        })
+        .unwrap();
+    while link.refresh_display(&mut host, now.get()) > 0 {}
+    driver.deliver(&mut link);
+
+    assert_eq!(
+        driver.panel.output_state().ring(1).unwrap().value,
+        original,
+        "a value that came back must be sent again; remembering every value ever          shown rather than the latest would leave the panel displaying the old one"
     );
 }

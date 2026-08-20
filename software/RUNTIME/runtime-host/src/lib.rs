@@ -364,7 +364,6 @@ impl PanelLink {
                         });
                     }
                     self.descriptor = Some(descriptor);
-                    self.shown.clear();
                     self.bound = true;
                 }
                 PanelEvent::Input(message) => self.deliver(message, host),

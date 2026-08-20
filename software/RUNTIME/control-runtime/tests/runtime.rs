@@ -2271,3 +2271,32 @@ fn a_send_binding_is_validated_against_the_parameter_it_actually_drives() {
         PanelBindingRefusalReason::TargetRejected(SinkError::InvalidTarget)
     ));
 }
+
+#[test]
+fn a_value_domain_maps_its_whole_range_onto_a_display() {
+    let gain = ValueDomain::new(0, 2_000_000);
+    assert_eq!(gain.normalize(0), 0);
+    assert_eq!(gain.normalize(2_000_000), u16::MAX);
+    assert_eq!(gain.normalize(1_000_000), u16::MAX / 2);
+
+    // A domain whose minimum is negative is where spanning the maximum rather
+    // than the range goes wrong, and gain alone would never show it.
+    let pan = ValueDomain::new(-1_000_000, 1_000_000);
+    assert_eq!(pan.normalize(-1_000_000), 0);
+    assert_eq!(pan.normalize(1_000_000), u16::MAX);
+    assert_eq!(
+        pan.normalize(0),
+        u16::MAX / 2,
+        "centre reads as half scale, not as the bottom of the range"
+    );
+}
+
+#[test]
+fn a_position_outside_its_domain_is_shown_at_the_nearest_edge() {
+    let pan = ValueDomain::new(-1_000_000, 1_000_000);
+
+    assert_eq!(pan.normalize(-5_000_000), 0);
+    assert_eq!(pan.normalize(5_000_000), u16::MAX);
+    assert_eq!(pan.normalize(i32::MIN), 0);
+    assert_eq!(pan.normalize(i32::MAX), u16::MAX);
+}
