@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path};
 
 use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
@@ -199,6 +199,169 @@ fn invalid_argument(message: &'static str) -> io::Error {
 #[must_use]
 pub fn identity(metadata: &Metadata) -> (u64, u64) {
     (metadata.dev(), metadata.ino())
+}
+
+/// Reads one bounded regular non-link file while retaining its identity and
+/// proving that two complete reads and the published directory entry agree.
+///
+/// # Errors
+///
+/// Returns an I/O or validation error when the entry is linked, non-regular,
+/// oversized, replaced, or changes while it is read.
+pub fn read_stable_file(directory: &Dir, name: &str, maximum_bytes: u64) -> io::Result<Vec<u8>> {
+    let published = directory.symlink_metadata(name)?;
+    if published.file_type().is_symlink() || !published.is_file() {
+        return Err(invalid_argument(
+            "stable file must be a regular non-link file",
+        ));
+    }
+    if published.len() > maximum_bytes {
+        return Err(invalid_argument("stable file exceeds its byte limit"));
+    }
+    let published_identity = identity(&published);
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = directory.open_with(name, &options)?;
+    let before = file.metadata()?;
+    if !before.is_file()
+        || before.len() != published.len()
+        || identity(&before) != published_identity
+    {
+        return Err(invalid_argument(
+            "stable file identity changed before reading",
+        ));
+    }
+    let first = read_bounded(&mut file, before.len(), maximum_bytes)?;
+    file.seek(SeekFrom::Start(0))?;
+    let second = read_bounded(&mut file, before.len(), maximum_bytes)?;
+    let after = file.metadata()?;
+    let republished = directory.symlink_metadata(name)?;
+    if first != second
+        || !after.is_file()
+        || after.len() != first.len() as u64
+        || identity(&after) != published_identity
+        || republished.file_type().is_symlink()
+        || !republished.is_file()
+        || identity(&republished) != published_identity
+    {
+        return Err(invalid_argument("stable file changed while being read"));
+    }
+    Ok(first)
+}
+
+/// Synchronizes a retained directory authority.
+///
+/// # Errors
+///
+/// Returns the platform synchronization failure.
+pub fn sync_directory(directory: &Dir) -> io::Result<()> {
+    directory.try_clone()?.into_std_file().sync_all()
+}
+
+/// Opens an ambient directory with the access required for an explicit
+/// metadata durability barrier on every supported desktop platform.
+///
+/// # Errors
+///
+/// Returns an I/O error when the directory cannot be opened for durable
+/// publication.
+pub fn open_syncable_directory_ambient(path: &Path) -> io::Result<Dir> {
+    #[cfg(unix)]
+    {
+        Dir::open_ambient_dir(path, ambient_authority())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
+        const FILE_SHARE_DELETE: u32 = 4;
+        let validated = Dir::open_ambient_dir(path, ambient_authority())?;
+        let expected_identity = identity(&validated.dir_metadata()?);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let directory = Dir::from_std_file(file);
+        let opened = directory.dir_metadata()?;
+        if !opened.is_dir() || identity(&opened) != expected_identity {
+            return Err(invalid_argument(
+                "syncable directory identity does not match validated authority",
+            ));
+        }
+        Ok(directory)
+    }
+}
+
+/// Opens a non-link child directory with the access required for an explicit
+/// metadata durability barrier.
+///
+/// # Errors
+///
+/// Returns an I/O or validation error when the child cannot be opened as a
+/// real directory with synchronization access.
+pub fn open_syncable_directory_at(parent: &Dir, name: &str) -> io::Result<Dir> {
+    #[cfg(unix)]
+    {
+        parent.open_dir_nofollow(name)
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
+        const FILE_SHARE_DELETE: u32 = 4;
+        let validated = parent.open_dir_nofollow(name)?;
+        let expected_identity = identity(&validated.dir_metadata()?);
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .follow(FollowSymlinks::No);
+        let file = parent.open_with(name, &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_dir() || identity(&metadata) != expected_identity {
+            return Err(invalid_argument(
+                "syncable directory identity does not match validated authority",
+            ));
+        }
+        Ok(Dir::from_std_file(file.into_std()))
+    }
+}
+
+fn read_bounded(file: &mut File, expected_bytes: u64, maximum_bytes: u64) -> io::Result<Vec<u8>> {
+    let capacity = usize::try_from(expected_bytes)
+        .map_err(|_| invalid_argument("stable file cannot fit in memory"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| invalid_argument("stable file capacity is unavailable"))?;
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let next = u64::try_from(bytes.len())
+            .unwrap_or(u64::MAX)
+            .checked_add(count as u64)
+            .ok_or_else(|| invalid_argument("stable file byte count overflowed"))?;
+        if next > maximum_bytes {
+            return Err(invalid_argument("stable file grew beyond its byte limit"));
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    Ok(bytes)
 }
 
 fn parse_identity(value: Option<String>, message: &'static str) -> Result<u64, Box<dyn Error>> {
@@ -790,5 +953,65 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         Some("copy-file") => copy_verified_file(&mut arguments),
         Some("write-file") => write_verified_file(&mut arguments),
         _ => Err(invalid_argument("unsupported filesystem authority operation").into()),
+    }
+}
+
+#[cfg(test)]
+mod stable_file_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+
+    use super::{open_syncable_directory_ambient, read_stable_file, sync_directory};
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl TemporaryDirectory {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock must follow the Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "hyper-fs-stable-file-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("temporary authority root must be unique");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn stable_read_is_exact_and_bounded() {
+        let temporary = TemporaryDirectory::new();
+        fs::write(temporary.path().join("state.json"), b"stable").unwrap();
+        let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+
+        assert_eq!(
+            read_stable_file(&directory, "state.json", 6).unwrap(),
+            b"stable"
+        );
+        assert!(read_stable_file(&directory, "state.json", 5).is_err());
+    }
+
+    #[test]
+    fn syncable_directory_accepts_a_metadata_barrier() {
+        let temporary = TemporaryDirectory::new();
+        let directory = open_syncable_directory_ambient(temporary.path()).unwrap();
+
+        sync_directory(&directory).unwrap();
     }
 }
