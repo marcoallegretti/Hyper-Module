@@ -20,6 +20,7 @@ const temporaryRoot = await mkdtemp(
 
 try {
   const fixture = await createMinimalProject(temporaryRoot, "source", {
+    audioAsset: true,
     playbackReady: true,
   });
   const javascriptBundle = join(temporaryRoot, "javascript.runtime");
@@ -59,6 +60,10 @@ try {
   );
 
   const native = await verifyBundleArtifact(nativeBundle);
+  assert(
+    native.manifest.files.some((descriptor) => descriptor.role === "audio"),
+    "cross-language builder conformance must cover an audio payload",
+  );
   assert.equal(native.bundle_sha256, javascript.identity.slice("sha256:".length));
   assert(
     (await readFile(join(nativeBundle, "manifest.json"))).equals(
