@@ -16,7 +16,10 @@ use crate::project_lock::{
 };
 use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
-use hyper_project_model::{ProjectManifest, ResourceRole, is_valid_entity_id};
+use hyper_audio_source::{AudioContainer, DecodeLimits, decode_bytes};
+use hyper_project_model::{
+    AssetRole, AudioMediaType, ProjectManifest, ResourceRole, is_valid_entity_id,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io;
@@ -27,6 +30,7 @@ use uuid::Uuid;
 use super::same_directory;
 
 const CLIP_STAGING_NAME: &str = "clip.json";
+const SAMPLE_STAGING_NAME: &str = "sample.wav";
 const TRACK_STAGING_NAME: &str = "track.json";
 const PREVIOUS_TRACK_NAME: &str = "previous-track.json";
 
@@ -38,6 +42,12 @@ pub struct AudioClipPublicationRequest<'a> {
     pub track_id: &'a str,
     pub track_bytes: &'a [u8],
     pub asset_id: &'a str,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ImportedAudioClipPublicationRequest<'a> {
+    pub clip: AudioClipPublicationRequest<'a>,
+    pub sample_bytes: &'a [u8],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,13 +126,18 @@ struct AudioClipTransactionRecord {
     clip: TransactionFile,
     track: TransactionFile,
     previous_track: TransactionFile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sample: Option<TransactionFile>,
     created_clip_directory: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    created_sample_directory: bool,
     extensions: serde_json::Map<String, Value>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AudioClipPublicationPhase {
     Transaction,
+    Sample,
     Clip,
     Track,
     Manifest,
@@ -140,7 +155,26 @@ pub fn publish_audio_clip(
     project_path: impl AsRef<Path>,
     request: AudioClipPublicationRequest<'_>,
 ) -> Result<AudioClipPublicationOutcome, ProjectResourcePublicationError> {
-    publish_audio_clip_observed(project_path.as_ref(), request, |_, _| Ok(()))
+    publish_audio_clip_observed(project_path.as_ref(), request, None, |_, _| Ok(()))
+}
+
+/// Publishes one project-owned WAV sample and a full-range reusable clip as one
+/// recoverable, manifest-last mutation.
+///
+/// # Errors
+///
+/// Returns the same classified errors as [`publish_audio_clip`], and rejects an
+/// empty or conflicting sample payload before publication.
+pub fn publish_imported_audio_clip(
+    project_path: impl AsRef<Path>,
+    request: ImportedAudioClipPublicationRequest<'_>,
+) -> Result<AudioClipPublicationOutcome, ProjectResourcePublicationError> {
+    publish_audio_clip_observed(
+        project_path.as_ref(),
+        request.clip,
+        Some(request.sample_bytes),
+        |_, _| Ok(()),
+    )
 }
 
 /// Recovers every durable audio-clip publication in one project.
@@ -179,6 +213,7 @@ pub fn recover_audio_clip_publications(
 fn publish_audio_clip_observed(
     project_path: &Path,
     request: AudioClipPublicationRequest<'_>,
+    sample_bytes: Option<&[u8]>,
     mut observer: impl FnMut(
         AudioClipPublicationPhase,
         &Path,
@@ -193,6 +228,9 @@ fn publish_audio_clip_observed(
             error,
         )
     })?;
+    let imported_frames = sample_bytes
+        .map(|bytes| validate_imported_sample(bytes, verified.manifest().sample_rate_hz()))
+        .transpose()?;
     if request.expected_project_sha256 != *verified.manifest_sha256() {
         return Err(failure(
             ProjectResourcePublicationErrorKind::ProjectChanged,
@@ -200,7 +238,8 @@ fn publish_audio_clip_observed(
         ));
     }
     let clip_path = format!("clips/{}.json", request.clip_id);
-    validate_audio_clip_request(&verified, request, &clip_path)?;
+    let sample_path = sample_bytes.map(|_| format!("assets/samples/{}.wav", request.asset_id));
+    validate_audio_clip_request(&verified, request, &clip_path, sample_path.as_deref())?;
     let track_descriptor = unique_resource(&verified, request.track_id, ResourceRole::Track)?;
     let previous_track = verified.read_resource(request.track_id).map_err(|error| {
         caused(
@@ -210,6 +249,9 @@ fn publish_audio_clip_observed(
         )
     })?;
     validate_audio_clip_documents(request, verified.manifest().project_id(), &previous_track)?;
+    if let Some(frames) = imported_frames {
+        validate_imported_clip_range(request.clip_bytes, frames)?;
+    }
     inspect_clip_destination(&verified.root_dir, &clip_path)?;
 
     let backups = open_or_create_dir(&verified.root_dir, "backups")?;
@@ -244,6 +286,11 @@ fn publish_audio_clip_observed(
         )
     })?;
     let created_clip_directory = inspect_clip_destination(&verified.root_dir, &clip_path)?;
+    let created_sample_directory = if let Some(path) = sample_path.as_deref() {
+        inspect_sample_destination(&verified.root_dir, path)?
+    } else {
+        false
+    };
     let active_project = read_bounded(&verified.root_dir, MANIFEST_NAME, MAX_JSON_BYTES)?;
     if digest(&active_project) != request.expected_project_sha256 {
         return Err(failure(
@@ -273,8 +320,14 @@ fn publish_audio_clip_observed(
                 "project revision cannot be incremented",
             )
         })?;
-    let candidate_project =
-        candidate_audio_clip_manifest(&active_project, request, &clip_path, next_revision)?;
+    let candidate_project = candidate_audio_clip_manifest(
+        &active_project,
+        request,
+        &clip_path,
+        sample_path.as_deref(),
+        sample_bytes,
+        next_revision,
+    )?;
     let transaction_name = format!("{AUDIO_CLIP_TRANSACTION_PREFIX}{}", Uuid::new_v4());
     backups.create_dir(&transaction_name).map_err(|error| {
         caused(
@@ -301,8 +354,11 @@ fn publish_audio_clip_observed(
         request,
         track_descriptor.path(),
         &clip_path,
+        sample_path.as_deref(),
+        sample_bytes,
         &previous_track,
         created_clip_directory,
+        created_sample_directory,
         &active_project,
         &candidate_project,
         next_revision,
@@ -431,8 +487,11 @@ fn run_audio_clip_publication(
     request: AudioClipPublicationRequest<'_>,
     track_path: &str,
     clip_path: &str,
+    sample_path: Option<&str>,
+    sample_bytes: Option<&[u8]>,
     previous_track: &[u8],
     created_clip_directory: bool,
+    created_sample_directory: bool,
     previous_project: &[u8],
     candidate_project: &[u8],
     next_revision: u64,
@@ -442,6 +501,9 @@ fn run_audio_clip_publication(
     ) -> Result<(), ProjectResourcePublicationError>,
 ) -> Result<AudioClipPublicationOutcome, ProjectResourcePublicationError> {
     write_audio_clip_intent(transaction, transaction_name)?;
+    if let Some(bytes) = sample_bytes {
+        write_exclusive_synced(transaction, SAMPLE_STAGING_NAME, bytes)?;
+    }
     write_exclusive_synced(transaction, CLIP_STAGING_NAME, request.clip_bytes)?;
     write_exclusive_synced(transaction, TRACK_STAGING_NAME, request.track_bytes)?;
     write_exclusive_synced(transaction, PREVIOUS_TRACK_NAME, previous_track)?;
@@ -449,7 +511,7 @@ fn run_audio_clip_publication(
     write_exclusive_synced(transaction, PREVIOUS_PROJECT_NAME, previous_project)?;
     let tx = AudioClipTransactionRecord {
         format: "hyper-audio-clip-publication-transaction".to_owned(),
-        format_version: 1,
+        format_version: if sample_bytes.is_some() { 2 } else { 1 },
         id: audio_clip_transaction_id(transaction_name)?,
         before_project_sha256: hex_digest(*verified.manifest_sha256()),
         after_project_sha256: hex_digest(digest(candidate_project)),
@@ -473,7 +535,15 @@ fn run_audio_clip_publication(
             byte_length: previous_track.len() as u64,
             sha256: hex_digest(digest(previous_track)),
         },
+        sample: sample_path
+            .zip(sample_bytes)
+            .map(|(path, bytes)| TransactionFile {
+                path: path.to_owned(),
+                byte_length: bytes.len() as u64,
+                sha256: hex_digest(digest(bytes)),
+            }),
         created_clip_directory,
+        created_sample_directory,
         extensions: serde_json::Map::new(),
     };
     let transaction_bytes = serde_json_canonicalizer::to_vec(&tx).map_err(|error| {
@@ -487,6 +557,32 @@ fn run_audio_clip_publication(
     sync_dir(transaction)?;
     sync_dir(backups)?;
     observer(AudioClipPublicationPhase::Transaction, verified.root())?;
+
+    if created_sample_directory {
+        let assets = open_or_create_dir(&verified.root_dir, "assets")?;
+        assets.create_dir("samples").map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "create imported-sample directory",
+                error,
+            )
+        })?;
+        sync_dir(&assets)?;
+    }
+    if let Some(path) = sample_path {
+        let sample_parent = open_relative_parent(&verified.root_dir, path)?;
+        transaction
+            .hard_link(SAMPLE_STAGING_NAME, &sample_parent, file_name(path)?)
+            .map_err(|error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::ResourceConflict,
+                    "publish imported sample without overwriting",
+                    error,
+                )
+            })?;
+        sync_dir(&sample_parent)?;
+        observer(AudioClipPublicationPhase::Sample, verified.root())?;
+    }
 
     if created_clip_directory {
         verified.root_dir.create_dir("clips").map_err(|error| {
@@ -561,6 +657,7 @@ fn validate_audio_clip_request(
     verified: &StructurallyVerifiedProject,
     request: AudioClipPublicationRequest<'_>,
     clip_path: &str,
+    sample_path: Option<&str>,
 ) -> Result<(), ProjectResourcePublicationError> {
     if !is_valid_entity_id(request.clip_id)
         || request.clip_id == verified.manifest().project_id()
@@ -588,13 +685,139 @@ fn validate_audio_clip_request(
         .iter()
         .filter(|descriptor| descriptor.id() == request.asset_id)
         .count();
-    if matching_assets != 1 {
+    if (sample_path.is_none() && matching_assets != 1)
+        || (sample_path.is_some()
+            && (matching_assets != 0
+                || verified.manifest().assets().iter().any(|descriptor| {
+                    descriptor.path() == sample_path.expect("checked sample path")
+                })))
+    {
         return Err(failure(
             ProjectResourcePublicationErrorKind::ResourceConflict,
             "audio-clip source asset does not exist uniquely",
         ));
     }
     Ok(())
+}
+
+fn validate_imported_sample(
+    bytes: &[u8],
+    sample_rate_hz: u32,
+) -> Result<usize, ProjectResourcePublicationError> {
+    let byte_limit = u64::try_from(bytes.len()).map_err(|_| {
+        failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "imported sample is not addressable",
+        )
+    })?;
+    if byte_limit == 0 {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "imported sample is empty",
+        ));
+    }
+    let limits = DecodeLimits::new(byte_limit, byte_limit, bytes.len()).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "construct imported-sample verification limits",
+            error,
+        )
+    })?;
+    let audio = decode_bytes(bytes.to_vec(), AudioContainer::Wav, sample_rate_hz, limits).map_err(
+        |error| {
+            caused(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "verify imported sample WAV",
+                error,
+            )
+        },
+    )?;
+    Ok(audio.frame_count())
+}
+
+fn validate_imported_clip_range(
+    clip_bytes: &[u8],
+    frame_count: usize,
+) -> Result<(), ProjectResourcePublicationError> {
+    let clip: Value = serde_json::from_slice(clip_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse imported audio clip",
+            error,
+        )
+    })?;
+    if clip["source"]["start_frame"].as_u64() != Some(0)
+        || clip["source"]["frame_count"].as_u64() != u64::try_from(frame_count).ok()
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "imported audio clip must cover the complete sample",
+        ));
+    }
+    Ok(())
+}
+
+fn inspect_sample_destination(
+    root: &Dir,
+    sample_path: &str,
+) -> Result<bool, ProjectResourcePublicationError> {
+    let assets = match root.symlink_metadata("assets") {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "asset directory is not a real directory",
+            ));
+        }
+        Ok(_) => root.open_dir_nofollow("assets").map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "open asset directory",
+                error,
+            )
+        })?,
+        Err(error) => {
+            return Err(caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "inspect asset directory",
+                error,
+            ));
+        }
+    };
+    let samples = match assets.symlink_metadata("samples") {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "inspect imported-sample directory",
+                error,
+            ));
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "imported-sample directory is not a real directory",
+            ));
+        }
+        Ok(_) => assets.open_dir_nofollow("samples").map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "open imported-sample directory",
+                error,
+            )
+        })?,
+    };
+    match samples.symlink_metadata(file_name(sample_path)?) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Ok(_) => Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "imported-sample path already exists",
+        )),
+        Err(error) => Err(caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "inspect imported-sample destination",
+            error,
+        )),
+    }
 }
 
 fn validate_audio_clip_documents(
@@ -714,6 +937,8 @@ fn candidate_audio_clip_manifest(
     active: &[u8],
     request: AudioClipPublicationRequest<'_>,
     clip_path: &str,
+    sample_path: Option<&str>,
+    sample_bytes: Option<&[u8]>,
     revision: u64,
 ) -> Result<Vec<u8>, ProjectResourcePublicationError> {
     let mut value: Value = serde_json::from_slice(active).map_err(|error| {
@@ -750,6 +975,25 @@ fn candidate_audio_clip_manifest(
         "sha256": hex_digest(digest(request.clip_bytes)),
         "extensions": {}
     }));
+    if let Some((path, bytes)) = sample_path.zip(sample_bytes) {
+        value["assets"]
+            .as_array_mut()
+            .ok_or_else(|| {
+                failure(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "project asset declarations are invalid",
+                )
+            })?
+            .push(serde_json::json!({
+                "id": request.asset_id,
+                "role": "sample",
+                "path": path,
+                "media_type": "audio/wav",
+                "byte_length": bytes.len(),
+                "sha256": hex_digest(digest(bytes)),
+                "extensions": {}
+            }));
+    }
     let bytes = serde_json_canonicalizer::to_vec(&value).map_err(|error| {
         caused(
             ProjectResourcePublicationErrorKind::Integrity,
@@ -904,8 +1148,10 @@ fn recover_audio_clip_transaction(
     }
     rollback_audio_clip_track(root, transaction, tx)?;
     remove_published_audio_clip(root, tx)?;
+    remove_published_imported_sample(root, tx)?;
     cleanup_audio_clip_temporaries(root, backups, transaction, tx)?;
     remove_created_clip_directory(root, tx)?;
+    remove_created_sample_directory(root, tx)?;
     let previous = read_bounded(transaction, PREVIOUS_PROJECT_NAME, MAX_JSON_BYTES)?;
     if digest(&previous) != before {
         return Err(failure(
@@ -983,6 +1229,38 @@ fn remove_published_audio_clip(
     sync_dir(&parent)
 }
 
+fn remove_published_imported_sample(
+    root: &Dir,
+    tx: &AudioClipTransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    let Some(sample) = &tx.sample else {
+        return Ok(());
+    };
+    let parent = match open_relative_parent(root, &sample.path) {
+        Ok(parent) => parent,
+        Err(error) if error_is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let name = file_name(&sample.path)?;
+    let Some(bytes) = read_optional_file(&parent, name)? else {
+        return Ok(());
+    };
+    if digest(&bytes) != decode_digest(&sample.sha256)? {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "imported-sample rollback refuses unrelated content",
+        ));
+    }
+    parent.remove_file(name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "remove rolled-back imported sample",
+            error,
+        )
+    })?;
+    sync_dir(&parent)
+}
+
 fn remove_created_clip_directory(
     root: &Dir,
     tx: &AudioClipTransactionRecord,
@@ -996,6 +1274,31 @@ fn remove_created_clip_directory(
         Err(error) => Err(caused(
             ProjectResourcePublicationErrorKind::Recovery,
             "remove transaction-created audio-clip directory",
+            error,
+        )),
+    }
+}
+
+fn remove_created_sample_directory(
+    root: &Dir,
+    tx: &AudioClipTransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    if !tx.created_sample_directory {
+        return Ok(());
+    }
+    let assets = root.open_dir_nofollow("assets").map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "open asset directory for imported-sample rollback",
+            error,
+        )
+    })?;
+    match assets.remove_dir("samples") {
+        Ok(()) => sync_dir(&assets),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "remove transaction-created imported-sample directory",
             error,
         )),
     }
@@ -1034,6 +1337,26 @@ fn validate_staged_audio_clip_transaction(
             "staged audio-clip bytes do not match the transaction record",
         ));
     }
+    let sample_bytes = if let Some(sample) = &tx.sample {
+        let maximum = usize::try_from(sample.byte_length).map_err(|_| {
+            failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "staged imported sample length is not addressable",
+            )
+        })?;
+        let bytes = read_bounded(transaction, SAMPLE_STAGING_NAME, maximum)?;
+        if bytes.len() as u64 != sample.byte_length
+            || digest(&bytes) != decode_digest(&sample.sha256)?
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "staged imported sample does not match the transaction record",
+            ));
+        }
+        Some(bytes)
+    } else {
+        None
+    };
     let previous_project = read_bounded(transaction, PREVIOUS_PROJECT_NAME, MAX_JSON_BYTES)?;
     let candidate_project = read_bounded(transaction, PROJECT_STAGING_NAME, MAX_JSON_BYTES)?;
     if digest(&previous_project) != decode_digest(&tx.before_project_sha256)?
@@ -1071,6 +1394,12 @@ fn validate_staged_audio_clip_transaction(
     let previous_track_descriptor = manifest_resource(&previous_manifest, &tx.track_id)?;
     let candidate_track_descriptor = manifest_resource(&candidate_manifest, &tx.track_id)?;
     let candidate_clip_descriptor = manifest_resource(&candidate_manifest, &tx.clip_id)?;
+    let candidate_sample_descriptor = tx.sample.as_ref().map(|_| {
+        candidate_manifest
+            .assets()
+            .iter()
+            .find(|descriptor| descriptor.id() == tx.asset_id)
+    });
     if previous_track_descriptor.role() != ResourceRole::Track
         || candidate_track_descriptor.role() != ResourceRole::Track
         || previous_track_descriptor.path() != tx.previous_track.path
@@ -1087,12 +1416,28 @@ fn validate_staged_audio_clip_transaction(
             .resources()
             .iter()
             .any(|descriptor| descriptor.id() == tx.clip_id || descriptor.path() == tx.clip.path)
-        || previous_manifest
-            .assets()
-            .iter()
-            .filter(|descriptor| descriptor.id() == tx.asset_id)
-            .count()
-            != 1
+        || match (&tx.sample, candidate_sample_descriptor) {
+            (None, None) => {
+                previous_manifest
+                    .assets()
+                    .iter()
+                    .filter(|descriptor| descriptor.id() == tx.asset_id)
+                    .count()
+                    != 1
+            }
+            (Some(sample), Some(Some(descriptor))) => {
+                previous_manifest
+                    .assets()
+                    .iter()
+                    .any(|previous| previous.id() == tx.asset_id || previous.path() == sample.path)
+                    || descriptor.path() != sample.path
+                    || descriptor.role() != AssetRole::Sample
+                    || descriptor.media_type() != AudioMediaType::AudioWav
+                    || descriptor.byte_length() != sample.byte_length
+                    || descriptor.sha256() != sample.sha256
+            }
+            _ => true,
+        }
     {
         return Err(failure(
             ProjectResourcePublicationErrorKind::Recovery,
@@ -1108,10 +1453,16 @@ fn validate_staged_audio_clip_transaction(
         asset_id: &tx.asset_id,
     };
     validate_audio_clip_documents(request, previous_manifest.project_id(), &previous_track)?;
+    if let Some(bytes) = sample_bytes.as_deref() {
+        let frames = validate_imported_sample(bytes, previous_manifest.sample_rate_hz())?;
+        validate_imported_clip_range(&clip, frames)?;
+    }
     let expected = candidate_audio_clip_manifest(
         &previous_project,
         request,
         &tx.clip.path,
+        tx.sample.as_ref().map(|sample| sample.path.as_str()),
+        sample_bytes.as_deref(),
         tx.after_project_revision,
     )?;
     if expected != candidate_project {
@@ -1151,7 +1502,9 @@ fn read_audio_clip_transaction(
         || !intent.extensions.is_empty()
         || intent.id != expected_id
         || tx.format != "hyper-audio-clip-publication-transaction"
-        || tx.format_version != 1
+        || !matches!(tx.format_version, 1 | 2)
+        || (tx.format_version == 1 && (tx.sample.is_some() || tx.created_sample_directory))
+        || (tx.format_version == 2 && tx.sample.is_none())
         || !tx.extensions.is_empty()
         || tx.id != expected_id
         || !is_valid_entity_id(&tx.clip_id)
@@ -1166,6 +1519,11 @@ fn read_audio_clip_transaction(
                     || file.byte_length > MAX_JSON_FILE_BYTES
                     || decode_digest(&file.sha256).is_err()
             })
+        || tx.sample.as_ref().is_some_and(|sample| {
+            sample.path != format!("assets/samples/{}.wav", tx.asset_id)
+                || sample.byte_length == 0
+                || decode_digest(&sample.sha256).is_err()
+        })
         || decode_digest(&tx.before_project_sha256).is_err()
         || decode_digest(&tx.after_project_sha256).is_err()
         || tx.before_project_revision.checked_add(1) != Some(tx.after_project_revision)
@@ -1202,6 +1560,7 @@ fn validate_audio_clip_prepublication_residue(
             name.as_str(),
             INTENT_STAGING_NAME
                 | INTENT_NAME
+                | SAMPLE_STAGING_NAME
                 | CLIP_STAGING_NAME
                 | TRACK_STAGING_NAME
                 | PREVIOUS_TRACK_NAME
@@ -1312,6 +1671,7 @@ fn clear_audio_clip_transaction(transaction: &Dir) -> Result<(), ProjectResource
     for name in [
         INTENT_STAGING_NAME,
         INTENT_NAME,
+        SAMPLE_STAGING_NAME,
         CLIP_STAGING_NAME,
         TRACK_STAGING_NAME,
         PREVIOUS_TRACK_NAME,
@@ -1415,6 +1775,7 @@ mod tests {
     const TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334457";
     const ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334458";
     const CLIP_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334459";
+    const IMPORT_ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334460";
 
     struct Fixture {
         root: PathBuf,
@@ -1593,6 +1954,117 @@ mod tests {
     }
 
     #[test]
+    fn publishes_imported_sample_clip_and_track_as_one_revision() {
+        let fixture = Fixture::new();
+        let sample = hyper_audio_source::encode_float_wav(
+            &hyper_audio_source::DecodedAudio::from_mono(48_000, vec![0.25; 63]).unwrap(),
+        )
+        .unwrap();
+        let mut clip: Value = serde_json::from_slice(&fixture.clip).unwrap();
+        clip["source"]["asset_id"] = IMPORT_ASSET_ID.into();
+        let clip = serde_json_canonicalizer::to_vec(&clip).unwrap();
+        let request = AudioClipPublicationRequest {
+            expected_project_sha256: *verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest_sha256(),
+            clip_id: CLIP_ID,
+            clip_bytes: &clip,
+            track_id: TRACK_ID,
+            track_bytes: &fixture.track,
+            asset_id: IMPORT_ASSET_ID,
+        };
+
+        let outcome = publish_imported_audio_clip(
+            &fixture.root,
+            ImportedAudioClipPublicationRequest {
+                clip: request,
+                sample_bytes: &sample,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.project_revision(), 2);
+        assert_eq!(
+            fs::read(
+                fixture
+                    .root
+                    .join(format!("assets/samples/{IMPORT_ASSET_ID}.wav"))
+            )
+            .unwrap(),
+            sample
+        );
+        let verified = verify_project_package(&fixture.root).unwrap();
+        let imported = verified
+            .manifest()
+            .assets()
+            .iter()
+            .find(|asset| asset.id() == IMPORT_ASSET_ID)
+            .unwrap();
+        assert_eq!(
+            imported.path(),
+            format!("assets/samples/{IMPORT_ASSET_ID}.wav")
+        );
+        assert!(fixture.transaction_names().is_empty());
+    }
+
+    #[test]
+    fn imported_sample_crash_before_manifest_removes_every_published_file() {
+        for crash_phase in [
+            AudioClipPublicationPhase::Sample,
+            AudioClipPublicationPhase::Clip,
+            AudioClipPublicationPhase::Track,
+        ] {
+            let fixture = Fixture::new();
+            let sample = hyper_audio_source::encode_float_wav(
+                &hyper_audio_source::DecodedAudio::from_mono(48_000, vec![0.25; 63]).unwrap(),
+            )
+            .unwrap();
+            let mut clip: Value = serde_json::from_slice(&fixture.clip).unwrap();
+            clip["source"]["asset_id"] = IMPORT_ASSET_ID.into();
+            let clip = serde_json_canonicalizer::to_vec(&clip).unwrap();
+            let request = AudioClipPublicationRequest {
+                expected_project_sha256: *verify_project_package(&fixture.root)
+                    .unwrap()
+                    .manifest_sha256(),
+                clip_id: CLIP_ID,
+                clip_bytes: &clip,
+                track_id: TRACK_ID,
+                track_bytes: &fixture.track,
+                asset_id: IMPORT_ASSET_ID,
+            };
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                let _ = publish_audio_clip_observed(
+                    &fixture.root,
+                    request,
+                    Some(&sample),
+                    |phase, _| {
+                        assert_ne!(phase, crash_phase, "simulated process crash");
+                        Ok(())
+                    },
+                );
+            }));
+
+            let recovered = recover_audio_clip_publications(&fixture.root).unwrap();
+            assert_eq!(
+                recovered[0].disposition(),
+                AudioClipPublicationRecoveryDisposition::RolledBack
+            );
+            assert_eq!(
+                fs::read(fixture.root.join(format!("tracks/{TRACK_ID}.json"))).unwrap(),
+                fixture.original_track
+            );
+            assert!(!fixture.root.join(format!("clips/{CLIP_ID}.json")).exists());
+            assert!(
+                !fixture
+                    .root
+                    .join(format!("assets/samples/{IMPORT_ASSET_ID}.wav"))
+                    .exists()
+            );
+            verify_project_package(&fixture.root).unwrap();
+        }
+    }
+
+    #[test]
     fn rejects_stale_identity_and_non_exact_track_delta() {
         let fixture = Fixture::new();
         let mut stale = fixture.request();
@@ -1629,11 +2101,15 @@ mod tests {
         ] {
             let fixture = Fixture::new();
             let result = catch_unwind(AssertUnwindSafe(|| {
-                let _ =
-                    publish_audio_clip_observed(&fixture.root, fixture.request(), |phase, _| {
+                let _ = publish_audio_clip_observed(
+                    &fixture.root,
+                    fixture.request(),
+                    None,
+                    |phase, _| {
                         assert_ne!(phase, crash_phase, "simulated process crash");
                         Ok(())
-                    });
+                    },
+                );
             }));
             assert!(result.is_err());
 
@@ -1663,14 +2139,15 @@ mod tests {
     fn crash_after_manifest_recovers_as_committed() {
         let fixture = Fixture::new();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let _ = publish_audio_clip_observed(&fixture.root, fixture.request(), |phase, _| {
-                assert_ne!(
-                    phase,
-                    AudioClipPublicationPhase::Manifest,
-                    "simulated process crash"
-                );
-                Ok(())
-            });
+            let _ =
+                publish_audio_clip_observed(&fixture.root, fixture.request(), None, |phase, _| {
+                    assert_ne!(
+                        phase,
+                        AudioClipPublicationPhase::Manifest,
+                        "simulated process crash"
+                    );
+                    Ok(())
+                });
         }));
         assert!(result.is_err());
 
@@ -1701,26 +2178,27 @@ mod tests {
     #[test]
     fn committed_manifest_retains_publication_authority_when_recovery_is_incomplete() {
         let fixture = Fixture::new();
-        let error = publish_audio_clip_observed(&fixture.root, fixture.request(), |phase, _| {
-            if phase != AudioClipPublicationPhase::Manifest {
-                return Ok(());
-            }
-            let name = fixture.transaction_names().pop().unwrap();
-            let id = name.strip_prefix(AUDIO_CLIP_TRANSACTION_PREFIX).unwrap();
-            fs::write(
-                fixture
-                    .root
-                    .join("backups")
-                    .join(format!(".audio-clip-project-{id}.json")),
-                b"unrelated cleanup residue",
-            )
-            .unwrap();
-            Err(failure(
-                ProjectResourcePublicationErrorKind::Io,
-                "simulated post-manifest failure",
-            ))
-        })
-        .unwrap_err();
+        let error =
+            publish_audio_clip_observed(&fixture.root, fixture.request(), None, |phase, _| {
+                if phase != AudioClipPublicationPhase::Manifest {
+                    return Ok(());
+                }
+                let name = fixture.transaction_names().pop().unwrap();
+                let id = name.strip_prefix(AUDIO_CLIP_TRANSACTION_PREFIX).unwrap();
+                fs::write(
+                    fixture
+                        .root
+                        .join("backups")
+                        .join(format!(".audio-clip-project-{id}.json")),
+                    b"unrelated cleanup residue",
+                )
+                .unwrap();
+                Err(failure(
+                    ProjectResourcePublicationErrorKind::Io,
+                    "simulated post-manifest failure",
+                ))
+            })
+            .unwrap_err();
 
         assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
         assert!(error.published());
@@ -1862,15 +2340,19 @@ mod tests {
         for replace_track in [false, true] {
             let fixture = Fixture::new();
             let result = catch_unwind(AssertUnwindSafe(|| {
-                let _ =
-                    publish_audio_clip_observed(&fixture.root, fixture.request(), |phase, _| {
+                let _ = publish_audio_clip_observed(
+                    &fixture.root,
+                    fixture.request(),
+                    None,
+                    |phase, _| {
                         assert_ne!(
                             phase,
                             AudioClipPublicationPhase::Track,
                             "simulated process crash"
                         );
                         Ok(())
-                    });
+                    },
+                );
             }));
             assert!(result.is_err());
             let unrelated = serde_json_canonicalizer::to_vec(&json!({"unrelated":true})).unwrap();
@@ -1893,14 +2375,15 @@ mod tests {
     fn staged_clip_blocks_other_publication_until_global_recovery() {
         let fixture = Fixture::new();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let _ = publish_audio_clip_observed(&fixture.root, fixture.request(), |phase, _| {
-                assert_ne!(
-                    phase,
-                    AudioClipPublicationPhase::Transaction,
-                    "simulated process crash"
-                );
-                Ok(())
-            });
+            let _ =
+                publish_audio_clip_observed(&fixture.root, fixture.request(), None, |phase, _| {
+                    assert_ne!(
+                        phase,
+                        AudioClipPublicationPhase::Transaction,
+                        "simulated process crash"
+                    );
+                    Ok(())
+                });
         }));
         assert!(result.is_err());
         let replacement = serde_json_canonicalizer::to_vec(&json!({

@@ -9,6 +9,7 @@ publish = false
 cap-std = "=4.0.2"
 cap-fs-ext = "=4.0.2"
 hyper-control-mappings = { path = "../control-mappings" }
+hyper-audio-source = { path = "../audio-source" }
 hyper-project-model = { path = "../project-model" }
 hyper-recording-metadata = { path = "../recording-metadata" }
 hyper-strict-json = { path = "../strict-json" }

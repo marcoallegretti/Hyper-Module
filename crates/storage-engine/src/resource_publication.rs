@@ -16,7 +16,8 @@ mod audio_clip_publication;
 
 pub use audio_clip_publication::{
     AudioClipPublicationOutcome, AudioClipPublicationRecovery,
-    AudioClipPublicationRecoveryDisposition, AudioClipPublicationRequest, publish_audio_clip,
+    AudioClipPublicationRecoveryDisposition, AudioClipPublicationRequest,
+    ImportedAudioClipPublicationRequest, publish_audio_clip, publish_imported_audio_clip,
     recover_audio_clip_publications,
 };
 
