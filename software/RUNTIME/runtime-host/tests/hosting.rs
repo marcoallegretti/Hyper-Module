@@ -1494,45 +1494,11 @@ fn a_display_that_has_not_changed_sends_nothing_more() {
     let stop = AtomicBool::new(false);
     let mut host = Host::new(CHANNELS);
     let now = Rc::new(Cell::new(0_u64));
-    let mut driver = PanelDriver::new(display_descriptor(2, 4), Rc::clone(&now), &stop, Vec::new());
-    let clock = Rc::clone(&now);
-    let mut link = PanelLink::new(config());
-    link.start(0x5EED, 0).unwrap();
-    // Reach a connected link by driving the handshake through the same loop
-    // the production code uses, then stop it.
-    stop.store(true, Ordering::Release);
-    let _ = serve_panel(
-        &mut driver,
-        &mut host,
-        config(),
-        0x5EED,
-        &stop,
-        move || clock.get(),
-        || {},
-    );
-    drop(link);
+    let (mut link, _driver) =
+        connected_link(&mut host, display_descriptor(2, 4), &stop, &now);
 
-    // A fresh link, connected, then refreshed twice with nothing moving.
-    let stop = AtomicBool::new(false);
-    let mut host = Host::new(CHANNELS);
-    let now = Rc::new(Cell::new(0_u64));
-    let mut driver = PanelDriver::new(display_descriptor(2, 4), Rc::clone(&now), &stop, Vec::new());
-    let clock = Rc::clone(&now);
-    let mut link = PanelLink::new(config());
-    link.start(0x5EED, 0).unwrap();
-    let mut buffer = [0_u8; 1024];
-    for _ in 0..6 {
-        let outbound = link.take_transmit();
-        if !outbound.is_empty() {
-            driver.write_all(&outbound).unwrap();
-        }
-        let read = driver.read(&mut buffer).unwrap_or_default();
-        link.step(&buffer[..read], clock.get(), &mut host);
-    }
-    assert!(link.holds_bindings(), "the handshake completed");
-
-    let first = link.refresh_display(&mut host, clock.get());
-    let second = link.refresh_display(&mut host, clock.get());
+    let first = link.refresh_display(&mut host, now.get());
+    let second = link.refresh_display(&mut host, now.get());
 
     assert!(first > 0, "the first refresh has everything to say");
     assert_eq!(
