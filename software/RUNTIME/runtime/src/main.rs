@@ -11,15 +11,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hyper_audio_source::DecodeLimits;
-#[cfg(test)]
-use hyper_control_runtime::PanelControl;
 use hyper_control_runtime::{
     PanelBinding, PanelConnectError, PanelConnection, PanelDispatchError, PanelDispatchOutcome,
     PanelDisplay, PanelReleaseFailure,
 };
 use hyper_desktop_audio::{
     DesktopControlSinkError, DesktopOutputConfig, DesktopPlaybackSession, OutputStreamCounters,
-    OutputStreamState, OutputStreamStatus,
+    OutputStreamSnapshot, OutputStreamState, OutputStreamStatus,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
@@ -158,6 +156,16 @@ trait RuntimeOperatorControl {
     fn queue_transport(&mut self, command: TransportCommand) -> Result<(), String>;
 }
 
+trait RuntimeOutputObservation {
+    fn output_state(&self) -> OutputStreamState;
+}
+
+impl RuntimeOutputObservation for OutputStreamStatus {
+    fn output_state(&self) -> OutputStreamState {
+        self.state()
+    }
+}
+
 impl RuntimeOperatorControl for SessionHost {
     fn queue_transport(&mut self, command: TransportCommand) -> Result<(), String> {
         self.session
@@ -253,19 +261,23 @@ fn run_headless(arguments: &RuntimeArguments) -> Result<(), String> {
     Ok(())
 }
 
-fn host_runtime(
+fn host_runtime<H, O>(
     arguments: &RuntimeArguments,
-    host: &mut SessionHost,
-    output_status: &OutputStreamStatus,
+    host: &mut H,
+    output_status: &O,
     stop: &AtomicBool,
     commands: Option<&Receiver<OperatorCommand>>,
     diagnostic: &dyn Fn(String),
-) -> Result<(), String> {
-    let mut owner_turn = |host: &mut SessionHost| {
+) -> Result<(), String>
+where
+    H: PanelHost + RuntimeOperatorControl,
+    O: RuntimeOutputObservation,
+{
+    let mut owner_turn = |host: &mut H| {
         if let Some(commands) = commands {
             drain_operator_commands(host, commands, stop, diagnostic);
         }
-        if output_status.state() == OutputStreamState::Failed {
+        if output_status.output_state() == OutputStreamState::Failed {
             stop.store(true, Ordering::Release);
         }
     };
@@ -279,18 +291,32 @@ fn host_runtime(
         return finish_runtime_output(output_status, diagnostic);
     };
 
-    let listener = TcpListener::bind(address)
-        .map_err(|error| format!("cannot listen on {address}: {error}"))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| format!("cannot poll {address}: {error}"))?;
+    let listener = match prepare_panel_listener(address) {
+        Ok(listener) => listener,
+        Err(error) => {
+            contain_panel_service_failure(host, stop, diagnostic, error, &mut owner_turn);
+            return finish_runtime_output(output_status, diagnostic);
+        }
+    };
     diagnostic(format!(
         "panel link listening on {}",
         listener.local_addr().unwrap_or(address)
     ));
 
-    let config = LinkConfig::new(HEARTBEAT_INTERVAL_MS, HEARTBEAT_TIMEOUT_MS)
-        .map_err(|error| format!("panel link configuration is invalid: {error:?}"))?;
+    let config = match LinkConfig::new(HEARTBEAT_INTERVAL_MS, HEARTBEAT_TIMEOUT_MS) {
+        Ok(config) => config,
+        Err(error) => {
+            drop(listener);
+            contain_panel_service_failure(
+                host,
+                stop,
+                diagnostic,
+                format!("panel link configuration is invalid: {error:?}"),
+                &mut owner_turn,
+            );
+            return finish_runtime_output(output_status, diagnostic);
+        }
+    };
     let started = Instant::now();
     let service = serve_panels_with_idle(
         &listener,
@@ -303,27 +329,55 @@ fn host_runtime(
     );
     drop(listener);
     if let Err(error) = service {
-        diagnostic(format!("panel service ended: {error}"));
-        for failure in host.disconnect_panel() {
-            diagnostic(format!(
-                "{:?} could not be released and stays held",
-                failure.control()
-            ));
-        }
-        diagnostic("the project stays hosted; request shutdown to stop it".to_owned());
-        while !stop.load(Ordering::Acquire) {
-            owner_turn(host);
-            std::thread::sleep(hyper_runtime_host::ACCEPT_POLL_INTERVAL);
-        }
+        contain_panel_service_failure(
+            host,
+            stop,
+            diagnostic,
+            format!("panel service ended: {error}"),
+            &mut owner_turn,
+        );
     }
     finish_runtime_output(output_status, diagnostic)
 }
 
-fn finish_runtime_output(
-    output_status: &OutputStreamStatus,
+fn prepare_panel_listener(address: std::net::SocketAddr) -> Result<TcpListener, String> {
+    let listener = TcpListener::bind(address)
+        .map_err(|error| format!("cannot listen on {address}: {error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("cannot poll {address}: {error}"))?;
+    Ok(listener)
+}
+
+fn contain_panel_service_failure<H, I>(
+    host: &mut H,
+    stop: &AtomicBool,
+    diagnostic: &dyn Fn(String),
+    error: String,
+    mut owner_turn: I,
+) where
+    H: PanelHost,
+    I: FnMut(&mut H),
+{
+    diagnostic(error);
+    for failure in host.disconnect_panel() {
+        diagnostic(format!(
+            "{:?} could not be released and stays held",
+            failure.control()
+        ));
+    }
+    diagnostic("the project stays hosted; request shutdown to stop it".to_owned());
+    while !stop.load(Ordering::Acquire) {
+        owner_turn(host);
+        std::thread::sleep(hyper_runtime_host::ACCEPT_POLL_INTERVAL);
+    }
+}
+
+fn finish_runtime_output<O: RuntimeOutputObservation>(
+    output_status: &O,
     diagnostic: &dyn Fn(String),
 ) -> Result<(), String> {
-    if output_status.state() == OutputStreamState::Failed {
+    if output_status.output_state() == OutputStreamState::Failed {
         let message = "native audio ownership ended unexpectedly".to_owned();
         diagnostic(message.clone());
         Err(message)
@@ -414,9 +468,18 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let ui_result = ui
         .run()
         .map_err(|error| format!("operator UI failed: {error}"));
-    stop.store(true, Ordering::Release);
-    let _ = commands_tx.try_send(OperatorCommand::Quit);
     drop(timer);
+    finish_operator_worker(ui_result, &stop, &commands_tx, worker)
+}
+
+fn finish_operator_worker(
+    ui_result: Result<(), String>,
+    stop: &AtomicBool,
+    commands: &SyncSender<OperatorCommand>,
+    worker: std::thread::JoinHandle<Result<(), String>>,
+) -> Result<(), String> {
+    stop.store(true, Ordering::Release);
+    let _ = commands.try_send(OperatorCommand::Quit);
     let worker_result = worker
         .join()
         .map_err(|_| "Runtime worker panicked during shutdown".to_owned())?;
@@ -464,12 +527,7 @@ fn wire_operator_quit(
     let diagnostic_for_button = Arc::clone(diagnostic);
     let weak = ui.as_weak();
     ui.on_quit_requested(move || {
-        stop_for_button.store(true, Ordering::Release);
-        send_operator_command(
-            &sender_for_button,
-            OperatorCommand::Quit,
-            &diagnostic_for_button,
-        );
+        request_operator_shutdown(&stop_for_button, &sender_for_button, &diagnostic_for_button);
         if let Some(ui) = weak.upgrade() {
             let _ = ui.hide();
         }
@@ -479,10 +537,18 @@ fn wire_operator_quit(
     let stop = Arc::clone(stop);
     let diagnostic = Arc::clone(diagnostic);
     ui.window().on_close_requested(move || {
-        stop.store(true, Ordering::Release);
-        send_operator_command(&sender, OperatorCommand::Quit, &diagnostic);
+        request_operator_shutdown(&stop, &sender, &diagnostic);
         CloseRequestResponse::HideWindow
     });
+}
+
+fn request_operator_shutdown(
+    stop: &AtomicBool,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Mutex<String>,
+) {
+    stop.store(true, Ordering::Release);
+    send_operator_command(sender, OperatorCommand::Quit, diagnostic);
 }
 
 fn send_operator_command(
@@ -513,48 +579,86 @@ fn apply_static_facts(ui: &OperatorWindow, facts: &RuntimeFacts) {
     );
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct OperatorObservationPresentation {
+    transport_state: &'static str,
+    transport_frame: String,
+    stream_state: String,
+    callback_count: String,
+    stream_failures: String,
+    native_xruns: String,
+    panel_state: &'static str,
+    diagnostic: String,
+}
+
+fn operator_observation_presentation(
+    transport_state: PlaybackRecoveryTransportState,
+    transport_frame: usize,
+    stream_state: OutputStreamState,
+    counters: OutputStreamSnapshot,
+    panel_connected: bool,
+    diagnostic: String,
+) -> OperatorObservationPresentation {
+    OperatorObservationPresentation {
+        transport_state: match transport_state {
+            PlaybackRecoveryTransportState::Stopped => "Stopped",
+            PlaybackRecoveryTransportState::Rolling => "Rolling",
+        },
+        transport_frame: transport_frame.to_string(),
+        stream_state: format!("{stream_state:?}"),
+        callback_count: counters.callback_count.to_string(),
+        stream_failures: counters.stream_error_count.to_string(),
+        native_xruns: counters
+            .native_xruns
+            .and_then(|snapshot| snapshot.recovery_count)
+            .map_or_else(|| "unavailable".to_owned(), |count| count.to_string()),
+        panel_state: if panel_connected {
+            "Connected"
+        } else {
+            "Disconnected"
+        },
+        diagnostic: if stream_state == OutputStreamState::Failed {
+            "native audio ownership ended unexpectedly".to_owned()
+        } else {
+            diagnostic
+        },
+    }
+}
+
 fn apply_observations(
     ui: &OperatorWindow,
     observers: &RuntimeObservers,
     diagnostic: &Mutex<String>,
 ) {
     let recovery = observers.recovery.snapshot();
-    ui.set_transport_state(
-        match recovery.state() {
-            PlaybackRecoveryTransportState::Stopped => "Stopped",
-            PlaybackRecoveryTransportState::Rolling => "Rolling",
-        }
-        .into(),
-    );
-    ui.set_transport_frame(recovery.position_frame().to_string().into());
-    ui.set_stream_state(format!("{:?}", observers.output_status.state()).into());
+    let stream_state = observers.output_status.state();
     let counters = observers.output_counters.snapshot();
-    ui.set_callback_count(counters.callback_count.to_string().into());
-    ui.set_stream_failures(counters.stream_error_count.to_string().into());
-    ui.set_native_xruns(
-        counters
-            .native_xruns
-            .and_then(|snapshot| snapshot.recovery_count)
-            .map_or_else(|| "unavailable".to_owned(), |count| count.to_string())
-            .into(),
-    );
-    ui.set_panel_state(
-        if observers.panel_connected.load(Ordering::Acquire) {
-            "Connected"
-        } else {
-            "Disconnected"
-        }
-        .into(),
-    );
-    if observers.output_status.state() == OutputStreamState::Failed {
+    if stream_state == OutputStreamState::Failed {
         set_diagnostic(
             diagnostic,
             "native audio ownership ended unexpectedly".to_owned(),
         );
     }
-    if let Ok(current) = diagnostic.lock() {
-        ui.set_diagnostic(current.clone().into());
-    }
+    let current_diagnostic = diagnostic.lock().map_or_else(
+        |_| "diagnostic state unavailable".to_owned(),
+        |value| value.clone(),
+    );
+    let presentation = operator_observation_presentation(
+        recovery.state(),
+        recovery.position_frame(),
+        stream_state,
+        counters,
+        observers.panel_connected.load(Ordering::Acquire),
+        current_diagnostic,
+    );
+    ui.set_transport_state(presentation.transport_state.into());
+    ui.set_transport_frame(presentation.transport_frame.into());
+    ui.set_stream_state(presentation.stream_state.into());
+    ui.set_callback_count(presentation.callback_count.into());
+    ui.set_stream_failures(presentation.stream_failures.into());
+    ui.set_native_xruns(presentation.native_xruns.into());
+    ui.set_panel_state(presentation.panel_state.into());
+    ui.set_diagnostic(presentation.diagnostic.into());
 }
 
 /// Enforces the process startup boundary: artifact acceptance and semantic
@@ -578,46 +682,6 @@ fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
         source = cause.source();
     }
     rendered
-}
-
-/// Receives the process-level events that follow the panel service ending.
-#[cfg(test)]
-trait PanelServiceReporter<E> {
-    fn service_ended(&mut self, error: &E);
-    fn release_failed(&mut self, control: PanelControl);
-    fn project_still_hosted(&mut self);
-}
-
-/// Releases the listener and applies the process policy after panel service.
-///
-/// The listener is owned so it is closed before any failure is reported: a
-/// panel must never connect to a port the process no longer services. A service
-/// failure gets one process-owner release attempt, then project playback stays
-/// alive until the ordinary quit flag is observed.
-#[cfg(test)]
-fn finish_panel_service<L, E, D, R, W>(
-    listener: L,
-    service: Result<(), E>,
-    stop: &AtomicBool,
-    mut disconnect: D,
-    reporter: &mut R,
-    mut wait: W,
-) where
-    D: FnMut() -> Vec<PanelControl>,
-    R: PanelServiceReporter<E>,
-    W: FnMut(),
-{
-    drop(listener);
-    if let Err(error) = service {
-        reporter.service_ended(&error);
-        for control in disconnect() {
-            reporter.release_failed(control);
-        }
-        reporter.project_still_hosted();
-        while !stop.load(Ordering::Acquire) {
-            wait();
-        }
-    }
 }
 
 fn report_to(served: &ServedPanel, diagnostic: &dyn Fn(String)) {
@@ -700,40 +764,6 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use super::*;
-
-    struct DropProbe<'a>(&'a Cell<bool>);
-
-    impl Drop for DropProbe<'_> {
-        fn drop(&mut self) {
-            self.0.set(true);
-        }
-    }
-
-    #[derive(Debug, Eq, PartialEq)]
-    enum Reported {
-        ServiceEnded,
-        ReleaseFailed(PanelControl),
-        ProjectStillHosted,
-    }
-
-    #[derive(Default)]
-    struct Reporter {
-        events: Vec<Reported>,
-    }
-
-    impl PanelServiceReporter<()> for Reporter {
-        fn service_ended(&mut self, _error: &()) {
-            self.events.push(Reported::ServiceEnded);
-        }
-
-        fn release_failed(&mut self, control: PanelControl) {
-            self.events.push(Reported::ReleaseFailed(control));
-        }
-
-        fn project_still_hosted(&mut self) {
-            self.events.push(Reported::ProjectStillHosted);
-        }
-    }
 
     #[test]
     fn rejected_bundle_preparation_cannot_open_output() {
@@ -819,65 +849,80 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_panel_service_releases_the_port_retries_controls_and_keeps_hosting() {
-        let dropped = Cell::new(false);
-        let disconnects = Cell::new(0);
-        let waits = Cell::new(0);
+    fn an_unavailable_panel_listener_keeps_the_runtime_owner_until_quit() {
+        let occupied = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = occupied.local_addr().unwrap();
+        let arguments = RuntimeArguments::parse([
+            "--panel-listen".to_owned(),
+            address.to_string(),
+            "deployment".to_owned(),
+        ])
+        .unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        sender.send(OperatorCommand::Quit).unwrap();
         let stop = AtomicBool::new(false);
-        let mut reporter = Reporter::default();
+        let mut owner = OperatorControl::default();
+        let diagnostics = RefCell::new(Vec::new());
 
-        finish_panel_service(
-            DropProbe(&dropped),
-            Err(()),
+        host_runtime(
+            &arguments,
+            &mut owner,
+            &OutputObservation(OutputStreamState::Running),
             &stop,
-            || {
-                assert!(dropped.get(), "the unattended port is closed first");
-                disconnects.set(disconnects.get() + 1);
-                vec![PanelControl::Button { index: 2 }]
-            },
-            &mut reporter,
-            || {
-                waits.set(waits.get() + 1);
-                stop.store(true, Ordering::Release);
-            },
-        );
+            Some(&receiver),
+            &|message| diagnostics.borrow_mut().push(message),
+        )
+        .unwrap();
 
-        assert!(dropped.get());
-        assert_eq!(disconnects.get(), 1, "the process owner retries once");
-        assert_eq!(waits.get(), 1, "the project remains hosted until quit");
-        assert_eq!(
-            reporter.events,
-            [
-                Reported::ServiceEnded,
-                Reported::ReleaseFailed(PanelControl::Button { index: 2 }),
-                Reported::ProjectStillHosted,
-            ]
+        assert!(
+            diagnostics
+                .borrow()
+                .iter()
+                .any(|message| message.contains("cannot listen")),
+            "the occupied endpoint remains visible: {:?}",
+            diagnostics.borrow()
         );
+        assert!(
+            diagnostics
+                .borrow()
+                .iter()
+                .any(|message| message.contains("project stays hosted"))
+        );
+        assert_eq!(owner.disconnects, 1, "the sole owner gets one release turn");
+        assert!(stop.load(Ordering::Acquire));
+        drop(occupied);
     }
 
     #[test]
-    fn a_clean_panel_service_end_only_releases_the_listener() {
-        let dropped = Cell::new(false);
+    fn native_output_failure_ends_the_same_production_host_loop() {
+        let arguments = RuntimeArguments::parse(["deployment".to_owned()]).unwrap();
         let stop = AtomicBool::new(false);
-        let mut reporter = Reporter::default();
+        let mut owner = OperatorControl::default();
+        let diagnostics = RefCell::new(Vec::new());
 
-        finish_panel_service(
-            DropProbe(&dropped),
-            Ok(()),
+        let error = host_runtime(
+            &arguments,
+            &mut owner,
+            &OutputObservation(OutputStreamState::Failed),
             &stop,
-            || panic!("a clean service end has no stranded controls"),
-            &mut reporter,
-            || panic!("a clean service end does not enter failure waiting"),
-        );
+            None,
+            &|message| diagnostics.borrow_mut().push(message),
+        )
+        .unwrap_err();
 
-        assert!(dropped.get());
-        assert!(reporter.events.is_empty());
+        assert_eq!(error, "native audio ownership ended unexpectedly");
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(
+            owner.disconnects, 0,
+            "there was no panel service to release"
+        );
     }
 
     #[derive(Default)]
     struct OperatorControl {
         commands: Vec<TransportCommand>,
         reject: bool,
+        disconnects: usize,
     }
 
     impl RuntimeOperatorControl for OperatorControl {
@@ -888,6 +933,48 @@ mod tests {
                 self.commands.push(command);
                 Ok(())
             }
+        }
+    }
+
+    impl PanelHost for OperatorControl {
+        type Error = core::convert::Infallible;
+
+        fn mixer_channel_count(&self) -> usize {
+            0
+        }
+
+        fn connect_panel(
+            &mut self,
+            _descriptor: PanelDescriptor,
+            _bindings: &[PanelBinding],
+        ) -> Result<PanelConnection<Self::Error>, PanelConnectError> {
+            panic!("the occupied-port test cannot accept a panel")
+        }
+
+        fn disconnect_panel(&mut self) -> Vec<PanelReleaseFailure<Self::Error>> {
+            self.disconnects += 1;
+            Vec::new()
+        }
+
+        fn panel_connected(&self) -> bool {
+            false
+        }
+
+        fn dispatch_panel(
+            &mut self,
+            _message: Message,
+        ) -> Result<PanelDispatchOutcome, PanelDispatchError<Self::Error>> {
+            panic!("the occupied-port test cannot dispatch a panel")
+        }
+
+        fn panel_display(&mut self, _out: &mut Vec<PanelDisplay>) {}
+    }
+
+    struct OutputObservation(OutputStreamState);
+
+    impl RuntimeOutputObservation for OutputObservation {
+        fn output_state(&self) -> OutputStreamState {
+            self.0
         }
     }
 
@@ -943,18 +1030,114 @@ mod tests {
     }
 
     #[test]
-    fn operator_buttons_publish_only_the_commands_the_worker_accepts() {
+    fn operator_ui_wires_commands_and_authoritative_properties() {
         let ui = OperatorWindow::new().unwrap();
         let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
-        let diagnostic = Arc::new(Mutex::new(String::new()));
+        let diagnostic = Arc::new(Mutex::new("authoritative diagnostic".to_owned()));
+        let stop = Arc::new(AtomicBool::new(false));
         wire_operator_action(&ui, &sender, &diagnostic, OperatorCommand::Start);
         wire_operator_stop(&ui, &sender, &diagnostic);
+        wire_operator_quit(&ui, &sender, &stop, &diagnostic);
+
+        let facts = RuntimeFacts {
+            bundle_identity: "f".repeat(64),
+            deployment_generation: u64::MAX,
+            recovered_from: Some("e".repeat(64)),
+            project_name: "Night Drive".to_owned(),
+            project_id: "project-night-drive".to_owned(),
+            project_revision: u64::MAX - 1,
+        };
+        let observers = RuntimeObservers {
+            facts: facts.clone(),
+            output_status: OutputStreamStatus::default(),
+            output_counters: OutputStreamCounters::default(),
+            recovery: PlaybackRecoveryCheckpoint::default(),
+            panel_connected: Arc::new(AtomicBool::new(false)),
+        };
+        apply_static_facts(&ui, &facts);
+        apply_observations(&ui, &observers, &diagnostic);
 
         ui.invoke_start_requested();
         ui.invoke_stop_requested();
+        ui.invoke_quit_requested();
 
         assert_eq!(receiver.try_recv(), Ok(OperatorCommand::Start));
         assert_eq!(receiver.try_recv(), Ok(OperatorCommand::Stop));
+        assert_eq!(receiver.try_recv(), Ok(OperatorCommand::Quit));
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(ui.get_project_name().as_str(), "Night Drive");
+        assert_eq!(ui.get_project_identity().as_str(), "project-night-drive");
+        assert_eq!(
+            ui.get_project_revision().as_str(),
+            (u64::MAX - 1).to_string()
+        );
+        assert_eq!(
+            ui.get_deployment_generation().as_str(),
+            u64::MAX.to_string()
+        );
+        assert_eq!(ui.get_bundle_identity().as_str(), "f".repeat(64));
+        assert!(ui.get_recovery_state().contains(&"e".repeat(64)));
+        assert_eq!(ui.get_transport_state().as_str(), "Stopped");
+        assert_eq!(ui.get_transport_frame().as_str(), "0");
+        assert_eq!(ui.get_stream_state().as_str(), "Starting");
+        assert_eq!(ui.get_callback_count().as_str(), "0");
+        assert_eq!(ui.get_stream_failures().as_str(), "0");
+        assert_eq!(ui.get_native_xruns().as_str(), "unavailable");
+        assert_eq!(ui.get_panel_state().as_str(), "Disconnected");
+        assert_eq!(ui.get_diagnostic().as_str(), "authoritative diagnostic");
+    }
+
+    #[test]
+    fn operator_shutdown_waits_for_the_worker_it_signals() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        let stop = Arc::new(AtomicBool::new(false));
+        let joined = Arc::new(AtomicBool::new(false));
+        let worker_joined = Arc::clone(&joined);
+        let worker = std::thread::spawn(move || {
+            assert_eq!(receiver.recv(), Ok(OperatorCommand::Quit));
+            worker_joined.store(true, Ordering::Release);
+            Ok(())
+        });
+
+        finish_operator_worker(Ok(()), &stop, &sender, worker).unwrap();
+
+        assert!(stop.load(Ordering::Acquire));
+        assert!(
+            joined.load(Ordering::Acquire),
+            "the join observed worker exit"
+        );
+    }
+
+    #[test]
+    fn operator_observation_formatting_preserves_full_width_evidence() {
+        let presentation = operator_observation_presentation(
+            PlaybackRecoveryTransportState::Rolling,
+            usize::MAX,
+            OutputStreamState::Failed,
+            OutputStreamSnapshot {
+                callback_count: u64::MAX,
+                stream_error_count: u64::MAX - 1,
+                native_xruns: Some(hyper_desktop_audio::NativeXrunSnapshot {
+                    recovery_count: Some(u64::MAX - 2),
+                    ..hyper_desktop_audio::NativeXrunSnapshot::default()
+                }),
+                ..OutputStreamSnapshot::default()
+            },
+            true,
+            "stale diagnostic".to_owned(),
+        );
+
+        assert_eq!(presentation.transport_state, "Rolling");
+        assert_eq!(presentation.transport_frame, usize::MAX.to_string());
+        assert_eq!(presentation.stream_state, "Failed");
+        assert_eq!(presentation.callback_count, u64::MAX.to_string());
+        assert_eq!(presentation.stream_failures, (u64::MAX - 1).to_string());
+        assert_eq!(presentation.native_xruns, (u64::MAX - 2).to_string());
+        assert_eq!(presentation.panel_state, "Connected");
+        assert_eq!(
+            presentation.diagnostic,
+            "native audio ownership ended unexpectedly"
+        );
     }
 }
