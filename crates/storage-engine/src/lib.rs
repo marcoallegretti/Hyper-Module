@@ -195,6 +195,30 @@ impl StructurallyVerifiedProject {
         self.manifest_byte_length
     }
 
+    /// Re-reads the canonical project manifest through this retained authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a verification rejection when the manifest is no longer the
+    /// exact regular file captured by this project authority.
+    pub fn read_manifest(&self) -> Result<Vec<u8>, StorageError> {
+        let file = open_declared_file(&self.root_dir, MANIFEST_NAME)?;
+        let verified = verify_open_stable(
+            file,
+            MANIFEST_NAME,
+            self.manifest_byte_length,
+            self.manifest_sha256,
+            true,
+        )?;
+        verified.bytes.ok_or_else(|| {
+            rejection(
+                StorageErrorKind::Io,
+                MANIFEST_NAME,
+                "verified project manifest bytes are unavailable",
+            )
+        })
+    }
+
     /// Re-reads one declared resource as stable, digest-verified bytes.
     ///
     /// # Errors

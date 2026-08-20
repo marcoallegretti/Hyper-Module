@@ -2396,6 +2396,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-runtime-bundle-builder"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "hyper-audio-source",
+ "hyper-fs-authority",
+ "hyper-media-cache",
+ "hyper-playback-json",
+ "hyper-playback-session",
+ "hyper-project-loader",
+ "hyper-project-model",
+ "hyper-runtime-bundle",
+ "hyper-storage-engine",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
 name = "hyper-runtime-deployment"
 version = "0.1.0"
 dependencies = [
