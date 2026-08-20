@@ -7,6 +7,9 @@ use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use rubato::audioadapter::Adapter;
+use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
+use rubato::{Async, FixedAsync, Resampler, SincInterpolationParameters};
 use symphonia::core::audio::{Channels, SampleBuffer};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -180,6 +183,9 @@ pub enum DecodeError {
     NonFiniteSample { frame: u64, channel: usize },
     CapacityUnavailable,
     InvalidDecodedAudio(&'static str),
+    Resampling(String),
+    Wave(hound::Error),
+    OutputFrameLimitExceeded { actual: u64, maximum: u64 },
 }
 
 impl fmt::Display for DecodeError {
@@ -254,6 +260,12 @@ impl fmt::Display for DecodeError {
             Self::InvalidDecodedAudio(reason) => {
                 write!(formatter, "invalid decoded audio: {reason}")
             }
+            Self::Resampling(reason) => write!(formatter, "audio resampling failed: {reason}"),
+            Self::Wave(error) => write!(formatter, "WAV encoding failed: {error}"),
+            Self::OutputFrameLimitExceeded { actual, maximum } => write!(
+                formatter,
+                "resampled audio has {actual} frames; maximum is {maximum}"
+            ),
         }
     }
 }
@@ -263,6 +275,7 @@ impl Error for DecodeError {
         match self {
             Self::Io(error) => Some(error),
             Self::Media(error) => Some(error),
+            Self::Wave(error) => Some(error),
             _ => None,
         }
     }
@@ -277,6 +290,12 @@ impl From<io::Error> for DecodeError {
 impl From<SymphoniaError> for DecodeError {
     fn from(error: SymphoniaError) -> Self {
         Self::Media(error)
+    }
+}
+
+impl From<hound::Error> for DecodeError {
+    fn from(error: hound::Error) -> Self {
+        Self::Wave(error)
     }
 }
 
@@ -321,7 +340,49 @@ pub fn decode_open_file(
     file.seek(SeekFrom::Start(0))?;
     verify_container_signature(&mut file, container)?;
     file.seek(SeekFrom::Start(0))?;
-    decode_source(Box::new(file), container, expected_sample_rate_hz, limits)
+    decode_source(
+        Box::new(file),
+        container,
+        Some(expected_sample_rate_hz),
+        limits,
+    )
+}
+
+/// Decodes one complete WAV or native FLAC file at its declared source rate.
+///
+/// This is intended for offline import before explicit conversion to the
+/// project's sample rate. Playback loaders should continue to use
+/// [`decode_file`] so package-rate mismatches fail closed.
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] under the same structural and resource limits as
+/// [`decode_file`], without imposing a caller-selected sample rate.
+pub fn decode_file_at_source_rate(
+    path: &Path,
+    container: AudioContainer,
+    limits: DecodeLimits,
+) -> Result<DecodedAudio, DecodeError> {
+    decode_open_file_at_source_rate(File::open(path)?, container, limits)
+}
+
+/// Decodes an already-open WAV or FLAC file at its declared source rate.
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] under the same rules as
+/// [`decode_file_at_source_rate`].
+pub fn decode_open_file_at_source_rate(
+    mut file: File,
+    container: AudioContainer,
+    limits: DecodeLimits,
+) -> Result<DecodedAudio, DecodeError> {
+    let file_length = file.metadata()?.len();
+    require_file_limit(file_length, limits)?;
+    file.seek(SeekFrom::Start(0))?;
+    verify_container_signature(&mut file, container)?;
+    file.seek(SeekFrom::Start(0))?;
+    decode_source(Box::new(file), container, None, limits)
 }
 
 /// Decodes complete verified WAV or native FLAC bytes outside the real-time
@@ -345,7 +406,172 @@ pub fn decode_bytes(
     let mut cursor = Cursor::new(bytes);
     verify_container_signature(&mut cursor, container)?;
     cursor.seek(SeekFrom::Start(0))?;
-    decode_source(Box::new(cursor), container, expected_sample_rate_hz, limits)
+    decode_source(
+        Box::new(cursor),
+        container,
+        Some(expected_sample_rate_hz),
+        limits,
+    )
+}
+
+/// Converts a complete decoded clip to a positive target rate with a bounded,
+/// band-limited sinc resampler.
+///
+/// Same-rate input is returned without altering its samples. The output frame
+/// limit is checked both before allocation and after conversion.
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] for an invalid target, arithmetic/capacity failure,
+/// an exceeded output bound, or a resampler failure.
+pub fn resample_audio(
+    audio: DecodedAudio,
+    target_sample_rate_hz: u32,
+    maximum_output_frames: u64,
+) -> Result<DecodedAudio, DecodeError> {
+    if target_sample_rate_hz == 0 || maximum_output_frames == 0 {
+        return Err(DecodeError::InvalidLimits);
+    }
+    if audio.sample_rate_hz == target_sample_rate_hz {
+        if u64::try_from(audio.frame_count()).map_or(true, |frames| frames > maximum_output_frames)
+        {
+            return Err(DecodeError::OutputFrameLimitExceeded {
+                actual: u64::try_from(audio.frame_count()).unwrap_or(u64::MAX),
+                maximum: maximum_output_frames,
+            });
+        }
+        return Ok(audio);
+    }
+    let input_frames = audio.frame_count();
+    let estimated_frames = u128::try_from(input_frames)
+        .ok()
+        .and_then(|frames| frames.checked_mul(u128::from(target_sample_rate_hz)))
+        .and_then(|scaled| scaled.checked_add(u128::from(audio.sample_rate_hz - 1)))
+        .map(|scaled| scaled / u128::from(audio.sample_rate_hz))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    if estimated_frames > u128::from(maximum_output_frames) {
+        return Err(DecodeError::OutputFrameLimitExceeded {
+            actual: u64::try_from(estimated_frames).unwrap_or(u64::MAX),
+            maximum: maximum_output_frames,
+        });
+    }
+    let expected_output_frames =
+        usize::try_from(estimated_frames).map_err(|_| DecodeError::CapacityUnavailable)?;
+    let channels = audio.channels();
+    let mut planes = Vec::new();
+    planes
+        .try_reserve_exact(channels)
+        .map_err(|_| DecodeError::CapacityUnavailable)?;
+    for channel in 0..channels {
+        planes.push(
+            audio
+                .plane(channel)
+                .ok_or(DecodeError::InvalidDecodedAudio("missing channel plane"))?
+                .to_vec(),
+        );
+    }
+    let ratio = f64::from(target_sample_rate_hz) / f64::from(audio.sample_rate_hz);
+    let mut resampler = Async::<f32>::new_sinc(
+        ratio,
+        1.0,
+        &SincInterpolationParameters::default(),
+        input_frames.clamp(1, 4096),
+        channels,
+        FixedAsync::Input,
+    )
+    .map_err(|error| DecodeError::Resampling(error.to_string()))?;
+    let input = SequentialSliceOfVecs::new(&planes, channels, input_frames)
+        .map_err(|error| DecodeError::Resampling(error.to_string()))?;
+    let output = resampler
+        .process_all(&input, input_frames, None)
+        .map_err(|error| DecodeError::Resampling(error.to_string()))?;
+    if output.frames() < expected_output_frames {
+        return Err(DecodeError::Resampling(
+            "resampler returned fewer frames than the source duration requires".to_owned(),
+        ));
+    }
+    let output_frames = expected_output_frames;
+    let mut interleaved = output.take_data();
+    interleaved.truncate(
+        output_frames
+            .checked_mul(channels)
+            .ok_or(DecodeError::CapacityUnavailable)?,
+    );
+    let mut converted = vec![Vec::new(); channels];
+    for plane in &mut converted {
+        plane
+            .try_reserve_exact(output_frames)
+            .map_err(|_| DecodeError::CapacityUnavailable)?;
+    }
+    for frame in interleaved.chunks_exact(channels) {
+        for (channel, sample) in frame.iter().copied().enumerate() {
+            if !sample.is_finite() {
+                return Err(DecodeError::NonFiniteSample {
+                    frame: u64::try_from(converted[channel].len()).unwrap_or(u64::MAX),
+                    channel,
+                });
+            }
+            converted[channel].push(sample);
+        }
+    }
+    match converted.as_mut_slice() {
+        [mono] => DecodedAudio::from_mono(target_sample_rate_hz, std::mem::take(mono)),
+        [left, right] => DecodedAudio::from_stereo(
+            target_sample_rate_hz,
+            std::mem::take(left),
+            std::mem::take(right),
+        ),
+        _ => Err(DecodeError::InvalidDecodedAudio(
+            "resampler returned an unsupported channel count",
+        )),
+    }
+}
+
+/// Encodes a complete decoded clip as a finalized IEEE-float WAV.
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] for an unrepresentable channel count, output
+/// capacity failure, or a WAV writer failure.
+pub fn encode_float_wav(audio: &DecodedAudio) -> Result<Vec<u8>, DecodeError> {
+    let channels = u16::try_from(audio.channels()).map_err(|_| DecodeError::CapacityUnavailable)?;
+    let sample_count = audio
+        .frame_count()
+        .checked_mul(audio.channels())
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    let capacity = sample_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|bytes| bytes.checked_add(68))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| DecodeError::CapacityUnavailable)?;
+    {
+        let cursor = Cursor::new(&mut bytes);
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: audio.sample_rate_hz,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::new(cursor, spec)?;
+        let left = audio
+            .plane(0)
+            .ok_or(DecodeError::InvalidDecodedAudio("missing channel plane"))?;
+        if let Some(right) = audio.plane(1) {
+            for (&left, &right) in left.iter().zip(right) {
+                writer.write_sample(left)?;
+                writer.write_sample(right)?;
+            }
+        } else {
+            for &sample in left {
+                writer.write_sample(sample)?;
+            }
+        }
+        writer.finalize()?;
+    }
+    Ok(bytes)
 }
 
 fn require_file_limit(file_length: u64, limits: DecodeLimits) -> Result<(), DecodeError> {
@@ -374,7 +600,7 @@ fn require_expected_sample_rate(expected_sample_rate_hz: u32) -> Result<(), Deco
 fn decode_source(
     source: Box<dyn MediaSource>,
     container: AudioContainer,
-    expected_sample_rate_hz: u32,
+    expected_sample_rate_hz: Option<u32>,
     limits: DecodeLimits,
 ) -> Result<DecodedAudio, DecodeError> {
     let media_stream = MediaSourceStream::new(source, MediaSourceStreamOptions::default());
@@ -409,9 +635,9 @@ fn decode_source(
     let sample_rate_hz = parameters
         .sample_rate
         .ok_or(DecodeError::MissingStreamProperty("sample rate"))?;
-    if sample_rate_hz != expected_sample_rate_hz {
+    if expected_sample_rate_hz.is_some_and(|expected| sample_rate_hz != expected) {
         return Err(DecodeError::SampleRateMismatch {
-            expected: expected_sample_rate_hz,
+            expected: expected_sample_rate_hz.expect("checked expected rate"),
             actual: sample_rate_hz,
         });
     }

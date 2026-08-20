@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use hyper_audio_source::{
     AudioContainer, DecodeError, DecodeLimits, DecodedAudio, decode_bytes, decode_file,
+    decode_file_at_source_rate, encode_float_wav, resample_audio,
 };
 
 static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -249,6 +250,64 @@ fn validates_limits_and_in_memory_sources() {
     assert!(matches!(
         decode_bytes(Vec::new(), AudioContainer::Wav, 0, limits()),
         Err(DecodeError::InvalidDecodedAudio(_))
+    ));
+}
+
+#[test]
+fn source_rate_decode_resample_and_float_wav_round_trip() {
+    let source_samples: Vec<i16> = (0..441)
+        .map(|frame| if frame == 120 { 16_384 } else { 0 })
+        .collect();
+    let source = TemporaryAudioFile::create("wav", &pcm16_wav(1, 44_100, &source_samples));
+    let decoded = decode_file_at_source_rate(source.path(), AudioContainer::Wav, limits()).unwrap();
+    assert_eq!(decoded.sample_rate_hz(), 44_100);
+    assert_eq!(decoded.frame_count(), 441);
+
+    let converted = resample_audio(decoded, 48_000, 500).unwrap();
+    assert_eq!(converted.sample_rate_hz(), 48_000);
+    assert_eq!(converted.channels(), 1);
+    assert_eq!(converted.frame_count(), 480);
+    assert!(
+        converted
+            .plane(0)
+            .unwrap()
+            .iter()
+            .all(|sample| sample.is_finite())
+    );
+    assert!(
+        converted
+            .plane(0)
+            .unwrap()
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max)
+            > 0.4
+    );
+
+    let wav = encode_float_wav(&converted).unwrap();
+    let round_trip = decode_bytes(wav, AudioContainer::Wav, 48_000, limits()).unwrap();
+    assert_eq!(round_trip, converted);
+}
+
+#[test]
+fn same_rate_conversion_is_exact_and_output_bound_is_enforced() {
+    let audio = DecodedAudio::from_stereo(48_000, vec![0.25, -0.5], vec![-0.25, 0.5]).unwrap();
+    assert_eq!(resample_audio(audio.clone(), 48_000, 2).unwrap(), audio);
+    assert!(matches!(
+        resample_audio(audio.clone(), 48_000, 1),
+        Err(DecodeError::OutputFrameLimitExceeded {
+            actual: 2,
+            maximum: 1
+        })
+    ));
+
+    let upsampled = resample_audio(audio, 96_000, 3);
+    assert!(matches!(
+        upsampled,
+        Err(DecodeError::OutputFrameLimitExceeded {
+            actual: 4,
+            maximum: 3
+        })
     ));
 }
 

@@ -2100,6 +2100,8 @@ version = "0.1.0"
 name = "hyper-audio-source"
 version = "0.1.0"
 dependencies = [
+ "hound",
+ "rubato",
  "symphonia",
 ]
 
