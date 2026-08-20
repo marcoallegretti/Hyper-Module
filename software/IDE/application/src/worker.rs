@@ -10632,7 +10632,7 @@ mod tests {
         IdeOutputTestState, IdePlaybackExtent, IdePlaybackSessionOwner,
         OutputTestingDesktopIdeApplication, TestPlaybackSession,
     };
-    use hyper_audio_source::DecodeLimits;
+    use hyper_audio_source::{AudioContainer, DecodeLimits, decode_bytes};
     use hyper_media_cache::CacheLimits;
     use hyper_playback_json::LoaderLimits;
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
@@ -10640,6 +10640,8 @@ mod tests {
     use hyper_storage_engine::{ProjectCreationErrorKind, verify_project_package};
 
     const WAIT: Duration = Duration::from_secs(2);
+    const AUDIO_IMPORT_FLAC_FIXTURE_BASE64: &str =
+        include_str!("../../../../crates/audio-source/tests/fixtures/mono-44100.flac.b64");
 
     fn application_config() -> IdeApplicationConfig {
         IdeApplicationConfig::try_new(
@@ -10668,19 +10670,49 @@ mod tests {
         )
     }
 
+    fn audio_import_application() -> DesktopIdeApplication {
+        let config = IdeApplicationConfig::try_new(
+            256,
+            ProjectPlaybackLimits {
+                max_total_resource_bytes: 2_097_152,
+                audio: DecodeLimits::new(2_097_152, 300_000, 2_400_000).unwrap(),
+                session: PlaybackSessionAssemblyLimits {
+                    documents: LoaderLimits::VERSION_1,
+                    media_cache: CacheLimits {
+                        max_assets: 8,
+                        max_frames_per_asset: 300_000,
+                        max_decoded_sample_bytes: 4_800_000,
+                    },
+                },
+            },
+        )
+        .unwrap();
+        DesktopIdeApplication::from_inventories(
+            config,
+            IdeAudioOutputInventory::try_new(&[("route-a", "Output A")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[("input-a", "Input A")]).unwrap(),
+        )
+    }
+
     fn mono_pcm16_wav(sample_rate_hz: u32, samples: &[i16]) -> Vec<u8> {
+        pcm16_wav(1, sample_rate_hz, samples)
+    }
+
+    fn pcm16_wav(channels: u16, sample_rate_hz: u32, samples: &[i16]) -> Vec<u8> {
+        assert_eq!(samples.len() % usize::from(channels), 0);
         let data_bytes = u32::try_from(std::mem::size_of_val(samples)).unwrap();
-        let byte_rate = sample_rate_hz * 2;
+        let block_align = channels * 2;
+        let byte_rate = sample_rate_hz * u32::from(block_align);
         let mut bytes = Vec::with_capacity(44 + samples.len() * 2);
         bytes.extend_from_slice(b"RIFF");
         bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
         bytes.extend_from_slice(b"WAVEfmt ");
         bytes.extend_from_slice(&16_u32.to_le_bytes());
         bytes.extend_from_slice(&1_u16.to_le_bytes());
-        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
         bytes.extend_from_slice(&sample_rate_hz.to_le_bytes());
         bytes.extend_from_slice(&byte_rate.to_le_bytes());
-        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
         bytes.extend_from_slice(&16_u16.to_le_bytes());
         bytes.extend_from_slice(b"data");
         bytes.extend_from_slice(&data_bytes.to_le_bytes());
@@ -10688,6 +10720,58 @@ mod tests {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
         bytes
+    }
+
+    fn decode_base64_fixture(encoded: &str) -> Vec<u8> {
+        let mut output = Vec::with_capacity(encoded.len() * 3 / 4);
+        let mut accumulator = 0_u32;
+        let mut bits = 0_u8;
+        for byte in encoded.bytes().filter(|byte| !byte.is_ascii_whitespace() && *byte != b'=') {
+            let value = match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => panic!("invalid base64 fixture"),
+            };
+            accumulator = (accumulator << 6) | u32::from(value);
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                output.push(u8::try_from((accumulator >> bits) & 0xff).unwrap());
+                accumulator &= (1_u32 << bits) - 1;
+            }
+        }
+        output
+    }
+
+    fn assert_imported_audio_assets(project: &Path, expected_revision: u64) {
+        let verified = verify_project_package(project).unwrap();
+        assert_eq!(verified.manifest().revision(), expected_revision);
+        let mut decoded_assets = verified
+            .manifest()
+            .assets()
+            .iter()
+            .map(|asset| {
+                decode_bytes(
+                    verified.read_asset(asset.id(), 2_097_152).unwrap(),
+                    AudioContainer::Wav,
+                    48_000,
+                    DecodeLimits::new(2_097_152, 300_000, 2_400_000).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        decoded_assets.sort_by_key(hyper_audio_source::DecodedAudio::frame_count);
+        assert_eq!(decoded_assets[0].frame_count(), 480);
+        assert_eq!(decoded_assets[0].channels(), 2);
+        assert_ne!(
+            decoded_assets[0].plane(0).unwrap(),
+            decoded_assets[0].plane(1).unwrap()
+        );
+        assert_eq!(decoded_assets[1].frame_count(), 240_000);
+        assert_eq!(decoded_assets[1].channels(), 1);
     }
 
     fn output_testing_application(
@@ -10958,13 +11042,22 @@ mod tests {
         let project = created.project().root().to_path_buf();
         let initial_revision = created.project().manifest().revision();
         drop(created);
-        let first = fixture.join("Kick.wav");
-        let second = fixture.join("Snare.WAV");
-        std::fs::write(&first, mono_pcm16_wav(44_100, &[1_000; 441])).unwrap();
-        std::fs::write(&second, mono_pcm16_wav(48_000, &[-1_000; 480])).unwrap();
+        let first = fixture.join("Stereo.wav");
+        let second = fixture.join("Voice.flac");
+        let mut stereo = Vec::with_capacity(441 * 2);
+        for frame in 0..441 {
+            stereo.push(if frame == 100 { 24_000 } else { 0 });
+            stereo.push(if frame == 300 { -16_000 } else { 0 });
+        }
+        std::fs::write(&first, pcm16_wav(2, 44_100, &stereo)).unwrap();
+        std::fs::write(
+            &second,
+            decode_base64_fixture(AUDIO_IMPORT_FLAC_FIXTURE_BASE64),
+        )
+        .unwrap();
 
         let worker =
-            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 5)
+            DesktopIdeWorker::start_state(WorkerState::Closed(audio_import_application()), 2, 5)
                 .unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
@@ -11011,21 +11104,21 @@ mod tests {
                 .iter()
                 .map(IdeAudioClip::name)
                 .collect::<Vec<_>>(),
-            ["Kick", "Snare"]
+            ["Stereo", "Voice"]
         );
-        assert!(
+        assert!(reopened.audio_clips().iter().all(|clip| clip.track_id() == track_id));
+        assert_eq!(
             reopened
                 .audio_clips()
                 .iter()
-                .all(|clip| clip.track_id() == track_id && clip.source_frame_count() == 480)
+                .map(IdeAudioClip::source_frame_count)
+                .collect::<Vec<_>>(),
+            [480, 240_000]
         );
         assert_eq!(outcome.imported(), 2);
         assert_eq!(outcome.clip_ids().len(), 2);
         assert_eq!(outcome.final_revision(), initial_revision + 2);
-        assert_eq!(
-            verify_project_package(&project).unwrap().manifest().revision(),
-            initial_revision + 2
-        );
+        assert_imported_audio_assets(&project, initial_revision + 2);
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }

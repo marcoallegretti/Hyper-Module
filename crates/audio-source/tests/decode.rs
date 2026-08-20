@@ -10,7 +10,7 @@ use hyper_audio_source::{
 
 static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(0);
 const EPSILON: f32 = 1.0e-6;
-const FLAC_FIXTURE_BASE64: &str = "ZkxhQwAAACIQABAAAAALAAANCsRA8AADXVSKK2c+p/lnjCv6lOIyKK0KhAAAKCAAAAByZWZlcmVuY2UgbGliRkxBQyAxLjQuMiAyMDIyMTAyMgAAAAD/+MkIAJUAAAAhvf/4yQgBkgAAAE3F//jJCAKbAAAA+U3/+MkIA5wAAACVNf/4yQgEiQAAABBY//jJCAWOAAAAfCD/+MkIBocAAADIqP/4yQgHgAAAAKTQ//jJCAitAAAAQnf/+MkICaoAAAAuD//4yQgKowAAAJqH//jJCAukAAAA9v//+MkIDLEAAABzkv/4yQgNtgAAAB/q//jJCA6/AAAAq2L/+MkID7gAAADHGv/4yQgQ5QAAAOYp//jJCBHiAAAAilH/+MkIEusAAAA+2f/4yQgT7AAAAFKh//jJCBT5AAAA18z/+MkIFf4AAAC7tP/4yQgW9wAAAA88//jJCBfwAAAAY0T/+MkIGN0AAACF4//4yQgZ2gAAAOmb//jJCBrTAAAAXRP/+MkIG9QAAAAxa//4yQgcwQAAALQG//jJCB3GAAAA2H7/+MkIHs8AAABs9v/4yQgfyAAAAACO//jJCCB1AAAALpD/+MkIIXIAAABC6P/4yQgiewAAAPZg//jJCCN8AAAAmhj/+MkIJGkAAAAfdf/4yQglbgAAAHMN//jJCCZnAAAAx4X/+MkIJ2AAAACr/f/4yQgoTQAAAE1a//jJCClKAAAAISL/+MkIKkMAAACVqv/4yQgrRAAAAPnS//jJCCxRAAAAfL//+MkILVYAAAAQx//4yQguXwAAAKRP//jJCC9YAAAAyDf/+MkIMAUAAADpBP/4yQgxAgAAAIV8//jJCDILAAAAMfT/+MkIMwwAAABdjP/4yQg0GQAAANjh//h5CDUNUxcAAAAcSg==";
+const FLAC_FIXTURE_BASE64: &str = include_str!("fixtures/mono-44100.flac.b64");
 
 struct TemporaryAudioFile {
     path: PathBuf,
@@ -347,7 +347,10 @@ fn decode_base64(encoded: &str) -> Vec<u8> {
     let mut output = Vec::with_capacity(encoded.len() * 3 / 4);
     let mut accumulator = 0_u32;
     let mut bits = 0_u8;
-    for byte in encoded.bytes().filter(|byte| *byte != b'=') {
+    for byte in encoded
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
+    {
         let value = match byte {
             b'A'..=b'Z' => byte - b'A',
             b'a'..=b'z' => byte - b'a' + 26,
