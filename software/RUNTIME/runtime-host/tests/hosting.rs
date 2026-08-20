@@ -1577,10 +1577,11 @@ fn a_refresh_sends_no_more_than_its_budget_however_much_has_changed() {
         rings: 8,
         ..display_descriptor(8, 8)
     };
-    let (mut link, _driver) = connected_link(&mut host, wide, &stop, &now);
+    let (mut link, mut driver) = connected_link(&mut host, wide, &stop, &now);
 
     // Sixteen controls have something to say and the budget is four.
     let sent = link.refresh_display(&mut host, now.get());
+    driver.deliver(&mut link);
 
     // Compared against how much was available, not against the constant the
     // code just read — which would compare a value with itself.
@@ -1590,6 +1591,7 @@ fn a_refresh_sends_no_more_than_its_budget_however_much_has_changed() {
         "a burst of change must not starve input or the stop flag: sent {sent} of {available}"
     );
     let rest = link.refresh_display(&mut host, now.get());
+    driver.deliver(&mut link);
     assert!(
         rest > 0,
         "what did not fit this tick goes out on the next: {rest}"
@@ -1601,6 +1603,7 @@ fn a_refresh_sends_no_more_than_its_budget_however_much_has_changed() {
             break;
         }
         total += more;
+        driver.deliver(&mut link);
     }
     assert!(
         total >= available,

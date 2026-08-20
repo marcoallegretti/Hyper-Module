@@ -3,7 +3,9 @@
 
 use hyper_panel_protocol::{FirmwareVersion, LinkConfig, Message, PanelDescriptor};
 use hyper_panel_simulator::{PanelSimulator, PanelSimulatorConfig};
-use hyper_runtime_panel_session::{PanelEvent, PanelSession};
+use hyper_runtime_panel_session::{
+    PanelEvent, PanelSession, PanelSessionError, TRANSMIT_FRAME_CAPACITY,
+};
 
 const HEARTBEAT_INTERVAL_MS: u32 = 50;
 const HEARTBEAT_TIMEOUT_MS: u32 = 200;
@@ -206,6 +208,62 @@ fn a_link_fault_stops_the_session_driving_the_panel() {
     assert!(
         session.receive(&stray, 2).is_empty(),
         "and ignores anything more that arrives"
+    );
+}
+
+#[test]
+fn a_full_transmit_queue_rejects_without_consuming_a_sequence_and_recovers_after_drain() {
+    let mut peers = Peers::new();
+    peers.connect();
+
+    for now_ms in 1..=u64::try_from(TRANSMIT_FRAME_CAPACITY).unwrap() {
+        peers
+            .session
+            .send(
+                Message::SetLed {
+                    control_id: 0,
+                    enabled: false,
+                },
+                now_ms,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        peers.session.send(
+            Message::SetLed {
+                control_id: 0,
+                enabled: true,
+            },
+            u64::try_from(TRANSMIT_FRAME_CAPACITY + 1).unwrap(),
+        ),
+        Err(PanelSessionError::TransmitOverflow),
+        "capacity exhaustion is reported rather than silently dropping a frame"
+    );
+    assert!(
+        peers.session.is_connected(),
+        "backpressure is not a link failure"
+    );
+
+    let _ = peers.exchange(u64::try_from(TRANSMIT_FRAME_CAPACITY + 2).unwrap());
+    peers
+        .session
+        .send(
+            Message::SetLed {
+                control_id: 0,
+                enabled: true,
+            },
+            u64::try_from(TRANSMIT_FRAME_CAPACITY + 3).unwrap(),
+        )
+        .unwrap();
+    let _ = peers.exchange(u64::try_from(TRANSMIT_FRAME_CAPACITY + 4).unwrap());
+
+    assert!(
+        peers.panel.output_state().led(0).unwrap().enabled,
+        "the retry keeps the next expected sequence and reaches the panel"
+    );
+    assert!(
+        peers.panel.is_connected() && peers.session.is_connected(),
+        "drain and retry recover without a sequence-gap disconnect"
     );
 }
 

@@ -15,8 +15,8 @@ use hyper_control_runtime::{
     PanelButtonBehavior, PanelConnectError, PanelConnection, PanelControl, PanelDispatchError,
     PanelDispatchOutcome, PanelDisplay, PanelReleaseFailure, UnboundReason, ValueControlTarget,
 };
-use hyper_panel_protocol::{LinkConfig, LinkFault, Message, PanelDescriptor};
-use hyper_runtime_panel_session::{PanelEvent, PanelSession};
+use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
+use hyper_runtime_panel_session::{PanelEvent, PanelSession, PanelSessionError};
 
 /// How far one encoder detent moves a channel gain, in millionths.
 ///
@@ -329,7 +329,7 @@ impl PanelLink {
     /// # Errors
     ///
     /// Returns the link's refusal to start.
-    pub fn start(&mut self, session_id: u64, now_ms: u64) -> Result<(), LinkFault> {
+    pub fn start(&mut self, session_id: u64, now_ms: u64) -> Result<(), PanelSessionError> {
         self.session.start(session_id, now_ms)
     }
 
@@ -383,7 +383,8 @@ impl PanelLink {
                 PanelEvent::Fault(_)
                 | PanelEvent::TimedOut
                 | PanelEvent::VersionRejected
-                | PanelEvent::Undecodable(_) => {
+                | PanelEvent::Undecodable(_)
+                | PanelEvent::TransmitFailed(_) => {
                     self.release(host);
                     return PanelStep::Closed(PanelClosure::LinkLost);
                 }
