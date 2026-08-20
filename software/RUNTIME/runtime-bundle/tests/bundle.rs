@@ -123,25 +123,70 @@ fn prepares_a_contract_shaped_bundle_and_retains_its_identity() {
     let fixture = Fixture::new();
     let manifest_bytes = fs::read(fixture.root.join("manifest.json")).unwrap();
     let expected_sha256: [u8; 32] = Sha256::digest(&manifest_bytes).into();
+    let expected_byte_length = manifest_bytes.len() as u64
+        + fixture.manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["byte_length"].as_u64().unwrap())
+            .sum::<u64>();
     let bundle = prepare_runtime_bundle(&fixture.root, "0.1.0", 1 << 30, limits()).unwrap();
 
     assert_eq!(bundle.bundle_sha256(), &expected_sha256);
+    assert_eq!(bundle.bundle_byte_length(), expected_byte_length);
     assert_eq!(bundle.project().session().parts().0.track_count(), 1);
     bundle.project().package().confirm_unchanged().unwrap();
 }
 
 #[test]
-fn rejects_a_newer_runtime_requirement_before_project_loading() {
+fn compares_runtime_versions_by_semver_precedence() {
     let fixture = Fixture::new();
-    let mut manifest = fixture.manifest.clone();
-    manifest["minimum_runtime_version"] = "0.2.0".into();
-    fixture.rewrite(&manifest);
+    for (runtime, minimum, compatible) in [
+        ("1.0.0", "1.0.0", true),
+        ("1.0.1", "1.0.0", true),
+        ("1.0.0", "1.0.1", false),
+        ("1.0.0-alpha.2", "1.0.0-alpha.1", true),
+        ("1.0.0-alpha.1", "1.0.0-alpha.2", false),
+        ("1.0.0+aaa", "1.0.0+zzz", true),
+        ("1.0.0+zzz", "1.0.0+aaa", true),
+    ] {
+        let mut manifest = fixture.manifest.clone();
+        manifest["minimum_runtime_version"] = minimum.into();
+        fixture.rewrite(&manifest);
+        let result = prepare_runtime_bundle(&fixture.root, runtime, 1 << 30, limits());
+        if compatible {
+            result.unwrap();
+        } else {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                RuntimeBundleErrorKind::RuntimeIncompatible,
+                "Runtime {runtime} must reject minimum {minimum}"
+            );
+        }
+    }
+}
 
+#[test]
+fn accepts_the_exact_bundle_limit_and_rejects_one_byte_less() {
+    let fixture = Fixture::new();
+    let manifest_bytes = fs::read(fixture.root.join("manifest.json")).unwrap();
+    let exact_byte_length = manifest_bytes.len() as u64
+        + fixture.manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["byte_length"].as_u64().unwrap())
+            .sum::<u64>();
+
+    let bundle =
+        prepare_runtime_bundle(&fixture.root, "0.1.0", exact_byte_length, limits()).unwrap();
+    assert_eq!(bundle.bundle_byte_length(), exact_byte_length);
+    drop(bundle);
     assert_eq!(
-        prepare_runtime_bundle(&fixture.root, "0.1.0", 1 << 30, limits())
+        prepare_runtime_bundle(&fixture.root, "0.1.0", exact_byte_length - 1, limits())
             .unwrap_err()
             .kind(),
-        RuntimeBundleErrorKind::RuntimeIncompatible
+        RuntimeBundleErrorKind::BundleLimit
     );
 }
 
@@ -190,6 +235,29 @@ fn rejects_noncanonical_runtime_metadata() {
             .kind(),
         RuntimeBundleErrorKind::NonCanonicalJson
     );
+}
+
+#[test]
+#[ignore = "executed by contracts/scripts/test-native-runtime-bundle.mjs"]
+fn consumes_a_javascript_built_contract_bundle() {
+    let root = std::env::var_os("HYPER_CONTRACT_RUNTIME_BUNDLE")
+        .map(PathBuf::from)
+        .expect("the contract harness must supply its JavaScript-built bundle");
+    let manifest_bytes = fs::read(root.join("manifest.json")).unwrap();
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    let expected_byte_length = manifest_bytes.len() as u64
+        + manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["byte_length"].as_u64().unwrap())
+            .sum::<u64>();
+
+    let bundle = prepare_runtime_bundle(&root, "1.0.0", expected_byte_length, limits()).unwrap();
+
+    assert_eq!(bundle.bundle_byte_length(), expected_byte_length);
+    assert_eq!(bundle.project().session().parts().0.track_count(), 0);
+    bundle.project().package().confirm_unchanged().unwrap();
 }
 
 fn limits() -> ProjectPlaybackLimits {

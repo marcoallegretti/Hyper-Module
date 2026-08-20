@@ -1,6 +1,7 @@
 #![doc = "Native verification and preparation of deployable Runtime bundles."]
 #![forbid(unsafe_code)]
 
+use core::cmp::Ordering;
 use core::error::Error;
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
@@ -152,7 +153,7 @@ pub fn prepare_runtime_bundle(
         source: Some(Box::new(source)),
     })?;
     let manifest = validate_manifest(raw)?;
-    if runtime_version < manifest.minimum_runtime_version {
+    if runtime_version.cmp_precedence(&manifest.minimum_runtime_version) == Ordering::Less {
         return Err(reject(
             RuntimeBundleErrorKind::RuntimeIncompatible,
             "bundle requires a newer Runtime version",

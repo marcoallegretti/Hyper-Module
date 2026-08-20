@@ -361,6 +361,16 @@ fn runtime_bundle_project_binds_reserved_manifest_and_forbids_local_state() {
         verify_runtime_bundle_project_with_limits(&fixture.root, limits, authority).unwrap();
     verified.confirm_unchanged().unwrap();
 
+    fs::write(
+        fixture.root.join("manifest.json"),
+        br#"{"format":"hyper-runtime-bundlf"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        verified.confirm_unchanged().unwrap_err().kind(),
+        StorageErrorKind::Sha256Mismatch
+    );
+
     fs::write(fixture.root.join("manifest.json"), b"changed").unwrap();
     assert_eq!(
         verified.confirm_unchanged().unwrap_err().kind(),

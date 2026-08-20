@@ -7,7 +7,7 @@ import canonicalize from "canonicalize";
 export async function createMinimalProject(
   parent,
   name = "project",
-  { revision = 7 } = {},
+  { playbackReady = false, revision = 7 } = {},
 ) {
   const root = join(parent, name);
   await mkdir(join(root, "timeline"), { recursive: true });
@@ -25,6 +25,47 @@ export async function createMinimalProject(
   const timelineBytes = Buffer.from(canonicalize(timeline), "utf8");
   const timelinePath = "timeline/timeline.json";
   await writeFile(join(root, ...timelinePath.split("/")), timelineBytes);
+  const resources = [
+    {
+      id: timeline.id,
+      role: "timeline",
+      path: timelinePath,
+      media_type: "application/json",
+      byte_length: timelineBytes.length,
+      sha256: createHash("sha256").update(timelineBytes).digest("hex"),
+      extensions: {},
+    },
+  ];
+  if (playbackReady) {
+    const mixer = {
+      format: "hyper-mixer",
+      format_version: 1,
+      id: "018f47a2-6b2d-7c11-8a44-001122334468",
+      project_id: projectId,
+      channels: [],
+      return_buses: [],
+      main: { gain_millionths: 1_000_000, mute: false },
+      cue: {
+        source: "solo",
+        gain_millionths: 1_000_000,
+        mute: false,
+      },
+      extensions: {},
+    };
+    const mixerBytes = Buffer.from(canonicalize(mixer), "utf8");
+    const mixerPath = "mixer/mixer.json";
+    await mkdir(join(root, "mixer"), { recursive: true });
+    await writeFile(join(root, ...mixerPath.split("/")), mixerBytes);
+    resources.push({
+      id: mixer.id,
+      role: "mixer",
+      path: mixerPath,
+      media_type: "application/json",
+      byte_length: mixerBytes.length,
+      sha256: createHash("sha256").update(mixerBytes).digest("hex"),
+      extensions: {},
+    });
+  }
   const project = {
     format: "hyper-project",
     format_version: 1,
@@ -47,17 +88,7 @@ export async function createMinimalProject(
       has_ethernet: true,
       extensions: {},
     },
-    resources: [
-      {
-        id: timeline.id,
-        role: "timeline",
-        path: timelinePath,
-        media_type: "application/json",
-        byte_length: timelineBytes.length,
-        sha256: createHash("sha256").update(timelineBytes).digest("hex"),
-        extensions: {},
-      },
-    ],
+    resources,
     assets: [],
     extensions: {},
   };
