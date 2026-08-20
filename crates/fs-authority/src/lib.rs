@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::ffi::OsString;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -269,12 +270,87 @@ pub fn read_stable_file(directory: &Dir, name: &str, maximum_bytes: u64) -> io::
     read_stable_file_observed(directory, name, maximum_bytes, || Ok(()))
 }
 
+/// Identity and content evidence for one stable external file snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StableFileEvidence {
+    identity: (u64, u64),
+    byte_length: u64,
+    sha256: [u8; 32],
+}
+
+/// Exact bytes and evidence captured from one stable external file.
+#[derive(Debug, Eq, PartialEq)]
+pub struct StableFileSnapshot {
+    bytes: Vec<u8>,
+    evidence: StableFileEvidence,
+}
+
+impl StableFileSnapshot {
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, StableFileEvidence) {
+        (self.bytes, self.evidence)
+    }
+}
+
+/// Reads one absolute regular file without following any path link, proving
+/// that two complete reads and the published entry agree.
+///
+/// # Errors
+///
+/// Returns an I/O or validation error when the path is not absolute, contains
+/// lexical aliases, crosses a link, names an irregular entry, exceeds the byte
+/// limit, is replaced, or changes while being read.
+pub fn read_stable_absolute_file(
+    path: &Path,
+    maximum_bytes: u64,
+) -> io::Result<StableFileSnapshot> {
+    let (parent, name) = open_absolute_parent(path)?;
+    read_stable_file_snapshot_observed(&parent, &name, maximum_bytes, || Ok(()))
+}
+
+/// Confirms that an absolute external file still has the captured filesystem
+/// identity and exact content.
+///
+/// # Errors
+///
+/// Returns an I/O or validation error when the current entry is inaccessible,
+/// linked, irregular, oversized, unstable, replaced, or content-changed.
+pub fn confirm_stable_absolute_file(
+    path: &Path,
+    maximum_bytes: u64,
+    expected: &StableFileEvidence,
+) -> io::Result<()> {
+    let current = read_stable_absolute_file(path, maximum_bytes)?;
+    if current.evidence != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stable file identity or content changed",
+        ));
+    }
+    Ok(())
+}
+
 fn read_stable_file_observed(
     directory: &Dir,
     name: &str,
     maximum_bytes: u64,
     after_first_read: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<Vec<u8>> {
+    read_stable_file_snapshot_observed(
+        directory,
+        Path::new(name),
+        maximum_bytes,
+        after_first_read,
+    )
+    .map(|snapshot| snapshot.bytes)
+}
+
+fn read_stable_file_snapshot_observed(
+    directory: &Dir,
+    name: &Path,
+    maximum_bytes: u64,
+    after_first_read: impl FnOnce() -> io::Result<()>,
+) -> io::Result<StableFileSnapshot> {
     let published = directory.symlink_metadata(name)?;
     if published.file_type().is_symlink() || !published.is_file() {
         return Err(invalid_argument(
@@ -315,7 +391,47 @@ fn read_stable_file_observed(
     {
         return Err(invalid_argument("stable file changed while being read"));
     }
-    Ok(first)
+    Ok(StableFileSnapshot {
+        evidence: StableFileEvidence {
+            identity: published_identity,
+            byte_length: first.len() as u64,
+            sha256: Sha256::digest(&first).into(),
+        },
+        bytes: first,
+    })
+}
+
+fn open_absolute_parent(path: &Path) -> io::Result<(Dir, PathBuf)> {
+    if !path.is_absolute() {
+        return Err(invalid_argument("stable file path must be absolute"));
+    }
+    let mut anchor = PathBuf::new();
+    let mut names = Vec::<OsString>::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => anchor.push(component.as_os_str()),
+            Component::Normal(name) => names.push(name.to_owned()),
+            Component::CurDir | Component::ParentDir => {
+                return Err(invalid_argument(
+                    "stable file path must not contain lexical aliases",
+                ));
+            }
+        }
+    }
+    let leaf = names
+        .pop()
+        .ok_or_else(|| invalid_argument("stable file path must name an entry"))?;
+    let mut directory = Dir::open_ambient_dir(anchor, ambient_authority())?;
+    for name in names {
+        let metadata = directory.symlink_metadata(&name)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(invalid_argument(
+                "stable file path crosses a link or non-directory entry",
+            ));
+        }
+        directory = directory.open_dir_nofollow(&name)?;
+    }
+    Ok((directory, PathBuf::from(leaf)))
 }
 
 #[cfg(unix)]
@@ -1103,8 +1219,8 @@ mod stable_file_tests {
     use cap_std::fs::Dir;
 
     use super::{
-        open_syncable_directory_ambient, path_is_proven_absent, read_stable_file,
-        read_stable_file_observed, sync_directory,
+        confirm_stable_absolute_file, open_syncable_directory_ambient, path_is_proven_absent,
+        read_stable_absolute_file, read_stable_file, read_stable_file_observed, sync_directory,
     };
 
     struct TemporaryDirectory(PathBuf);
@@ -1168,6 +1284,27 @@ mod stable_file_tests {
         });
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn absolute_snapshot_rejects_content_change_and_entry_replacement() {
+        let temporary = TemporaryDirectory::new();
+        let path = temporary.path().join("source.wav");
+        fs::write(&path, b"original").unwrap();
+        let snapshot = read_stable_absolute_file(&path, 8).unwrap();
+        let (_, evidence) = snapshot.into_parts();
+
+        confirm_stable_absolute_file(&path, 8, &evidence).unwrap();
+
+        fs::write(&path, b"mutated!").unwrap();
+        assert!(confirm_stable_absolute_file(&path, 8, &evidence).is_err());
+
+        fs::write(&path, b"original").unwrap();
+        let replacement = temporary.path().join("replacement.wav");
+        fs::write(&replacement, b"original").unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert!(confirm_stable_absolute_file(&path, 8, &evidence).is_err());
     }
 
     #[test]

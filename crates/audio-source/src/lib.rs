@@ -385,6 +385,28 @@ pub fn decode_open_file_at_source_rate(
     decode_source(Box::new(file), container, None, limits)
 }
 
+/// Decodes exact bounded WAV or FLAC bytes at their declared source rate.
+///
+/// This entry point lets an external-file authority snapshot and audio decoding
+/// share the same immutable encoded payload.
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] under the same rules as
+/// [`decode_file_at_source_rate`].
+pub fn decode_bytes_at_source_rate(
+    bytes: Vec<u8>,
+    container: AudioContainer,
+    limits: DecodeLimits,
+) -> Result<DecodedAudio, DecodeError> {
+    let file_length = u64::try_from(bytes.len()).map_err(|_| DecodeError::CapacityUnavailable)?;
+    require_file_limit(file_length, limits)?;
+    let mut cursor = Cursor::new(bytes);
+    verify_container_signature(&mut cursor, container)?;
+    cursor.seek(SeekFrom::Start(0))?;
+    decode_source(Box::new(cursor), container, None, limits)
+}
+
 /// Decodes complete verified WAV or native FLAC bytes outside the real-time
 /// path.
 ///

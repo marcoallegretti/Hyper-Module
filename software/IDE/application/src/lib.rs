@@ -4,6 +4,7 @@
 use core::error::Error;
 use core::fmt;
 use core::mem::size_of;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +14,7 @@ use hyper_audio_engine::{
     LinearGain, LoudnessMeasurementCommand, Pan, ParameterError, StereoSineTestToneConfigError,
 };
 use hyper_audio_source::{
-    AudioContainer, DecodeError, DecodeLimits, decode_file_at_source_rate, encode_float_wav,
+    AudioContainer, DecodeError, DecodeLimits, decode_bytes_at_source_rate, encode_float_wav,
     resample_audio,
 };
 pub use hyper_control_mappings::{
@@ -41,6 +42,9 @@ pub use hyper_desktop_audio::{
     DesktopAudioPreviewState, DesktopSceneAvailability as IdeSceneAvailability,
 };
 use hyper_mapping_compiler::{ControlMappingResolver, MixerSendAddress};
+use hyper_fs_authority::{
+    StableFileEvidence, confirm_stable_absolute_file, read_stable_absolute_file,
+};
 use hyper_mapping_editor::{
     MappingEditor, MappingEditorMutationError, MappingEditorPreviewError,
     MappingEditorPublicationError,
@@ -2312,6 +2316,7 @@ pub enum IdeAudioImportError {
     UnsupportedContainer,
     InvalidClipName,
     Source(DecodeError),
+    SourceChanged(io::Error),
     MixerSave(Box<IdeProjectSaveError>),
     ProjectReload(ProjectPlaybackError),
     TrackResourceMissing,
@@ -2337,6 +2342,10 @@ impl fmt::Display for IdeAudioImportError {
                 "the imported file name must contain 1 through 120 characters after normalization",
             ),
             Self::Source(source) => source.fmt(formatter),
+            Self::SourceChanged(source) => write!(
+                formatter,
+                "selected audio source changed or could not be reverified before publication: {source}"
+            ),
             Self::MixerSave(source) => write!(
                 formatter,
                 "live mixer state could not be preserved: {source}"
@@ -2369,6 +2378,7 @@ impl Error for IdeAudioImportError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Source(source) => Some(source),
+            Self::SourceChanged(source) => Some(source),
             Self::MixerSave(source) => Some(source.as_ref()),
             Self::ProjectReload(source) => Some(source),
             Self::Storage(source) => Some(source),
@@ -5396,6 +5406,9 @@ struct IdeAudioClipCreationPlan {
 
 #[derive(Debug)]
 struct IdeImportedAudioClipPlan {
+    source_path: PathBuf,
+    source_maximum_bytes: u64,
+    source_evidence: StableFileEvidence,
     project_path: PathBuf,
     expected_project_sha256: [u8; 32],
     clip_id: String,
@@ -5407,7 +5420,13 @@ struct IdeImportedAudioClipPlan {
 }
 
 impl IdeImportedAudioClipPlan {
-    fn publish(&self) -> Result<AudioClipPublicationOutcome, ProjectResourcePublicationError> {
+    fn publish(&self) -> Result<AudioClipPublicationOutcome, IdeAudioImportError> {
+        confirm_stable_absolute_file(
+            &self.source_path,
+            self.source_maximum_bytes,
+            &self.source_evidence,
+        )
+        .map_err(IdeAudioImportError::SourceChanged)?;
         publish_imported_audio_clip(
             &self.project_path,
             ImportedAudioClipPublicationRequest {
@@ -5422,6 +5441,7 @@ impl IdeImportedAudioClipPlan {
                 sample_bytes: &self.sample_bytes,
             },
         )
+        .map_err(|source| IdeAudioImportError::Publication(Box::new(source)))
     }
 }
 
@@ -6813,13 +6833,9 @@ impl RunningDesktopIdeApplication {
         for (index, path) in paths.iter().enumerate() {
             let plan = Self::prepare_imported_audio_clip(application, &prepared, path, track_id)
                 .map_err(|source| failure(index, path.clone(), source))?;
-            let outcome = plan.publish().map_err(|source| {
-                failure(
-                    index,
-                    path.clone(),
-                    IdeAudioImportError::Publication(Box::new(source)),
-                )
-            })?;
+            let outcome = plan
+                .publish()
+                .map_err(|source| failure(index, path.clone(), source))?;
             final_revision = outcome.project_revision();
             clip_ids.push(outcome.clip_id().to_owned());
             if index + 1 < total {
@@ -6852,7 +6868,10 @@ impl RunningDesktopIdeApplication {
     ) -> Result<IdeImportedAudioClipPlan, IdeAudioImportError> {
         let container = audio_import_container(path)?;
         let limits = application.config.project_limits();
-        let decoded = decode_file_at_source_rate(path, container, limits.audio)
+        let source = read_stable_absolute_file(path, limits.audio.max_file_bytes())
+            .map_err(|error| IdeAudioImportError::Source(error.into()))?;
+        let (source_bytes, source_evidence) = source.into_parts();
+        let decoded = decode_bytes_at_source_rate(source_bytes, container, limits.audio)
             .map_err(IdeAudioImportError::Source)?;
         let converted = resample_audio(
             decoded,
@@ -6950,6 +6969,9 @@ impl RunningDesktopIdeApplication {
             return Err(IdeAudioImportError::CapacityUnavailable);
         }
         Ok(IdeImportedAudioClipPlan {
+            source_path: path.to_path_buf(),
+            source_maximum_bytes: limits.audio.max_file_bytes(),
+            source_evidence,
             project_path: package.root().to_path_buf(),
             expected_project_sha256: *package.manifest_sha256(),
             clip_id,
@@ -10226,6 +10248,27 @@ mod tests {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
         bytes
+    }
+
+    fn arrangement_test_import_plan(
+        source: &Path,
+    ) -> (ArrangementProjectFixture, IdeImportedAudioClipPlan, [u8; 32]) {
+        let fixture = ArrangementProjectFixture::new();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let prepared = hyper_project_loader::prepare_project_playback(fixture.root(), limits).unwrap();
+        let original_identity = *prepared.package().manifest_sha256();
+        let application = DesktopIdeApplication::from_inventory(
+            desktop_ide_application_config().unwrap(),
+            IdeAudioOutputInventory::try_new(&[("output", "Output")]).unwrap(),
+        );
+        let plan = RunningDesktopIdeApplication::prepare_imported_audio_clip(
+            &application,
+            &prepared,
+            source,
+            ARRANGEMENT_TEST_TRACK_ID,
+        )
+        .unwrap();
+        (fixture, plan, original_identity)
     }
 
     fn config(
@@ -14292,6 +14335,58 @@ mod tests {
         );
         drop(verified);
         assert!(hyper_project_loader::prepare_project_playback(&project_path, limits).is_ok());
+    }
+
+    #[test]
+    fn prepared_audio_import_publishes_only_while_the_source_is_unchanged() {
+        let source_directory = TestDirectory::new();
+        let source = source_directory.0.join("unchanged.wav");
+        std::fs::write(&source, arrangement_test_wav(&[1; 100])).unwrap();
+        let (fixture, plan, original_identity) = arrangement_test_import_plan(&source);
+
+        let outcome = plan.publish().unwrap();
+
+        assert_eq!(outcome.project_revision(), 2);
+        let verified = hyper_storage_engine::verify_project_package(fixture.root()).unwrap();
+        assert_ne!(verified.manifest_sha256(), &original_identity);
+    }
+
+    #[test]
+    fn prepared_audio_import_rejects_same_length_source_mutation_without_project_change() {
+        let source_directory = TestDirectory::new();
+        let source = source_directory.0.join("mutated.wav");
+        std::fs::write(&source, arrangement_test_wav(&[1; 100])).unwrap();
+        let (fixture, plan, original_identity) = arrangement_test_import_plan(&source);
+        std::fs::write(&source, arrangement_test_wav(&[2; 100])).unwrap();
+
+        assert!(matches!(
+            plan.publish(),
+            Err(IdeAudioImportError::SourceChanged(_))
+        ));
+        let verified = hyper_storage_engine::verify_project_package(fixture.root()).unwrap();
+        assert_eq!(verified.manifest().revision(), 1);
+        assert_eq!(verified.manifest_sha256(), &original_identity);
+    }
+
+    #[test]
+    fn prepared_audio_import_rejects_source_entry_replacement_without_project_change() {
+        let source_directory = TestDirectory::new();
+        let source = source_directory.0.join("replaced.wav");
+        let replacement = source_directory.0.join("replacement.wav");
+        let bytes = arrangement_test_wav(&[1; 100]);
+        std::fs::write(&source, &bytes).unwrap();
+        let (fixture, plan, original_identity) = arrangement_test_import_plan(&source);
+        std::fs::write(&replacement, &bytes).unwrap();
+        std::fs::remove_file(&source).unwrap();
+        std::fs::rename(&replacement, &source).unwrap();
+
+        assert!(matches!(
+            plan.publish(),
+            Err(IdeAudioImportError::SourceChanged(_))
+        ));
+        let verified = hyper_storage_engine::verify_project_package(fixture.root()).unwrap();
+        assert_eq!(verified.manifest().revision(), 1);
+        assert_eq!(verified.manifest_sha256(), &original_identity);
     }
 
     #[test]
