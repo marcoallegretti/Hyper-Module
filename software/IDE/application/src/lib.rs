@@ -15,7 +15,7 @@ use hyper_audio_engine::{
 };
 use hyper_audio_source::{
     AudioContainer, DecodeError, DecodeLimits, decode_bytes_at_source_rate, encode_float_wav,
-    resample_audio,
+    float_wav_encoded_capacity, plan_resampling_memory, resample_audio,
 };
 pub use hyper_control_mappings::{
     ChannelParameter as IdeControlChannelParameter, ControlBinding, ControlMappingDocument,
@@ -175,6 +175,7 @@ const DESKTOP_MAX_AUDIO_FRAMES: u64 = 43_200_000;
 const DESKTOP_MAX_AUDIO_DECODED_BYTES: usize = 2 * 43_200_000 * size_of::<f32>();
 const DESKTOP_MAX_PROJECT_RESOURCE_BYTES: usize = 1_024 * 1_024 * 1_024;
 const DESKTOP_MAX_PROJECT_DECODED_BYTES: usize = 1_024 * 1_024 * 1_024;
+const DESKTOP_MAX_AUDIO_IMPORT_WORKING_BYTES: usize = 7 * 256 * 1_024 * 1_024;
 /// Maximum scene metadata rows published by the version-1 desktop IDE.
 pub const MAX_IDE_SCENES: usize = LoaderLimits::VERSION_1.max_scene_documents;
 /// Maximum channel rows published by the version-1 desktop IDE mixer.
@@ -207,6 +208,80 @@ fn audio_import_clip_name(path: &Path) -> Result<String, IdeAudioImportError> {
         .map_err(|_| IdeAudioImportError::CapacityUnavailable)?;
     owned.push_str(name);
     Ok(owned)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AudioImportMemoryPlan {
+    decode_peak: usize,
+    resampling_peak: usize,
+    encoding_peak: usize,
+    resampling_working: usize,
+    peak: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AudioImportMemoryInput {
+    retained_project_bytes: usize,
+    encoded_source_bytes: usize,
+    input_frames: usize,
+    input_sample_rate_hz: u32,
+    target_sample_rate_hz: u32,
+    channels: usize,
+    maximum_output_frames: u64,
+}
+
+fn plan_audio_import_memory(
+    input: AudioImportMemoryInput,
+    maximum_working_bytes: usize,
+) -> Result<AudioImportMemoryPlan, IdeAudioImportError> {
+    if maximum_working_bytes == 0 {
+        return Err(IdeAudioImportError::CapacityUnavailable);
+    }
+    let resampling = plan_resampling_memory(
+        input.input_frames,
+        input.input_sample_rate_hz,
+        input.target_sample_rate_hz,
+        input.channels,
+        input.maximum_output_frames,
+    )
+    .map_err(IdeAudioImportError::Source)?;
+    let normalized_bytes = resampling
+        .expected_output_frames()
+        .checked_mul(input.channels)
+        .and_then(|samples| samples.checked_mul(size_of::<f32>()))
+        .ok_or(IdeAudioImportError::CapacityUnavailable)?;
+    let encoded_output_bytes = float_wav_encoded_capacity(
+        resampling.expected_output_frames(),
+        input.channels,
+    )
+    .map_err(IdeAudioImportError::Source)?;
+    let decode_peak = input
+        .retained_project_bytes
+        .checked_add(input.encoded_source_bytes)
+        .and_then(|bytes| bytes.checked_add(resampling.input_bytes()))
+        .ok_or(IdeAudioImportError::CapacityUnavailable)?;
+    let resampling_peak = input.retained_project_bytes
+        .checked_add(resampling.working_bytes())
+        .ok_or(IdeAudioImportError::CapacityUnavailable)?;
+    let encoding_peak = input
+        .retained_project_bytes
+        .checked_add(normalized_bytes)
+        .and_then(|bytes| bytes.checked_add(encoded_output_bytes))
+        .ok_or(IdeAudioImportError::CapacityUnavailable)?;
+    let peak = decode_peak.max(resampling_peak).max(encoding_peak);
+    if peak > maximum_working_bytes {
+        return Err(IdeAudioImportError::WorkingMemoryLimitExceeded {
+            required: peak,
+            maximum: maximum_working_bytes,
+        });
+    }
+    Ok(AudioImportMemoryPlan {
+        decode_peak,
+        resampling_peak,
+        encoding_peak,
+        resampling_working: resampling.working_bytes(),
+        peak,
+    })
 }
 
 /// Builds the bounded playback policy used by the desktop IDE executable.
@@ -2324,6 +2399,7 @@ pub enum IdeAudioImportError {
     Storage(StorageError),
     Serialization(AudioClipAdditionSerializationError),
     CapacityUnavailable,
+    WorkingMemoryLimitExceeded { required: usize, maximum: usize },
     Publication(Box<ProjectResourcePublicationError>),
     NativeClose(IdeNativeCloseFailure),
 }
@@ -2365,6 +2441,10 @@ impl fmt::Display for IdeAudioImportError {
             Self::CapacityUnavailable => {
                 formatter.write_str("audio import capacity is unavailable")
             }
+            Self::WorkingMemoryLimitExceeded { required, maximum } => write!(
+                formatter,
+                "audio import needs {required} bytes of peak working memory, limit is {maximum}"
+            ),
             Self::Publication(source) => source.fmt(formatter),
             Self::NativeClose(source) => write!(
                 formatter,
@@ -2391,6 +2471,7 @@ impl Error for IdeAudioImportError {
             | Self::TrackResourceMissing
             | Self::TrackResourceRoleMismatch
             | Self::CapacityUnavailable
+            | Self::WorkingMemoryLimitExceeded { .. }
             | Self::NativeClose(_) => None,
         }
     }
@@ -6897,18 +6978,31 @@ impl RunningDesktopIdeApplication {
         let source = read_stable_absolute_file(path, limits.audio.max_file_bytes())
             .map_err(|error| IdeAudioImportError::Source(error.into()))?;
         let (source_bytes, source_evidence) = source.into_parts();
+        let encoded_source_bytes = source_bytes.len();
         let decoded = decode_bytes_at_source_rate(source_bytes, container, limits.audio)
             .map_err(IdeAudioImportError::Source)?;
+        let media = prepared.session().parts().3;
+        let maximum_output_frames = u64::try_from(
+            limits.session.media_cache.max_frames_per_asset,
+        )
+        .map_err(|_| IdeAudioImportError::CapacityUnavailable)?;
+        let memory = plan_audio_import_memory(
+            AudioImportMemoryInput {
+                retained_project_bytes: media.decoded_sample_bytes(),
+                encoded_source_bytes,
+                input_frames: decoded.frame_count(),
+                input_sample_rate_hz: decoded.sample_rate_hz(),
+                target_sample_rate_hz: prepared.package().manifest().sample_rate_hz(),
+                channels: decoded.channels(),
+                maximum_output_frames,
+            },
+            DESKTOP_MAX_AUDIO_IMPORT_WORKING_BYTES,
+        )?;
         let converted = resample_audio(
             decoded,
             prepared.package().manifest().sample_rate_hz(),
-            u64::try_from(limits.session.media_cache.max_frames_per_asset)
-                .map_err(|_| IdeAudioImportError::CapacityUnavailable)?,
-            limits
-                .audio
-                .max_decoded_sample_bytes()
-                .checked_mul(3)
-                .ok_or(IdeAudioImportError::CapacityUnavailable)?,
+            maximum_output_frames,
+            memory.resampling_working,
         )
         .map_err(IdeAudioImportError::Source)?;
         let decoded_bytes = converted
@@ -6916,7 +7010,6 @@ impl RunningDesktopIdeApplication {
             .checked_mul(converted.channels())
             .and_then(|samples| samples.checked_mul(size_of::<f32>()))
             .ok_or(IdeAudioImportError::CapacityUnavailable)?;
-        let media = prepared.session().parts().3;
         if media.asset_count() >= limits.session.media_cache.max_assets
             || decoded_bytes > limits.audio.max_decoded_sample_bytes()
             || media
@@ -10468,6 +10561,65 @@ mod tests {
             limits.session.media_cache.max_decoded_sample_bytes
                 >= limits.audio.max_decoded_sample_bytes()
         );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn audio_import_memory_plan_has_independent_phase_peaks_and_exact_refusal() {
+        let upsample = plan_audio_import_memory(
+            AudioImportMemoryInput {
+                retained_project_bytes: 1_000,
+                encoded_source_bytes: 200,
+                input_frames: 441,
+                input_sample_rate_hz: 44_100,
+                target_sample_rate_hz: 48_000,
+                channels: 2,
+                maximum_output_frames: 500,
+            },
+            695_068,
+        )
+        .unwrap();
+        assert_eq!(upsample.decode_peak, 4_728);
+        assert_eq!(upsample.resampling_peak, 695_068);
+        assert_eq!(upsample.encoding_peak, 8_748);
+        assert_eq!(upsample.resampling_working, 694_068);
+        assert_eq!(upsample.peak, 695_068);
+        assert!(matches!(
+            plan_audio_import_memory(
+                AudioImportMemoryInput {
+                    retained_project_bytes: 1_000,
+                    encoded_source_bytes: 200,
+                    input_frames: 441,
+                    input_sample_rate_hz: 44_100,
+                    target_sample_rate_hz: 48_000,
+                    channels: 2,
+                    maximum_output_frames: 500,
+                },
+                695_067,
+            ),
+            Err(IdeAudioImportError::WorkingMemoryLimitExceeded {
+                required: 695_068,
+                maximum: 695_067,
+            })
+        ));
+
+        let downsample = plan_audio_import_memory(
+            AudioImportMemoryInput {
+                retained_project_bytes: 1_000,
+                encoded_source_bytes: 200,
+                input_frames: 480,
+                input_sample_rate_hz: 48_000,
+                target_sample_rate_hz: 24_000,
+                channels: 1,
+                maximum_output_frames: 500,
+            },
+            675_548,
+        )
+        .unwrap();
+        assert_eq!(downsample.decode_peak, 3_120);
+        assert_eq!(downsample.resampling_peak, 675_548);
+        assert_eq!(downsample.encoding_peak, 2_988);
+        assert_eq!(downsample.peak, 675_548);
     }
 
     #[test]

@@ -11085,7 +11085,13 @@ mod tests {
             recv(&worker),
             IdeWorkerEvent::AudioImporting { files: 2 }
         ));
-        let IdeWorkerEvent::Running(reopened) = recv(&worker) else {
+        let reopened_event = worker
+            .events
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the audio-import worker must publish a terminal state");
+        let IdeWorkerEvent::Running(reopened) = reopened_event else {
             panic!("the worker must publish the reloaded committed project first");
         };
         let completion = recv(&worker);

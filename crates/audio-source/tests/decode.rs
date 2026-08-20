@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use hyper_audio_source::{
     AudioContainer, DecodeError, DecodeLimits, DecodedAudio, decode_bytes, decode_file,
-    decode_file_at_source_rate, encode_float_wav, resample_audio,
+    decode_file_at_source_rate, encode_float_wav, plan_resampling_memory, resample_audio,
 };
 
 static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -323,13 +323,18 @@ fn stereo_resampling_obeys_the_exact_checked_buffer_budget() {
         .map(|frame| if frame == 300 { -0.5 } else { 0.0 })
         .collect();
     let audio = DecodedAudio::from_stereo(44_100, left, right).unwrap();
-    let required = match resample_audio(audio.clone(), 48_000, 500, 1) {
-        Err(DecodeError::ResamplingByteLimitExceeded {
-            required,
-            maximum: 1,
-        }) => required,
-        result => panic!("unexpected resampling budget result: {result:?}"),
-    };
+    let plan = plan_resampling_memory(441, 44_100, 48_000, 2, 500).unwrap();
+    assert_eq!(plan.expected_output_frames(), 480);
+    assert_eq!(plan.output_capacity_frames(), 2_390);
+    assert_eq!(plan.input_bytes(), 3_528);
+    assert_eq!(plan.output_bytes(), 19_120);
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(plan.resampler_scratch_bytes(), 671_324);
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(plan.adapter_bytes(), 96);
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(plan.working_bytes(), 694_068);
+    let required = plan.working_bytes();
 
     let converted = resample_audio(audio.clone(), 48_000, 500, required).unwrap();
     assert_eq!(converted.frame_count(), 480);
@@ -341,6 +346,14 @@ fn stereo_resampling_obeys_the_exact_checked_buffer_budget() {
             maximum: rejected,
         }) if actual == required && rejected == required - 1
     ));
+
+    let downsample = plan_resampling_memory(480, 48_000, 24_000, 1, 500).unwrap();
+    assert_eq!(downsample.expected_output_frames(), 240);
+    assert_eq!(downsample.output_capacity_frames(), 1_234);
+    assert_eq!(downsample.input_bytes(), 1_920);
+    assert_eq!(downsample.output_bytes(), 4_936);
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(downsample.working_bytes(), 674_548);
 }
 
 fn decode_base64(encoded: &str) -> Vec<u8> {

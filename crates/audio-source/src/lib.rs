@@ -18,6 +18,10 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 const MAX_DECODE_PACKET_FRAMES: u64 = 65_536;
+const RESAMPLER_MAX_CHUNK_FRAMES: usize = 4_096;
+const RESAMPLER_SINC_LENGTH: usize = 256;
+const RESAMPLER_OVERSAMPLING_FACTOR: usize = 128;
+const RESAMPLER_CONSTRUCTION_TABLE_COPIES: usize = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioContainer {
@@ -100,6 +104,56 @@ enum Planes {
 pub struct DecodedAudio {
     sample_rate_hz: u32,
     planes: Planes,
+}
+
+/// Conservative application-visible memory requirements for the pinned sinc
+/// resampler configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResamplingMemoryPlan {
+    expected_output_frames: usize,
+    output_capacity_frames: usize,
+    input_bytes: usize,
+    output_bytes: usize,
+    resampler_scratch_bytes: usize,
+    adapter_bytes: usize,
+    working_bytes: usize,
+}
+
+impl ResamplingMemoryPlan {
+    #[must_use]
+    pub const fn expected_output_frames(self) -> usize {
+        self.expected_output_frames
+    }
+
+    #[must_use]
+    pub const fn output_capacity_frames(self) -> usize {
+        self.output_capacity_frames
+    }
+
+    #[must_use]
+    pub const fn input_bytes(self) -> usize {
+        self.input_bytes
+    }
+
+    #[must_use]
+    pub const fn output_bytes(self) -> usize {
+        self.output_bytes
+    }
+
+    #[must_use]
+    pub const fn resampler_scratch_bytes(self) -> usize {
+        self.resampler_scratch_bytes
+    }
+
+    #[must_use]
+    pub const fn adapter_bytes(self) -> usize {
+        self.adapter_bytes
+    }
+
+    #[must_use]
+    pub const fn working_bytes(self) -> usize {
+        self.working_bytes
+    }
 }
 
 impl DecodedAudio {
@@ -440,16 +494,157 @@ pub fn decode_bytes(
     )
 }
 
+/// Plans the conservative memory owned during conversion by the pinned Rubato
+/// sinc configuration and its application-provided input/output buffers.
+///
+/// Same-rate input needs no resampler output or scratch allocation.
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] for invalid dimensions, arithmetic/capacity failure,
+/// or an exceeded output-frame bound.
+pub fn plan_resampling_memory(
+    input_frames: usize,
+    input_sample_rate_hz: u32,
+    target_sample_rate_hz: u32,
+    channels: usize,
+    maximum_output_frames: u64,
+) -> Result<ResamplingMemoryPlan, DecodeError> {
+    if input_frames == 0
+        || input_sample_rate_hz == 0
+        || target_sample_rate_hz == 0
+        || !matches!(channels, 1 | 2)
+        || maximum_output_frames == 0
+    {
+        return Err(DecodeError::InvalidLimits);
+    }
+    let expected_output_frames = estimated_output_frames(
+        input_frames,
+        input_sample_rate_hz,
+        target_sample_rate_hz,
+        maximum_output_frames,
+    )?;
+    let input_bytes = planar_sample_bytes(input_frames, channels)?;
+    if input_sample_rate_hz == target_sample_rate_hz {
+        return Ok(ResamplingMemoryPlan {
+            expected_output_frames,
+            output_capacity_frames: 0,
+            input_bytes,
+            output_bytes: 0,
+            resampler_scratch_bytes: 0,
+            adapter_bytes: 0,
+            working_bytes: input_bytes,
+        });
+    }
+
+    // Rubato 4.0.0's fixed-input asynchronous sinc path needs the expected
+    // complete output plus delay and one maximum processing chunk. This bound
+    // deliberately rounds the ratio upward and covers two sinc lengths in
+    // addition to the pinned input chunk, so it remains above those terms for
+    // both upsampling and downsampling.
+    let chunk_frames = input_frames.clamp(1, RESAMPLER_MAX_CHUNK_FRAMES);
+    let ratio_ceiling = usize::try_from(
+        u64::from(target_sample_rate_hz)
+            .checked_add(u64::from(input_sample_rate_hz) - 1)
+            .ok_or(DecodeError::CapacityUnavailable)?
+            / u64::from(input_sample_rate_hz),
+    )
+    .map_err(|_| DecodeError::CapacityUnavailable)?
+    .max(1);
+    let output_headroom_frames = chunk_frames
+        .checked_add(RESAMPLER_SINC_LENGTH * 2 + 2)
+        .and_then(|frames| frames.checked_mul(ratio_ceiling))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    let output_capacity_frames = expected_output_frames
+        .checked_add(output_headroom_frames)
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    let output_bytes = planar_sample_bytes(output_capacity_frames, channels)?;
+
+    // The pinned constructor temporarily owns window, flat sinc, nested sinc,
+    // and aligned SIMD tables while producing its retained table. Five full
+    // tables are a conservative upper bound for those payloads. The retained
+    // channel buffer, combined-sinc work area, Vec headers, channel mask, and a
+    // fixed metadata allowance cover the remaining Rubato-owned state.
+    let table_samples = RESAMPLER_SINC_LENGTH
+        .checked_mul(RESAMPLER_OVERSAMPLING_FACTOR)
+        .and_then(|samples| samples.checked_mul(RESAMPLER_CONSTRUCTION_TABLE_COPIES))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    let channel_buffer_samples = chunk_frames
+        .checked_add(RESAMPLER_SINC_LENGTH * 2)
+        .and_then(|frames| frames.checked_mul(channels))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    let scratch_sample_bytes = table_samples
+        .checked_add(channel_buffer_samples)
+        .and_then(|samples| samples.checked_add(RESAMPLER_SINC_LENGTH + 1))
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    let scratch_vec_bytes = RESAMPLER_OVERSAMPLING_FACTOR
+        .checked_add(channels)
+        .and_then(|vectors| vectors.checked_add(4))
+        .and_then(|vectors| vectors.checked_mul(std::mem::size_of::<Vec<f32>>()))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    let resampler_scratch_bytes = scratch_sample_bytes
+        .checked_add(scratch_vec_bytes)
+        .and_then(|bytes| bytes.checked_add(4_096))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    let adapter_bytes = channels
+        .checked_mul(std::mem::size_of::<Vec<f32>>())
+        .and_then(|bytes| bytes.checked_mul(2))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    let working_bytes = input_bytes
+        .checked_add(output_bytes)
+        .and_then(|bytes| bytes.checked_add(resampler_scratch_bytes))
+        .and_then(|bytes| bytes.checked_add(adapter_bytes))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    Ok(ResamplingMemoryPlan {
+        expected_output_frames,
+        output_capacity_frames,
+        input_bytes,
+        output_bytes,
+        resampler_scratch_bytes,
+        adapter_bytes,
+        working_bytes,
+    })
+}
+
+fn estimated_output_frames(
+    input_frames: usize,
+    input_sample_rate_hz: u32,
+    target_sample_rate_hz: u32,
+    maximum_output_frames: u64,
+) -> Result<usize, DecodeError> {
+    let estimated_frames = u128::try_from(input_frames)
+        .ok()
+        .and_then(|frames| frames.checked_mul(u128::from(target_sample_rate_hz)))
+        .and_then(|scaled| scaled.checked_add(u128::from(input_sample_rate_hz - 1)))
+        .map(|scaled| scaled / u128::from(input_sample_rate_hz))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    if estimated_frames > u128::from(maximum_output_frames) {
+        return Err(DecodeError::OutputFrameLimitExceeded {
+            actual: u64::try_from(estimated_frames).unwrap_or(u64::MAX),
+            maximum: maximum_output_frames,
+        });
+    }
+    usize::try_from(estimated_frames).map_err(|_| DecodeError::CapacityUnavailable)
+}
+
+fn planar_sample_bytes(frames: usize, channels: usize) -> Result<usize, DecodeError> {
+    frames
+        .checked_mul(channels)
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or(DecodeError::CapacityUnavailable)
+}
+
 /// Converts a complete decoded clip to a positive target rate with a bounded,
 /// band-limited sinc resampler.
 ///
 /// Same-rate input is returned without altering its samples. The output frame
-/// limit is checked both before allocation and after conversion.
+/// and planned memory limits are checked before constructing the resampler.
 ///
 /// # Errors
 ///
 /// Returns [`DecodeError`] for an invalid target, arithmetic/capacity failure,
-/// an exceeded output bound, or a resampler failure.
+/// an exceeded output bound, memory-budget refusal, or a resampler failure.
 pub fn resample_audio(
     audio: DecodedAudio,
     target_sample_rate_hz: u32,
@@ -474,21 +669,20 @@ pub fn resample_audio(
     }
     let input_frames = audio.frame_count();
     let input_sample_rate_hz = audio.sample_rate_hz;
-    let estimated_frames = u128::try_from(input_frames)
-        .ok()
-        .and_then(|frames| frames.checked_mul(u128::from(target_sample_rate_hz)))
-        .and_then(|scaled| scaled.checked_add(u128::from(input_sample_rate_hz - 1)))
-        .map(|scaled| scaled / u128::from(input_sample_rate_hz))
-        .ok_or(DecodeError::CapacityUnavailable)?;
-    if estimated_frames > u128::from(maximum_output_frames) {
-        return Err(DecodeError::OutputFrameLimitExceeded {
-            actual: u64::try_from(estimated_frames).unwrap_or(u64::MAX),
-            maximum: maximum_output_frames,
+    let channels = audio.channels();
+    let memory = plan_resampling_memory(
+        input_frames,
+        input_sample_rate_hz,
+        target_sample_rate_hz,
+        channels,
+        maximum_output_frames,
+    )?;
+    if memory.working_bytes > maximum_resampling_bytes {
+        return Err(DecodeError::ResamplingByteLimitExceeded {
+            required: memory.working_bytes,
+            maximum: maximum_resampling_bytes,
         });
     }
-    let expected_output_frames =
-        usize::try_from(estimated_frames).map_err(|_| DecodeError::CapacityUnavailable)?;
-    let channels = audio.channels();
     let mut planes = Vec::new();
     planes
         .try_reserve_exact(channels)
@@ -505,40 +699,33 @@ pub fn resample_audio(
         ratio,
         1.0,
         &SincInterpolationParameters::default(),
-        input_frames.clamp(1, 4096),
+        input_frames.clamp(1, RESAMPLER_MAX_CHUNK_FRAMES),
         channels,
         FixedAsync::Input,
     )
     .map_err(|error| DecodeError::Resampling(error.to_string()))?;
     // Rubato calculates its target with `f64`; one additional frame covers a
     // possible upward rounding difference from the exact integer ratio below.
-    let processing_output_frames = expected_output_frames
+    let processing_output_frames = memory
+        .expected_output_frames
         .checked_add(1)
         .ok_or(DecodeError::CapacityUnavailable)?;
-    let output_capacity_frames = resampler
+    let rubato_required_output_frames = resampler
         .output_delay()
         .checked_add(resampler.output_frames_max())
         .and_then(|frames| frames.checked_add(processing_output_frames))
         .ok_or(DecodeError::CapacityUnavailable)?;
-    let required_bytes = required_resampling_buffer_bytes(
-        input_frames,
-        output_capacity_frames,
-        channels,
-    )?;
-    if required_bytes > maximum_resampling_bytes {
-        return Err(DecodeError::ResamplingByteLimitExceeded {
-            required: required_bytes,
-            maximum: maximum_resampling_bytes,
-        });
+    if rubato_required_output_frames > memory.output_capacity_frames {
+        return Err(DecodeError::CapacityUnavailable);
     }
     let input = SequentialSliceOfVecs::new(&planes, channels, input_frames)
         .map_err(|error| DecodeError::Resampling(error.to_string()))?;
-    let mut converted = allocate_resampling_output(channels, output_capacity_frames)?;
+    let mut converted = allocate_resampling_output(channels, rubato_required_output_frames)?;
     let output_frames = {
         let mut output = SequentialSliceOfVecs::new_mut(
             &mut converted,
             channels,
-            output_capacity_frames,
+            rubato_required_output_frames,
         )
         .map_err(|error| DecodeError::Resampling(error.to_string()))?;
         resampler.reset();
@@ -547,12 +734,16 @@ pub fn resample_audio(
             .map_err(|error| DecodeError::Resampling(error.to_string()))?;
         output_frames
     };
-    if output_frames < expected_output_frames {
+    if output_frames < memory.expected_output_frames {
         return Err(DecodeError::Resampling(
             "resampler returned fewer frames than the source duration requires".to_owned(),
         ));
     }
-    finish_resampled_audio(converted, expected_output_frames, target_sample_rate_hz)
+    finish_resampled_audio(
+        converted,
+        memory.expected_output_frames,
+        target_sample_rate_hz,
+    )
 }
 
 fn allocate_resampling_output(
@@ -603,27 +794,23 @@ fn finish_resampled_audio(
     }
 }
 
-fn required_resampling_buffer_bytes(
-    input_frames: usize,
-    output_capacity_frames: usize,
+/// Returns the fallible reservation capacity used by canonical float-WAV
+/// encoding for a supported non-empty planar shape.
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] for an unsupported shape or arithmetic overflow.
+pub fn float_wav_encoded_capacity(
+    frames: usize,
     channels: usize,
 ) -> Result<usize, DecodeError> {
-    let sample_bytes = std::mem::size_of::<f32>();
-    let input = input_frames
+    if frames == 0 || !matches!(channels, 1 | 2) {
+        return Err(DecodeError::InvalidLimits);
+    }
+    frames
         .checked_mul(channels)
-        .and_then(|samples| samples.checked_mul(sample_bytes))
-        .ok_or(DecodeError::CapacityUnavailable)?;
-    let output = output_capacity_frames
-        .checked_mul(channels)
-        .and_then(|samples| samples.checked_mul(sample_bytes))
-        .ok_or(DecodeError::CapacityUnavailable)?;
-    let adapters = channels
-        .checked_mul(std::mem::size_of::<Vec<f32>>())
-        .and_then(|bytes| bytes.checked_mul(2))
-        .ok_or(DecodeError::CapacityUnavailable)?;
-    input
-        .checked_add(output)
-        .and_then(|bytes| bytes.checked_add(adapters))
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>()))
+        .and_then(|bytes| bytes.checked_add(68))
         .ok_or(DecodeError::CapacityUnavailable)
 }
 
@@ -635,14 +822,7 @@ fn required_resampling_buffer_bytes(
 /// capacity failure, or a WAV writer failure.
 pub fn encode_float_wav(audio: &DecodedAudio) -> Result<Vec<u8>, DecodeError> {
     let channels = u16::try_from(audio.channels()).map_err(|_| DecodeError::CapacityUnavailable)?;
-    let sample_count = audio
-        .frame_count()
-        .checked_mul(audio.channels())
-        .ok_or(DecodeError::CapacityUnavailable)?;
-    let capacity = sample_count
-        .checked_mul(std::mem::size_of::<f32>())
-        .and_then(|bytes| bytes.checked_add(68))
-        .ok_or(DecodeError::CapacityUnavailable)?;
+    let capacity = float_wav_encoded_capacity(audio.frame_count(), audio.channels())?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(capacity)
