@@ -268,6 +268,39 @@ fn a_full_transmit_queue_rejects_without_consuming_a_sequence_and_recovers_after
 }
 
 #[test]
+fn heartbeat_overflow_is_contained_after_the_link_has_allocated_its_sequence() {
+    let mut peers = Peers::new();
+    peers.connect();
+    for now_ms in 1..=u64::try_from(TRANSMIT_FRAME_CAPACITY).unwrap() {
+        peers
+            .session
+            .send(
+                Message::SetLed {
+                    control_id: 0,
+                    enabled: false,
+                },
+                now_ms,
+            )
+            .unwrap();
+    }
+
+    assert!(matches!(
+        peers
+            .session
+            .poll(u64::from(HEARTBEAT_INTERVAL_MS) + 1),
+        Some(PanelEvent::TransmitFailed(
+            PanelSessionError::TransmitOverflow
+        ))
+    ));
+    assert!(peers.session.is_faulted());
+    assert!(!peers.session.is_connected());
+    assert!(
+        peers.session.take_transmit().is_empty(),
+        "partial output is discarded because the heartbeat already consumed its sequence"
+    );
+}
+
+#[test]
 fn a_corrupted_frame_is_reported_and_the_link_survives_it() {
     let mut peers = Peers::new();
     peers.connect();

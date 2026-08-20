@@ -2119,7 +2119,8 @@ impl PanelPeers {
                 PanelEvent::Fault(_)
                 | PanelEvent::TimedOut
                 | PanelEvent::VersionRejected
-                | PanelEvent::Undecodable(_) => {
+                | PanelEvent::Undecodable(_)
+                | PanelEvent::TransmitFailed(_) => {
                     assert!(runtime.disconnect_panel().is_empty());
                     live = false;
                 }
