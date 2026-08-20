@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use hyper_audio_source::DecodeLimits;
 use hyper_control_runtime::{
-    PanelBinding, PanelConnectError, PanelConnection, PanelDispatchError, PanelDispatchOutcome,
-    PanelDisplay, PanelReleaseFailure,
+    PanelBinding, PanelConnectError, PanelConnection, PanelControl, PanelDispatchError,
+    PanelDispatchOutcome, PanelDisplay, PanelReleaseFailure,
 };
 use hyper_desktop_audio::{DesktopControlSinkError, DesktopOutputConfig, DesktopPlaybackSession};
 use hyper_media_cache::CacheLimits;
@@ -20,7 +20,7 @@ use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
 use hyper_playback_json::LoaderLimits;
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::ProjectPlaybackLimits;
-use hyper_runtime_host::{PanelHost, RuntimeArguments, ServedPanel, serve_panels};
+use hyper_runtime_host::{PanelHost, RuntimeArguments, ServeError, ServedPanel, serve_panels};
 
 /// The runtime's own hosting policy. Stated here rather than borrowed from the
 /// IDE: these are the limits this process accepts, and they are software
@@ -142,26 +142,77 @@ fn run() -> Result<(), String> {
         || millis_since(started),
         report,
     );
-    // The port goes back whatever happened: nothing else will be accepted on it,
-    // and leaving it bound and unattended invites a panel to connect to silence.
-    drop(listener);
-
-    if let Err(error) = service {
-        eprintln!("hyper-runtime: panel service ended: {error}");
-        for failure in host.disconnect_panel() {
-            eprintln!(
-                "hyper-runtime: {:?} could not be released and stays held",
-                failure.control()
-            );
-        }
-        eprintln!("hyper-runtime: the project stays hosted; send quit to stop it");
-        while !stop.load(Ordering::Acquire) {
-            std::thread::sleep(hyper_runtime_host::ACCEPT_POLL_INTERVAL);
-        }
-    }
+    let mut reporter = ConsolePanelServiceReporter;
+    finish_panel_service(
+        listener,
+        service,
+        &stop,
+        || {
+            host.disconnect_panel()
+                .into_iter()
+                .map(|failure| failure.control())
+                .collect()
+        },
+        &mut reporter,
+        || std::thread::sleep(hyper_runtime_host::ACCEPT_POLL_INTERVAL),
+    );
 
     println!("stopping");
     Ok(())
+}
+
+/// Receives the process-level events that follow the panel service ending.
+trait PanelServiceReporter<E> {
+    fn service_ended(&mut self, error: &E);
+    fn release_failed(&mut self, control: PanelControl);
+    fn project_still_hosted(&mut self);
+}
+
+struct ConsolePanelServiceReporter;
+
+impl PanelServiceReporter<ServeError> for ConsolePanelServiceReporter {
+    fn service_ended(&mut self, error: &ServeError) {
+        eprintln!("hyper-runtime: panel service ended: {error}");
+    }
+
+    fn release_failed(&mut self, control: PanelControl) {
+        eprintln!("hyper-runtime: {control:?} could not be released and stays held");
+    }
+
+    fn project_still_hosted(&mut self) {
+        eprintln!("hyper-runtime: the project stays hosted; send quit to stop it");
+    }
+}
+
+/// Releases the listener and applies the process policy after panel service.
+///
+/// The listener is owned so it is closed before any failure is reported: a
+/// panel must never connect to a port the process no longer services. A service
+/// failure gets one process-owner release attempt, then project playback stays
+/// alive until the ordinary quit flag is observed.
+fn finish_panel_service<L, E, D, R, W>(
+    listener: L,
+    service: Result<(), E>,
+    stop: &AtomicBool,
+    mut disconnect: D,
+    reporter: &mut R,
+    mut wait: W,
+) where
+    D: FnMut() -> Vec<PanelControl>,
+    R: PanelServiceReporter<E>,
+    W: FnMut(),
+{
+    drop(listener);
+    if let Err(error) = service {
+        reporter.service_ended(&error);
+        for control in disconnect() {
+            reporter.release_failed(control);
+        }
+        reporter.project_still_hosted();
+        while !stop.load(Ordering::Acquire) {
+            wait();
+        }
+    }
 }
 
 fn report(served: &ServedPanel) {
@@ -228,4 +279,101 @@ fn watch_for_quit(stop: Arc<AtomicBool>) {
 
 fn millis_since(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    struct DropProbe<'a>(&'a Cell<bool>);
+
+    impl Drop for DropProbe<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum Reported {
+        ServiceEnded,
+        ReleaseFailed(PanelControl),
+        ProjectStillHosted,
+    }
+
+    #[derive(Default)]
+    struct Reporter {
+        events: Vec<Reported>,
+    }
+
+    impl PanelServiceReporter<()> for Reporter {
+        fn service_ended(&mut self, _error: &()) {
+            self.events.push(Reported::ServiceEnded);
+        }
+
+        fn release_failed(&mut self, control: PanelControl) {
+            self.events.push(Reported::ReleaseFailed(control));
+        }
+
+        fn project_still_hosted(&mut self) {
+            self.events.push(Reported::ProjectStillHosted);
+        }
+    }
+
+    #[test]
+    fn a_failed_panel_service_releases_the_port_retries_controls_and_keeps_hosting() {
+        let dropped = Cell::new(false);
+        let disconnects = Cell::new(0);
+        let waits = Cell::new(0);
+        let stop = AtomicBool::new(false);
+        let mut reporter = Reporter::default();
+
+        finish_panel_service(
+            DropProbe(&dropped),
+            Err(()),
+            &stop,
+            || {
+                assert!(dropped.get(), "the unattended port is closed first");
+                disconnects.set(disconnects.get() + 1);
+                vec![PanelControl::Button { index: 2 }]
+            },
+            &mut reporter,
+            || {
+                waits.set(waits.get() + 1);
+                stop.store(true, Ordering::Release);
+            },
+        );
+
+        assert!(dropped.get());
+        assert_eq!(disconnects.get(), 1, "the process owner retries once");
+        assert_eq!(waits.get(), 1, "the project remains hosted until quit");
+        assert_eq!(
+            reporter.events,
+            [
+                Reported::ServiceEnded,
+                Reported::ReleaseFailed(PanelControl::Button { index: 2 }),
+                Reported::ProjectStillHosted,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_clean_panel_service_end_only_releases_the_listener() {
+        let dropped = Cell::new(false);
+        let stop = AtomicBool::new(false);
+        let mut reporter = Reporter::default();
+
+        finish_panel_service(
+            DropProbe(&dropped),
+            Ok(()),
+            &stop,
+            || panic!("a clean service end has no stranded controls"),
+            &mut reporter,
+            || panic!("a clean service end does not enter failure waiting"),
+        );
+
+        assert!(dropped.get());
+        assert!(reporter.events.is_empty());
+    }
 }
