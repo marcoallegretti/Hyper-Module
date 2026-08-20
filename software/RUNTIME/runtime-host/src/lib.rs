@@ -296,6 +296,9 @@ pub struct PanelLink {
     /// feedback affordable at all.
     shown: Vec<PanelDisplay>,
     wanted: Vec<PanelDisplay>,
+    /// The next display candidate to inspect. The position survives refreshes
+    /// so controls near the front cannot consume every bounded tick.
+    feedback_cursor: usize,
 }
 
 impl PanelLink {
@@ -308,6 +311,7 @@ impl PanelLink {
             descriptor: None,
             shown: Vec::new(),
             wanted: Vec::new(),
+            feedback_cursor: 0,
         }
     }
 
@@ -416,22 +420,29 @@ impl PanelLink {
             return 0;
         };
         host.panel_display(&mut self.wanted);
+        if self.wanted.is_empty() {
+            self.feedback_cursor = 0;
+            return 0;
+        }
         let mut sent = 0;
-        for display in &self.wanted {
-            if sent == FEEDBACK_PER_TICK {
-                break;
-            }
-            if !descriptor_shows(descriptor, *display) {
+        let candidates = self.wanted.len();
+        let mut inspected = 0;
+        while inspected < candidates && sent < FEEDBACK_PER_TICK {
+            let index = self.feedback_cursor % candidates;
+            self.feedback_cursor = (index + 1) % candidates;
+            inspected += 1;
+            let display = self.wanted[index];
+            if !descriptor_shows(descriptor, display) {
                 continue;
             }
-            if self.shown.contains(display) {
+            if self.shown.contains(&display) {
                 continue;
             }
-            if self.session.send(message_for(*display), now_ms).is_err() {
+            if self.session.send(message_for(display), now_ms).is_err() {
                 break;
             }
-            self.shown.retain(|known| !same_control(*known, *display));
-            self.shown.push(*display);
+            self.shown.retain(|known| !same_control(*known, display));
+            self.shown.push(display);
             sent += 1;
         }
         sent

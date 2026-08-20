@@ -22,9 +22,9 @@ use hyper_mapping_compiler::CompiledControlMappingTable;
 use hyper_panel_protocol::{FirmwareVersion, LinkConfig, Message, PanelDescriptor};
 use hyper_panel_simulator::{PanelSimulator, PanelSimulatorConfig};
 use hyper_runtime_host::{
-    ArgumentError, DEFAULT_GAIN_STEP_MILLIONTHS, PANEL_READ_TIMEOUT, PanelClosure, PanelHost,
-    PanelLink, PanelNotice, RuntimeArguments, ServeError, default_layout, prepare_panel_stream,
-    refuse_waiting_panels, serve_panel, serve_panels,
+    ArgumentError, DEFAULT_GAIN_STEP_MILLIONTHS, FEEDBACK_PER_TICK, PANEL_READ_TIMEOUT,
+    PanelClosure, PanelHost, PanelLink, PanelNotice, RuntimeArguments, ServeError, default_layout,
+    prepare_panel_stream, refuse_waiting_panels, serve_panel, serve_panels,
 };
 
 const CHANNELS: usize = 3;
@@ -1602,6 +1602,55 @@ fn a_refresh_sends_no_more_than_its_budget_however_much_has_changed() {
     assert!(
         total >= available,
         "every control that had something to say eventually said it: {total} of {available}"
+    );
+}
+
+#[test]
+fn continuously_changing_early_controls_cannot_starve_a_later_control() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(8);
+    let now = Rc::new(Cell::new(0_u64));
+    let wide = PanelDescriptor {
+        encoders: 8,
+        buttons: 8,
+        leds: 8,
+        rings: 8,
+        ..display_descriptor(8, 8)
+    };
+    let (mut link, mut driver) = connected_link(&mut host, wide, &stop, &now);
+
+    while link.refresh_display(&mut host, now.get()) > 0 {}
+    driver.deliver(&mut link);
+    let original = driver.panel.output_state().ring(7).unwrap().value;
+
+    host.runtime
+        .try_send_direct(RuntimeControlCommand::ChannelGain {
+            channel_index: 7,
+            gain_millionths: 1_750_000,
+        })
+        .unwrap();
+
+    for tick in 0..=FEEDBACK_PER_TICK {
+        let early_value = if tick % 2 == 0 { 1_250_000 } else { 750_000 };
+        for channel_index in 0..FEEDBACK_PER_TICK {
+            host.runtime
+                .try_send_direct(RuntimeControlCommand::ChannelGain {
+                    channel_index,
+                    gain_millionths: early_value,
+                })
+                .unwrap();
+        }
+        let sent = link.refresh_display(&mut host, now.get());
+        assert!(
+            (1..=FEEDBACK_PER_TICK).contains(&sent),
+            "feedback keeps making bounded progress while the early controls move: {sent}"
+        );
+        driver.deliver(&mut link);
+    }
+
+    assert!(
+        driver.panel.output_state().ring(7).unwrap().value > original,
+        "a later control must be visited even while the first budget-sized group changes on every tick"
     );
 }
 
