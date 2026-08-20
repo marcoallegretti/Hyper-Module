@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hyper_storage_engine::{
-    ProjectPackageLimit, ProjectPackageVerificationLimits, StorageErrorKind,
-    verify_project_package, verify_project_package_with_limits,
+    ProjectPackageLimit, ProjectPackageVerificationLimits, RuntimeBundleManifestFile,
+    StorageErrorKind, verify_project_package, verify_project_package_with_limits,
+    verify_runtime_bundle_project_with_limits,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -338,6 +339,42 @@ fn issued_authority_rejects_later_payload_changes_and_caller_limits() {
     assert_eq!(
         verified.confirm_unchanged().unwrap_err().kind(),
         StorageErrorKind::Sha256Mismatch
+    );
+}
+
+#[test]
+fn runtime_bundle_project_binds_reserved_manifest_and_forbids_local_state() {
+    let fixture = Fixture::new();
+    let runtime_manifest = br#"{"format":"hyper-runtime-bundle"}"#;
+    fs::write(fixture.root.join("manifest.json"), runtime_manifest).unwrap();
+    let authority = RuntimeBundleManifestFile {
+        byte_length: runtime_manifest.len() as u64,
+        sha256: Sha256::digest(runtime_manifest).into(),
+    };
+    let limits = ProjectPackageVerificationLimits {
+        max_total_resource_bytes: 1_024,
+        max_assets: 1,
+        max_asset_file_bytes: 1_024,
+    };
+
+    let verified =
+        verify_runtime_bundle_project_with_limits(&fixture.root, limits, authority).unwrap();
+    verified.confirm_unchanged().unwrap();
+
+    fs::write(fixture.root.join("manifest.json"), b"changed").unwrap();
+    assert_eq!(
+        verified.confirm_unchanged().unwrap_err().kind(),
+        StorageErrorKind::ByteLengthMismatch
+    );
+
+    let local_state = Fixture::new();
+    fs::write(local_state.root.join("manifest.json"), runtime_manifest).unwrap();
+    fs::create_dir(local_state.root.join("cache")).unwrap();
+    assert_eq!(
+        verify_runtime_bundle_project_with_limits(&local_state.root, limits, authority)
+            .unwrap_err()
+            .kind(),
+        StorageErrorKind::UndeclaredEntry
     );
 }
 

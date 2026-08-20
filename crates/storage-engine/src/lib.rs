@@ -63,6 +63,7 @@ use sha2::{Digest, Sha256};
 use crate::stable_file::{is_link_like, read_open_stable, verify_open_stable};
 
 const MANIFEST_NAME: &str = "project.json";
+const RUNTIME_MANIFEST_NAME: &str = "manifest.json";
 const MAX_JSON_BYTES: usize = 1_048_576;
 const MAX_JSON_FILE_BYTES: u64 = 1_048_576;
 const MAX_ENTRIES: usize = 32_768;
@@ -116,6 +117,14 @@ pub struct ProjectPackageVerificationLimits {
     pub max_asset_file_bytes: u64,
 }
 
+/// Exact authority for the runtime manifest that accompanies a bundled
+/// project. It is retained and rechecked with the embedded project package.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeBundleManifestFile {
+    pub byte_length: u64,
+    pub sha256: [u8; 32],
+}
+
 #[derive(Debug)]
 pub struct StorageError {
     kind: StorageErrorKind,
@@ -161,6 +170,7 @@ pub struct StructurallyVerifiedProject {
     manifest: ProjectManifest,
     manifest_sha256: [u8; 32],
     verification_limits: Option<ProjectPackageVerificationLimits>,
+    runtime_manifest: Option<RuntimeBundleManifestFile>,
 }
 
 impl StructurallyVerifiedProject {
@@ -231,7 +241,11 @@ impl StructurallyVerifiedProject {
     /// Returns a verification rejection when any owned file, manifest byte, or
     /// filesystem boundary has changed.
     pub fn confirm_unchanged(&self) -> Result<(), StorageError> {
-        let current = verify_project_package_inner(&self.root, self.verification_limits)?;
+        let current = verify_project_package_inner(
+            &self.root,
+            self.verification_limits,
+            self.runtime_manifest,
+        )?;
         if !same_directory(&self.root_dir, &current.root_dir)?
             || current.manifest_sha256 != self.manifest_sha256
         {
@@ -290,7 +304,7 @@ impl StructurallyVerifiedProject {
 pub fn verify_project_package(
     root: impl AsRef<Path>,
 ) -> Result<StructurallyVerifiedProject, StorageError> {
-    verify_project_package_inner(root.as_ref(), None)
+    verify_project_package_inner(root.as_ref(), None, None)
 }
 
 /// Verifies a project package with application-specific declaration bounds.
@@ -307,12 +321,39 @@ pub fn verify_project_package_with_limits(
     root: impl AsRef<Path>,
     limits: ProjectPackageVerificationLimits,
 ) -> Result<StructurallyVerifiedProject, StorageError> {
-    verify_project_package_inner(root.as_ref(), Some(limits))
+    verify_project_package_inner(root.as_ref(), Some(limits), None)
+}
+
+/// Verifies the project embedded in a versioned runtime bundle while binding
+/// the reserved `manifest.json` to an exact length and digest.
+///
+/// Unlike editable project verification, this profile permits no cache or
+/// backup entries. The returned authority rechecks the runtime manifest during
+/// [`StructurallyVerifiedProject::confirm_unchanged`].
+///
+/// # Errors
+///
+/// Returns a classified rejection for an invalid manifest descriptor or any
+/// project-package verification failure.
+pub fn verify_runtime_bundle_project_with_limits(
+    root: impl AsRef<Path>,
+    limits: ProjectPackageVerificationLimits,
+    runtime_manifest: RuntimeBundleManifestFile,
+) -> Result<StructurallyVerifiedProject, StorageError> {
+    if runtime_manifest.byte_length == 0 || runtime_manifest.byte_length > MAX_JSON_FILE_BYTES {
+        return Err(rejection(
+            StorageErrorKind::LimitExceeded,
+            RUNTIME_MANIFEST_NAME,
+            "runtime manifest length is outside the supported range",
+        ));
+    }
+    verify_project_package_inner(root.as_ref(), Some(limits), Some(runtime_manifest))
 }
 
 fn verify_project_package_inner(
     root: &Path,
     limits: Option<ProjectPackageVerificationLimits>,
+    runtime_manifest: Option<RuntimeBundleManifestFile>,
 ) -> Result<StructurallyVerifiedProject, StorageError> {
     if let Some(limits) = limits
         && (limits.max_total_resource_bytes == 0
@@ -342,10 +383,19 @@ fn verify_project_package_inner(
 
     preflight_manifest(&manifest, limits)?;
 
-    let policy = TreePolicy::new(&manifest);
+    let policy = TreePolicy::new(&manifest, runtime_manifest.is_some());
     let initial_files = collect_owned_tree(root, &policy)?;
     require_managed_tree(&initial_files, &policy)?;
     verify_records(&root_dir, &manifest)?;
+    if let Some(runtime_manifest) = runtime_manifest {
+        verify_open_stable(
+            open_declared_file(&root_dir, RUNTIME_MANIFEST_NAME)?,
+            RUNTIME_MANIFEST_NAME,
+            runtime_manifest.byte_length,
+            runtime_manifest.sha256,
+            false,
+        )?;
+    }
 
     let final_files = collect_owned_tree(root, &policy)?;
     if initial_files != final_files {
@@ -375,6 +425,7 @@ fn verify_project_package_inner(
         manifest,
         manifest_sha256: Sha256::digest(&manifest_bytes).into(),
         verification_limits: limits,
+        runtime_manifest,
     })
 }
 
@@ -428,7 +479,7 @@ pub(crate) fn verify_project_candidate(
         source: Some(Box::new(error)),
     })?;
     preflight_manifest(&manifest, None)?;
-    let policy = TreePolicy::new(&manifest);
+    let policy = TreePolicy::new(&manifest, false);
     let initial_files = collect_owned_tree(root, &policy)?;
     require_managed_tree(&initial_files, &policy)?;
     verify_records(root_dir, &manifest)?;
@@ -456,7 +507,7 @@ pub(crate) fn verify_retained_project_candidate(
         source: Some(Box::new(error)),
     })?;
     preflight_manifest(&manifest, None)?;
-    let policy = TreePolicy::new(&manifest);
+    let policy = TreePolicy::new(&manifest, false);
     let initial_files = collect_owned_tree_retained(root_dir, &policy)?;
     require_managed_tree(&initial_files, &policy)?;
     verify_records(root_dir, &manifest)?;
@@ -679,12 +730,16 @@ struct TreePolicy {
     declared_files: BTreeSet<String>,
     allowed_directories: BTreeSet<String>,
     managed_files: Vec<String>,
+    allow_local_state: bool,
 }
 
 impl TreePolicy {
-    fn new(manifest: &ProjectManifest) -> Self {
+    fn new(manifest: &ProjectManifest, runtime_bundle: bool) -> Self {
         let mut declared_files = BTreeSet::new();
         declared_files.insert(MANIFEST_NAME.to_owned());
+        if runtime_bundle {
+            declared_files.insert(RUNTIME_MANIFEST_NAME.to_owned());
+        }
         for path in manifest
             .resources()
             .iter()
@@ -695,7 +750,7 @@ impl TreePolicy {
         }
         let mut managed_files = declared_files
             .iter()
-            .filter(|path| path.as_str() != MANIFEST_NAME)
+            .filter(|path| path.as_str() != MANIFEST_NAME && path.as_str() != RUNTIME_MANIFEST_NAME)
             .cloned()
             .collect::<Vec<_>>();
         managed_files.sort();
@@ -711,15 +766,17 @@ impl TreePolicy {
             declared_files,
             allowed_directories,
             managed_files,
+            allow_local_state: !runtime_bundle,
         }
     }
 
     fn allows_directory(&self, path: &str) -> bool {
-        self.allowed_directories.contains(path) || local_only_directory(path)
+        self.allowed_directories.contains(path)
+            || self.allow_local_state && local_only_directory(path)
     }
 
     fn allows_file(&self, path: &str) -> bool {
-        self.declared_files.contains(path) || local_only_file(path)
+        self.declared_files.contains(path) || self.allow_local_state && local_only_file(path)
     }
 }
 
@@ -920,7 +977,11 @@ fn collect_owned_tree_retained(
 fn require_managed_tree(files: &[String], policy: &TreePolicy) -> Result<(), StorageError> {
     let managed = files
         .iter()
-        .filter(|path| path.as_str() != MANIFEST_NAME && !local_only_file(path))
+        .filter(|path| {
+            path.as_str() != MANIFEST_NAME
+                && path.as_str() != RUNTIME_MANIFEST_NAME
+                && !local_only_file(path)
+        })
         .cloned()
         .collect::<Vec<_>>();
     if managed != policy.managed_files {
