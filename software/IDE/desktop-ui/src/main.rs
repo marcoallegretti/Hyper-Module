@@ -5048,9 +5048,7 @@ fn apply_running_event(
             ui.set_error_text("The audio callback could not render this recorded take".into());
         }
         DesktopAudioPreviewState::Idle => {
-            ui.set_app_mode(AppMode::Running);
-            ui.set_status_text("Runtime evidence updated".into());
-            ui.set_error_text(SharedString::default());
+            apply_idle_running_event(ui);
         }
     }
 }
@@ -8323,6 +8321,14 @@ fn mode_after_closed_event(current: AppMode) -> AppMode {
     }
 }
 
+fn apply_idle_running_event(ui: &MainWindow) {
+    if ui.get_app_mode() != AppMode::PreparingRuntime {
+        ui.set_app_mode(AppMode::Running);
+        ui.set_status_text("Runtime evidence updated".into());
+        ui.set_error_text(SharedString::default());
+    }
+}
+
 fn mode_after_submission_failure(
     current: AppMode,
     command: IdeWorkerCommandKind,
@@ -9585,6 +9591,19 @@ mod tests {
 
     #[test]
     fn runtime_preparation_has_a_dedicated_recoverable_mode() {
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::PreparingRuntime);
+        ui.set_status_text("Choose a Runtime destination".into());
+        ui.set_error_text("retained message".into());
+        apply_idle_running_event(&ui);
+        assert_eq!(ui.get_app_mode(), AppMode::PreparingRuntime);
+        assert_eq!(ui.get_status_text(), "Choose a Runtime destination");
+        assert_eq!(ui.get_error_text(), "retained message");
+
+        ui.set_app_mode(AppMode::Running);
+        apply_idle_running_event(&ui);
+        assert_eq!(ui.get_status_text(), "Runtime evidence updated");
+        assert!(ui.get_error_text().is_empty());
         assert_eq!(
             mode_after_successful_submission(
                 AppMode::PreparingRuntime,
