@@ -435,6 +435,7 @@ mod tests {
 
     #[test]
     fn startup_diagnostics_retain_the_bundle_rejection_cause() {
+        let output_opened = Cell::new(false);
         let missing = std::env::temp_dir().join(format!(
             "hyper-runtime-missing-bundle-{}-{}",
             std::process::id(),
@@ -443,20 +444,30 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let error = resolve_runtime_deployment(
-            missing,
-            env!("CARGO_PKG_VERSION"),
-            MAX_RUNTIME_BUNDLE_BYTES,
-            limits().unwrap(),
+        let diagnostic = prepare_output_and_host(
+            || {
+                resolve_runtime_deployment(
+                    missing,
+                    env!("CARGO_PKG_VERSION"),
+                    MAX_RUNTIME_BUNDLE_BYTES,
+                    limits().unwrap(),
+                )
+                .map_err(|error| format_error_chain(&error))
+            },
+            || {
+                output_opened.set(true);
+                Ok(())
+            },
+            |(), _| Ok(()),
         )
         .unwrap_err();
 
-        let diagnostic = format_error_chain(&error);
         assert!(diagnostic.starts_with("inspect deployment target: "));
         assert!(
             diagnostic.len() > "inspect deployment target: ".len(),
             "the operating-system cause remains visible"
         );
+        assert!(!output_opened.get());
     }
 
     #[test]

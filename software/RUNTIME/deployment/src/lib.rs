@@ -12,7 +12,7 @@ use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, DirBuilder, OpenOptions};
 use hyper_fs_authority::{
     identity, open_syncable_directory_ambient, open_syncable_directory_at, read_stable_file,
-    rename_replace, sync_directory,
+    remove_directory_entry, rename_replace, sync_directory,
 };
 use hyper_project_loader::ProjectPlaybackLimits;
 use hyper_project_model::{is_valid_entity_id, is_valid_extension_key};
@@ -279,22 +279,39 @@ impl<'a> DeploymentLock<'a> {
             }
             Err(source) => return Err(io_error("create deployment lock", source)),
         }
+        let created_identity = created_directory_identity(target, LOCK_NAME)?;
         let directory = match open_syncable_directory_at(&target.root, LOCK_NAME) {
             Ok(directory) => directory,
             Err(source) => {
                 let primary = io_error("retain deployment lock", source);
-                return match target
-                    .root
-                    .remove_dir(LOCK_NAME)
-                    .and_then(|()| sync_directory(&target.root))
-                {
-                    Ok(()) => Err(primary),
-                    Err(cleanup) => {
-                        Err(cleanup_error(primary, "clean up deployment lock", &cleanup))
-                    }
-                };
+                return Err(cleanup_created_directory(
+                    target,
+                    LOCK_NAME,
+                    created_identity,
+                    primary,
+                    "clean up deployment lock",
+                ));
             }
         };
+        let retained_identity = directory
+            .dir_metadata()
+            .map(|metadata| identity(&metadata))
+            .map_err(|source| io_error("inspect retained deployment lock", source));
+        if !matches!(retained_identity, Ok(identity) if identity == created_identity) {
+            let primary = retained_identity.err().unwrap_or_else(|| {
+                reject(
+                    DeploymentStartupErrorKind::AuthorityChanged,
+                    "deployment lock identity changed while being retained",
+                )
+            });
+            return Err(cleanup_created_directory(
+                target,
+                LOCK_NAME,
+                created_identity,
+                primary,
+                "clean up deployment lock",
+            ));
+        }
         let initialized = Self::initialize(target, &directory);
         match initialized {
             Ok((lock_identity, owner_bytes)) => Ok(Self {
@@ -759,42 +776,7 @@ fn publish_state(
         ));
     }
     let bytes = canonical_state_bytes(state)?;
-    let transaction_name = format!(".state-{}", Uuid::new_v4());
-    target
-        .root
-        .create_dir_with(&transaction_name, &private_directory_builder())
-        .map_err(|source| io_error("create deployment state transaction", source))?;
-    let transaction = match target.root.open_dir_nofollow(&transaction_name) {
-        Ok(directory) => directory,
-        Err(source) => {
-            let primary = io_error("retain deployment state transaction", source);
-            return match target.root.remove_dir(&transaction_name) {
-                Ok(()) => Err(primary),
-                Err(cleanup) => Err(cleanup_error(
-                    primary,
-                    "clean up deployment state transaction",
-                    &cleanup,
-                )),
-            };
-        }
-    };
-    let transaction_identity = match transaction.dir_metadata() {
-        Ok(metadata) => identity(&metadata),
-        Err(source) => {
-            let primary = io_error("inspect deployment state transaction", source);
-            return match transaction
-                .remove_open_dir_all()
-                .and_then(|()| sync_directory(&target.root))
-            {
-                Ok(()) => Err(primary),
-                Err(cleanup) => Err(cleanup_error(
-                    primary,
-                    "clean up deployment state transaction",
-                    &cleanup,
-                )),
-            };
-        }
-    };
+    let (transaction_name, transaction, transaction_identity) = create_state_transaction(target)?;
     let mut options = OpenOptions::new();
     options
         .write(true)
@@ -841,6 +823,93 @@ fn publish_state(
             ),
             source: Some(Box::new(operation)),
         }),
+    }
+}
+
+fn create_state_transaction(
+    target: &TargetAuthority,
+) -> Result<(String, Dir, (u64, u64)), DeploymentStartupError> {
+    let name = format!(".metadata-{}", Uuid::new_v4());
+    target
+        .root
+        .create_dir_with(&name, &private_directory_builder())
+        .map_err(|source| io_error("create deployment state transaction", source))?;
+    let created_identity = created_directory_identity(target, &name)?;
+    let transaction = match target.root.open_dir_nofollow(&name) {
+        Ok(directory) => directory,
+        Err(source) => {
+            let primary = io_error("retain deployment state transaction", source);
+            return Err(cleanup_created_directory(
+                target,
+                &name,
+                created_identity,
+                primary,
+                "clean up deployment state transaction",
+            ));
+        }
+    };
+    let transaction_identity = match transaction.dir_metadata() {
+        Ok(metadata) if identity(&metadata) == created_identity => created_identity,
+        Ok(_) => {
+            let primary = reject(
+                DeploymentStartupErrorKind::AuthorityChanged,
+                "deployment state transaction identity changed while being retained",
+            );
+            return Err(cleanup_created_directory(
+                target,
+                &name,
+                created_identity,
+                primary,
+                "clean up deployment state transaction",
+            ));
+        }
+        Err(source) => {
+            let primary = io_error("inspect deployment state transaction", source);
+            return match transaction
+                .remove_open_dir_all()
+                .and_then(|()| sync_directory(&target.root))
+            {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(cleanup_error(
+                    primary,
+                    "clean up deployment state transaction",
+                    &cleanup,
+                )),
+            };
+        }
+    };
+    Ok((name, transaction, transaction_identity))
+}
+
+fn created_directory_identity(
+    target: &TargetAuthority,
+    name: &str,
+) -> Result<(u64, u64), DeploymentStartupError> {
+    let metadata = target
+        .root
+        .symlink_metadata(name)
+        .map_err(|source| io_error("inspect created deployment directory", source))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(reject(
+            DeploymentStartupErrorKind::AuthorityChanged,
+            "created deployment directory identity changed",
+        ));
+    }
+    Ok(identity(&metadata))
+}
+
+fn cleanup_created_directory(
+    target: &TargetAuthority,
+    name: &str,
+    expected_identity: (u64, u64),
+    primary: DeploymentStartupError,
+    operation: &str,
+) -> DeploymentStartupError {
+    match remove_directory_entry(&target.root, name, expected_identity)
+        .and_then(|()| sync_directory(&target.root))
+    {
+        Ok(()) => primary,
+        Err(cleanup) => cleanup_error(primary, operation, &cleanup),
     }
 }
 
@@ -1019,4 +1088,155 @@ fn is_link_like(metadata: &fs::Metadata) -> bool {
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     metadata.file_type().is_symlink()
         || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use serde_json::{Value, json};
+
+    use super::{
+        DeploymentStartupErrorKind, MAXIMUM_METADATA_BYTES, STATE_NAME, TargetAuthority, read_state,
+    };
+
+    struct TemporaryTarget(PathBuf);
+
+    impl TemporaryTarget {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "hyper-runtime-deployment-state-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn write(&self, bytes: &[u8]) {
+            fs::write(self.path().join(STATE_NAME), bytes).unwrap();
+        }
+    }
+
+    impl Drop for TemporaryTarget {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn valid_state() -> Value {
+        json!({
+            "format": "hyper-deployment-state",
+            "format_version": 1,
+            "generation": 1,
+            "active": {
+                "bundle_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "project_id": "018f47a2-6b2d-7c11-8a44-001122334455",
+                "project_revision": 1,
+                "minimum_runtime_version": "1.0.0",
+                "status": "healthy"
+            },
+            "previous_bundle_sha256": null,
+            "extensions": {}
+        })
+    }
+
+    fn canonical(value: &Value) -> Vec<u8> {
+        serde_json_canonicalizer::to_vec(value).unwrap()
+    }
+
+    #[test]
+    fn state_parser_accepts_only_the_canonical_contract() {
+        let temporary = TemporaryTarget::new();
+        let bytes = canonical(&valid_state());
+        temporary.write(&bytes);
+        let target = TargetAuthority::open(temporary.path()).unwrap();
+
+        let state = read_state(&target).unwrap();
+
+        assert_eq!(state.original_bytes, bytes);
+        assert_eq!(state.raw.generation, 1);
+    }
+
+    #[test]
+    fn state_parser_rejects_independent_shape_and_domain_failures() {
+        let mut cases = Vec::new();
+
+        let mut unknown = valid_state();
+        unknown["unknown"] = json!(true);
+        cases.push(canonical(&unknown));
+
+        let mut zero_generation = valid_state();
+        zero_generation["generation"] = json!(0);
+        cases.push(canonical(&zero_generation));
+
+        let mut invalid_id = valid_state();
+        invalid_id["active"]["project_id"] = json!("project");
+        cases.push(canonical(&invalid_id));
+
+        let mut uppercase_digest = valid_state();
+        uppercase_digest["active"]["bundle_sha256"] =
+            json!("0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef");
+        cases.push(canonical(&uppercase_digest));
+
+        let mut invalid_version = valid_state();
+        invalid_version["active"]["minimum_runtime_version"] = json!("latest");
+        cases.push(canonical(&invalid_version));
+
+        let mut invalid_extension = valid_state();
+        invalid_extension["extensions"]["internal"] = json!(true);
+        cases.push(canonical(&invalid_extension));
+
+        for bytes in cases {
+            let temporary = TemporaryTarget::new();
+            temporary.write(&bytes);
+            let target = TargetAuthority::open(temporary.path()).unwrap();
+
+            let error = read_state(&target).unwrap_err();
+
+            assert_eq!(error.kind(), DeploymentStartupErrorKind::StateInvalid);
+            assert_eq!(fs::read(temporary.path().join(STATE_NAME)).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn state_parser_rejects_noncanonical_duplicate_and_oversized_input() {
+        let canonical_state = String::from_utf8(canonical(&valid_state())).unwrap();
+        let noncanonical = canonical_state.replace("{\"active\"", "{ \"active\"");
+        let duplicate = canonical_state.replacen(
+            "\"format_version\":1",
+            "\"format_version\":1,\"format_version\":1",
+            1,
+        );
+        let oversized = vec![b' '; usize::try_from(MAXIMUM_METADATA_BYTES).unwrap() + 1];
+
+        for (bytes, expected) in [
+            (
+                noncanonical.into_bytes(),
+                DeploymentStartupErrorKind::StateNonCanonical,
+            ),
+            (
+                duplicate.into_bytes(),
+                DeploymentStartupErrorKind::StateInvalid,
+            ),
+            (oversized, DeploymentStartupErrorKind::Io),
+        ] {
+            let temporary = TemporaryTarget::new();
+            temporary.write(&bytes);
+            let target = TargetAuthority::open(temporary.path()).unwrap();
+
+            let error = read_state(&target).unwrap_err();
+
+            assert_eq!(error.kind(), expected);
+            assert_eq!(fs::read(temporary.path().join(STATE_NAME)).unwrap(), bytes);
+        }
+    }
 }

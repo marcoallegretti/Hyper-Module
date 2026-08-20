@@ -43,7 +43,7 @@ fn resolves_a_javascript_managed_deployment_target() {
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .starts_with(".state-")
+            .starts_with(".metadata-")
     }));
     resolved
         .bundle()
@@ -88,7 +88,7 @@ fn rejects_an_exhausted_javascript_managed_deployment_atomically() {
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .starts_with(".state-")
+            .starts_with(".metadata-")
     }));
 }
 
@@ -112,6 +112,21 @@ fn leaves_a_healthy_javascript_managed_deployment_unchanged() {
 
 #[test]
 #[ignore = "executed by the JavaScript deployment contract suite"]
+fn rejects_activation_manifest_mismatch_without_mutation() {
+    let root = contract_target();
+    let state_before = fs::read(root.join("state.json")).unwrap();
+
+    let error = resolve_runtime_deployment(&root, "1.0.0", 1 << 30, limits()).unwrap_err();
+    let diagnostic = error_chain(&error);
+
+    assert_eq!(error.kind(), DeploymentStartupErrorKind::CandidateRejected);
+    assert!(diagnostic.contains("deployment activation does not match the installed bundle"));
+    assert_eq!(fs::read(root.join("state.json")).unwrap(), state_before);
+    assert_clean_release(&root);
+}
+
+#[test]
+#[ignore = "executed by the JavaScript deployment contract suite"]
 fn preserves_both_javascript_candidate_failures() {
     let root = contract_target();
     let state_before = fs::read(root.join("state.json")).unwrap();
@@ -122,6 +137,11 @@ fn preserves_both_javascript_candidate_failures() {
     assert_eq!(error.kind(), DeploymentStartupErrorKind::CandidateRejected);
     assert!(diagnostic.contains("active candidate:"));
     assert!(diagnostic.contains("previous candidate:"));
+    assert!(
+        diagnostic.contains("runtime manifest is not strict JSON"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("project.json"), "{diagnostic}");
     assert_eq!(fs::read(root.join("state.json")).unwrap(), state_before);
     assert_clean_release(&root);
 }
@@ -156,7 +176,7 @@ fn assert_clean_release(root: &Path) {
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .starts_with(".state-")
+            .starts_with(".metadata-")
     }));
 }
 

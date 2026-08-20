@@ -102,6 +102,20 @@ try {
     "leaves_a_healthy_javascript_managed_deployment_unchanged",
   );
 
+  const healthy7 = await readDeploymentState(target);
+  await writeFile(
+    join(target, "state.json"),
+    canonicalize({
+      ...healthy7,
+      active: {
+        ...healthy7.active,
+        project_revision: healthy7.active.project_revision + 1,
+      },
+    }),
+  );
+  await runNative(target, "rejects_activation_manifest_mismatch_without_mutation");
+  await writeFile(join(target, "state.json"), canonicalize(healthy7));
+
   const pending8 = await deployBundle(bundle8, target, "1.0.0");
   assert.equal(pending8.active.status, "pending");
   const manifestPath = join(
@@ -148,6 +162,10 @@ try {
   const corruptedRecoveredManifest = Buffer.from(recoveredManifest);
   corruptedRecoveredManifest[0] ^= 1;
   await writeFile(recoveredManifestPath, corruptedRecoveredManifest);
+  await writeFile(manifestPath, manifest);
+  await rm(
+    join(target, "bundles", pending8.active.bundle_sha256, "project.json"),
+  );
   await runNative(target, "preserves_both_javascript_candidate_failures");
 
   const lockPath = join(target, "deployment.lock");
@@ -169,7 +187,7 @@ try {
   await rm(lockPath, { recursive: true });
 
   console.log(
-    "Native Runtime deployment conformance passed: promotion, idempotence, recovery, failure preservation, exhaustion, and lock contention",
+    "Native Runtime deployment conformance passed: promotion, idempotence, activation binding, recovery, distinct failure preservation, exhaustion, and lock contention",
   );
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
