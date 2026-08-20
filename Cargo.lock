@@ -2381,7 +2381,10 @@ dependencies = [
 name = "hyper-runtime-bundle"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "hyper-audio-source",
+ "hyper-fs-authority",
  "hyper-media-cache",
  "hyper-playback-json",
  "hyper-playback-session",

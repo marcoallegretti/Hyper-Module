@@ -15,7 +15,7 @@ use hyper_fs_authority::{
 };
 use hyper_project_loader::{ProjectPlaybackError, ProjectPlaybackLimits, prepare_project_playback};
 use hyper_project_model::{AudioMediaType, HardwareCapabilities, ProjectManifest, UsbMode};
-use hyper_runtime_bundle::{RuntimeBundleError, prepare_runtime_bundle};
+use hyper_runtime_bundle::{RuntimeBundleError, prepare_runtime_bundle, prepare_runtime_bundle_at};
 use semver::Version;
 use serde::Serialize;
 use serde_json::Value;
@@ -41,6 +41,7 @@ pub enum RuntimeBundleBuildErrorKind {
     Serialization,
     Verification,
     OutputConflict,
+    ArtifactReadyButCleanupFailed,
     PublishedButUnsynced,
 }
 
@@ -58,8 +59,9 @@ impl RuntimeBundleBuildError {
         self.kind
     }
 
-    /// Returns the published artifact when only the final parent durability
-    /// barrier failed. The caller must not assume the artifact was lost.
+    /// Returns the verified artifact when publication or reuse succeeded but a
+    /// later durability or cleanup operation failed. The caller must not assume
+    /// the artifact was lost.
     #[must_use]
     pub fn published(&self) -> Option<&PublishedRuntimeBundle> {
         self.published.as_deref()
@@ -290,13 +292,7 @@ fn publish_prepared_bundle(
     let output_parent = open_syncable_directory_ambient(output_parent_path)
         .map_err(|source| filesystem_error("open Runtime bundle output parent", source))?;
     let stage_name = format!(".runtime-staging-{}", Uuid::new_v4());
-    create_stage(&output_parent, &stage_name)?;
-    let stage = open_syncable_directory_at(&output_parent, &stage_name)
-        .map_err(|source| filesystem_error("open Runtime bundle staging directory", source))?;
-    let stage_identity = stage
-        .dir_metadata()
-        .map(|metadata| identity(&metadata))
-        .map_err(|source| filesystem_error("inspect Runtime bundle staging directory", source))?;
+    let (stage, stage_identity) = create_and_open_stage(&output_parent, &stage_name)?;
     let stage_path = output_parent_path.join(&stage_name);
 
     let result = build_in_stage(
@@ -363,10 +359,9 @@ fn publish_prepared_bundle(
             let cleanup = remove_directory_entry(&output_parent, &stage_name, stage_identity);
             match (existing, cleanup) {
                 (Ok(existing), Ok(())) => finish_publication(&output_parent, existing),
-                (Ok(_), Err(cleanup)) => Err(filesystem_error_with_source(
-                    "identical output exists but staging cleanup failed",
-                    cleanup,
-                )),
+                (Ok(existing), Err(cleanup)) => {
+                    Err(artifact_ready_but_cleanup_failed(existing, cleanup))
+                }
                 (Err(conflict), Ok(())) => Err(conflict.with_rename_source(rename_error)),
                 (Err(conflict), Err(cleanup)) => Err(filesystem_error_with_source(
                     &format!("{conflict}; staging cleanup also failed"),
@@ -472,6 +467,7 @@ fn build_in_stage(
     }
     write_file(stage, MANIFEST_NAME, manifest_bytes)?;
     verify_generated(
+        stage,
         stage_path,
         minimum_runtime_version,
         maximum_bundle_bytes,
@@ -482,6 +478,7 @@ fn build_in_stage(
     sync_created_directories(stage, &directories)?;
     source.confirm_unchanged().map_err(source_storage_error)?;
     verify_generated(
+        stage,
         stage_path,
         minimum_runtime_version,
         maximum_bundle_bytes,
@@ -528,6 +525,48 @@ fn create_stage(parent: &Dir, name: &str) -> Result<(), RuntimeBundleBuildError>
     parent
         .create_dir_with(name, &builder)
         .map_err(|source| filesystem_error("create Runtime bundle staging directory", source))
+}
+
+fn create_and_open_stage(
+    parent: &Dir,
+    name: &str,
+) -> Result<(Dir, (u64, u64)), RuntimeBundleBuildError> {
+    create_stage(parent, name)?;
+    let stage = match open_syncable_directory_at(parent, name) {
+        Ok(stage) => stage,
+        Err(source) => {
+            let primary = filesystem_error("open Runtime bundle staging directory", source);
+            return cleanup_created_stage(parent, name, primary);
+        }
+    };
+    let stage_identity = match stage.dir_metadata() {
+        Ok(metadata) => identity(&metadata),
+        Err(source) => {
+            drop(stage);
+            let primary = filesystem_error("inspect Runtime bundle staging directory", source);
+            return cleanup_created_stage(parent, name, primary);
+        }
+    };
+    Ok((stage, stage_identity))
+}
+
+fn cleanup_created_stage<T>(
+    parent: &Dir,
+    name: &str,
+    primary: RuntimeBundleBuildError,
+) -> Result<T, RuntimeBundleBuildError> {
+    let stage_identity = match parent.symlink_metadata(name) {
+        Ok(metadata) => identity(&metadata),
+        Err(cleanup) => {
+            return Err(filesystem_error_with_source(
+                &format!(
+                    "{primary}; could not identify the Runtime bundle staging entry for cleanup"
+                ),
+                cleanup,
+            ));
+        }
+    };
+    cleanup_after_failure(primary, parent, name, stage_identity)
 }
 
 fn write_payload(
@@ -602,6 +641,7 @@ fn open_relative_directory(root: &Dir, path: &str) -> Result<Dir, RuntimeBundleB
 }
 
 fn verify_generated(
+    root: &Dir,
     path: &Path,
     minimum_runtime_version: &str,
     maximum_bundle_bytes: u64,
@@ -609,8 +649,12 @@ fn verify_generated(
     expected_sha256: [u8; 32],
     expected_bytes: u64,
 ) -> Result<(), RuntimeBundleBuildError> {
-    let verified = prepare_runtime_bundle(
+    let directory = root
+        .try_clone()
+        .map_err(|source| filesystem_error("retain Runtime bundle staging directory", source))?;
+    let verified = prepare_runtime_bundle_at(
         path,
+        directory,
         minimum_runtime_version,
         maximum_bundle_bytes,
         playback_limits,
@@ -682,6 +726,21 @@ fn finish_publication(
         });
     }
     Ok(published)
+}
+
+fn artifact_ready_but_cleanup_failed(
+    published: PublishedRuntimeBundle,
+    source: io::Error,
+) -> RuntimeBundleBuildError {
+    RuntimeBundleBuildError {
+        kind: RuntimeBundleBuildErrorKind::ArtifactReadyButCleanupFailed,
+        message: format!(
+            "verified Runtime bundle remains available at {} but staging cleanup failed",
+            published.output_path().display()
+        ),
+        source: Some(Box::new(source)),
+        published: Some(Box::new(published)),
+    }
 }
 
 fn cleanup_after_failure<T>(
@@ -806,5 +865,34 @@ fn verification_error(source: RuntimeBundleError) -> RuntimeBundleBuildError {
         message: "generated Runtime bundle failed independent verification".to_owned(),
         source: Some(Box::new(source)),
         published: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_failure_preserves_verified_artifact_evidence() {
+        let published = PublishedRuntimeBundle {
+            output_path: PathBuf::from("prepared.runtime"),
+            bundle_sha256: [7; 32],
+            bundle_byte_length: 42,
+            reused: true,
+        };
+
+        let error = artifact_ready_but_cleanup_failed(
+            published,
+            io::Error::other("injected cleanup failure"),
+        );
+
+        assert_eq!(
+            error.kind(),
+            RuntimeBundleBuildErrorKind::ArtifactReadyButCleanupFailed
+        );
+        let retained = error.published().expect("artifact evidence must survive");
+        assert_eq!(retained.output_path(), Path::new("prepared.runtime"));
+        assert_eq!(retained.bundle_byte_length(), 42);
+        assert!(retained.reused());
     }
 }

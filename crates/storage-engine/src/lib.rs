@@ -172,6 +172,7 @@ pub struct StructurallyVerifiedProject {
     manifest_sha256: [u8; 32],
     verification_limits: Option<ProjectPackageVerificationLimits>,
     runtime_manifest: Option<RuntimeBundleManifestFile>,
+    reopen_root_on_confirm: bool,
 }
 
 impl StructurallyVerifiedProject {
@@ -271,11 +272,26 @@ impl StructurallyVerifiedProject {
     /// Returns a verification rejection when any owned file, manifest byte, or
     /// filesystem boundary has changed.
     pub fn confirm_unchanged(&self) -> Result<(), StorageError> {
-        let current = verify_project_package_inner(
-            &self.root,
-            self.verification_limits,
-            self.runtime_manifest,
-        )?;
+        let current = if self.reopen_root_on_confirm {
+            verify_project_package_inner(
+                &self.root,
+                self.verification_limits,
+                self.runtime_manifest,
+            )?
+        } else {
+            let root_dir = self
+                .root_dir
+                .try_clone()
+                .map(Arc::new)
+                .map_err(|error| io_error(".", "retain project root", error))?;
+            verify_project_package_from_open_root(
+                self.root.clone(),
+                root_dir,
+                self.verification_limits,
+                self.runtime_manifest,
+                false,
+            )?
+        };
         if !same_directory(&self.root_dir, &current.root_dir)?
             || current.manifest_sha256 != self.manifest_sha256
         {
@@ -380,11 +396,61 @@ pub fn verify_runtime_bundle_project_with_limits(
     verify_project_package_inner(root.as_ref(), Some(limits), Some(runtime_manifest))
 }
 
+/// Verifies the project embedded in a Runtime bundle through an already retained
+/// non-link directory authority.
+///
+/// The supplied path is retained only as a diagnostic label; verification and
+/// later unchanged confirmation never re-enter the ambient namespace.
+///
+/// # Errors
+///
+/// Returns a classified rejection for invalid limits, a non-directory authority,
+/// or any Runtime bundle project verification failure.
+pub fn verify_runtime_bundle_project_with_limits_at(
+    root: impl AsRef<Path>,
+    root_dir: Dir,
+    limits: ProjectPackageVerificationLimits,
+    runtime_manifest: RuntimeBundleManifestFile,
+) -> Result<StructurallyVerifiedProject, StorageError> {
+    if runtime_manifest.byte_length == 0 || runtime_manifest.byte_length > MAX_JSON_FILE_BYTES {
+        return Err(rejection(
+            StorageErrorKind::LimitExceeded,
+            RUNTIME_MANIFEST_NAME,
+            "runtime manifest length is outside the supported range",
+        ));
+    }
+    let metadata = root_dir
+        .dir_metadata()
+        .map_err(|error| io_error(".", "inspect retained project root", error))?;
+    if !metadata.is_dir() {
+        return Err(rejection(
+            StorageErrorKind::RootNotDirectory,
+            ".",
+            "retained project root must be a directory",
+        ));
+    }
+    verify_project_package_from_open_root(
+        root.as_ref().to_path_buf(),
+        Arc::new(root_dir),
+        Some(limits),
+        Some(runtime_manifest),
+        false,
+    )
+}
+
 fn verify_project_package_inner(
     root: &Path,
     limits: Option<ProjectPackageVerificationLimits>,
     runtime_manifest: Option<RuntimeBundleManifestFile>,
 ) -> Result<StructurallyVerifiedProject, StorageError> {
+    validate_verification_limits(limits)?;
+    let (canonical_root, root_dir) = open_stable_project_root(root)?;
+    verify_project_package_from_open_root(canonical_root, root_dir, limits, runtime_manifest, true)
+}
+
+fn validate_verification_limits(
+    limits: Option<ProjectPackageVerificationLimits>,
+) -> Result<(), StorageError> {
     if let Some(limits) = limits
         && (limits.max_total_resource_bytes == 0
             || limits.max_assets == 0
@@ -396,7 +462,17 @@ fn verify_project_package_inner(
             "project verification limits must be positive",
         ));
     }
-    let (canonical_root, root_dir) = open_stable_project_root(root)?;
+    Ok(())
+}
+
+fn verify_project_package_from_open_root(
+    root: PathBuf,
+    root_dir: Arc<Dir>,
+    limits: Option<ProjectPackageVerificationLimits>,
+    runtime_manifest: Option<RuntimeBundleManifestFile>,
+    reopen_root_on_confirm: bool,
+) -> Result<StructurallyVerifiedProject, StorageError> {
+    validate_verification_limits(limits)?;
     let manifest_bytes = read_open_stable(
         open_declared_file(&root_dir, MANIFEST_NAME)?,
         MANIFEST_NAME,
@@ -414,7 +490,7 @@ fn verify_project_package_inner(
     preflight_manifest(&manifest, limits)?;
 
     let policy = TreePolicy::new(&manifest, runtime_manifest.is_some());
-    let initial_files = collect_owned_tree(root, &policy)?;
+    let initial_files = collect_owned_tree_retained(&root_dir, &policy)?;
     require_managed_tree(&initial_files, &policy)?;
     verify_records(&root_dir, &manifest)?;
     if let Some(runtime_manifest) = runtime_manifest {
@@ -427,7 +503,7 @@ fn verify_project_package_inner(
         )?;
     }
 
-    let final_files = collect_owned_tree(root, &policy)?;
+    let final_files = collect_owned_tree_retained(&root_dir, &policy)?;
     if initial_files != final_files {
         return Err(rejection(
             StorageErrorKind::ChangedDuringVerification,
@@ -450,13 +526,14 @@ fn verify_project_package_inner(
     }
 
     Ok(StructurallyVerifiedProject {
-        root: canonical_root,
+        root,
         root_dir,
         manifest,
         manifest_byte_length: u64::try_from(manifest_bytes.len()).unwrap_or(u64::MAX),
         manifest_sha256: Sha256::digest(&manifest_bytes).into(),
         verification_limits: limits,
         runtime_manifest,
+        reopen_root_on_confirm,
     })
 }
 

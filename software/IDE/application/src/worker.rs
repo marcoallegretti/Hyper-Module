@@ -1367,6 +1367,20 @@ pub enum IdeRuntimePreparationError {
     },
 }
 
+impl IdeRuntimePreparationError {
+    /// Returns a verified Runtime artifact when preparation reached that point
+    /// before a later cleanup, durability, or project-reopen failure.
+    #[must_use]
+    pub fn published(&self) -> Option<&PublishedRuntimeBundle> {
+        match self {
+            Self::Save(_) => None,
+            Self::Bundle(source) => source.published(),
+            Self::ReopenAfterPublication { bundle, .. } => Some(bundle),
+            Self::ReopenAfterFailure { preparation, .. } => preparation.published(),
+        }
+    }
+}
+
 impl fmt::Display for IdeRuntimePreparationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

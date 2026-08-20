@@ -6,6 +6,8 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+cap-fs-ext = "=4.0.2"
+cap-std = "=4.0.2"
 hyper-project-loader = { path = "../../../crates/project-loader" }
 hyper-project-model = { path = "../../../crates/project-model" }
 hyper-storage-engine = { path = "../../../crates/storage-engine" }
@@ -18,6 +20,7 @@ sha2 = "=0.10.9"
 
 [dev-dependencies]
 hyper-audio-source = { path = "../../../crates/audio-source" }
+hyper-fs-authority = { path = "../../../crates/fs-authority" }
 hyper-media-cache = { path = "../../../crates/media-cache" }
 hyper-playback-json = { path = "../../../crates/playback-json" }
 hyper-playback-session = { path = "../../../crates/playback-session" }

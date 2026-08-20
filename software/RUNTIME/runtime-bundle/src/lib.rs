@@ -9,6 +9,8 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::Path;
 
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions};
 use hyper_project_loader::{
     PreparedProjectPlayback, ProjectPlaybackError, ProjectPlaybackLimits,
     prepare_verified_project_playback,
@@ -19,6 +21,7 @@ use hyper_project_model::{
 };
 use hyper_storage_engine::{
     RuntimeBundleManifestFile, StorageError, verify_runtime_bundle_project_with_limits,
+    verify_runtime_bundle_project_with_limits_at,
 };
 use semver::Version;
 use serde::Deserialize;
@@ -121,6 +124,61 @@ pub fn prepare_runtime_bundle(
     maximum_bundle_bytes: u64,
     playback_limits: ProjectPlaybackLimits,
 ) -> Result<VerifiedRuntimeBundle, RuntimeBundleError> {
+    prepare_runtime_bundle_inner(
+        RuntimeBundleRoot::Ambient(root.as_ref()),
+        runtime_version,
+        maximum_bundle_bytes,
+        playback_limits,
+    )
+}
+
+/// Verifies and prepares one Runtime bundle through an already retained
+/// non-link directory authority.
+///
+/// `root` is used only for diagnostics and project provenance. All bundle reads,
+/// verification, and unchanged confirmation use `root_dir` directly.
+///
+/// # Errors
+///
+/// Returns the same classified rejections as [`prepare_runtime_bundle`].
+pub fn prepare_runtime_bundle_at(
+    root: impl AsRef<Path>,
+    root_dir: Dir,
+    runtime_version: &str,
+    maximum_bundle_bytes: u64,
+    playback_limits: ProjectPlaybackLimits,
+) -> Result<VerifiedRuntimeBundle, RuntimeBundleError> {
+    prepare_runtime_bundle_inner(
+        RuntimeBundleRoot::Retained {
+            label: root.as_ref(),
+            directory: root_dir,
+        },
+        runtime_version,
+        maximum_bundle_bytes,
+        playback_limits,
+    )
+}
+
+enum RuntimeBundleRoot<'a> {
+    Ambient(&'a Path),
+    Retained { label: &'a Path, directory: Dir },
+}
+
+impl RuntimeBundleRoot<'_> {
+    fn read_manifest(&self, maximum_bundle_bytes: u64) -> Result<Vec<u8>, RuntimeBundleError> {
+        match self {
+            Self::Ambient(root) => read_manifest(root, maximum_bundle_bytes),
+            Self::Retained { directory, .. } => read_manifest_at(directory, maximum_bundle_bytes),
+        }
+    }
+}
+
+fn prepare_runtime_bundle_inner(
+    root: RuntimeBundleRoot<'_>,
+    runtime_version: &str,
+    maximum_bundle_bytes: u64,
+    playback_limits: ProjectPlaybackLimits,
+) -> Result<VerifiedRuntimeBundle, RuntimeBundleError> {
     if maximum_bundle_bytes == 0 {
         return Err(reject(
             RuntimeBundleErrorKind::BundleLimit,
@@ -132,7 +190,7 @@ pub fn prepare_runtime_bundle(
         message: "executing Runtime version is invalid".to_owned(),
         source: Some(Box::new(source)),
     })?;
-    let manifest_bytes = read_manifest(root.as_ref(), maximum_bundle_bytes)?;
+    let manifest_bytes = root.read_manifest(maximum_bundle_bytes)?;
     let value: Value =
         hyper_strict_json::parse(&manifest_bytes, MAX_MANIFEST_BYTES).map_err(|source| {
             RuntimeBundleError {
@@ -187,14 +245,23 @@ pub fn prepare_runtime_bundle(
     let package_limits = playback_limits
         .package_verification_limits()
         .map_err(playback_error)?;
-    let package = verify_runtime_bundle_project_with_limits(
-        root,
-        package_limits,
-        RuntimeBundleManifestFile {
-            byte_length: u64::try_from(manifest_bytes.len()).unwrap_or(u64::MAX),
-            sha256: bundle_sha256,
-        },
-    )
+    let runtime_manifest = RuntimeBundleManifestFile {
+        byte_length: u64::try_from(manifest_bytes.len()).unwrap_or(u64::MAX),
+        sha256: bundle_sha256,
+    };
+    let package = match root {
+        RuntimeBundleRoot::Ambient(root) => {
+            verify_runtime_bundle_project_with_limits(root, package_limits, runtime_manifest)
+        }
+        RuntimeBundleRoot::Retained { label, directory } => {
+            verify_runtime_bundle_project_with_limits_at(
+                label,
+                directory,
+                package_limits,
+                runtime_manifest,
+            )
+        }
+    }
     .map_err(storage_error)?;
     bind_project(
         &manifest,
@@ -246,6 +313,54 @@ fn read_manifest(root: &Path, maximum_bundle_bytes: u64) -> Result<Vec<u8>, Runt
     file.take(maximum.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|source| io_error("read runtime manifest", source))?;
+    if bytes.len() as u64 > maximum {
+        return Err(reject(
+            RuntimeBundleErrorKind::BundleLimit,
+            "runtime manifest grew beyond its byte limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_manifest_at(root: &Dir, maximum_bundle_bytes: u64) -> Result<Vec<u8>, RuntimeBundleError> {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = root
+        .open_with(MANIFEST_NAME, &options)
+        .map_err(|source| io_error("open retained runtime manifest", source))?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| io_error("inspect retained runtime manifest", source))?;
+    if !metadata.is_file() {
+        return Err(reject(
+            RuntimeBundleErrorKind::ManifestInvalid,
+            "runtime manifest must be a regular non-link file",
+        ));
+    }
+    let maximum = maximum_bundle_bytes.min(MAX_MANIFEST_BYTES as u64);
+    if metadata.len() > maximum {
+        return Err(reject(
+            RuntimeBundleErrorKind::BundleLimit,
+            "runtime manifest exceeds its byte limit",
+        ));
+    }
+    let capacity = usize::try_from(metadata.len()).map_err(|_| {
+        reject(
+            RuntimeBundleErrorKind::BundleLimit,
+            "runtime manifest cannot fit in memory",
+        )
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|_| {
+        reject(
+            RuntimeBundleErrorKind::BundleLimit,
+            "runtime manifest capacity is unavailable",
+        )
+    })?;
+    file.by_ref()
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_error("read retained runtime manifest", source))?;
     if bytes.len() as u64 > maximum {
         return Err(reject(
             RuntimeBundleErrorKind::BundleLimit,

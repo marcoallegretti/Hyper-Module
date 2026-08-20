@@ -3,12 +3,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hyper_audio_source::DecodeLimits;
+use hyper_fs_authority::open_syncable_directory_ambient;
 use hyper_media_cache::CacheLimits;
 use hyper_playback_json::LoaderLimits;
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::ProjectPlaybackLimits;
 use hyper_project_model::{AudioMediaType, UsbMode};
-use hyper_runtime_bundle::{RuntimeBundleErrorKind, prepare_runtime_bundle};
+use hyper_runtime_bundle::{
+    RuntimeBundleErrorKind, prepare_runtime_bundle, prepare_runtime_bundle_at,
+};
 use hyper_storage_engine::{ProjectCreationRequest, create_project, verify_project_package};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -134,6 +137,20 @@ fn prepares_a_contract_shaped_bundle_and_retains_its_identity() {
 
     assert_eq!(bundle.bundle_sha256(), &expected_sha256);
     assert_eq!(bundle.bundle_byte_length(), expected_byte_length);
+    assert_eq!(bundle.project().session().parts().0.track_count(), 1);
+    bundle.project().package().confirm_unchanged().unwrap();
+}
+
+#[test]
+fn retained_bundle_authority_survives_an_ambient_rename() {
+    let fixture = Fixture::new();
+    let retained = open_syncable_directory_ambient(&fixture.root).unwrap();
+    let moved = fixture.root.parent().unwrap().join("MovedRuntimeBundle");
+    fs::rename(&fixture.root, &moved).unwrap();
+
+    let bundle =
+        prepare_runtime_bundle_at(&fixture.root, retained, "0.1.0", 1 << 30, limits()).unwrap();
+
     assert_eq!(bundle.project().session().parts().0.track_count(), 1);
     bundle.project().package().confirm_unchanged().unwrap();
 }
