@@ -1640,6 +1640,26 @@ fn a_link_with_no_bindings_shows_nothing() {
 }
 
 #[test]
+fn a_link_that_has_released_its_bindings_stops_showing_anything() {
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+    let now = Rc::new(Cell::new(0_u64));
+    let (mut link, _driver) = connected_link(&mut host, display_descriptor(2, 4), &stop, &now);
+    assert!(
+        link.refresh_display(&mut host, now.get()) > 0,
+        "a bound link has something to show"
+    );
+
+    link.release(&mut host);
+
+    assert_eq!(
+        link.refresh_display(&mut host, now.get()),
+        0,
+        "the panel it was talking to is gone; the remembered descriptor is not permission to keep talking"
+    );
+}
+
+#[test]
 fn a_value_that_returns_to_where_it_was_is_shown_again() {
     let stop = AtomicBool::new(false);
     let mut host = Host::new(CHANNELS);
