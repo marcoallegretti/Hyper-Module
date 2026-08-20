@@ -25,7 +25,7 @@ use hyper_runtime_host::{
     ArgumentError, DEFAULT_GAIN_STEP_MILLIONTHS, FEEDBACK_PER_TICK, PANEL_READ_TIMEOUT,
     PANEL_REFUSALS_PER_TICK, PanelClosure, PanelHost, PanelLink, PanelNotice, RuntimeArguments,
     ServeError, default_layout, prepare_panel_stream, refuse_waiting_panels, serve_panel,
-    serve_panels,
+    serve_panels, serve_panels_with_idle,
 };
 
 const CHANNELS: usize = 3;
@@ -153,6 +153,7 @@ struct Host {
     /// Answers with a display even when no panel is connected. The link must
     /// not rely on the owner's discipline for whether it is safe to talk.
     displays_regardless: bool,
+    idle_turns: usize,
 }
 
 impl Host {
@@ -165,12 +166,37 @@ impl Host {
             controls_stuck: false,
             disconnects: 0,
             displays_regardless: false,
+            idle_turns: 0,
         }
     }
 
     fn commands(&self) -> &[RuntimeControlCommand] {
         &self.runtime.sink().commands
     }
+}
+
+#[test]
+fn the_accept_loop_gives_bounded_owner_work_the_mutable_host_while_idle() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = AtomicBool::new(false);
+    let mut host = Host::new(CHANNELS);
+
+    serve_panels_with_idle(
+        &listener,
+        &mut host,
+        config(),
+        &stop,
+        || 0,
+        |_| panic!("there is no panel to report"),
+        |host| {
+            host.idle_turns += 1;
+            stop.store(true, Ordering::Release);
+        },
+    )
+    .unwrap();
+
+    assert_eq!(host.idle_turns, 1, "one finite owner turn stops the loop");
 }
 
 impl PanelHost for Host {
@@ -937,10 +963,12 @@ fn arguments_name_a_deployment_target_and_optionally_a_panel_address() {
         std::path::Path::new("/deployments/demo")
     );
     assert_eq!(parsed.panel_listen(), None);
+    assert!(!parsed.operator_ui());
 
     let parsed = RuntimeArguments::parse([
         "--panel-listen".to_owned(),
         "127.0.0.1:9000".to_owned(),
+        "--operator-ui".to_owned(),
         "/deployments/demo".to_owned(),
     ])
     .unwrap();
@@ -952,6 +980,7 @@ fn arguments_name_a_deployment_target_and_optionally_a_panel_address() {
         parsed.panel_listen(),
         Some("127.0.0.1:9000".parse::<SocketAddr>().unwrap())
     );
+    assert!(parsed.operator_ui());
 }
 
 #[test]
@@ -988,6 +1017,14 @@ fn a_malformed_argument_list_is_reported_rather_than_assumed() {
             "127.0.0.1:2".to_owned(),
         ]),
         Err(ArgumentError::Repeated("--panel-listen"))
+    );
+    assert_eq!(
+        RuntimeArguments::parse([
+            "one".to_owned(),
+            "--operator-ui".to_owned(),
+            "--operator-ui".to_owned(),
+        ]),
+        Err(ArgumentError::Repeated("--operator-ui"))
     );
 }
 

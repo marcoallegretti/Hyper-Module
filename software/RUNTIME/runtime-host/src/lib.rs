@@ -80,6 +80,7 @@ pub const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub struct RuntimeArguments {
     deployment_root: PathBuf,
     panel_listen: Option<SocketAddr>,
+    operator_ui: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,9 +126,16 @@ impl RuntimeArguments {
     {
         let mut deployment_root = None;
         let mut panel_listen = None;
+        let mut operator_ui = false;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
+                "--operator-ui" => {
+                    if operator_ui {
+                        return Err(ArgumentError::Repeated("--operator-ui"));
+                    }
+                    operator_ui = true;
+                }
                 "--panel-listen" => {
                     if panel_listen.is_some() {
                         return Err(ArgumentError::Repeated("--panel-listen"));
@@ -155,6 +163,7 @@ impl RuntimeArguments {
         Ok(Self {
             deployment_root: deployment_root.ok_or(ArgumentError::MissingDeploymentRoot)?,
             panel_listen,
+            operator_ui,
         })
     }
 
@@ -166,6 +175,11 @@ impl RuntimeArguments {
     #[must_use]
     pub const fn panel_listen(&self) -> Option<SocketAddr> {
         self.panel_listen
+    }
+
+    #[must_use]
+    pub const fn operator_ui(&self) -> bool {
+        self.operator_ui
     }
 }
 
@@ -504,7 +518,7 @@ pub fn serve_panel<S, H, C, I>(
     config: LinkConfig,
     session_id: u64,
     stop: &AtomicBool,
-    mut clock: C,
+    clock: C,
     mut while_idle: I,
 ) -> (io::Result<PanelClosure>, Vec<PanelNotice>)
 where
@@ -512,6 +526,26 @@ where
     H: PanelHost,
     C: FnMut() -> u64,
     I: FnMut(),
+{
+    serve_panel_with_host_idle(stream, host, config, session_id, stop, clock, |_| {
+        while_idle();
+    })
+}
+
+fn serve_panel_with_host_idle<S, H, C, I>(
+    stream: &mut S,
+    host: &mut H,
+    config: LinkConfig,
+    session_id: u64,
+    stop: &AtomicBool,
+    mut clock: C,
+    mut while_idle: I,
+) -> (io::Result<PanelClosure>, Vec<PanelNotice>)
+where
+    S: Read + Write,
+    H: PanelHost,
+    C: FnMut() -> u64,
+    I: FnMut(&mut H),
 {
     let mut link = PanelLink::new(config);
     let outcome = drive_panel(
@@ -543,7 +577,7 @@ where
     S: Read + Write,
     H: PanelHost,
     C: FnMut() -> u64,
-    I: FnMut(),
+    I: FnMut(&mut H),
 {
     if link.start(session_id, clock()).is_err() {
         return Ok(PanelClosure::LinkLost);
@@ -567,7 +601,7 @@ where
             // A quiet moment is the only safe place to do anything other than
             // serve this panel, so it is where a second one gets turned away.
             Err(error) if is_quiet(error.kind()) => {
-                while_idle();
+                while_idle(host);
                 link.refresh_display(host, clock());
                 0
             }
@@ -682,19 +716,47 @@ pub fn serve_panels<H, C, R>(
     host: &mut H,
     config: LinkConfig,
     stop: &AtomicBool,
-    mut clock: C,
-    mut served: R,
+    clock: C,
+    served: R,
 ) -> Result<(), ServeError>
 where
     H: PanelHost,
     C: FnMut() -> u64,
     R: FnMut(&ServedPanel),
 {
+    serve_panels_with_idle(listener, host, config, stop, clock, served, |_| {})
+}
+
+/// Accepts and serves panels while giving other bounded owner commands one
+/// turn whenever the socket service is idle.
+///
+/// The callback runs with the sole mutable host authority. It must perform
+/// finite non-blocking work so panel upkeep and shutdown remain bounded.
+///
+/// # Errors
+///
+/// Returns the same terminal service failures as [`serve_panels`].
+pub fn serve_panels_with_idle<H, C, R, I>(
+    listener: &TcpListener,
+    host: &mut H,
+    config: LinkConfig,
+    stop: &AtomicBool,
+    mut clock: C,
+    mut served: R,
+    mut while_idle: I,
+) -> Result<(), ServeError>
+where
+    H: PanelHost,
+    C: FnMut() -> u64,
+    R: FnMut(&ServedPanel),
+    I: FnMut(&mut H),
+{
     let mut session_id = 1_u64;
     while !stop.load(Ordering::Acquire) {
         let (mut stream, peer) = match listener.accept() {
             Ok(accepted) => accepted,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                while_idle(host);
                 std::thread::sleep(ACCEPT_POLL_INTERVAL);
                 continue;
             }
@@ -706,15 +768,16 @@ where
         // same panel reconnecting after a reset.
         let _ = refuse_waiting_panels(listener);
         let (outcome, notices) = match prepare_panel_stream(&stream) {
-            Ok(()) => serve_panel(
+            Ok(()) => serve_panel_with_host_idle(
                 &mut stream,
                 host,
                 config,
                 session_id,
                 stop,
                 &mut clock,
-                || {
+                |host| {
                     let _ = refuse_waiting_panels(listener);
+                    while_idle(host);
                 },
             ),
             Err(error) => (Err(error), Vec::new()),
