@@ -92,23 +92,33 @@ fn run() -> Result<(), String> {
         format!("{error}\nusage: hyper-runtime <runtime-bundle-directory> [--panel-listen ADDRESS]")
     })?;
 
-    let bundle = prepare_runtime_bundle(
-        arguments.bundle_root(),
-        env!("CARGO_PKG_VERSION"),
-        MAX_RUNTIME_BUNDLE_BYTES,
-        limits()?,
-    )
-    .map_err(|error| {
-        format!(
-            "{} could not be verified and prepared: {error}",
-            arguments.bundle_root().display()
-        )
-    })?;
-    let bundle_identity = hex_digest(bundle.bundle_sha256());
-    let output = DesktopOutputConfig::try_new(SAMPLE_RATE_HZ, MAXIMUM_BLOCK_FRAMES)
-        .map_err(|error| format!("output configuration is invalid: {error}"))?;
-    let session = DesktopPlaybackSession::start_project(output, bundle.into_project())
-        .map_err(|error| format!("verified bundle could not be hosted: {error}"))?;
+    let (bundle_identity, session) = prepare_output_and_host(
+        || {
+            let bundle = prepare_runtime_bundle(
+                arguments.bundle_root(),
+                env!("CARGO_PKG_VERSION"),
+                MAX_RUNTIME_BUNDLE_BYTES,
+                limits()?,
+            )
+            .map_err(|error| {
+                format!(
+                    "{} could not be verified and prepared: {}",
+                    arguments.bundle_root().display(),
+                    format_error_chain(&error)
+                )
+            })?;
+            Ok((hex_digest(bundle.bundle_sha256()), bundle.into_project()))
+        },
+        || {
+            DesktopOutputConfig::try_new(SAMPLE_RATE_HZ, MAXIMUM_BLOCK_FRAMES)
+                .map_err(|error| format!("output configuration is invalid: {error}"))
+        },
+        |output, (identity, project)| {
+            DesktopPlaybackSession::start_project(output, project)
+                .map(|session| (identity, session))
+                .map_err(|error| format!("verified bundle could not be hosted: {error}"))
+        },
+    )?;
     let mut host = SessionHost(session);
     println!(
         "hosting bundle {bundle_identity} from {} with {} mixer channels",
@@ -169,6 +179,29 @@ fn run() -> Result<(), String> {
 
     println!("stopping");
     Ok(())
+}
+
+/// Enforces the process startup boundary: artifact acceptance and semantic
+/// preparation finish before the native output owner can be constructed.
+fn prepare_output_and_host<P, O, S>(
+    prepare: impl FnOnce() -> Result<P, String>,
+    open_output: impl FnOnce() -> Result<O, String>,
+    host: impl FnOnce(O, P) -> Result<S, String>,
+) -> Result<S, String> {
+    let prepared = prepare()?;
+    let output = open_output()?;
+    host(output, prepared)
+}
+
+fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        use core::fmt::Write;
+        write!(&mut rendered, ": {cause}").expect("writing to a string cannot fail");
+        source = cause.source();
+    }
+    rendered
 }
 
 /// Receives the process-level events that follow the panel service ending.
@@ -302,7 +335,7 @@ fn hex_digest(value: &[u8; 32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     use super::*;
 
@@ -338,6 +371,78 @@ mod tests {
         fn project_still_hosted(&mut self) {
             self.events.push(Reported::ProjectStillHosted);
         }
+    }
+
+    #[test]
+    fn rejected_bundle_preparation_cannot_open_output() {
+        let events = RefCell::new(Vec::new());
+
+        let result = prepare_output_and_host(
+            || {
+                events.borrow_mut().push("prepare");
+                Err::<(), _>("bundle rejected".to_owned())
+            },
+            || {
+                events.borrow_mut().push("output");
+                Ok(())
+            },
+            |(), ()| {
+                events.borrow_mut().push("host");
+                Ok(())
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), "bundle rejected");
+        assert_eq!(*events.borrow(), ["prepare"]);
+    }
+
+    #[test]
+    fn successful_startup_prepares_then_opens_output_then_hosts() {
+        let events = RefCell::new(Vec::new());
+
+        prepare_output_and_host(
+            || {
+                events.borrow_mut().push("prepare");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("output");
+                Ok(())
+            },
+            |(), ()| {
+                events.borrow_mut().push("host");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*events.borrow(), ["prepare", "output", "host"]);
+    }
+
+    #[test]
+    fn startup_diagnostics_retain_the_bundle_rejection_cause() {
+        let missing = std::env::temp_dir().join(format!(
+            "hyper-runtime-missing-bundle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let error = prepare_runtime_bundle(
+            missing,
+            env!("CARGO_PKG_VERSION"),
+            MAX_RUNTIME_BUNDLE_BYTES,
+            limits().unwrap(),
+        )
+        .unwrap_err();
+
+        let diagnostic = format_error_chain(&error);
+        assert!(diagnostic.starts_with("inspect runtime manifest: "));
+        assert!(
+            diagnostic.len() > "inspect runtime manifest: ".len(),
+            "the operating-system cause remains visible"
+        );
     }
 
     #[test]
