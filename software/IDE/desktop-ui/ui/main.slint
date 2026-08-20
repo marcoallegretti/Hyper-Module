@@ -43,6 +43,7 @@ export enum AppMode {
     duplicating-scene,
     changing-scene-activation,
     creating-clip,
+    importing-audio,
     preparing-preview,
     previewing,
     saving,
@@ -264,6 +265,7 @@ export global IdeActions {
     callback abort-recording();
     callback toggle-take-preview(int);
     callback create-audio-clip-from-take(int, string);
+    callback choose-audio-import(int);
     callback preview-gain(float);
     callback preview-mute();
     callback close-project();
@@ -550,6 +552,8 @@ export component MainWindow inherits Window {
     in property <[ArrangementSceneLaunchRow]> arrangement-scene-launches: [];
     in property <[string]> scene-names: [];
     in property <[ClipRow]> audio-clips: [];
+    in property <[string]> audio-import-track-names: [];
+    in-out property <int> selected-audio-import-track-index: 0;
     in property <string> arrangement-span-clock: "—";
     in property <bool> preview-active: false;
     in property <float> preview-gain-percent: 25;
@@ -655,6 +659,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.changing-clip-reverse ? "◌  UPDATING DIRECTION"
                         : root.app-mode == AppMode.changing-clip-source ? "◌  SLIPPING SOURCE"
                         : root.app-mode == AppMode.creating-clip ? "◌  CREATING CLIP"
+                        : root.app-mode == AppMode.importing-audio ? "◌  IMPORTING AUDIO"
                         : root.app-mode == AppMode.selecting ? "◌  SELECTING"
                         : root.app-mode == AppMode.closing ? "◌  CLOSING"
                         : root.app-mode == AppMode.closed ? "●  READY"
@@ -3008,28 +3013,50 @@ export component MainWindow inherits Window {
                         padding: 16px;
                         spacing: 10px;
 
-                        HorizontalLayout {
-                            height: 48px;
-                            VerticalLayout {
-                                Text { text: "AUDIO CLIPS"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: "Reusable verified source views · exact placement · global activation, direction, gain, loop, and linear fades"; color: #aebccc; font-size: 12px; }
+                        VerticalLayout {
+                            height: 76px;
+                            spacing: 6px;
+                            HorizontalLayout {
+                                height: 30px;
+                                Text { text: "AUDIO CLIPS"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; vertical-alignment: center; }
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                Button {
+                                    text: "Performance";
+                                    clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.clip-source-slip-visible = false; root.add-arrangement-placement-visible = false; }
+                                }
+                                Button {
+                                    text: "Mixer";
+                                    enabled: root.app-mode == AppMode.running;
+                                    clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.clip-source-slip-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
+                                }
                             }
-                            Rectangle { horizontal-stretch: 1; background: transparent; }
-                            Button {
-                                text: "Performance";
-                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.clip-source-slip-visible = false; root.add-arrangement-placement-visible = false; }
-                            }
-                            Button {
-                                text: "Mixer";
-                                enabled: root.app-mode == AppMode.running;
-                                clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.clip-source-slip-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
+                            HorizontalLayout {
+                                height: 34px;
+                                Text { text: "Reusable verified source views · import creates no arrangement placement"; color: #aebccc; font-size: 11px; vertical-alignment: center; }
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                Text { text: "DESTINATION"; color: #65758a; font-size: 9px; vertical-alignment: center; }
+                                ComboBox {
+                                    width: 150px;
+                                    model: root.audio-import-track-names;
+                                    current-index <=> root.selected-audio-import-track-index;
+                                    enabled: root.app-mode == AppMode.running && root.audio-import-track-names.length > 0;
+                                    accessible-label: "Destination audio track for imported files";
+                                }
+                                Button {
+                                    width: 112px;
+                                    text: root.app-mode == AppMode.importing-audio ? "Importing…" : "Import audio…";
+                                    enabled: root.app-mode == AppMode.running
+                                        && root.selected-audio-import-track-index >= 0
+                                        && root.selected-audio-import-track-index < root.audio-import-track-names.length;
+                                    clicked => { IdeActions.choose-audio-import(root.selected-audio-import-track-index); }
+                                }
                             }
                         }
 
                         Rectangle { height: 1px; background: #27313d; }
 
                         if root.audio-clips.length == 0 : Text {
-                            text: "This project contains no audio clips.";
+                            text: "This project contains no audio clips. Import WAV or FLAC into an audio track to create reusable clips.";
                             color: #8fa0b4;
                             font-size: 13px;
                             horizontal-alignment: center;
@@ -3197,7 +3224,7 @@ export component MainWindow inherits Window {
                         }
 
                         Text {
-                            text: "Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Place creates one full-length non-ripple reference. Activation, direction, source slip, gain, loop, and fades affect every existing reference. Source slip keeps duration and placements fixed; reverse does not reverse transport or rewrite media.";
+                            text: "Import copies WAV or FLAC into project-owned 48 kHz media and creates one full-file reusable clip per file; it creates no arrangement placement. Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Place creates one full-length non-ripple reference. Activation, direction, source slip, gain, loop, and fades affect every existing reference.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;

@@ -65,6 +65,7 @@ type InputRoutes = Rc<RefCell<Vec<InputRoute>>>;
 type RecentProjectRoutes = Rc<RefCell<Vec<PathBuf>>>;
 type RecordingRoutes = Rc<RefCell<Vec<usize>>>;
 type TakeRoutes = Rc<RefCell<Vec<TakeRoute>>>;
+type AudioImportRoutes = Rc<RefCell<Vec<String>>>;
 type ProjectUiStateCell = Rc<ProjectUiState>;
 
 #[derive(Clone, Default)]
@@ -74,6 +75,7 @@ struct UiRoutes {
     recent_projects: RecentProjectRoutes,
     recordings: RecordingRoutes,
     takes: TakeRoutes,
+    audio_imports: AudioImportRoutes,
 }
 
 #[derive(Default)]
@@ -389,6 +391,81 @@ fn bind_callbacks(
     bind_monitoring_callbacks(ui, worker);
     bind_recording_callbacks(ui, worker, &routes.recordings);
     bind_audio_preview_callbacks(ui, worker, &routes.takes);
+    bind_audio_import_callback(ui, worker, &routes.audio_imports);
+}
+
+fn bind_audio_import_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    routes: &AudioImportRoutes,
+) {
+    bind_audio_import_callback_with(ui, worker, routes, |weak, worker, track_id| {
+        let weak_for_dialog = weak.clone();
+        let spawn_result = slint::spawn_local(async move {
+            let selection = rfd::AsyncFileDialog::new()
+                .set_title("Import audio into project")
+                .add_filter("WAV and FLAC audio", &["wav", "flac"])
+                .pick_files()
+                .await;
+            let Some(ui) = weak_for_dialog.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::ImportingAudio {
+                return;
+            }
+            let Some(selection) = selection else {
+                ui.set_app_mode(AppMode::Running);
+                ui.set_status_text("Audio import cancelled".into());
+                return;
+            };
+            let paths = selection
+                .into_iter()
+                .map(|file| file.path().to_path_buf())
+                .collect();
+            submit_to_ui(
+                &ui,
+                &worker,
+                IdeWorkerCommand::ImportAudio { paths, track_id },
+            );
+        });
+        if spawn_result.is_err()
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Audio file selection is unavailable".into());
+        }
+    });
+}
+
+fn bind_audio_import_callback_with(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    routes: &AudioImportRoutes,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell, String) + 'static,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    let routes = Rc::clone(routes);
+    actions.on_choose_audio_import(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running {
+            return;
+        }
+        let Some(track_id) = usize::try_from(index)
+            .ok()
+            .and_then(|index| routes.borrow().get(index).cloned())
+        else {
+            ui.set_error_text("Audio import destination is no longer available".into());
+            return;
+        };
+        ui.set_app_mode(AppMode::ImportingAudio);
+        ui.set_status_text("Waiting for WAV or FLAC files…".into());
+        ui.set_error_text(SharedString::default());
+        choose(weak.clone(), Rc::clone(&worker), track_id);
+    });
 }
 
 fn bind_project_callbacks(
@@ -3093,6 +3170,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::RemoveAudioTrack => AppMode::RemovingTrack,
         IdeWorkerCommandKind::RenameAudioTrack => AppMode::RenamingTrack,
         IdeWorkerCommandKind::SetAudioTrackActive => AppMode::ChangingTrackActivation,
+        IdeWorkerCommandKind::ImportAudio => AppMode::ImportingAudio,
         IdeWorkerCommandKind::SetArrangementPlacementActive => {
             AppMode::ChangingArrangementActivation
         }
@@ -3207,6 +3285,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetAudioTrackActive => {
             "Preserving mixer state, updating the audio track, and reopening project…"
+        }
+        IdeWorkerCommandKind::ImportAudio => {
+            "Preserving mixer state, importing project-owned audio, and reopening project…"
         }
         IdeWorkerCommandKind::SetArrangementPlacementActive => {
             "Preserving mixer state, updating the arrangement placement, and reopening project…"
@@ -3333,6 +3414,9 @@ fn apply_event(
                 snapshot.inputs(),
                 snapshot.input_selection(),
             );
+            routes.audio_imports.borrow_mut().clear();
+            ui.set_audio_import_track_names(ModelRc::default());
+            ui.set_selected_audio_import_track_index(-1);
             reset_project(ui, &routes.recordings, &routes.takes, project_state);
             ui.set_output_test_confirming(false);
             let mode = mode_after_closed_event(ui.get_app_mode());
@@ -3349,6 +3433,7 @@ fn apply_event(
             ui,
             &routes.recordings,
             &routes.takes,
+            &routes.audio_imports,
             project_state,
             &observation,
         ),
@@ -3403,6 +3488,23 @@ fn apply_event(
         event @ (IdeWorkerEvent::AudioTrackActivationChanged { .. }
         | IdeWorkerEvent::AudioTrackActivationChanging { .. }) => {
             apply_audio_track_activation_event(ui, &event);
+        }
+        IdeWorkerEvent::AudioImporting { files } => {
+            ui.set_app_mode(AppMode::ImportingAudio);
+            ui.set_status_text(format!("Importing {files} audio files…").into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioImported(outcome) => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text(
+                format!(
+                    "Imported {} audio files in project revision {}",
+                    outcome.imported(),
+                    outcome.final_revision()
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
         }
         event @ (IdeWorkerEvent::ArrangementPlacementActivationChanged { .. }
         | IdeWorkerEvent::ArrangementPlacementActivationChanging { .. }) => {
@@ -5044,6 +5146,7 @@ fn apply_running_event(
     ui: &MainWindow,
     recording_routes: &RecordingRoutes,
     take_routes: &TakeRoutes,
+    audio_import_routes: &AudioImportRoutes,
     project_state: &ProjectUiStateCell,
     observation: &IdeRunningObservation,
 ) {
@@ -5059,6 +5162,7 @@ fn apply_running_event(
     let scenes_changed = set_observed_scenes(ui, project_state, observation);
     apply_mixer_observation(ui, observation);
     set_recording_targets(ui, recording_routes, observation.mixer_channels());
+    set_audio_import_targets(ui, audio_import_routes, observation.mixer_channels());
     set_recording_takes(ui, take_routes, observation);
     set_playback_extent(ui, project_state, observation);
     set_tempo_and_loop(ui, project_state, observation);
@@ -5694,6 +5798,33 @@ fn set_recording_targets(
     ui.set_selected_recording_target_index(i32::try_from(selected).unwrap_or(-1));
 }
 
+fn set_audio_import_targets(
+    ui: &MainWindow,
+    routes: &AudioImportRoutes,
+    channels: &[IdeMixerChannel],
+) {
+    let previous = usize::try_from(ui.get_selected_audio_import_track_index())
+        .ok()
+        .and_then(|index| routes.borrow().get(index).cloned());
+    let mut next_routes = Vec::new();
+    let mut names = Vec::new();
+    for channel in channels {
+        if channel.kind() == IdeMixerChannelKind::Audio {
+            next_routes.push(channel.id().to_owned());
+            names.push(SharedString::from(channel.name()));
+        }
+    }
+    let selected = previous
+        .as_ref()
+        .and_then(|previous| next_routes.iter().position(|route| route == previous))
+        .or_else(|| (!next_routes.is_empty()).then_some(0));
+    *routes.borrow_mut() = next_routes;
+    ui.set_audio_import_track_names(ModelRc::from(Rc::new(VecModel::from(names))));
+    ui.set_selected_audio_import_track_index(
+        selected.and_then(|index| i32::try_from(index).ok()).unwrap_or(-1),
+    );
+}
+
 fn apply_mixer_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
     set_mixer(ui, observation.mixer_channels());
     if let Some(main) = observation.mixer_main() {
@@ -5998,6 +6129,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         {
             AppMode::Running
         }
+        IdeWorkerCommandKind::ImportAudio if current == AppMode::ImportingAudio => AppMode::Running,
         IdeWorkerCommandKind::SetArrangementPlacementActive
             if current == AppMode::ChangingArrangementActivation =>
         {
@@ -11177,6 +11309,7 @@ mod tests {
             MAX_IDE_SCENES
         );
         assert_recent_project_window_contract(&ui);
+        assert_audio_import_window_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);
         ui.set_status_text("Choose a Runtime destination".into());
         ui.set_error_text("retained message".into());
@@ -11354,6 +11487,68 @@ mod tests {
         assert_eq!(ui.get_project_location(), "retained");
 
         std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    fn assert_audio_import_window_contract(ui: &MainWindow) {
+        let routes: AudioImportRoutes = Rc::default();
+        let channels = [
+            IdeMixerChannel::for_test("track-a", "Audio A", IdeMixerChannelKind::Audio),
+            IdeMixerChannel::for_test("bus-a", "Group A", IdeMixerChannelKind::Group),
+            IdeMixerChannel::for_test("track-b", "Audio B", IdeMixerChannelKind::Audio),
+        ];
+        set_audio_import_targets(ui, &routes, &channels);
+        let names = ui.get_audio_import_track_names();
+        assert_eq!(names.row_count(), 2);
+        assert_eq!(names.row_data(0).unwrap(), "Audio A");
+        assert_eq!(names.row_data(1).unwrap(), "Audio B");
+        assert_eq!(routes.borrow().as_slice(), ["track-a", "track-b"]);
+
+        let chosen = Rc::new(RefCell::new(Vec::new()));
+        let chosen_by_callback = Rc::clone(&chosen);
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        bind_audio_import_callback_with(
+            ui,
+            &worker,
+            &routes,
+            move |_, _, track_id| chosen_by_callback.borrow_mut().push(track_id),
+        );
+        ui.set_project_history_warning("retained history warning".into());
+        ui.set_app_mode(AppMode::Running);
+        ui.set_error_text("stale error".into());
+        ui.global::<IdeActions>().invoke_choose_audio_import(1);
+        assert_eq!(chosen.borrow().as_slice(), ["track-b"]);
+        assert_eq!(ui.get_app_mode(), AppMode::ImportingAudio);
+        assert!(ui.get_error_text().is_empty());
+        assert_eq!(ui.get_project_history_warning(), "retained history warning");
+
+        ui.set_app_mode(AppMode::Closed);
+        ui.global::<IdeActions>().invoke_choose_audio_import(0);
+        assert_eq!(chosen.borrow().len(), 1, "Closed mode owns no import action");
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>().invoke_choose_audio_import(-1);
+        assert!(ui.get_error_text().contains("no longer available"));
+        assert_eq!(chosen.borrow().len(), 1);
+
+        routes.borrow_mut().truncate(1);
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>().invoke_choose_audio_import(1);
+        assert!(ui.get_error_text().contains("no longer available"));
+        assert_eq!(chosen.borrow().len(), 1);
+        assert_eq!(ui.get_project_history_warning(), "retained history warning");
+
+        *routes.borrow_mut() = vec!["track-a".to_owned(), "track-b".to_owned()];
+        ui.set_selected_audio_import_track_index(1);
+        set_audio_import_targets(
+            ui,
+            &routes,
+            &[
+                IdeMixerChannel::for_test("track-b", "Audio B", IdeMixerChannelKind::Audio),
+                IdeMixerChannel::for_test("track-a", "Audio A", IdeMixerChannelKind::Audio),
+            ],
+        );
+        assert_eq!(ui.get_selected_audio_import_track_index(), 0);
     }
 
     fn assert_committed_audio_clip_source_slip_warning(ui: &MainWindow) {
