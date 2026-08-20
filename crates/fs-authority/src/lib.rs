@@ -377,10 +377,10 @@ fn read_stable_file_snapshot_observed(
     let first = read_bounded(&mut file, before.len(), maximum_bytes)?;
     after_first_read()?;
     file.seek(SeekFrom::Start(0))?;
-    let second = read_bounded(&mut file, before.len(), maximum_bytes)?;
+    let second_matches = read_matches(&mut file, &first)?;
     let after = file.metadata()?;
     let republished = directory.symlink_metadata(name)?;
-    if first != second
+    if !second_matches
         || !after.is_file()
         || after.len() != first.len() as u64
         || identity(&after) != published_identity
@@ -399,6 +399,21 @@ fn read_stable_file_snapshot_observed(
         },
         bytes: first,
     })
+}
+
+fn read_matches(file: &mut File, expected: &[u8]) -> io::Result<bool> {
+    let mut offset = 0;
+    let mut buffer = [0_u8; 8 * 1_024];
+    while offset < expected.len() {
+        let count = (expected.len() - offset).min(buffer.len());
+        file.read_exact(&mut buffer[..count])?;
+        if buffer[..count] != expected[offset..offset + count] {
+            return Ok(false);
+        }
+        offset += count;
+    }
+    let mut trailing = [0_u8; 1];
+    Ok(file.read(&mut trailing)? == 0)
 }
 
 fn open_absolute_parent(path: &Path) -> io::Result<(Dir, PathBuf)> {

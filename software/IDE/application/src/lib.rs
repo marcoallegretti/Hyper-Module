@@ -6878,6 +6878,11 @@ impl RunningDesktopIdeApplication {
             prepared.package().manifest().sample_rate_hz(),
             u64::try_from(limits.session.media_cache.max_frames_per_asset)
                 .map_err(|_| IdeAudioImportError::CapacityUnavailable)?,
+            limits
+                .audio
+                .max_decoded_sample_bytes()
+                .checked_mul(3)
+                .ok_or(IdeAudioImportError::CapacityUnavailable)?,
         )
         .map_err(IdeAudioImportError::Source)?;
         let decoded_bytes = converted

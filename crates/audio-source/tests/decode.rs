@@ -263,7 +263,7 @@ fn source_rate_decode_resample_and_float_wav_round_trip() {
     assert_eq!(decoded.sample_rate_hz(), 44_100);
     assert_eq!(decoded.frame_count(), 441);
 
-    let converted = resample_audio(decoded, 48_000, 500).unwrap();
+    let converted = resample_audio(decoded, 48_000, 500, 1_000_000).unwrap();
     assert_eq!(converted.sample_rate_hz(), 48_000);
     assert_eq!(converted.channels(), 1);
     assert_eq!(converted.frame_count(), 480);
@@ -292,22 +292,54 @@ fn source_rate_decode_resample_and_float_wav_round_trip() {
 #[test]
 fn same_rate_conversion_is_exact_and_output_bound_is_enforced() {
     let audio = DecodedAudio::from_stereo(48_000, vec![0.25, -0.5], vec![-0.25, 0.5]).unwrap();
-    assert_eq!(resample_audio(audio.clone(), 48_000, 2).unwrap(), audio);
+    assert_eq!(
+        resample_audio(audio.clone(), 48_000, 2, 1_000_000).unwrap(),
+        audio
+    );
     assert!(matches!(
-        resample_audio(audio.clone(), 48_000, 1),
+        resample_audio(audio.clone(), 48_000, 1, 1_000_000),
         Err(DecodeError::OutputFrameLimitExceeded {
             actual: 2,
             maximum: 1
         })
     ));
 
-    let upsampled = resample_audio(audio, 96_000, 3);
+    let upsampled = resample_audio(audio, 96_000, 3, 1_000_000);
     assert!(matches!(
         upsampled,
         Err(DecodeError::OutputFrameLimitExceeded {
             actual: 4,
             maximum: 3
         })
+    ));
+}
+
+#[test]
+fn stereo_resampling_obeys_the_exact_checked_buffer_budget() {
+    let left: Vec<f32> = (0..441)
+        .map(|frame| if frame == 100 { 0.75 } else { 0.0 })
+        .collect();
+    let right: Vec<f32> = (0..441)
+        .map(|frame| if frame == 300 { -0.5 } else { 0.0 })
+        .collect();
+    let audio = DecodedAudio::from_stereo(44_100, left, right).unwrap();
+    let required = match resample_audio(audio.clone(), 48_000, 500, 1) {
+        Err(DecodeError::ResamplingByteLimitExceeded {
+            required,
+            maximum: 1,
+        }) => required,
+        result => panic!("unexpected resampling budget result: {result:?}"),
+    };
+
+    let converted = resample_audio(audio.clone(), 48_000, 500, required).unwrap();
+    assert_eq!(converted.frame_count(), 480);
+    assert_ne!(converted.plane(0).unwrap(), converted.plane(1).unwrap());
+    assert!(matches!(
+        resample_audio(audio, 48_000, 500, required - 1),
+        Err(DecodeError::ResamplingByteLimitExceeded {
+            required: actual,
+            maximum: rejected,
+        }) if actual == required && rejected == required - 1
     ));
 }
 

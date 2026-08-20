@@ -7,7 +7,6 @@ use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use rubato::audioadapter::Adapter;
 use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::{Async, FixedAsync, Resampler, SincInterpolationParameters};
 use symphonia::core::audio::{Channels, SampleBuffer};
@@ -186,6 +185,7 @@ pub enum DecodeError {
     Resampling(String),
     Wave(hound::Error),
     OutputFrameLimitExceeded { actual: u64, maximum: u64 },
+    ResamplingByteLimitExceeded { required: usize, maximum: usize },
 }
 
 impl fmt::Display for DecodeError {
@@ -265,6 +265,10 @@ impl fmt::Display for DecodeError {
             Self::OutputFrameLimitExceeded { actual, maximum } => write!(
                 formatter,
                 "resampled audio has {actual} frames; maximum is {maximum}"
+            ),
+            Self::ResamplingByteLimitExceeded { required, maximum } => write!(
+                formatter,
+                "resampling buffers require {required} bytes; maximum is {maximum}"
             ),
         }
     }
@@ -450,8 +454,12 @@ pub fn resample_audio(
     audio: DecodedAudio,
     target_sample_rate_hz: u32,
     maximum_output_frames: u64,
+    maximum_resampling_bytes: usize,
 ) -> Result<DecodedAudio, DecodeError> {
-    if target_sample_rate_hz == 0 || maximum_output_frames == 0 {
+    if target_sample_rate_hz == 0
+        || maximum_output_frames == 0
+        || maximum_resampling_bytes == 0
+    {
         return Err(DecodeError::InvalidLimits);
     }
     if audio.sample_rate_hz == target_sample_rate_hz {
@@ -465,11 +473,12 @@ pub fn resample_audio(
         return Ok(audio);
     }
     let input_frames = audio.frame_count();
+    let input_sample_rate_hz = audio.sample_rate_hz;
     let estimated_frames = u128::try_from(input_frames)
         .ok()
         .and_then(|frames| frames.checked_mul(u128::from(target_sample_rate_hz)))
-        .and_then(|scaled| scaled.checked_add(u128::from(audio.sample_rate_hz - 1)))
-        .map(|scaled| scaled / u128::from(audio.sample_rate_hz))
+        .and_then(|scaled| scaled.checked_add(u128::from(input_sample_rate_hz - 1)))
+        .map(|scaled| scaled / u128::from(input_sample_rate_hz))
         .ok_or(DecodeError::CapacityUnavailable)?;
     if estimated_frames > u128::from(maximum_output_frames) {
         return Err(DecodeError::OutputFrameLimitExceeded {
@@ -484,15 +493,14 @@ pub fn resample_audio(
     planes
         .try_reserve_exact(channels)
         .map_err(|_| DecodeError::CapacityUnavailable)?;
-    for channel in 0..channels {
-        planes.push(
-            audio
-                .plane(channel)
-                .ok_or(DecodeError::InvalidDecodedAudio("missing channel plane"))?
-                .to_vec(),
-        );
+    match audio.planes {
+        Planes::Mono(samples) => planes.push(samples),
+        Planes::Stereo { left, right } => {
+            planes.push(left);
+            planes.push(right);
+        }
     }
-    let ratio = f64::from(target_sample_rate_hz) / f64::from(audio.sample_rate_hz);
+    let ratio = f64::from(target_sample_rate_hz) / f64::from(input_sample_rate_hz);
     let mut resampler = Async::<f32>::new_sinc(
         ratio,
         1.0,
@@ -502,44 +510,90 @@ pub fn resample_audio(
         FixedAsync::Input,
     )
     .map_err(|error| DecodeError::Resampling(error.to_string()))?;
+    // Rubato calculates its target with `f64`; one additional frame covers a
+    // possible upward rounding difference from the exact integer ratio below.
+    let processing_output_frames = expected_output_frames
+        .checked_add(1)
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    let output_capacity_frames = resampler
+        .output_delay()
+        .checked_add(resampler.output_frames_max())
+        .and_then(|frames| frames.checked_add(processing_output_frames))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    let required_bytes = required_resampling_buffer_bytes(
+        input_frames,
+        output_capacity_frames,
+        channels,
+    )?;
+    if required_bytes > maximum_resampling_bytes {
+        return Err(DecodeError::ResamplingByteLimitExceeded {
+            required: required_bytes,
+            maximum: maximum_resampling_bytes,
+        });
+    }
     let input = SequentialSliceOfVecs::new(&planes, channels, input_frames)
         .map_err(|error| DecodeError::Resampling(error.to_string()))?;
-    let output = resampler
-        .process_all(&input, input_frames, None)
+    let mut converted = allocate_resampling_output(channels, output_capacity_frames)?;
+    let output_frames = {
+        let mut output = SequentialSliceOfVecs::new_mut(
+            &mut converted,
+            channels,
+            output_capacity_frames,
+        )
         .map_err(|error| DecodeError::Resampling(error.to_string()))?;
-    if output.frames() < expected_output_frames {
+        resampler.reset();
+        let (_, output_frames) = resampler
+            .process_all_into_buffer(&input, &mut output, input_frames, None)
+            .map_err(|error| DecodeError::Resampling(error.to_string()))?;
+        output_frames
+    };
+    if output_frames < expected_output_frames {
         return Err(DecodeError::Resampling(
             "resampler returned fewer frames than the source duration requires".to_owned(),
         ));
     }
-    let output_frames = expected_output_frames;
-    let mut interleaved = output.take_data();
-    interleaved.truncate(
-        output_frames
-            .checked_mul(channels)
-            .ok_or(DecodeError::CapacityUnavailable)?,
-    );
-    let mut converted = vec![Vec::new(); channels];
-    for plane in &mut converted {
+    finish_resampled_audio(converted, expected_output_frames, target_sample_rate_hz)
+}
+
+fn allocate_resampling_output(
+    channels: usize,
+    output_capacity_frames: usize,
+) -> Result<Vec<Vec<f32>>, DecodeError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(channels)
+        .map_err(|_| DecodeError::CapacityUnavailable)?;
+    for _ in 0..channels {
+        let mut plane = Vec::new();
         plane
-            .try_reserve_exact(output_frames)
+            .try_reserve_exact(output_capacity_frames)
             .map_err(|_| DecodeError::CapacityUnavailable)?;
+        plane.resize(output_capacity_frames, 0.0);
+        output.push(plane);
     }
-    for frame in interleaved.chunks_exact(channels) {
-        for (channel, sample) in frame.iter().copied().enumerate() {
+    Ok(output)
+}
+
+fn finish_resampled_audio(
+    mut planes: Vec<Vec<f32>>,
+    output_frames: usize,
+    sample_rate_hz: u32,
+) -> Result<DecodedAudio, DecodeError> {
+    for (channel, plane) in planes.iter_mut().enumerate() {
+        plane.truncate(output_frames);
+        for (frame, sample) in plane.iter().copied().enumerate() {
             if !sample.is_finite() {
                 return Err(DecodeError::NonFiniteSample {
-                    frame: u64::try_from(converted[channel].len()).unwrap_or(u64::MAX),
+                    frame: u64::try_from(frame).unwrap_or(u64::MAX),
                     channel,
                 });
             }
-            converted[channel].push(sample);
         }
     }
-    match converted.as_mut_slice() {
-        [mono] => DecodedAudio::from_mono(target_sample_rate_hz, std::mem::take(mono)),
+    match planes.as_mut_slice() {
+        [mono] => DecodedAudio::from_mono(sample_rate_hz, std::mem::take(mono)),
         [left, right] => DecodedAudio::from_stereo(
-            target_sample_rate_hz,
+            sample_rate_hz,
             std::mem::take(left),
             std::mem::take(right),
         ),
@@ -547,6 +601,30 @@ pub fn resample_audio(
             "resampler returned an unsupported channel count",
         )),
     }
+}
+
+fn required_resampling_buffer_bytes(
+    input_frames: usize,
+    output_capacity_frames: usize,
+    channels: usize,
+) -> Result<usize, DecodeError> {
+    let sample_bytes = std::mem::size_of::<f32>();
+    let input = input_frames
+        .checked_mul(channels)
+        .and_then(|samples| samples.checked_mul(sample_bytes))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    let output = output_capacity_frames
+        .checked_mul(channels)
+        .and_then(|samples| samples.checked_mul(sample_bytes))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    let adapters = channels
+        .checked_mul(std::mem::size_of::<Vec<f32>>())
+        .and_then(|bytes| bytes.checked_mul(2))
+        .ok_or(DecodeError::CapacityUnavailable)?;
+    input
+        .checked_add(output)
+        .and_then(|bytes| bytes.checked_add(adapters))
+        .ok_or(DecodeError::CapacityUnavailable)
 }
 
 /// Encodes a complete decoded clip as a finalized IEEE-float WAV.
