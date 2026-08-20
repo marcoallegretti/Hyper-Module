@@ -50,6 +50,15 @@ const RELEASE_ATTEMPTS: usize = 3;
 /// refreshes an entire panel several times a second.
 pub const FEEDBACK_PER_TICK: usize = 4;
 
+/// How many panels waiting behind the active one may be refused in one host
+/// tick.
+///
+/// The refusal path performs an `accept` system call for every panel. Giving it
+/// the same four-item budget as feedback keeps a quiet 20 ms tick finite while
+/// still rejecting up to two hundred stale connections per second. Any excess
+/// remains queued for the next quiet tick.
+pub const PANEL_REFUSALS_PER_TICK: usize = 4;
+
 /// How long a serving loop waits on a quiet panel before letting link upkeep
 /// and the stop flag have a turn.
 pub const PANEL_READ_TIMEOUT: Duration = Duration::from_millis(20);
@@ -690,7 +699,7 @@ where
         // the moment one panel is committed to. Draining after the session
         // instead would also refuse panels that arrived later — including the
         // same panel reconnecting after a reset.
-        refuse_waiting_panels(listener);
+        let _ = refuse_waiting_panels(listener);
         let (outcome, notices) = match prepare_panel_stream(&stream) {
             Ok(()) => serve_panel(
                 &mut stream,
@@ -699,7 +708,9 @@ where
                 session_id,
                 stop,
                 &mut clock,
-                || refuse_waiting_panels(listener),
+                || {
+                    let _ = refuse_waiting_panels(listener);
+                },
             ),
             Err(error) => (Err(error), Vec::new()),
         };
@@ -737,20 +748,24 @@ pub fn prepare_panel_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_write_timeout(Some(PANEL_WRITE_TIMEOUT))
 }
 
-/// Accepts and immediately drops anything waiting on the listener.
+/// Accepts and immediately drops a bounded number of panels waiting on the
+/// listener.
 ///
 /// One panel at a time: a second one is turned away where it can see that it
 /// was, rather than left in the backlog to be promoted stale once the first
 /// disconnects.
 ///
-/// # Panics
-///
-/// Does not panic, but **will not return** if given a blocking listener — it
-/// accepts until the queue is empty, and a blocking `accept` waits instead of
-/// reporting an empty queue. [`serve_panels`] only calls it on the non-blocking
-/// listener it requires.
-pub fn refuse_waiting_panels(listener: &TcpListener) {
-    while let Ok((extra, _)) = listener.accept() {
+/// Returns how many were refused. The listener must be non-blocking, as required
+/// by [`serve_panels`]; otherwise the first empty `accept` can still block.
+#[must_use]
+pub fn refuse_waiting_panels(listener: &TcpListener) -> usize {
+    let mut refused = 0;
+    for _ in 0..PANEL_REFUSALS_PER_TICK {
+        let Ok((extra, _)) = listener.accept() else {
+            break;
+        };
         drop(extra);
+        refused += 1;
     }
+    refused
 }

@@ -23,8 +23,9 @@ use hyper_panel_protocol::{FirmwareVersion, LinkConfig, Message, PanelDescriptor
 use hyper_panel_simulator::{PanelSimulator, PanelSimulatorConfig};
 use hyper_runtime_host::{
     ArgumentError, DEFAULT_GAIN_STEP_MILLIONTHS, FEEDBACK_PER_TICK, PANEL_READ_TIMEOUT,
-    PanelClosure, PanelHost, PanelLink, PanelNotice, RuntimeArguments, ServeError, default_layout,
-    prepare_panel_stream, refuse_waiting_panels, serve_panel, serve_panels,
+    PANEL_REFUSALS_PER_TICK, PanelClosure, PanelHost, PanelLink, PanelNotice, RuntimeArguments,
+    ServeError, default_layout, prepare_panel_stream, refuse_waiting_panels, serve_panel,
+    serve_panels,
 };
 
 const CHANNELS: usize = 3;
@@ -695,7 +696,9 @@ fn a_second_panel_is_turned_away_while_one_is_being_served() {
         }
     };
 
-    refuse_waiting_panels(&listener);
+    let refused = refuse_waiting_panels(&listener);
+
+    assert_eq!(refused, 1, "exactly the waiting panel was refused");
 
     second
         .set_read_timeout(Some(PANEL_READ_TIMEOUT * 20))
@@ -1602,6 +1605,34 @@ fn a_refresh_sends_no_more_than_its_budget_however_much_has_changed() {
     assert!(
         total >= available,
         "every control that had something to say eventually said it: {total} of {available}"
+    );
+}
+
+#[test]
+fn one_refusal_tick_has_a_fixed_work_budget_even_when_more_panels_are_waiting() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let waiting = PANEL_REFUSALS_PER_TICK * 2;
+    let clients: Vec<TcpStream> = (0..waiting)
+        .map(|_| TcpStream::connect(address).unwrap())
+        .collect();
+
+    let first_tick = refuse_waiting_panels(&listener);
+    let second_tick = refuse_waiting_panels(&listener);
+
+    assert_eq!(
+        first_tick, PANEL_REFUSALS_PER_TICK,
+        "a busy listener cannot consume more than one tick's refusal budget"
+    );
+    assert_eq!(
+        second_tick, PANEL_REFUSALS_PER_TICK,
+        "work left by the first tick remains available to the next"
+    );
+    assert_eq!(
+        clients.len(),
+        waiting,
+        "clients stay alive until assertions finish"
     );
 }
 
