@@ -303,9 +303,26 @@ pub fn sync_directory(directory: &Dir) -> io::Result<()> {
 /// Returns an I/O error when the directory cannot be opened for durable
 /// publication.
 pub fn open_syncable_directory_ambient(path: &Path) -> io::Result<Dir> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        Dir::open_ambient_dir(path, ambient_authority())
+        use std::os::unix::fs::OpenOptionsExt;
+
+        use rustix::fs::OFlags;
+
+        let validated = Dir::open_ambient_dir(path, ambient_authority())?;
+        let expected_identity = identity(&validated.dir_metadata()?);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags((OFlags::DIRECTORY | OFlags::NOFOLLOW).bits().cast_signed())
+            .open(path)?;
+        let directory = Dir::from_std_file(file);
+        let opened = directory.dir_metadata()?;
+        if !opened.is_dir() || identity(&opened) != expected_identity {
+            return Err(invalid_argument(
+                "syncable directory identity does not match validated authority",
+            ));
+        }
+        Ok(directory)
     }
     #[cfg(windows)]
     {
@@ -343,9 +360,20 @@ pub fn open_syncable_directory_ambient(path: &Path) -> io::Result<Dir> {
 /// Returns an I/O or validation error when the child cannot be opened as a
 /// real directory with synchronization access.
 pub fn open_syncable_directory_at(parent: &Dir, name: &str) -> io::Result<Dir> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        parent.open_dir_nofollow(name)
+        let validated = parent.open_dir_nofollow(name)?;
+        let expected_identity = identity(&validated.dir_metadata()?);
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let file = parent.open_with(name, &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_dir() || identity(&metadata) != expected_identity {
+            return Err(invalid_argument(
+                "syncable directory identity does not match validated authority",
+            ));
+        }
+        Ok(Dir::from_std_file(file.into_std()))
     }
     #[cfg(windows)]
     {
@@ -1077,8 +1105,10 @@ mod stable_file_tests {
         fs::write(&path, b"stable").unwrap();
         let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
 
-        let result =
-            read_stable_file_observed(&directory, "state.json", 6, || fs::write(&path, b"stable"));
+        let result = read_stable_file_observed(&directory, "state.json", 6, || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            fs::write(&path, b"stable")
+        });
 
         assert!(result.is_err());
     }
