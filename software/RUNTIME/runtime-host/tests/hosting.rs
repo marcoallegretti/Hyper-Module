@@ -149,6 +149,9 @@ struct Host {
     /// `ServeError::ControlsStillHeld` exists for.
     controls_stuck: bool,
     disconnects: usize,
+    /// Answers with a display even when no panel is connected. The link must
+    /// not rely on the owner's discipline for whether it is safe to talk.
+    displays_regardless: bool,
 }
 
 impl Host {
@@ -160,6 +163,7 @@ impl Host {
             momentary_layout: false,
             controls_stuck: false,
             disconnects: 0,
+            displays_regardless: false,
         }
     }
 
@@ -211,6 +215,12 @@ impl PanelHost for Host {
 
     fn panel_display(&mut self, out: &mut Vec<hyper_control_runtime::PanelDisplay>) {
         self.runtime.panel_display(out);
+        if self.displays_regardless && out.is_empty() {
+            out.push(hyper_control_runtime::PanelDisplay::Led {
+                index: 0,
+                enabled: true,
+            });
+        }
     }
 }
 
@@ -1650,6 +1660,8 @@ fn a_link_that_has_released_its_bindings_stops_showing_anything() {
         "a bound link has something to show"
     );
 
+    // Even an owner that keeps answering must not get the panel written to.
+    host.displays_regardless = true;
     link.release(&mut host);
 
     assert_eq!(
