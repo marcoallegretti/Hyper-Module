@@ -12,15 +12,18 @@ pub use hyper_audio_engine::LoudnessMeasurementState as IdeLoudnessMeasurementSt
 use hyper_audio_engine::{
     LinearGain, LoudnessMeasurementCommand, Pan, ParameterError, StereoSineTestToneConfigError,
 };
-use hyper_audio_source::{DecodeError, DecodeLimits};
+use hyper_audio_source::{
+    AudioContainer, DecodeError, DecodeLimits, decode_file_at_source_rate, encode_float_wav,
+    resample_audio,
+};
 pub use hyper_control_mappings::{
     ChannelParameter as IdeControlChannelParameter, ControlBinding, ControlMappingDocument,
-    ControlMappingParseError, ControlMappingProject,
-    ControlScope, ControlSource, ControlTarget, ControlTransform,
-    CueParameter as IdeControlCueParameter, Edge,
-    MainParameter as IdeControlMainParameter, SceneAction, SendParameter as IdeControlSendParameter,
-    TransportAction, TriggerBehavior,
+    ControlMappingParseError, ControlMappingProject, ControlScope, ControlSource, ControlTarget,
+    ControlTransform, CueParameter as IdeControlCueParameter, Edge,
+    MainParameter as IdeControlMainParameter, SceneAction,
+    SendParameter as IdeControlSendParameter, TransportAction, TriggerBehavior,
 };
+pub use hyper_desktop_audio::OfflineExportReport;
 use hyper_desktop_audio::{
     CaptureStreamSnapshot, DesktopAudioPreviewCommandError, DesktopAudioPreviewControlError,
     DesktopAudioPreviewSnapshot, DesktopDirectControlError, DesktopInputConfig,
@@ -34,11 +37,16 @@ use hyper_desktop_audio::{
     OutputStreamState, PendingNativeShutdown, PendingNativeShutdownWait, StreamState,
     discover_desktop_input_targets, discover_desktop_output_targets, export_project_wav_with_mixer,
 };
-pub use hyper_desktop_audio::OfflineExportReport;
 pub use hyper_desktop_audio::{
     DesktopAudioPreviewState, DesktopSceneAvailability as IdeSceneAvailability,
 };
+use hyper_mapping_compiler::{ControlMappingResolver, MixerSendAddress};
+use hyper_mapping_editor::{
+    MappingEditor, MappingEditorMutationError, MappingEditorPreviewError,
+    MappingEditorPublicationError,
+};
 use hyper_media_cache::CacheLimits;
+use hyper_mixer_runtime::MixerParameterStateSnapshot;
 pub use hyper_mixer_runtime::{
     EbuLoudnessPresentationConfig as IdeLoudnessPresentationConfig,
     EbuLoudnessScale as IdeLoudnessScale, LocateState,
@@ -56,6 +64,9 @@ use hyper_mixer_runtime::{
 #[cfg(test)]
 use hyper_mixer_runtime::{OutputMeterReceiver, output_meter_channel};
 use hyper_playback_compiler::scene::LaunchQuantization;
+pub use hyper_playback_compiler::{
+    MeterEvent, MusicalPosition, TempoEvent, musical_position_at_frame,
+};
 pub use hyper_playback_json::is_native_audio_clip_gain_decibels as ide_audio_clip_gain_is_supported;
 use hyper_playback_json::{
     ArrangementPlacementDocumentSerializationError, AudioClipAdditionSerializationError,
@@ -66,40 +77,36 @@ use hyper_playback_json::{
     AudioTrackDocumentSerializationError, AudioTrackRemovalBlockers,
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
     AutomationTakeAddition, AutomationTakeAdditionSerializationError,
-    AutomationTakeEditSerializationError, AutomationTargetSelection,
-    CompiledMixerGraph, CompiledMixerTap, CompiledMixerTrackKind,
-    LoadError as PlaybackDocumentLoadError, LoaderLimits, MixerBaseState, MixerChannelBaseState,
-    MixerSendBaseState, MixerStateSerializationError, SceneAdditionSerializationError,
-    SceneDocumentSerializationError, SceneDuplicationSerializationError,
-    SceneRenameSerializationError, SceneSlotEdit, SceneSlotEditSerializationError,
+    AutomationTakeEditSerializationError, AutomationTargetSelection, CompiledMixerGraph,
+    CompiledMixerTap, CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits,
+    MediaAssetFact, MixerBaseState, MixerChannelBaseState, MixerSendBaseState,
+    MixerStateSerializationError, SceneAdditionSerializationError, SceneDocumentSerializationError,
+    SceneDuplicationSerializationError, SceneRenameSerializationError, SceneSlotEdit,
+    SceneSlotEditSerializationError, TempoSerializationError, serialize_arrangement_loop_range,
     serialize_arrangement_placement_activation, serialize_arrangement_placement_addition,
     serialize_arrangement_placement_duplication, serialize_arrangement_placement_duration,
     serialize_arrangement_placement_front_trim, serialize_arrangement_placement_move,
     serialize_arrangement_placement_removal, serialize_arrangement_placement_split,
-    TempoSerializationError, serialize_arrangement_loop_range,
-    serialize_arrangement_scene_launch_addition,
-    serialize_arrangement_scene_launch_move, serialize_timeline_meter,
-    serialize_timeline_tempo,
-    serialize_automation_take_activation, serialize_automation_take_addition,
+    serialize_arrangement_scene_launch_addition, serialize_arrangement_scene_launch_move,
     serialize_arrangement_scene_launch_removal, serialize_arrangement_scene_launch_scene_edit,
     serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
     serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_rename,
     serialize_audio_clip_reverse, serialize_audio_clip_source_start,
     serialize_audio_track_activation, serialize_audio_track_addition,
-    serialize_audio_track_removal, serialize_audio_track_rename, serialize_mixer_base_state,
-    serialize_recording_audio_clip_addition, serialize_scene_activation, serialize_scene_addition,
-    serialize_scene_duplication, serialize_scene_rename, serialize_scene_slot_edit,
-};
-pub use hyper_playback_compiler::{
-    MeterEvent, MusicalPosition, TempoEvent, musical_position_at_frame,
-};
-pub use hyper_playback_json::{
-    bpm_for_microseconds_per_quarter, meter_is_in_version_one_domain,
-    microseconds_per_quarter_for_bpm,
+    serialize_audio_track_removal, serialize_audio_track_rename,
+    serialize_automation_take_activation, serialize_automation_take_addition,
+    serialize_mixer_base_state, serialize_recording_audio_clip_addition,
+    serialize_scene_activation, serialize_scene_addition, serialize_scene_duplication,
+    serialize_scene_rename, serialize_scene_slot_edit, serialize_timeline_meter,
+    serialize_timeline_tempo,
 };
 pub use hyper_playback_json::{
     AutomationChannelParameter, AutomationInterpolation, AutomationMainParameter, AutomationPoint,
     AutomationSendParameter, AutomationTarget, AutomationValue,
+};
+pub use hyper_playback_json::{
+    bpm_for_microseconds_per_quarter, meter_is_in_version_one_domain,
+    microseconds_per_quarter_for_bpm,
 };
 use hyper_playback_session::{
     AudioClipGainValidationError, AudioClipSourceSlipValidationError, PlaybackSessionAssemblyLimits,
@@ -108,28 +115,21 @@ pub use hyper_playback_session::{
     PlaybackArrangement as IdePlaybackArrangement, PlaybackAutomation as IdePlaybackAutomation,
     PlaybackAutomationLane as IdePlaybackAutomationLane, PlaybackExtent as IdePlaybackExtent,
 };
-use hyper_mapping_compiler::{ControlMappingResolver, MixerSendAddress};
-use hyper_mixer_runtime::MixerParameterStateSnapshot;
-use hyper_mapping_editor::{
-    MappingEditor, MappingEditorMutationError, MappingEditorPreviewError,
-    MappingEditorPublicationError,
-};
-use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackLimits};
 pub use hyper_project_history::{
     MAX_RECENT_PROJECTS, ProjectHistory, ProjectHistoryError, ProjectHistoryErrorKind,
     RecentProject,
 };
+use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackError, ProjectPlaybackLimits};
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
     AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
     AudioTrackRemovalRequest, AutomationTakePublicationRequest, ControlMappingPublicationRequest,
-    ProjectResourcePublicationError,
+    ImportedAudioClipPublicationRequest, ProjectResourcePublicationError,
     ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest,
-    RequiredControlCapabilities, ScenePublicationRequest,
-    StorageError, publish_arrangement, publish_audio_clip, publish_audio_track,
-    publish_automation_take, publish_control_mapping, publish_project_resource, publish_scene,
-    remove_audio_track,
+    RequiredControlCapabilities, ScenePublicationRequest, StorageError, publish_arrangement,
+    publish_audio_clip, publish_audio_track, publish_automation_take, publish_control_mapping,
+    publish_imported_audio_clip, publish_project_resource, publish_scene, remove_audio_track,
 };
 
 mod recording;
@@ -145,12 +145,12 @@ pub use worker::{
     DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeAudioClip,
     IdeAudioClipEditCommittedWarning, IdeAudioPreviewObservation, IdeClosedSnapshot,
     IdeMixerChannel, IdeMixerSend, IdeProjectCreationError, IdeRecordingCaptureKind,
-    IdeRecordingState, IdeRecordingTake, IdeRunningObservation, IdeScene, IdeSceneTrackAction,
-    IdeSceneTrackSlot, IdeWorkerCommand, IdeWorkerCommandFailure, IdeWorkerCommandKind,
-    IdeRuntimePreparationError, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
-    IdeWorkerPendingShutdownWait,
-    IdeWorkerSendError, IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, IdeWorkerStartError,
-    MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS, desktop_ide_worker_supervisor_snapshot,
+    IdeRecordingState, IdeRecordingTake, IdeRunningObservation, IdeRuntimePreparationError,
+    IdeScene, IdeSceneTrackAction, IdeSceneTrackSlot, IdeWorkerCommand, IdeWorkerCommandFailure,
+    IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
+    IdeWorkerPendingShutdownWait, IdeWorkerSendError, IdeWorkerShutdownOutcome,
+    IdeWorkerShutdownReport, IdeWorkerStartError, MAX_IDE_WORKER_COMMANDS, MAX_IDE_WORKER_EVENTS,
+    desktop_ide_worker_supervisor_snapshot,
 };
 
 const DESKTOP_MAXIMUM_BLOCK_FRAMES: usize = 4_096;
@@ -175,6 +175,35 @@ const DESKTOP_MAX_PROJECT_DECODED_BYTES: usize = 1_024 * 1_024 * 1_024;
 pub const MAX_IDE_SCENES: usize = LoaderLimits::VERSION_1.max_scene_documents;
 /// Maximum channel rows published by the version-1 desktop IDE mixer.
 pub const MAX_IDE_MIXER_CHANNELS: usize = hyper_mixer_runtime::MAX_MAIN_MIXER_SLOTS;
+
+fn audio_import_container(path: &Path) -> Result<AudioContainer, IdeAudioImportError> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .ok_or(IdeAudioImportError::UnsupportedContainer)?;
+    if extension.eq_ignore_ascii_case("wav") {
+        Ok(AudioContainer::Wav)
+    } else if extension.eq_ignore_ascii_case("flac") {
+        Ok(AudioContainer::Flac)
+    } else {
+        Err(IdeAudioImportError::UnsupportedContainer)
+    }
+}
+
+fn audio_import_clip_name(path: &Path) -> Result<String, IdeAudioImportError> {
+    let name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && name.chars().count() <= 120)
+        .ok_or(IdeAudioImportError::InvalidClipName)?;
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(name.len())
+        .map_err(|_| IdeAudioImportError::CapacityUnavailable)?;
+    owned.push_str(name);
+    Ok(owned)
+}
 
 /// Builds the bounded playback policy used by the desktop IDE executable.
 ///
@@ -2277,6 +2306,160 @@ impl Error for IdeAudioClipCreationPublicationError {
 pub type IdeRecordingClipCreationPublicationError = IdeAudioClipCreationPublicationError;
 
 #[derive(Debug)]
+pub enum IdeAudioImportError {
+    EmptySelection,
+    InvalidDestinationTrack,
+    UnsupportedContainer,
+    InvalidClipName,
+    Source(DecodeError),
+    MixerSave(Box<IdeProjectSaveError>),
+    ProjectReload(ProjectPlaybackError),
+    TrackResourceMissing,
+    TrackResourceRoleMismatch,
+    Storage(StorageError),
+    Serialization(AudioClipAdditionSerializationError),
+    CapacityUnavailable,
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+}
+
+impl fmt::Display for IdeAudioImportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptySelection => formatter.write_str("audio import requires at least one file"),
+            Self::InvalidDestinationTrack => {
+                formatter.write_str("audio import requires an existing audio track")
+            }
+            Self::UnsupportedContainer => {
+                formatter.write_str("audio import accepts WAV and native FLAC files")
+            }
+            Self::InvalidClipName => formatter.write_str(
+                "the imported file name must contain 1 through 120 characters after normalization",
+            ),
+            Self::Source(source) => source.fmt(formatter),
+            Self::MixerSave(source) => write!(
+                formatter,
+                "live mixer state could not be preserved: {source}"
+            ),
+            Self::ProjectReload(source) => write!(
+                formatter,
+                "project could not be reloaded between imports: {source}"
+            ),
+            Self::TrackResourceMissing => {
+                formatter.write_str("the destination track is no longer present")
+            }
+            Self::TrackResourceRoleMismatch => {
+                formatter.write_str("the import destination is not a structural track")
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("audio import capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before audio import: {source:?}"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAudioImportError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::ProjectReload(source) => Some(source),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::EmptySelection
+            | Self::InvalidDestinationTrack
+            | Self::UnsupportedContainer
+            | Self::InvalidClipName
+            | Self::TrackResourceMissing
+            | Self::TrackResourceRoleMismatch
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct IdeAudioImportBatchFailure {
+    completed: usize,
+    total: usize,
+    path: PathBuf,
+    source: Box<IdeAudioImportError>,
+}
+
+impl IdeAudioImportBatchFailure {
+    #[must_use]
+    pub const fn completed(&self) -> usize {
+        self.completed
+    }
+
+    #[must_use]
+    pub const fn total(&self) -> usize {
+        self.total
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &IdeAudioImportError {
+        self.source.as_ref()
+    }
+}
+
+impl fmt::Display for IdeAudioImportBatchFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "imported {} of {} files; {} failed: {}",
+            self.completed,
+            self.total,
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl Error for IdeAudioImportBatchFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdeAudioImportBatchOutcome {
+    imported: usize,
+    final_revision: u64,
+    clip_ids: Vec<String>,
+}
+
+impl IdeAudioImportBatchOutcome {
+    #[must_use]
+    pub const fn imported(&self) -> usize {
+        self.imported
+    }
+
+    #[must_use]
+    pub const fn final_revision(&self) -> u64 {
+        self.final_revision
+    }
+
+    #[must_use]
+    pub fn clip_ids(&self) -> &[String] {
+        &self.clip_ids
+    }
+}
+
+#[derive(Debug)]
 pub enum IdeRecordingClipCreationError {
     InvalidRecordingIdentity,
     InvalidClipName,
@@ -3579,9 +3762,7 @@ impl fmt::Display for IdeResourceRestoreError {
                 "live mixer state could not be published before the undo: {source}"
             ),
             Self::Storage(source) => source.fmt(formatter),
-            Self::CapacityUnavailable => {
-                formatter.write_str("undo capacity is unavailable")
-            }
+            Self::CapacityUnavailable => formatter.write_str("undo capacity is unavailable"),
             Self::CandidateInvalid(source) => write!(
                 formatter,
                 "undoing this edit would leave a project that cannot open: {source}"
@@ -5214,6 +5395,37 @@ struct IdeAudioClipCreationPlan {
 }
 
 #[derive(Debug)]
+struct IdeImportedAudioClipPlan {
+    project_path: PathBuf,
+    expected_project_sha256: [u8; 32],
+    clip_id: String,
+    clip_bytes: Vec<u8>,
+    track_id: String,
+    track_bytes: Vec<u8>,
+    asset_id: String,
+    sample_bytes: Vec<u8>,
+}
+
+impl IdeImportedAudioClipPlan {
+    fn publish(&self) -> Result<AudioClipPublicationOutcome, ProjectResourcePublicationError> {
+        publish_imported_audio_clip(
+            &self.project_path,
+            ImportedAudioClipPublicationRequest {
+                clip: AudioClipPublicationRequest {
+                    expected_project_sha256: self.expected_project_sha256,
+                    clip_id: &self.clip_id,
+                    clip_bytes: &self.clip_bytes,
+                    track_id: &self.track_id,
+                    track_bytes: &self.track_bytes,
+                    asset_id: &self.asset_id,
+                },
+                sample_bytes: &self.sample_bytes,
+            },
+        )
+    }
+}
+
+#[derive(Debug)]
 struct IdeAudioTrackAdditionPlan {
     project_path: PathBuf,
     expected_project_sha256: [u8; 32],
@@ -5441,12 +5653,10 @@ impl IdeControlMappingEditPlan {
             },
         )
         .map(|outcome| outcome.project_revision())
-        .map_err(
-            |source| IdeControlMappingPublicationError::Mapping {
-                mixer: Box::new(mixer),
-                source: Box::new(MappingEditorPublicationError::Storage(source)),
-            },
-        )
+        .map_err(|source| IdeControlMappingPublicationError::Mapping {
+            mixer: Box::new(mixer),
+            source: Box::new(MappingEditorPublicationError::Storage(source)),
+        })
     }
 }
 
@@ -6538,6 +6748,219 @@ impl RunningDesktopIdeApplication {
         )
     }
 
+    fn import_audio_files(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        paths: &[PathBuf],
+        track_id: &str,
+    ) -> Result<IdeAudioImportBatchOutcome, IdeAudioImportBatchFailure> {
+        let total = paths.len();
+        let failure = |completed: usize, path: PathBuf, source| IdeAudioImportBatchFailure {
+            completed,
+            total,
+            path,
+            source: Box::new(source),
+        };
+        let Some(first_path) = paths.first() else {
+            return Err(failure(
+                0,
+                PathBuf::new(),
+                IdeAudioImportError::EmptySelection,
+            ));
+        };
+        if track_id.is_empty() {
+            return Err(failure(
+                0,
+                first_path.clone(),
+                IdeAudioImportError::InvalidDestinationTrack,
+            ));
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery).map_err(|source| {
+            failure(
+                0,
+                first_path.clone(),
+                IdeAudioImportError::MixerSave(Box::new(source)),
+            )
+        })?;
+        let project_path = mixer.project_path.clone();
+        mixer.publish().map_err(|source| {
+            failure(
+                0,
+                first_path.clone(),
+                IdeAudioImportError::MixerSave(Box::new(IdeProjectSaveError::Publication(
+                    Box::new(source),
+                ))),
+            )
+        })?;
+        let limits = application.config.project_limits();
+        let mut prepared = hyper_project_loader::prepare_project_playback(&project_path, limits)
+            .map_err(|source| {
+                failure(
+                    0,
+                    first_path.clone(),
+                    IdeAudioImportError::ProjectReload(source),
+                )
+            })?;
+        let mut clip_ids = Vec::new();
+        clip_ids.try_reserve_exact(total).map_err(|_| {
+            failure(
+                0,
+                first_path.clone(),
+                IdeAudioImportError::CapacityUnavailable,
+            )
+        })?;
+        let mut final_revision = prepared.package().manifest().revision();
+        for (index, path) in paths.iter().enumerate() {
+            let plan = Self::prepare_imported_audio_clip(application, &prepared, path, track_id)
+                .map_err(|source| failure(index, path.clone(), source))?;
+            let outcome = plan.publish().map_err(|source| {
+                failure(
+                    index,
+                    path.clone(),
+                    IdeAudioImportError::Publication(Box::new(source)),
+                )
+            })?;
+            final_revision = outcome.project_revision();
+            clip_ids.push(outcome.clip_id().to_owned());
+            if index + 1 < total {
+                prepared = hyper_project_loader::prepare_project_playback(&project_path, limits)
+                    .map_err(|source| {
+                        failure(
+                            index + 1,
+                            paths[index + 1].clone(),
+                            IdeAudioImportError::ProjectReload(source),
+                        )
+                    })?;
+            }
+        }
+        Ok(IdeAudioImportBatchOutcome {
+            imported: total,
+            final_revision,
+            clip_ids,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the import plan keeps bounded decode, destination authority, exact clip construction, and total package capacity in one auditable prepublication boundary"
+    )]
+    fn prepare_imported_audio_clip(
+        application: &DesktopIdeApplication,
+        prepared: &PreparedProjectPlayback,
+        path: &Path,
+        track_id: &str,
+    ) -> Result<IdeImportedAudioClipPlan, IdeAudioImportError> {
+        let container = audio_import_container(path)?;
+        let limits = application.config.project_limits();
+        let decoded = decode_file_at_source_rate(path, container, limits.audio)
+            .map_err(IdeAudioImportError::Source)?;
+        let converted = resample_audio(
+            decoded,
+            prepared.package().manifest().sample_rate_hz(),
+            u64::try_from(limits.session.media_cache.max_frames_per_asset)
+                .map_err(|_| IdeAudioImportError::CapacityUnavailable)?,
+        )
+        .map_err(IdeAudioImportError::Source)?;
+        let decoded_bytes = converted
+            .frame_count()
+            .checked_mul(converted.channels())
+            .and_then(|samples| samples.checked_mul(size_of::<f32>()))
+            .ok_or(IdeAudioImportError::CapacityUnavailable)?;
+        let media = prepared.session().parts().3;
+        if media.asset_count() >= limits.session.media_cache.max_assets
+            || decoded_bytes > limits.audio.max_decoded_sample_bytes()
+            || media
+                .decoded_sample_bytes()
+                .checked_add(decoded_bytes)
+                .is_none_or(|bytes| bytes > limits.session.media_cache.max_decoded_sample_bytes)
+        {
+            return Err(IdeAudioImportError::CapacityUnavailable);
+        }
+        let sample_bytes = encode_float_wav(&converted).map_err(IdeAudioImportError::Source)?;
+        if u64::try_from(sample_bytes.len())
+            .map_or(true, |bytes| bytes > limits.audio.max_file_bytes())
+        {
+            return Err(IdeAudioImportError::Source(DecodeError::FileTooLarge {
+                actual: u64::try_from(sample_bytes.len()).unwrap_or(u64::MAX),
+                maximum: limits.audio.max_file_bytes(),
+            }));
+        }
+        let clip_name = audio_import_clip_name(path)?;
+        let package = prepared.package();
+        let track_descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == track_id)
+            .ok_or(IdeAudioImportError::TrackResourceMissing)?;
+        if track_descriptor.role() != ResourceRole::Track {
+            return Err(IdeAudioImportError::TrackResourceRoleMismatch);
+        }
+        let source_track = package
+            .read_resource(track_id)
+            .map_err(IdeAudioImportError::Storage)?;
+        let asset_id = uuid::Uuid::new_v4().to_string();
+        let clip_id = uuid::Uuid::new_v4().to_string();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count() + 1)
+            .map_err(|_| IdeAudioImportError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        assets.push(MediaAssetFact {
+            id: &asset_id,
+            sample_rate_hz: converted.sample_rate_hz(),
+            frame_count: converted.frame_count(),
+        });
+        let documents = serialize_recording_audio_clip_addition(
+            prepared.session().parts().0,
+            &assets,
+            &source_track,
+            track_id,
+            &asset_id,
+            0,
+            u64::try_from(converted.frame_count())
+                .map_err(|_| IdeAudioImportError::CapacityUnavailable)?,
+            &clip_id,
+            &clip_name,
+            limits.session.documents,
+        )
+        .map_err(IdeAudioImportError::Serialization)?;
+        let (track_bytes, clip_bytes, _) = documents.into_parts();
+        let current_resource_bytes = package
+            .manifest()
+            .resources()
+            .iter()
+            .map(hyper_project_model::ResourceDescriptor::byte_length)
+            .chain(
+                package
+                    .manifest()
+                    .assets()
+                    .iter()
+                    .map(hyper_project_model::AssetDescriptor::byte_length),
+            )
+            .try_fold(0_u64, u64::checked_add)
+            .ok_or(IdeAudioImportError::CapacityUnavailable)?;
+        let candidate_bytes = current_resource_bytes
+            .checked_sub(track_descriptor.byte_length())
+            .and_then(|bytes| bytes.checked_add(track_bytes.len() as u64))
+            .and_then(|bytes| bytes.checked_add(clip_bytes.len() as u64))
+            .and_then(|bytes| bytes.checked_add(sample_bytes.len() as u64))
+            .ok_or(IdeAudioImportError::CapacityUnavailable)?;
+        if candidate_bytes > limits.max_total_resource_bytes as u64 {
+            return Err(IdeAudioImportError::CapacityUnavailable);
+        }
+        Ok(IdeImportedAudioClipPlan {
+            project_path: package.root().to_path_buf(),
+            expected_project_sha256: *package.manifest_sha256(),
+            clip_id,
+            clip_bytes,
+            track_id: track_id.to_owned(),
+            track_bytes,
+            asset_id,
+            sample_bytes,
+        })
+    }
+
     fn prepare_recording_clip_creation_from_project(
         application: &DesktopIdeApplication,
         mixer: IdeMixerSavePlan,
@@ -6887,16 +7310,20 @@ impl RunningDesktopIdeApplication {
                 hyper_playback_compiler::graph::GraphLimits::VERSION_1,
                 hyper_playback_compiler::scene::SceneLimits::VERSION_1,
             )
-            .map_err(|_| IdeArrangementPlacementEditError::LoopMark(LoopMarkFailure::TimelineUnavailable))?;
+            .map_err(|_| {
+                IdeArrangementPlacementEditError::LoopMark(LoopMarkFailure::TimelineUnavailable)
+            })?;
         let authority = graph.scene_authority();
-        let start_tick = authority
-            .frame_to_tick(frames.start_frame)
-            .map_err(|_| IdeArrangementPlacementEditError::LoopMark(LoopMarkFailure::MarkOutOfRange))?;
-        let end_tick = authority
-            .frame_to_tick(frames.end_frame)
-            .map_err(|_| IdeArrangementPlacementEditError::LoopMark(LoopMarkFailure::MarkOutOfRange))?;
+        let start_tick = authority.frame_to_tick(frames.start_frame).map_err(|_| {
+            IdeArrangementPlacementEditError::LoopMark(LoopMarkFailure::MarkOutOfRange)
+        })?;
+        let end_tick = authority.frame_to_tick(frames.end_frame).map_err(|_| {
+            IdeArrangementPlacementEditError::LoopMark(LoopMarkFailure::MarkOutOfRange)
+        })?;
         if end_tick <= start_tick {
-            return Err(IdeArrangementPlacementEditError::LoopMark(LoopMarkFailure::MarksCollapse));
+            return Err(IdeArrangementPlacementEditError::LoopMark(
+                LoopMarkFailure::MarksCollapse,
+            ));
         }
         Ok(Some((start_tick, end_tick, frames.enabled)))
     }
@@ -6971,14 +7398,7 @@ impl RunningDesktopIdeApplication {
             mixer,
             prepared,
             |project, facts, source, limits| {
-                serialize_timeline_meter(
-                    project,
-                    facts,
-                    source,
-                    numerator,
-                    denominator,
-                    limits,
-                )
+                serialize_timeline_meter(project, facts, source, numerator, denominator, limits)
             },
         )
     }
@@ -7450,8 +7870,8 @@ impl RunningDesktopIdeApplication {
             IdePlaybackSessionOwner::Test(_) => None,
         }
         .ok_or(IdeProjectExportError::ProjectSnapshotUnavailable)?;
-        let journal_path = export_journal_path(wav_path)
-            .ok_or(IdeProjectExportError::DestinationUnavailable)?;
+        let journal_path =
+            export_journal_path(wav_path).ok_or(IdeProjectExportError::DestinationUnavailable)?;
         let live_mixer = self.live_compiled_mixer(prepared)?;
         let report = export_project_wav_with_mixer(
             prepared.session(),
@@ -7473,9 +7893,10 @@ impl RunningDesktopIdeApplication {
         prepared: &PreparedProjectPlayback,
     ) -> Result<Option<CompiledMixerGraph>, IdeProjectExportError> {
         let Some(live) = (match &self.session {
-            IdePlaybackSessionOwner::Native(session) => {
-                session.recovery_checkpoint().snapshot().mixer_parameter_state()
-            }
+            IdePlaybackSessionOwner::Native(session) => session
+                .recovery_checkpoint()
+                .snapshot()
+                .mixer_parameter_state(),
             #[cfg(test)]
             IdePlaybackSessionOwner::Test(_) => None,
         }) else {
@@ -7613,8 +8034,9 @@ impl RunningDesktopIdeApplication {
                 ResourceRole::Mapping | ResourceRole::RecordingMetadata => {}
             }
         }
-        let invalid =
-            |source: Box<dyn Error + Send + Sync>| IdeResourceRestoreError::CandidateInvalid(source);
+        let invalid = |source: Box<dyn Error + Send + Sync>| {
+            IdeResourceRestoreError::CandidateInvalid(source)
+        };
         let track_refs: Vec<&[u8]> = tracks.iter().map(Vec::as_slice).collect();
         let clip_refs: Vec<&[u8]> = clips.iter().map(Vec::as_slice).collect();
         let scene_refs: Vec<&[u8]> = scenes.iter().map(Vec::as_slice).collect();
@@ -7836,10 +8258,7 @@ impl RunningDesktopIdeApplication {
                 track_id,
                 parameter: *parameter,
             },
-            IdeAutomationTarget::Send {
-                send_id,
-                parameter,
-            } => AutomationTargetSelection::Send {
+            IdeAutomationTarget::Send { send_id, parameter } => AutomationTargetSelection::Send {
                 send_id,
                 parameter: *parameter,
             },
@@ -7890,7 +8309,11 @@ impl RunningDesktopIdeApplication {
             ))
         })?;
         Self::prepare_automation_take_activation_from_project(
-            application, mixer, prepared, take_id, enabled,
+            application,
+            mixer,
+            prepared,
+            take_id,
+            enabled,
         )
     }
 
@@ -11710,13 +12133,14 @@ mod tests {
             ],
         };
 
-        let overlapping = RunningDesktopIdeApplication::prepare_automation_take_creation_from_project(
-            &application,
-            mixer_plan(),
-            &prepared,
-            &request(2, 6),
-        )
-        .unwrap_err();
+        let overlapping =
+            RunningDesktopIdeApplication::prepare_automation_take_creation_from_project(
+                &application,
+                mixer_plan(),
+                &prepared,
+                &request(2, 6),
+            )
+            .unwrap_err();
         assert!(
             matches!(
                 overlapping,
@@ -11751,7 +12175,11 @@ mod tests {
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
         let published = reopened.session().automation_takes().takes();
         assert_eq!(published.len(), 2);
-        assert!(published.iter().all(hyper_playback_session::PlaybackAutomationTake::enabled));
+        assert!(
+            published
+                .iter()
+                .all(hyper_playback_session::PlaybackAutomationTake::enabled)
+        );
         let (_, _, automation, _) = reopened.session().parts();
         assert_eq!(automation.unwrap().target_count(), 1);
     }
@@ -11790,14 +12218,15 @@ mod tests {
             resource_bytes: mixer_bytes.clone(),
         };
 
-        let missing = RunningDesktopIdeApplication::prepare_automation_take_activation_from_project(
-            &application,
-            mixer_plan(),
-            &prepared,
-            "018f47a2-6b2d-7c11-8a44-0011223344ff",
-            false,
-        )
-        .unwrap_err();
+        let missing =
+            RunningDesktopIdeApplication::prepare_automation_take_activation_from_project(
+                &application,
+                mixer_plan(),
+                &prepared,
+                "018f47a2-6b2d-7c11-8a44-0011223344ff",
+                false,
+            )
+            .unwrap_err();
         assert!(
             matches!(missing, IdeAutomationTakeEditError::Serialization(_)),
             "{missing}"
@@ -11888,7 +12317,11 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(plan.role, ResourceRole::Scene, "the role comes from the manifest");
+        assert_eq!(
+            plan.role,
+            ResourceRole::Scene,
+            "the role comes from the manifest"
+        );
         drop(reopened);
         let restored = plan.publish().unwrap();
         assert_eq!(
@@ -11900,7 +12333,10 @@ mod tests {
         let verified =
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
         assert_eq!(
-            verified.package().read_resource(ARRANGEMENT_TEST_SCENE_ID).unwrap(),
+            verified
+                .package()
+                .read_resource(ARRANGEMENT_TEST_SCENE_ID)
+                .unwrap(),
             scene_bytes,
             "the undone edit is byte-identical to the original"
         );
@@ -11988,7 +12424,11 @@ mod tests {
         };
 
         let undone = restore(&undo_bytes);
-        assert_eq!(read_scene(), original, "the undo restores the original bytes");
+        assert_eq!(
+            read_scene(),
+            original,
+            "the undo restores the original bytes"
+        );
         let redo_bytes = undone.previous_resource().unwrap().to_vec();
         assert_eq!(
             redo_bytes, edited,
@@ -12178,22 +12618,24 @@ mod tests {
             "no marks writes no range"
         );
 
-        let (start_tick, end_tick, enabled) =
-            RunningDesktopIdeApplication::loop_range_ticks(
-                &prepared,
-                Some(IdeLoopRangeFrames {
-                    start_frame: 24_000,
-                    end_frame: 96_000,
-                    enabled: true,
-                }),
-            )
-            .unwrap()
-            .expect("a usable range converts");
+        let (start_tick, end_tick, enabled) = RunningDesktopIdeApplication::loop_range_ticks(
+            &prepared,
+            Some(IdeLoopRangeFrames {
+                start_frame: 24_000,
+                end_frame: 96_000,
+                enabled: true,
+            }),
+        )
+        .unwrap()
+        .expect("a usable range converts");
         assert!(
             start_tick < end_tick,
             "the start mark becomes the start tick, not the end"
         );
-        assert!(enabled, "and whether it was engaged survives the conversion");
+        assert!(
+            enabled,
+            "and whether it was engaged survives the conversion"
+        );
 
         let disengaged = RunningDesktopIdeApplication::loop_range_ticks(
             &prepared,
@@ -12496,7 +12938,11 @@ mod tests {
     fn the_export_journal_never_collides_with_its_destination() {
         let wav = Path::new("C:/Renders/night drive.wav");
         let journal = export_journal_path(wav).unwrap();
-        assert_eq!(journal.parent(), wav.parent(), "staging sits beside the file");
+        assert_eq!(
+            journal.parent(),
+            wav.parent(),
+            "staging sits beside the file"
+        );
         assert_ne!(journal, wav.to_path_buf());
         assert_eq!(
             journal.file_name().unwrap().to_str().unwrap(),
@@ -12606,7 +13052,9 @@ mod tests {
         let binding_id = {
             let opened =
                 hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
-            let id = opened.control_mapping().unwrap().bindings()[0].id().to_owned();
+            let id = opened.control_mapping().unwrap().bindings()[0]
+                .id()
+                .to_owned();
             drop(opened);
             id
         };
@@ -12647,9 +13095,7 @@ mod tests {
                 resource_bytes: mixer_bytes,
             };
             let plan = RunningDesktopIdeApplication::prepare_control_mapping_edit_from_project(
-                mixer_plan,
-                &prepared,
-                &edit,
+                mixer_plan, &prepared, &edit,
             )
             .unwrap();
             drop(prepared);
@@ -12694,11 +13140,7 @@ mod tests {
         }
     }
 
-    fn edge_source_insertion_case(
-        source: ControlSource,
-        expect_clock: bool,
-        expect_reset: bool,
-    ) {
+    fn edge_source_insertion_case(source: ControlSource, expect_clock: bool, expect_reset: bool) {
         let fixture = ArrangementProjectFixture::with_two_scenes();
         let project_path = fixture.root().to_path_buf();
         let config = desktop_ide_application_config().unwrap();
@@ -12750,7 +13192,8 @@ mod tests {
     }
 
     fn publish_first_control_binding(project_path: &Path, limits: ProjectPlaybackLimits) {
-        let prepared = hyper_project_loader::prepare_project_playback(project_path, limits).unwrap();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(project_path, limits).unwrap();
         let package = prepared.package();
         let mixer_id = package
             .manifest()
@@ -12794,7 +13237,8 @@ mod tests {
         limits: ProjectPlaybackLimits,
         take_id: &str,
     ) {
-        let prepared = hyper_project_loader::prepare_project_playback(project_path, limits).unwrap();
+        let prepared =
+            hyper_project_loader::prepare_project_playback(project_path, limits).unwrap();
         let package = prepared.package();
         let mixer = package
             .manifest()

@@ -26,33 +26,32 @@ use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSn
 
 use super::recording::{IdeRecordingPlan, IdeRecordingTarget, RecordingDesktopIdeApplication};
 use super::{
+    ControlBinding, ControlScope, ControlSource, ControlTarget, ControlTransform,
     DesktopIdeApplication, DesktopIdePendingClose, DesktopIdePendingSaveClose,
-    DesktopPlaybackRecovery, IdeApplicationConfig, IdeArrangementLocateError,
+    DesktopPlaybackRecovery, Edge, IdeApplicationConfig, IdeArrangementLocateError,
     IdeArrangementPlacementEditError, IdeAudioClipActivationEditError,
     IdeAudioClipDuplicationError, IdeAudioClipFadeEditError, IdeAudioClipGainEditError,
     IdeAudioClipLoopEditError, IdeAudioClipRenameEditError, IdeAudioClipReverseEditError,
-    IdeAudioClipSourceSlipEditError, IdeAudioInputInventory, IdeAudioOutputInventory,
+    IdeAudioClipSourceSlipEditError, IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome,
+    IdeAudioImportError, IdeAudioInputInventory, IdeAudioOutputInventory,
     IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioTrackAdditionError,
-    ControlBinding, ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
     IdeAudioTrackEditError, IdeAudioTrackRemovalError, IdeAutomationTakeCreationError,
-    IdeControlMappingEdit, IdeControlMappingEditError, IdeProjectExportError,
-    IdeLoopRangeFrames, IdeResourceRestoreError, IdeTempoEditError,
     IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
-    IdeInputDiscoveryError,
-    IdeInputSelection, IdeInputSelectionError, IdeLoudnessCommand, IdeLoudnessCommandError,
+    IdeControlMappingEdit, IdeControlMappingEditError, IdeInputDiscoveryError, IdeInputSelection,
+    IdeInputSelectionError, IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessCommandError,
     IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
     IdeMixerMainState, IdeMonitoringCommand, IdeMonitoringCommandError, IdeMonitoringState,
     IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError,
     IdeOutputTestError, IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
     IdePendingCloseWait, IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait,
-    IdePendingSaveCloseWait, IdeProjectOpenError, IdeProjectSaveError, IdeRecordingAbortError,
-    IdeRecordingAbortOutcome, IdeRecordingClipCreationError, IdeRecordingError,
-    IdeRecordingImportOutcome, IdeRecordingObservation, IdeSaveCloseOutcome, IdeSceneAvailability,
-    IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneEditError, IdeSceneLaunchQuantization,
-    IdeSceneRenameError, IdeSceneSlotEdit, IdeSceneSlotEditError, IdeTransportSeekError,
-    InputInventoryError, LocateState, OutputInventoryError, OutputStreamSnapshot,
-    OutputStreamState, OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication,
-    RunningIdeSnapshot,
+    IdePendingSaveCloseWait, IdeProjectExportError, IdeProjectOpenError, IdeProjectSaveError,
+    IdeRecordingAbortError, IdeRecordingAbortOutcome, IdeRecordingClipCreationError,
+    IdeRecordingError, IdeRecordingImportOutcome, IdeRecordingObservation, IdeResourceRestoreError,
+    IdeSaveCloseOutcome, IdeSceneAvailability, IdeSceneCreationError, IdeSceneDuplicationError,
+    IdeSceneEditError, IdeSceneLaunchQuantization, IdeSceneRenameError, IdeSceneSlotEdit,
+    IdeSceneSlotEditError, IdeTempoEditError, IdeTransportSeekError, InputInventoryError,
+    LocateState, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
+    OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication, RunningIdeSnapshot,
 };
 
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
@@ -142,6 +141,7 @@ pub enum IdeWorkerCommandKind {
     RemoveAudioTrack,
     RenameAudioTrack,
     SetAudioTrackActive,
+    ImportAudio,
     CreateAudioClipFromTake,
     DuplicateAudioClip,
     AddArrangementPlacement,
@@ -242,6 +242,10 @@ pub enum IdeWorkerCommand {
     SetAudioTrackActive {
         track_id: String,
         active: bool,
+    },
+    ImportAudio {
+        paths: Vec<PathBuf>,
+        track_id: String,
     },
     CreateAudioClipFromTake {
         recording_id: String,
@@ -419,6 +423,7 @@ impl IdeWorkerCommand {
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
             Self::RenameAudioTrack { .. } => IdeWorkerCommandKind::RenameAudioTrack,
             Self::SetAudioTrackActive { .. } => IdeWorkerCommandKind::SetAudioTrackActive,
+            Self::ImportAudio { .. } => IdeWorkerCommandKind::ImportAudio,
             Self::CreateAudioClipFromTake { .. } => IdeWorkerCommandKind::CreateAudioClipFromTake,
             Self::DuplicateAudioClip { .. } => IdeWorkerCommandKind::DuplicateAudioClip,
             Self::AddArrangementPlacement { .. } => IdeWorkerCommandKind::AddArrangementPlacement,
@@ -428,9 +433,7 @@ impl IdeWorkerCommand {
             Self::MoveArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::MoveArrangementSceneLaunch
             }
-            Self::SetArrangementLoopRange { .. } => {
-                IdeWorkerCommandKind::SetArrangementLoopRange
-            }
+            Self::SetArrangementLoopRange { .. } => IdeWorkerCommandKind::SetArrangementLoopRange,
             Self::SetTempo { .. } => IdeWorkerCommandKind::SetTempo,
             Self::SetMeter { .. } => IdeWorkerCommandKind::SetMeter,
             Self::SetArrangementSceneLaunchScene { .. } => {
@@ -949,9 +952,10 @@ fn control_scene_label(scene_id: &str, snapshot: &RunningIdeSnapshot<'_>) -> Str
     snapshot.scene_ids[..snapshot.scene_count]
         .iter()
         .position(|id| *id == scene_id)
-        .map_or_else(|| scene_id.to_owned(), |index| {
-            snapshot.scene_names[index].to_owned()
-        })
+        .map_or_else(
+            || scene_id.to_owned(),
+            |index| snapshot.scene_names[index].to_owned(),
+        )
 }
 
 fn control_send_label(send_id: &str, snapshot: &RunningIdeSnapshot<'_>) -> String {
@@ -979,10 +983,7 @@ fn control_target_label(target: &ControlTarget, snapshot: &RunningIdeSnapshot<'_
             control_track_label(track_id, snapshot),
             format!("{parameter:?}").to_lowercase()
         ),
-        ControlTarget::MixerSend {
-            send_id,
-            parameter,
-        } => format!(
+        ControlTarget::MixerSend { send_id, parameter } => format!(
             "{} send {}",
             control_send_label(send_id, snapshot),
             format!("{parameter:?}").to_lowercase()
@@ -1039,6 +1040,19 @@ pub struct IdeMixerSend {
 }
 
 impl IdeMixerChannel {
+    #[cfg(any(test, feature = "ui-test-support"))]
+    #[must_use]
+    pub fn for_test(id: &str, name: &str, kind: IdeMixerChannelKind) -> Self {
+        Self {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            kind,
+            active: true,
+            state: None,
+            sends: Vec::new(),
+        }
+    }
+
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
@@ -1388,7 +1402,10 @@ impl fmt::Display for IdeRuntimePreparationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Save(source) => {
-                write!(formatter, "project could not be saved for Runtime: {source}")
+                write!(
+                    formatter,
+                    "project could not be saved for Runtime: {source}"
+                )
             }
             Self::Bundle(source) => write!(
                 formatter,
@@ -1443,6 +1460,15 @@ pub enum IdeWorkerCommandFailure {
     AudioTrackRemoval(Box<super::IdeAudioTrackRemovalError>),
     AudioTrackRename(Box<super::IdeAudioTrackEditError>),
     AudioTrackActivation(Box<super::IdeAudioTrackEditError>),
+    AudioImport(Box<super::IdeAudioImportBatchFailure>),
+    AudioImportReopen {
+        outcome: IdeAudioImportBatchOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    AudioImportAndReopen {
+        import: Box<IdeAudioImportBatchFailure>,
+        reopen: Box<IdeProjectOpenError>,
+    },
     RecordingClipCreation(Box<IdeRecordingClipCreationError>),
     AudioClipDuplication(Box<IdeAudioClipDuplicationError>),
     ArrangementPlacementAddition(Box<IdeArrangementPlacementEditError>),
@@ -1497,7 +1523,11 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::ProjectCreation(source) => source.fmt(formatter),
             Self::ProjectOpen(source) => source.fmt(formatter),
             Self::RecentProjectMissing(path) => {
-                write!(formatter, "recent project no longer exists at {}", path.display())
+                write!(
+                    formatter,
+                    "recent project no longer exists at {}",
+                    path.display()
+                )
             }
             Self::Transport(source) => source.fmt(formatter),
             Self::Seek(source) => source.fmt(formatter),
@@ -1513,6 +1543,17 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioTrackRename(source) | Self::AudioTrackActivation(source) => {
                 source.fmt(formatter)
             }
+            Self::AudioImport(source) => source.fmt(formatter),
+            Self::AudioImportReopen { outcome, source } => write!(
+                formatter,
+                "{} audio files were imported through project revision {}, but the project could not be reopened: {source}",
+                outcome.imported(),
+                outcome.final_revision()
+            ),
+            Self::AudioImportAndReopen { import, reopen } => write!(
+                formatter,
+                "audio import failed ({import}) and the project could not be reopened ({reopen})"
+            ),
             Self::RecordingClipCreation(source) => source.fmt(formatter),
             Self::AudioClipDuplication(source) => source.fmt(formatter),
             Self::ArrangementPlacementAddition(source)
@@ -1584,6 +1625,9 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioTrackAddition(source) => Some(source),
             Self::AudioTrackRemoval(source) => Some(source),
             Self::AudioTrackRename(source) | Self::AudioTrackActivation(source) => Some(source),
+            Self::AudioImport(source) => Some(source),
+            Self::AudioImportReopen { source, .. } => Some(source.as_ref()),
+            Self::AudioImportAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::RecordingClipCreation(source) => Some(source),
             Self::AudioClipDuplication(source) => Some(source),
             Self::ArrangementPlacementAddition(source)
@@ -1713,6 +1757,7 @@ pub enum IdeWorkerEvent {
         changed: bool,
         active: bool,
     },
+    AudioImported(IdeAudioImportBatchOutcome),
     AudioClipCreatedFromTake {
         revision: u64,
         clip_id: String,
@@ -1933,6 +1978,9 @@ pub enum IdeWorkerEvent {
     AudioTrackRenaming,
     AudioTrackActivationChanging {
         active: bool,
+    },
+    AudioImporting {
+        files: usize,
     },
     AudioClipCreatingFromTake,
     AudioClipDuplicating,
@@ -2401,6 +2449,10 @@ enum ProjectMutation {
         track_id: String,
         active: bool,
     },
+    ImportAudio {
+        paths: Vec<PathBuf>,
+        track_id: String,
+    },
     CreateAudioClipFromTake {
         recording_id: String,
         name: String,
@@ -2536,9 +2588,7 @@ enum ProjectMutation {
 impl ProjectMutation {
     const fn command(&self) -> IdeWorkerCommandKind {
         match self {
-            Self::SetArrangementLoopRange { .. } => {
-                IdeWorkerCommandKind::SetArrangementLoopRange
-            }
+            Self::SetArrangementLoopRange { .. } => IdeWorkerCommandKind::SetArrangementLoopRange,
             Self::SetTempo { .. } => IdeWorkerCommandKind::SetTempo,
             Self::SetMeter { .. } => IdeWorkerCommandKind::SetMeter,
             Self::SaveMixer => IdeWorkerCommandKind::SaveProject,
@@ -2547,6 +2597,7 @@ impl ProjectMutation {
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
             Self::RenameAudioTrack { .. } => IdeWorkerCommandKind::RenameAudioTrack,
             Self::SetAudioTrackActive { .. } => IdeWorkerCommandKind::SetAudioTrackActive,
+            Self::ImportAudio { .. } => IdeWorkerCommandKind::ImportAudio,
             Self::CreateAudioClipFromTake { .. } => IdeWorkerCommandKind::CreateAudioClipFromTake,
             Self::DuplicateAudioClip { .. } => IdeWorkerCommandKind::DuplicateAudioClip,
             Self::AddArrangementPlacement { .. } => IdeWorkerCommandKind::AddArrangementPlacement,
@@ -2614,6 +2665,9 @@ impl ProjectMutation {
             Self::RenameAudioTrack { .. } => IdeWorkerEvent::AudioTrackRenaming,
             Self::SetAudioTrackActive { active, .. } => {
                 IdeWorkerEvent::AudioTrackActivationChanging { active: *active }
+            }
+            Self::ImportAudio { paths, .. } => {
+                IdeWorkerEvent::AudioImporting { files: paths.len() }
             }
             Self::CreateAudioClipFromTake { .. } => IdeWorkerEvent::AudioClipCreatingFromTake,
             Self::DuplicateAudioClip { .. } => IdeWorkerEvent::AudioClipDuplicating,
@@ -2855,6 +2909,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::Monitoring
         | IdeWorkerCommandKind::AddAudioTrack
         | IdeWorkerCommandKind::RemoveAudioTrack
+        | IdeWorkerCommandKind::ImportAudio
         | IdeWorkerCommandKind::CreateAudioClipFromTake
         | IdeWorkerCommandKind::DuplicateAudioClip
         | IdeWorkerCommandKind::EditControlMapping
@@ -2888,8 +2943,12 @@ fn run_worker(
         return finish_worker(state, unpublished_native_failure);
     }
     loop {
-        if !poll_pending_state(&mut state, events, &mut unpublished_native_failure, &mut history)
-        {
+        if !poll_pending_state(
+            &mut state,
+            events,
+            &mut unpublished_native_failure,
+            &mut history,
+        ) {
             return finish_worker(state, unpublished_native_failure);
         }
         let command = if matches!(
@@ -3093,15 +3152,13 @@ fn process_command(
             unpublished_native_failure,
             project_history,
         ),
-        IdeWorkerCommand::OpenProject(path) => {
-            open_project(
-                state,
-                path,
-                events,
-                unpublished_native_failure,
-                project_history,
-            )
-        }
+        IdeWorkerCommand::OpenProject(path) => open_project(
+            state,
+            path,
+            events,
+            unpublished_native_failure,
+            project_history,
+        ),
         IdeWorkerCommand::OpenRecentProject(path) => open_recent_project(
             state,
             path,
@@ -3146,6 +3203,7 @@ fn process_command(
         | IdeWorkerCommand::RemoveAudioTrack { .. }
         | IdeWorkerCommand::RenameAudioTrack { .. }
         | IdeWorkerCommand::SetAudioTrackActive { .. }
+        | IdeWorkerCommand::ImportAudio { .. }
         | IdeWorkerCommand::CreateAudioClipFromTake { .. }
         | IdeWorkerCommand::DuplicateAudioClip { .. }
         | IdeWorkerCommand::AddArrangementPlacement { .. }
@@ -3276,6 +3334,9 @@ fn process_project_mutation_command(
         IdeWorkerCommand::SetAudioTrackActive { track_id, active } => {
             set_audio_track_active(state, events, &track_id, active)
         }
+        IdeWorkerCommand::ImportAudio { paths, track_id } => {
+            import_audio(state, events, paths, track_id)
+        }
         IdeWorkerCommand::CreateAudioClipFromTake { recording_id, name } => {
             create_audio_clip_from_take(state, events, &recording_id, &name)
         }
@@ -3336,9 +3397,7 @@ fn process_project_mutation_command(
         IdeWorkerCommand::SetAutomationTakeActive { take_id, enabled } => {
             set_automation_take_active(state, events, &take_id, enabled)
         }
-        IdeWorkerCommand::EditControlMapping { edit } => {
-            edit_control_mapping(state, events, edit)
-        }
+        IdeWorkerCommand::EditControlMapping { edit } => edit_control_mapping(state, events, edit),
         IdeWorkerCommand::Undo => restore_edit(state, events, history, false),
         IdeWorkerCommand::Redo => restore_edit(state, events, history, true),
         IdeWorkerCommand::DuplicateScene { scene_id, name } => {
@@ -3357,6 +3416,38 @@ fn process_project_mutation_command(
         }
         _ => unreachable!("only project-mutation commands are routed to this handler"),
     }
+}
+
+fn import_audio(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    paths: Vec<PathBuf>,
+    track_id: String,
+) -> bool {
+    let invalid = if paths.is_empty() {
+        Some(IdeAudioImportError::EmptySelection)
+    } else if track_id.is_empty() {
+        Some(IdeAudioImportError::InvalidDestinationTrack)
+    } else {
+        None
+    };
+    if let Some(source) = invalid {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::ImportAudio,
+            IdeWorkerCommandFailure::AudioImport(Box::new(IdeAudioImportBatchFailure {
+                completed: 0,
+                total: paths.len(),
+                path: paths.first().cloned().unwrap_or_default(),
+                source: Box::new(source),
+            })),
+        );
+    }
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::ImportAudio { paths, track_id },
+    )
 }
 
 fn process_arrangement_mutation_command(
@@ -5343,7 +5434,11 @@ fn add_automation_take(
     }
     normalized_name.push_str(name);
     request.name = normalized_name;
-    begin_project_mutation_request(state, events, ProjectMutation::AddAutomationTake { request })
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::AddAutomationTake { request },
+    )
 }
 
 fn export_project(
@@ -5476,6 +5571,10 @@ enum HistoryEffect<'a> {
 /// omitted `AddArrangementPlacement`, `DuplicateArrangementPlacement`, and
 /// `SplitArrangementPlacement`, which replace the same arrangement document as
 /// the operations it did list, so an undo reverted work it never captured.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive mutation table keeps every success, partial commit, and refusal tied to its undo-history effect"
+)]
 fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
     match attempt {
         ProjectMutationAttempt::PrepareRuntime(attempt) => attempt
@@ -5485,42 +5584,133 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         ProjectMutationAttempt::Save(Ok(outcome))
         | ProjectMutationAttempt::RenameAudioTrack(Ok(outcome))
         | ProjectMutationAttempt::RemoveArrangementPlacement(Ok(outcome))
-        | ProjectMutationAttempt::SetAudioTrackActive { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetArrangementLoopRange { result: Ok(outcome) }
-        | ProjectMutationAttempt::SetTempo { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetMeter { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetArrangementSceneLaunchScene { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::RemoveArrangementSceneLaunch { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetArrangementPlacementActive { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetSceneSlot { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::MoveArrangementPlacement { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetArrangementPlacementDuration { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::TrimArrangementPlacementFront { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::RenameAudioClip { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetAudioClipActive { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetAudioClipGain { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetAudioClipFades { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetAudioClipLoop { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetAudioClipReverse { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetAudioClipSourceStart { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::AddScene { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::AddAutomationTake { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetAutomationTakeActive { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::DuplicateScene { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::RenameScene { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::SetSceneActive { result: Ok(outcome), .. }
-        | ProjectMutationAttempt::RestoreResource { result: Ok(outcome), .. } => {
-            HistoryEffect::Replacement(outcome)
+        | ProjectMutationAttempt::SetAudioTrackActive {
+            result: Ok(outcome),
+            ..
         }
-        ProjectMutationAttempt::AddArrangementPlacement { result: Ok(publication), .. }
-        | ProjectMutationAttempt::DuplicateArrangementPlacement { result: Ok(publication), .. }
-        | ProjectMutationAttempt::SplitArrangementPlacement { result: Ok(publication), .. } => {
-            HistoryEffect::Replacement(&publication.outcome)
+        | ProjectMutationAttempt::AddArrangementSceneLaunch {
+            result: Ok(outcome),
+            ..
         }
+        | ProjectMutationAttempt::MoveArrangementSceneLaunch {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::SetArrangementLoopRange {
+            result: Ok(outcome),
+        }
+        | ProjectMutationAttempt::SetTempo {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::SetMeter {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::SetArrangementSceneLaunchScene {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::RemoveArrangementSceneLaunch {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::SetArrangementPlacementActive {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::SetSceneSlot {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::MoveArrangementPlacement {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::SetArrangementPlacementDuration {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::TrimArrangementPlacementFront {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::RenameAudioClip {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::SetAudioClipActive {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::SetAudioClipGain {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::SetAudioClipFades {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::SetAudioClipLoop {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::SetAudioClipReverse {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::SetAudioClipSourceStart {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::AddScene {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::AddAutomationTake {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::SetAutomationTakeActive {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::DuplicateScene {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::RenameScene {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::SetSceneActive {
+            result: Ok(outcome),
+            ..
+        }
+        | ProjectMutationAttempt::RestoreResource {
+            result: Ok(outcome),
+            ..
+        } => HistoryEffect::Replacement(outcome),
+        ProjectMutationAttempt::AddArrangementPlacement {
+            result: Ok(publication),
+            ..
+        }
+        | ProjectMutationAttempt::DuplicateArrangementPlacement {
+            result: Ok(publication),
+            ..
+        }
+        | ProjectMutationAttempt::SplitArrangementPlacement {
+            result: Ok(publication),
+            ..
+        } => HistoryEffect::Replacement(&publication.outcome),
         ProjectMutationAttempt::AddAudioTrack(Ok(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Ok(_))
+        | ProjectMutationAttempt::ImportAudio(
+            Ok(_)
+            | Err(IdeAudioImportBatchFailure {
+                completed: 1.., ..
+            }),
+        )
         | ProjectMutationAttempt::CreateAudioClipFromTake(Ok(_))
         | ProjectMutationAttempt::DuplicateAudioClip { result: Ok(_), .. }
         | ProjectMutationAttempt::EditControlMapping { result: Ok(_), .. } => {
@@ -5529,6 +5719,10 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         ProjectMutationAttempt::Save(Err(_))
         | ProjectMutationAttempt::AddAudioTrack(Err(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Err(_))
+        | ProjectMutationAttempt::ImportAudio(Err(IdeAudioImportBatchFailure {
+            completed: 0,
+            ..
+        }))
         | ProjectMutationAttempt::RenameAudioTrack(Err(_))
         | ProjectMutationAttempt::CreateAudioClipFromTake(Err(_))
         | ProjectMutationAttempt::RemoveArrangementPlacement(Err(_))
@@ -5581,7 +5775,11 @@ fn restore_edit(
     let Some(entry) = history.peek(redo).cloned() else {
         return publish_failure(events, command, IdeWorkerCommandFailure::NothingToRestore);
     };
-    begin_project_mutation_request(state, events, ProjectMutation::RestoreResource { entry, redo })
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::RestoreResource { entry, redo },
+    )
 }
 
 fn edit_control_mapping(
@@ -5628,12 +5826,11 @@ fn attempt_control_mapping_edit(
     if let Some(failure) = native_failure {
         return Err(IdeControlMappingEditError::NativeClose(failure));
     }
-    RunningDesktopIdeApplication::prepare_control_mapping_edit(application, recovery, edit).and_then(
-        |plan| {
+    RunningDesktopIdeApplication::prepare_control_mapping_edit(application, recovery, edit)
+        .and_then(|plan| {
             plan.publish()
                 .map_err(|source| IdeControlMappingEditError::Publication(Box::new(source)))
-        },
-    )
+        })
 }
 
 fn control_mapping_edit_reopen_failure(
@@ -6149,6 +6346,14 @@ fn project_mutation_save_failure(
                 IdeAudioTrackEditError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::ImportAudio { paths, .. } => IdeWorkerCommandFailure::AudioImport(
+            Box::new(IdeAudioImportBatchFailure {
+                completed: 0,
+                total: paths.len(),
+                path: paths.first().cloned().unwrap_or_default(),
+                source: Box::new(IdeAudioImportError::MixerSave(Box::new(reason))),
+            }),
+        ),
         ProjectMutation::CreateAudioClipFromTake { .. } => {
             IdeWorkerCommandFailure::RecordingClipCreation(Box::new(
                 IdeRecordingClipCreationError::MixerSave(Box::new(reason)),
@@ -6362,9 +6567,9 @@ fn project_mutation_native_close_failure(
             IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::NativeClose(failure))
         }
         ProjectMutation::PrepareRuntime { .. } => {
-            IdeWorkerCommandFailure::RuntimePreparation(Box::new(
-                IdeRuntimePreparationError::Save(IdeProjectSaveError::NativeClose(failure)),
-            ))
+            IdeWorkerCommandFailure::RuntimePreparation(Box::new(IdeRuntimePreparationError::Save(
+                IdeProjectSaveError::NativeClose(failure),
+            )))
         }
         ProjectMutation::AddAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackAddition(
             Box::new(IdeAudioTrackAdditionError::NativeClose(failure)),
@@ -6380,6 +6585,14 @@ fn project_mutation_native_close_failure(
                 IdeAudioTrackEditError::NativeClose(failure),
             ))
         }
+        ProjectMutation::ImportAudio { paths, .. } => IdeWorkerCommandFailure::AudioImport(
+            Box::new(IdeAudioImportBatchFailure {
+                completed: 0,
+                total: paths.len(),
+                path: paths.first().cloned().unwrap_or_default(),
+                source: Box::new(IdeAudioImportError::NativeClose(failure)),
+            }),
+        ),
         ProjectMutation::CreateAudioClipFromTake { .. } => {
             IdeWorkerCommandFailure::RecordingClipCreation(Box::new(
                 IdeRecordingClipCreationError::NativeClose(failure),
@@ -6542,6 +6755,7 @@ enum ProjectMutationAttempt {
         result:
             Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAudioTrackEditError>,
     },
+    ImportAudio(Result<IdeAudioImportBatchOutcome, IdeAudioImportBatchFailure>),
     CreateAudioClipFromTake(
         Result<hyper_storage_engine::AudioClipPublicationOutcome, IdeRecordingClipCreationError>,
     ),
@@ -6565,17 +6779,11 @@ enum ProjectMutationAttempt {
     SetMeter {
         numerator: u16,
         denominator: u16,
-        result: Result<
-            hyper_storage_engine::ProjectResourcePublicationOutcome,
-            IdeTempoEditError,
-        >,
+        result: Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeTempoEditError>,
     },
     SetTempo {
         microseconds_per_quarter: u32,
-        result: Result<
-            hyper_storage_engine::ProjectResourcePublicationOutcome,
-            IdeTempoEditError,
-        >,
+        result: Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeTempoEditError>,
     },
     SetArrangementLoopRange {
         result: Result<
@@ -6904,9 +7112,7 @@ pub(super) fn scene_creation_failure_event(
     }
 }
 
-fn automation_take_activation_failure_event(
-    reason: IdeAutomationTakeEditError,
-) -> IdeWorkerEvent {
+fn automation_take_activation_failure_event(reason: IdeAutomationTakeEditError) -> IdeWorkerEvent {
     if reason.publication_committed() {
         IdeWorkerEvent::AutomationTakeActivationCommittedWithWarning {
             warning: Box::new(reason),
@@ -7118,6 +7324,14 @@ fn complete_project_mutation(
                     IdeWorkerCommandKind::SetAudioTrackActive,
                     IdeWorkerCommandFailure::AudioTrackActivation(Box::new(reason)),
                 ),
+                ProjectMutationAttempt::ImportAudio(Ok(outcome)) => {
+                    send_event(events, IdeWorkerEvent::AudioImported(outcome))
+                }
+                ProjectMutationAttempt::ImportAudio(Err(reason)) => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::ImportAudio,
+                    IdeWorkerCommandFailure::AudioImport(Box::new(reason)),
+                ),
                 ProjectMutationAttempt::CreateAudioClipFromTake(Ok(outcome)) => send_event(
                     events,
                     IdeWorkerEvent::AudioClipCreatedFromTake {
@@ -7253,22 +7467,22 @@ fn complete_project_mutation(
                         }
                     },
                 ),
-                ProjectMutationAttempt::SetArrangementLoopRange { result: Ok(outcome) } => {
-                    send_event(
-                        events,
-                        IdeWorkerEvent::ArrangementLoopRangeChanged {
-                            revision: outcome.project_revision(),
-                        },
-                    )
-                }
-                ProjectMutationAttempt::SetArrangementLoopRange { result: Err(reason) } => {
-                    publish_arrangement_edit_failure(
-                        events,
-                        IdeWorkerCommandKind::SetArrangementLoopRange,
-                        reason,
-                        IdeWorkerCommandFailure::ArrangementLoopRange,
-                    )
-                }
+                ProjectMutationAttempt::SetArrangementLoopRange {
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::ArrangementLoopRangeChanged {
+                        revision: outcome.project_revision(),
+                    },
+                ),
+                ProjectMutationAttempt::SetArrangementLoopRange {
+                    result: Err(reason),
+                } => publish_arrangement_edit_failure(
+                    events,
+                    IdeWorkerCommandKind::SetArrangementLoopRange,
+                    reason,
+                    IdeWorkerCommandFailure::ArrangementLoopRange,
+                ),
                 ProjectMutationAttempt::MoveArrangementSceneLaunch {
                     launch_id,
                     tick,
@@ -7851,6 +8065,24 @@ fn attempt_project_mutation(
                 },
             }
         }
+        ProjectMutation::ImportAudio { paths, track_id } => {
+            ProjectMutationAttempt::ImportAudio(if let Some(failure) = native_failure {
+                let total = paths.len();
+                Err(IdeAudioImportBatchFailure {
+                    completed: 0,
+                    total,
+                    path: paths.first().cloned().unwrap_or_default(),
+                    source: Box::new(IdeAudioImportError::NativeClose(failure)),
+                })
+            } else {
+                RunningDesktopIdeApplication::import_audio_files(
+                    application,
+                    recovery,
+                    &paths,
+                    &track_id,
+                )
+            })
+        }
         ProjectMutation::CreateAudioClipFromTake { recording_id, name } => {
             ProjectMutationAttempt::CreateAudioClipFromTake(if let Some(failure) = native_failure {
                 Err(IdeRecordingClipCreationError::NativeClose(failure))
@@ -8417,10 +8649,8 @@ fn attempt_automation_take_creation(
     recovery: &DesktopPlaybackRecovery,
     request: &IdeAutomationTakeRequest,
     native_failure: Option<IdeNativeCloseFailure>,
-) -> Result<
-    hyper_storage_engine::ProjectResourcePublicationOutcome,
-    IdeAutomationTakeCreationError,
-> {
+) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAutomationTakeCreationError>
+{
     if let Some(failure) = native_failure {
         return Err(IdeAutomationTakeCreationError::NativeClose(failure));
     }
@@ -8908,6 +9138,18 @@ fn project_mutation_reopen_failure(
                 reopen,
                 IdeWorkerCommandFailure::AudioTrackActivation,
             )
+        }
+        ProjectMutationAttempt::ImportAudio(Ok(outcome)) => {
+            IdeWorkerCommandFailure::AudioImportReopen {
+                outcome,
+                source: Box::new(reopen),
+            }
+        }
+        ProjectMutationAttempt::ImportAudio(Err(import)) => {
+            IdeWorkerCommandFailure::AudioImportAndReopen {
+                import: Box::new(import),
+                reopen: Box::new(reopen),
+            }
         }
         ProjectMutationAttempt::CreateAudioClipFromTake(result) => {
             recording_clip_creation_reopen_failure(result, reopen)
@@ -9743,17 +9985,15 @@ fn poll_pending_state(
                 application,
                 recovery,
                 failure,
-            } => {
-                complete_project_mutation(
-                    state,
-                    application,
-                    recovery,
-                    operation,
-                    failure,
-                    events,
-                    history,
-                )
-            }
+            } => complete_project_mutation(
+                state,
+                application,
+                recovery,
+                operation,
+                failure,
+                events,
+                history,
+            ),
             IdePendingSaveCloseWait::TimedOut(pending) => {
                 *state = WorkerState::Saving { pending, operation };
                 true
@@ -10428,6 +10668,28 @@ mod tests {
         )
     }
 
+    fn mono_pcm16_wav(sample_rate_hz: u32, samples: &[i16]) -> Vec<u8> {
+        let data_bytes = u32::try_from(std::mem::size_of_val(samples)).unwrap();
+        let byte_rate = sample_rate_hz * 2;
+        let mut bytes = Vec::with_capacity(44 + samples.len() * 2);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate_hz.to_le_bytes());
+        bytes.extend_from_slice(&byte_rate.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
+    }
+
     fn output_testing_application(
         stop_failure: Option<IdeNativeCloseFailure>,
     ) -> OutputTestingDesktopIdeApplication {
@@ -10511,7 +10773,9 @@ mod tests {
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
 
         worker
-            .try_send(IdeWorkerCommand::OpenRecentProject(canonical_project.clone()))
+            .try_send(IdeWorkerCommand::OpenRecentProject(
+                canonical_project.clone(),
+            ))
             .unwrap();
         assert!(matches!(
             recv(&worker),
@@ -10524,7 +10788,9 @@ mod tests {
 
         std::fs::remove_dir(&project).unwrap();
         worker
-            .try_send(IdeWorkerCommand::OpenRecentProject(canonical_project.clone()))
+            .try_send(IdeWorkerCommand::OpenRecentProject(
+                canonical_project.clone(),
+            ))
             .unwrap();
         assert!(matches!(
             recv(&worker),
@@ -10570,10 +10836,15 @@ mod tests {
             3,
         )
         .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RecentProjectsChanged { .. }
+        ));
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
-            .try_send(IdeWorkerCommand::OpenRecentProject(canonical_project.clone()))
+            .try_send(IdeWorkerCommand::OpenRecentProject(
+                canonical_project.clone(),
+            ))
             .unwrap();
         assert!(matches!(
             recv(&worker),
@@ -10627,12 +10898,16 @@ mod tests {
             4,
         )
         .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.is_empty()));
+        assert!(
+            matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.is_empty())
+        );
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(existing.clone()))
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.len() == 1 && projects[0].name() == " Existing\n"));
+        assert!(
+            matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.len() == 1 && projects[0].name() == " Existing\n")
+        );
         assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
         assert_eq!(history.load().unwrap()[0].path(), existing);
         assert_eq!(shutdown_report(worker).native_failure(), None);
@@ -10644,7 +10919,9 @@ mod tests {
             4,
         )
         .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.len() == 1));
+        assert!(
+            matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.len() == 1)
+        );
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::CreateProject {
@@ -10653,12 +10930,213 @@ mod tests {
                 project_name: "Created".to_owned(),
             })
             .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.len() == 2 && projects[0].name() == "Created"));
+        assert!(
+            matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.len() == 2 && projects[0].name() == "Created")
+        );
         assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
         assert_eq!(history.load().unwrap()[0].name(), "Created");
         assert_eq!(shutdown_report(worker).native_failure(), None);
 
         std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn running_worker_imports_each_audio_file_and_reopens_once_with_the_committed_batch() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-audio-import-success-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        let initial_revision = created.project().manifest().revision();
+        drop(created);
+        let first = fixture.join("Kick.wav");
+        let second = fixture.join("Snare.WAV");
+        std::fs::write(&first, mono_pcm16_wav(44_100, &[1_000; 441])).unwrap();
+        std::fs::write(&second, mono_pcm16_wav(48_000, &[-1_000; 480])).unwrap();
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 5)
+                .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the verified project must open before import");
+        };
+        let original_generation = opened.playback_session_generation();
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .unwrap()
+            .id()
+            .to_owned();
+
+        worker
+            .try_send(IdeWorkerCommand::ImportAudio {
+                paths: vec![first, second],
+                track_id: track_id.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioImporting { files: 2 }
+        ));
+        let IdeWorkerEvent::Running(reopened) = recv(&worker) else {
+            panic!("the worker must publish the reloaded committed project first");
+        };
+        let completion = recv(&worker);
+        assert_ne!(
+            reopened.playback_session_generation(),
+            original_generation,
+            "the native playback owner is replaced exactly at the worker fence"
+        );
+        let IdeWorkerEvent::AudioImported(outcome) = completion else {
+            panic!("the successful batch must be reported after the reloaded state: {completion:?}");
+        };
+        assert_eq!(reopened.audio_clips().len(), 2);
+        assert_eq!(
+            reopened
+                .audio_clips()
+                .iter()
+                .map(IdeAudioClip::name)
+                .collect::<Vec<_>>(),
+            ["Kick", "Snare"]
+        );
+        assert!(
+            reopened
+                .audio_clips()
+                .iter()
+                .all(|clip| clip.track_id() == track_id && clip.source_frame_count() == 480)
+        );
+        assert_eq!(outcome.imported(), 2);
+        assert_eq!(outcome.clip_ids().len(), 2);
+        assert_eq!(outcome.final_revision(), initial_revision + 2);
+        assert_eq!(
+            verify_project_package(&project).unwrap().manifest().revision(),
+            initial_revision + 2
+        );
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn running_worker_stops_audio_batch_at_the_first_failure_and_keeps_prior_commits() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-audio-import-partial-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        let initial_revision = created.project().manifest().revision();
+        drop(created);
+        let valid = fixture.join("Bass.wav");
+        let unsupported = fixture.join("Lead.mp3");
+        std::fs::write(&valid, mono_pcm16_wav(48_000, &[500; 48])).unwrap();
+        std::fs::write(&unsupported, b"not an accepted container").unwrap();
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 5)
+                .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the project must open");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .unwrap()
+            .id()
+            .to_owned();
+        worker
+            .try_send(IdeWorkerCommand::ImportAudio {
+                paths: vec![valid, unsupported.clone()],
+                track_id,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioImporting { files: 2 }
+        ));
+        let reopened = recv(&worker);
+        let completion = recv(&worker);
+        assert!(matches!(
+            reopened,
+            IdeWorkerEvent::Running(ref observation)
+                if observation.audio_clips().len() == 1
+                    && observation.audio_clips()[0].name() == "Bass"
+        ), "unexpected reopened state: {reopened:?}; completion: {completion:?}");
+        assert!(matches!(
+            completion,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportAudio,
+                reason: IdeWorkerCommandFailure::AudioImport(reason),
+            } if reason.completed() == 1
+                && reason.total() == 2
+                && reason.path() == unsupported
+                && matches!(reason.reason(), IdeAudioImportError::UnsupportedContainer)
+        ));
+        assert_eq!(
+            verify_project_package(&project).unwrap().manifest().revision(),
+            initial_revision + 1,
+            "the first independent publication survives the later refusal"
+        );
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn invalid_audio_import_request_is_rejected_without_closing_playback() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 2).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                ..
+            }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::ImportAudio {
+                paths: Vec::new(),
+                track_id: "track".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportAudio,
+                reason: IdeWorkerCommandFailure::AudioImport(reason),
+            } if reason.completed() == 0
+                && reason.total() == 0
+                && matches!(reason.reason(), IdeAudioImportError::EmptySelection)
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
     }
 
     #[test]
@@ -10682,7 +11160,10 @@ mod tests {
             3,
         )
         .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RecentProjectsChanged { .. }
+        ));
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(fixture.join("missing")))
@@ -10706,7 +11187,10 @@ mod tests {
             3,
         )
         .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RecentProjectsChanged { .. }
+        ));
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::CreateProject {
@@ -10766,7 +11250,9 @@ mod tests {
             4,
         )
         .unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.is_empty()));
+        assert!(
+            matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.is_empty())
+        );
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
         worker
             .try_send(IdeWorkerCommand::OpenProject(project))
@@ -12878,8 +13364,7 @@ mod tests {
     /// A real project whose mixer has been replaced once, so the outcome under
     /// test is the one production publishes rather than a hand-built value.
     fn captured_mixer_edit(name: &str) -> CapturedEdit {
-        let parent = std::env::temp_dir()
-            .join(format!("hyper-undo-{name}-{}", std::process::id()));
+        let parent = std::env::temp_dir().join(format!("hyper-undo-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&parent);
         std::fs::create_dir(&parent).unwrap();
         let created = hyper_storage_engine::create_project(
@@ -13426,8 +13911,12 @@ mod tests {
             "a committed publication is visible through the reopen wrapper"
         );
 
-        let (event, consumed) =
-            restore_failure_event(&mut history, &labelled("scene", "scene rename"), false, reason);
+        let (event, consumed) = restore_failure_event(
+            &mut history,
+            &labelled("scene", "scene rename"),
+            false,
+            reason,
+        );
         assert!(consumed);
         assert!(
             matches!(
@@ -13479,7 +13968,10 @@ mod tests {
                 IdeProjectSaveError::ProjectSnapshotUnavailable,
             )),
         ] {
-            assert!(permanent.is_permanent_refusal(), "{permanent} cannot succeed later");
+            assert!(
+                permanent.is_permanent_refusal(),
+                "{permanent} cannot succeed later"
+            );
             assert!(!permanent.publication_committed());
         }
     }
@@ -13493,9 +13985,15 @@ mod tests {
                 "Runtime preparation save",
             ),
             (IdeWorkerCommandKind::RenameAudioTrack, "track rename"),
-            (IdeWorkerCommandKind::SetAudioTrackActive, "track activation"),
+            (
+                IdeWorkerCommandKind::SetAudioTrackActive,
+                "track activation",
+            ),
             (IdeWorkerCommandKind::AddArrangementPlacement, "placement"),
-            (IdeWorkerCommandKind::MoveArrangementPlacement, "placement move"),
+            (
+                IdeWorkerCommandKind::MoveArrangementPlacement,
+                "placement move",
+            ),
             (
                 IdeWorkerCommandKind::SetArrangementPlacementDuration,
                 "placement duration",
@@ -13520,7 +14018,10 @@ mod tests {
                 IdeWorkerCommandKind::SplitArrangementPlacement,
                 "placement split",
             ),
-            (IdeWorkerCommandKind::AddArrangementSceneLaunch, "scene marker"),
+            (
+                IdeWorkerCommandKind::AddArrangementSceneLaunch,
+                "scene marker",
+            ),
             (
                 IdeWorkerCommandKind::MoveArrangementSceneLaunch,
                 "scene marker move",
