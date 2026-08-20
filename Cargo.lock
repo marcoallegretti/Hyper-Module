@@ -2365,12 +2365,15 @@ dependencies = [
  "hyper-control-runtime",
  "hyper-desktop-audio",
  "hyper-media-cache",
+ "hyper-mixer-runtime",
  "hyper-panel-protocol",
  "hyper-playback-json",
  "hyper-playback-session",
  "hyper-project-loader",
  "hyper-runtime-deployment",
  "hyper-runtime-host",
+ "slint",
+ "slint-build",
 ]
 
 [[package]]

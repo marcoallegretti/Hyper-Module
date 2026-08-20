@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+build = "build.rs"
 
 [[bin]]
 name = "hyper-runtime"
@@ -23,3 +24,14 @@ hyper-playback-session = { path = "../../../crates/playback-session" }
 hyper-project-loader = { path = "../../../crates/project-loader" }
 hyper-runtime-deployment = { path = "../deployment" }
 hyper-runtime-host = { path = "../runtime-host" }
+hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
+slint = { version = "=1.17.1", default-features = false, features = [
+    "accessibility",
+    "backend-winit",
+    "compat-1-2",
+    "renderer-femtovg",
+    "std",
+] }
+
+[build-dependencies]
+slint-build = "=1.17.1"

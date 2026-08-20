@@ -1,0 +1,106 @@
+import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
+
+component FactCard inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    background: #171b24;
+    border-color: #2c3445;
+    border-width: 1px;
+    border-radius: 8px;
+    min-height: 72px;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 5px;
+        Text { text: root.label; color: #8d99ad; font-size: 11px; }
+        Text { text: root.value; color: #edf2f8; font-size: 15px; overflow: elide; }
+    }
+}
+
+export component OperatorWindow inherits Window {
+    title: "Hyper Runtime";
+    width: 880px;
+    height: 560px;
+    background: #0d1016;
+
+    in property <string> project-name;
+    in property <string> project-identity;
+    in property <string> project-revision;
+    in property <string> deployment-generation;
+    in property <string> bundle-identity;
+    in property <string> recovery-state;
+    in property <string> transport-state;
+    in property <string> transport-frame;
+    in property <string> stream-state;
+    in property <string> callback-count;
+    in property <string> stream-failures;
+    in property <string> native-xruns;
+    in property <string> panel-state;
+    in property <string> diagnostic;
+
+    callback start-requested();
+    callback stop-requested();
+    callback quit-requested();
+
+    VerticalLayout {
+        padding: 24px;
+        spacing: 18px;
+
+        VerticalLayout {
+            spacing: 4px;
+            Text { text: "HYPER RUNTIME"; color: #6fd6bd; font-size: 13px; font-weight: 700; }
+            Text { text: root.project-name; color: #f7f9fc; font-size: 28px; font-weight: 700; }
+            Text { text: root.project-identity + "  ·  revision " + root.project-revision; color: #8d99ad; font-size: 12px; }
+        }
+
+        HorizontalLayout {
+            spacing: 12px;
+            FactCard { label: "TRANSPORT"; value: root.transport-state + "  ·  frame " + root.transport-frame; }
+            FactCard { label: "AUDIO OWNER"; value: root.stream-state; }
+            FactCard { label: "PANEL LINK"; value: root.panel-state; }
+        }
+
+        HorizontalLayout {
+            spacing: 12px;
+            FactCard { label: "DEPLOYMENT"; value: "generation " + root.deployment-generation; }
+            FactCard { label: "CALLBACKS"; value: root.callback-count; }
+            FactCard { label: "STREAM FAILURES / XRUNS"; value: root.stream-failures + " / " + root.native-xruns; }
+        }
+
+        Rectangle {
+            background: #111620;
+            border-color: #2c3445;
+            border-width: 1px;
+            border-radius: 8px;
+            min-height: 92px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 5px;
+                Text { text: "VERIFIED BUNDLE"; color: #8d99ad; font-size: 11px; }
+                Text { text: root.bundle-identity; color: #dce4ef; font-family: "monospace"; font-size: 12px; overflow: elide; }
+                Text { text: root.recovery-state; color: #8d99ad; font-size: 12px; }
+            }
+        }
+
+        Rectangle {
+            background: #171b24;
+            border-radius: 8px;
+            min-height: 54px;
+            Text {
+                x: 12px; width: parent.width - 24px;
+                vertical-alignment: center;
+                text: root.diagnostic;
+                color: #c8d1df;
+                overflow: elide;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 10px;
+            Button { text: "Start"; clicked => { root.start-requested(); } }
+            Button { text: "Stop"; clicked => { root.stop-requested(); } }
+            Rectangle { horizontal-stretch: 1; }
+            Button { text: "Shut down Runtime"; clicked => { root.quit-requested(); } }
+        }
+    }
+}
