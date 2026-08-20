@@ -20,7 +20,7 @@ use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
 use hyper_playback_json::LoaderLimits;
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::ProjectPlaybackLimits;
-use hyper_runtime_bundle::prepare_runtime_bundle;
+use hyper_runtime_deployment::resolve_runtime_deployment;
 use hyper_runtime_host::{PanelHost, RuntimeArguments, ServeError, ServedPanel, serve_panels};
 
 /// The runtime's own hosting policy. Stated here rather than borrowed from the
@@ -89,42 +89,56 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let arguments = RuntimeArguments::parse(std::env::args().skip(1)).map_err(|error| {
-        format!("{error}\nusage: hyper-runtime <runtime-bundle-directory> [--panel-listen ADDRESS]")
+        format!(
+            "{error}\nusage: hyper-runtime <deployment-target-directory> [--panel-listen ADDRESS]"
+        )
     })?;
 
-    let (bundle_identity, session) = prepare_output_and_host(
-        || {
-            let bundle = prepare_runtime_bundle(
-                arguments.bundle_root(),
-                env!("CARGO_PKG_VERSION"),
-                MAX_RUNTIME_BUNDLE_BYTES,
-                limits()?,
-            )
-            .map_err(|error| {
-                format!(
-                    "{} could not be verified and prepared: {}",
-                    arguments.bundle_root().display(),
-                    format_error_chain(&error)
+    let (bundle_identity, deployment_generation, recovered_from, session) =
+        prepare_output_and_host(
+            || {
+                let deployment = resolve_runtime_deployment(
+                    arguments.deployment_root(),
+                    env!("CARGO_PKG_VERSION"),
+                    MAX_RUNTIME_BUNDLE_BYTES,
+                    limits()?,
                 )
-            })?;
-            Ok((hex_digest(bundle.bundle_sha256()), bundle.into_project()))
-        },
-        || {
-            DesktopOutputConfig::try_new(SAMPLE_RATE_HZ, MAXIMUM_BLOCK_FRAMES)
-                .map_err(|error| format!("output configuration is invalid: {error}"))
-        },
-        |output, (identity, project)| {
-            DesktopPlaybackSession::start_project(output, project)
-                .map(|session| (identity, session))
-                .map_err(|error| format!("verified bundle could not be hosted: {error}"))
-        },
-    )?;
+                .map_err(|error| {
+                    format!(
+                        "deployment target {} could not be resolved: {}",
+                        arguments.deployment_root().display(),
+                        format_error_chain(&error)
+                    )
+                })?;
+                let identity = hex_digest(deployment.bundle().bundle_sha256());
+                let generation = deployment.generation();
+                let recovered = deployment.recovered_from_bundle_sha256().map(hex_digest);
+                Ok((
+                    identity,
+                    generation,
+                    recovered,
+                    deployment.into_bundle().into_project(),
+                ))
+            },
+            || {
+                DesktopOutputConfig::try_new(SAMPLE_RATE_HZ, MAXIMUM_BLOCK_FRAMES)
+                    .map_err(|error| format!("output configuration is invalid: {error}"))
+            },
+            |output, (identity, generation, recovered, project)| {
+                DesktopPlaybackSession::start_project(output, project)
+                    .map(|session| (identity, generation, recovered, session))
+                    .map_err(|error| format!("verified bundle could not be hosted: {error}"))
+            },
+        )?;
     let mut host = SessionHost(session);
     println!(
-        "hosting bundle {bundle_identity} from {} with {} mixer channels",
-        arguments.bundle_root().display(),
+        "hosting deployment generation {deployment_generation} bundle {bundle_identity} from {} with {} mixer channels",
+        arguments.deployment_root().display(),
         host.mixer_channel_count()
     );
+    if let Some(recovered) = recovered_from {
+        println!("recovered from rejected bundle {recovered}");
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     watch_for_quit(Arc::clone(&stop));
@@ -429,7 +443,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let error = prepare_runtime_bundle(
+        let error = resolve_runtime_deployment(
             missing,
             env!("CARGO_PKG_VERSION"),
             MAX_RUNTIME_BUNDLE_BYTES,
@@ -438,9 +452,9 @@ mod tests {
         .unwrap_err();
 
         let diagnostic = format_error_chain(&error);
-        assert!(diagnostic.starts_with("inspect runtime manifest: "));
+        assert!(diagnostic.starts_with("inspect deployment target: "));
         assert!(
-            diagnostic.len() > "inspect runtime manifest: ".len(),
+            diagnostic.len() > "inspect deployment target: ".len(),
             "the operating-system cause remains visible"
         );
     }

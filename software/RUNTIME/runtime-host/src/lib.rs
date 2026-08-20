@@ -78,13 +78,13 @@ pub const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// What the runtime was asked to host.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeArguments {
-    bundle_root: PathBuf,
+    deployment_root: PathBuf,
     panel_listen: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArgumentError {
-    MissingBundleRoot,
+    MissingDeploymentRoot,
     UnknownOption(String),
     MissingValue(&'static str),
     UnreadableAddress(String),
@@ -94,7 +94,9 @@ pub enum ArgumentError {
 impl fmt::Display for ArgumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingBundleRoot => formatter.write_str("no runtime bundle directory was given"),
+            Self::MissingDeploymentRoot => {
+                formatter.write_str("no Runtime deployment target directory was given")
+            }
             Self::UnknownOption(option) => write!(formatter, "unknown option {option}"),
             Self::MissingValue(option) => write!(formatter, "{option} needs a value"),
             Self::UnreadableAddress(value) => {
@@ -121,7 +123,7 @@ impl RuntimeArguments {
     where
         I: IntoIterator<Item = String>,
     {
-        let mut bundle_root = None;
+        let mut deployment_root = None;
         let mut panel_listen = None;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
@@ -142,21 +144,23 @@ impl RuntimeArguments {
                 option if option.starts_with("--") => {
                     return Err(ArgumentError::UnknownOption(option.to_owned()));
                 }
-                _ if bundle_root.is_some() => {
-                    return Err(ArgumentError::Repeated("the runtime bundle directory"));
+                _ if deployment_root.is_some() => {
+                    return Err(ArgumentError::Repeated(
+                        "the Runtime deployment target directory",
+                    ));
                 }
-                _ => bundle_root = Some(PathBuf::from(argument)),
+                _ => deployment_root = Some(PathBuf::from(argument)),
             }
         }
         Ok(Self {
-            bundle_root: bundle_root.ok_or(ArgumentError::MissingBundleRoot)?,
+            deployment_root: deployment_root.ok_or(ArgumentError::MissingDeploymentRoot)?,
             panel_listen,
         })
     }
 
     #[must_use]
-    pub fn bundle_root(&self) -> &Path {
-        &self.bundle_root
+    pub fn deployment_root(&self) -> &Path {
+        &self.deployment_root
     }
 
     #[must_use]

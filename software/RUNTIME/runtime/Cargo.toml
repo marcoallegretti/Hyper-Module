@@ -21,5 +21,5 @@ hyper-panel-protocol = { path = "../../../crates/panel-protocol" }
 hyper-playback-json = { path = "../../../crates/playback-json" }
 hyper-playback-session = { path = "../../../crates/playback-session" }
 hyper-project-loader = { path = "../../../crates/project-loader" }
-hyper-runtime-bundle = { path = "../runtime-bundle" }
+hyper-runtime-deployment = { path = "../deployment" }
 hyper-runtime-host = { path = "../runtime-host" }

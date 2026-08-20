@@ -2369,7 +2369,7 @@ dependencies = [
  "hyper-playback-json",
  "hyper-playback-session",
  "hyper-project-loader",
- "hyper-runtime-bundle",
+ "hyper-runtime-deployment",
  "hyper-runtime-host",
 ]
 
@@ -2390,6 +2390,29 @@ dependencies = [
  "serde_json",
  "serde_json_canonicalizer",
  "sha2",
+]
+
+[[package]]
+name = "hyper-runtime-deployment"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "hyper-audio-source",
+ "hyper-fs-authority",
+ "hyper-media-cache",
+ "hyper-playback-json",
+ "hyper-playback-session",
+ "hyper-project-loader",
+ "hyper-project-model",
+ "hyper-runtime-bundle",
+ "hyper-strict-json",
+ "same-file",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "uuid",
 ]
 
 [[package]]

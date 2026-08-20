@@ -930,18 +930,24 @@ fn a_project_with_more_channels_than_a_panel_can_address_binds_every_control() {
 }
 
 #[test]
-fn arguments_name_a_runtime_bundle_and_optionally_a_panel_address() {
-    let parsed = RuntimeArguments::parse(["/bundles/demo".to_owned()]).unwrap();
-    assert_eq!(parsed.bundle_root(), std::path::Path::new("/bundles/demo"));
+fn arguments_name_a_deployment_target_and_optionally_a_panel_address() {
+    let parsed = RuntimeArguments::parse(["/deployments/demo".to_owned()]).unwrap();
+    assert_eq!(
+        parsed.deployment_root(),
+        std::path::Path::new("/deployments/demo")
+    );
     assert_eq!(parsed.panel_listen(), None);
 
     let parsed = RuntimeArguments::parse([
         "--panel-listen".to_owned(),
         "127.0.0.1:9000".to_owned(),
-        "/bundles/demo".to_owned(),
+        "/deployments/demo".to_owned(),
     ])
     .unwrap();
-    assert_eq!(parsed.bundle_root(), std::path::Path::new("/bundles/demo"));
+    assert_eq!(
+        parsed.deployment_root(),
+        std::path::Path::new("/deployments/demo")
+    );
     assert_eq!(
         parsed.panel_listen(),
         Some("127.0.0.1:9000".parse::<SocketAddr>().unwrap())
@@ -952,7 +958,7 @@ fn arguments_name_a_runtime_bundle_and_optionally_a_panel_address() {
 fn a_malformed_argument_list_is_reported_rather_than_assumed() {
     assert_eq!(
         RuntimeArguments::parse(Vec::new()),
-        Err(ArgumentError::MissingBundleRoot)
+        Err(ArgumentError::MissingDeploymentRoot)
     );
     assert_eq!(
         RuntimeArguments::parse(["--panel-listen".to_owned()]),
@@ -970,7 +976,9 @@ fn a_malformed_argument_list_is_reported_rather_than_assumed() {
     );
     assert_eq!(
         RuntimeArguments::parse(["one".to_owned(), "two".to_owned()]),
-        Err(ArgumentError::Repeated("the runtime bundle directory"))
+        Err(ArgumentError::Repeated(
+            "the Runtime deployment target directory"
+        ))
     );
     assert_eq!(
         RuntimeArguments::parse([
@@ -986,7 +994,7 @@ fn a_malformed_argument_list_is_reported_rather_than_assumed() {
 #[test]
 fn every_argument_failure_says_what_was_wrong() {
     let rendered: Vec<String> = [
-        ArgumentError::MissingBundleRoot,
+        ArgumentError::MissingDeploymentRoot,
         ArgumentError::UnknownOption("--nope".to_owned()),
         ArgumentError::MissingValue("--panel-listen"),
         ArgumentError::UnreadableAddress("1.2.3".to_owned()),
@@ -996,7 +1004,7 @@ fn every_argument_failure_says_what_was_wrong() {
     .map(ToString::to_string)
     .collect();
 
-    assert!(rendered[0].contains("runtime bundle directory"));
+    assert!(rendered[0].contains("Runtime deployment target directory"));
     assert!(rendered[1].contains("--nope"));
     assert!(rendered[2].contains("--panel-listen"));
     assert!(rendered[3].contains("1.2.3"));

@@ -74,6 +74,7 @@ pub struct VerifiedRuntimeBundle {
     project: PreparedProjectPlayback,
     bundle_sha256: [u8; 32],
     bundle_byte_length: u64,
+    minimum_runtime_version: Version,
 }
 
 impl VerifiedRuntimeBundle {
@@ -90,6 +91,11 @@ impl VerifiedRuntimeBundle {
     #[must_use]
     pub const fn bundle_byte_length(&self) -> u64 {
         self.bundle_byte_length
+    }
+
+    #[must_use]
+    pub const fn minimum_runtime_version(&self) -> &Version {
+        &self.minimum_runtime_version
     }
 
     #[must_use]
@@ -202,6 +208,7 @@ pub fn prepare_runtime_bundle(
         project,
         bundle_sha256,
         bundle_byte_length,
+        minimum_runtime_version: manifest.minimum_runtime_version,
     })
 }
 
