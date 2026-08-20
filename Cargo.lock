@@ -2373,6 +2373,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-runtime-bundle"
+version = "0.1.0"
+dependencies = [
+ "hyper-audio-source",
+ "hyper-media-cache",
+ "hyper-playback-json",
+ "hyper-playback-session",
+ "hyper-project-loader",
+ "hyper-project-model",
+ "hyper-storage-engine",
+ "hyper-strict-json",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
+]
+
+[[package]]
 name = "hyper-runtime-host"
 version = "0.1.0"
 dependencies = [

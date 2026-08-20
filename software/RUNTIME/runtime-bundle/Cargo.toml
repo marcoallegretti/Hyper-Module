@@ -1,0 +1,27 @@
+[package]
+name = "hyper-runtime-bundle"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+hyper-project-loader = { path = "../../../crates/project-loader" }
+hyper-project-model = { path = "../../../crates/project-model" }
+hyper-storage-engine = { path = "../../../crates/storage-engine" }
+hyper-strict-json = { path = "../../../crates/strict-json" }
+semver = "=1.0.28"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+serde_json_canonicalizer = "=0.3.2"
+sha2 = "=0.10.9"
+
+[dev-dependencies]
+hyper-audio-source = { path = "../../../crates/audio-source" }
+hyper-media-cache = { path = "../../../crates/media-cache" }
+hyper-playback-json = { path = "../../../crates/playback-json" }
+hyper-playback-session = { path = "../../../crates/playback-session" }
+hyper-storage-engine = { path = "../../../crates/storage-engine" }
+
+[lints]
+workspace = true

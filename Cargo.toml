@@ -32,6 +32,7 @@ members = [
     "software/RUNTIME/panel-session",
     "software/RUNTIME/runtime",
     "software/RUNTIME/runtime-host",
+    "software/RUNTIME/runtime-bundle",
 ]
 exclude = ["third_party/pipewire"]
 resolver = "3"

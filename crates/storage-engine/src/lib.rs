@@ -168,6 +168,7 @@ pub struct StructurallyVerifiedProject {
     root: PathBuf,
     root_dir: Arc<Dir>,
     manifest: ProjectManifest,
+    manifest_byte_length: u64,
     manifest_sha256: [u8; 32],
     verification_limits: Option<ProjectPackageVerificationLimits>,
     runtime_manifest: Option<RuntimeBundleManifestFile>,
@@ -187,6 +188,11 @@ impl StructurallyVerifiedProject {
     #[must_use]
     pub const fn manifest_sha256(&self) -> &[u8; 32] {
         &self.manifest_sha256
+    }
+
+    #[must_use]
+    pub const fn manifest_byte_length(&self) -> u64 {
+        self.manifest_byte_length
     }
 
     /// Re-reads one declared resource as stable, digest-verified bytes.
@@ -423,6 +429,7 @@ fn verify_project_package_inner(
         root: canonical_root,
         root_dir,
         manifest,
+        manifest_byte_length: u64::try_from(manifest_bytes.len()).unwrap_or(u64::MAX),
         manifest_sha256: Sha256::digest(&manifest_bytes).into(),
         verification_limits: limits,
         runtime_manifest,
