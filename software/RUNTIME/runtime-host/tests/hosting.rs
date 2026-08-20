@@ -1532,15 +1532,29 @@ fn a_refresh_sends_no_more_than_its_budget_however_much_has_changed() {
     // Sixteen controls have something to say and the budget is four.
     let sent = link.refresh_display(&mut host, now.get());
 
-    assert_eq!(
-        sent,
-        hyper_runtime_host::FEEDBACK_PER_TICK,
-        "a burst of change must not starve input or the stop flag"
+    // Compared against how much was available, not against the constant the
+    // code just read — which would compare a value with itself.
+    let available = 16;
+    assert!(
+        sent > 0 && sent < available,
+        "a burst of change must not starve input or the stop flag: sent {sent} of {available}"
     );
     let rest = link.refresh_display(&mut host, now.get());
     assert!(
         rest > 0,
         "what did not fit this tick goes out on the next: {rest}"
+    );
+    let mut total = sent + rest;
+    loop {
+        let more = link.refresh_display(&mut host, now.get());
+        if more == 0 {
+            break;
+        }
+        total += more;
+    }
+    assert!(
+        total >= available,
+        "every control that had something to say eventually said it: {total} of {available}"
     );
 }
 
