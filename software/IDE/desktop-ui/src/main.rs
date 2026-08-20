@@ -11,7 +11,7 @@ use std::time::Duration;
 use hyper_desktop_ide::{
     AutomationChannelParameter, AutomationInterpolation, AutomationMainParameter, AutomationPoint,
     AutomationSendParameter, AutomationTarget, AutomationValue, DesktopAudioPreviewState,
-    DesktopIdeWorker, IdeApplicationConfig, IdeAudioClip,
+    DesktopIdeWorker, IdeApplicationConfig, IdeAudioClip, ProjectHistory, RecentProject,
     IdeAudioInputInventory, IdeAudioOutputInventory, IdeAudioPreviewControlCommand,
     IdeInputSelection, IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
     IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
@@ -56,14 +56,25 @@ const INITIAL_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const FINAL_SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 const MAX_VISIBLE_SCENE_NAME_CHARS: usize = 20;
 const MAX_VISIBLE_MIXER_NAME_CHARS: usize = 10;
+const MAX_VISIBLE_RECENT_PROJECT_NAME_CHARS: usize = 28;
 const MAX_SAFE_TIMELINE_TICK: u64 = 9_007_199_254_740_991;
 
 type WorkerCell = Rc<RefCell<Option<DesktopIdeWorker>>>;
 type OutputRoutes = Rc<RefCell<Vec<Option<String>>>>;
 type InputRoutes = Rc<RefCell<Vec<InputRoute>>>;
+type RecentProjectRoutes = Rc<RefCell<Vec<PathBuf>>>;
 type RecordingRoutes = Rc<RefCell<Vec<usize>>>;
 type TakeRoutes = Rc<RefCell<Vec<TakeRoute>>>;
 type ProjectUiStateCell = Rc<ProjectUiState>;
+
+#[derive(Clone, Default)]
+struct UiRoutes {
+    outputs: OutputRoutes,
+    inputs: InputRoutes,
+    recent_projects: RecentProjectRoutes,
+    recordings: RecordingRoutes,
+    takes: TakeRoutes,
+}
 
 #[derive(Default)]
 struct ProjectUiState {
@@ -268,6 +279,14 @@ struct InputPresentation {
     selected: usize,
 }
 
+#[derive(Debug)]
+struct RecentProjectPresentation {
+    routes: Vec<PathBuf>,
+    names: Vec<SharedString>,
+    display_names: Vec<SharedString>,
+    paths: Vec<SharedString>,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("desktop IDE failed: {error}");
@@ -278,36 +297,29 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let ui = MainWindow::new()?;
     configure_ui_contracts(&ui);
-    let worker = DesktopIdeWorker::start(
-        application_config()?,
-        WORKER_COMMAND_CAPACITY,
-        WORKER_EVENT_CAPACITY,
-    )?;
+    let application = application_config()?;
+    let worker = match ProjectHistory::for_current_user() {
+        Ok(project_history) => DesktopIdeWorker::start_with_project_history(
+            application,
+            project_history,
+            WORKER_COMMAND_CAPACITY,
+            WORKER_EVENT_CAPACITY,
+        )?,
+        Err(error) => {
+            ui.set_project_history_warning(format!("Recent projects unavailable: {error}").into());
+            DesktopIdeWorker::start(
+                application,
+                WORKER_COMMAND_CAPACITY,
+                WORKER_EVENT_CAPACITY,
+            )?
+        }
+    };
     let worker = Rc::new(RefCell::new(Some(worker)));
-    let output_routes = Rc::new(RefCell::new(Vec::new()));
-    let input_routes = Rc::new(RefCell::new(Vec::new()));
-    let recording_routes = Rc::new(RefCell::new(Vec::new()));
-    let take_routes = Rc::new(RefCell::new(Vec::new()));
+    let routes = UiRoutes::default();
     let project_state = Rc::new(ProjectUiState::default());
 
-    bind_callbacks(
-        &ui,
-        &worker,
-        &output_routes,
-        &input_routes,
-        &recording_routes,
-        &take_routes,
-        &project_state,
-    );
-    let timer = start_event_pump(
-        &ui,
-        &worker,
-        &output_routes,
-        &input_routes,
-        &recording_routes,
-        &take_routes,
-        &project_state,
-    );
+    bind_callbacks(&ui, &worker, &routes, &project_state);
+    let timer = start_event_pump(&ui, &worker, &routes, &project_state);
     let run_result = ui.run();
     timer.stop();
 
@@ -330,10 +342,7 @@ fn application_config() -> Result<IdeApplicationConfig, Box<dyn Error>> {
 fn bind_callbacks(
     ui: &MainWindow,
     worker: &WorkerCell,
-    output_routes: &OutputRoutes,
-    input_routes: &InputRoutes,
-    recording_routes: &RecordingRoutes,
-    take_routes: &TakeRoutes,
+    routes: &UiRoutes,
     project_state: &ProjectUiStateCell,
 ) {
     let actions = ui.global::<IdeActions>();
@@ -352,7 +361,7 @@ fn bind_callbacks(
 
     let weak = ui.as_weak();
     let worker_for_selection = Rc::clone(worker);
-    let routes_for_selection = Rc::clone(output_routes);
+    let routes_for_selection = Rc::clone(&routes.outputs);
     actions.on_select_output(move |index| {
         let selection = usize::try_from(index)
             .ok()
@@ -372,20 +381,63 @@ fn bind_callbacks(
 
     bind_output_test_callbacks(ui, worker);
 
-    bind_input_selection_callbacks(ui, worker, input_routes);
+    bind_input_selection_callbacks(ui, worker, &routes.inputs);
 
-    bind_project_callbacks(ui, worker);
+    bind_project_callbacks(ui, worker, &routes.recent_projects);
 
     bind_playback_callbacks(ui, worker, project_state);
     bind_monitoring_callbacks(ui, worker);
-    bind_recording_callbacks(ui, worker, recording_routes);
-    bind_audio_preview_callbacks(ui, worker, take_routes);
+    bind_recording_callbacks(ui, worker, &routes.recordings);
+    bind_audio_preview_callbacks(ui, worker, &routes.takes);
 }
 
-fn bind_project_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+fn bind_project_callbacks(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    recent_project_routes: &RecentProjectRoutes,
+) {
     bind_project_creation_callback(ui, worker);
     bind_project_open_callback(ui, worker);
+    bind_recent_project_callback(ui, worker, recent_project_routes);
     bind_runtime_preparation_callback(ui, worker);
+}
+
+fn bind_recent_project_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    recent_project_routes: &RecentProjectRoutes,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    let routes = Rc::clone(recent_project_routes);
+    actions.on_open_recent_project(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Closed {
+            return;
+        }
+        let Some(command) = recent_project_command(&routes, index) else {
+            ui.set_error_text("Recent project selection is no longer available".into());
+            return;
+        };
+        let IdeWorkerCommand::OpenRecentProject(path) = &command else {
+            unreachable!("recent-project routing only creates recent-project commands");
+        };
+        ui.set_project_location(path.to_string_lossy().into_owned().into());
+        submit_to_ui(&ui, &worker, command);
+    });
+}
+
+fn recent_project_command(
+    routes: &RecentProjectRoutes,
+    index: i32,
+) -> Option<IdeWorkerCommand> {
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| routes.borrow().get(index).cloned())
+        .map(IdeWorkerCommand::OpenRecentProject)
 }
 
 fn bind_runtime_preparation_callback(ui: &MainWindow, worker: &WorkerCell) {
@@ -2902,19 +2954,13 @@ fn parse_exact_arrangement_tick(
 fn start_event_pump(
     ui: &MainWindow,
     worker: &WorkerCell,
-    output_routes: &OutputRoutes,
-    input_routes: &InputRoutes,
-    recording_routes: &RecordingRoutes,
-    take_routes: &TakeRoutes,
+    routes: &UiRoutes,
     project_state: &ProjectUiStateCell,
 ) -> Timer {
     let timer = Timer::default();
     let weak = ui.as_weak();
     let worker = Rc::clone(worker);
-    let output_routes = Rc::clone(output_routes);
-    let input_routes = Rc::clone(input_routes);
-    let recording_routes = Rc::clone(recording_routes);
-    let take_routes = Rc::clone(take_routes);
+    let routes = routes.clone();
     let project_state = Rc::clone(project_state);
     let mut observation_pending = false;
     timer.start(TimerMode::Repeated, UI_POLL_INTERVAL, move || {
@@ -2933,10 +2979,7 @@ fn start_event_pump(
                     }
                     apply_event(
                         &ui,
-                        &output_routes,
-                        &input_routes,
-                        &recording_routes,
-                        &take_routes,
+                        &routes,
                         &project_state,
                         event,
                     );
@@ -3039,6 +3082,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::StartOutputTest => AppMode::StartingOutputTest,
         IdeWorkerCommandKind::StopOutputTest => AppMode::StoppingOutputTest,
         IdeWorkerCommandKind::CreateProject => AppMode::Creating,
+        IdeWorkerCommandKind::OpenProject => AppMode::Opening,
         IdeWorkerCommandKind::SaveProject
         | IdeWorkerCommandKind::AddScene
         | IdeWorkerCommandKind::SetSceneSlot
@@ -3266,27 +3310,30 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
 )]
 fn apply_event(
     ui: &MainWindow,
-    output_routes: &OutputRoutes,
-    input_routes: &InputRoutes,
-    recording_routes: &RecordingRoutes,
-    take_routes: &TakeRoutes,
+    routes: &UiRoutes,
     project_state: &ProjectUiStateCell,
     event: IdeWorkerEvent,
 ) {
     match event {
+        IdeWorkerEvent::RecentProjectsChanged { projects } => {
+            apply_recent_projects(ui, &routes.recent_projects, &projects);
+        }
+        IdeWorkerEvent::ProjectHistoryWarning(error) => {
+            ui.set_project_history_warning(format!("Recent projects unavailable: {error}").into());
+        }
         IdeWorkerEvent::Closed {
             snapshot,
             native_failure,
             input_failure,
         } => {
-            apply_output_inventory(ui, output_routes, snapshot.outputs(), snapshot.selection());
+            apply_output_inventory(ui, &routes.outputs, snapshot.outputs(), snapshot.selection());
             apply_input_inventory(
                 ui,
-                input_routes,
+                &routes.inputs,
                 snapshot.inputs(),
                 snapshot.input_selection(),
             );
-            reset_project(ui, recording_routes, take_routes, project_state);
+            reset_project(ui, &routes.recordings, &routes.takes, project_state);
             ui.set_output_test_confirming(false);
             let mode = mode_after_closed_event(ui.get_app_mode());
             ui.set_app_mode(mode);
@@ -3300,8 +3347,8 @@ fn apply_event(
         }
         IdeWorkerEvent::Running(observation) => apply_running_event(
             ui,
-            recording_routes,
-            take_routes,
+            &routes.recordings,
+            &routes.takes,
             project_state,
             &observation,
         ),
@@ -3613,6 +3660,51 @@ fn apply_event(
             ui.set_app_mode(mode_after_failure(ui.get_app_mode(), command));
             ui.set_error_text(format!("{}: {reason}", command_status(command)).into());
         }
+    }
+}
+
+fn apply_recent_projects(
+    ui: &MainWindow,
+    routes: &RecentProjectRoutes,
+    projects: &[RecentProject],
+) {
+    let presentation = recent_project_presentation(projects);
+    *routes.borrow_mut() = presentation.routes;
+    ui.set_recent_project_names(ModelRc::from(Rc::new(VecModel::from(
+        presentation.names,
+    ))));
+    ui.set_recent_project_display_names(ModelRc::from(Rc::new(VecModel::from(
+        presentation.display_names,
+    ))));
+    ui.set_recent_project_paths(ModelRc::from(Rc::new(VecModel::from(
+        presentation.paths,
+    ))));
+    ui.set_project_history_warning(SharedString::default());
+}
+
+fn recent_project_presentation(projects: &[RecentProject]) -> RecentProjectPresentation {
+    RecentProjectPresentation {
+        routes: projects
+            .iter()
+            .map(|project| project.path().to_path_buf())
+            .collect(),
+        names: projects
+            .iter()
+            .map(|project| SharedString::from(project.name()))
+            .collect(),
+        display_names: projects
+            .iter()
+            .map(|project| {
+                SharedString::from(compact_name(
+                    project.name(),
+                    MAX_VISIBLE_RECENT_PROJECT_NAME_CHARS,
+                ))
+            })
+            .collect(),
+        paths: projects
+            .iter()
+            .map(|project| project.path().display().to_string().into())
+            .collect(),
     }
 }
 
@@ -8546,6 +8638,47 @@ mod tests {
     }
 
     #[test]
+    fn recent_project_presentation_routes_by_retained_path() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ui-history-{}-{nonce}",
+            std::process::id()
+        ));
+        let config = fixture.join("config");
+        let project = fixture.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let history = ProjectHistory::at(&config);
+        let projects = history.remember("Daily Session", &project).unwrap();
+
+        let routes: RecentProjectRoutes = Rc::new(RefCell::new(Vec::new()));
+        let presentation = recent_project_presentation(&projects);
+        *routes.borrow_mut() = presentation.routes.clone();
+
+        assert_eq!(presentation.names, [SharedString::from("Daily Session")]);
+        assert_eq!(
+            presentation.display_names,
+            [SharedString::from("Daily Session")]
+        );
+        assert_eq!(presentation.paths.len(), 1);
+        assert!(recent_project_command(&routes, -1).is_none());
+        assert!(recent_project_command(&routes, 1).is_none());
+        let Some(IdeWorkerCommand::OpenRecentProject(path)) = recent_project_command(&routes, 0)
+        else {
+            panic!("the retained recent-project path must be routed");
+        };
+        assert_eq!(path, projects[0].path());
+
+        std::fs::remove_dir(project).unwrap();
+        std::fs::remove_file(history.document_path()).unwrap();
+        std::fs::remove_file(config.join("recent-projects.lock")).unwrap();
+        std::fs::remove_dir(config).unwrap();
+        std::fs::remove_dir(fixture).unwrap();
+    }
+
+    #[test]
     fn meter_presentation_is_bounded_and_preserves_unavailable_state() {
         assert_eq!(meter_presentation(None), (0.0, "—".to_owned()));
         assert_eq!(meter_presentation(Some(f32::NAN)), (0.0, "—".to_owned()));
@@ -9591,19 +9724,6 @@ mod tests {
 
     #[test]
     fn runtime_preparation_has_a_dedicated_recoverable_mode() {
-        let ui = MainWindow::new().unwrap();
-        ui.set_app_mode(AppMode::PreparingRuntime);
-        ui.set_status_text("Choose a Runtime destination".into());
-        ui.set_error_text("retained message".into());
-        apply_idle_running_event(&ui);
-        assert_eq!(ui.get_app_mode(), AppMode::PreparingRuntime);
-        assert_eq!(ui.get_status_text(), "Choose a Runtime destination");
-        assert_eq!(ui.get_error_text(), "retained message");
-
-        ui.set_app_mode(AppMode::Running);
-        apply_idle_running_event(&ui);
-        assert_eq!(ui.get_status_text(), "Runtime evidence updated");
-        assert!(ui.get_error_text().is_empty());
         assert_eq!(
             mode_after_successful_submission(
                 AppMode::PreparingRuntime,
@@ -11056,6 +11176,19 @@ mod tests {
             usize::try_from(ui.get_max_scene_count()).unwrap(),
             MAX_IDE_SCENES
         );
+        ui.set_app_mode(AppMode::PreparingRuntime);
+        ui.set_status_text("Choose a Runtime destination".into());
+        ui.set_error_text("retained message".into());
+        apply_idle_running_event(&ui);
+        assert_eq!(ui.get_app_mode(), AppMode::PreparingRuntime);
+        assert_eq!(ui.get_status_text(), "Choose a Runtime destination");
+        assert_eq!(ui.get_error_text(), "retained message");
+
+        ui.set_app_mode(AppMode::Running);
+        apply_idle_running_event(&ui);
+        assert_eq!(ui.get_status_text(), "Runtime evidence updated");
+        assert!(ui.get_error_text().is_empty());
+
         ui.set_app_mode(AppMode::Running);
         ui.set_clip_fades_visible(true);
         ui.set_clip_fades_id("clip-a".into());
