@@ -775,6 +775,7 @@ fn inspect_sample_destination(
                 error,
             )
         })?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(error) => {
             return Err(caused(
                 ProjectResourcePublicationErrorKind::Io,
@@ -2005,6 +2006,26 @@ mod tests {
             format!("assets/samples/{IMPORT_ASSET_ID}.wav")
         );
         assert!(fixture.transaction_names().is_empty());
+    }
+
+    #[test]
+    fn missing_asset_tree_is_admitted_as_a_directory_creation_plan() {
+        let root = std::env::temp_dir().join(format!(
+            "hyper-imported-sample-empty-root-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let (_, authority) = open_stable_project_root(&root).unwrap();
+
+        assert!(inspect_sample_destination(
+            &authority,
+            "assets/samples/018f47a2-6b2d-7c11-8a44-001122334499.wav"
+        )
+        .unwrap());
+
+        drop(authority);
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]
