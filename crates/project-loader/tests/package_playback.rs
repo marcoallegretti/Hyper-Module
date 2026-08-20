@@ -14,7 +14,7 @@ use hyper_playback_json::{
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::{
     ProjectPlaybackError, ProjectPlaybackLimits, RecordingBindingErrorKind,
-    prepare_project_playback,
+    prepare_project_playback, prepare_verified_project_playback,
 };
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
@@ -482,6 +482,20 @@ fn prepares_one_verified_owned_playback_session() {
     assert!(prepared.control_mapping().is_none());
     assert!(prepared.compiled_control_mapping().is_none());
     assert!(prepared.recording_metadata().is_empty());
+    prepared.package().confirm_unchanged().unwrap();
+}
+
+#[test]
+fn prepares_from_an_existing_structural_authority() {
+    let fixture = Fixture::new();
+    let package = verify_project_package(&fixture.root).unwrap();
+    let prepared = prepare_verified_project_playback(package, limits()).unwrap();
+
+    assert_eq!(prepared.session().project_id(), PROJECT_ID);
+    assert_eq!(
+        prepared.package().root(),
+        fixture.root.canonicalize().unwrap()
+    );
     prepared.package().confirm_unchanged().unwrap();
 }
 

@@ -36,6 +36,33 @@ pub struct ProjectPlaybackLimits {
     pub session: PlaybackSessionAssemblyLimits,
 }
 
+impl ProjectPlaybackLimits {
+    /// Derives the structural package bounds used before playback capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectPlaybackError::InvalidLimits`] when any required
+    /// playback capacity is zero.
+    pub fn package_verification_limits(
+        self,
+    ) -> Result<ProjectPackageVerificationLimits, ProjectPlaybackError> {
+        let cache_limits = self.session.media_cache;
+        if self.max_total_resource_bytes == 0
+            || cache_limits.max_assets == 0
+            || cache_limits.max_frames_per_asset == 0
+            || cache_limits.max_decoded_sample_bytes == 0
+        {
+            return Err(ProjectPlaybackError::InvalidLimits);
+        }
+        Ok(ProjectPackageVerificationLimits {
+            max_total_resource_bytes: u64::try_from(self.max_total_resource_bytes)
+                .unwrap_or(u64::MAX),
+            max_assets: cache_limits.max_assets,
+            max_asset_file_bytes: self.audio.max_file_bytes(),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedProjectPlayback {
     package: StructurallyVerifiedProject,
@@ -375,22 +402,34 @@ pub fn prepare_project_playback(
     root: impl AsRef<Path>,
     limits: ProjectPlaybackLimits,
 ) -> Result<PreparedProjectPlayback, ProjectPlaybackError> {
-    let cache_limits = limits.session.media_cache;
-    if limits.max_total_resource_bytes == 0
-        || cache_limits.max_assets == 0
-        || cache_limits.max_frames_per_asset == 0
-        || cache_limits.max_decoded_sample_bytes == 0
-    {
-        return Err(ProjectPlaybackError::InvalidLimits);
-    }
-    let verification_limits = ProjectPackageVerificationLimits {
-        max_total_resource_bytes: u64::try_from(limits.max_total_resource_bytes)
-            .unwrap_or(u64::MAX),
-        max_assets: cache_limits.max_assets,
-        max_asset_file_bytes: limits.audio.max_file_bytes(),
-    };
+    let verification_limits = limits.package_verification_limits()?;
     let package = verify_project_package_with_limits(root, verification_limits)
         .map_err(playback_storage_error)?;
+    prepare_verified_project_playback_inner(package, limits)
+}
+
+/// Semantically resolves and decodes an already structurally verified project.
+///
+/// This is the loading seam for a stronger outer artifact authority such as a
+/// runtime bundle. The project authority remains owned by the returned session
+/// and is reconfirmed after all resources and assets have been captured.
+///
+/// # Errors
+///
+/// Returns a fail-closed rejection for invalid limits, capacity, role, media,
+/// cross-resource semantic, or concurrent package failure.
+pub fn prepare_verified_project_playback(
+    package: StructurallyVerifiedProject,
+    limits: ProjectPlaybackLimits,
+) -> Result<PreparedProjectPlayback, ProjectPlaybackError> {
+    limits.package_verification_limits()?;
+    prepare_verified_project_playback_inner(package, limits)
+}
+
+fn prepare_verified_project_playback_inner(
+    package: StructurallyVerifiedProject,
+    limits: ProjectPlaybackLimits,
+) -> Result<PreparedProjectPlayback, ProjectPlaybackError> {
     let inventory = ResourceInventory::new(&package, limits.max_total_resource_bytes)?;
     let captured = inventory.read(&package)?;
     validate_recording_inventory(
