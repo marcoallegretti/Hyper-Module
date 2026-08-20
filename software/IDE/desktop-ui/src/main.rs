@@ -11176,6 +11176,7 @@ mod tests {
             usize::try_from(ui.get_max_scene_count()).unwrap(),
             MAX_IDE_SCENES
         );
+        assert_recent_project_window_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);
         ui.set_status_text("Choose a Runtime destination".into());
         ui.set_error_text("retained message".into());
@@ -11275,6 +11276,84 @@ mod tests {
         assert_automation_targets_repopulate_after_a_project_reset(&ui);
         assert_control_targets_repopulate_after_a_project_reset(&ui);
         assert_control_mapping_events_report_durable_outcomes(&ui);
+    }
+
+    fn assert_recent_project_window_contract(ui: &MainWindow) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ui-window-history-{}-{nonce}",
+            std::process::id()
+        ));
+        let config = fixture.join("config");
+        let first = fixture.join("first");
+        let second = fixture.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let history = ProjectHistory::at(&config);
+        history
+            .remember("First project with a deliberately long visible name", &first)
+            .unwrap();
+        let projects = history.remember("Second", &second).unwrap();
+        let routes = UiRoutes::default();
+        let project_state = Rc::new(ProjectUiState::default());
+
+        ui.set_project_history_warning("stale warning".into());
+        apply_recent_projects(ui, &routes.recent_projects, &projects);
+        assert!(ui.get_project_history_warning().is_empty());
+        let names = ui.get_recent_project_names();
+        let display_names = ui.get_recent_project_display_names();
+        let paths = ui.get_recent_project_paths();
+        assert_eq!((names.row_count(), display_names.row_count(), paths.row_count()), (2, 2, 2));
+        for (index, project) in projects.iter().enumerate() {
+            assert_eq!(names.row_data(index).unwrap(), project.name());
+            assert_eq!(
+                paths.row_data(index).unwrap(),
+                project.path().display().to_string()
+            );
+            assert_eq!(routes.recent_projects.borrow()[index], project.path());
+        }
+
+        let bad_config = fixture.join("bad-config");
+        std::fs::write(&bad_config, b"not a directory").unwrap();
+        let warning = ProjectHistory::at(&bad_config).load().unwrap_err();
+        apply_event(
+            ui,
+            &routes,
+            &project_state,
+            IdeWorkerEvent::ProjectHistoryWarning(warning),
+        );
+        assert_eq!(ui.get_recent_project_names().row_count(), 2);
+        assert!(!ui.get_project_history_warning().is_empty());
+
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        bind_recent_project_callback(ui, &worker, &routes.recent_projects);
+        ui.set_app_mode(AppMode::Closed);
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>().invoke_open_recent_project(1);
+        assert_eq!(
+            ui.get_project_location(),
+            projects[1].path().to_string_lossy()
+        );
+        assert!(!ui.get_error_text().is_empty());
+
+        routes.recent_projects.borrow_mut().truncate(1);
+        ui.set_app_mode(AppMode::Closed);
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>().invoke_open_recent_project(1);
+        assert!(
+            ui.get_error_text()
+                .contains("selection is no longer available")
+        );
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_project_location("retained".into());
+        ui.global::<IdeActions>().invoke_open_recent_project(0);
+        assert_eq!(ui.get_project_location(), "retained");
+
+        std::fs::remove_dir_all(fixture).unwrap();
     }
 
     fn assert_committed_audio_clip_source_slip_warning(ui: &MainWindow) {

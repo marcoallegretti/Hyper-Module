@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
@@ -199,6 +199,63 @@ fn invalid_argument(message: &'static str) -> io::Error {
 #[must_use]
 pub fn identity(metadata: &Metadata) -> (u64, u64) {
     (metadata.dev(), metadata.ino())
+}
+
+/// Returns whether an absolute path is proven absent while refusing to follow
+/// links in any traversed component.
+///
+/// An existing link, irregular entry, access failure, or unstable namespace is
+/// not absence and is returned as an error. A missing component below a retained
+/// real directory is proof that the complete path cannot currently exist.
+///
+/// # Errors
+///
+/// Returns an I/O or validation error when the path is not absolute, contains
+/// lexical aliases, crosses a link, or cannot be classified through retained
+/// directory authority.
+pub fn path_is_proven_absent(path: &Path) -> io::Result<bool> {
+    if !path.is_absolute() {
+        return Err(invalid_argument("classified path must be absolute"));
+    }
+    let mut anchor = PathBuf::new();
+    let mut names = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => anchor.push(component.as_os_str()),
+            Component::Normal(name) => names.push(name),
+            Component::CurDir | Component::ParentDir => {
+                return Err(invalid_argument(
+                    "classified path must not contain lexical aliases",
+                ));
+            }
+        }
+    }
+    if anchor.as_os_str().is_empty() || names.is_empty() {
+        return Err(invalid_argument(
+            "classified path must name an entry below an absolute root",
+        ));
+    }
+    let mut directory = Dir::open_ambient_dir(anchor, ambient_authority())?;
+    for (index, name) in names.iter().enumerate() {
+        let metadata = match directory.symlink_metadata(name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(invalid_argument("classified path crosses a link"));
+        }
+        if index + 1 == names.len() {
+            return Ok(false);
+        }
+        if !metadata.is_dir() {
+            return Err(invalid_argument(
+                "classified path crosses a non-directory entry",
+            ));
+        }
+        directory = directory.open_dir_nofollow(name)?;
+    }
+    Ok(false)
 }
 
 /// Reads one bounded regular non-link file while retaining its identity and
@@ -1046,8 +1103,8 @@ mod stable_file_tests {
     use cap_std::fs::Dir;
 
     use super::{
-        open_syncable_directory_ambient, read_stable_file, read_stable_file_observed,
-        sync_directory,
+        open_syncable_directory_ambient, path_is_proven_absent, read_stable_file,
+        read_stable_file_observed, sync_directory,
     };
 
     struct TemporaryDirectory(PathBuf);
@@ -1111,6 +1168,31 @@ mod stable_file_tests {
         });
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn retained_path_classification_distinguishes_present_and_missing() {
+        let temporary = TemporaryDirectory::new();
+        let parent = temporary.path().join("parent");
+        let present = parent.join("project");
+        fs::create_dir_all(&present).unwrap();
+
+        assert!(!path_is_proven_absent(&present).unwrap());
+        assert!(path_is_proven_absent(&parent.join("missing")).unwrap());
+        assert!(path_is_proven_absent(&parent.join("missing/project")).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_path_classification_does_not_call_a_dangling_link_absent() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TemporaryDirectory::new();
+        let linked = temporary.path().join("linked");
+        symlink(temporary.path().join("missing-target"), &linked).unwrap();
+
+        assert!(path_is_proven_absent(&linked.join("project")).is_err());
+        assert!(path_is_proven_absent(&linked).is_err());
     }
 }
 

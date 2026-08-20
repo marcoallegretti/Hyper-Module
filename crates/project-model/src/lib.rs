@@ -16,6 +16,15 @@ const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_MANIFEST_BYTES: usize = 1_048_576;
 const MAX_RECORDS: usize = 4_096;
 
+/// Returns whether a project name belongs to the version-1 manifest domain.
+///
+/// Importers must preserve every name accepted by the format. Interactive
+/// creation may impose additional presentation or portability policy.
+#[must_use]
+pub fn is_valid_project_name(name: &str) -> bool {
+    (1..=120).contains(&name.chars().count())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManifestErrorKind {
     Json(StrictJsonErrorKind),
@@ -409,9 +418,8 @@ fn validate_manifest(raw: RawManifest) -> Result<ProjectManifest, ManifestError>
         raw.revision <= MAX_SAFE_INTEGER,
         "project revision exceeds the interoperable integer range",
     )?;
-    let name_length = raw.name.chars().count();
     require(
-        (1..=120).contains(&name_length),
+        is_valid_project_name(&raw.name),
         "project name length is invalid",
     )?;
     require(

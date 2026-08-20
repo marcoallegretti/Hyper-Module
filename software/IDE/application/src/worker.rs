@@ -10,6 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use hyper_desktop_audio::{DesktopAudioPreviewSnapshot, DesktopAudioPreviewState};
+use hyper_fs_authority::path_is_proven_absent;
 use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, TransportCommand};
 use hyper_playback_json::SceneTrackAction;
 use hyper_project_history::{ProjectHistory, ProjectHistoryError, RecentProject};
@@ -3542,8 +3543,8 @@ fn open_recent_project(
     unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
     project_history: Option<&ProjectHistory>,
 ) -> bool {
-    match std::fs::symlink_metadata(&path) {
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+    match path_is_proven_absent(&path) {
+        Ok(true) => {
             if let Some(project_history) = project_history {
                 let history_event = match project_history.forget(&path) {
                     Ok(projects) => IdeWorkerEvent::RecentProjectsChanged { projects },
@@ -3559,7 +3560,7 @@ fn open_recent_project(
                 IdeWorkerCommandFailure::RecentProjectMissing(path),
             )
         }
-        Ok(_) | Err(_) => open_project(
+        Ok(false) | Err(_) => open_project(
             state,
             path,
             events,
@@ -10509,6 +10510,18 @@ mod tests {
         ));
         assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
 
+        worker
+            .try_send(IdeWorkerCommand::OpenRecentProject(canonical_project.clone()))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::OpenProject,
+                reason: IdeWorkerCommandFailure::ProjectOpen(_),
+            }
+        ));
+        assert_eq!(history.load().unwrap().len(), 1);
+
         std::fs::remove_dir(&project).unwrap();
         worker
             .try_send(IdeWorkerCommand::OpenRecentProject(canonical_project.clone()))
@@ -10531,6 +10544,266 @@ mod tests {
         std::fs::remove_file(config.join("recent-projects.lock")).unwrap();
         std::fs::remove_dir(config).unwrap();
         std::fs::remove_dir(fixture).unwrap();
+    }
+
+    #[test]
+    fn recent_project_with_a_dangling_parent_link_is_retained() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-linked-history-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = fixture.join("config");
+        let parent = fixture.join("parent");
+        let project = parent.join("project");
+        let missing_target = fixture.join("missing-target");
+        std::fs::create_dir_all(&project).unwrap();
+        let history = ProjectHistory::at(&config);
+        history.remember("Linked Session", &project).unwrap();
+        let canonical_project = std::fs::canonicalize(&project).unwrap();
+        std::fs::remove_dir_all(&parent).unwrap();
+        create_directory_link(&missing_target, &parent);
+
+        let worker = DesktopIdeWorker::start_state_with_history(
+            WorkerState::Closed(closed_application()),
+            Some(history.clone()),
+            2,
+            3,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenRecentProject(canonical_project.clone()))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::OpenProject,
+                reason: IdeWorkerCommandFailure::ProjectOpen(_),
+            }
+        ));
+        assert_eq!(history.load().unwrap()[0].path(), canonical_project);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+
+        remove_directory_link(&parent);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn successful_open_and_creation_publish_recent_projects_before_running() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-history-success-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = fixture.join("config");
+        let projects = fixture.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let existing = create_project_package(
+            &projects,
+            ProjectCreationRequest {
+                directory_name: "Existing",
+                project_name: "Existing",
+            },
+        )
+        .unwrap()
+        .project()
+        .root()
+        .to_path_buf();
+        let manifest_path = existing.join("project.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["name"] = serde_json::Value::String(" Existing\n".to_owned());
+        std::fs::write(
+            &manifest_path,
+            serde_json_canonicalizer::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let history = ProjectHistory::at(&config);
+
+        let worker = DesktopIdeWorker::start_state_with_history(
+            WorkerState::Closed(closed_application()),
+            Some(history.clone()),
+            2,
+            4,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.is_empty()));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(existing.clone()))
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.len() == 1 && projects[0].name() == " Existing\n"));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
+        assert_eq!(history.load().unwrap()[0].path(), existing);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+
+        let worker = DesktopIdeWorker::start_state_with_history(
+            WorkerState::Closed(closed_application()),
+            Some(history.clone()),
+            2,
+            4,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.len() == 1));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::CreateProject {
+                parent: projects.clone(),
+                directory_name: "Created".to_owned(),
+                project_name: "Created".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.len() == 2 && projects[0].name() == "Created"));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
+        assert_eq!(history.load().unwrap()[0].name(), "Created");
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn failed_open_and_created_but_not_opened_do_not_mutate_history() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-history-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = fixture.join("config");
+        let projects = fixture.join("projects");
+        let seeded = projects.join("seeded");
+        std::fs::create_dir_all(&seeded).unwrap();
+        let history = ProjectHistory::at(&config);
+        history.remember("Seeded", &seeded).unwrap();
+        let before = std::fs::read(history.document_path()).unwrap();
+
+        let worker = DesktopIdeWorker::start_state_with_history(
+            WorkerState::Closed(closed_application()),
+            Some(history.clone()),
+            2,
+            3,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(fixture.join("missing")))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::OpenProject,
+                reason: IdeWorkerCommandFailure::ProjectOpen(_),
+            }
+        ));
+        assert_eq!(std::fs::read(history.document_path()).unwrap(), before);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+
+        let mut application = closed_application();
+        application.output_selection = IdeOutputSelection::Routed("missing-route".to_owned());
+        let worker = DesktopIdeWorker::start_state_with_history(
+            WorkerState::Closed(application),
+            Some(history.clone()),
+            2,
+            3,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::CreateProject {
+                parent: projects,
+                directory_name: "Preserved".to_owned(),
+                project_name: "Preserved".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::CreateProject,
+                reason: IdeWorkerCommandFailure::ProjectCreation(_),
+            }
+        ));
+        assert_eq!(std::fs::read(history.document_path()).unwrap(), before);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn history_lock_failure_warns_without_hiding_successful_open() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-history-warning-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = fixture.join("config");
+        let projects = fixture.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let project = create_project_package(
+            &projects,
+            ProjectCreationRequest {
+                directory_name: "Openable",
+                project_name: "Openable",
+            },
+        )
+        .unwrap()
+        .project()
+        .root()
+        .to_path_buf();
+        let history = ProjectHistory::at(&config);
+        std::fs::create_dir_all(&config).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(config.join("recent-projects.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+
+        let worker = DesktopIdeWorker::start_state_with_history(
+            WorkerState::Closed(closed_application()),
+            Some(history.clone()),
+            2,
+            4,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::RecentProjectsChanged { projects } if projects.is_empty()));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ProjectHistoryWarning(reason)
+                if reason.kind() == hyper_project_history::ProjectHistoryErrorKind::Locked
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
+        assert!(!history.document_path().exists());
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+
+        drop(lock);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn create_directory_link(target: &std::path::Path, link: &std::path::Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(target: &std::path::Path, link: &std::path::Path) {
+        std::fs::create_dir(target).unwrap();
+        junction::create(target, link).unwrap();
+        std::fs::remove_dir(target).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn remove_directory_link(link: &std::path::Path) {
+        std::fs::remove_file(link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn remove_directory_link(link: &std::path::Path) {
+        junction::delete(link).unwrap();
     }
 
     #[test]

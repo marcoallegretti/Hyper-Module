@@ -16,6 +16,7 @@ hyper-control-mappings = { path = "../../../crates/control-mappings" }
 hyper-mapping-compiler = { path = "../../../crates/mapping-compiler" }
 hyper-mapping-editor = { path = "../mapping-editor" }
 hyper-desktop-audio = { path = "../audio-backend" }
+hyper-fs-authority = { path = "../../../crates/fs-authority" }
 hyper-media-cache = { path = "../../../crates/media-cache" }
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
 hyper-playback-compiler = { path = "../../../crates/playback-compiler" }
@@ -40,3 +41,6 @@ hyper-clip-engine = { path = "../../../crates/clip-engine" }
 serde_json = "=1.0.151"
 serde_json_canonicalizer = "=0.3.2"
 sha2 = "=0.10.9"
+
+[target.'cfg(windows)'.dev-dependencies]
+junction = { version = "=2.0.0", default-features = false }

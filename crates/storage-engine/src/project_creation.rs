@@ -5,6 +5,7 @@ use std::path::Path;
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::fs::{Dir, OpenOptions};
+use hyper_project_model::is_valid_project_name;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -264,8 +265,7 @@ fn open_creation_target(
 }
 
 fn validate_request(request: ProjectCreationRequest<'_>) -> Result<(), ProjectCreationError> {
-    let project_chars = request.project_name.chars().count();
-    if !(1..=120).contains(&project_chars)
+    if !is_valid_project_name(request.project_name)
         || request.project_name.trim() != request.project_name
         || request.project_name.chars().any(char::is_control)
     {

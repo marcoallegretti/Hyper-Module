@@ -3,14 +3,20 @@
 
 use core::error::Error;
 use core::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use atomic_write_file::AtomicWriteFile;
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions};
 use directories::BaseDirs;
-use hyper_fs_authority::{open_syncable_directory_ambient, read_stable_file};
+use hyper_fs_authority::{
+    identity, open_syncable_directory_ambient, path_is_proven_absent, read_stable_file,
+    rename_replace, sync_directory,
+};
+use hyper_project_model::is_valid_project_name;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 const DOCUMENT_FORMAT: &str = "hyper-ide-project-history";
 const DOCUMENT_VERSION: u8 = 1;
@@ -122,18 +128,14 @@ impl ProjectHistory {
     /// Returns a classified rejection for unreadable, oversized, linked,
     /// noncanonical, or structurally invalid history.
     pub fn load(&self) -> Result<Vec<RecentProject>, ProjectHistoryError> {
-        let Some(parent) = self.document_path.parent() else {
-            return Err(rejection(
-                ProjectHistoryErrorKind::InvalidDocument,
-                "project history path has no parent directory",
-            ));
-        };
-        if !parent.exists() {
+        let Some(directory) = self.open_existing_directory()? else {
             return Ok(Vec::new());
-        }
-        let directory = open_syncable_directory_ambient(parent)
-            .map_err(|source| io_error("open project history directory", source))?;
-        let bytes = match read_stable_file(&directory, HISTORY_FILE_NAME, MAX_DOCUMENT_BYTES_U64) {
+        };
+        Self::load_from(&directory)
+    }
+
+    fn load_from(directory: &Dir) -> Result<Vec<RecentProject>, ProjectHistoryError> {
+        let bytes = match read_stable_file(directory, HISTORY_FILE_NAME, MAX_DOCUMENT_BYTES_U64) {
             Ok(bytes) => bytes,
             Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(source) if source.kind() == io::ErrorKind::InvalidInput => {
@@ -180,8 +182,8 @@ impl ProjectHistory {
                 "recent project must be an absolute UTF-8 directory path",
             ));
         }
-        self.with_exclusive_lock(|| {
-            let mut projects = self.load()?;
+        self.with_exclusive_lock(|directory| {
+            let mut projects = Self::load_from(directory)?;
             projects.retain(|project| project.path != path);
             projects.insert(
                 0,
@@ -191,7 +193,7 @@ impl ProjectHistory {
                 },
             );
             projects.truncate(MAX_RECENT_PROJECTS);
-            self.publish(&projects)?;
+            Self::publish(directory, &projects)?;
             Ok(projects)
         })
     }
@@ -207,12 +209,12 @@ impl ProjectHistory {
         path: impl AsRef<Path>,
     ) -> Result<Vec<RecentProject>, ProjectHistoryError> {
         let path = path.as_ref();
-        self.with_exclusive_lock(|| {
-            let mut projects = self.load()?;
+        self.with_exclusive_lock(|directory| {
+            let mut projects = Self::load_from(directory)?;
             let previous = projects.len();
             projects.retain(|project| project.path != path);
             if projects.len() != previous {
-                self.publish(&projects)?;
+                Self::publish(directory, &projects)?;
             }
             Ok(projects)
         })
@@ -220,7 +222,7 @@ impl ProjectHistory {
 
     fn with_exclusive_lock<T>(
         &self,
-        operation: impl FnOnce() -> Result<T, ProjectHistoryError>,
+        operation: impl FnOnce(&Dir) -> Result<T, ProjectHistoryError>,
     ) -> Result<T, ProjectHistoryError> {
         let parent = self.lock_path.parent().ok_or_else(|| {
             rejection(
@@ -230,13 +232,25 @@ impl ProjectHistory {
         })?;
         fs::create_dir_all(parent)
             .map_err(|source| io_error("create project history directory", source))?;
-        let lock = OpenOptions::new()
+        if path_is_proven_absent(parent).map_err(classification_error)? {
+            return Err(rejection(
+                ProjectHistoryErrorKind::InvalidDocument,
+                "created project history directory is absent",
+            ));
+        }
+        let directory = open_syncable_directory_ambient(parent)
+            .map_err(|source| io_error("open project history directory", source))?;
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&self.lock_path)
+            .follow(FollowSymlinks::No);
+        let lock = directory
+            .open_with(LOCK_FILE_NAME, &options)
             .map_err(|source| io_error("open project history lock", source))?;
+        let lock = lock.into_std();
         lock.try_lock().map_err(|source| match source {
             std::fs::TryLockError::WouldBlock => rejection(
                 ProjectHistoryErrorKind::Locked,
@@ -244,10 +258,26 @@ impl ProjectHistory {
             ),
             std::fs::TryLockError::Error(source) => io_error("lock project history", source),
         })?;
-        operation()
+        operation(&directory)
     }
 
-    fn publish(&self, projects: &[RecentProject]) -> Result<(), ProjectHistoryError> {
+    fn open_existing_directory(&self) -> Result<Option<Dir>, ProjectHistoryError> {
+        let parent = self.document_path.parent().ok_or_else(|| {
+            rejection(
+                ProjectHistoryErrorKind::InvalidDocument,
+                "project history path has no parent directory",
+            )
+        })?;
+        match path_is_proven_absent(parent) {
+            Ok(true) => Ok(None),
+            Ok(false) => open_syncable_directory_ambient(parent)
+                .map(Some)
+                .map_err(|source| io_error("open project history directory", source)),
+            Err(source) => Err(classification_error(source)),
+        }
+    }
+
+    fn publish(directory: &Dir, projects: &[RecentProject]) -> Result<(), ProjectHistoryError> {
         let document = StoredHistory {
             format: DOCUMENT_FORMAT,
             format_version: DOCUMENT_VERSION,
@@ -267,13 +297,57 @@ impl ProjectHistory {
                 "project history exceeds its byte limit",
             ));
         }
-        let mut file = AtomicWriteFile::open(&self.document_path)
-            .map_err(|source| io_error("stage project history", source))?;
-        file.write_all(&bytes)
-            .map_err(|source| io_error("write project history", source))?;
-        file.commit()
-            .map_err(|source| io_error("publish project history", source))
+        let temporary_name = format!(".recent-projects-{}.tmp", Uuid::new_v4());
+        if let Err(publication) = stage_and_publish(directory, &temporary_name, &bytes) {
+            return match directory.remove_file(&temporary_name) {
+                Ok(()) => Err(publication),
+                Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => Err(publication),
+                Err(cleanup) => Err(error_with_source(
+                    ProjectHistoryErrorKind::Io,
+                    &format!(
+                        "clean up staged project history after publication failure: {publication}"
+                    ),
+                    cleanup,
+                )),
+            };
+        }
+        Ok(())
     }
+}
+
+fn stage_and_publish(
+    directory: &Dir,
+    temporary_name: &str,
+    bytes: &[u8],
+) -> Result<(), ProjectHistoryError> {
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    let mut file = directory
+        .open_with(temporary_name, &options)
+        .map_err(|source| io_error("stage project history", source))?;
+    file.write_all(bytes)
+        .map_err(|source| io_error("write project history", source))?;
+    file.sync_all()
+        .map_err(|source| io_error("sync staged project history", source))?;
+    let staged_identity = identity(
+        &file
+            .metadata()
+            .map_err(|source| io_error("inspect staged project history", source))?,
+    );
+    drop(file);
+    rename_replace(
+        directory,
+        temporary_name,
+        staged_identity,
+        directory,
+        HISTORY_FILE_NAME,
+    )
+    .map_err(|source| io_error("publish project history", source))?;
+    sync_directory(directory)
+        .map_err(|source| io_error("synchronize project history directory", source))
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,17 +424,11 @@ fn decode_document(bytes: &[u8]) -> Result<Vec<RecentProject>, ProjectHistoryErr
         })?;
     for raw in raw.projects {
         validate_name(&raw.name)?;
-        let path = PathBuf::from(&raw.path);
-        if !path.is_absolute() || raw.path.contains('\0') {
-            return Err(rejection(
-                ProjectHistoryErrorKind::InvalidDocument,
-                "recent project path must be an absolute UTF-8 path",
-            ));
-        }
-        if projects
-            .iter()
-            .any(|project: &RecentProject| project.path == path)
-        {
+        let path = validate_stored_path(&raw.path)?;
+        let path_key = stored_path_key(&raw.path);
+        if projects.iter().any(|project: &RecentProject| {
+            stored_path_key(project.path.to_str().unwrap_or_default()) == path_key
+        }) {
             return Err(rejection(
                 ProjectHistoryErrorKind::InvalidDocument,
                 "recent project paths must be unique",
@@ -375,13 +443,59 @@ fn decode_document(bytes: &[u8]) -> Result<Vec<RecentProject>, ProjectHistoryErr
 }
 
 fn validate_name(name: &str) -> Result<(), ProjectHistoryError> {
-    if name.trim() != name || !(1..=120).contains(&name.chars().count()) || name.contains('\0') {
+    if !is_valid_project_name(name) {
         return Err(rejection(
             ProjectHistoryErrorKind::InvalidProject,
             "recent project name is outside the supported domain",
         ));
     }
     Ok(())
+}
+
+fn validate_stored_path(raw: &str) -> Result<PathBuf, ProjectHistoryError> {
+    let path = PathBuf::from(raw);
+    let normalized: PathBuf = path.components().collect();
+    let has_parent = path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir));
+    #[cfg(windows)]
+    let has_alternate_separator = raw.contains('/');
+    #[cfg(not(windows))]
+    let has_alternate_separator = false;
+    if !path.is_absolute()
+        || raw.contains('\0')
+        || has_parent
+        || has_alternate_separator
+        || normalized != path
+    {
+        return Err(rejection(
+            ProjectHistoryErrorKind::InvalidDocument,
+            "recent project path is not in canonical absolute form",
+        ));
+    }
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn stored_path_key(path: &str) -> String {
+    path.to_lowercase()
+}
+
+#[cfg(not(windows))]
+fn stored_path_key(path: &str) -> &str {
+    path
+}
+
+fn classification_error(source: io::Error) -> ProjectHistoryError {
+    if source.kind() == io::ErrorKind::InvalidInput {
+        error_with_source(
+            ProjectHistoryErrorKind::InvalidDocument,
+            "project history directory path is linked or irregular",
+            source,
+        )
+    } else {
+        io_error("classify project history directory", source)
+    }
 }
 
 fn rejection(kind: ProjectHistoryErrorKind, message: &str) -> ProjectHistoryError {
@@ -495,7 +609,7 @@ mod tests {
         let project = fixture.project(0);
         let lock_parent = fixture.history.lock_path.parent().unwrap();
         fs::create_dir_all(lock_parent).unwrap();
-        let lock = OpenOptions::new()
+        let lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -504,10 +618,19 @@ mod tests {
             .unwrap();
         lock.try_lock().unwrap();
 
-        let error = fixture.history.remember("Project", project).unwrap_err();
+        let error = fixture.history.remember("Project", &project).unwrap_err();
 
         assert_eq!(error.kind(), ProjectHistoryErrorKind::Locked);
         assert!(!fixture.history.document_path().exists());
+
+        drop(lock);
+        fixture.history.remember("Project", &project).unwrap();
+        let second = fixture.project(1);
+        fixture.history.remember("Second", &second).unwrap();
+        let projects = fixture.history.load().unwrap();
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].name(), "Second");
+        assert_eq!(projects[1].name(), "Project");
     }
 
     #[test]
@@ -558,6 +681,34 @@ mod tests {
                 }),
                 ProjectHistoryErrorKind::DocumentLimit,
             ),
+            (
+                json!({
+                    "format": DOCUMENT_FORMAT,
+                    "format_version": DOCUMENT_VERSION + 1,
+                    "projects": []
+                }),
+                ProjectHistoryErrorKind::InvalidDocument,
+            ),
+            (
+                json!({
+                    "format": DOCUMENT_FORMAT,
+                    "format_version": DOCUMENT_VERSION,
+                    "projects": [],
+                    "unknown": true
+                }),
+                ProjectHistoryErrorKind::InvalidDocument,
+            ),
+            (
+                json!({
+                    "format": DOCUMENT_FORMAT,
+                    "format_version": DOCUMENT_VERSION,
+                    "projects": [{
+                        "name": "Alias",
+                        "path": lexical_alias_test_path()
+                    }]
+                }),
+                ProjectHistoryErrorKind::InvalidDocument,
+            ),
         ] {
             fs::write(
                 fixture.history.document_path(),
@@ -566,6 +717,37 @@ mod tests {
             .unwrap();
             assert_eq!(fixture.history.load().unwrap_err().kind(), expected);
         }
+
+        fs::write(
+            fixture.history.document_path(),
+            vec![b' '; MAX_DOCUMENT_BYTES + 1],
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.history.load().unwrap_err().kind(),
+            ProjectHistoryErrorKind::DocumentLimit
+        );
+    }
+
+    #[test]
+    fn config_parent_failures_are_not_reported_as_empty_history() {
+        let fixture = Fixture::new();
+        let config = fixture.root.join("not-a-directory");
+        fs::write(&config, b"entry").unwrap();
+        let history = ProjectHistory::at(&config);
+
+        assert!(history.load().is_err());
+    }
+
+    #[test]
+    fn history_accepts_every_version_one_manifest_name() {
+        let fixture = Fixture::new();
+        let project = fixture.project(0);
+
+        let projects = fixture.history.remember(" Project\n", project).unwrap();
+
+        assert_eq!(projects[0].name(), " Project\n");
+        assert_eq!(fixture.history.load().unwrap()[0].name(), " Project\n");
     }
 
     #[cfg(unix)]
@@ -586,9 +768,45 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_linked_config_directory() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let target = fixture.root.join("target-config");
+        let linked = fixture.root.join("linked-config");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &linked).unwrap();
+
+        assert!(ProjectHistory::at(linked).load().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_a_linked_config_directory() {
+        let fixture = Fixture::new();
+        let target = fixture.root.join("target-config");
+        let linked = fixture.root.join("linked-config");
+        fs::create_dir(&target).unwrap();
+        junction::create(&target, &linked).unwrap();
+
+        assert!(ProjectHistory::at(&linked).load().is_err());
+        junction::delete(&linked).unwrap();
+    }
+
     fn absolute_test_path(suffix: &str) -> String {
         std::env::temp_dir()
             .join(format!("history-{suffix}"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn lexical_alias_test_path() -> String {
+        std::env::temp_dir()
+            .join("history-alias")
+            .join("..")
+            .join("history-target")
             .to_string_lossy()
             .into_owned()
     }
