@@ -39,7 +39,9 @@ use hyper_desktop_ide::{
 use hyper_desktop_ide::{
     IdeArrangementPlacementEditError, IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError,
     IdeAudioClipLoopEditError, IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError,
+    IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome, IdeAudioImportError,
     IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneRenameError, IdeSceneSlotEditError,
+    IdeWorkerCommandFailure,
 };
 use slint::platform::PlatformError;
 use slint::{
@@ -67,6 +69,12 @@ type RecordingRoutes = Rc<RefCell<Vec<usize>>>;
 type TakeRoutes = Rc<RefCell<Vec<TakeRoute>>>;
 type AudioImportRoutes = Rc<RefCell<Vec<String>>>;
 type ProjectUiStateCell = Rc<ProjectUiState>;
+
+#[derive(Debug)]
+enum AudioImportChoice {
+    Selected(Vec<PathBuf>),
+    Cancelled,
+}
 
 #[derive(Clone, Default)]
 struct UiRoutes {
@@ -413,19 +421,19 @@ fn bind_audio_import_callback(
             if ui.get_app_mode() != AppMode::ImportingAudio {
                 return;
             }
-            let Some(selection) = selection else {
-                ui.set_app_mode(AppMode::Running);
-                ui.set_status_text("Audio import cancelled".into());
-                return;
-            };
-            let paths = selection
-                .into_iter()
-                .map(|file| file.path().to_path_buf())
-                .collect();
-            submit_to_ui(
+            let choice = selection.map_or(AudioImportChoice::Cancelled, |selection| {
+                AudioImportChoice::Selected(
+                    selection
+                        .into_iter()
+                        .map(|file| file.path().to_path_buf())
+                        .collect(),
+                )
+            });
+            complete_audio_import_choice(
                 &ui,
                 &worker,
-                IdeWorkerCommand::ImportAudio { paths, track_id },
+                track_id,
+                choice,
             );
         });
         if spawn_result.is_err()
@@ -435,6 +443,34 @@ fn bind_audio_import_callback(
             ui.set_status_text("Audio file selection is unavailable".into());
         }
     });
+}
+
+fn complete_audio_import_choice(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    track_id: String,
+    choice: AudioImportChoice,
+) {
+    complete_audio_import_choice_with(ui, track_id, choice, |command| {
+        submit_to_ui(ui, worker, command);
+    });
+}
+
+fn complete_audio_import_choice_with(
+    ui: &MainWindow,
+    track_id: String,
+    choice: AudioImportChoice,
+    submit: impl FnOnce(IdeWorkerCommand),
+) {
+    match choice {
+        AudioImportChoice::Selected(paths) => {
+            submit(IdeWorkerCommand::ImportAudio { paths, track_id });
+        }
+        AudioImportChoice::Cancelled => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Audio import cancelled".into());
+        }
+    }
 }
 
 fn bind_audio_import_callback_with(
@@ -11503,52 +11539,161 @@ mod tests {
         assert_eq!(names.row_data(1).unwrap(), "Audio B");
         assert_eq!(routes.borrow().as_slice(), ["track-a", "track-b"]);
 
-        let chosen = Rc::new(RefCell::new(Vec::new()));
-        let chosen_by_callback = Rc::clone(&chosen);
+        assert_audio_import_callback_contract(ui, &routes);
+        assert_audio_import_event_contract(ui, &routes);
+    }
+
+    fn assert_audio_import_callback_contract(ui: &MainWindow, routes: &AudioImportRoutes) {
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
         let worker: WorkerCell = Rc::new(RefCell::new(None));
         bind_audio_import_callback_with(
             ui,
             &worker,
-            &routes,
-            move |_, _, track_id| chosen_by_callback.borrow_mut().push(track_id),
+            routes,
+            move |weak, _, track_id| {
+                let ui = weak.upgrade().unwrap();
+                complete_audio_import_choice_with(
+                    &ui,
+                    track_id,
+                    AudioImportChoice::Selected(vec![
+                        PathBuf::from("kick.wav"),
+                        PathBuf::from("snare.flac"),
+                    ]),
+                    |command| submitted_by_callback.borrow_mut().push(command),
+                );
+            },
         );
         ui.set_project_history_warning("retained history warning".into());
         ui.set_app_mode(AppMode::Running);
         ui.set_error_text("stale error".into());
         ui.global::<IdeActions>().invoke_choose_audio_import(1);
-        assert_eq!(chosen.borrow().as_slice(), ["track-b"]);
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::ImportAudio { paths, track_id }]
+                if paths == &[PathBuf::from("kick.wav"), PathBuf::from("snare.flac")]
+                    && track_id == "track-b"
+        ));
         assert_eq!(ui.get_app_mode(), AppMode::ImportingAudio);
         assert!(ui.get_error_text().is_empty());
         assert_eq!(ui.get_project_history_warning(), "retained history warning");
 
         ui.set_app_mode(AppMode::Closed);
         ui.global::<IdeActions>().invoke_choose_audio_import(0);
-        assert_eq!(chosen.borrow().len(), 1, "Closed mode owns no import action");
+        assert_eq!(
+            submitted.borrow().len(),
+            1,
+            "Closed mode owns no import action"
+        );
 
         ui.set_app_mode(AppMode::Running);
         ui.set_error_text(SharedString::default());
         ui.global::<IdeActions>().invoke_choose_audio_import(-1);
         assert!(ui.get_error_text().contains("no longer available"));
-        assert_eq!(chosen.borrow().len(), 1);
+        assert_eq!(submitted.borrow().len(), 1);
 
         routes.borrow_mut().truncate(1);
         ui.set_error_text(SharedString::default());
         ui.global::<IdeActions>().invoke_choose_audio_import(1);
         assert!(ui.get_error_text().contains("no longer available"));
-        assert_eq!(chosen.borrow().len(), 1);
+        assert_eq!(submitted.borrow().len(), 1);
         assert_eq!(ui.get_project_history_warning(), "retained history warning");
 
         *routes.borrow_mut() = vec!["track-a".to_owned(), "track-b".to_owned()];
         ui.set_selected_audio_import_track_index(1);
         set_audio_import_targets(
             ui,
-            &routes,
+            routes,
             &[
                 IdeMixerChannel::for_test("track-b", "Audio B", IdeMixerChannelKind::Audio),
                 IdeMixerChannel::for_test("track-a", "Audio A", IdeMixerChannelKind::Audio),
             ],
         );
         assert_eq!(ui.get_selected_audio_import_track_index(), 0);
+
+        bind_audio_import_callback_with(ui, &worker, routes, move |weak, _, track_id| {
+            let ui = weak.upgrade().unwrap();
+            complete_audio_import_choice_with(
+                &ui,
+                track_id,
+                AudioImportChoice::Cancelled,
+                |_| panic!("a cancelled chooser must not submit a command"),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>().invoke_choose_audio_import(0);
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(ui.get_status_text(), "Audio import cancelled");
+
+        bind_audio_import_callback_with(ui, &worker, routes, move |weak, worker, track_id| {
+            let ui = weak.upgrade().unwrap();
+            complete_audio_import_choice(
+                &ui,
+                &worker,
+                track_id,
+                AudioImportChoice::Selected(vec![PathBuf::from("kick.wav")]),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.global::<IdeActions>().invoke_choose_audio_import(0);
+        assert_eq!(ui.get_app_mode(), AppMode::Unavailable);
+        assert!(ui.get_error_text().contains("no longer available"));
+    }
+
+    fn assert_audio_import_event_contract(ui: &MainWindow, routes: &AudioImportRoutes) {
+        let ui_routes = UiRoutes {
+            audio_imports: Rc::clone(routes),
+            ..UiRoutes::default()
+        };
+        let project_state = Rc::new(ProjectUiState::default());
+        ui.set_project_history_warning("retained history warning".into());
+        apply_event(
+            ui,
+            &ui_routes,
+            &project_state,
+            IdeWorkerEvent::AudioImporting { files: 2 },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::ImportingAudio);
+        assert_eq!(ui.get_status_text(), "Importing 2 audio files…");
+        assert!(ui.get_error_text().is_empty());
+
+        apply_event(
+            ui,
+            &ui_routes,
+            &project_state,
+            IdeWorkerEvent::AudioImported(IdeAudioImportBatchOutcome::for_test(
+                2,
+                7,
+                vec!["clip-a".to_owned(), "clip-b".to_owned()],
+            )),
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(
+            ui.get_status_text(),
+            "Imported 2 audio files in project revision 7"
+        );
+        assert!(ui.get_error_text().is_empty());
+
+        ui.set_app_mode(AppMode::ImportingAudio);
+        apply_event(
+            ui,
+            &ui_routes,
+            &project_state,
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportAudio,
+                reason: IdeWorkerCommandFailure::AudioImport(Box::new(
+                    IdeAudioImportBatchFailure::for_test(
+                        1,
+                        2,
+                        PathBuf::from("snare.flac"),
+                        IdeAudioImportError::UnsupportedContainer,
+                    ),
+                )),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(ui.get_error_text().contains("imported 1 of 2"));
+        assert_eq!(ui.get_project_history_warning(), "retained history warning");
     }
 
     fn assert_committed_audio_clip_source_slip_warning(ui: &MainWindow) {

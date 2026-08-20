@@ -2405,6 +2405,22 @@ pub struct IdeAudioImportBatchFailure {
 }
 
 impl IdeAudioImportBatchFailure {
+    #[cfg(any(test, feature = "ui-test-support"))]
+    #[must_use]
+    pub fn for_test(
+        completed: usize,
+        total: usize,
+        path: PathBuf,
+        source: IdeAudioImportError,
+    ) -> Self {
+        Self {
+            completed,
+            total,
+            path,
+            source: Box::new(source),
+        }
+    }
+
     #[must_use]
     pub const fn completed(&self) -> usize {
         self.completed
@@ -2453,6 +2469,16 @@ pub struct IdeAudioImportBatchOutcome {
 }
 
 impl IdeAudioImportBatchOutcome {
+    #[cfg(any(test, feature = "ui-test-support"))]
+    #[must_use]
+    pub fn for_test(imported: usize, final_revision: u64, clip_ids: Vec<String>) -> Self {
+        Self {
+            imported,
+            final_revision,
+            clip_ids,
+        }
+    }
+
     #[must_use]
     pub const fn imported(&self) -> usize {
         self.imported

@@ -13846,6 +13846,102 @@ mod tests {
     }
 
     #[test]
+    fn audio_import_history_effect_distinguishes_zero_partial_and_complete_batches() {
+        let completed = ProjectMutationAttempt::ImportAudio(Ok(IdeAudioImportBatchOutcome {
+            imported: 2,
+            final_revision: 3,
+            clip_ids: vec!["clip-a".to_owned(), "clip-b".to_owned()],
+        }));
+        let partial = ProjectMutationAttempt::ImportAudio(Err(IdeAudioImportBatchFailure {
+            completed: 1,
+            total: 2,
+            path: PathBuf::from("second.flac"),
+            source: Box::new(IdeAudioImportError::UnsupportedContainer),
+        }));
+        for attempt in [&completed, &partial] {
+            let (events, receiver) = std::sync::mpsc::sync_channel(4);
+            let mut history = UndoHistory::default();
+            history.record_edit(labelled("undo", "clip gain"));
+            history.record_restore(false, labelled("redo", "scene rename"));
+
+            observe_history(
+                &mut history,
+                attempt,
+                IdeWorkerCommandKind::ImportAudio,
+                &events,
+            );
+
+            assert!(history.undo.is_empty() && history.redo.is_empty());
+            assert!(matches!(
+                receiver.try_recv(),
+                Ok(IdeWorkerEvent::UndoStateChanged {
+                    undo_label: None,
+                    redo_label: None,
+                })
+            ));
+        }
+
+        let zero = ProjectMutationAttempt::ImportAudio(Err(IdeAudioImportBatchFailure {
+            completed: 0,
+            total: 1,
+            path: PathBuf::from("refused.wav"),
+            source: Box::new(IdeAudioImportError::UnsupportedContainer),
+        }));
+        let (events, receiver) = std::sync::mpsc::sync_channel(4);
+        let mut history = UndoHistory::default();
+        history.record_edit(labelled("undo", "clip gain"));
+        history.record_restore(false, labelled("redo", "scene rename"));
+
+        observe_history(
+            &mut history,
+            &zero,
+            IdeWorkerCommandKind::ImportAudio,
+            &events,
+        );
+
+        assert_eq!(history.undo.len(), 1);
+        assert_eq!(history.redo.len(), 1);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn audio_import_reopen_failures_retain_complete_and_partial_outcomes() {
+        let completed = project_mutation_reopen_failure(
+            ProjectMutationAttempt::ImportAudio(Ok(IdeAudioImportBatchOutcome {
+                imported: 2,
+                final_revision: 3,
+                clip_ids: vec!["clip-a".to_owned(), "clip-b".to_owned()],
+            })),
+            IdeProjectOpenError::SelectedOutputUnavailable,
+        );
+        assert!(matches!(
+            completed,
+            IdeWorkerCommandFailure::AudioImportReopen { outcome, source }
+                if outcome.imported() == 2
+                    && outcome.final_revision() == 3
+                    && matches!(source.as_ref(), IdeProjectOpenError::SelectedOutputUnavailable)
+        ));
+
+        let partial = project_mutation_reopen_failure(
+            ProjectMutationAttempt::ImportAudio(Err(IdeAudioImportBatchFailure {
+                completed: 1,
+                total: 2,
+                path: PathBuf::from("second.flac"),
+                source: Box::new(IdeAudioImportError::UnsupportedContainer),
+            })),
+            IdeProjectOpenError::SelectedOutputUnavailable,
+        );
+        assert!(matches!(
+            partial,
+            IdeWorkerCommandFailure::AudioImportAndReopen { import, reopen }
+                if import.completed() == 1
+                    && import.total() == 2
+                    && matches!(import.reason(), IdeAudioImportError::UnsupportedContainer)
+                    && matches!(reopen.as_ref(), IdeProjectOpenError::SelectedOutputUnavailable)
+        ));
+    }
+
+    #[test]
     fn the_controls_report_the_newest_entry_on_each_stack() {
         let mut history = UndoHistory::default();
         history.record_edit(labelled("first", "scene rename"));
