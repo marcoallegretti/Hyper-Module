@@ -590,6 +590,37 @@ pub struct AudioClipDuplicationDocuments {
     asset_id: String,
 }
 
+/// Canonical owning-track replacement and retained source identity produced by
+/// removing one unused reusable audio clip.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioClipRemovalDocuments {
+    track: Vec<u8>,
+    track_id: String,
+    asset_id: String,
+}
+
+impl AudioClipRemovalDocuments {
+    #[must_use]
+    pub fn track(&self) -> &[u8] {
+        &self.track
+    }
+
+    #[must_use]
+    pub fn track_id(&self) -> &str {
+        &self.track_id
+    }
+
+    #[must_use]
+    pub fn asset_id(&self) -> &str {
+        &self.asset_id
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, String, String) {
+        (self.track, self.track_id, self.asset_id)
+    }
+}
+
 impl AudioClipDuplicationDocuments {
     #[must_use]
     pub fn track(&self) -> &[u8] {
@@ -692,6 +723,29 @@ pub enum AudioClipDuplicationSerializationError {
     InvalidDocumentShape,
     Serialization(serde_json::Error),
     ProjectCompilation(AdapterCompileError),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AudioClipRemovalBlockers {
+    pub arrangement_placements: usize,
+    pub scene_slots: usize,
+}
+
+impl AudioClipRemovalBlockers {
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.arrangement_placements == 0 && self.scene_slots == 0
+    }
+}
+
+#[derive(Debug)]
+pub enum AudioClipRemovalSerializationError {
+    ClipMissing,
+    Blocked(AudioClipRemovalBlockers),
+    Track(AudioTrackDocumentSerializationError),
+    InvalidDocumentShape,
+    Source(LoadError),
+    Serialization(serde_json::Error),
 }
 
 #[derive(Debug)]
@@ -1469,6 +1523,35 @@ impl Error for AudioClipDuplicationSerializationError {
             | Self::InvalidClipIdentity
             | Self::InvalidClipName
             | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
+impl fmt::Display for AudioClipRemovalSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClipMissing => formatter.write_str("the reusable audio clip does not exist"),
+            Self::Blocked(blockers) => write!(
+                formatter,
+                "the reusable audio clip is still referenced by {} arrangement placements and {} scene slots",
+                blockers.arrangement_placements, blockers.scene_slots
+            ),
+            Self::Track(source) => source.fmt(formatter),
+            Self::InvalidDocumentShape => formatter
+                .write_str("the owning track changed shape after the clip was validated"),
+            Self::Source(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioClipRemovalSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Track(source) => Some(source),
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::ClipMissing | Self::Blocked(_) | Self::InvalidDocumentShape => None,
         }
     }
 }
@@ -2302,6 +2385,76 @@ pub fn serialize_audio_clip_duplication(
         track,
         clip,
         asset_id,
+    })
+}
+
+/// Removes one unused reusable audio clip from its canonical owning track.
+///
+/// The immutable source asset remains declared by the project. Arrangement
+/// placements and scene Play actions are blockers because rewriting them would
+/// be a different, cascading edit.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the clip is absent or referenced, the
+/// supplied owning-track bytes are stale or non-canonical, or the reduced
+/// project fails structural identity validation.
+pub fn serialize_audio_clip_removal(
+    project: &LoadedPlaybackProject,
+    source_track: &[u8],
+    clip_id: &str,
+    limits: LoaderLimits,
+) -> Result<AudioClipRemovalDocuments, AudioClipRemovalSerializationError> {
+    let clip_index = project
+        .clips
+        .iter()
+        .position(|clip| clip.id == clip_id)
+        .ok_or(AudioClipRemovalSerializationError::ClipMissing)?;
+    let clip = &project.clips[clip_index];
+    let blockers = project
+        .audio_clip_removal_blockers(clip_id)
+        .ok_or(AudioClipRemovalSerializationError::ClipMissing)?;
+    if !blockers.is_empty() {
+        return Err(AudioClipRemovalSerializationError::Blocked(blockers));
+    }
+    let track_index = project
+        .track_index(&clip.track_id)
+        .ok_or(AudioClipRemovalSerializationError::InvalidDocumentShape)?;
+    let track = serialize_audio_track_document_edit(
+        project,
+        source_track,
+        &clip.track_id,
+        limits,
+        |document| {
+            let Some(clip_ids) = document.get_mut("clip_ids").and_then(Value::as_array_mut) else {
+                return;
+            };
+            clip_ids.retain(|value| value.as_str() != Some(clip_id));
+        },
+    )
+    .map_err(AudioClipRemovalSerializationError::Track)?;
+    let reduced_track = load_track(
+        &track,
+        track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(AudioClipRemovalSerializationError::Source)?;
+    if reduced_track.clip_ids.len().checked_add(1)
+        != Some(project.tracks[track_index].clip_ids.len())
+    {
+        return Err(AudioClipRemovalSerializationError::InvalidDocumentShape);
+    }
+
+    let mut reduced = project.clone();
+    reduced.clips.remove(clip_index);
+    reduced.tracks[track_index] = reduced_track;
+    validate_loaded_identities(&reduced).map_err(AudioClipRemovalSerializationError::Source)?;
+    Ok(AudioClipRemovalDocuments {
+        track,
+        track_id: clip.track_id.clone(),
+        asset_id: clip.asset_id.clone(),
     })
 }
 
@@ -4965,6 +5118,39 @@ impl LoadedPlaybackProject {
     #[must_use]
     pub fn clip_count(&self) -> usize {
         self.clips.len()
+    }
+
+    /// Returns the persisted playback references that prevent safe unused-clip
+    /// removal. `None` means the clip identity is not part of this project.
+    #[must_use]
+    pub fn audio_clip_removal_blockers(
+        &self,
+        clip_id: &str,
+    ) -> Option<AudioClipRemovalBlockers> {
+        self.clips.iter().any(|clip| clip.id == clip_id).then(|| {
+            let arrangement_placements = self.arrangement.as_ref().map_or(0, |arrangement| {
+                arrangement
+                    .placements
+                    .iter()
+                    .filter(|placement| placement.clip_id == clip_id)
+                    .count()
+            });
+            let scene_slots = self
+                .scenes
+                .iter()
+                .flat_map(|scene| &scene.slots)
+                .filter(|slot| {
+                    matches!(
+                        &slot.action,
+                        LoadedSceneSlotAction::Play { clip_id: referenced } if referenced == clip_id
+                    )
+                })
+                .count();
+            AudioClipRemovalBlockers {
+                arrangement_placements,
+                scene_slots,
+            }
+        })
     }
 
     /// Returns a validated audio-clip name by canonical project order.
@@ -8216,6 +8402,132 @@ mod tests {
                 ..LoaderLimits::VERSION_1
             }),
             Err(AudioClipDuplicationSerializationError::TrackReferenceCapacity)
+        ));
+    }
+
+    #[test]
+    fn removes_only_an_unused_clip_reference_and_retains_its_asset_identity() {
+        let mut track: Value = serde_json::from_slice(TRACK).unwrap();
+        track["extensions"]["org.example.track"] = json!({"kept": [1, 2, 3]});
+        let track = serde_json_canonicalizer::to_vec(&track).unwrap();
+        let clip = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(CLIP).unwrap(),
+        )
+        .unwrap();
+        let tracks: [&[u8]; 1] = [&track];
+        let clips: [&[u8]; 1] = [&clip];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let removed = serialize_audio_clip_removal(
+            &loaded,
+            &track,
+            "018f47a2-6b2d-7c11-8a44-001122334460",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            removed.track_id(),
+            "018f47a2-6b2d-7c11-8a44-001122334456"
+        );
+        assert_eq!(
+            removed.asset_id(),
+            "018f47a2-6b2d-7c11-8a44-001122334457"
+        );
+        let reduced_track: Value = serde_json::from_slice(removed.track()).unwrap();
+        assert_eq!(reduced_track["clip_ids"], json!([]));
+        assert_eq!(
+            reduced_track["extensions"]["org.example.track"],
+            json!({"kept": [1, 2, 3]})
+        );
+        let reduced_tracks: [&[u8]; 1] = [removed.track()];
+        let reopened = load(
+            input(TIMELINE, &reduced_tracks, &[], None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.clip_count(), 0);
+        assert_eq!(reopened.track_count(), 1);
+    }
+
+    #[test]
+    fn audio_clip_removal_refuses_playback_references_and_stale_authority() {
+        let track = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(TRACK).unwrap(),
+        )
+        .unwrap();
+        let clip = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(CLIP).unwrap(),
+        )
+        .unwrap();
+        let scene = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(SCENE).unwrap(),
+        )
+        .unwrap();
+        let arrangement = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(ARRANGEMENT).unwrap(),
+        )
+        .unwrap();
+        let tracks: [&[u8]; 1] = [&track];
+        let clips: [&[u8]; 1] = [&clip];
+        let scenes: [&[u8]; 1] = [&scene];
+        let loaded = load(
+            input_with_scenes(
+                TIMELINE,
+                &tracks,
+                &clips,
+                &scenes,
+                Some(&arrangement),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_audio_clip_removal(
+                &loaded,
+                &track,
+                "018f47a2-6b2d-7c11-8a44-001122334460",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipRemovalSerializationError::Blocked(
+                AudioClipRemovalBlockers {
+                    arrangement_placements: 1,
+                    scene_slots: 1,
+                }
+            ))
+        ));
+
+        let unused = load(
+            input(TIMELINE, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut stale: Value = serde_json::from_slice(&track).unwrap();
+        stale["active"] = false.into();
+        let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
+        assert!(matches!(
+            serialize_audio_clip_removal(
+                &unused,
+                &stale,
+                "018f47a2-6b2d-7c11-8a44-001122334460",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipRemovalSerializationError::Track(
+                AudioTrackDocumentSerializationError::SourceTrackMismatch
+            ))
+        ));
+        assert!(matches!(
+            serialize_audio_clip_removal(
+                &unused,
+                &track,
+                "018f47a2-6b2d-7c11-8a44-001122334469",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipRemovalSerializationError::ClipMissing)
         ));
     }
 
