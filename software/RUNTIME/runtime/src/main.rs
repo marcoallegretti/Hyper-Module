@@ -19,14 +19,15 @@ use hyper_control_runtime::{
     PanelDisplay, PanelReleaseFailure,
 };
 use hyper_desktop_audio::{
-    DesktopControlSinkError, DesktopOutputConfig, DesktopPlaybackSession, DesktopSceneAvailability,
-    OutputStreamCounters, OutputStreamSnapshot, OutputStreamState, OutputStreamStatus,
+    DesktopControlSinkError, DesktopMixerSendTap, DesktopOutputConfig, DesktopPlaybackSession,
+    DesktopSceneAvailability, OutputStreamCounters, OutputStreamSnapshot, OutputStreamState,
+    OutputStreamStatus,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
     ChannelSamplePeakBallistics, EbuLoudnessPresentationConfig, LocateState,
     LoudnessPresentationSnapshot, LoudnessScaleRegion, MaximumTruePeakDisplay, MixerChannelHandle,
-    MixerParameterCommand, MixerParameterStateSnapshot, OutputMeterReceiver,
+    MixerParameterCommand, MixerParameterStateSnapshot, MixerSendHandle, OutputMeterReceiver,
     PlaybackCycleObservation, PlaybackRecoveryCheckpoint, PlaybackRecoverySnapshot,
     PlaybackRecoveryTransportState, SamplePeakBallisticsConfig, ScaledLoudnessValue,
     StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot, TransportCommand,
@@ -160,6 +161,7 @@ struct OperatorReady {
     meters: OutputMeterReceiver,
     scenes: Vec<OperatorScene>,
     mixer_channels: Vec<OperatorMixerChannel>,
+    mixer_sends: Vec<OperatorMixerSend>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,6 +177,16 @@ struct OperatorMixerChannel {
     name: String,
     handle: MixerChannelHandle,
     solo_available: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperatorMixerSend {
+    channel_index: usize,
+    send_index: usize,
+    source_name: String,
+    target_name: String,
+    tap: DesktopMixerSendTap,
+    handle: MixerSendHandle,
 }
 
 struct OperatorWorker {
@@ -278,6 +290,18 @@ enum OperatorCommand {
         channel: MixerChannelHandle,
         solo: bool,
     },
+    SetMixerSendGain {
+        send: MixerSendHandle,
+        gain_millionths: u32,
+    },
+    SetMixerSendPan {
+        send: MixerSendHandle,
+        pan_millionths: i32,
+    },
+    SetMixerSendEnabled {
+        send: MixerSendHandle,
+        enabled: bool,
+    },
     SetMainMute {
         muted: bool,
     },
@@ -306,8 +330,17 @@ struct OperatorMixerChannelAuthority {
 #[derive(Clone, Debug, PartialEq)]
 struct OperatorMixerAuthority {
     channels: Vec<OperatorMixerChannelAuthority>,
+    sends: Vec<OperatorMixerSendAuthority>,
     main_gain: LinearGain,
     main_muted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OperatorMixerSendAuthority {
+    handle: MixerSendHandle,
+    gain: LinearGain,
+    pan: Pan,
+    enabled: bool,
 }
 
 const OPERATOR_COMMAND_CAPACITY: usize = 8;
@@ -636,11 +669,14 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
             }
             command @ (OperatorCommand::SetMixerChannelGain { .. }
             | OperatorCommand::SetMixerChannelPan { .. }
+            | OperatorCommand::SetMixerSendGain { .. }
+            | OperatorCommand::SetMixerSendPan { .. }
             | OperatorCommand::SetMainGain { .. }) => {
                 drain_operator_mixer_value_command(host, command, diagnostic);
             }
             command @ (OperatorCommand::SetMixerChannelMute { .. }
             | OperatorCommand::SetMixerChannelSolo { .. }
+            | OperatorCommand::SetMixerSendEnabled { .. }
             | OperatorCommand::SetMainMute { .. }) => {
                 drain_operator_mixer_boolean_command(host, command, diagnostic);
             }
@@ -672,6 +708,15 @@ fn drain_operator_mixer_boolean_command<H: RuntimeOperatorControl>(
                 "mixer channel unsolo queued"
             },
             "mixer channel solo refused",
+        ),
+        OperatorCommand::SetMixerSendEnabled { send, enabled } => (
+            MixerParameterCommand::SendEnabled { send, enabled },
+            if enabled {
+                "mixer send enable queued"
+            } else {
+                "mixer send disable queued"
+            },
+            "mixer send toggle refused",
         ),
         OperatorCommand::SetMainMute { muted } => (
             MixerParameterCommand::MainMute { muted },
@@ -719,6 +764,32 @@ fn drain_operator_mixer_value_command<H: RuntimeOperatorControl>(
             ),
             Err(error) => {
                 diagnostic(format!("mixer channel pan refused: {error}"));
+                return;
+            }
+        },
+        OperatorCommand::SetMixerSendGain {
+            send,
+            gain_millionths,
+        } => match LinearGain::from_millionths(gain_millionths) {
+            Ok(gain) => (
+                MixerParameterCommand::SendGain { send, gain },
+                "mixer send gain",
+            ),
+            Err(error) => {
+                diagnostic(format!("mixer send gain refused: {error}"));
+                return;
+            }
+        },
+        OperatorCommand::SetMixerSendPan {
+            send,
+            pan_millionths,
+        } => match Pan::from_millionths(pan_millionths) {
+            Ok(pan) => (
+                MixerParameterCommand::SendPan { send, pan },
+                "mixer send pan",
+            ),
+            Err(error) => {
+                diagnostic(format!("mixer send pan refused: {error}"));
                 return;
             }
         },
@@ -789,6 +860,73 @@ fn operator_mixer_catalog(
     )
 }
 
+fn operator_mixer_send_catalog(
+    session: &DesktopPlaybackSession,
+    channels: &[OperatorMixerChannel],
+) -> Result<Vec<OperatorMixerSend>, String> {
+    build_operator_mixer_send_catalog(
+        channels,
+        |channel_index| session.mixer_send_count(channel_index),
+        |channel_index, send_index| {
+            session
+                .mixer_send(channel_index, send_index)
+                .map(|send| {
+                    send.map(|send| (send.target_name().to_owned(), send.tap(), send.handle()))
+                })
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn build_operator_mixer_send_catalog(
+    channels: &[OperatorMixerChannel],
+    mut send_count: impl FnMut(usize) -> Option<usize>,
+    mut send: impl FnMut(
+        usize,
+        usize,
+    ) -> Result<Option<(String, DesktopMixerSendTap, MixerSendHandle)>, String>,
+) -> Result<Vec<OperatorMixerSend>, String> {
+    let mut sends = Vec::new();
+    for channel in channels {
+        let count = send_count(channel.index).ok_or_else(|| {
+            format!(
+                "prepared mixer channel {} has no retained send count",
+                channel.index
+            )
+        })?;
+        sends.try_reserve(count).map_err(|_| {
+            format!(
+                "operator mixer sends for channel {} exceed available capacity",
+                channel.index
+            )
+        })?;
+        for send_index in 0..count {
+            let (target_name, tap, handle) = send(channel.index, send_index)
+                .map_err(|error| {
+                    format!(
+                        "prepared mixer send {}/{} cannot be controlled: {error}",
+                        channel.index, send_index
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "prepared mixer send {}/{} has no retained routing facts",
+                        channel.index, send_index
+                    )
+                })?;
+            sends.push(OperatorMixerSend {
+                channel_index: channel.index,
+                send_index,
+                source_name: channel.name.clone(),
+                target_name,
+                tap,
+                handle,
+            });
+        }
+    }
+    Ok(sends)
+}
+
 fn build_operator_mixer_catalog(
     channel_count: usize,
     mut channel_name: impl FnMut(usize) -> Option<String>,
@@ -832,18 +970,22 @@ fn spawn_operator_worker(
                 let ready_model =
                     operator_scene_catalog(&runtime.host.session).and_then(|scenes| {
                         operator_mixer_catalog(&runtime.host.session).and_then(|mixer_channels| {
-                            runtime
-                                .host
-                                .take_meter_receiver()
-                                .map(|meters| OperatorReady {
-                                    observers: runtime.observers.clone(),
-                                    meters,
-                                    scenes,
-                                    mixer_channels,
-                                })
-                                .ok_or_else(|| {
-                                    "operator output meter authority was already transferred"
-                                        .to_owned()
+                            operator_mixer_send_catalog(&runtime.host.session, &mixer_channels)
+                                .and_then(|mixer_sends| {
+                                    runtime
+                                        .host
+                                        .take_meter_receiver()
+                                        .map(|meters| OperatorReady {
+                                            observers: runtime.observers.clone(),
+                                            meters,
+                                            scenes,
+                                            mixer_channels,
+                                            mixer_sends,
+                                        })
+                                        .ok_or_else(|| {
+                                            "operator output meter authority was already transferred"
+                                                .to_owned()
+                                        })
                                 })
                         })
                     });
@@ -925,6 +1067,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         meters,
         scenes,
         mixer_channels,
+        mixer_sends,
     } = ready;
     let meter_observer = Rc::new(RefCell::new(OperatorMeterObserver::new(
         meters,
@@ -932,11 +1075,13 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     )));
     let scene_model = Rc::new(VecModel::from(operator_scene_rows(&scenes)));
     let mixer_model = Rc::new(VecModel::from(operator_mixer_rows(&mixer_channels)));
+    let mixer_send_model = Rc::new(VecModel::from(operator_mixer_send_rows(&mixer_sends)));
     let loop_authority = Rc::new(Cell::new(None));
     let loudness_authority = Rc::new(Cell::new(None));
     let mixer_authority = Rc::new(RefCell::new(None));
     ui.set_scenes(ModelRc::from(Rc::clone(&scene_model)));
     ui.set_mixer_channels(ModelRc::from(Rc::clone(&mixer_model)));
+    ui.set_mixer_sends(ModelRc::from(Rc::clone(&mixer_send_model)));
 
     apply_static_facts(&ui, &observers.facts);
     wire_operator_action(&ui, &commands_tx, &diagnostic, OperatorCommand::Start);
@@ -966,7 +1111,9 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     apply_operator_mixer_observation(
         &ui,
         &mixer_model,
+        &mixer_send_model,
         &mixer_channels,
+        &mixer_sends,
         &mixer_authority,
         &observers.recovery.snapshot(),
         false,
@@ -979,8 +1126,10 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer_loop_authority = Rc::clone(&loop_authority);
     let timer_loudness_authority = Rc::clone(&loudness_authority);
     let timer_mixer_model = Rc::clone(&mixer_model);
+    let timer_mixer_send_model = Rc::clone(&mixer_send_model);
     let timer_mixer_authority = Rc::clone(&mixer_authority);
     let timer_mixer_channels = mixer_channels;
+    let timer_mixer_sends = mixer_sends;
     let timer_diagnostic = Arc::clone(&diagnostic);
     let timer_close_error = Arc::clone(&completion_close_error);
     let mut completion_observed = false;
@@ -1006,7 +1155,9 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
             apply_operator_mixer_observation(
                 &ui,
                 &timer_mixer_model,
+                &timer_mixer_send_model,
                 &timer_mixer_channels,
+                &timer_mixer_sends,
                 &timer_mixer_authority,
                 &timer_observers.recovery.snapshot(),
                 terminal_latched,
@@ -1038,6 +1189,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 revoke_operator_mixer_authority(
                     &ui,
                     &timer_mixer_model,
+                    &timer_mixer_send_model,
                     &timer_mixer_authority,
                     true,
                 );
@@ -1355,7 +1507,92 @@ fn wire_operator_mixer_controls(
 ) {
     wire_operator_mixer_channel_value_controls(ui, sender, diagnostic, authority);
     wire_operator_mixer_channel_boolean_controls(ui, sender, diagnostic, authority);
+    wire_operator_mixer_send_controls(ui, sender, diagnostic, authority);
     wire_operator_main_mixer_controls(ui, sender, diagnostic, authority);
+}
+
+fn wire_operator_mixer_send_controls(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    authority: &Rc<RefCell<Option<OperatorMixerAuthority>>>,
+) {
+    let gain_sender = sender.clone();
+    let gain_diagnostic = Arc::clone(diagnostic);
+    let gain_authority = Rc::clone(authority);
+    ui.on_set_mixer_send_gain_requested(move |row, percent| {
+        let Some(send) = operator_mixer_send_authority(&gain_authority, row) else {
+            set_diagnostic(
+                &gain_diagnostic,
+                "mixer send gain refused: accepted state is unavailable".to_owned(),
+            );
+            return;
+        };
+        let Ok(gain_millionths) = operator_gain_percent_to_millionths(percent) else {
+            set_diagnostic(
+                &gain_diagnostic,
+                "mixer send gain refused: value is outside 0..=200%".to_owned(),
+            );
+            return;
+        };
+        send_operator_command(
+            &gain_sender,
+            OperatorCommand::SetMixerSendGain {
+                send: send.handle,
+                gain_millionths,
+            },
+            &gain_diagnostic,
+        );
+    });
+
+    let pan_sender = sender.clone();
+    let pan_diagnostic = Arc::clone(diagnostic);
+    let pan_authority = Rc::clone(authority);
+    ui.on_set_mixer_send_pan_requested(move |row, percent| {
+        let Some(send) = operator_mixer_send_authority(&pan_authority, row) else {
+            set_diagnostic(
+                &pan_diagnostic,
+                "mixer send pan refused: accepted state is unavailable".to_owned(),
+            );
+            return;
+        };
+        let Ok(pan_millionths) = operator_pan_percent_to_millionths(percent) else {
+            set_diagnostic(
+                &pan_diagnostic,
+                "mixer send pan refused: value is outside -100..=100%".to_owned(),
+            );
+            return;
+        };
+        send_operator_command(
+            &pan_sender,
+            OperatorCommand::SetMixerSendPan {
+                send: send.handle,
+                pan_millionths,
+            },
+            &pan_diagnostic,
+        );
+    });
+
+    let toggle_sender = sender.clone();
+    let toggle_diagnostic = Arc::clone(diagnostic);
+    let toggle_authority = Rc::clone(authority);
+    ui.on_toggle_mixer_send_requested(move |row| {
+        let Some(send) = operator_mixer_send_authority(&toggle_authority, row) else {
+            set_diagnostic(
+                &toggle_diagnostic,
+                "mixer send toggle refused: accepted state is unavailable".to_owned(),
+            );
+            return;
+        };
+        send_operator_command(
+            &toggle_sender,
+            OperatorCommand::SetMixerSendEnabled {
+                send: send.handle,
+                enabled: !send.enabled,
+            },
+            &toggle_diagnostic,
+        );
+    });
 }
 
 fn wire_operator_mixer_channel_value_controls(
@@ -1558,6 +1795,15 @@ fn operator_mixer_channel_authority(
         .and_then(|row| authority.borrow().as_ref()?.channels.get(row).copied())
 }
 
+fn operator_mixer_send_authority(
+    authority: &RefCell<Option<OperatorMixerAuthority>>,
+    row: i32,
+) -> Option<OperatorMixerSendAuthority> {
+    usize::try_from(row)
+        .ok()
+        .and_then(|row| authority.borrow().as_ref()?.sends.get(row).copied())
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -1662,8 +1908,28 @@ fn operator_mixer_rows(channels: &[OperatorMixerChannel]) -> Vec<OperatorMixerRo
         .collect()
 }
 
+fn operator_mixer_send_rows(sends: &[OperatorMixerSend]) -> Vec<OperatorMixerSendRow> {
+    sends
+        .iter()
+        .map(|send| OperatorMixerSendRow {
+            source_name: send.source_name.clone().into(),
+            target_name: send.target_name.clone().into(),
+            tap: match send.tap {
+                DesktopMixerSendTap::PreFader => "PRE",
+                DesktopMixerSendTap::PostFader => "POST",
+            }
+            .into(),
+            gain_percent: 0.0,
+            pan_percent: 0.0,
+            enabled: false,
+            controls_enabled: false,
+        })
+        .collect()
+}
+
 fn mixer_authority(
     channels: &[OperatorMixerChannel],
+    sends: &[OperatorMixerSend],
     state: &MixerParameterStateSnapshot,
 ) -> Option<OperatorMixerAuthority> {
     if state.channel_count() != channels.len() {
@@ -1673,6 +1939,14 @@ fn mixer_authority(
     authority.try_reserve_exact(channels.len()).ok()?;
     for channel in channels {
         let accepted = state.channel(channel.index)?;
+        if accepted.send_count()
+            != sends
+                .iter()
+                .filter(|send| send.channel_index == channel.index)
+                .count()
+        {
+            return None;
+        }
         let parameters = accepted.parameters();
         authority.push(OperatorMixerChannelAuthority {
             handle: channel.handle,
@@ -1683,36 +1957,55 @@ fn mixer_authority(
             solo_available: channel.solo_available,
         });
     }
+    let mut send_authority = Vec::new();
+    send_authority.try_reserve_exact(sends.len()).ok()?;
+    for send in sends {
+        let accepted = state.channel(send.channel_index)?.send(send.send_index)?;
+        let parameters = accepted.parameters();
+        send_authority.push(OperatorMixerSendAuthority {
+            handle: send.handle,
+            gain: parameters.gain,
+            pan: parameters.pan,
+            enabled: accepted.enabled(),
+        });
+    }
     Some(OperatorMixerAuthority {
         channels: authority,
+        sends: send_authority,
         main_gain: state.main_gain(),
         main_muted: state.main_muted(),
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one coherent recovery observation must validate and update channel and send authority together"
+)]
 fn apply_operator_mixer_observation(
     ui: &OperatorWindow,
     model: &VecModel<OperatorMixerRow>,
+    send_model: &VecModel<OperatorMixerSendRow>,
     channels: &[OperatorMixerChannel],
+    sends: &[OperatorMixerSend],
     authority: &RefCell<Option<OperatorMixerAuthority>>,
     snapshot: &PlaybackRecoverySnapshot,
     terminal_latched: bool,
 ) {
     if terminal_latched {
-        revoke_operator_mixer_authority(ui, model, authority, true);
+        revoke_operator_mixer_authority(ui, model, send_model, authority, true);
         return;
     }
     let Some(state) = snapshot.mixer_parameter_state() else {
-        revoke_operator_mixer_authority(ui, model, authority, false);
+        revoke_operator_mixer_authority(ui, model, send_model, authority, false);
         return;
     };
-    let Some(next) = mixer_authority(channels, &state) else {
-        revoke_operator_mixer_authority(ui, model, authority, false);
+    let Some(next) = mixer_authority(channels, sends, &state) else {
+        revoke_operator_mixer_authority(ui, model, send_model, authority, false);
         return;
     };
     for (row, channel) in next.channels.iter().enumerate() {
         let Some(mut model_row) = model.row_data(row) else {
-            revoke_operator_mixer_authority(ui, model, authority, false);
+            revoke_operator_mixer_authority(ui, model, send_model, authority, false);
             return;
         };
         model_row.gain_percent = channel.gain.value() * 100.0;
@@ -1721,6 +2014,17 @@ fn apply_operator_mixer_observation(
         model_row.soloed = channel.solo;
         model_row.controls_enabled = true;
         model.set_row_data(row, model_row);
+    }
+    for (row, send) in next.sends.iter().enumerate() {
+        let Some(mut model_row) = send_model.row_data(row) else {
+            revoke_operator_mixer_authority(ui, model, send_model, authority, false);
+            return;
+        };
+        model_row.gain_percent = send.gain.value() * 100.0;
+        model_row.pan_percent = send.pan.value() * 100.0;
+        model_row.enabled = send.enabled;
+        model_row.controls_enabled = true;
+        send_model.set_row_data(row, model_row);
     }
     ui.set_main_gain_percent(next.main_gain.value() * 100.0);
     ui.set_main_muted(next.main_muted);
@@ -1732,6 +2036,7 @@ fn apply_operator_mixer_observation(
 fn revoke_operator_mixer_authority(
     ui: &OperatorWindow,
     model: &VecModel<OperatorMixerRow>,
+    send_model: &VecModel<OperatorMixerSendRow>,
     authority: &RefCell<Option<OperatorMixerAuthority>>,
     terminal_latched: bool,
 ) {
@@ -1740,6 +2045,12 @@ fn revoke_operator_mixer_authority(
         if let Some(mut channel) = model.row_data(row) {
             channel.controls_enabled = false;
             model.set_row_data(row, channel);
+        }
+    }
+    for row in 0..send_model.row_count() {
+        if let Some(mut send) = send_model.row_data(row) {
+            send.controls_enabled = false;
+            send_model.set_row_data(row, send);
         }
     }
     ui.set_main_mute_enabled(false);
@@ -2815,6 +3126,11 @@ mod tests {
             "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Scene group","kind":"group",
             "order":1,"active":true,"clip_ids":[],"extensions":{}
         }"#;
+        const RETURN_TRACK: &[u8] = br#"{
+            "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-00112233950a",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Ritorno \u03a9","kind":"return",
+            "order":2,"active":true,"clip_ids":[],"extensions":{}
+        }"#;
         const CLIP: &[u8] = br#"{
             "format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339503",
             "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","track_id":"018f47a2-6b2d-7c11-8a44-001122339502",
@@ -2844,10 +3160,15 @@ mod tests {
             "project_id":"018f47a2-6b2d-7c11-8a44-001122339500",
             "channels":[
             {"track_id":"018f47a2-6b2d-7c11-8a44-001122339502","gain_millionths":1000000,
-            "pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},"sends":[]},
+            "pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},
+            "sends":[{"id":"018f47a2-6b2d-7c11-8a44-00112233950b","bus":"a","tap":"post-fader",
+            "gain_millionths":800000,"pan_millionths":-300000,"enabled":true}]},
             {"track_id":"018f47a2-6b2d-7c11-8a44-001122339508","gain_millionths":1000000,
+            "pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},"sends":[]},
+            {"track_id":"018f47a2-6b2d-7c11-8a44-00112233950a","gain_millionths":1000000,
             "pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},"sends":[]}],
-            "return_buses":[],"main":{"gain_millionths":1000000,"mute":false},
+            "return_buses":[{"bus":"a","track_id":"018f47a2-6b2d-7c11-8a44-00112233950a"}],
+            "main":{"gain_millionths":1000000,"mute":false},
             "cue":{"source":"main","gain_millionths":1000000,"mute":false},"extensions":{}
         }"#;
 
@@ -2862,7 +3183,7 @@ mod tests {
                 project_id: PROJECT_ID.to_owned(),
                 sample_rate_hz: SAMPLE_RATE_HZ,
                 timeline: TIMELINE.to_vec(),
-                tracks: vec![TRACK.to_vec(), SCENE_TRACK.to_vec()],
+                tracks: vec![TRACK.to_vec(), SCENE_TRACK.to_vec(), RETURN_TRACK.to_vec()],
                 clips: vec![CLIP.to_vec()],
                 scenes: vec![SCENE.to_vec()],
                 arrangement: Some(ARRANGEMENT.to_vec()),
@@ -2899,9 +3220,12 @@ mod tests {
         let mut scratch_right = [0.0_f32; 480];
         let mut scene_scratch_left = [0.0_f32; 480];
         let mut scene_scratch_right = [0.0_f32; 480];
+        let mut return_scratch_left = [0.0_f32; 480];
+        let mut return_scratch_right = [0.0_f32; 480];
         let mut scratch = [
             RenderScratchSlot::new(&mut scratch_left, &mut scratch_right),
             RenderScratchSlot::new(&mut scene_scratch_left, &mut scene_scratch_right),
+            RenderScratchSlot::new(&mut return_scratch_left, &mut return_scratch_right),
         ];
         let mut interleaved = [0.0_f32; 960];
         let mut operator_scenes = build_operator_scene_catalog(
@@ -2990,7 +3314,72 @@ mod tests {
                 .iter()
                 .map(|channel| (channel.index, channel.name.as_str()))
                 .collect::<Vec<_>>(),
-            [(0, "Meter source"), (1, "Scene group")]
+            [(0, "Meter source"), (1, "Scene group"), (2, "Ritorno Ω")]
+        );
+        let mixer_sends = build_operator_mixer_send_catalog(
+            &mixer_channels,
+            |channel_index| session.mixer_send_count_at(channel_index),
+            |channel_index, send_index| {
+                let send = session.mixer_send_at(channel_index, send_index);
+                send.map(|send| {
+                    mixer_sender
+                        .resolve_send_address(channel_index, send_index)
+                        .map(|handle| {
+                            (
+                                send.target_name().to_owned(),
+                                match send.tap() {
+                                    hyper_playback_session::PlaybackMixerSendTap::PreFader => {
+                                        DesktopMixerSendTap::PreFader
+                                    }
+                                    hyper_playback_session::PlaybackMixerSendTap::PostFader => {
+                                        DesktopMixerSendTap::PostFader
+                                    }
+                                },
+                                handle,
+                            )
+                        })
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()
+            },
+        )
+        .unwrap();
+        assert_eq!(mixer_sends.len(), 1);
+        assert_eq!(mixer_sends[0].source_name, "Meter source");
+        assert_eq!(mixer_sends[0].target_name, "Ritorno Ω");
+        assert_eq!(mixer_sends[0].tap, DesktopMixerSendTap::PostFader);
+        assert!(
+            build_operator_mixer_send_catalog(
+                &mixer_channels,
+                |channel_index| (channel_index != 1).then_some(0),
+                |_, _| panic!("a missing send count cannot query routing facts"),
+            )
+            .is_err()
+        );
+        assert!(
+            build_operator_mixer_send_catalog(
+                &mixer_channels,
+                |channel_index| Some(usize::from(channel_index == 0)),
+                |_, _| Ok(None),
+            )
+            .is_err()
+        );
+        assert!(
+            build_operator_mixer_send_catalog(
+                &mixer_channels,
+                |channel_index| Some(usize::from(channel_index == 0)),
+                |_, _| Err("generation-bound handle is unavailable".to_owned()),
+            )
+            .is_err()
+        );
+        assert!(
+            build_operator_mixer_send_catalog(
+                &mixer_channels,
+                |_| Some(0),
+                |_, _| panic!("an empty send catalog cannot query routing facts"),
+            )
+            .unwrap()
+            .is_empty()
         );
         assert!(
             build_operator_mixer_catalog(
@@ -3007,7 +3396,7 @@ mod tests {
         );
         assert!(
             build_operator_mixer_catalog(
-                3,
+                4,
                 |index| Some(format!("Channel {index}")),
                 |index| mixer_sender
                     .resolve_channel_index(index)
@@ -3127,11 +3516,49 @@ mod tests {
                 MixerParameterCommand::MainMute { muted: true },
             ]
         );
+        owner_mixer_commands
+            .send(OperatorCommand::SetMixerSendGain {
+                send: mixer_sends[0].handle,
+                gain_millionths: 555_000,
+            })
+            .unwrap();
+        owner_mixer_commands
+            .send(OperatorCommand::SetMixerSendPan {
+                send: mixer_sends[0].handle,
+                pan_millionths: 250_000,
+            })
+            .unwrap();
+        owner_mixer_commands
+            .send(OperatorCommand::SetMixerSendEnabled {
+                send: mixer_sends[0].handle,
+                enabled: false,
+            })
+            .unwrap();
+        drain_operator_commands(&mut owner, &owner_mixer_receiver, &owner_stop, &|_| {});
+        assert_eq!(
+            &owner.mixer_commands[6..],
+            [
+                MixerParameterCommand::SendGain {
+                    send: mixer_sends[0].handle,
+                    gain: LinearGain::from_millionths(555_000).unwrap(),
+                },
+                MixerParameterCommand::SendPan {
+                    send: mixer_sends[0].handle,
+                    pan: Pan::from_millionths(250_000).unwrap(),
+                },
+                MixerParameterCommand::SendEnabled {
+                    send: mixer_sends[0].handle,
+                    enabled: false,
+                },
+            ]
+        );
         let mixer_model = Rc::new(VecModel::from(operator_mixer_rows(&mixer_channels)));
+        let mixer_send_model = Rc::new(VecModel::from(operator_mixer_send_rows(&mixer_sends)));
         let mixer_authority = Rc::new(RefCell::new(None));
         ui.set_mixer_channels(ModelRc::from(Rc::clone(&mixer_model)));
+        ui.set_mixer_sends(ModelRc::from(Rc::clone(&mixer_send_model)));
         let (mixer_commands, mixer_command_receiver) =
-            std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+            std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY * 2);
         let mixer_diagnostic = Arc::new(Mutex::new(String::new()));
         wire_operator_mixer_controls(ui, &mixer_commands, &mixer_diagnostic, &mixer_authority);
 
@@ -3148,7 +3575,9 @@ mod tests {
         apply_operator_mixer_observation(
             ui,
             &mixer_model,
+            &mixer_send_model,
             &mixer_channels,
+            &mixer_sends,
             &mixer_authority,
             &recovery.snapshot(),
             false,
@@ -3162,8 +3591,8 @@ mod tests {
         assert!(!ui.get_main_muted());
         assert!(ui.get_main_mute_enabled());
         let generated_mixer = ui.get_mixer_channels();
-        assert_eq!(generated_mixer.row_count(), 2);
-        for (row, name) in [(0, "Meter source"), (1, "Scene group")] {
+        assert_eq!(generated_mixer.row_count(), 3);
+        for (row, name) in [(0, "Meter source"), (1, "Scene group"), (2, "Ritorno Ω")] {
             let channel = generated_mixer.row_data(row).unwrap();
             assert_eq!(channel.name.as_str(), name);
             assert_operator_float(channel.gain_percent, 100.0);
@@ -3172,6 +3601,19 @@ mod tests {
             assert!(!channel.soloed);
             assert!(channel.controls_enabled);
         }
+        let generated_sends = ui.get_mixer_sends();
+        assert_eq!(generated_sends.row_count(), 1);
+        let send_row = generated_sends.row_data(0).unwrap();
+        assert_eq!(send_row.source_name.as_str(), "Meter source");
+        assert_eq!(send_row.target_name.as_str(), "Ritorno Ω");
+        assert_eq!(send_row.tap.as_str(), "POST");
+        assert_operator_float(send_row.gain_percent, 80.0);
+        assert_operator_float(
+            send_row.pan_percent,
+            Pan::from_millionths(-300_000).unwrap().value() * 100.0,
+        );
+        assert!(send_row.enabled);
+        assert!(send_row.controls_enabled);
 
         assert!(generated_mixer.row_data(0).unwrap().solo_available);
         assert!(!generated_mixer.row_data(1).unwrap().solo_available);
@@ -3211,6 +3653,33 @@ mod tests {
                 solo: true,
             }
         );
+        ui.invoke_set_mixer_send_gain_requested(0, 55.5);
+        let send_gain = mixer_command_receiver.try_recv().unwrap();
+        assert_eq!(
+            send_gain,
+            OperatorCommand::SetMixerSendGain {
+                send: mixer_sends[0].handle,
+                gain_millionths: 555_000,
+            }
+        );
+        ui.invoke_set_mixer_send_pan_requested(0, 25.0);
+        let send_pan = mixer_command_receiver.try_recv().unwrap();
+        assert_eq!(
+            send_pan,
+            OperatorCommand::SetMixerSendPan {
+                send: mixer_sends[0].handle,
+                pan_millionths: 250_000,
+            }
+        );
+        ui.invoke_toggle_mixer_send_requested(0);
+        let send_enabled = mixer_command_receiver.try_recv().unwrap();
+        assert_eq!(
+            send_enabled,
+            OperatorCommand::SetMixerSendEnabled {
+                send: mixer_sends[0].handle,
+                enabled: false,
+            }
+        );
         ui.invoke_set_main_gain_requested(75.0);
         let main_gain = mixer_command_receiver.try_recv().unwrap();
         assert_eq!(
@@ -3231,6 +3700,12 @@ mod tests {
         assert_operator_float(generated_mixer.row_data(0).unwrap().pan_percent, 0.0);
         assert!(!generated_mixer.row_data(1).unwrap().muted);
         assert!(!generated_mixer.row_data(0).unwrap().soloed);
+        assert_operator_float(generated_sends.row_data(0).unwrap().gain_percent, 80.0);
+        assert_operator_float(
+            generated_sends.row_data(0).unwrap().pan_percent,
+            Pan::from_millionths(-300_000).unwrap().value() * 100.0,
+        );
+        assert!(generated_sends.row_data(0).unwrap().enabled);
         for invalid_gain in [f32::NAN, -0.1, 200.1] {
             ui.invoke_set_mixer_channel_gain_requested(0, invalid_gain);
             ui.invoke_set_main_gain_requested(invalid_gain);
@@ -3242,6 +3717,7 @@ mod tests {
 
         let mismatched_channels = &mixer_channels[..1];
         let mismatched_model = VecModel::from(operator_mixer_rows(mismatched_channels));
+        let mismatched_send_model = VecModel::from(operator_mixer_send_rows(&mixer_sends));
         let mut retained_row = mismatched_model.row_data(0).unwrap();
         retained_row.muted = true;
         retained_row.soloed = true;
@@ -3256,13 +3732,21 @@ mod tests {
                 solo: true,
                 solo_available: true,
             }],
+            sends: vec![OperatorMixerSendAuthority {
+                handle: mixer_sends[0].handle,
+                gain: LinearGain::from_millionths(800_000).unwrap(),
+                pan: Pan::from_millionths(-300_000).unwrap(),
+                enabled: true,
+            }],
             main_gain: LinearGain::UNITY,
             main_muted: true,
         }));
         apply_operator_mixer_observation(
             ui,
             &mismatched_model,
+            &mismatched_send_model,
             mismatched_channels,
+            &mixer_sends,
             &mismatched_authority,
             &recovery.snapshot(),
             false,
@@ -3272,7 +3756,41 @@ mod tests {
         assert!(retained_row.soloed);
         assert!(!retained_row.controls_enabled);
         assert_eq!(*mismatched_authority.borrow(), None);
-        for command in [gain, pan, mute, solo, main_gain, main_mute] {
+        let missing_send_model = VecModel::from(Vec::<OperatorMixerSendRow>::new());
+        let missing_send_authority = RefCell::new(None);
+        apply_operator_mixer_observation(
+            ui,
+            &mixer_model,
+            &missing_send_model,
+            &mixer_channels,
+            &[],
+            &missing_send_authority,
+            &recovery.snapshot(),
+            false,
+        );
+        assert_eq!(*missing_send_authority.borrow(), None);
+        assert!(!mixer_model.row_data(0).unwrap().controls_enabled);
+        apply_operator_mixer_observation(
+            ui,
+            &mixer_model,
+            &mixer_send_model,
+            &mixer_channels,
+            &mixer_sends,
+            &mixer_authority,
+            &recovery.snapshot(),
+            false,
+        );
+        for command in [
+            gain,
+            pan,
+            mute,
+            solo,
+            main_gain,
+            main_mute,
+            send_gain,
+            send_pan,
+            send_enabled,
+        ] {
             match command {
                 OperatorCommand::SetMixerChannelGain {
                     channel,
@@ -3297,6 +3815,27 @@ mod tests {
                     .unwrap(),
                 OperatorCommand::SetMixerChannelSolo { channel, solo } => mixer_sender
                     .try_send(MixerParameterCommand::ChannelSolo { channel, solo })
+                    .unwrap(),
+                OperatorCommand::SetMixerSendGain {
+                    send,
+                    gain_millionths,
+                } => mixer_sender
+                    .try_send(MixerParameterCommand::SendGain {
+                        send,
+                        gain: LinearGain::from_millionths(gain_millionths).unwrap(),
+                    })
+                    .unwrap(),
+                OperatorCommand::SetMixerSendPan {
+                    send,
+                    pan_millionths,
+                } => mixer_sender
+                    .try_send(MixerParameterCommand::SendPan {
+                        send,
+                        pan: Pan::from_millionths(pan_millionths).unwrap(),
+                    })
+                    .unwrap(),
+                OperatorCommand::SetMixerSendEnabled { send, enabled } => mixer_sender
+                    .try_send(MixerParameterCommand::SendEnabled { send, enabled })
                     .unwrap(),
                 OperatorCommand::SetMainMute { muted } => mixer_sender
                     .try_send(MixerParameterCommand::MainMute { muted })
@@ -3342,7 +3881,9 @@ mod tests {
         apply_operator_mixer_observation(
             ui,
             &mixer_model,
+            &mixer_send_model,
             &mixer_channels,
+            &mixer_sends,
             &mixer_authority,
             &recovery.snapshot(),
             false,
@@ -3354,6 +3895,9 @@ mod tests {
         assert_operator_float(generated_mixer.row_data(0).unwrap().pan_percent, -25.25);
         assert!(generated_mixer.row_data(1).unwrap().muted);
         assert!(generated_mixer.row_data(0).unwrap().soloed);
+        assert_operator_float(generated_sends.row_data(0).unwrap().gain_percent, 55.5);
+        assert_operator_float(generated_sends.row_data(0).unwrap().pan_percent, 25.0);
+        assert!(!generated_sends.row_data(0).unwrap().enabled);
 
         ui.invoke_toggle_mixer_channel_solo_requested(1);
         assert_eq!(mixer_command_receiver.try_recv(), Err(TryRecvError::Empty));
@@ -3366,6 +3910,9 @@ mod tests {
         ui.invoke_set_mixer_channel_pan_requested(0, 0.0);
         ui.invoke_toggle_mixer_channel_mute_requested(1);
         ui.invoke_toggle_mixer_channel_solo_requested(0);
+        ui.invoke_set_mixer_send_gain_requested(0, 80.0);
+        ui.invoke_set_mixer_send_pan_requested(0, -30.0);
+        ui.invoke_toggle_mixer_send_requested(0);
         ui.invoke_set_main_gain_requested(100.0);
         ui.invoke_toggle_main_mute_requested();
         for expected in [
@@ -3384,6 +3931,18 @@ mod tests {
             MixerParameterCommand::ChannelSolo {
                 channel: mixer_channels[0].handle,
                 solo: false,
+            },
+            MixerParameterCommand::SendGain {
+                send: mixer_sends[0].handle,
+                gain: LinearGain::from_millionths(800_000).unwrap(),
+            },
+            MixerParameterCommand::SendPan {
+                send: mixer_sends[0].handle,
+                pan: Pan::from_millionths(-300_000).unwrap(),
+            },
+            MixerParameterCommand::SendEnabled {
+                send: mixer_sends[0].handle,
+                enabled: true,
             },
             MixerParameterCommand::MainGain {
                 gain: LinearGain::UNITY,
@@ -3412,6 +3971,23 @@ mod tests {
                 OperatorCommand::SetMixerChannelSolo { channel, solo } => {
                     MixerParameterCommand::ChannelSolo { channel, solo }
                 }
+                OperatorCommand::SetMixerSendGain {
+                    send,
+                    gain_millionths,
+                } => MixerParameterCommand::SendGain {
+                    send,
+                    gain: LinearGain::from_millionths(gain_millionths).unwrap(),
+                },
+                OperatorCommand::SetMixerSendPan {
+                    send,
+                    pan_millionths,
+                } => MixerParameterCommand::SendPan {
+                    send,
+                    pan: Pan::from_millionths(pan_millionths).unwrap(),
+                },
+                OperatorCommand::SetMixerSendEnabled { send, enabled } => {
+                    MixerParameterCommand::SendEnabled { send, enabled }
+                }
                 OperatorCommand::SetMainMute { muted } => MixerParameterCommand::MainMute { muted },
                 OperatorCommand::SetMainGain { gain_millionths } => {
                     MixerParameterCommand::MainGain {
@@ -3439,7 +4015,9 @@ mod tests {
         apply_operator_mixer_observation(
             ui,
             &mixer_model,
+            &mixer_send_model,
             &mixer_channels,
+            &mixer_sends,
             &mixer_authority,
             &recovery.snapshot(),
             false,
@@ -3450,11 +4028,22 @@ mod tests {
         assert_operator_float(generated_mixer.row_data(0).unwrap().pan_percent, 0.0);
         assert!(!generated_mixer.row_data(1).unwrap().muted);
         assert!(!generated_mixer.row_data(0).unwrap().soloed);
-        for stale_row in [-1, 2, 9] {
+        assert_operator_float(generated_sends.row_data(0).unwrap().gain_percent, 80.0);
+        assert_operator_float(
+            generated_sends.row_data(0).unwrap().pan_percent,
+            Pan::from_millionths(-300_000).unwrap().value() * 100.0,
+        );
+        assert!(generated_sends.row_data(0).unwrap().enabled);
+        for stale_row in [-1, 3, 9] {
             ui.invoke_set_mixer_channel_gain_requested(stale_row, 50.0);
             ui.invoke_set_mixer_channel_pan_requested(stale_row, 25.0);
             ui.invoke_toggle_mixer_channel_mute_requested(stale_row);
             ui.invoke_toggle_mixer_channel_solo_requested(stale_row);
+        }
+        for stale_row in [-1, 1, 9] {
+            ui.invoke_set_mixer_send_gain_requested(stale_row, 50.0);
+            ui.invoke_set_mixer_send_pan_requested(stale_row, 25.0);
+            ui.invoke_toggle_mixer_send_requested(stale_row);
         }
         assert_eq!(mixer_command_receiver.try_recv(), Err(TryRecvError::Empty));
 
@@ -3463,7 +4052,9 @@ mod tests {
         apply_operator_mixer_observation(
             ui,
             &mixer_model,
+            &mixer_send_model,
             &mixer_channels,
+            &mixer_sends,
             &mixer_authority,
             &missing_mixer.snapshot(),
             false,
@@ -3473,10 +4064,16 @@ mod tests {
         assert!(!ui.get_main_mute_enabled());
         assert!(!generated_mixer.row_data(0).unwrap().muted);
         assert!(!generated_mixer.row_data(0).unwrap().controls_enabled);
+        assert_operator_float(generated_sends.row_data(0).unwrap().gain_percent, 80.0);
+        assert!(generated_sends.row_data(0).unwrap().enabled);
+        assert!(!generated_sends.row_data(0).unwrap().controls_enabled);
         ui.invoke_set_mixer_channel_gain_requested(0, 50.0);
         ui.invoke_set_mixer_channel_pan_requested(0, 25.0);
         ui.invoke_toggle_mixer_channel_mute_requested(0);
         ui.invoke_toggle_mixer_channel_solo_requested(1);
+        ui.invoke_set_mixer_send_gain_requested(0, 50.0);
+        ui.invoke_set_mixer_send_pan_requested(0, 25.0);
+        ui.invoke_toggle_mixer_send_requested(0);
         ui.invoke_set_main_gain_requested(50.0);
         ui.invoke_toggle_main_mute_requested();
         assert_eq!(mixer_command_receiver.try_recv(), Err(TryRecvError::Empty));
@@ -3484,7 +4081,9 @@ mod tests {
         apply_operator_mixer_observation(
             ui,
             &mixer_model,
+            &mixer_send_model,
             &mixer_channels,
+            &mixer_sends,
             &mixer_authority,
             &recovery.snapshot(),
             false,
@@ -3502,6 +4101,8 @@ mod tests {
         ui.invoke_set_mixer_channel_pan_requested(0, 25.0);
         ui.invoke_set_main_gain_requested(50.0);
         ui.invoke_toggle_mixer_channel_mute_requested(0);
+        ui.invoke_set_mixer_send_gain_requested(0, 50.0);
+        ui.invoke_toggle_mixer_send_requested(0);
         assert_eq!(
             saturated_mixer_receiver.try_recv(),
             Ok(OperatorCommand::Start)
@@ -3517,6 +4118,8 @@ mod tests {
                 .contains("operator command refused")
         );
         assert!(!generated_mixer.row_data(0).unwrap().muted);
+        assert_operator_float(generated_sends.row_data(0).unwrap().gain_percent, 80.0);
+        assert!(generated_sends.row_data(0).unwrap().enabled);
 
         let (disconnected_mixer_sender, disconnected_mixer_receiver) =
             std::sync::mpsc::sync_channel(1);
@@ -3532,6 +4135,9 @@ mod tests {
         ui.invoke_set_mixer_channel_pan_requested(0, 25.0);
         ui.invoke_toggle_mixer_channel_mute_requested(1);
         ui.invoke_toggle_mixer_channel_solo_requested(0);
+        ui.invoke_set_mixer_send_gain_requested(0, 50.0);
+        ui.invoke_set_mixer_send_pan_requested(0, 25.0);
+        ui.invoke_toggle_mixer_send_requested(0);
         ui.invoke_set_main_gain_requested(50.0);
         ui.invoke_toggle_main_mute_requested();
         assert!(
@@ -4302,7 +4908,9 @@ mod tests {
         apply_operator_mixer_observation(
             ui,
             &mixer_model,
+            &mixer_send_model,
             &mixer_channels,
+            &mixer_sends,
             &mixer_authority,
             &recovery.snapshot(),
             true,
@@ -4315,10 +4923,16 @@ mod tests {
         assert!(!ui.get_main_mute_enabled());
         assert!(!generated_mixer.row_data(0).unwrap().muted);
         assert!(!generated_mixer.row_data(0).unwrap().controls_enabled);
+        assert_operator_float(generated_sends.row_data(0).unwrap().gain_percent, 80.0);
+        assert!(generated_sends.row_data(0).unwrap().enabled);
+        assert!(!generated_sends.row_data(0).unwrap().controls_enabled);
         ui.invoke_set_mixer_channel_gain_requested(0, 50.0);
         ui.invoke_set_mixer_channel_pan_requested(0, 25.0);
         ui.invoke_toggle_mixer_channel_mute_requested(0);
         ui.invoke_toggle_mixer_channel_solo_requested(1);
+        ui.invoke_set_mixer_send_gain_requested(0, 50.0);
+        ui.invoke_set_mixer_send_pan_requested(0, 25.0);
+        ui.invoke_toggle_mixer_send_requested(0);
         ui.invoke_set_main_gain_requested(50.0);
         ui.invoke_toggle_main_mute_requested();
         assert_eq!(

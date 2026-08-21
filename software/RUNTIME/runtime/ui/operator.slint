@@ -18,6 +18,16 @@ export struct OperatorMixerRow {
     solo-available: bool,
 }
 
+export struct OperatorMixerSendRow {
+    source-name: string,
+    target-name: string,
+    tap: string,
+    gain-percent: float,
+    pan-percent: float,
+    enabled: bool,
+    controls-enabled: bool,
+}
+
 component FactCard inherits Rectangle {
     in property <string> label;
     in property <string> value;
@@ -320,6 +330,62 @@ component MixerChannelRow inherits Rectangle {
     }
 }
 
+component MixerSendRow inherits Rectangle {
+    in property <string> source-name;
+    in property <string> target-name;
+    in property <string> tap;
+    in property <float> gain-percent;
+    in property <float> pan-percent;
+    in property <bool> send-enabled;
+    in property <bool> controls-enabled;
+    callback toggle-requested();
+    callback gain-requested(float);
+    callback pan-requested(float);
+    min-height: 74px;
+    background: #111620;
+    border-color: #2c3445;
+    border-width: 1px;
+    border-radius: 5px;
+
+    VerticalLayout {
+        padding: 6px;
+        spacing: 5px;
+        HorizontalLayout {
+            spacing: 7px;
+            Text { text: root.source-name + " → " + root.target-name; color: #edf2f8; font-size: 11px; font-weight: 700; overflow: elide; }
+            Text { text: root.tap; color: #8d99ad; font-size: 9px; }
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+            send-toggle := Button {
+                text: root.send-enabled ? "Disable" : "Enable";
+                accessible-label: self.text + " send " + root.source-name + " to " + root.target-name;
+                enabled: root.controls-enabled;
+                clicked => { root.toggle-requested(); }
+            }
+        }
+        HorizontalLayout {
+            spacing: 7px;
+            Text { text: "GAIN " + Math.round(root.gain-percent) + "%"; color: #8d99ad; font-size: 9px; width: 68px; }
+            CommittedSlider {
+                minimum: 0;
+                maximum: 200;
+                committed-value: root.gain-percent;
+                enabled: root.controls-enabled;
+                control-label: root.source-name + " to " + root.target-name + " send gain";
+                released(value) => { root.gain-requested(value); }
+            }
+            Text { text: "PAN " + Math.round(root.pan-percent); color: #8d99ad; font-size: 9px; width: 58px; }
+            CommittedSlider {
+                minimum: -100;
+                maximum: 100;
+                committed-value: root.pan-percent;
+                enabled: root.controls-enabled;
+                control-label: root.source-name + " to " + root.target-name + " send pan";
+                released(value) => { root.pan-requested(value); }
+            }
+        }
+    }
+}
+
 export component OperatorWindow inherits Window {
     title: "Hyper Runtime";
     width: 880px;
@@ -368,6 +434,7 @@ export component OperatorWindow inherits Window {
     in property <[OperatorSceneRow]> scenes;
     in property <string> scene-feedback;
     in property <[OperatorMixerRow]> mixer-channels;
+    in property <[OperatorMixerSendRow]> mixer-sends;
     in property <float> main-gain-percent: 0;
     in property <bool> main-muted: false;
     in property <bool> main-mute-enabled: false;
@@ -389,6 +456,9 @@ export component OperatorWindow inherits Window {
     callback toggle-mixer-channel-solo-requested(int);
     callback set-mixer-channel-gain-requested(int, float);
     callback set-mixer-channel-pan-requested(int, float);
+    callback toggle-mixer-send-requested(int);
+    callback set-mixer-send-gain-requested(int, float);
+    callback set-mixer-send-pan-requested(int, float);
     callback set-main-gain-requested(float);
     callback toggle-main-mute-requested();
     callback launch-scene-requested(int);
@@ -571,6 +641,35 @@ export component OperatorWindow inherits Window {
                         solo-requested => { root.toggle-mixer-channel-solo-requested(index); }
                         gain-requested(value) => { root.set-mixer-channel-gain-requested(index, value); }
                         pan-requested(value) => { root.set-mixer-channel-pan-requested(index, value); }
+                    }
+                }
+            }
+        }
+
+
+        if root.mixer-sends.length > 0 : Rectangle {
+            background: #171b24;
+            border-color: #2c3445;
+            border-width: 1px;
+            border-radius: 8px;
+            min-height: 184px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 7px;
+                Text { text: "LIVE SENDS · SESSION ONLY"; color: #8d99ad; font-size: 11px; font-weight: 700; }
+                ListView {
+                    height: 148px;
+                    for send[index] in root.mixer-sends : MixerSendRow {
+                        source-name: send.source-name;
+                        target-name: send.target-name;
+                        tap: send.tap;
+                        gain-percent: send.gain-percent;
+                        pan-percent: send.pan-percent;
+                        send-enabled: send.enabled;
+                        controls-enabled: send.controls-enabled;
+                        toggle-requested => { root.toggle-mixer-send-requested(index); }
+                        gain-requested(value) => { root.set-mixer-send-gain-requested(index, value); }
+                        pan-requested(value) => { root.set-mixer-send-pan-requested(index, value); }
                     }
                 }
             }

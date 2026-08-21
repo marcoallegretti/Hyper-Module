@@ -13,6 +13,9 @@ enum MixerIntent {
     Pan(i32, u32),
     Mute(i32),
     Solo(i32),
+    SendGain(i32, u32),
+    SendPan(i32, u32),
+    SendToggle(i32),
     MainGain(u32),
     MainMute,
 }
@@ -42,6 +45,16 @@ fn generated_mixer_controls_forward_exact_rows_values_and_capability() {
         },
     ]));
     ui.set_mixer_channels(ModelRc::from(Rc::clone(&rows)));
+    let sends = Rc::new(VecModel::from(vec![OperatorMixerSendRow {
+        source_name: "Audio Ω".into(),
+        target_name: "Return β".into(),
+        tap: "POST".into(),
+        gain_percent: 60.0,
+        pan_percent: 25.0,
+        enabled: true,
+        controls_enabled: true,
+    }]));
+    ui.set_mixer_sends(ModelRc::from(Rc::clone(&sends)));
     ui.set_main_gain_percent(40.0);
     ui.set_main_mute_enabled(true);
 
@@ -76,10 +89,28 @@ fn generated_mixer_controls_forward_exact_rows_values_and_capability() {
             .borrow_mut()
             .push(MixerIntent::MainGain(percent.to_bits()));
     });
+    let send_toggle_intents = Rc::clone(&intents);
+    ui.on_toggle_mixer_send_requested(move |row| {
+        send_toggle_intents
+            .borrow_mut()
+            .push(MixerIntent::SendToggle(row));
+    });
+    let send_gain_intents = Rc::clone(&intents);
+    ui.on_set_mixer_send_gain_requested(move |row, percent| {
+        send_gain_intents
+            .borrow_mut()
+            .push(MixerIntent::SendGain(row, percent.to_bits()));
+    });
+    let send_pan_intents = Rc::clone(&intents);
+    ui.on_set_mixer_send_pan_requested(move |row, percent| {
+        send_pan_intents
+            .borrow_mut()
+            .push(MixerIntent::SendPan(row, percent.to_bits()));
+    });
     ui.show().unwrap();
 
     verify_enabled_controls(&ui, &intents);
-    verify_recovery_and_disabled_controls(&ui, &rows, &intents);
+    verify_recovery_and_disabled_controls(&ui, &rows, &sends, &intents);
 }
 
 fn verify_enabled_controls(ui: &OperatorWindow, intents: &RefCell<Vec<MixerIntent>>) {
@@ -131,10 +162,29 @@ fn verify_enabled_controls(ui: &OperatorWindow, intents: &RefCell<Vec<MixerInten
     assert_eq!(unavailable.accessible_enabled(), Some(false));
     unavailable.mock_single_click(PointerEventButton::Left);
 
-    assert_eq!(intents.borrow().len(), 8);
+    click_enabled(ui, "Disable send Audio Ω to Return β");
+    let send_gain = find_control(ui, "Audio Ω to Return β send gain");
+    let send_pan = find_control(ui, "Audio Ω to Return β send pan");
+    assert_accessible_value(&send_gain, 60.0);
+    assert_accessible_value(&send_pan, 25.0);
+    send_gain.set_accessible_value("125");
+    send_pan.set_accessible_value("-75");
+    assert_accessible_value(&send_gain, 60.0);
+    assert_accessible_value(&send_pan, 25.0);
+
+    assert_eq!(intents.borrow().len(), 11);
     assert_eq!(intents.borrow()[0], MixerIntent::Mute(1));
     assert_eq!(intents.borrow()[1], MixerIntent::Solo(0));
     assert_eq!(intents.borrow()[7], MixerIntent::MainMute);
+    assert_eq!(intents.borrow()[8], MixerIntent::SendToggle(0));
+    assert_eq!(
+        intents.borrow()[9],
+        MixerIntent::SendGain(0, 125.0_f32.to_bits())
+    );
+    assert_eq!(
+        intents.borrow()[10],
+        MixerIntent::SendPan(0, (-75.0_f32).to_bits())
+    );
     assert!((ui.get_main_gain_percent() - 40.0).abs() <= f32::EPSILON);
     let committed = ui.get_mixer_channels();
     assert!((committed.row_data(1).unwrap().gain_percent - 40.0).abs() <= f32::EPSILON);
@@ -144,6 +194,7 @@ fn verify_enabled_controls(ui: &OperatorWindow, intents: &RefCell<Vec<MixerInten
 fn verify_recovery_and_disabled_controls(
     ui: &OperatorWindow,
     rows: &VecModel<OperatorMixerRow>,
+    sends: &VecModel<OperatorMixerSendRow>,
     intents: &RefCell<Vec<MixerIntent>>,
 ) {
     let group_gain = find_control(ui, "2 · Group β live gain");
@@ -155,6 +206,14 @@ fn verify_recovery_and_disabled_controls(
     ui.set_main_gain_percent(80.0);
     assert_accessible_value(&group_gain, 130.0);
     assert_accessible_value(&main_gain, 80.0);
+    let send_gain = find_control(ui, "Audio Ω to Return β send gain");
+    let send_pan = find_control(ui, "Audio Ω to Return β send pan");
+    let mut recovered_send = sends.row_data(0).unwrap();
+    recovered_send.gain_percent = 90.0;
+    recovered_send.pan_percent = -10.0;
+    sends.set_row_data(0, recovered_send);
+    assert_accessible_value(&send_gain, 90.0);
+    assert_accessible_value(&send_pan, -10.0);
 
     let mut disabled_group = rows.row_data(1).unwrap();
     disabled_group.controls_enabled = false;
@@ -163,13 +222,23 @@ fn verify_recovery_and_disabled_controls(
     disabled_audio.controls_enabled = false;
     rows.set_row_data(0, disabled_audio);
     ui.set_main_mute_enabled(false);
+    let mut disabled_send = sends.row_data(0).unwrap();
+    disabled_send.controls_enabled = false;
+    sends.set_row_data(0, disabled_send);
     assert_eq!(group_gain.accessible_enabled(), Some(false));
     assert_eq!(audio_pan.accessible_enabled(), Some(false));
     assert_eq!(main_gain.accessible_enabled(), Some(false));
+    assert_eq!(send_gain.accessible_enabled(), Some(false));
+    assert_eq!(send_pan.accessible_enabled(), Some(false));
+    let send_toggle = find_control(ui, "Disable send Audio Ω to Return β");
+    assert_eq!(send_toggle.accessible_enabled(), Some(false));
     let before_disabled_interaction = intents.borrow().len();
     drag_to_right_edge(&group_gain);
     audio_pan.set_accessible_value("100");
     main_gain.mock_single_click(PointerEventButton::Left);
+    send_gain.set_accessible_value("100");
+    send_pan.set_accessible_value("100");
+    send_toggle.mock_single_click(PointerEventButton::Left);
     assert_eq!(intents.borrow().len(), before_disabled_interaction);
 }
 
