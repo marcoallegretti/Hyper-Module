@@ -133,7 +133,8 @@ use hyper_storage_engine::{
     AudioTrackRemovalRequest, AutomationTakePublicationRequest, ControlMappingPublicationRequest,
     ImportedAudioClipPublicationRequest, ProjectResourcePublicationError,
     ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest,
-    RequiredControlCapabilities, ScenePublicationRequest, StorageError, publish_arrangement,
+    RequiredControlCapabilities, SampleCleanupOutcome, SampleCleanupRequest,
+    ScenePublicationRequest, StorageError, clean_unused_samples, publish_arrangement,
     publish_audio_clip, publish_audio_track, publish_automation_take, publish_control_mapping,
     publish_imported_audio_clip, publish_project_resource, publish_scene, remove_audio_clip,
     remove_audio_track,
@@ -2702,6 +2703,139 @@ impl Error for IdeRecordingClipCreationError {
 #[derive(Debug)]
 pub struct IdeAudioClipRemovalCommittedWarning {
     source: Box<dyn Error + Send + Sync>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdeUnusedSampleCleanupSummary {
+    project_identity: [u8; 32],
+    project_revision: u64,
+    assets: usize,
+    bytes: u64,
+}
+
+impl IdeUnusedSampleCleanupSummary {
+    #[must_use]
+    pub const fn new(
+        project_identity: [u8; 32],
+        project_revision: u64,
+        assets: usize,
+        bytes: u64,
+    ) -> Self {
+        Self {
+            project_identity,
+            project_revision,
+            assets,
+            bytes,
+        }
+    }
+    #[must_use]
+    pub const fn project_identity(&self) -> &[u8; 32] {
+        &self.project_identity
+    }
+    #[must_use]
+    pub const fn project_revision(&self) -> u64 {
+        self.project_revision
+    }
+    #[must_use]
+    pub const fn assets(&self) -> usize {
+        self.assets
+    }
+    #[must_use]
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.assets == 0
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeUnusedSampleCleanupError {
+    Empty,
+    StaleConfirmation,
+    CapacityUnavailable,
+    MixerSave(Box<IdeProjectSaveError>),
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    ReopenAfterPublication {
+        outcome: SampleCleanupOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterFailure {
+        cleanup: Box<IdeUnusedSampleCleanupError>,
+        source: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeUnusedSampleCleanupError {
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication(source) => source.published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::ReopenAfterFailure { cleanup, .. } => cleanup.publication_committed(),
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeUnusedSampleCleanupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("the project has no unused sample media"),
+            Self::StaleConfirmation => {
+                formatter.write_str("the unused-media cleanup confirmation is no longer current")
+            }
+            Self::CapacityUnavailable => {
+                formatter.write_str("unused-media cleanup capacity is unavailable")
+            }
+            Self::MixerSave(source) => write!(
+                formatter,
+                "live mixer state could not be preserved: {source}"
+            ),
+            Self::Publication(source) if source.published() => write!(
+                formatter,
+                "unused sample media was removed, but verification or transaction recovery is incomplete: {source}"
+            ),
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before unused-media cleanup: {source:?}"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "{} unused sample assets were removed in project revision {}, but the project could not be reopened: {source}",
+                outcome.removed_assets(),
+                outcome.project_revision()
+            ),
+            Self::ReopenAfterFailure { cleanup, source } if cleanup.publication_committed() => {
+                write!(
+                    formatter,
+                    "unused sample media was removed with incomplete recovery ({cleanup}), and the project could not be reopened ({source})"
+                )
+            }
+            Self::ReopenAfterFailure { cleanup, source } => write!(
+                formatter,
+                "unused-media cleanup failed ({cleanup}), and the unchanged project could not be reopened ({source})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeUnusedSampleCleanupError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::ReopenAfterPublication { source, .. }
+            | Self::ReopenAfterFailure { source, .. } => Some(source.as_ref()),
+            Self::Empty
+            | Self::StaleConfirmation
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
 }
 
 impl IdeAudioClipRemovalCommittedWarning {
@@ -5764,6 +5898,30 @@ struct IdeAudioClipRemovalPlan {
     track_bytes: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct IdeUnusedSampleCleanupPlan {
+    mixer: IdeMixerSavePlan,
+    asset_ids: Vec<String>,
+}
+
+impl IdeUnusedSampleCleanupPlan {
+    fn publish(&self) -> Result<SampleCleanupOutcome, IdeUnusedSampleCleanupError> {
+        let mixer = self.mixer.publish().map_err(|source| {
+            IdeUnusedSampleCleanupError::MixerSave(Box::new(IdeProjectSaveError::Publication(
+                Box::new(source),
+            )))
+        })?;
+        clean_unused_samples(
+            &self.mixer.project_path,
+            SampleCleanupRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                asset_ids: &self.asset_ids,
+            },
+        )
+        .map_err(|source| IdeUnusedSampleCleanupError::Publication(Box::new(source)))
+    }
+}
+
 impl IdeAudioClipRemovalPlan {
     fn publish(&self) -> Result<AudioClipRemovalOutcome, IdeAudioClipRemovalError> {
         let mixer = self
@@ -6608,6 +6766,7 @@ pub struct RunningIdeSnapshot<'a> {
     pub arrangement: Arc<IdePlaybackArrangement>,
     pub automation: Arc<IdePlaybackAutomation>,
     pub recording_metadata: &'a [hyper_recording_metadata::RecordingMetadataDocument],
+    pub unused_sample_cleanup: IdeUnusedSampleCleanupSummary,
     pub scene_count: usize,
     pub track_count: usize,
     pub scene_ids: [&'a str; MAX_IDE_SCENES],
@@ -6637,6 +6796,27 @@ pub struct RunningIdeSnapshot<'a> {
     pub monitoring: Option<IdeMonitoringState>,
     pub preview: DesktopAudioPreviewSnapshot,
     pub recovery: PlaybackRecoverySnapshot,
+}
+
+fn unused_sample_cleanup_summary(
+    prepared: &PreparedProjectPlayback,
+) -> Result<IdeUnusedSampleCleanupSummary, IdeUnusedSampleCleanupError> {
+    let mut assets = 0_usize;
+    let mut bytes = 0_u64;
+    for asset in prepared.unused_sample_assets() {
+        assets = assets
+            .checked_add(1)
+            .ok_or(IdeUnusedSampleCleanupError::CapacityUnavailable)?;
+        bytes = bytes
+            .checked_add(asset.byte_length())
+            .ok_or(IdeUnusedSampleCleanupError::CapacityUnavailable)?;
+    }
+    Ok(IdeUnusedSampleCleanupSummary {
+        project_identity: *prepared.package().manifest_sha256(),
+        project_revision: prepared.package().manifest().revision(),
+        assets,
+        bytes,
+    })
 }
 
 #[derive(Debug)]
@@ -7447,6 +7627,36 @@ impl RunningDesktopIdeApplication {
             prepared,
             clip_id,
         )
+    }
+
+    fn prepare_unused_sample_cleanup(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        confirmation: IdeUnusedSampleCleanupSummary,
+    ) -> Result<IdeUnusedSampleCleanupPlan, IdeUnusedSampleCleanupError> {
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeUnusedSampleCleanupError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let current = unused_sample_cleanup_summary(prepared)?;
+        if current.is_empty() {
+            return Err(IdeUnusedSampleCleanupError::Empty);
+        }
+        if current != confirmation {
+            return Err(IdeUnusedSampleCleanupError::StaleConfirmation);
+        }
+        let mut asset_ids = Vec::new();
+        asset_ids
+            .try_reserve_exact(current.assets())
+            .map_err(|_| IdeUnusedSampleCleanupError::CapacityUnavailable)?;
+        for asset in prepared.unused_sample_assets() {
+            asset_ids.push(asset.id().to_owned());
+        }
+        asset_ids.sort_unstable();
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeUnusedSampleCleanupError::MixerSave(Box::new(source)))?;
+        Ok(IdeUnusedSampleCleanupPlan { mixer, asset_ids })
     }
 
     fn prepare_audio_clip_removal_from_project(
@@ -9295,6 +9505,7 @@ impl RunningDesktopIdeApplication {
             arrangement: project.session().shared_arrangement(),
             automation: project.session().shared_automation_takes(),
             recording_metadata: project.recording_metadata(),
+            unused_sample_cleanup: unused_sample_cleanup_summary(project).ok()?,
             scene_count,
             track_count: loaded.track_count(),
             scene_ids,

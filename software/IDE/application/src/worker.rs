@@ -50,7 +50,8 @@ use super::{
     IdeRecordingError, IdeRecordingImportOutcome, IdeRecordingObservation, IdeResourceRestoreError,
     IdeSaveCloseOutcome, IdeSceneAvailability, IdeSceneCreationError, IdeSceneDuplicationError,
     IdeSceneEditError, IdeSceneLaunchQuantization, IdeSceneRenameError, IdeSceneSlotEdit,
-    IdeSceneSlotEditError, IdeTempoEditError, IdeTransportSeekError, InputInventoryError,
+    IdeSceneSlotEditError, IdeTempoEditError, IdeTransportSeekError, IdeUnusedSampleCleanupError,
+    IdeUnusedSampleCleanupSummary, InputInventoryError,
     LocateState, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
     OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication, RunningIdeSnapshot,
 };
@@ -149,6 +150,7 @@ pub enum IdeWorkerCommandKind {
     CreateAudioClipFromTake,
     DuplicateAudioClip,
     RemoveAudioClip,
+    CleanUnusedSamples,
     AddArrangementPlacement,
     AddArrangementSceneLaunch,
     MoveArrangementSceneLaunch,
@@ -262,6 +264,9 @@ pub enum IdeWorkerCommand {
     },
     RemoveAudioClip {
         clip_id: String,
+    },
+    CleanUnusedSamples {
+        confirmation: IdeUnusedSampleCleanupSummary,
     },
     AddArrangementPlacement {
         clip_id: String,
@@ -435,6 +440,7 @@ impl IdeWorkerCommand {
             Self::CreateAudioClipFromTake { .. } => IdeWorkerCommandKind::CreateAudioClipFromTake,
             Self::DuplicateAudioClip { .. } => IdeWorkerCommandKind::DuplicateAudioClip,
             Self::RemoveAudioClip { .. } => IdeWorkerCommandKind::RemoveAudioClip,
+            Self::CleanUnusedSamples { .. } => IdeWorkerCommandKind::CleanUnusedSamples,
             Self::AddArrangementPlacement { .. } => IdeWorkerCommandKind::AddArrangementPlacement,
             Self::AddArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::AddArrangementSceneLaunch
@@ -670,6 +676,7 @@ pub struct IdeRunningObservation {
     control_bindings: Vec<IdeControlBinding>,
     audio_clips: Vec<IdeAudioClip>,
     recording_takes: Vec<IdeRecordingTake>,
+    unused_sample_cleanup: IdeUnusedSampleCleanupSummary,
     preview: IdeAudioPreviewObservation,
     scenes: Vec<IdeScene>,
     track_count: usize,
@@ -1259,6 +1266,11 @@ impl IdeRunningObservation {
     }
 
     #[must_use]
+    pub const fn unused_sample_cleanup(&self) -> IdeUnusedSampleCleanupSummary {
+        self.unused_sample_cleanup
+    }
+
+    #[must_use]
     pub const fn preview(&self) -> &IdeAudioPreviewObservation {
         &self.preview
     }
@@ -1481,6 +1493,7 @@ pub enum IdeWorkerCommandFailure {
     RecordingClipCreation(Box<IdeRecordingClipCreationError>),
     AudioClipDuplication(Box<IdeAudioClipDuplicationError>),
     AudioClipRemoval(Box<IdeAudioClipRemovalError>),
+    UnusedSampleCleanup(Box<IdeUnusedSampleCleanupError>),
     ArrangementPlacementAddition(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchAddition(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchMove(Box<IdeArrangementPlacementEditError>),
@@ -1567,6 +1580,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::RecordingClipCreation(source) => source.fmt(formatter),
             Self::AudioClipDuplication(source) => source.fmt(formatter),
             Self::AudioClipRemoval(source) => source.fmt(formatter),
+            Self::UnusedSampleCleanup(source) => source.fmt(formatter),
             Self::ArrangementPlacementAddition(source)
             | Self::ArrangementSceneLaunchAddition(source)
             | Self::ArrangementSceneLaunchMove(source)
@@ -1642,6 +1656,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::RecordingClipCreation(source) => Some(source),
             Self::AudioClipDuplication(source) => Some(source),
             Self::AudioClipRemoval(source) => Some(source),
+            Self::UnusedSampleCleanup(source) => Some(source),
             Self::ArrangementPlacementAddition(source)
             | Self::ArrangementSceneLaunchAddition(source)
             | Self::ArrangementSceneLaunchMove(source)
@@ -1785,6 +1800,18 @@ pub enum IdeWorkerEvent {
     },
     AudioClipRemovalCommittedWithWarning {
         warning: Box<IdeAudioClipRemovalError>,
+    },
+    UnusedSampleCleanupStarting {
+        assets: usize,
+        bytes: u64,
+    },
+    UnusedSamplesCleaned {
+        revision: u64,
+        assets: usize,
+        bytes: u64,
+    },
+    UnusedSampleCleanupCommittedWithWarning {
+        warning: Box<IdeUnusedSampleCleanupError>,
     },
     AudioClipDuplicationCommittedWithWarning {
         name: String,
@@ -2484,6 +2511,9 @@ enum ProjectMutation {
     RemoveAudioClip {
         clip_id: String,
     },
+    CleanUnusedSamples {
+        confirmation: IdeUnusedSampleCleanupSummary,
+    },
     AddArrangementPlacement {
         clip_id: String,
         start_tick: u64,
@@ -2624,6 +2654,7 @@ impl ProjectMutation {
             Self::CreateAudioClipFromTake { .. } => IdeWorkerCommandKind::CreateAudioClipFromTake,
             Self::DuplicateAudioClip { .. } => IdeWorkerCommandKind::DuplicateAudioClip,
             Self::RemoveAudioClip { .. } => IdeWorkerCommandKind::RemoveAudioClip,
+            Self::CleanUnusedSamples { .. } => IdeWorkerCommandKind::CleanUnusedSamples,
             Self::AddArrangementPlacement { .. } => IdeWorkerCommandKind::AddArrangementPlacement,
             Self::AddArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::AddArrangementSceneLaunch
@@ -2696,6 +2727,12 @@ impl ProjectMutation {
             Self::CreateAudioClipFromTake { .. } => IdeWorkerEvent::AudioClipCreatingFromTake,
             Self::DuplicateAudioClip { .. } => IdeWorkerEvent::AudioClipDuplicating,
             Self::RemoveAudioClip { .. } => IdeWorkerEvent::AudioClipRemoving,
+            Self::CleanUnusedSamples { confirmation } => {
+                IdeWorkerEvent::UnusedSampleCleanupStarting {
+                    assets: confirmation.assets(),
+                    bytes: confirmation.bytes(),
+                }
+            }
             Self::AddArrangementPlacement { start_tick, .. } => {
                 IdeWorkerEvent::ArrangementPlacementAdding {
                     start_tick: *start_tick,
@@ -2938,6 +2975,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::CreateAudioClipFromTake
         | IdeWorkerCommandKind::DuplicateAudioClip
         | IdeWorkerCommandKind::RemoveAudioClip
+        | IdeWorkerCommandKind::CleanUnusedSamples
         | IdeWorkerCommandKind::EditControlMapping
         | IdeWorkerCommandKind::ExportProject
         | IdeWorkerCommandKind::Undo
@@ -3233,6 +3271,7 @@ fn process_command(
         | IdeWorkerCommand::CreateAudioClipFromTake { .. }
         | IdeWorkerCommand::DuplicateAudioClip { .. }
         | IdeWorkerCommand::RemoveAudioClip { .. }
+        | IdeWorkerCommand::CleanUnusedSamples { .. }
         | IdeWorkerCommand::AddArrangementPlacement { .. }
         | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
@@ -3338,6 +3377,10 @@ fn process_output_setup_command(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive command router keeps every project mutation on one lifecycle path"
+)]
 fn process_project_mutation_command(
     state: &mut WorkerState,
     command: IdeWorkerCommand,
@@ -3371,6 +3414,11 @@ fn process_project_mutation_command(
             duplicate_audio_clip(state, events, &clip_id, &name)
         }
         IdeWorkerCommand::RemoveAudioClip { clip_id } => remove_audio_clip(state, events, &clip_id),
+        IdeWorkerCommand::CleanUnusedSamples { confirmation } => begin_project_mutation_request(
+            state,
+            events,
+            ProjectMutation::CleanUnusedSamples { confirmation },
+        ),
         command @ (IdeWorkerCommand::AddArrangementPlacement { .. }
         | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
@@ -5776,10 +5824,16 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::CreateAudioClipFromTake(Ok(_))
         | ProjectMutationAttempt::DuplicateAudioClip { result: Ok(_), .. }
         | ProjectMutationAttempt::RemoveAudioClip(Ok(_))
+        | ProjectMutationAttempt::CleanUnusedSamples(Ok(_))
         | ProjectMutationAttempt::EditControlMapping { result: Ok(_), .. } => {
             HistoryEffect::Invalidate
         }
         ProjectMutationAttempt::RemoveAudioClip(Err(reason))
+            if reason.publication_committed() =>
+        {
+            HistoryEffect::Invalidate
+        }
+        ProjectMutationAttempt::CleanUnusedSamples(Err(reason))
             if reason.publication_committed() =>
         {
             HistoryEffect::Invalidate
@@ -5797,6 +5851,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::SetAudioTrackActive { result: Err(_), .. }
         | ProjectMutationAttempt::DuplicateAudioClip { result: Err(_), .. }
         | ProjectMutationAttempt::RemoveAudioClip(Err(_))
+        | ProjectMutationAttempt::CleanUnusedSamples(Err(_))
         | ProjectMutationAttempt::AddArrangementPlacement { result: Err(_), .. }
         | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Err(_), .. }
@@ -6436,6 +6491,11 @@ fn project_mutation_save_failure(
         ProjectMutation::RemoveAudioClip { .. } => IdeWorkerCommandFailure::AudioClipRemoval(
             Box::new(IdeAudioClipRemovalError::MixerSave(Box::new(reason))),
         ),
+        ProjectMutation::CleanUnusedSamples { .. } => {
+            IdeWorkerCommandFailure::UnusedSampleCleanup(Box::new(
+                IdeUnusedSampleCleanupError::MixerSave(Box::new(reason)),
+            ))
+        }
         ProjectMutation::AddArrangementPlacement { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementAddition(Box::new(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
@@ -6678,6 +6738,11 @@ fn project_mutation_native_close_failure(
         ProjectMutation::RemoveAudioClip { .. } => IdeWorkerCommandFailure::AudioClipRemoval(
             Box::new(IdeAudioClipRemovalError::NativeClose(failure)),
         ),
+        ProjectMutation::CleanUnusedSamples { .. } => {
+            IdeWorkerCommandFailure::UnusedSampleCleanup(Box::new(
+                IdeUnusedSampleCleanupError::NativeClose(failure),
+            ))
+        }
         ProjectMutation::AddArrangementPlacement { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementAddition(Box::new(
                 IdeArrangementPlacementEditError::NativeClose(failure),
@@ -6841,6 +6906,9 @@ enum ProjectMutationAttempt {
     },
     RemoveAudioClip(
         Result<hyper_storage_engine::AudioClipRemovalOutcome, IdeAudioClipRemovalError>,
+    ),
+    CleanUnusedSamples(
+        Result<hyper_storage_engine::SampleCleanupOutcome, IdeUnusedSampleCleanupError>,
     ),
     AddArrangementPlacement {
         start_tick: u64,
@@ -7475,6 +7543,30 @@ fn complete_project_mutation(
                 ),
                 ProjectMutationAttempt::RemoveAudioClip(Err(reason)) => {
                     send_event(events, audio_clip_removal_failure_event(reason))
+                }
+                ProjectMutationAttempt::CleanUnusedSamples(Ok(outcome)) => send_event(
+                    events,
+                    IdeWorkerEvent::UnusedSamplesCleaned {
+                        revision: outcome.project_revision(),
+                        assets: outcome.removed_assets(),
+                        bytes: outcome.removed_bytes(),
+                    },
+                ),
+                ProjectMutationAttempt::CleanUnusedSamples(Err(reason)) => {
+                    if reason.publication_committed() {
+                        send_event(
+                            events,
+                            IdeWorkerEvent::UnusedSampleCleanupCommittedWithWarning {
+                                warning: Box::new(reason),
+                            },
+                        )
+                    } else {
+                        publish_failure(
+                            events,
+                            IdeWorkerCommandKind::CleanUnusedSamples,
+                            IdeWorkerCommandFailure::UnusedSampleCleanup(Box::new(reason)),
+                        )
+                    }
                 }
                 ProjectMutationAttempt::AddArrangementPlacement {
                     start_tick,
@@ -8227,6 +8319,18 @@ fn attempt_project_mutation(
                     application,
                     recovery,
                     &clip_id,
+                )
+                .and_then(|plan| plan.publish())
+            })
+        }
+        ProjectMutation::CleanUnusedSamples { confirmation } => {
+            ProjectMutationAttempt::CleanUnusedSamples(if let Some(failure) = native_failure {
+                Err(IdeUnusedSampleCleanupError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_unused_sample_cleanup(
+                    application,
+                    recovery,
+                    confirmation,
                 )
                 .and_then(|plan| plan.publish())
             })
@@ -9309,6 +9413,22 @@ fn project_mutation_reopen_failure(
                 IdeAudioClipRemovalError::ReopenAfterPreparation {
                     preparation: Box::new(preparation),
                     reopen: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::CleanUnusedSamples(Ok(outcome)) => {
+            IdeWorkerCommandFailure::UnusedSampleCleanup(Box::new(
+                IdeUnusedSampleCleanupError::ReopenAfterPublication {
+                    outcome,
+                    source: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::CleanUnusedSamples(Err(cleanup)) => {
+            IdeWorkerCommandFailure::UnusedSampleCleanup(Box::new(
+                IdeUnusedSampleCleanupError::ReopenAfterFailure {
+                    cleanup: Box::new(cleanup),
+                    source: Box::new(reopen),
                 },
             ))
         }
@@ -10602,6 +10722,7 @@ fn running_observation(
         control_bindings,
         audio_clips,
         recording_takes,
+        unused_sample_cleanup: snapshot.unused_sample_cleanup,
         preview: IdeAudioPreviewObservation {
             snapshot: snapshot.preview,
             asset_id: preview_asset_id,
@@ -10993,6 +11114,82 @@ mod tests {
                 if revision == initial_revision + 4 && clip_id == removed_clip_id
         ));
         assert_imported_audio_assets(project, initial_revision + 4);
+
+        assert_worker_unused_sample_cleanup_lifecycle(
+            worker,
+            project,
+            initial_revision,
+            &retained_clip_id,
+            &after_removal,
+        );
+    }
+
+    fn assert_worker_unused_sample_cleanup_lifecycle(
+        worker: &DesktopIdeWorker,
+        project: &Path,
+        initial_revision: u64,
+        retained_clip_id: &str,
+        after_removal: &IdeRunningObservation,
+    ) {
+        let cleanup_before_edit = after_removal.unused_sample_cleanup();
+        assert_eq!(cleanup_before_edit.assets(), 1);
+        assert!(cleanup_before_edit.bytes() > 0);
+
+        worker
+            .try_send(IdeWorkerCommand::RenameAudioClip {
+                clip_id: retained_clip_id.to_owned(),
+                name: "Stereo retained before cleanup".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(recv(worker), IdeWorkerEvent::AudioClipRenaming));
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some(_),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(before_cleanup) = recv(worker) else {
+            panic!("the edited project must reopen before cleanup");
+        };
+        let cleanup = before_cleanup.unused_sample_cleanup();
+        assert_eq!(cleanup.assets(), 1);
+        assert_eq!(cleanup.bytes(), cleanup_before_edit.bytes());
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::AudioClipRenamed { changed: true, .. }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::CleanUnusedSamples {
+                confirmation: cleanup,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::UnusedSampleCleanupStarting { assets: 1, bytes }
+                if bytes == cleanup.bytes()
+        ));
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(cleaned) = recv(worker) else {
+            panic!("the cleaned project must reopen before completion");
+        };
+        assert!(cleaned.unused_sample_cleanup().is_empty());
+        assert_eq!(cleaned.audio_clips().len(), 1);
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::UnusedSamplesCleaned { revision, assets: 1, bytes }
+                if revision == initial_revision + 6 && bytes == cleanup.bytes()
+        ));
+        let verified = verify_project_package(project).unwrap();
+        assert_eq!(verified.manifest().revision(), initial_revision + 6);
+        assert_eq!(verified.manifest().assets().len(), 1);
     }
 
     fn output_testing_application(
