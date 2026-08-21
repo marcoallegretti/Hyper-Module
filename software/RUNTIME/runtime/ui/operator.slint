@@ -3,6 +3,7 @@ import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
 component FactCard inherits Rectangle {
     in property <string> label;
     in property <string> value;
+    in property <string> detail;
     background: #171b24;
     border-color: #2c3445;
     border-width: 1px;
@@ -14,6 +15,7 @@ component FactCard inherits Rectangle {
         spacing: 5px;
         Text { text: root.label; color: #8d99ad; font-size: 11px; }
         Text { text: root.value; color: #edf2f8; font-size: 15px; overflow: elide; }
+        if root.detail != "" : Text { text: root.detail; color: #8d99ad; font-size: 11px; overflow: elide; }
     }
 }
 
@@ -30,6 +32,7 @@ export component OperatorWindow inherits Window {
     in property <string> bundle-identity;
     in property <string> recovery-state;
     in property <string> transport-state;
+    in property <string> transport-time;
     in property <string> transport-frame;
     in property <string> stream-state;
     in property <string> callback-count;
@@ -56,7 +59,11 @@ export component OperatorWindow inherits Window {
 
         HorizontalLayout {
             spacing: 12px;
-            FactCard { label: "TRANSPORT"; value: root.transport-state + "  ·  frame " + root.transport-frame; }
+            FactCard {
+                label: "TRANSPORT";
+                value: root.transport-state + "  ·  " + root.transport-time;
+                detail: "frame " + root.transport-frame;
+            }
             FactCard { label: "AUDIO OWNER"; value: root.stream-state; }
             FactCard { label: "PANEL LINK"; value: root.panel-state; }
         }

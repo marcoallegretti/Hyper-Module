@@ -603,6 +603,7 @@ fn apply_static_facts(ui: &OperatorWindow, facts: &RuntimeFacts) {
 #[derive(Debug, Eq, PartialEq)]
 struct OperatorObservationPresentation {
     transport_state: &'static str,
+    transport_time: String,
     transport_frame: String,
     stream_state: String,
     callback_count: String,
@@ -625,6 +626,7 @@ fn operator_observation_presentation(
             PlaybackRecoveryTransportState::Stopped => "Stopped",
             PlaybackRecoveryTransportState::Rolling => "Rolling",
         },
+        transport_time: format_transport_time(transport_frame as u64),
         transport_frame: transport_frame.to_string(),
         stream_state: format!("{stream_state:?}"),
         callback_count: counters.callback_count.to_string(),
@@ -644,6 +646,16 @@ fn operator_observation_presentation(
             diagnostic
         },
     }
+}
+
+fn format_transport_time(frame: u64) -> String {
+    let sample_rate_hz = u64::from(SAMPLE_RATE_HZ);
+    let whole_seconds = frame / sample_rate_hz;
+    let milliseconds = (frame % sample_rate_hz) * 1_000 / sample_rate_hz;
+    let hours = whole_seconds / 3_600;
+    let minutes = whole_seconds / 60 % 60;
+    let seconds = whole_seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}")
 }
 
 fn apply_observations(
@@ -673,6 +685,7 @@ fn apply_observations(
         current_diagnostic,
     );
     ui.set_transport_state(presentation.transport_state.into());
+    ui.set_transport_time(presentation.transport_time.into());
     ui.set_transport_frame(presentation.transport_frame.into());
     ui.set_stream_state(presentation.stream_state.into());
     ui.set_callback_count(presentation.callback_count.into());
@@ -1115,6 +1128,7 @@ mod tests {
         assert_eq!(ui.get_bundle_identity().as_str(), "f".repeat(64));
         assert!(ui.get_recovery_state().contains(&"e".repeat(64)));
         assert_eq!(ui.get_transport_state().as_str(), "Stopped");
+        assert_eq!(ui.get_transport_time().as_str(), "00:00:00.000");
         assert_eq!(ui.get_transport_frame().as_str(), "0");
         assert_eq!(ui.get_stream_state().as_str(), "Starting");
         assert_eq!(ui.get_callback_count().as_str(), "0");
@@ -1165,6 +1179,10 @@ mod tests {
         );
 
         assert_eq!(presentation.transport_state, "Rolling");
+        assert_eq!(
+            presentation.transport_time,
+            format_transport_time(usize::MAX as u64)
+        );
         assert_eq!(presentation.transport_frame, usize::MAX.to_string());
         assert_eq!(presentation.stream_state, "Failed");
         assert_eq!(presentation.callback_count, u64::MAX.to_string());
@@ -1174,6 +1192,21 @@ mod tests {
         assert_eq!(
             presentation.diagnostic,
             "native audio ownership ended unexpectedly"
+        );
+    }
+
+    #[test]
+    fn runtime_transport_clock_truncates_frames_without_wrapping_hours() {
+        assert_eq!(format_transport_time(0), "00:00:00.000");
+        assert_eq!(format_transport_time(47_999), "00:00:00.999");
+        assert_eq!(format_transport_time(72_000), "00:00:01.500");
+        assert_eq!(
+            format_transport_time(48_000 * (3 * 3_600 + 2 * 60 + 1) + 24_000),
+            "03:02:01.500"
+        );
+        assert_eq!(
+            format_transport_time(u64::MAX),
+            "106751991167:18:02.325"
         );
     }
 }
