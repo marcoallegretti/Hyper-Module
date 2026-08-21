@@ -76,7 +76,8 @@ use hyper_playback_json::{
     ArrangementPlacementDocumentSerializationError, AudioClipAdditionSerializationError,
     AudioClipDocumentSerializationError, AudioClipDuplicationSerializationError,
     AudioClipFadeSerializationError, AudioClipGainSerializationError,
-    AudioClipLoopSerializationError, AudioClipRenameSerializationError,
+    AudioClipLoopSerializationError, AudioClipRemovalSerializationError,
+    AudioClipRenameSerializationError,
     AudioClipSourceStartSerializationError, AudioTrackAdditionSerializationError,
     AudioTrackDocumentSerializationError, AudioTrackRemovalBlockers,
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
@@ -94,8 +95,8 @@ use hyper_playback_json::{
     serialize_arrangement_scene_launch_addition, serialize_arrangement_scene_launch_move,
     serialize_arrangement_scene_launch_removal, serialize_arrangement_scene_launch_scene_edit,
     serialize_audio_clip_activation, serialize_audio_clip_duplication, serialize_audio_clip_fades,
-    serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_rename,
-    serialize_audio_clip_reverse, serialize_audio_clip_source_start,
+    serialize_audio_clip_gain, serialize_audio_clip_loop, serialize_audio_clip_removal,
+    serialize_audio_clip_rename, serialize_audio_clip_reverse, serialize_audio_clip_source_start,
     serialize_audio_track_activation, serialize_audio_track_addition,
     serialize_audio_track_removal, serialize_audio_track_rename,
     serialize_automation_take_activation, serialize_automation_take_addition,
@@ -127,13 +128,15 @@ use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackError, Projec
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
+    AudioClipRemovalOutcome, AudioClipRemovalRequest,
     AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
     AudioTrackRemovalRequest, AutomationTakePublicationRequest, ControlMappingPublicationRequest,
     ImportedAudioClipPublicationRequest, ProjectResourcePublicationError,
     ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest,
     RequiredControlCapabilities, ScenePublicationRequest, StorageError, publish_arrangement,
     publish_audio_clip, publish_audio_track, publish_automation_take, publish_control_mapping,
-    publish_imported_audio_clip, publish_project_resource, publish_scene, remove_audio_track,
+    publish_imported_audio_clip, publish_project_resource, publish_scene, remove_audio_clip,
+    remove_audio_track,
 };
 
 mod recording;
@@ -2688,6 +2691,118 @@ impl Error for IdeRecordingClipCreationError {
             | Self::InvalidClipName
             | Self::RecordingMetadataMissing
             | Self::RecordingMetadataAmbiguous
+            | Self::TrackResourceMissing
+            | Self::TrackResourceRoleMismatch
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IdeAudioClipRemovalError {
+    InvalidClipIdentity,
+    MixerSave(Box<IdeProjectSaveError>),
+    ClipResourceMissing,
+    ClipResourceRoleMismatch,
+    TrackResourceMissing,
+    TrackResourceRoleMismatch,
+    Storage(StorageError),
+    Serialization(AudioClipRemovalSerializationError),
+    CapacityUnavailable,
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeAudioClipRemovalError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: AudioClipRemovalOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<ProjectResourcePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl fmt::Display for IdeAudioClipRemovalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidClipIdentity => {
+                formatter.write_str("audio-clip removal requires a clip identity")
+            }
+            Self::MixerSave(source) => {
+                write!(formatter, "live mixer state could not be preserved: {source}")
+            }
+            Self::ClipResourceMissing => {
+                formatter.write_str("the audio clip is no longer present")
+            }
+            Self::ClipResourceRoleMismatch => {
+                formatter.write_str("the selected identity is not an audio-clip resource")
+            }
+            Self::TrackResourceMissing => {
+                formatter.write_str("the audio clip's owning track is no longer present")
+            }
+            Self::TrackResourceRoleMismatch => {
+                formatter.write_str("the audio clip's owner is not a structural track")
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("audio-clip removal capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before removing the audio clip: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before removing the audio clip ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-clip removal preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "audio clip {} was removed in project revision {} but the project could not be reopened: {source}",
+                outcome.clip_id(),
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-clip removal failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAudioClipRemovalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidClipIdentity
+            | Self::ClipResourceMissing
+            | Self::ClipResourceRoleMismatch
             | Self::TrackResourceMissing
             | Self::TrackResourceRoleMismatch
             | Self::CapacityUnavailable
@@ -5571,6 +5686,37 @@ struct IdeAudioTrackRemovalPlan {
     mixer_bytes: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct IdeAudioClipRemovalPlan {
+    mixer: IdeMixerSavePlan,
+    clip_id: String,
+    track_id: String,
+    track_bytes: Vec<u8>,
+}
+
+impl IdeAudioClipRemovalPlan {
+    fn publish(&self) -> Result<AudioClipRemovalOutcome, IdeAudioClipRemovalError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| {
+                IdeAudioClipRemovalError::MixerSave(Box::new(IdeProjectSaveError::Publication(
+                    Box::new(source),
+                )))
+            })?;
+        remove_audio_clip(
+            &self.mixer.project_path,
+            AudioClipRemovalRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                clip_id: &self.clip_id,
+                track_id: &self.track_id,
+                track_bytes: &self.track_bytes,
+            },
+        )
+        .map_err(|source| IdeAudioClipRemovalError::Publication(Box::new(source)))
+    }
+}
+
 impl IdeAudioTrackRemovalPlan {
     fn publish(&self) -> Result<AudioTrackRemovalOutcome, ProjectResourcePublicationError> {
         remove_audio_track(
@@ -7203,6 +7349,82 @@ impl RunningDesktopIdeApplication {
             source_clip_id,
             clip_name,
         )
+    }
+
+    fn prepare_audio_clip_removal(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        clip_id: &str,
+    ) -> Result<IdeAudioClipRemovalPlan, IdeAudioClipRemovalError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAudioClipRemovalError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAudioClipRemovalError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        Self::prepare_audio_clip_removal_from_project(
+            application,
+            mixer,
+            prepared,
+            clip_id,
+        )
+    }
+
+    fn prepare_audio_clip_removal_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        clip_id: &str,
+    ) -> Result<IdeAudioClipRemovalPlan, IdeAudioClipRemovalError> {
+        let package = prepared.package();
+        let clip_descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == clip_id)
+            .ok_or(IdeAudioClipRemovalError::ClipResourceMissing)?;
+        if clip_descriptor.role() != ResourceRole::Clip {
+            return Err(IdeAudioClipRemovalError::ClipResourceRoleMismatch);
+        }
+        let (project, _, _, _) = prepared.session().parts();
+        let clip_index = (0..project.clip_count())
+            .find(|index| project.clip_id_at(*index) == Some(clip_id))
+            .ok_or(IdeAudioClipRemovalError::ClipResourceMissing)?;
+        let track_id = project
+            .clip_track_id_at(clip_index)
+            .ok_or(IdeAudioClipRemovalError::TrackResourceMissing)?;
+        let track_descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == track_id)
+            .ok_or(IdeAudioClipRemovalError::TrackResourceMissing)?;
+        if track_descriptor.role() != ResourceRole::Track {
+            return Err(IdeAudioClipRemovalError::TrackResourceRoleMismatch);
+        }
+        let source_track = package
+            .read_resource(track_id)
+            .map_err(IdeAudioClipRemovalError::Storage)?;
+        let documents = serialize_audio_clip_removal(
+            project,
+            &source_track,
+            clip_id,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeAudioClipRemovalError::Serialization)?;
+        let (track_bytes, owned_track_id, _) = documents.into_parts();
+        let mut owned_clip_id = String::new();
+        owned_clip_id
+            .try_reserve_exact(clip_id.len())
+            .map_err(|_| IdeAudioClipRemovalError::CapacityUnavailable)?;
+        owned_clip_id.push_str(clip_id);
+        Ok(IdeAudioClipRemovalPlan {
+            mixer,
+            clip_id: owned_clip_id,
+            track_id: owned_track_id,
+            track_bytes,
+        })
     }
 
     fn prepare_audio_clip_duplication_from_project(
@@ -12059,6 +12281,103 @@ mod tests {
         assert_eq!(
             track["clip_ids"],
             json!([ARRANGEMENT_TEST_CLIP_ID, outcome.clip_id()])
+        );
+    }
+
+    #[test]
+    fn unused_audio_clip_removal_refuses_playback_use_then_retains_media() {
+        let fixture = ArrangementProjectFixture::new();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+        let application = DesktopIdeApplication::from_inventories(
+            desktop_ide_application_config().unwrap(),
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let mixer = prepared
+            .package()
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_id = mixer.id().to_owned();
+        let mixer_bytes = prepared.package().read_resource(&mixer_id).unwrap();
+        let mixer_plan = || IdeMixerSavePlan {
+            project_path: project_path.clone(),
+            expected_project_sha256: *prepared.package().manifest_sha256(),
+            resource_id: mixer_id.clone(),
+            resource_bytes: mixer_bytes.clone(),
+        };
+        assert!(matches!(
+            RunningDesktopIdeApplication::prepare_audio_clip_removal_from_project(
+                &application,
+                mixer_plan(),
+                &prepared,
+                ARRANGEMENT_TEST_CLIP_ID,
+            ),
+            Err(IdeAudioClipRemovalError::Serialization(
+                AudioClipRemovalSerializationError::Blocked(_)
+            ))
+        ));
+        let duplication = RunningDesktopIdeApplication::prepare_audio_clip_duplication_from_project(
+            &application,
+            mixer_plan(),
+            &prepared,
+            ARRANGEMENT_TEST_CLIP_ID,
+            "Unused copy",
+        )
+        .unwrap();
+        let duplicate_id = duplication.clip_id.clone();
+        drop(prepared);
+        duplication.publish().unwrap();
+
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let mixer = prepared
+            .package()
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let source_media = std::fs::read(project_path.join("assets/samples/sample.wav")).unwrap();
+        let removal = RunningDesktopIdeApplication::prepare_audio_clip_removal_from_project(
+            &application,
+            IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: *prepared.package().manifest_sha256(),
+                resource_id: mixer.id().to_owned(),
+                resource_bytes: prepared.package().read_resource(mixer.id()).unwrap(),
+            },
+            &prepared,
+            &duplicate_id,
+        )
+        .unwrap();
+        drop(prepared);
+
+        let outcome = removal.publish().unwrap();
+
+        assert_eq!(outcome.clip_id(), duplicate_id);
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let (project, _, _, _) = reopened.session().parts();
+        assert_eq!(project.clip_count(), 1);
+        assert_eq!(project.clip_id_at(0), Some(ARRANGEMENT_TEST_CLIP_ID));
+        assert_eq!(project.placement_count(), 1);
+        assert!(
+            reopened
+                .package()
+                .manifest()
+                .resources()
+                .iter()
+                .all(|descriptor| descriptor.id() != duplicate_id)
+        );
+        assert_eq!(
+            std::fs::read(project_path.join("assets/samples/sample.wav")).unwrap(),
+            source_media
         );
     }
 

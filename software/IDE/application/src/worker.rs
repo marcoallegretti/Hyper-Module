@@ -31,6 +31,7 @@ use super::{
     DesktopPlaybackRecovery, Edge, IdeApplicationConfig, IdeArrangementLocateError,
     IdeArrangementPlacementEditError, IdeAudioClipActivationEditError,
     IdeAudioClipDuplicationError, IdeAudioClipFadeEditError, IdeAudioClipGainEditError,
+    IdeAudioClipRemovalError,
     IdeAudioClipLoopEditError, IdeAudioClipRenameEditError, IdeAudioClipReverseEditError,
     IdeAudioClipSourceSlipEditError, IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome,
     IdeAudioImportError, IdeAudioInputInventory, IdeAudioOutputInventory,
@@ -144,6 +145,7 @@ pub enum IdeWorkerCommandKind {
     ImportAudio,
     CreateAudioClipFromTake,
     DuplicateAudioClip,
+    RemoveAudioClip,
     AddArrangementPlacement,
     AddArrangementSceneLaunch,
     MoveArrangementSceneLaunch,
@@ -254,6 +256,9 @@ pub enum IdeWorkerCommand {
     DuplicateAudioClip {
         clip_id: String,
         name: String,
+    },
+    RemoveAudioClip {
+        clip_id: String,
     },
     AddArrangementPlacement {
         clip_id: String,
@@ -426,6 +431,7 @@ impl IdeWorkerCommand {
             Self::ImportAudio { .. } => IdeWorkerCommandKind::ImportAudio,
             Self::CreateAudioClipFromTake { .. } => IdeWorkerCommandKind::CreateAudioClipFromTake,
             Self::DuplicateAudioClip { .. } => IdeWorkerCommandKind::DuplicateAudioClip,
+            Self::RemoveAudioClip { .. } => IdeWorkerCommandKind::RemoveAudioClip,
             Self::AddArrangementPlacement { .. } => IdeWorkerCommandKind::AddArrangementPlacement,
             Self::AddArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::AddArrangementSceneLaunch
@@ -1471,6 +1477,7 @@ pub enum IdeWorkerCommandFailure {
     },
     RecordingClipCreation(Box<IdeRecordingClipCreationError>),
     AudioClipDuplication(Box<IdeAudioClipDuplicationError>),
+    AudioClipRemoval(Box<IdeAudioClipRemovalError>),
     ArrangementPlacementAddition(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchAddition(Box<IdeArrangementPlacementEditError>),
     ArrangementSceneLaunchMove(Box<IdeArrangementPlacementEditError>),
@@ -1556,6 +1563,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             ),
             Self::RecordingClipCreation(source) => source.fmt(formatter),
             Self::AudioClipDuplication(source) => source.fmt(formatter),
+            Self::AudioClipRemoval(source) => source.fmt(formatter),
             Self::ArrangementPlacementAddition(source)
             | Self::ArrangementSceneLaunchAddition(source)
             | Self::ArrangementSceneLaunchMove(source)
@@ -1630,6 +1638,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioImportAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::RecordingClipCreation(source) => Some(source),
             Self::AudioClipDuplication(source) => Some(source),
+            Self::AudioClipRemoval(source) => Some(source),
             Self::ArrangementPlacementAddition(source)
             | Self::ArrangementSceneLaunchAddition(source)
             | Self::ArrangementSceneLaunchMove(source)
@@ -1766,6 +1775,10 @@ pub enum IdeWorkerEvent {
         revision: u64,
         clip_id: String,
         name: String,
+    },
+    AudioClipRemoved {
+        revision: u64,
+        clip_id: String,
     },
     AudioClipDuplicationCommittedWithWarning {
         name: String,
@@ -1984,6 +1997,7 @@ pub enum IdeWorkerEvent {
     },
     AudioClipCreatingFromTake,
     AudioClipDuplicating,
+    AudioClipRemoving,
     ArrangementPlacementAdding {
         start_tick: u64,
     },
@@ -2461,6 +2475,9 @@ enum ProjectMutation {
         clip_id: String,
         name: String,
     },
+    RemoveAudioClip {
+        clip_id: String,
+    },
     AddArrangementPlacement {
         clip_id: String,
         start_tick: u64,
@@ -2600,6 +2617,7 @@ impl ProjectMutation {
             Self::ImportAudio { .. } => IdeWorkerCommandKind::ImportAudio,
             Self::CreateAudioClipFromTake { .. } => IdeWorkerCommandKind::CreateAudioClipFromTake,
             Self::DuplicateAudioClip { .. } => IdeWorkerCommandKind::DuplicateAudioClip,
+            Self::RemoveAudioClip { .. } => IdeWorkerCommandKind::RemoveAudioClip,
             Self::AddArrangementPlacement { .. } => IdeWorkerCommandKind::AddArrangementPlacement,
             Self::AddArrangementSceneLaunch { .. } => {
                 IdeWorkerCommandKind::AddArrangementSceneLaunch
@@ -2671,6 +2689,7 @@ impl ProjectMutation {
             }
             Self::CreateAudioClipFromTake { .. } => IdeWorkerEvent::AudioClipCreatingFromTake,
             Self::DuplicateAudioClip { .. } => IdeWorkerEvent::AudioClipDuplicating,
+            Self::RemoveAudioClip { .. } => IdeWorkerEvent::AudioClipRemoving,
             Self::AddArrangementPlacement { start_tick, .. } => {
                 IdeWorkerEvent::ArrangementPlacementAdding {
                     start_tick: *start_tick,
@@ -2912,6 +2931,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::ImportAudio
         | IdeWorkerCommandKind::CreateAudioClipFromTake
         | IdeWorkerCommandKind::DuplicateAudioClip
+        | IdeWorkerCommandKind::RemoveAudioClip
         | IdeWorkerCommandKind::EditControlMapping
         | IdeWorkerCommandKind::ExportProject
         | IdeWorkerCommandKind::Undo
@@ -3206,6 +3226,7 @@ fn process_command(
         | IdeWorkerCommand::ImportAudio { .. }
         | IdeWorkerCommand::CreateAudioClipFromTake { .. }
         | IdeWorkerCommand::DuplicateAudioClip { .. }
+        | IdeWorkerCommand::RemoveAudioClip { .. }
         | IdeWorkerCommand::AddArrangementPlacement { .. }
         | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
@@ -3343,6 +3364,7 @@ fn process_project_mutation_command(
         IdeWorkerCommand::DuplicateAudioClip { clip_id, name } => {
             duplicate_audio_clip(state, events, &clip_id, &name)
         }
+        IdeWorkerCommand::RemoveAudioClip { clip_id } => remove_audio_clip(state, events, &clip_id),
         command @ (IdeWorkerCommand::AddArrangementPlacement { .. }
         | IdeWorkerCommand::AddArrangementSceneLaunch { .. }
         | IdeWorkerCommand::MoveArrangementSceneLaunch { .. }
@@ -4851,6 +4873,40 @@ fn duplicate_audio_clip(
     )
 }
 
+fn remove_audio_clip(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    clip_id: &str,
+) -> bool {
+    if clip_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RemoveAudioClip,
+            IdeWorkerCommandFailure::AudioClipRemoval(Box::new(
+                IdeAudioClipRemovalError::InvalidClipIdentity,
+            )),
+        );
+    }
+    let mut owned_clip_id = String::new();
+    if owned_clip_id.try_reserve_exact(clip_id.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RemoveAudioClip,
+            IdeWorkerCommandFailure::AudioClipRemoval(Box::new(
+                IdeAudioClipRemovalError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_clip_id.push_str(clip_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::RemoveAudioClip {
+            clip_id: owned_clip_id,
+        },
+    )
+}
+
 fn add_arrangement_placement(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -5713,6 +5769,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         )
         | ProjectMutationAttempt::CreateAudioClipFromTake(Ok(_))
         | ProjectMutationAttempt::DuplicateAudioClip { result: Ok(_), .. }
+        | ProjectMutationAttempt::RemoveAudioClip(Ok(_))
         | ProjectMutationAttempt::EditControlMapping { result: Ok(_), .. } => {
             HistoryEffect::Invalidate
         }
@@ -5728,6 +5785,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::RemoveArrangementPlacement(Err(_))
         | ProjectMutationAttempt::SetAudioTrackActive { result: Err(_), .. }
         | ProjectMutationAttempt::DuplicateAudioClip { result: Err(_), .. }
+        | ProjectMutationAttempt::RemoveAudioClip(Err(_))
         | ProjectMutationAttempt::AddArrangementPlacement { result: Err(_), .. }
         | ProjectMutationAttempt::AddArrangementSceneLaunch { result: Err(_), .. }
         | ProjectMutationAttempt::MoveArrangementSceneLaunch { result: Err(_), .. }
@@ -6364,6 +6422,9 @@ fn project_mutation_save_failure(
                 IdeAudioClipDuplicationError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::RemoveAudioClip { .. } => IdeWorkerCommandFailure::AudioClipRemoval(
+            Box::new(IdeAudioClipRemovalError::MixerSave(Box::new(reason))),
+        ),
         ProjectMutation::AddArrangementPlacement { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementAddition(Box::new(
                 IdeArrangementPlacementEditError::MixerSave(Box::new(reason)),
@@ -6603,6 +6664,9 @@ fn project_mutation_native_close_failure(
                 IdeAudioClipDuplicationError::NativeClose(failure),
             ))
         }
+        ProjectMutation::RemoveAudioClip { .. } => IdeWorkerCommandFailure::AudioClipRemoval(
+            Box::new(IdeAudioClipRemovalError::NativeClose(failure)),
+        ),
         ProjectMutation::AddArrangementPlacement { .. } => {
             IdeWorkerCommandFailure::ArrangementPlacementAddition(Box::new(
                 IdeArrangementPlacementEditError::NativeClose(failure),
@@ -6764,6 +6828,9 @@ enum ProjectMutationAttempt {
         result:
             Result<hyper_storage_engine::AudioClipPublicationOutcome, IdeAudioClipDuplicationError>,
     },
+    RemoveAudioClip(
+        Result<hyper_storage_engine::AudioClipRemovalOutcome, IdeAudioClipRemovalError>,
+    ),
     AddArrangementPlacement {
         start_tick: u64,
         result: Result<ArrangementPlacementCreationPublication, IdeArrangementPlacementEditError>,
@@ -7372,6 +7439,18 @@ fn complete_project_mutation(
                     events,
                     IdeWorkerCommandKind::DuplicateAudioClip,
                     IdeWorkerCommandFailure::AudioClipDuplication(Box::new(reason)),
+                ),
+                ProjectMutationAttempt::RemoveAudioClip(Ok(outcome)) => send_event(
+                    events,
+                    IdeWorkerEvent::AudioClipRemoved {
+                        revision: outcome.project_revision(),
+                        clip_id: outcome.clip_id().to_owned(),
+                    },
+                ),
+                ProjectMutationAttempt::RemoveAudioClip(Err(reason)) => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::RemoveAudioClip,
+                    IdeWorkerCommandFailure::AudioClipRemoval(Box::new(reason)),
                 ),
                 ProjectMutationAttempt::AddArrangementPlacement {
                     start_tick,
@@ -8115,6 +8194,18 @@ fn attempt_project_mutation(
                     .and_then(publish_audio_clip_duplication_plan)
                 },
             }
+        }
+        ProjectMutation::RemoveAudioClip { clip_id } => {
+            ProjectMutationAttempt::RemoveAudioClip(if let Some(failure) = native_failure {
+                Err(IdeAudioClipRemovalError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_audio_clip_removal(
+                    application,
+                    recovery,
+                    &clip_id,
+                )
+                .and_then(|plan| plan.publish())
+            })
         }
         ProjectMutation::AddArrangementPlacement {
             clip_id,
@@ -9156,6 +9247,38 @@ fn project_mutation_reopen_failure(
         }
         ProjectMutationAttempt::DuplicateAudioClip { result, .. } => {
             audio_clip_duplication_reopen_failure(result, reopen)
+        }
+        ProjectMutationAttempt::RemoveAudioClip(Ok(outcome)) => {
+            IdeWorkerCommandFailure::AudioClipRemoval(Box::new(
+                IdeAudioClipRemovalError::ReopenAfterPublication {
+                    outcome,
+                    source: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::RemoveAudioClip(Err(IdeAudioClipRemovalError::Publication(
+            publication,
+        ))) => IdeWorkerCommandFailure::AudioClipRemoval(Box::new(
+            IdeAudioClipRemovalError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::RemoveAudioClip(Err(IdeAudioClipRemovalError::NativeClose(
+            close,
+        ))) => IdeWorkerCommandFailure::AudioClipRemoval(Box::new(
+            IdeAudioClipRemovalError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::RemoveAudioClip(Err(preparation)) => {
+            IdeWorkerCommandFailure::AudioClipRemoval(Box::new(
+                IdeAudioClipRemovalError::ReopenAfterPreparation {
+                    preparation: Box::new(preparation),
+                    reopen: Box::new(reopen),
+                },
+            ))
         }
         ProjectMutationAttempt::AddArrangementPlacement { result, .. } => {
             arrangement_placement_creation_reopen_failure(
@@ -15202,6 +15325,55 @@ mod tests {
                 command: IdeWorkerCommandKind::DuplicateAudioClip,
                 reason: IdeWorkerCommandFailure::AudioClipDuplication(reason),
             } if matches!(reason.as_ref(), IdeAudioClipDuplicationError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn audio_clip_removal_validates_identity_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::RemoveAudioClip {
+                clip_id: String::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RemoveAudioClip,
+                reason: IdeWorkerCommandFailure::AudioClipRemoval(reason),
+            } if matches!(reason.as_ref(), IdeAudioClipRemovalError::InvalidClipIdentity)
+        ));
+        worker
+            .try_send(IdeWorkerCommand::RemoveAudioClip {
+                clip_id: "018f47a2-6b2d-7c11-8a44-001122334460".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::AudioClipRemoving));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RemoveAudioClip,
+                reason: IdeWorkerCommandFailure::AudioClipRemoval(reason),
+            } if matches!(reason.as_ref(), IdeAudioClipRemovalError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
