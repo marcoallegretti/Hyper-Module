@@ -433,6 +433,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let diagnostic = Arc::new(Mutex::new(
         "starting verified Runtime deployment".to_owned(),
     ));
+    let completion_close_error = Arc::new(Mutex::new(None));
     let worker_diagnostic = Arc::clone(&diagnostic);
     let worker_stop = Arc::clone(&stop);
     let worker = std::thread::spawn(move || {
@@ -480,13 +481,34 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let weak = ui.as_weak();
     let timer_observers = observers.clone();
     let timer_diagnostic = Arc::clone(&diagnostic);
+    let timer_close_error = Arc::clone(&completion_close_error);
+    let mut completion_observed = false;
     let timer = Timer::default();
     timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
         if let Some(ui) = weak.upgrade() {
             apply_observations(&ui, &timer_observers, &timer_diagnostic);
-            apply_operator_worker_completion(&ui, &completion_rx, &timer_diagnostic, || {
-                let _ = ui.hide();
-            });
+            if !completion_observed
+                && let Some(close_result) =
+                    apply_operator_worker_completion(&ui, &completion_rx, &timer_diagnostic, || {
+                        close_operator_surface(
+                            || {
+                                ui.hide().map_err(|error| {
+                                    format!("operator surface could not hide: {error}")
+                                })
+                            },
+                            || {
+                                slint::quit_event_loop().map_err(|error| {
+                                    format!("operator event loop could not terminate: {error}")
+                                })
+                            },
+                        )
+                    })
+            {
+                completion_observed = true;
+                if let Err(error) = close_result {
+                    set_first_error(&timer_close_error, error);
+                }
+            }
         }
     });
     apply_observations(&ui, &observers, &diagnostic);
@@ -495,6 +517,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         .run()
         .map_err(|error| format!("operator UI failed: {error}"));
     drop(timer);
+    let ui_result = reconcile_operator_ui_close(ui_result, &completion_close_error);
     finish_operator_worker(ui_result, &stop, &commands_tx, worker)
 }
 
@@ -520,8 +543,35 @@ fn finish_operator_worker(
     let worker_result = worker
         .join()
         .map_err(|_| "Runtime worker panicked during shutdown".to_owned())?;
-    ui_result?;
-    worker_result
+    reconcile_operator_results(ui_result, worker_result)
+}
+
+fn reconcile_operator_results(
+    ui_result: Result<(), String>,
+    worker_result: Result<(), String>,
+) -> Result<(), String> {
+    match (worker_result, ui_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(ui_error)) => Err(ui_error),
+        (Err(worker_error), Ok(())) => Err(worker_error),
+        (Err(worker_error), Err(ui_error)) => Err(format!(
+            "{worker_error}; operator UI shutdown also failed: {ui_error}"
+        )),
+    }
+}
+
+fn reconcile_operator_ui_close(
+    ui_result: Result<(), String>,
+    close_error: &Mutex<Option<String>>,
+) -> Result<(), String> {
+    let close_error = close_error.lock().ok().and_then(|mut error| error.take());
+    match (ui_result, close_error) {
+        (Ok(()), None) => Ok(()),
+        (Err(error), None) | (Ok(()), Some(error)) => Err(error),
+        (Err(ui_error), Some(close_error)) => Err(format!(
+            "{ui_error}; operator surface shutdown also failed: {close_error}"
+        )),
+    }
 }
 
 fn set_diagnostic(diagnostic: &Mutex<String>, message: String) {
@@ -530,24 +580,51 @@ fn set_diagnostic(diagnostic: &Mutex<String>, message: String) {
     }
 }
 
+fn set_first_error(error: &Mutex<Option<String>>, message: String) {
+    if let Ok(mut current) = error.lock()
+        && current.is_none()
+    {
+        *current = Some(message);
+    }
+}
+
+fn close_operator_surface(
+    hide: impl FnOnce() -> Result<(), String>,
+    quit_event_loop: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let Err(hide_error) = hide() else {
+        return Ok(());
+    };
+    match quit_event_loop() {
+        Ok(()) => Err(format!(
+            "{hide_error}; explicit event-loop termination was required"
+        )),
+        Err(quit_error) => Err(format!("{hide_error}; {quit_error}")),
+    }
+}
+
 fn apply_operator_worker_completion(
     ui: &OperatorWindow,
     completion: &Receiver<Result<(), String>>,
     diagnostic: &Mutex<String>,
-    close_operator_surface: impl FnOnce(),
-) -> bool {
+    close_operator_surface: impl FnOnce() -> Result<(), String>,
+) -> Option<Result<(), String>> {
     let message = match completion.try_recv() {
         Ok(Ok(())) => "Runtime worker stopped".to_owned(),
         Ok(Err(error)) => format!("Runtime worker stopped: {error}"),
-        Err(TryRecvError::Empty) => return false,
+        Err(TryRecvError::Empty) => return None,
         Err(TryRecvError::Disconnected) => {
             "Runtime worker ended without publishing its result".to_owned()
         }
     };
+    let close_result = close_operator_surface();
+    let message = close_result
+        .as_ref()
+        .err()
+        .map_or(message.clone(), |error| format!("{message}; {error}"));
     set_diagnostic(diagnostic, message.clone());
     ui.set_diagnostic(message.into());
-    close_operator_surface();
-    true
+    Some(close_result)
 }
 
 fn wire_operator_action(
@@ -1187,22 +1264,24 @@ mod tests {
 
         let (completion_sender, completion_receiver) = std::sync::mpsc::sync_channel(1);
         let surface_closed = Cell::new(false);
-        assert!(!apply_operator_worker_completion(
-            &ui,
-            &completion_receiver,
-            &diagnostic,
-            || surface_closed.set(true),
-        ));
+        assert_eq!(
+            apply_operator_worker_completion(&ui, &completion_receiver, &diagnostic, || {
+                surface_closed.set(true);
+                Ok(())
+            },),
+            None
+        );
         assert!(!surface_closed.get());
         completion_sender
             .send(Err("native audio ownership ended unexpectedly".to_owned()))
             .unwrap();
-        assert!(apply_operator_worker_completion(
-            &ui,
-            &completion_receiver,
-            &diagnostic,
-            || surface_closed.set(true),
-        ));
+        assert_eq!(
+            apply_operator_worker_completion(&ui, &completion_receiver, &diagnostic, || {
+                surface_closed.set(true);
+                Ok(())
+            },),
+            Some(Ok(()))
+        );
         assert!(surface_closed.get());
         assert_eq!(
             ui.get_diagnostic().as_str(),
@@ -1212,16 +1291,17 @@ mod tests {
         let (lost_sender, lost_receiver) = std::sync::mpsc::sync_channel(1);
         drop(lost_sender);
         surface_closed.set(false);
-        assert!(apply_operator_worker_completion(
-            &ui,
-            &lost_receiver,
-            &diagnostic,
-            || surface_closed.set(true),
-        ));
+        assert_eq!(
+            apply_operator_worker_completion(&ui, &lost_receiver, &diagnostic, || {
+                surface_closed.set(true);
+                Err("adapter refused to hide".to_owned())
+            }),
+            Some(Err("adapter refused to hide".to_owned()))
+        );
         assert!(surface_closed.get());
         assert_eq!(
             ui.get_diagnostic().as_str(),
-            "Runtime worker ended without publishing its result"
+            "Runtime worker ended without publishing its result; adapter refused to hide"
         );
     }
 
@@ -1247,6 +1327,89 @@ mod tests {
     }
 
     #[test]
+    fn operator_terminal_results_keep_worker_failure_primary() {
+        assert_eq!(reconcile_operator_results(Ok(()), Ok(())), Ok(()));
+        assert_eq!(
+            reconcile_operator_results(Err("UI failed".to_owned()), Ok(())),
+            Err("UI failed".to_owned())
+        );
+        assert_eq!(
+            reconcile_operator_results(Ok(()), Err("audio owner failed".to_owned())),
+            Err("audio owner failed".to_owned())
+        );
+        assert_eq!(
+            reconcile_operator_results(
+                Err("UI failed".to_owned()),
+                Err("audio owner failed".to_owned())
+            ),
+            Err("audio owner failed; operator UI shutdown also failed: UI failed".to_owned())
+        );
+
+        let close_error = Mutex::new(Some("surface adapter refused hide".to_owned()));
+        assert_eq!(
+            reconcile_operator_ui_close(Ok(()), &close_error),
+            Err("surface adapter refused hide".to_owned())
+        );
+        let close_error = Mutex::new(Some("surface adapter refused hide".to_owned()));
+        assert_eq!(
+            reconcile_operator_ui_close(Err("event loop failed".to_owned()), &close_error),
+            Err(
+                "event loop failed; operator surface shutdown also failed: surface adapter refused hide"
+                    .to_owned()
+            )
+        );
+
+        let stop = AtomicBool::new(false);
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        let worker =
+            std::thread::spawn(|| -> Result<(), String> { panic!("worker panic evidence") });
+        assert_eq!(
+            finish_operator_worker(Err("UI failed".to_owned()), &stop, &sender, worker),
+            Err("Runtime worker panicked during shutdown".to_owned())
+        );
+    }
+
+    #[test]
+    fn operator_surface_close_uses_checked_event_loop_fallback() {
+        let quit_called = Cell::new(false);
+        assert_eq!(
+            close_operator_surface(
+                || Err("surface adapter refused hide".to_owned()),
+                || {
+                    quit_called.set(true);
+                    Ok(())
+                }
+            ),
+            Err(
+                "surface adapter refused hide; explicit event-loop termination was required"
+                    .to_owned()
+            )
+        );
+        assert!(quit_called.get());
+
+        assert_eq!(
+            close_operator_surface(
+                || Err("surface adapter refused hide".to_owned()),
+                || Err("event loop refused quit".to_owned())
+            ),
+            Err("surface adapter refused hide; event loop refused quit".to_owned())
+        );
+
+        quit_called.set(false);
+        assert_eq!(
+            close_operator_surface(
+                || Ok(()),
+                || {
+                    quit_called.set(true);
+                    Ok(())
+                }
+            ),
+            Ok(())
+        );
+        assert!(!quit_called.get());
+    }
+
+    #[test]
     fn failed_operator_startup_joins_the_worker_and_returns_its_error() {
         let joined = Arc::new(AtomicBool::new(false));
         let worker_joined = Arc::clone(&joined);
@@ -1261,6 +1424,31 @@ mod tests {
 
         assert_eq!(error, "verified deployment was rejected");
         assert!(joined.load(Ordering::Acquire));
+
+        let panicked =
+            std::thread::spawn(|| -> Result<(), String> { panic!("startup panic evidence") });
+        assert_eq!(
+            finish_failed_operator_startup("readiness disconnected".to_owned(), panicked),
+            Err("Runtime worker panicked during startup".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_full_operator_queue_refuses_without_replacing_the_queued_command() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        sender.send(OperatorCommand::Start).unwrap();
+        let diagnostic = Mutex::new("healthy".to_owned());
+
+        send_operator_command(&sender, OperatorCommand::ReturnToStart, &diagnostic);
+
+        assert_eq!(receiver.try_recv(), Ok(OperatorCommand::Start));
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert!(
+            diagnostic
+                .lock()
+                .unwrap()
+                .starts_with("operator command refused:")
+        );
     }
 
     #[test]
