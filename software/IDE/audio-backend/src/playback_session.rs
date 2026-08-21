@@ -1589,6 +1589,12 @@ impl DesktopPlaybackSession {
         self.controls.mixer().channel_count()
     }
 
+    /// Returns one compiled mixer channel's retained project track name.
+    #[must_use]
+    pub fn mixer_channel_name(&self, channel_index: usize) -> Option<&str> {
+        self.source.session().mixer_channel_name_at(channel_index)
+    }
+
     /// Resolves one compiled channel index through this session's mixer layout.
     ///
     /// # Errors

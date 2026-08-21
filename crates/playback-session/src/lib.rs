@@ -538,6 +538,19 @@ impl PreparedPlaybackSession {
         &self.automation_view
     }
 
+    /// Returns the fixed channel count in the compiled mixer layout.
+    #[must_use]
+    pub fn mixer_channel_count(&self) -> usize {
+        self.mixer.slots().len()
+    }
+
+    /// Returns one compiled mixer channel's retained project track name.
+    #[must_use]
+    pub fn mixer_channel_name_at(&self, channel_index: usize) -> Option<&str> {
+        let track_id = self.mixer.slots().get(channel_index)?.track_id();
+        self.project.track_name(track_id)
+    }
+
     #[must_use]
     pub fn shared_automation_takes(&self) -> Arc<PlaybackAutomation> {
         Arc::clone(&self.automation_view)
@@ -1168,6 +1181,9 @@ mod tests {
         assert_eq!(session.sample_rate_hz(), 48_000);
         assert_eq!(session.media_asset_count(), 1);
         assert!(session.has_automation());
+        assert_eq!(session.mixer_channel_count(), 1);
+        assert_eq!(session.mixer_channel_name_at(0), Some("Audio"));
+        assert_eq!(session.mixer_channel_name_at(1), None);
         let takes = session.automation_takes().takes();
         assert_eq!(takes.len(), 1);
         assert_eq!(takes[0].id(), "018f47a2-6b2d-7c11-8a44-001122337508");
