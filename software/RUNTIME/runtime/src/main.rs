@@ -3202,6 +3202,13 @@ mod tests {
         assert_eq!(operator_seek_frame(1_500, 100.0), Some(1_500));
         assert_eq!(operator_seek_frame(3, 50.0), Some(2));
         assert_eq!(operator_seek_frame(usize::MAX, 100.0), Some(usize::MAX));
+        assert_eq!(
+            operator_seek_frame(usize::MAX, 50.0),
+            Some(usize::MAX / 2 + 1)
+        );
+        assert_operator_float(operator_seek_percent(0, 1_500), 0.0);
+        assert_operator_float(operator_seek_percent(1_500, 1_500), 100.0);
+        assert_operator_float(operator_seek_percent(1_501, 1_500), 100.0);
         for invalid in [f32::NAN, f32::INFINITY, -0.1, 100.1] {
             assert_eq!(operator_seek_frame(1_500, invalid), None);
         }
@@ -5263,6 +5270,67 @@ mod tests {
         );
         assert_operator_float(ui.get_transport_position_percent(), 50.0);
 
+        ui.invoke_locate_percent_requested(25.0);
+        let rolling_locate = seek_receiver.try_recv().unwrap();
+        assert_eq!(rolling_locate, OperatorCommand::Locate { frame: 375 });
+        let OperatorCommand::Locate { frame } = rolling_locate else {
+            unreachable!("the rolling seek fixture emits one exact locate")
+        };
+        transport_sender.try_send(TransportCommand::Start).unwrap();
+        transport_sender
+            .try_send(TransportCommand::Locate {
+                frame,
+                state: LocateState::Preserve,
+            })
+            .unwrap();
+        let rolling_seek_cycle = transport
+            .process_cycle(
+                &mut scratch,
+                StereoOutput {
+                    left: &mut mixer_left,
+                    right: &mut mixer_right,
+                },
+            )
+            .unwrap();
+        let committed_mixer = transport.mixer_parameter_state();
+        recovery_publisher.publish_cycle(rolling_seek_cycle, Some(&committed_mixer));
+        let rolling_sought = recovery.observe_cycle();
+        assert_eq!(rolling_sought.position_frame(), 855);
+        assert_eq!(
+            rolling_sought.state(),
+            PlaybackRecoveryTransportState::Rolling
+        );
+        apply_operator_seek_observation(
+            ui,
+            &seek_authority,
+            PlaybackExtent::Bounded { end_frame: 1_500 },
+            rolling_sought.position_frame(),
+        );
+        assert_operator_float(ui.get_transport_position_percent(), 57.0);
+        let seek_observers = RuntimeObservers {
+            facts: RuntimeFacts {
+                bundle_identity: "seek-fixture".to_owned(),
+                deployment_generation: 1,
+                recovered_from: None,
+                project_name: "Seek fixture".to_owned(),
+                project_id: PROJECT_ID.to_owned(),
+                project_revision: 1,
+                playback_extent: PlaybackExtent::Bounded { end_frame: 1_500 },
+            },
+            output_status: OutputStreamStatus::default(),
+            output_counters: OutputStreamCounters::default(),
+            recovery: recovery.clone(),
+            panel_connected: Arc::new(AtomicBool::new(false)),
+        };
+        let _ = apply_observations(ui, &seek_observers, &seek_diagnostic);
+        assert_eq!(ui.get_transport_frame().as_str(), "855");
+        let committed_frame = ui.get_transport_frame();
+        revoke_operator_seek_authority(ui, &seek_authority);
+        assert_eq!(seek_authority.get(), None);
+        assert!(!ui.get_transport_seek_enabled());
+        assert_eq!(ui.get_transport_frame(), committed_frame);
+        assert_operator_float(ui.get_transport_position_percent(), 57.0);
+
         drop(meter_sender);
         apply_operator_meter_observation(
             ui,
@@ -5346,6 +5414,8 @@ mod tests {
             Ok(OperatorCommand::Locate { frame: 750 })
         );
         assert_operator_float(ui.get_transport_position_percent(), 0.0);
+        apply_operator_seek_observation(&ui, &seek_authority, facts.playback_extent, 375);
+        assert_operator_float(ui.get_transport_position_percent(), 25.0);
         ui.invoke_locate_percent_requested(f32::NAN);
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(
@@ -5371,6 +5441,7 @@ mod tests {
                 .unwrap()
                 .contains("operator command refused")
         );
+        assert_operator_float(ui.get_transport_position_percent(), 25.0);
 
         let (lost_seek_sender, lost_seek_receiver) = std::sync::mpsc::sync_channel(1);
         drop(lost_seek_receiver);
@@ -5388,7 +5459,7 @@ mod tests {
                 .unwrap()
                 .contains("operator command refused")
         );
-        assert_operator_float(ui.get_transport_position_percent(), 0.0);
+        assert_operator_float(ui.get_transport_position_percent(), 25.0);
         wire_operator_seek(&ui, &sender, &diagnostic, &seek_authority);
 
         apply_operator_seek_observation(
@@ -5458,11 +5529,14 @@ mod tests {
             true,
         );
         assert_eq!(loop_authority.get(), None);
+        apply_operator_seek_observation(&ui, &seek_authority, facts.playback_extent, 375);
+        assert_operator_float(ui.get_transport_position_percent(), 25.0);
         revoke_operator_seek_authority(&ui, &seek_authority);
         assert_eq!(ui.get_loop_toggle_label().as_str(), "Runtime stopped");
         assert!(!ui.get_loop_toggle_enabled());
         assert_eq!(seek_authority.get(), None);
         assert!(!ui.get_transport_seek_enabled());
+        assert_operator_float(ui.get_transport_position_percent(), 25.0);
         ui.invoke_locate_percent_requested(50.0);
         ui.invoke_toggle_loop_requested();
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));

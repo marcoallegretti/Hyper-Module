@@ -141,9 +141,25 @@ fn verify_committed_transport_seek(ui: &OperatorWindow, intents: &RefCell<Vec<u3
     let seek = find_control(ui, "Committed transport position percent");
     assert_eq!(seek.accessible_enabled(), Some(true));
     assert_accessible_value(&seek, 20.0);
-    click_committed_marker(ui, &seek, 0.2);
+    let pressed = committed_marker_position(&seek, 0.2);
+    let released = committed_marker_position(&seek, 0.4);
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position: pressed });
+    assert!(intents.borrow().is_empty());
+    ui.window().dispatch_event(WindowEvent::PointerPressed {
+        position: pressed,
+        button: PointerEventButton::Left,
+    });
+    assert!(intents.borrow().is_empty());
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position: released });
+    assert!(intents.borrow().is_empty());
+    ui.window().dispatch_event(WindowEvent::PointerReleased {
+        position: released,
+        button: PointerEventButton::Left,
+    });
     assert_eq!(intents.borrow().len(), 1);
-    assert!((f32::from_bits(intents.borrow()[0]) - 20.0).abs() <= 0.001);
+    assert!((f32::from_bits(intents.borrow()[0]) - 40.0).abs() <= 0.001);
     assert_accessible_value(&seek, 20.0);
     drag_to_right_edge(&seek);
     assert_eq!(intents.borrow().len(), 2, "seek emits only on release");
@@ -332,13 +348,7 @@ fn drag_to_right_edge(element: &ElementHandle) {
 }
 
 fn click_committed_marker(ui: &OperatorWindow, element: &ElementHandle, normalized: f32) {
-    const THUMB_WIDTH: f32 = 18.0;
-    let position = element.absolute_position();
-    let size = element.size();
-    let marker = LogicalPosition::new(
-        position.x + THUMB_WIDTH / 2.0 + (size.width - THUMB_WIDTH) * normalized,
-        position.y + size.height / 2.0,
-    );
+    let marker = committed_marker_position(element, normalized);
     ui.window()
         .dispatch_event(WindowEvent::PointerMoved { position: marker });
     ui.window().dispatch_event(WindowEvent::PointerPressed {
@@ -351,6 +361,16 @@ fn click_committed_marker(ui: &OperatorWindow, element: &ElementHandle, normaliz
         position: marker,
         button: PointerEventButton::Left,
     });
+}
+
+fn committed_marker_position(element: &ElementHandle, normalized: f32) -> LogicalPosition {
+    const THUMB_WIDTH: f32 = 18.0;
+    let position = element.absolute_position();
+    let size = element.size();
+    LogicalPosition::new(
+        position.x + THUMB_WIDTH / 2.0 + (size.width - THUMB_WIDTH) * normalized,
+        position.y + size.height / 2.0,
+    )
 }
 
 fn scroll_down(ui: &OperatorWindow) {
