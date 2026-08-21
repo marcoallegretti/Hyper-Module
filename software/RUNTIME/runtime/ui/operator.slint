@@ -23,6 +23,7 @@ component OutputMeterBar inherits Rectangle {
     in property <string> channel;
     in property <float> level;
     in property <string> reading;
+    in property <string> peak-reading;
     background: #0c1118;
     border-radius: 5px;
     min-height: 30px;
@@ -43,7 +44,8 @@ component OutputMeterBar inherits Rectangle {
                 background: root.level >= 1 ? #ff5a55 : root.level > 0.76 ? #f5b83d : #3ddc97;
             }
         }
-        Text { text: root.reading; color: #edf2f8; font-size: 11px; width: 96px; horizontal-alignment: right; }
+        Text { text: root.reading; color: #edf2f8; font-size: 11px; width: 76px; horizontal-alignment: right; }
+        Text { text: root.peak-reading; color: #8d99ad; font-size: 10px; width: 84px; horizontal-alignment: right; }
     }
 }
 
@@ -69,8 +71,11 @@ export component OperatorWindow inherits Window {
     in property <string> panel-state;
     in property <float> left-output-level;
     in property <string> left-output-reading;
+    in property <string> left-output-peak-reading;
     in property <float> right-output-level;
     in property <string> right-output-reading;
+    in property <string> right-output-peak-reading;
+    in property <bool> output-overload-latched;
     in property <string> output-meter-state;
     in property <string> output-meter-telemetry;
     in property <string> diagnostic;
@@ -78,6 +83,7 @@ export component OperatorWindow inherits Window {
     callback start-requested();
     callback stop-requested();
     callback return-to-start-requested();
+    callback reset-output-peak-requested();
     callback quit-requested();
 
     VerticalLayout {
@@ -122,9 +128,33 @@ export component OperatorWindow inherits Window {
                     Text { text: "FINAL OUTPUT · SAMPLE PEAK"; color: #8d99ad; font-size: 11px; font-weight: 700; }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
                     Text { text: root.output-meter-state; color: #8d99ad; font-size: 11px; overflow: elide; }
+                    Rectangle {
+                        width: 104px;
+                        background: root.output-overload-latched ? #7f2428 : #202836;
+                        border-radius: 4px;
+                        Text {
+                            text: root.output-overload-latched ? "OVERLOAD" : "PEAK CLEAR";
+                            color: root.output-overload-latched ? #fff1f1 : #8d99ad;
+                            font-size: 10px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Button { text: "Reset peak"; clicked => { root.reset-output-peak-requested(); } }
                 }
-                OutputMeterBar { channel: "L"; level: root.left-output-level; reading: root.left-output-reading; }
-                OutputMeterBar { channel: "R"; level: root.right-output-level; reading: root.right-output-reading; }
+                OutputMeterBar {
+                    channel: "L";
+                    level: root.left-output-level;
+                    reading: root.left-output-reading;
+                    peak-reading: root.left-output-peak-reading;
+                }
+                OutputMeterBar {
+                    channel: "R";
+                    level: root.right-output-level;
+                    reading: root.right-output-reading;
+                    peak-reading: root.right-output-peak-reading;
+                }
                 Text { text: root.output-meter-telemetry; color: #69778c; font-size: 10px; overflow: elide; }
             }
         }

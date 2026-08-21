@@ -2,9 +2,11 @@
 
 #![deny(unsafe_code)]
 
+use std::cell::RefCell;
 use std::io::BufRead;
 use std::net::TcpListener;
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -199,6 +201,11 @@ impl OperatorMeterObserver {
             self.dropped_snapshot_count,
             self.sender_disconnected,
         )
+    }
+
+    fn reset_peak_hold(&mut self) {
+        self.ballistics.reset();
+        self.latest = None;
     }
 }
 
@@ -552,7 +559,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         SAMPLE_RATE_HZ,
         OUTPUT_METER_FLOOR_DBFS,
         OUTPUT_METER_FALLOFF_DB_PER_SECOND,
-        0,
+        u64::MAX,
     )
     .map_err(|error| format!("operator output meter policy is invalid: {error}"))?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -578,20 +585,24 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         }
     };
     let OperatorReady { observers, meters } = ready;
-    let mut meter_observer = OperatorMeterObserver::new(meters, meter_config);
+    let meter_observer = Rc::new(RefCell::new(OperatorMeterObserver::new(
+        meters,
+        meter_config,
+    )));
 
     apply_static_facts(&ui, &observers.facts);
     wire_operator_action(&ui, &commands_tx, &diagnostic, OperatorCommand::Start);
     wire_operator_stop(&ui, &commands_tx, &diagnostic);
     wire_operator_return_to_start(&ui, &commands_tx, &diagnostic);
     wire_operator_quit(&ui, &commands_tx, &stop, &diagnostic);
+    wire_operator_peak_reset(&ui, &meter_observer);
 
     apply_observations(&ui, &observers, &diagnostic);
-    apply_operator_meter_observation(&ui, &mut meter_observer);
+    apply_operator_meter_observation(&ui, &mut meter_observer.borrow_mut());
 
     let weak = ui.as_weak();
     let timer_observers = observers.clone();
-    let mut timer_meter_observer = meter_observer;
+    let timer_meter_observer = Rc::clone(&meter_observer);
     let timer_diagnostic = Arc::clone(&diagnostic);
     let timer_close_error = Arc::clone(&completion_close_error);
     let mut completion_observed = false;
@@ -599,7 +610,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
         if let Some(ui) = weak.upgrade() {
             apply_observations(&ui, &timer_observers, &timer_diagnostic);
-            apply_operator_meter_observation(&ui, &mut timer_meter_observer);
+            apply_operator_meter_observation(&ui, &mut timer_meter_observer.borrow_mut());
             if !completion_observed
                 && let Some(close_result) = apply_operator_worker_completion(
                     &ui,
@@ -804,6 +815,18 @@ fn wire_operator_quit(
     });
 }
 
+fn wire_operator_peak_reset(ui: &OperatorWindow, observer: &Rc<RefCell<OperatorMeterObserver>>) {
+    let observer = Rc::clone(observer);
+    let weak = ui.as_weak();
+    ui.on_reset_output_peak_requested(move || {
+        let mut observer = observer.borrow_mut();
+        observer.reset_peak_hold();
+        if let Some(ui) = weak.upgrade() {
+            apply_operator_meter_observation(&ui, &mut observer);
+        }
+    });
+}
+
 fn request_operator_shutdown(
     stop: &AtomicBool,
     sender: &SyncSender<OperatorCommand>,
@@ -858,10 +881,21 @@ struct OperatorObservationPresentation {
 struct OperatorMeterPresentation {
     left_level: f32,
     left_reading: String,
+    left_peak_reading: String,
     right_level: f32,
     right_reading: String,
+    right_peak_reading: String,
+    overload_latched: bool,
     state: &'static str,
     telemetry: String,
+}
+
+#[derive(Debug, PartialEq)]
+struct OperatorMeterChannelPresentation {
+    level: f32,
+    reading: String,
+    peak_reading: String,
+    overload_latched: bool,
 }
 
 fn operator_meter_presentation(
@@ -870,17 +904,18 @@ fn operator_meter_presentation(
     dropped_snapshot_count: u64,
     sender_disconnected: bool,
 ) -> OperatorMeterPresentation {
-    let (left_level, left_reading, right_level, right_reading, frame) = snapshot.map_or_else(
-        || (0.0, "— dBFS".to_owned(), 0.0, "— dBFS".to_owned(), None),
-        |snapshot| {
-            let (left_level, left_reading) = operator_meter_channel_presentation(snapshot.left());
-            let (right_level, right_reading) =
-                operator_meter_channel_presentation(snapshot.right());
+    let (left, right, frame) = snapshot.map_or_else(
+        || {
             (
-                left_level,
-                left_reading,
-                right_level,
-                right_reading,
+                operator_meter_channel_values(false, f32::NAN, f32::NAN),
+                operator_meter_channel_values(false, f32::NAN, f32::NAN),
+                None,
+            )
+        },
+        |snapshot| {
+            (
+                operator_meter_channel_presentation(snapshot.left()),
+                operator_meter_channel_presentation(snapshot.right()),
                 Some(snapshot.processed_frame_end()),
             )
         },
@@ -893,10 +928,13 @@ fn operator_meter_presentation(
     };
     let frame = frame.map_or_else(|| "unavailable".to_owned(), |frame| frame.to_string());
     OperatorMeterPresentation {
-        left_level,
-        left_reading,
-        right_level,
-        right_reading,
+        left_level: left.level,
+        left_reading: left.reading,
+        left_peak_reading: left.peak_reading,
+        right_level: right.level,
+        right_reading: right.reading,
+        right_peak_reading: right.peak_reading,
+        overload_latched: left.overload_latched || right.overload_latched,
         state,
         telemetry: format!(
             "meter frame {frame} · {coalesced_snapshot_count} coalesced · {dropped_snapshot_count} dropped"
@@ -904,8 +942,30 @@ fn operator_meter_presentation(
     }
 }
 
-fn operator_meter_channel_presentation(channel: ChannelSamplePeakBallistics) -> (f32, String) {
-    operator_meter_level_presentation(channel.measurement_available(), channel.level_dbfs())
+fn operator_meter_channel_presentation(
+    channel: ChannelSamplePeakBallistics,
+) -> OperatorMeterChannelPresentation {
+    operator_meter_channel_values(
+        channel.measurement_available(),
+        channel.level_dbfs(),
+        channel.held_peak_dbfs(),
+    )
+}
+
+fn operator_meter_channel_values(
+    measurement_available: bool,
+    level_dbfs: f32,
+    held_peak_dbfs: f32,
+) -> OperatorMeterChannelPresentation {
+    let (level, reading) = operator_meter_level_presentation(measurement_available, level_dbfs);
+    let (peak_reading, overload_latched) =
+        operator_peak_hold_presentation(measurement_available, held_peak_dbfs);
+    OperatorMeterChannelPresentation {
+        level,
+        reading,
+        peak_reading,
+        overload_latched,
+    }
 }
 
 fn operator_meter_level_presentation(measurement_available: bool, dbfs: f32) -> (f32, String) {
@@ -919,6 +979,18 @@ fn operator_meter_level_presentation(measurement_available: bool, dbfs: f32) -> 
         format!("{dbfs:.1} dBFS")
     };
     (level, reading)
+}
+
+fn operator_peak_hold_presentation(measurement_available: bool, dbfs: f32) -> (String, bool) {
+    if !measurement_available || !dbfs.is_finite() {
+        return ("hold —".to_owned(), false);
+    }
+    let reading = if dbfs <= OUTPUT_METER_FLOOR_DBFS {
+        format!("hold ≤ {OUTPUT_METER_FLOOR_DBFS:.1}")
+    } else {
+        format!("hold {dbfs:.1}")
+    };
+    (reading, dbfs >= 0.0)
 }
 
 fn operator_observation_presentation(
@@ -1007,8 +1079,11 @@ fn apply_operator_meter_observation(ui: &OperatorWindow, observer: &mut Operator
     let presentation = observer.observe();
     ui.set_left_output_level(presentation.left_level);
     ui.set_left_output_reading(presentation.left_reading.into());
+    ui.set_left_output_peak_reading(presentation.left_peak_reading.into());
     ui.set_right_output_level(presentation.right_level);
     ui.set_right_output_reading(presentation.right_reading.into());
+    ui.set_right_output_peak_reading(presentation.right_peak_reading.into());
+    ui.set_output_overload_latched(presentation.overload_latched);
     ui.set_output_meter_state(presentation.state.into());
     ui.set_output_meter_telemetry(presentation.telemetry.into());
 }
@@ -1399,16 +1474,23 @@ mod tests {
             SAMPLE_RATE_HZ,
             OUTPUT_METER_FLOOR_DBFS,
             OUTPUT_METER_FALLOFF_DB_PER_SECOND,
-            0,
+            u64::MAX,
         )
         .unwrap();
-        let mut meter_observer = OperatorMeterObserver::new(meter_receiver, meter_config);
-        apply_operator_meter_observation(ui, &mut meter_observer);
+        let meter_observer = Rc::new(RefCell::new(OperatorMeterObserver::new(
+            meter_receiver,
+            meter_config,
+        )));
+        wire_operator_peak_reset(ui, &meter_observer);
+        apply_operator_meter_observation(ui, &mut meter_observer.borrow_mut());
 
         assert!(ui.get_left_output_level().abs() <= f32::EPSILON);
         assert_eq!(ui.get_left_output_reading().as_str(), "— dBFS");
+        assert_eq!(ui.get_left_output_peak_reading().as_str(), "hold —");
         assert!(ui.get_right_output_level().abs() <= f32::EPSILON);
         assert_eq!(ui.get_right_output_reading().as_str(), "— dBFS");
+        assert_eq!(ui.get_right_output_peak_reading().as_str(), "hold —");
+        assert!(!ui.get_output_overload_latched());
         assert_eq!(
             ui.get_output_meter_state().as_str(),
             "Waiting for final-output evidence"
@@ -1418,8 +1500,15 @@ mod tests {
             "meter frame unavailable · 0 coalesced · 0 dropped"
         );
 
+        ui.set_output_meter_state("stale peak presentation".into());
+        ui.invoke_reset_output_peak_requested();
+        assert_eq!(
+            ui.get_output_meter_state().as_str(),
+            "Waiting for final-output evidence"
+        );
+
         drop(meter_sender);
-        apply_operator_meter_observation(ui, &mut meter_observer);
+        apply_operator_meter_observation(ui, &mut meter_observer.borrow_mut());
         assert_eq!(
             ui.get_output_meter_state().as_str(),
             "Meter producer ended before a snapshot"
@@ -1748,9 +1837,46 @@ mod tests {
             operator_meter_level_presentation(true, 3.0),
             (1.0, "3.0 dBFS".to_owned())
         );
+        assert_eq!(
+            operator_peak_hold_presentation(false, 3.0),
+            ("hold —".to_owned(), false)
+        );
+        assert_eq!(
+            operator_peak_hold_presentation(true, -12.5),
+            ("hold -12.5".to_owned(), false)
+        );
+        assert_eq!(
+            operator_peak_hold_presentation(true, 1.25),
+            ("hold 1.2".to_owned(), true)
+        );
+
+        let overloaded = operator_meter_channel_values(true, -18.0, 1.25);
+        assert!((overloaded.level - 0.8).abs() <= f32::EPSILON);
+        assert_eq!(overloaded.reading, "-18.0 dBFS");
+        assert_eq!(overloaded.peak_reading, "hold 1.2");
+        assert!(overloaded.overload_latched);
+
+        let (_meter_sender, meter_receiver) = hyper_mixer_runtime::output_meter_channel();
+        let meter_config = SamplePeakBallisticsConfig::try_new(
+            SAMPLE_RATE_HZ,
+            OUTPUT_METER_FLOOR_DBFS,
+            OUTPUT_METER_FALLOFF_DB_PER_SECOND,
+            u64::MAX,
+        )
+        .unwrap();
+        let mut observer = OperatorMeterObserver::new(meter_receiver, meter_config);
+        observer.coalesced_snapshot_count = 7;
+        observer.dropped_snapshot_count = 11;
+        observer.sender_disconnected = true;
+        observer.reset_peak_hold();
+        assert_eq!(observer.coalesced_snapshot_count, 7);
+        assert_eq!(observer.dropped_snapshot_count, 11);
+        assert!(observer.sender_disconnected);
+        assert!(observer.latest.is_none());
 
         let unavailable = operator_meter_presentation(None, u64::MAX, u64::MAX - 1, true);
         assert_eq!(unavailable.state, "Meter producer ended before a snapshot");
+        assert!(!unavailable.overload_latched);
         assert_eq!(
             unavailable.telemetry,
             format!(
