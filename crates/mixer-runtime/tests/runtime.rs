@@ -28,9 +28,13 @@ use common::{PlaybackFixture, fixture, graph_fixture, playback_fixture};
 
 const GRAPH_SOURCE_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336421";
 const GRAPH_GROUP_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336423";
+const GRAPH_RETURN_A_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336424";
+const GRAPH_RETURN_B_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336425";
 const GRAPH_SEND_A_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336433";
 const PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336400";
+const GRAPH_PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336420";
 const ARRANGEMENT_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336440";
+const SCENE_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336441";
 
 fn native_filter_chain(enabled: bool) -> DeviceChain {
     native_filter_chain_with_ids(
@@ -41,10 +45,26 @@ fn native_filter_chain(enabled: bool) -> DeviceChain {
 }
 
 fn native_filter_chain_with_ids(enabled: bool, chain_id: &str, device_id: &str) -> DeviceChain {
+    native_filter_chain_for_track(
+        PROJECT_ID,
+        ARRANGEMENT_TRACK_ID,
+        enabled,
+        chain_id,
+        device_id,
+    )
+}
+
+fn native_filter_chain_for_track(
+    project_id: &str,
+    track_id: &str,
+    enabled: bool,
+    chain_id: &str,
+    device_id: &str,
+) -> DeviceChain {
     DeviceChain::try_new(
         chain_id.to_owned(),
-        PROJECT_ID.to_owned(),
-        ARRANGEMENT_TRACK_ID.to_owned(),
+        project_id.to_owned(),
+        track_id.to_owned(),
         vec![
             NativeDeviceInstance::try_new_filter(
                 device_id.to_owned(),
@@ -231,6 +251,97 @@ fn locating_resets_native_filter_history() {
 
     assert_eq!(first_left.map(f32::to_bits), replay_left.map(f32::to_bits));
     assert_eq!(first_right.map(f32::to_bits), replay_right.map(f32::to_bits));
+}
+
+fn render_routed_graph_with_device(target: Option<&str>) -> ([f32; 64], [f32; 64]) {
+    let fixture = graph_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let chain = target.map(|track_id| {
+        native_filter_chain_for_track(
+            GRAPH_PROJECT_ID,
+            track_id,
+            true,
+            "018f47a2-6b2d-7c11-8a44-001122336474",
+            "018f47a2-6b2d-7c11-8a44-001122336475",
+        )
+    });
+    let chains = chain.as_slice();
+    let mut runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+        &prepared,
+        &fixture.mixer,
+        chains,
+        64,
+    )
+    .unwrap();
+    let mut scratch_left = [[0.0_f32; 64]; 5];
+    let mut scratch_right = [[0.0_f32; 64]; 5];
+    let mut scratch = scratch_left
+        .iter_mut()
+        .zip(&mut scratch_right)
+        .map(|(left, right)| RenderScratchSlot::new(left, right))
+        .collect::<Vec<_>>();
+    let mut left = [0.0_f32; 64];
+    let mut right = [0.0_f32; 64];
+    runtime
+        .process_window(
+            0,
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+    (left, right)
+}
+
+#[test]
+fn native_filters_run_on_audio_group_and_return_routes_with_pre_and_post_sends() {
+    let baseline = render_routed_graph_with_device(None);
+    for target in [
+        GRAPH_SOURCE_TRACK_ID,
+        GRAPH_GROUP_TRACK_ID,
+        GRAPH_RETURN_A_TRACK_ID,
+        GRAPH_RETURN_B_TRACK_ID,
+    ] {
+        let filtered = render_routed_graph_with_device(Some(target));
+        assert!(
+            baseline
+                .0
+                .iter()
+                .chain(&baseline.1)
+                .zip(filtered.0.iter().chain(&filtered.1))
+                .any(|(baseline, filtered)| baseline.to_bits() != filtered.to_bits()),
+            "the device on route {target} must affect its audible routed contribution"
+        );
+    }
+}
+
+#[test]
+fn native_filter_processes_arrangement_and_scheduled_scene_sources() {
+    let baseline = render_with_device_chain(None);
+    let arrangement = native_filter_chain_for_track(
+        PROJECT_ID,
+        ARRANGEMENT_TRACK_ID,
+        true,
+        "018f47a2-6b2d-7c11-8a44-001122336476",
+        "018f47a2-6b2d-7c11-8a44-001122336477",
+    );
+    let filtered_arrangement = render_with_device_chain(Some(&arrangement));
+    assert_ne!(baseline.0.map(f32::to_bits), filtered_arrangement.0.map(f32::to_bits));
+    assert_eq!(baseline.1.map(f32::to_bits), filtered_arrangement.1.map(f32::to_bits));
+
+    let scene = native_filter_chain_for_track(
+        PROJECT_ID,
+        SCENE_TRACK_ID,
+        true,
+        "018f47a2-6b2d-7c11-8a44-001122336478",
+        "018f47a2-6b2d-7c11-8a44-001122336479",
+    );
+    let filtered_scene = render_with_device_chain(Some(&scene));
+    assert_eq!(baseline.0.map(f32::to_bits), filtered_scene.0.map(f32::to_bits));
+    assert_ne!(baseline.1.map(f32::to_bits), filtered_scene.1.map(f32::to_bits));
 }
 
 fn assert_meter_delivery_and_backpressure(

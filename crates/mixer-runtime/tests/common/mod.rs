@@ -17,6 +17,11 @@ pub struct Fixture {
 
 pub struct GraphFixture {
     pub cache: DecodedMediaCache,
+    #[allow(
+        dead_code,
+        reason = "the functional runtime binary composes native devices with the loaded graph"
+    )]
+    pub project: LoadedPlaybackProject,
     pub schedule: OwnedCompiledSchedule,
     pub mixer: CompiledMixerGraph,
     #[allow(
@@ -29,6 +34,23 @@ pub struct GraphFixture {
         reason = "sample vector is asserted by the functional test binary"
     )]
     pub samples: Vec<f32>,
+}
+
+impl GraphFixture {
+    #[allow(
+        dead_code,
+        reason = "the functional runtime binary composes native devices with the loaded graph"
+    )]
+    pub fn compile_playback(&self) -> CompiledPlaybackGraph<'_> {
+        let facts = [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122336404",
+            sample_rate_hz: 48_000,
+            frame_count: 100,
+        }];
+        self.project
+            .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+            .unwrap()
+    }
 }
 
 pub struct PlaybackFixture {
@@ -581,6 +603,7 @@ pub fn graph_fixture() -> GraphFixture {
 
     GraphFixture {
         cache: builder.seal(),
+        project: loaded,
         schedule,
         mixer,
         automation,
