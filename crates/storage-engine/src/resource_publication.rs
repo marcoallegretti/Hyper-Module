@@ -1595,6 +1595,7 @@ fn run_publication(
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the durable removal order and every crash observation point remain explicit in one coordinator"
 )]
 fn run_resource_removal(
