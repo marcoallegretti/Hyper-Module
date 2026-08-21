@@ -10800,6 +10800,98 @@ mod tests {
         worker.events.as_ref().unwrap().recv_timeout(WAIT).unwrap()
     }
 
+    fn recv_native_mutation(worker: &DesktopIdeWorker) -> IdeWorkerEvent {
+        worker
+            .events
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the native project mutation must publish its next event")
+    }
+
+    fn save_changed_mixer(worker: &DesktopIdeWorker) {
+        worker.try_send(IdeWorkerCommand::SaveProject).unwrap();
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::Saving
+        ));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("mixer save"),
+                redo_label: None,
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::Running(_)
+        ));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::ProjectSaved { changed: true, .. }
+        ));
+    }
+
+    fn refuse_audio_import(
+        worker: &DesktopIdeWorker,
+        unsupported: &Path,
+        track_id: String,
+    ) {
+        worker
+            .try_send(IdeWorkerCommand::ImportAudio {
+                paths: vec![unsupported.to_path_buf()],
+                track_id,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::AudioImporting { files: 1 }
+        ));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::Running(_)
+        ));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportAudio,
+                reason: IdeWorkerCommandFailure::AudioImport(reason),
+            } if reason.completed() == 0
+                && reason.path() == unsupported
+                && matches!(reason.reason(), IdeAudioImportError::UnsupportedContainer)
+        ));
+    }
+
+    fn undo_mixer_save(worker: &DesktopIdeWorker) {
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "mixer save",
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: Some("mixer save"),
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::Running(_)
+        ));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::EditRestored {
+                redo: false,
+                label: "mixer save",
+                ..
+            }
+        ));
+    }
+
     fn shutdown_report(worker: DesktopIdeWorker) -> IdeWorkerShutdownReport {
         match worker.shutdown(WAIT) {
             IdeWorkerShutdownOutcome::Stopped(Ok(report)) => report,
@@ -11202,6 +11294,245 @@ mod tests {
             initial_revision + 1,
             "the first independent publication survives the later refusal"
         );
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn completed_audio_import_closes_before_reporting_a_forced_reopen_failure() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-audio-import-reopen-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        let initial_revision = created.project().manifest().revision();
+        drop(created);
+        let source = fixture.join("Bass.wav");
+        std::fs::write(&source, mono_pcm16_wav(48_000, &[500; 48])).unwrap();
+
+        let mut running = audio_import_application()
+            .open_project(&project)
+            .expect("the verified project must open before forcing the final reopen failure");
+        running.application.playback_session_generation = u64::MAX;
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 6).unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the worker must publish the running project");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .unwrap()
+            .id()
+            .to_owned();
+
+        worker
+            .try_send(IdeWorkerCommand::ImportAudio {
+                paths: vec![source],
+                track_id,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioImporting { files: 1 }
+        ));
+        assert!(
+            matches!(recv_native_mutation(&worker), IdeWorkerEvent::Closed { .. }),
+            "closed ownership must be visible before the composite failure"
+        );
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportAudio,
+                reason: IdeWorkerCommandFailure::AudioImportReopen { outcome, source },
+            } if outcome.imported() == 1
+                && outcome.final_revision() == initial_revision + 1
+                && matches!(source.as_ref(), IdeProjectOpenError::PlaybackSessionGenerationExhausted)
+        ));
+        assert_eq!(
+            verify_project_package(&project).unwrap().manifest().revision(),
+            initial_revision + 1,
+            "the committed import remains truthful when only the reload fails"
+        );
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn partial_audio_import_closes_before_reporting_both_failures() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-audio-import-partial-reopen-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        let initial_revision = created.project().manifest().revision();
+        drop(created);
+        let valid = fixture.join("Bass.wav");
+        let unsupported = fixture.join("Lead.mp3");
+        std::fs::write(&valid, mono_pcm16_wav(48_000, &[500; 48])).unwrap();
+        std::fs::write(&unsupported, b"not an accepted container").unwrap();
+
+        let mut running = audio_import_application()
+            .open_project(&project)
+            .expect("the verified project must open before forcing the final reopen failure");
+        running.application.playback_session_generation = u64::MAX;
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 6).unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the worker must publish the running project");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .unwrap()
+            .id()
+            .to_owned();
+
+        worker
+            .try_send(IdeWorkerCommand::ImportAudio {
+                paths: vec![valid, unsupported.clone()],
+                track_id,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioImporting { files: 2 }
+        ));
+        assert!(
+            matches!(recv_native_mutation(&worker), IdeWorkerEvent::Closed { .. }),
+            "closed ownership must be visible before the composite failure"
+        );
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ImportAudio,
+                reason: IdeWorkerCommandFailure::AudioImportAndReopen { import, reopen },
+            } if import.completed() == 1
+                && import.total() == 2
+                && import.path() == unsupported
+                && matches!(import.reason(), IdeAudioImportError::UnsupportedContainer)
+                && matches!(reopen.as_ref(), IdeProjectOpenError::PlaybackSessionGenerationExhausted)
+        ));
+        assert_eq!(
+            verify_project_package(&project).unwrap().manifest().revision(),
+            initial_revision + 1,
+            "the first publication remains committed despite both later failures"
+        );
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn zero_clip_import_keeps_a_real_mixer_save_undo_valid() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-audio-import-undo-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+        let package = verify_project_package(&project).unwrap();
+        let mixer_id = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|resource| resource.role() == hyper_project_model::ResourceRole::Mixer)
+            .unwrap()
+            .id()
+            .to_owned();
+        let original_mixer = package.read_resource(&mixer_id).unwrap();
+        drop(package);
+        let unsupported = fixture.join("Lead.mp3");
+        std::fs::write(&unsupported, b"not an accepted container").unwrap();
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8)
+                .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv_native_mutation(&worker) else {
+            panic!("the verified project must open");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .unwrap()
+            .id()
+            .to_owned();
+
+        worker
+            .try_send(IdeWorkerCommand::Mixer(IdeMixerCommand::MainMute {
+                muted: true,
+            }))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::MixerQueued(IdeMixerCommand::MainMute { muted: true })
+        ));
+        save_changed_mixer(&worker);
+        let first_saved_mixer = verify_project_package(&project)
+            .unwrap()
+            .read_resource(&mixer_id)
+            .unwrap();
+        assert_ne!(first_saved_mixer, original_mixer);
+
+        worker
+            .try_send(IdeWorkerCommand::Mixer(IdeMixerCommand::MainGain {
+                gain_millionths: 500_000,
+            }))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::MixerQueued(IdeMixerCommand::MainGain {
+                gain_millionths: 500_000,
+            })
+        ));
+        refuse_audio_import(&worker, &unsupported, track_id);
+        let second_saved_mixer = verify_project_package(&project)
+            .unwrap()
+            .read_resource(&mixer_id)
+            .unwrap();
+        assert_ne!(second_saved_mixer, first_saved_mixer);
+
+        undo_mixer_save(&worker);
+        assert_eq!(
+            verify_project_package(&project)
+                .unwrap()
+                .read_resource(&mixer_id)
+                .unwrap(),
+            original_mixer,
+            "the retained undo still targets the current project authority"
+        );
+
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
