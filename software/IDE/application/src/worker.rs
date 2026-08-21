@@ -5857,6 +5857,28 @@ fn observe_history(
             ));
             true
         }
+        ProjectMutationAttempt::AddAutomationTake {
+            inverse: Some(inverse),
+            result: Ok(outcome),
+            ..
+        } if outcome.changed() => {
+            history.record_edit(UndoEntry::from_operation(
+                inverse.clone(),
+                undo_label(command),
+            ));
+            true
+        }
+        ProjectMutationAttempt::AddAutomationTake {
+            inverse: Some(inverse),
+            result: Err(reason),
+            ..
+        } if reason.publication_committed() => {
+            history.record_edit(UndoEntry::from_operation(
+                inverse.clone(),
+                undo_label(command),
+            ));
+            true
+        }
         ProjectMutationAttempt::RemoveAutomationTake {
             inverse: Some(inverse),
             result: Err(reason),
@@ -7362,6 +7384,7 @@ enum ProjectMutationAttempt {
     },
     AddAutomationTake {
         name: String,
+        inverse: Option<IdeHistoryOperation>,
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeAutomationTakeCreationError,
@@ -8308,6 +8331,7 @@ fn complete_project_mutation(
                 ProjectMutationAttempt::AddAutomationTake {
                     name,
                     result: Ok(outcome),
+                    ..
                 } => send_event(
                     events,
                     IdeWorkerEvent::AutomationTakeAdded {
@@ -8319,6 +8343,7 @@ fn complete_project_mutation(
                 ProjectMutationAttempt::AddAutomationTake {
                     name,
                     result: Err(reason),
+                    ..
                 } => send_event(events, automation_take_creation_failure_event(name, reason)),
                 ProjectMutationAttempt::SetAutomationTakeActive {
                     enabled,
@@ -9115,14 +9140,16 @@ fn attempt_project_mutation(
             }
         }
         ProjectMutation::AddAutomationTake { request } => {
+            let (inverse, result) = attempt_automation_take_creation(
+                application,
+                recovery,
+                &request,
+                native_failure,
+            );
             ProjectMutationAttempt::AddAutomationTake {
                 name: request.name.clone(),
-                result: attempt_automation_take_creation(
-                    application,
-                    recovery,
-                    &request,
-                    native_failure,
-                ),
+                inverse,
+                result,
             }
         }
         ProjectMutation::AddScene { name, quantization } => ProjectMutationAttempt::AddScene {
@@ -9319,16 +9346,29 @@ fn attempt_automation_take_creation(
     recovery: &DesktopPlaybackRecovery,
     request: &IdeAutomationTakeRequest,
     native_failure: Option<IdeNativeCloseFailure>,
-) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAutomationTakeCreationError>
-{
+) -> (
+    Option<IdeHistoryOperation>,
+    Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAutomationTakeCreationError>,
+) {
     if let Some(failure) = native_failure {
-        return Err(IdeAutomationTakeCreationError::NativeClose(failure));
+        return (None, Err(IdeAutomationTakeCreationError::NativeClose(failure)));
     }
-    RunningDesktopIdeApplication::prepare_automation_take_creation(application, recovery, request)
-        .and_then(|plan| {
-            plan.publish()
-                .map_err(|source| IdeAutomationTakeCreationError::Publication(Box::new(source)))
-        })
+    match RunningDesktopIdeApplication::prepare_automation_take_creation(
+        application,
+        recovery,
+        request,
+    ) {
+        Ok(plan) => {
+            let inverse = plan.inverse();
+            (
+                Some(inverse),
+                plan.publish().map_err(|source| {
+                    IdeAutomationTakeCreationError::Publication(Box::new(source))
+                }),
+            )
+        }
+        Err(reason) => (None, Err(reason)),
+    }
 }
 
 fn attempt_arrangement_scene_launch_addition(
@@ -12561,6 +12601,13 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(recv(&worker), IdeWorkerEvent::AutomationTakeAdding));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("automation take"),
+                redo_label: None,
+            }
+        ));
         let IdeWorkerEvent::Running(_) = recv(&worker) else {
             panic!("the added automation take must reopen before completion");
         };
@@ -12573,6 +12620,38 @@ mod tests {
         else {
             panic!("the automation-take identity must be reported after reopen: {added_event:?}");
         };
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "automation take",
+            }
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 3,
+                redo: false,
+                ..
+            }
+        ));
+        assert!(!project.join("takes").exists());
+        worker.try_send(IdeWorkerCommand::Redo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: true, .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 4,
+                redo: true,
+                ..
+            }
+        ));
 
         worker
             .try_send(IdeWorkerCommand::RemoveAutomationTake {
@@ -12597,7 +12676,7 @@ mod tests {
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::AutomationTakeRemoved {
-                revision: 3,
+                revision: 5,
                 take_id: observed,
             } if observed == take_id
         ));
@@ -12618,7 +12697,7 @@ mod tests {
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::EditRestored {
-                revision: 4,
+                revision: 6,
                 redo: false,
                 ..
             }
@@ -12640,7 +12719,7 @@ mod tests {
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::EditRestored {
-                revision: 5,
+                revision: 7,
                 redo: true,
                 ..
             }

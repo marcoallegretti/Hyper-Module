@@ -6631,6 +6631,13 @@ impl IdeAutomationTakeRemovalPlan {
 }
 
 impl IdeAutomationTakePublicationPlan {
+    fn inverse(&self) -> IdeHistoryOperation {
+        IdeHistoryOperation::AutomationTakeRemoval {
+            take_id: self.take_id.clone(),
+            expected_bytes: self.take_bytes.clone(),
+        }
+    }
+
     fn publish(
         &self,
     ) -> Result<ProjectResourcePublicationOutcome, IdeAutomationTakePublicationError> {
