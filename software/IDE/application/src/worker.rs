@@ -5793,18 +5793,16 @@ fn restore_failure_event(
     history: &mut UndoHistory,
     entry: &UndoEntry,
     redo: bool,
-    displaced: Option<UndoEntry>,
     reason: IdeResourceRestoreError,
 ) -> (IdeWorkerEvent, bool) {
     if reason.publication_committed() {
-        history.complete_restore(redo, displaced);
         return (
             IdeWorkerEvent::EditRestoreCommittedWithWarning {
                 redo,
                 label: entry.label,
                 warning: Box::new(reason),
             },
-            true,
+            false,
         );
     }
     let consumed = reason.is_permanent_refusal();
@@ -5828,105 +5826,117 @@ fn restore_failure_event(
 /// so undoing an undo is redo. A structural change no stored document can
 /// express drops the history rather than leaving entries that would silently
 /// revert later work.
+fn complete_committed_restore(history: &mut UndoHistory, attempt: &ProjectMutationAttempt) -> bool {
+    let ProjectMutationAttempt::RestoreResource {
+        redo,
+        displaced,
+        result,
+        ..
+    } = attempt
+    else {
+        return false;
+    };
+    if matches!(result, Err(reason) if !reason.publication_committed()) {
+        return false;
+    }
+    history.complete_restore(*redo, displaced.clone());
+    true
+}
+
 fn observe_history(
     history: &mut UndoHistory,
     attempt: &ProjectMutationAttempt,
     command: IdeWorkerCommandKind,
     events: &SyncSender<IdeWorkerEvent>,
 ) {
-    let changed = match attempt {
-        ProjectMutationAttempt::EditNativeFilter {
-            inverse: Some(inverse),
-            result: Ok(outcome),
-            ..
-        } if outcome.changed() => {
-            history.record_edit(UndoEntry::from_operation(
-                inverse.clone(),
-                undo_label(command),
-            ));
-            true
-        }
-        ProjectMutationAttempt::RemoveAutomationTake {
-            inverse: Some(inverse),
-            result: Ok(outcome),
-            ..
-        } if outcome.changed() => {
-            history.record_edit(UndoEntry::from_operation(
-                inverse.clone(),
-                undo_label(command),
-            ));
-            true
-        }
-        ProjectMutationAttempt::AddAutomationTake {
-            inverse: Some(inverse),
-            result: Ok(outcome),
-            ..
-        } if outcome.changed() => {
-            history.record_edit(UndoEntry::from_operation(
-                inverse.clone(),
-                undo_label(command),
-            ));
-            true
-        }
-        ProjectMutationAttempt::AddAutomationTake {
-            inverse: Some(inverse),
-            result: Err(reason),
-            ..
-        } if reason.publication_committed() => {
-            history.record_edit(UndoEntry::from_operation(
-                inverse.clone(),
-                undo_label(command),
-            ));
-            true
-        }
-        ProjectMutationAttempt::RemoveAutomationTake {
-            inverse: Some(inverse),
-            result: Err(reason),
-            ..
-        } if reason.publication_committed() => {
-            history.record_edit(UndoEntry::from_operation(
-                inverse.clone(),
-                undo_label(command),
-            ));
-            true
-        }
-        ProjectMutationAttempt::EditNativeFilter {
-            inverse: Some(inverse),
-            result: Err(reason),
-            ..
-        } if reason.publication_committed() => {
-            history.record_edit(UndoEntry::from_operation(
-                inverse.clone(),
-                undo_label(command),
-            ));
-            true
-        }
-        ProjectMutationAttempt::RestoreResource {
-            redo,
-            displaced,
-            result: Ok(_),
-            ..
-        } => {
-            history.complete_restore(*redo, displaced.clone());
-            true
-        }
-        other => match history_effect(other) {
-            HistoryEffect::Replacement(outcome) => match outcome.previous_resource() {
-                Some(previous) => {
-                    history.record_edit(UndoEntry::from_operation(
-                        IdeHistoryOperation::ResourceReplacement {
-                            resource_id: outcome.resource_id().to_owned(),
-                            bytes: previous.to_vec(),
-                        },
-                        undo_label(command),
-                    ));
-                    true
-                }
-                None => false,
+    let changed = if complete_committed_restore(history, attempt) {
+        true
+    } else {
+        match attempt {
+            ProjectMutationAttempt::EditNativeFilter {
+                inverse: Some(inverse),
+                result: Ok(outcome),
+                ..
+            } if outcome.changed() => {
+                history.record_edit(UndoEntry::from_operation(
+                    inverse.clone(),
+                    undo_label(command),
+                ));
+                true
+            }
+            ProjectMutationAttempt::RemoveAutomationTake {
+                inverse: Some(inverse),
+                result: Ok(outcome),
+                ..
+            } if outcome.changed() => {
+                history.record_edit(UndoEntry::from_operation(
+                    inverse.clone(),
+                    undo_label(command),
+                ));
+                true
+            }
+            ProjectMutationAttempt::AddAutomationTake {
+                inverse: Some(inverse),
+                result: Ok(outcome),
+                ..
+            } if outcome.changed() => {
+                history.record_edit(UndoEntry::from_operation(
+                    inverse.clone(),
+                    undo_label(command),
+                ));
+                true
+            }
+            ProjectMutationAttempt::AddAutomationTake {
+                inverse: Some(inverse),
+                result: Err(reason),
+                ..
+            } if reason.publication_committed() => {
+                history.record_edit(UndoEntry::from_operation(
+                    inverse.clone(),
+                    undo_label(command),
+                ));
+                true
+            }
+            ProjectMutationAttempt::RemoveAutomationTake {
+                inverse: Some(inverse),
+                result: Err(reason),
+                ..
+            } if reason.publication_committed() => {
+                history.record_edit(UndoEntry::from_operation(
+                    inverse.clone(),
+                    undo_label(command),
+                ));
+                true
+            }
+            ProjectMutationAttempt::EditNativeFilter {
+                inverse: Some(inverse),
+                result: Err(reason),
+                ..
+            } if reason.publication_committed() => {
+                history.record_edit(UndoEntry::from_operation(
+                    inverse.clone(),
+                    undo_label(command),
+                ));
+                true
+            }
+            other => match history_effect(other) {
+                HistoryEffect::Replacement(outcome) => match outcome.previous_resource() {
+                    Some(previous) => {
+                        history.record_edit(UndoEntry::from_operation(
+                            IdeHistoryOperation::ResourceReplacement {
+                                resource_id: outcome.resource_id().to_owned(),
+                                bytes: previous.to_vec(),
+                            },
+                            undo_label(command),
+                        ));
+                        true
+                    }
+                    None => false,
+                },
+                HistoryEffect::Invalidate => history.clear(),
+                HistoryEffect::None => false,
             },
-            HistoryEffect::Invalidate => history.clear(),
-            HistoryEffect::None => false,
-        },
+        }
     };
     if changed {
         let _ = send_event(events, history.state_event());
@@ -8452,12 +8462,12 @@ fn complete_project_mutation(
                 ProjectMutationAttempt::RestoreResource {
                     entry,
                     redo,
-                    displaced,
                     result: Err(reason),
+                    ..
                 } => {
-                    let (event, consumed) =
-                        restore_failure_event(&mut *history, &entry, redo, displaced, reason);
-                    (!consumed || send_event(events, history.state_event()))
+                    let (event, history_changed) =
+                        restore_failure_event(&mut *history, &entry, redo, reason);
+                    (!history_changed || send_event(events, history.state_event()))
                         && send_event(events, event)
                 }
                 ProjectMutationAttempt::DuplicateScene {
@@ -15576,6 +15586,62 @@ mod tests {
     }
 
     #[test]
+    fn committed_restore_failure_records_displaced_inverse_before_reopen() {
+        let edit = captured_mixer_edit("committed-restore-history");
+        let source = UndoEntry::from_operation(
+            IdeHistoryOperation::ResourceReplacement {
+                resource_id: edit.mixer_id.clone(),
+                bytes: edit.original.clone(),
+            },
+            "mixer save",
+        );
+        let displaced = UndoEntry::from_operation(
+            IdeHistoryOperation::ResourceReplacement {
+                resource_id: edit.mixer_id.clone(),
+                bytes: edit.replacement.as_bytes().to_vec(),
+            },
+            "mixer save",
+        );
+        let attempt = ProjectMutationAttempt::RestoreResource {
+            entry: source.clone(),
+            redo: false,
+            displaced: Some(displaced.clone()),
+            result: Err(IdeResourceRestoreError::ReopenAfterPublication {
+                outcome: Box::new(edit.outcome.clone()),
+                source: Box::new(IdeProjectOpenError::PlaybackSessionGenerationExhausted),
+            }),
+        };
+        let (events, receiver) = std::sync::mpsc::sync_channel(4);
+        let mut history = UndoHistory::default();
+        history.record_edit(source);
+
+        observe_history(
+            &mut history,
+            &attempt,
+            IdeWorkerCommandKind::Undo,
+            &events,
+        );
+
+        assert!(history.undo.is_empty());
+        assert_eq!(history.redo.len(), 1);
+        assert_eq!(history.redo[0].operation(), displaced.operation());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: Some("mixer save"),
+            })
+        ));
+        let failure = project_mutation_reopen_failure(
+            attempt,
+            IdeProjectOpenError::PlaybackSessionGenerationExhausted,
+        );
+        assert!(matches!(failure, IdeWorkerCommandFailure::EditRestore(_)));
+        assert!(history.undo.is_empty());
+        assert_eq!(history.redo[0].operation(), displaced.operation());
+    }
+
+    #[test]
     fn history_captures_nothing_from_an_unchanged_republication() {
         let edit = captured_mixer_edit("unchanged");
         let (events, receiver) = std::sync::mpsc::sync_channel(8);
@@ -16240,7 +16306,6 @@ mod tests {
             &mut history,
             &labelled("dead", "track rename"),
             false,
-            None,
             IdeResourceRestoreError::ResourceMissing,
         );
         assert!(consumed, "a refusal that can never succeed is discarded");
@@ -16261,7 +16326,6 @@ mod tests {
             &mut history,
             &labelled("older", "clip gain"),
             false,
-            None,
             IdeResourceRestoreError::CapacityUnavailable,
         );
         assert!(!kept, "a retryable refusal keeps its entry");
@@ -16270,9 +16334,11 @@ mod tests {
     }
 
     #[test]
-    fn a_restore_that_committed_before_failing_consumes_its_entry() {
+    fn a_committed_restore_warning_does_not_mutate_preobserved_history() {
         let mut history = UndoHistory::default();
         history.record_edit(labelled("scene", "scene rename"));
+        let displaced = labelled("inverse", "scene rename");
+        history.complete_restore(false, Some(displaced.clone()));
         let edit = captured_mixer_edit("committed");
         let reason = IdeResourceRestoreError::ReopenAfterPreparation {
             preparation: Box::new(IdeResourceRestoreError::ReopenAfterPublication {
@@ -16286,14 +16352,16 @@ mod tests {
             "a committed publication is visible through the reopen wrapper"
         );
 
-        let (event, consumed) = restore_failure_event(
+        let (event, history_changed) = restore_failure_event(
             &mut history,
             &labelled("scene", "scene rename"),
             false,
-            None,
             reason,
         );
-        assert!(consumed);
+        assert!(
+            !history_changed,
+            "warning presentation does not change history again"
+        );
         assert!(
             matches!(
                 event,
@@ -16307,8 +16375,9 @@ mod tests {
         );
         assert!(
             history.undo.is_empty(),
-            "history agrees with disk rather than offering the undo again"
+            "history was completed before authoritative reopen"
         );
+        assert_eq!(history.redo.last().unwrap().resource_id, displaced.resource_id);
     }
 
     #[test]

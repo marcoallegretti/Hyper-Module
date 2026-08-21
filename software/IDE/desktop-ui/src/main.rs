@@ -7823,8 +7823,11 @@ fn set_automation(
     let channels = mixer_channel_facts(observation.mixer_channels());
     set_automation_targets(ui, project_state, &channels);
     let owner = observation.automation();
-    *project_state.automation_take_ids.borrow_mut() =
-        owner.takes().iter().map(|take| take.id().to_owned()).collect();
+    replace_automation_take_authority(
+        ui,
+        project_state,
+        owner.takes().iter().map(|take| take.id().to_owned()),
+    );
     let choices = automation_target_choices(&channels);
     let labels = owner
         .takes()
@@ -7840,6 +7843,15 @@ fn set_automation(
         owner: Arc::clone(owner),
         labels,
     }));
+}
+
+fn replace_automation_take_authority(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    take_ids: impl IntoIterator<Item = String>,
+) {
+    ui.set_automation_take_remove_confirming_id(SharedString::default());
+    *project_state.automation_take_ids.borrow_mut() = take_ids.into_iter().collect();
 }
 
 fn parse_automation_points(
@@ -9578,6 +9590,15 @@ mod tests {
                 if observed == take_id
         ));
 
+        ui.set_automation_take_remove_confirming_id(take_id.into());
+        replace_automation_take_authority(ui, &project_state, [take_id.to_owned()]);
+        assert!(ui.get_automation_take_remove_confirming_id().is_empty());
+        actions.invoke_remove_automation_take(take_id.into());
+        assert_eq!(submitted.borrow().len(), 1);
+        ui.set_automation_take_remove_confirming_id(take_id.into());
+        actions.invoke_remove_automation_take(take_id.into());
+        assert_eq!(submitted.borrow().len(), 2);
+
         ui.set_automation_take_remove_confirming_id("stale".into());
         actions.invoke_remove_automation_take(take_id.into());
         ui.set_app_mode(AppMode::Closed);
@@ -9587,7 +9608,7 @@ mod tests {
         project_state.automation_take_ids.borrow_mut().clear();
         ui.set_automation_take_remove_confirming_id(take_id.into());
         actions.invoke_remove_automation_take(take_id.into());
-        assert_eq!(submitted.borrow().len(), 1);
+        assert_eq!(submitted.borrow().len(), 2);
         assert!(ui.get_error_text().contains("no longer current"));
 
         apply_automation_take_removal_event(

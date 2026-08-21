@@ -13823,6 +13823,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one lifecycle test retains the exact removal, restore, byte, mixer, and reopen oracle"
+    )]
     fn automation_take_removal_and_history_restore_reopen_verified_playback() {
         let fixture = ArrangementProjectFixture::with_two_scenes();
         let project_path = fixture.root().to_path_buf();
@@ -13845,12 +13849,23 @@ mod tests {
             .iter()
             .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
             .unwrap();
+        let original_take_bytes = prepared.package().read_resource(take_id).unwrap();
+        let mixer_bytes = prepared.package().read_resource(mixer.id()).unwrap();
+        let live_mixer_bytes = String::from_utf8(mixer_bytes)
+            .unwrap()
+            .replace("\"gain_millionths\":1000000", "\"gain_millionths\":750000")
+            .into_bytes();
+        assert_ne!(
+            prepared.package().read_resource(mixer.id()).unwrap(),
+            live_mixer_bytes,
+            "the fixture must exercise preservation of a distinctive live mixer"
+        );
         let plan = RunningDesktopIdeApplication::prepare_automation_take_removal_from_project(
             IdeMixerSavePlan {
                 project_path: project_path.clone(),
                 expected_project_sha256: *prepared.package().manifest_sha256(),
                 resource_id: mixer.id().to_owned(),
-                resource_bytes: prepared.package().read_resource(mixer.id()).unwrap(),
+                resource_bytes: live_mixer_bytes.clone(),
             },
             &prepared,
             take_id,
@@ -13873,6 +13888,10 @@ mod tests {
             .iter()
             .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
             .unwrap();
+        assert_eq!(
+            removed.package().read_resource(mixer.id()).unwrap(),
+            live_mixer_bytes
+        );
         let restore_mixer = IdeMixerSavePlan {
             project_path: project_path.clone(),
             expected_project_sha256: *removed.package().manifest_sha256(),
@@ -13891,8 +13910,8 @@ mod tests {
             restore.displaced(),
             IdeHistoryOperation::AutomationTakeRemoval {
                 take_id: take_id.to_owned(),
-                expected_bytes: match inverse {
-                    IdeHistoryOperation::AutomationTakeAddition { bytes, .. } => bytes,
+                expected_bytes: match &inverse {
+                    IdeHistoryOperation::AutomationTakeAddition { bytes, .. } => bytes.clone(),
                     _ => unreachable!(),
                 },
             }
@@ -13904,6 +13923,93 @@ mod tests {
             hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
         assert!(restored.session().has_automation());
         assert_eq!(restored.session().automation_takes().takes()[0].id(), take_id);
+        assert_eq!(
+            restored.package().read_resource(take_id).unwrap(),
+            original_take_bytes
+        );
+        let restored_mixer_descriptor = restored
+            .package()
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        assert_eq!(
+            restored
+                .package()
+                .read_resource(restored_mixer_descriptor.id())
+                .unwrap(),
+            live_mixer_bytes
+        );
+
+    }
+
+    #[test]
+    fn automation_take_history_restore_refuses_stale_bytes_and_overlap_without_writing() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let take_id = "018f47a2-6b2d-7c11-8a44-00112233850a";
+        publish_main_gain_automation(&project_path, limits, take_id);
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let mixer = prepared
+            .package()
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_plan = IdeMixerSavePlan {
+            project_path: project_path.clone(),
+            expected_project_sha256: *prepared.package().manifest_sha256(),
+            resource_id: mixer.id().to_owned(),
+            resource_bytes: prepared.package().read_resource(mixer.id()).unwrap(),
+        };
+        let application = DesktopIdeApplication::from_inventories(
+            config,
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+        let take_bytes = prepared.package().read_resource(take_id).unwrap();
+        let manifest_before = std::fs::read(project_path.join("project.json")).unwrap();
+
+        assert!(matches!(
+            RunningDesktopIdeApplication::prepare_automation_take_history_restore_from_project(
+                &application,
+                mixer_plan.clone(),
+                &prepared,
+                &IdeHistoryOperation::AutomationTakeRemoval {
+                    take_id: take_id.to_owned(),
+                    expected_bytes: b"different canonical authority".to_vec(),
+                },
+            ),
+            Err(IdeResourceRestoreError::CandidateInvalid(_))
+        ));
+
+        let conflicting_id = "018f47a2-6b2d-7c11-8a44-00112233850b";
+        let mut conflicting: Value = serde_json::from_slice(&take_bytes).unwrap();
+        conflicting["id"] = conflicting_id.into();
+        conflicting["lanes"][0]["id"] =
+            "018f47a2-6b2d-7c11-8a44-00112233850c".into();
+        assert!(matches!(
+            RunningDesktopIdeApplication::prepare_automation_take_history_restore_from_project(
+                &application,
+                mixer_plan,
+                &prepared,
+                &IdeHistoryOperation::AutomationTakeAddition {
+                    take_id: conflicting_id.to_owned(),
+                    bytes: serde_json_canonicalizer::to_vec(&conflicting).unwrap(),
+                },
+            ),
+            Err(IdeResourceRestoreError::CandidateInvalid(_))
+        ));
+        assert_eq!(
+            std::fs::read(project_path.join("project.json")).unwrap(),
+            manifest_before
+        );
+        assert_eq!(prepared.package().read_resource(take_id).unwrap(), take_bytes);
     }
 
     #[test]
