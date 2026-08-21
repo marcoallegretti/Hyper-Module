@@ -11,11 +11,32 @@ use hyper_mixer_runtime::{
     MixerParameterCommand, PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime,
     TransportCommand, TransportOutputProcessor, loudness_command_channel, output_meter_channel,
 };
+use hyper_native_device::{
+    DeviceChain, NativeDeviceInstance, NativeFilterMode, NativeFilterState,
+};
 
 use common::{fixture, graph_fixture, playback_fixture};
 use realtime_allocator::HeapMeasurement;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn native_filter_chain() -> DeviceChain {
+    DeviceChain::try_new(
+        "018f47a2-6b2d-7c11-8a44-001122336470".to_owned(),
+        "018f47a2-6b2d-7c11-8a44-001122336400".to_owned(),
+        "018f47a2-6b2d-7c11-8a44-001122336440".to_owned(),
+        vec![
+            NativeDeviceInstance::try_new_filter(
+                "018f47a2-6b2d-7c11-8a44-001122336471".to_owned(),
+                true,
+                NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_107)
+                    .unwrap(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
+}
 
 #[test]
 fn prepared_arrangement_to_main_mix_performs_zero_heap_allocations() {
@@ -167,6 +188,47 @@ fn prepared_combined_playback_performs_zero_heap_allocations() {
     for (actual, source) in output_right[25..].iter().zip(&fixture.scene_samples[..39]) {
         assert!((*actual - *source).abs() <= f32::EPSILON);
     }
+}
+
+#[test]
+fn native_filter_playback_performs_zero_heap_allocations() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let chain = native_filter_chain();
+    let mut runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+        &prepared,
+        &fixture.mixer,
+        core::slice::from_ref(&chain),
+        64,
+    )
+    .unwrap();
+    let mut arrangement_left = [0.0_f32; 64];
+    let mut arrangement_right = [0.0_f32; 64];
+    let mut scene_left = [0.0_f32; 64];
+    let mut scene_right = [0.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut output_left = [0.0_f32; 64];
+    let mut output_right = [0.0_f32; 64];
+
+    let measurement = HeapMeasurement::start_verified();
+    let result = runtime.process_window(
+        0,
+        &mut scratch,
+        StereoOutput {
+            left: &mut output_left,
+            right: &mut output_right,
+        },
+    );
+    let heap_operations = measurement.finish();
+
+    assert!(result.is_ok());
+    assert_eq!(heap_operations, 0);
+    assert!(output_left.iter().any(|sample| *sample != 0.0));
 }
 
 #[test]

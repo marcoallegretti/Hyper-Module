@@ -94,7 +94,8 @@
             "mixer",
             "mapping",
             "automation-take",
-            "recording-metadata"
+            "recording-metadata",
+            "device-chain"
           ]
         },
         "path": {

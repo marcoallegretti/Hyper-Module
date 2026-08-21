@@ -20,12 +20,43 @@ use hyper_mixer_runtime::{
     TransportOutputProcessor, TransportState,
     loudness_command_channel, output_meter_channel,
 };
+use hyper_native_device::{
+    DeviceChain, NativeDeviceInstance, NativeFilterMode, NativeFilterState,
+};
 
 use common::{PlaybackFixture, fixture, graph_fixture, playback_fixture};
 
 const GRAPH_SOURCE_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336421";
 const GRAPH_GROUP_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336423";
 const GRAPH_SEND_A_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336433";
+const PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336400";
+const ARRANGEMENT_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122336440";
+
+fn native_filter_chain(enabled: bool) -> DeviceChain {
+    native_filter_chain_with_ids(
+        enabled,
+        "018f47a2-6b2d-7c11-8a44-001122336470",
+        "018f47a2-6b2d-7c11-8a44-001122336471",
+    )
+}
+
+fn native_filter_chain_with_ids(enabled: bool, chain_id: &str, device_id: &str) -> DeviceChain {
+    DeviceChain::try_new(
+        chain_id.to_owned(),
+        PROJECT_ID.to_owned(),
+        ARRANGEMENT_TRACK_ID.to_owned(),
+        vec![
+            NativeDeviceInstance::try_new_filter(
+                device_id.to_owned(),
+                enabled,
+                NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_107)
+                    .unwrap(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
+}
 
 fn assert_constant(samples: &[f32], expected: f32) {
     assert!(
@@ -70,6 +101,136 @@ fn assert_started_loudness(snapshot: &OutputMeterSnapshot, frame_count: u64) {
         snapshot.meter().loudness().programme_frame_count(),
         frame_count
     );
+}
+
+fn render_with_device_chain(chain: Option<&DeviceChain>) -> ([f32; 64], [f32; 64]) {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let chains = chain.map_or(&[][..], core::slice::from_ref);
+    let mut runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+        &prepared,
+        &fixture.mixer,
+        chains,
+        64,
+    )
+    .unwrap();
+    let mut arrangement_left = [0.0_f32; 64];
+    let mut arrangement_right = [0.0_f32; 64];
+    let mut scene_left = [0.0_f32; 64];
+    let mut scene_right = [0.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut left = [0.0_f32; 64];
+    let mut right = [0.0_f32; 64];
+    runtime
+        .process_window(
+            0,
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+    (left, right)
+}
+
+#[test]
+fn prepared_playback_runs_native_filter_before_the_mixer() {
+    let baseline = render_with_device_chain(None);
+    let bypassed_chain = native_filter_chain(false);
+    let bypassed = render_with_device_chain(Some(&bypassed_chain));
+    assert_eq!(baseline.0.map(f32::to_bits), bypassed.0.map(f32::to_bits));
+    assert_eq!(baseline.1.map(f32::to_bits), bypassed.1.map(f32::to_bits));
+
+    let filtered_chain = native_filter_chain(true);
+    let filtered = render_with_device_chain(Some(&filtered_chain));
+    assert!(
+        baseline
+            .0
+            .iter()
+            .zip(filtered.0)
+            .any(|(baseline, filtered)| baseline.to_bits() != filtered.to_bits())
+    );
+    assert_eq!(baseline.1.map(f32::to_bits), filtered.1.map(f32::to_bits));
+}
+
+#[test]
+fn prepared_playback_refuses_duplicate_device_chains_for_one_track() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let first = native_filter_chain(true);
+    let second = native_filter_chain_with_ids(
+        true,
+        "018f47a2-6b2d-7c11-8a44-001122336472",
+        "018f47a2-6b2d-7c11-8a44-001122336473",
+    );
+
+    assert!(matches!(
+        PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+            &prepared,
+            &fixture.mixer,
+            &[first, second],
+            64,
+        ),
+        Err(RuntimeCreationError::DuplicateDeviceChainTrack)
+    ));
+}
+
+#[test]
+fn locating_resets_native_filter_history() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let chain = native_filter_chain(true);
+    let mut runtime = PreparedPlaybackMainRuntime::try_new_prepared_playback_with_devices(
+        &prepared,
+        &fixture.mixer,
+        core::slice::from_ref(&chain),
+        64,
+    )
+    .unwrap();
+    let mut arrangement_left = [0.0_f32; 64];
+    let mut arrangement_right = [0.0_f32; 64];
+    let mut scene_left = [0.0_f32; 64];
+    let mut scene_right = [0.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut first_left = [0.0_f32; 64];
+    let mut first_right = [0.0_f32; 64];
+    runtime
+        .process_window(
+            0,
+            &mut scratch,
+            StereoOutput {
+                left: &mut first_left,
+                right: &mut first_right,
+            },
+        )
+        .unwrap();
+
+    runtime.seek(0);
+    let mut replay_left = [0.0_f32; 64];
+    let mut replay_right = [0.0_f32; 64];
+    runtime
+        .process_window(
+            0,
+            &mut scratch,
+            StereoOutput {
+                left: &mut replay_left,
+                right: &mut replay_right,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(first_left.map(f32::to_bits), replay_left.map(f32::to_bits));
+    assert_eq!(first_right.map(f32::to_bits), replay_right.map(f32::to_bits));
 }
 
 fn assert_meter_delivery_and_backpressure(

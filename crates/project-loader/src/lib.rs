@@ -15,6 +15,7 @@ use hyper_mapping_compiler::{
     CompiledControlMappingTable, ControlMappingCompileError, ControlMappingResolver,
     MixerSendAddress, compile_control_mapping,
 };
+use hyper_native_device::{DeviceChain, DeviceChainError};
 use hyper_playback_session::{
     DecodedPlaybackAsset, PlaybackDocumentBytes, PlaybackSessionAssemblyError,
     PlaybackSessionAssemblyInput, PlaybackSessionAssemblyLimits, PreparedPlaybackSession,
@@ -72,6 +73,7 @@ pub struct PreparedProjectPlayback {
     control_mapping: Option<ControlMappingDocument>,
     compiled_control_mapping: Option<CompiledControlMappingTable>,
     recording_metadata: Vec<RecordingMetadataDocument>,
+    device_chains: Vec<DeviceChain>,
     nested_playback_ids: BTreeSet<String>,
 }
 
@@ -112,6 +114,11 @@ impl PreparedProjectPlayback {
         &self.recording_metadata
     }
 
+    #[must_use]
+    pub fn device_chains(&self) -> &[DeviceChain] {
+        &self.device_chains
+    }
+
     /// Returns verified project-owned sample assets that no reusable audio
     /// clip references. Recording assets are deliberately outside this
     /// cleanup domain because they carry independent provenance metadata.
@@ -137,6 +144,7 @@ impl PreparedProjectPlayback {
         Option<ControlMappingDocument>,
         Option<CompiledControlMappingTable>,
         Vec<RecordingMetadataDocument>,
+        Vec<DeviceChain>,
     ) {
         (
             self.package,
@@ -144,6 +152,7 @@ impl PreparedProjectPlayback {
             self.control_mapping,
             self.compiled_control_mapping,
             self.recording_metadata,
+            self.device_chains,
         )
     }
 }
@@ -162,6 +171,56 @@ pub enum RecordingBindingErrorKind {
     ChannelMismatch { metadata: u8, audio: usize },
     FrameCountMismatch { metadata: u64, audio: usize },
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceChainBindingErrorKind {
+    ResourceIdMismatch,
+    ProjectIdMismatch,
+    TrackUnavailable,
+    DuplicateTrackChain,
+    IdentityCollision,
+}
+
+#[derive(Debug)]
+pub struct DeviceChainBindingError {
+    chain_id: String,
+    kind: DeviceChainBindingErrorKind,
+}
+
+impl DeviceChainBindingError {
+    #[must_use]
+    pub const fn kind(&self) -> DeviceChainBindingErrorKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn chain_id(&self) -> &str {
+        &self.chain_id
+    }
+}
+
+impl fmt::Display for DeviceChainBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "device chain {}: ", self.chain_id)?;
+        formatter.write_str(match self.kind {
+            DeviceChainBindingErrorKind::ResourceIdMismatch => {
+                "document ID does not match its resource descriptor"
+            }
+            DeviceChainBindingErrorKind::ProjectIdMismatch => "document belongs to another project",
+            DeviceChainBindingErrorKind::TrackUnavailable => {
+                "owning track is not a compiled mixer route"
+            }
+            DeviceChainBindingErrorKind::DuplicateTrackChain => {
+                "owning track has more than one device chain"
+            }
+            DeviceChainBindingErrorKind::IdentityCollision => {
+                "chain or device identity collides with another project identity"
+            }
+        })
+    }
+}
+
+impl Error for DeviceChainBindingError {}
 
 #[derive(Debug)]
 pub struct RecordingBindingError {
@@ -267,6 +326,11 @@ pub enum ProjectPlaybackError {
         resource_id: String,
         source: RecordingMetadataParseError,
     },
+    DeviceChain {
+        resource_id: String,
+        source: DeviceChainError,
+    },
+    DeviceChainBinding(DeviceChainBindingError),
     ResourceJson {
         resource_id: String,
         source: StrictJsonError,
@@ -341,6 +405,14 @@ impl fmt::Display for ProjectPlaybackError {
                 formatter,
                 "recording metadata resource {resource_id} is invalid: {source}"
             ),
+            Self::DeviceChain {
+                resource_id,
+                source,
+            } => write!(
+                formatter,
+                "device-chain resource {resource_id} is invalid: {source}"
+            ),
+            Self::DeviceChainBinding(source) => source.fmt(formatter),
             Self::ResourceJson {
                 resource_id,
                 source,
@@ -378,6 +450,8 @@ impl Error for ProjectPlaybackError {
             Self::ControlMappingBinding(source) => Some(source),
             Self::ControlMappingCompile(source) => Some(source),
             Self::RecordingMetadata { source, .. } => Some(source),
+            Self::DeviceChain { source, .. } => Some(source),
+            Self::DeviceChainBinding(source) => Some(source),
             Self::ResourceJson { source, .. } => Some(source),
             Self::RecordingBinding(source) => Some(source),
             Self::Audio { source, .. } => Some(source),
@@ -449,7 +523,7 @@ fn prepare_verified_project_playback_inner(
     limits: ProjectPlaybackLimits,
 ) -> Result<PreparedProjectPlayback, ProjectPlaybackError> {
     let inventory = ResourceInventory::new(&package, limits.max_total_resource_bytes)?;
-    let captured = inventory.read(&package)?;
+    let mut captured = inventory.read(&package)?;
     validate_recording_inventory(
         &package,
         &captured.recording_metadata,
@@ -464,6 +538,17 @@ fn prepare_verified_project_playback_inner(
         limits: limits.session,
     })
     .map_err(ProjectPlaybackError::Assembly)?;
+    validate_device_inventory(
+        &package,
+        &captured.device_chains,
+        &session,
+        &captured.nested_playback_ids,
+    )?;
+    for captured_chain in &captured.device_chains {
+        for device in captured_chain.document.devices() {
+            captured.nested_playback_ids.insert(device.id().to_owned());
+        }
+    }
     validate_recording_media(&session, &captured.recording_metadata, &decoded.facts)?;
     let compiled_control_mapping = captured
         .control_mapping
@@ -496,6 +581,11 @@ fn prepare_verified_project_playback_inner(
             .recording_metadata
             .into_iter()
             .map(|record| record.document)
+            .collect(),
+        device_chains: captured
+            .device_chains
+            .into_iter()
+            .map(|chain| chain.document)
             .collect(),
         nested_playback_ids: captured.nested_playback_ids,
     })
@@ -670,6 +760,7 @@ struct ResourceInventory<'manifest> {
     control_mapping: Option<&'manifest ResourceDescriptor>,
     automation_takes: Vec<&'manifest ResourceDescriptor>,
     recording_metadata: Vec<&'manifest ResourceDescriptor>,
+    device_chains: Vec<&'manifest ResourceDescriptor>,
 }
 
 impl<'manifest> ResourceInventory<'manifest> {
@@ -704,6 +795,7 @@ impl<'manifest> ResourceInventory<'manifest> {
         let mut control_mapping = None;
         let mut automation_takes = Vec::new();
         let mut recording_metadata = Vec::new();
+        let mut device_chains = Vec::new();
         for descriptor in resources {
             match descriptor.role() {
                 ResourceRole::Timeline => {}
@@ -731,6 +823,7 @@ impl<'manifest> ResourceInventory<'manifest> {
                 ResourceRole::RecordingMetadata => {
                     push_descriptor(&mut recording_metadata, descriptor)?;
                 }
+                ResourceRole::DeviceChain => push_descriptor(&mut device_chains, descriptor)?,
             }
         }
         let mixer = mixer.ok_or(ProjectPlaybackError::MissingMixer)?;
@@ -744,6 +837,7 @@ impl<'manifest> ResourceInventory<'manifest> {
             control_mapping,
             automation_takes,
             recording_metadata,
+            device_chains,
         })
     }
 
@@ -778,6 +872,7 @@ impl<'manifest> ResourceInventory<'manifest> {
                 .map(|descriptor| read_control_mapping(package, descriptor))
                 .transpose()?,
             recording_metadata: read_recording_metadata(package, &self.recording_metadata)?,
+            device_chains: read_device_chains(package, &self.device_chains)?,
             nested_playback_ids,
         })
     }
@@ -787,6 +882,7 @@ struct CapturedPackage {
     playback: PlaybackDocumentBytes,
     control_mapping: Option<CapturedControlMapping>,
     recording_metadata: Vec<CapturedRecordingMetadata>,
+    device_chains: Vec<CapturedDeviceChain>,
     nested_playback_ids: BTreeSet<String>,
 }
 
@@ -798,6 +894,11 @@ struct CapturedControlMapping {
 struct CapturedRecordingMetadata {
     descriptor_id: String,
     document: RecordingMetadataDocument,
+}
+
+struct CapturedDeviceChain {
+    descriptor_id: String,
+    document: DeviceChain,
 }
 
 /// Resolves control-mapping identities against one verified prepared project.
@@ -1051,6 +1152,84 @@ fn read_recording_metadata(
         });
     }
     Ok(documents)
+}
+
+fn read_device_chains(
+    package: &StructurallyVerifiedProject,
+    descriptors: &[&ResourceDescriptor],
+) -> Result<Vec<CapturedDeviceChain>, ProjectPlaybackError> {
+    let mut documents = Vec::new();
+    documents
+        .try_reserve_exact(descriptors.len())
+        .map_err(|_| ProjectPlaybackError::ResourceCapacityUnavailable)?;
+    for descriptor in descriptors {
+        let bytes = package.read_resource(descriptor.id())?;
+        let document =
+            DeviceChain::parse(&bytes).map_err(|source| ProjectPlaybackError::DeviceChain {
+                resource_id: descriptor.id().to_owned(),
+                source,
+            })?;
+        documents.push(CapturedDeviceChain {
+            descriptor_id: descriptor.id().to_owned(),
+            document,
+        });
+    }
+    Ok(documents)
+}
+
+fn validate_device_inventory(
+    package: &StructurallyVerifiedProject,
+    chains: &[CapturedDeviceChain],
+    session: &PreparedPlaybackSession,
+    nested_playback_ids: &BTreeSet<String>,
+) -> Result<(), ProjectPlaybackError> {
+    let manifest_ids: BTreeSet<&str> = package
+        .manifest()
+        .resources()
+        .iter()
+        .map(ResourceDescriptor::id)
+        .chain(package.manifest().assets().iter().map(AssetDescriptor::id))
+        .collect();
+    let mixer = session.parts().1;
+    let mut owned_tracks = BTreeSet::new();
+    let mut device_ids = BTreeSet::new();
+    for captured in chains {
+        let chain = &captured.document;
+        let fail = |kind| {
+            ProjectPlaybackError::DeviceChainBinding(DeviceChainBindingError {
+                chain_id: chain.id().to_owned(),
+                kind,
+            })
+        };
+        if captured.descriptor_id != chain.id() {
+            return Err(fail(DeviceChainBindingErrorKind::ResourceIdMismatch));
+        }
+        if chain.project_id() != package.manifest().project_id() {
+            return Err(fail(DeviceChainBindingErrorKind::ProjectIdMismatch));
+        }
+        if !mixer
+            .slots()
+            .iter()
+            .any(|slot| slot.track_id() == chain.track_id())
+        {
+            return Err(fail(DeviceChainBindingErrorKind::TrackUnavailable));
+        }
+        if !owned_tracks.insert(chain.track_id()) {
+            return Err(fail(DeviceChainBindingErrorKind::DuplicateTrackChain));
+        }
+        if nested_playback_ids.contains(chain.id()) {
+            return Err(fail(DeviceChainBindingErrorKind::IdentityCollision));
+        }
+        for device in chain.devices() {
+            if manifest_ids.contains(device.id())
+                || nested_playback_ids.contains(device.id())
+                || !device_ids.insert(device.id())
+            {
+                return Err(fail(DeviceChainBindingErrorKind::IdentityCollision));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_recording_inventory(

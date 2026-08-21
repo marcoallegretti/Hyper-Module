@@ -12,10 +12,12 @@ use hyper_mixer_runtime::{
     RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError, RuntimeProcessError,
     TransportCommand, TransportState,
 };
+use hyper_native_device::DeviceChain;
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
 use hyper_playback_json::{AdapterCompileError, CompiledMixerGraph};
 use hyper_playback_session::{PlaybackExtent, PreparedPlaybackSession};
+use hyper_project_loader::PreparedProjectPlayback;
 use hyper_recording_journal::{JournalConfig, JournalError, JournalWriter};
 use std::path::Path;
 
@@ -131,6 +133,33 @@ pub fn render_project_offline_with_mixer(
     spec: OfflineExportSpec,
     live_mixer: Option<&CompiledMixerGraph>,
 ) -> Result<DecodedAudio, OfflineExportError> {
+    render_project_offline_with_devices(session, &[], spec, live_mixer)
+}
+
+/// Renders a structurally verified project, including its native device chains.
+///
+/// # Errors
+///
+/// Returns the same classified rejections as [`render_project_offline_with_mixer`].
+pub fn render_prepared_project_offline_with_mixer(
+    project: &PreparedProjectPlayback,
+    spec: OfflineExportSpec,
+    live_mixer: Option<&CompiledMixerGraph>,
+) -> Result<DecodedAudio, OfflineExportError> {
+    render_project_offline_with_devices(
+        project.session(),
+        project.device_chains(),
+        spec,
+        live_mixer,
+    )
+}
+
+fn render_project_offline_with_devices(
+    session: &PreparedPlaybackSession,
+    device_chains: &[DeviceChain],
+    spec: OfflineExportSpec,
+    live_mixer: Option<&CompiledMixerGraph>,
+) -> Result<DecodedAudio, OfflineExportError> {
     let PlaybackExtent::Bounded { end_frame } = session.extent() else {
         return Err(OfflineExportError::UnboundedExtent);
     };
@@ -157,13 +186,19 @@ pub fn render_project_offline_with_mixer(
         .prepare_playback(&graph)
         .map_err(OfflineExportError::Media)?;
     let runtime = match automation {
-        Some(automation) => RoutedMainRuntime::try_new_prepared_playback_automated(
+        Some(automation) => RoutedMainRuntime::try_new_prepared_playback_automated_with_devices(
             &prepared,
             mixer,
             automation.clone(),
+            device_chains,
             block_frames,
         ),
-        None => RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, block_frames),
+        None => RoutedMainRuntime::try_new_prepared_playback_with_devices(
+            &prepared,
+            mixer,
+            device_chains,
+            block_frames,
+        ),
     }
     .map_err(OfflineExportError::Runtime)?;
 
@@ -286,6 +321,31 @@ pub fn export_project_wav_with_mixer(
     wav_path: &Path,
 ) -> Result<OfflineExportReport, OfflineExportError> {
     let rendered = render_project_offline_with_mixer(session, spec, live_mixer)?;
+    publish_rendered_wav(&rendered, spec, journal_path, wav_path)
+}
+
+/// Exports a structurally verified project, including its native device chains.
+///
+/// # Errors
+///
+/// Returns the same classified rejections as [`export_project_wav_with_mixer`].
+pub fn export_prepared_project_wav_with_mixer(
+    project: &PreparedProjectPlayback,
+    spec: OfflineExportSpec,
+    live_mixer: Option<&CompiledMixerGraph>,
+    journal_path: &Path,
+    wav_path: &Path,
+) -> Result<OfflineExportReport, OfflineExportError> {
+    let rendered = render_prepared_project_offline_with_mixer(project, spec, live_mixer)?;
+    publish_rendered_wav(&rendered, spec, journal_path, wav_path)
+}
+
+fn publish_rendered_wav(
+    rendered: &DecodedAudio,
+    spec: OfflineExportSpec,
+    journal_path: &Path,
+    wav_path: &Path,
+) -> Result<OfflineExportReport, OfflineExportError> {
     let frame_count = rendered.frame_count();
     let sample_rate_hz = rendered.sample_rate_hz();
     let left = rendered.plane(0).ok_or(OfflineExportError::EmptyExtent)?;

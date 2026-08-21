@@ -2421,6 +2421,7 @@ fn role_name(role: ResourceRole) -> &'static str {
         ResourceRole::Mapping => "mapping",
         ResourceRole::AutomationTake => "automation-take",
         ResourceRole::RecordingMetadata => "recording-metadata",
+        ResourceRole::DeviceChain => "device-chain",
     }
 }
 

@@ -38,6 +38,7 @@ use hyper_mixer_runtime::{
     TransportOutputProcessor, loudness_command_channel, output_meter_channel,
     playback_recovery_channel,
 };
+use hyper_native_device::DeviceChain;
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
 use hyper_playback_json::{AdapterCompileError, LoadedPlaybackProject, MediaAssetFact};
@@ -1456,6 +1457,9 @@ impl DesktopPlaybackSession {
                         recordings: thread_source
                             .project()
                             .map_or(&[], PreparedProjectPlayback::recording_metadata),
+                        device_chains: thread_source
+                            .project()
+                            .map_or(&[], PreparedProjectPlayback::device_chains),
                         sample_rate_hz,
                         maximum_block_frames,
                         initial_checkpoint: initial_checkpoint.as_deref(),
@@ -1923,6 +1927,7 @@ fn classify_output_start_failure(
 struct SessionInitialization<'a> {
     input: &'a DesktopPlaybackSessionInput,
     recordings: &'a [hyper_recording_metadata::RecordingMetadataDocument],
+    device_chains: &'a [DeviceChain],
     sample_rate_hz: u32,
     maximum_block_frames: usize,
     initial_checkpoint: Option<&'a PlaybackRecoverySnapshot>,
@@ -1930,6 +1935,10 @@ struct SessionInitialization<'a> {
     monitoring: Option<MonitoringConsumer>,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear startup transaction keeps preparation, realtime allocation, recovery, and publication ordering reviewable"
+)]
 fn initialize_session(
     runner: DesktopThreadRunner,
     initialization: SessionInitialization<'_>,
@@ -1938,6 +1947,7 @@ fn initialize_session(
     let SessionInitialization {
         input,
         recordings,
+        device_chains,
         sample_rate_hz,
         maximum_block_frames,
         initial_checkpoint,
@@ -1960,14 +1970,20 @@ fn initialize_session(
         .map_err(DesktopPlaybackSessionBuildError::Media)
         .or_else(|source| fail_build(publication, source))?;
     let runtime = match automation {
-        Some(automation) => RoutedMainRuntime::try_new_prepared_playback_automated(
+        Some(automation) => RoutedMainRuntime::try_new_prepared_playback_automated_with_devices(
             &prepared,
             mixer,
             automation.clone(),
+            device_chains,
             maximum_block_frames,
         ),
         None => {
-            RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, maximum_block_frames)
+            RoutedMainRuntime::try_new_prepared_playback_with_devices(
+                &prepared,
+                mixer,
+                device_chains,
+                maximum_block_frames,
+            )
         }
     }
     .map_err(DesktopPlaybackSessionBuildError::Runtime)

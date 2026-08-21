@@ -9,6 +9,7 @@ members = [
     "crates/media-cache",
     "crates/mapping-compiler",
     "crates/mixer-runtime",
+    "crates/native-device",
     "crates/offline-renderer",
     "crates/panel-protocol",
     "crates/playback-compiler",

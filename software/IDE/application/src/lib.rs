@@ -36,7 +36,8 @@ use hyper_desktop_audio::{
     DesktopPlaybackSession, DesktopProjectOpenError, DesktopTestToneConfig, DesktopTestToneSession,
     MonitoringSnapshot, OfflineExportError, OfflineExportSpec, OutputStreamSnapshot,
     OutputStreamState, PendingNativeShutdown, PendingNativeShutdownWait, StreamState,
-    discover_desktop_input_targets, discover_desktop_output_targets, export_project_wav_with_mixer,
+    discover_desktop_input_targets, discover_desktop_output_targets,
+    export_prepared_project_wav_with_mixer,
 };
 pub use hyper_desktop_audio::{
     DesktopAudioPreviewState, DesktopSceneAvailability as IdeSceneAvailability,
@@ -8564,8 +8565,8 @@ impl RunningDesktopIdeApplication {
         let journal_path =
             export_journal_path(wav_path).ok_or(IdeProjectExportError::DestinationUnavailable)?;
         let live_mixer = self.live_compiled_mixer(prepared)?;
-        let report = export_project_wav_with_mixer(
-            prepared.session(),
+        let report = export_prepared_project_wav_with_mixer(
+            prepared,
             OfflineExportSpec { block_frames },
             live_mixer.as_ref(),
             &journal_path,
@@ -8722,7 +8723,9 @@ impl RunningDesktopIdeApplication {
                 ResourceRole::Arrangement => arrangement = Some(bytes),
                 ResourceRole::Mixer => mixer_bytes = bytes,
                 ResourceRole::AutomationTake => takes.push(bytes),
-                ResourceRole::Mapping | ResourceRole::RecordingMetadata => {}
+                ResourceRole::Mapping
+                | ResourceRole::RecordingMetadata
+                | ResourceRole::DeviceChain => {}
             }
         }
         let invalid = |source: Box<dyn Error + Send + Sync>| {

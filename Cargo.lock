@@ -2149,6 +2149,7 @@ dependencies = [
  "hyper-mapping-compiler",
  "hyper-media-cache",
  "hyper-mixer-runtime",
+ "hyper-native-device",
  "hyper-panel-protocol",
  "hyper-playback-compiler",
  "hyper-playback-json",
@@ -2260,10 +2261,22 @@ dependencies = [
  "hyper-audio-engine",
  "hyper-audio-source",
  "hyper-media-cache",
+ "hyper-native-device",
  "hyper-playback-compiler",
  "hyper-playback-json",
  "rtrb",
  "sha2",
+]
+
+[[package]]
+name = "hyper-native-device"
+version = "0.1.0"
+dependencies = [
+ "hyper-project-model",
+ "hyper-strict-json",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
 ]
 
 [[package]]
@@ -2349,6 +2362,7 @@ dependencies = [
  "hyper-control-mappings",
  "hyper-mapping-compiler",
  "hyper-media-cache",
+ "hyper-native-device",
  "hyper-playback-json",
  "hyper-playback-session",
  "hyper-project-model",

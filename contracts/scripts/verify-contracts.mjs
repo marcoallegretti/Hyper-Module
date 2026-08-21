@@ -10,6 +10,7 @@ import { assertArrangementInvariants } from "../lib/arrangement.mjs";
 import { assertAutomationTakeInvariants } from "../lib/automation-take.mjs";
 import { assertAudioClipInvariants } from "../lib/audio-clip.mjs";
 import { assertControlMappingInvariants } from "../lib/control-mappings.mjs";
+import { assertDeviceChainInvariants } from "../lib/device-chain.mjs";
 import { assertMixerInvariants } from "../lib/mixer.mjs";
 import { assertRecordingMetadataInvariants } from "../lib/recording-metadata.mjs";
 import { assertSceneInvariants } from "../lib/scene.mjs";
@@ -56,6 +57,7 @@ function assertProjectInvariants(project) {
     mapping: "mappings/",
     "automation-take": "takes/",
     "recording-metadata": "assets/recordings/",
+    "device-chain": "devices/",
   };
   for (const resource of project.resources) {
     assert(
@@ -125,6 +127,7 @@ const schemaPaths = [
   "schemas/v1/timing-simulator-profile.schema.json",
   "schemas/v1/timing-frame.schema.json",
   "schemas/v1/finalized-recording-handoff.schema.json",
+  "schemas/v1/device-chain.schema.json",
 ];
 const schemas = await Promise.all(schemaPaths.map(loadJson));
 const ajv = new Ajv2020({
@@ -135,6 +138,17 @@ const ajv = new Ajv2020({
 schemas.forEach((schema) => ajv.addSchema(schema));
 
 const cases = [
+  {
+    path: "fixtures/valid/device-chain.json",
+    schema: schemas[23].$id,
+    valid: true,
+    invariants: assertDeviceChainInvariants,
+  },
+  {
+    path: "fixtures/invalid/device-chain-unknown-device.json",
+    schema: schemas[23].$id,
+    valid: false,
+  },
   {
     path: "fixtures/valid/hardware-capabilities.json",
     schema: schemas[1].$id,

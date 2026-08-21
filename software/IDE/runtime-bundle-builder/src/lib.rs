@@ -221,7 +221,7 @@ pub fn build_project_runtime_bundle(
     validate_request(minimum_runtime_version, maximum_bundle_bytes)?;
     let project =
         prepare_project_playback(project_path.as_ref(), playback_limits).map_err(source_error)?;
-    let (package, _, _, _, _) = project.into_parts();
+    let (package, _, _, _, _, _) = project.into_parts();
     let project_manifest = package.manifest();
     let mut payloads = describe_payloads(&package, project_manifest)?;
     payloads.sort_by(|left, right| left.descriptor.path.cmp(&right.descriptor.path));

@@ -16,6 +16,7 @@ import {
 } from "../lib/automation-take.mjs";
 import { assertAudioClipInvariants } from "../lib/audio-clip.mjs";
 import { assertControlMappingInvariants } from "../lib/control-mappings.mjs";
+import { assertDeviceChainInvariants } from "../lib/device-chain.mjs";
 import {
   collectRegularFiles,
   directoryPrefixes,
@@ -51,6 +52,7 @@ async function createProjectValidator() {
     "control-mappings.schema.json",
     "recording-metadata.schema.json",
     "automation-take.schema.json",
+    "device-chain.schema.json",
   ];
   const schemas = await Promise.all(
     schemaNames.map(async (name) =>
@@ -76,6 +78,7 @@ async function createProjectValidator() {
     mapping: ajv.getSchema(schemas[9].$id),
     "recording-metadata": ajv.getSchema(schemas[10].$id),
     "automation-take": ajv.getSchema(schemas[11].$id),
+    "device-chain": ajv.getSchema(schemas[12].$id),
   };
 }
 
@@ -104,6 +107,7 @@ function assertProjectInvariants(project) {
     mapping: "mappings/",
     "automation-take": "takes/",
     "recording-metadata": "assets/recordings/",
+    "device-chain": "devices/",
   };
   for (const resource of project.resources) {
     assert(
@@ -466,6 +470,8 @@ async function verifyProjectManifest(
       assertRecordingMetadataInvariants(resource);
     } else if (record.role === "automation-take") {
       assertAutomationTakeInvariants(resource);
+    } else if (record.role === "device-chain") {
+      assertDeviceChainInvariants(resource);
     }
     resources.set(resource.id, resource);
   }
@@ -493,6 +499,9 @@ async function verifyProjectManifest(
     .map((record) => resources.get(record.id));
   const automationTakes = project.resources
     .filter((record) => record.role === "automation-take")
+    .map((record) => resources.get(record.id));
+  const deviceChains = project.resources
+    .filter((record) => record.role === "device-chain")
     .map((record) => resources.get(record.id));
   const audioFormats = new Map();
 
@@ -764,6 +773,36 @@ async function verifyProjectManifest(
       ...arrangement.scene_launches.map((launch) => launch.id),
     ]),
   );
+  const deviceInstanceIds = new Set();
+  const deviceTrackIds = new Set();
+  const mixableDeviceTrackKinds = new Set([
+    "audio",
+    "external-input",
+    "group",
+    "return",
+  ]);
+  for (const chain of deviceChains) {
+    const track = resources.get(chain.track_id);
+    assert(
+      track?.format === "hyper-track" && mixableDeviceTrackKinds.has(track.kind),
+      "device chain must belong to a mixable track",
+    );
+    assert(
+      !deviceTrackIds.has(chain.track_id),
+      "a track must have at most one device chain",
+    );
+    deviceTrackIds.add(chain.track_id);
+    for (const device of chain.devices) {
+      assert(
+        !resources.has(device.id) &&
+          !project.assets.some((asset) => asset.id === device.id) &&
+          !arrangementEventIds.has(device.id) &&
+          !deviceInstanceIds.has(device.id),
+        "native device identifier collides with a project entity",
+      );
+      deviceInstanceIds.add(device.id);
+    }
+  }
   assert(mixers.length <= 1, "project must contain at most one mixer");
   for (const mixer of mixers) {
     const mixableKinds = new Set([

@@ -9,6 +9,7 @@ publish = false
 hyper-arrangement-renderer = { path = "../arrangement-renderer" }
 hyper-audio-engine = { path = "../audio-engine" }
 hyper-media-cache = { path = "../media-cache" }
+hyper-native-device = { path = "../native-device" }
 hyper-playback-compiler = { path = "../playback-compiler" }
 hyper-playback-json = { path = "../playback-json" }
 rtrb = "=0.3.4"

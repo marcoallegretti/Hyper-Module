@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hyper-module.invalid/schemas/v1/device-chain.schema.json",
+  "title": "Hyper Module Native Device chain version 1",
+  "type": "object",
+  "required": [
+    "format",
+    "format_version",
+    "id",
+    "project_id",
+    "track_id",
+    "devices",
+    "extensions"
+  ],
+  "properties": {
+    "format": { "const": "hyper-device-chain" },
+    "format_version": { "const": 1 },
+    "id": { "$ref": "common.schema.json#/$defs/entity_id" },
+    "project_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+    "track_id": { "$ref": "common.schema.json#/$defs/entity_id" },
+    "devices": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/native_filter" }
+    },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+  },
+  "$defs": {
+    "native_filter": {
+      "type": "object",
+      "required": [
+        "id",
+        "device_id",
+        "state_version",
+        "dsp_version",
+        "enabled",
+        "state",
+        "extensions"
+      ],
+      "properties": {
+        "id": { "$ref": "common.schema.json#/$defs/entity_id" },
+        "device_id": { "const": "org.hyper-module.native-filter" },
+        "state_version": { "const": 1 },
+        "dsp_version": { "const": 1 },
+        "enabled": { "type": "boolean" },
+        "state": { "$ref": "#/$defs/native_filter_state" },
+        "extensions": { "$ref": "common.schema.json#/$defs/extensions" }
+      },
+      "additionalProperties": false
+    },
+    "native_filter_state": {
+      "type": "object",
+      "required": ["mode", "cutoff_millihertz", "resonance_millionths"],
+      "properties": {
+        "mode": { "enum": ["low-pass", "high-pass"] },
+        "cutoff_millihertz": {
+          "type": "integer",
+          "minimum": 20000,
+          "maximum": 20000000
+        },
+        "resonance_millionths": {
+          "type": "integer",
+          "minimum": 100000,
+          "maximum": 20000000
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

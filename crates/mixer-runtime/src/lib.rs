@@ -17,6 +17,10 @@ use hyper_audio_engine::{
     StereoMixer, StereoOutput,
 };
 use hyper_media_cache::{PreparedPlayback, PreparedSceneAvailability, PreparedSchedule};
+use hyper_native_device::{
+    DeviceChain, NativeDeviceChainProcessor, NativeDeviceCreationError,
+    NativeDeviceProcessError, PROJECT_SAMPLE_RATE_HZ,
+};
 use hyper_playback_compiler::FrameTimelineError;
 use hyper_playback_compiler::scene::{SceneRuntimeCheckpoint, SceneRuntimeError};
 use hyper_playback_json::{
@@ -74,17 +78,20 @@ fn next_mixer_parameter_layout_id() -> u64 {
 pub enum RuntimeProjectComponent {
     Mixer,
     Automation,
+    DeviceChain,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeCreationError {
     ProjectMismatch { component: RuntimeProjectComponent },
+    DuplicateDeviceChainTrack,
     SlotLimit { actual: usize, maximum: usize },
     InvalidMaximumBlockFrames { actual: usize, maximum: usize },
     CapacityUnavailable,
     Renderer(RendererCreationError),
     PlaybackRenderer(PlaybackRendererCreationError),
     Mixer(MixerCreationError),
+    NativeDevice(NativeDeviceCreationError),
 }
 
 impl fmt::Display for RuntimeCreationError {
@@ -96,8 +103,12 @@ impl fmt::Display for RuntimeCreationError {
                 match component {
                     RuntimeProjectComponent::Mixer => "mixer",
                     RuntimeProjectComponent::Automation => "automation",
+                    RuntimeProjectComponent::DeviceChain => "device chain",
                 }
             ),
+            Self::DuplicateDeviceChainTrack => {
+                formatter.write_str("more than one native device chain targets the same track")
+            }
             Self::SlotLimit { actual, maximum } => write!(
                 formatter,
                 "compiled main mixer has {actual} slots; maximum is {maximum}"
@@ -114,6 +125,9 @@ impl fmt::Display for RuntimeCreationError {
                 write!(formatter, "playback track indexing failed: {source}")
             }
             Self::Mixer(source) => write!(formatter, "mixer construction failed: {source}"),
+            Self::NativeDevice(source) => {
+                write!(formatter, "native device construction failed: {source}")
+            }
         }
     }
 }
@@ -124,7 +138,9 @@ impl Error for RuntimeCreationError {
             Self::Renderer(source) => Some(source),
             Self::PlaybackRenderer(source) => Some(source),
             Self::Mixer(source) => Some(source),
+            Self::NativeDevice(source) => Some(source),
             Self::ProjectMismatch { .. }
+            | Self::DuplicateDeviceChainTrack
             | Self::SlotLimit { .. }
             | Self::InvalidMaximumBlockFrames { .. }
             | Self::CapacityUnavailable => None,
@@ -144,6 +160,7 @@ pub enum RuntimeProcessError {
     Render(RenderWindowError),
     PlaybackRender(PlaybackRenderError),
     Mixer(ProcessError),
+    NativeDevice(NativeDeviceProcessError),
 }
 
 impl fmt::Display for RuntimeProcessError {
@@ -171,6 +188,7 @@ impl fmt::Display for RuntimeProcessError {
                 write!(formatter, "combined track rendering failed: {source}")
             }
             Self::Mixer(source) => write!(formatter, "main mixing failed: {source}"),
+            Self::NativeDevice(source) => write!(formatter, "native device failed: {source}"),
         }
     }
 }
@@ -181,6 +199,7 @@ impl Error for RuntimeProcessError {
             Self::Render(source) => Some(source),
             Self::PlaybackRender(source) => Some(source),
             Self::Mixer(source) => Some(source),
+            Self::NativeDevice(source) => Some(source),
             Self::Automation(source) => Some(source),
             Self::Parameter(source) => Some(source),
             Self::Scene(source) => Some(source),
@@ -1844,6 +1863,13 @@ struct GraphSlotRuntime {
     controls: Vec<ChannelParameters>,
     processor: StereoMixer,
     sends: Vec<GraphSendRuntime>,
+    device: Option<GraphDeviceRuntime>,
+}
+
+#[derive(Debug)]
+struct GraphDeviceRuntime {
+    processor: NativeDeviceChainProcessor,
+    output: StereoBuffer,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2187,7 +2213,7 @@ impl<'prepared, 'cache, 'schedule>
         }
         let renderer = ArrangementRenderer::try_new_for_tracks(schedule, &track_ids[..slot_count])
             .map_err(RuntimeCreationError::Renderer)?;
-        build_routed_main_runtime(renderer, compiled, automation, max_block_frames)
+        build_routed_main_runtime(renderer, compiled, automation, &[], max_block_frames)
     }
 }
 
@@ -2206,6 +2232,27 @@ impl<'prepared, 'cache, 'graph, 'project>
         max_block_frames: usize,
     ) -> Result<Self, RuntimeCreationError> {
         Self::try_new_prepared_playback_inner(prepared, compiled, None, max_block_frames)
+    }
+
+    /// Binds prepared playback and validated Native Device chains to one graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structural, capacity, mixer, or device construction failure
+    /// before callback ownership.
+    pub fn try_new_prepared_playback_with_devices(
+        prepared: &'prepared PreparedPlayback<'cache, 'graph, 'project>,
+        compiled: &CompiledMixerGraph,
+        device_chains: &[DeviceChain],
+        max_block_frames: usize,
+    ) -> Result<Self, RuntimeCreationError> {
+        Self::try_new_prepared_playback_inner_with_devices(
+            prepared,
+            compiled,
+            None,
+            device_chains,
+            max_block_frames,
+        )
     }
 
     /// Binds prepared playback and compiled sample automation to one graph.
@@ -2228,13 +2275,52 @@ impl<'prepared, 'cache, 'graph, 'project>
         )
     }
 
+    /// Binds prepared playback, automation, and Native Device chains.
+    ///
+    /// # Errors
+    ///
+    /// Returns under the same conditions as
+    /// [`Self::try_new_prepared_playback_with_devices`].
+    pub fn try_new_prepared_playback_automated_with_devices(
+        prepared: &'prepared PreparedPlayback<'cache, 'graph, 'project>,
+        compiled: &CompiledMixerGraph,
+        automation: CompiledAutomation,
+        device_chains: &[DeviceChain],
+        max_block_frames: usize,
+    ) -> Result<Self, RuntimeCreationError> {
+        Self::try_new_prepared_playback_inner_with_devices(
+            prepared,
+            compiled,
+            Some(automation),
+            device_chains,
+            max_block_frames,
+        )
+    }
+
     fn try_new_prepared_playback_inner(
         prepared: &'prepared PreparedPlayback<'cache, 'graph, 'project>,
         compiled: &CompiledMixerGraph,
         automation: Option<CompiledAutomation>,
         max_block_frames: usize,
     ) -> Result<Self, RuntimeCreationError> {
+        Self::try_new_prepared_playback_inner_with_devices(
+            prepared,
+            compiled,
+            automation,
+            &[],
+            max_block_frames,
+        )
+    }
+
+    fn try_new_prepared_playback_inner_with_devices(
+        prepared: &'prepared PreparedPlayback<'cache, 'graph, 'project>,
+        compiled: &CompiledMixerGraph,
+        automation: Option<CompiledAutomation>,
+        device_chains: &[DeviceChain],
+        max_block_frames: usize,
+    ) -> Result<Self, RuntimeCreationError> {
         validate_project_identity(prepared.project_id(), compiled, automation.as_ref())?;
+        validate_device_chains(prepared.project_id(), compiled, device_chains)?;
         validate_routed_runtime_bounds(compiled, max_block_frames)?;
         let slot_count = compiled.slots().len();
         let mut track_ids = [""; MAX_MAIN_MIXER_SLOTS];
@@ -2249,8 +2335,40 @@ impl<'prepared, 'cache, 'graph, 'project>
             &track_ids[..slot_count],
         )
         .map_err(RuntimeCreationError::PlaybackRenderer)?;
-        build_routed_main_runtime(renderer, compiled, automation, max_block_frames)
+        build_routed_main_runtime(
+            renderer,
+            compiled,
+            automation,
+            device_chains,
+            max_block_frames,
+        )
     }
+}
+
+fn validate_device_chains(
+    project_id: &str,
+    compiled: &CompiledMixerGraph,
+    device_chains: &[DeviceChain],
+) -> Result<(), RuntimeCreationError> {
+    for (chain_index, chain) in device_chains.iter().enumerate() {
+        if chain.project_id() != project_id
+            || !compiled
+                .slots()
+                .iter()
+                .any(|slot| slot.track_id() == chain.track_id())
+        {
+            return Err(RuntimeCreationError::ProjectMismatch {
+                component: RuntimeProjectComponent::DeviceChain,
+            });
+        }
+        if device_chains[..chain_index]
+            .iter()
+            .any(|other| other.track_id() == chain.track_id())
+        {
+            return Err(RuntimeCreationError::DuplicateDeviceChainTrack);
+        }
+    }
+    Ok(())
 }
 
 fn validate_project_identity(
@@ -2295,6 +2413,7 @@ fn build_routed_main_runtime<R>(
     renderer: R,
     compiled: &CompiledMixerGraph,
     automation: Option<CompiledAutomation>,
+    device_chains: &[DeviceChain],
     max_block_frames: usize,
 ) -> Result<RoutedMainRuntime<R>, RuntimeCreationError> {
     let slot_count = compiled.slots().len();
@@ -2325,6 +2444,20 @@ fn build_routed_main_runtime<R>(
                     .map_err(RuntimeCreationError::Mixer)?,
             });
         }
+        let device = device_chains
+            .iter()
+            .find(|chain| chain.track_id() == compiled_slot.track_id())
+            .map(|chain| {
+                Ok(GraphDeviceRuntime {
+                    processor: NativeDeviceChainProcessor::try_new(
+                        chain,
+                        PROJECT_SAMPLE_RATE_HZ,
+                    )
+                    .map_err(RuntimeCreationError::NativeDevice)?,
+                    output: StereoBuffer::try_new(max_block_frames)?,
+                })
+            })
+            .transpose()?;
         slots.push(GraphSlotRuntime {
             kind: compiled_slot.kind(),
             destination: compiled_slot.destination(),
@@ -2334,6 +2467,7 @@ fn build_routed_main_runtime<R>(
             controls: try_filled(control_frame_count, parameters)?,
             processor,
             sends,
+            device,
         });
     }
     let mut processing_order = Vec::new();
@@ -2472,6 +2606,7 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
 
     pub fn seek(&mut self, frame: usize) {
         self.renderer.seek(frame);
+        self.reset_devices();
     }
 
     fn renderer_checkpoint(&self) -> R::Checkpoint {
@@ -2480,6 +2615,15 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
 
     fn restore_renderer(&mut self, checkpoint: R::Checkpoint) {
         self.renderer.restore(checkpoint);
+        self.reset_devices();
+    }
+
+    fn reset_devices(&mut self) {
+        for slot in &mut self.slots {
+            if let Some(device) = &mut slot.device {
+                device.processor.reset();
+            }
+        }
     }
 
     fn scene_count(&self) -> usize {
@@ -2659,6 +2803,7 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
 
             for order_index in 0..self.processing_order.len() {
                 let slot_index = self.processing_order[order_index];
+                self.process_devices(slot_index, frame_count, scratch)?;
                 self.process_sends(slot_index, CompiledMixerTap::PreFader, frame_count, scratch)?;
                 self.process_channel(slot_index, frame_count, scratch)?;
                 self.route_channel_output(slot_index, frame_count);
@@ -2691,8 +2836,47 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
         })();
         if result.is_err() {
             self.renderer.seek(arrangement_start_frame);
+            self.reset_devices();
         }
         result
+    }
+
+    fn process_devices(
+        &mut self,
+        slot_index: usize,
+        frame_count: usize,
+        scratch: &[RenderScratchSlot<'_>],
+    ) -> Result<(), RuntimeProcessError> {
+        let kind = self.slots[slot_index].kind;
+        let (slots, route_buffers) = (&mut self.slots, &self.route_buffers);
+        let Some(device) = slots[slot_index].device.as_mut() else {
+            return Ok(());
+        };
+        let input = if kind == CompiledMixerTrackKind::Audio {
+            scratch[slot_index].input_block()
+        } else {
+            InputBlock::Stereo {
+                left: &route_buffers[slot_index].left[..frame_count],
+                right: &route_buffers[slot_index].right[..frame_count],
+            }
+        };
+        match input {
+            InputBlock::Mono(samples) => {
+                device.output.left[..frame_count].copy_from_slice(samples);
+                device.output.right[..frame_count].copy_from_slice(samples);
+            }
+            InputBlock::Stereo { left, right } => {
+                device.output.left[..frame_count].copy_from_slice(left);
+                device.output.right[..frame_count].copy_from_slice(right);
+            }
+        }
+        device
+            .processor
+            .process_in_place(
+                &mut device.output.left[..frame_count],
+                &mut device.output.right[..frame_count],
+            )
+            .map_err(RuntimeProcessError::NativeDevice)
     }
 
     fn prepare_controls(
@@ -2787,16 +2971,28 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
         scratch: &[RenderScratchSlot<'_>],
     ) -> Result<(), RuntimeProcessError> {
         let send_count = self.slots[slot_index].sends.len();
+        let controls_enabled = self.controls_enabled();
         for send_index in 0..send_count {
             if self.slots[slot_index].sends[send_index].tap != tap {
                 continue;
             }
+            let GraphSlotRuntime {
+                kind,
+                sends,
+                device,
+                ..
+            } = &mut self.slots[slot_index];
             let input = if tap == CompiledMixerTap::PostFader {
                 InputBlock::Stereo {
                     left: &self.channel_output.left[..frame_count],
                     right: &self.channel_output.right[..frame_count],
                 }
-            } else if self.slots[slot_index].kind == CompiledMixerTrackKind::Audio {
+            } else if let Some(device) = device {
+                InputBlock::Stereo {
+                    left: &device.output.left[..frame_count],
+                    right: &device.output.right[..frame_count],
+                }
+            } else if *kind == CompiledMixerTrackKind::Audio {
                 scratch[slot_index].input_block()
             } else {
                 InputBlock::Stereo {
@@ -2805,8 +3001,8 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                 }
             };
             let inputs = [input];
-            if self.controls_enabled() {
-                let send = &mut self.slots[slot_index].sends[send_index];
+            let send = &mut sends[send_index];
+            if controls_enabled {
                 let controlled = [ControlledInputBlock {
                     input,
                     parameters: &send.controls[..frame_count],
@@ -2822,9 +3018,8 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                     )
                     .map_err(RuntimeProcessError::Mixer)?;
             } else {
-                let parameters = [self.slots[slot_index].sends[send_index].parameters];
-                self.slots[slot_index].sends[send_index]
-                    .processor
+                let parameters = [send.parameters];
+                send.processor
                     .process(
                         &inputs,
                         &parameters,
@@ -2836,7 +3031,7 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                     )
                     .map_err(RuntimeProcessError::Mixer)?;
             }
-            let target = self.slots[slot_index].sends[send_index].target_slot;
+            let target = send.target_slot;
             accumulate(
                 &mut self.route_buffers[target],
                 &self.send_output,
@@ -2852,7 +3047,21 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
         frame_count: usize,
         scratch: &[RenderScratchSlot<'_>],
     ) -> Result<(), RuntimeProcessError> {
-        let input = if self.slots[slot_index].kind == CompiledMixerTrackKind::Audio {
+        let controls_enabled = self.controls_enabled();
+        let GraphSlotRuntime {
+            kind,
+            parameters,
+            controls,
+            processor,
+            device,
+            ..
+        } = &mut self.slots[slot_index];
+        let input = if let Some(device) = device {
+            InputBlock::Stereo {
+                left: &device.output.left[..frame_count],
+                right: &device.output.right[..frame_count],
+            }
+        } else if *kind == CompiledMixerTrackKind::Audio {
             scratch[slot_index].input_block()
         } else {
             InputBlock::Stereo {
@@ -2861,13 +3070,12 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
             }
         };
         let inputs = [input];
-        if self.controls_enabled() {
-            let slot = &mut self.slots[slot_index];
+        if controls_enabled {
             let controlled = [ControlledInputBlock {
                 input,
-                parameters: &slot.controls[..frame_count],
+                parameters: &controls[..frame_count],
             }];
-            slot.processor
+            processor
                 .process_controlled(
                     &controlled,
                     &self.unity_master_controls[..frame_count],
@@ -2878,9 +3086,8 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                 )
                 .map_err(RuntimeProcessError::Mixer)
         } else {
-            let parameters = [self.slots[slot_index].parameters];
-            self.slots[slot_index]
-                .processor
+            let parameters = [*parameters];
+            processor
                 .process(
                     &inputs,
                     &parameters,

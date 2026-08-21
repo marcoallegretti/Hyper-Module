@@ -13,8 +13,8 @@ use hyper_playback_json::{
 };
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::{
-    ProjectPlaybackError, ProjectPlaybackLimits, RecordingBindingErrorKind,
-    prepare_project_playback, prepare_verified_project_playback,
+    DeviceChainBindingErrorKind, ProjectPlaybackError, ProjectPlaybackLimits,
+    RecordingBindingErrorKind, prepare_project_playback, prepare_verified_project_playback,
 };
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
@@ -42,6 +42,9 @@ const SECOND_MAPPING_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334463";
 const BINDING_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334464";
 const AUTOMATION_TAKE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334465";
 const ADDED_TRACK_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334466";
+const DEVICE_CHAIN_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334467";
+const NATIVE_DEVICE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334468";
+const SECOND_DEVICE_CHAIN_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334469";
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -363,6 +366,30 @@ impl Drop for Fixture {
     }
 }
 
+fn device_chain(id: &str, track_id: &str, device_id: &str) -> Value {
+    json!({
+        "format": "hyper-device-chain",
+        "format_version": 1,
+        "id": id,
+        "project_id": PROJECT_ID,
+        "track_id": track_id,
+        "devices": [{
+            "id": device_id,
+            "device_id": "org.hyper-module.native-filter",
+            "state_version": 1,
+            "dsp_version": 1,
+            "enabled": true,
+            "state": {
+                "mode": "low-pass",
+                "cutoff_millihertz": 1_000_000,
+                "resonance_millionths": 707_107
+            },
+            "extensions": {}
+        }],
+        "extensions": {}
+    })
+}
+
 #[test]
 fn newly_created_project_prepares_as_an_empty_recordable_session() {
     let parent = std::env::temp_dir().join(format!(
@@ -621,6 +648,77 @@ fn shared_playback_domain_cases_match_the_public_preparation_boundary() {
     }
 }
 
+#[test]
+fn binds_one_native_device_chain_to_its_compiled_mixer_route() {
+    let fixture = Fixture::new();
+    fixture.add_resource(
+        DEVICE_CHAIN_ID,
+        "device-chain",
+        "devices/audio.json",
+        &device_chain(DEVICE_CHAIN_ID, TRACK_ID, NATIVE_DEVICE_ID),
+    );
+
+    let prepared = prepare_project_playback(&fixture.root, limits()).unwrap();
+
+    assert_eq!(prepared.device_chains().len(), 1);
+    let chain = &prepared.device_chains()[0];
+    assert_eq!(chain.id(), DEVICE_CHAIN_ID);
+    assert_eq!(chain.track_id(), TRACK_ID);
+    assert_eq!(chain.devices()[0].id(), NATIVE_DEVICE_ID);
+}
+
+#[test]
+fn rejects_duplicate_unroutable_and_identity_colliding_device_chains() {
+    let duplicate = Fixture::new();
+    duplicate.add_resource(
+        DEVICE_CHAIN_ID,
+        "device-chain",
+        "devices/audio.json",
+        &device_chain(DEVICE_CHAIN_ID, TRACK_ID, NATIVE_DEVICE_ID),
+    );
+    duplicate.add_resource(
+        SECOND_DEVICE_CHAIN_ID,
+        "device-chain",
+        "devices/second.json",
+        &device_chain(
+            SECOND_DEVICE_CHAIN_ID,
+            TRACK_ID,
+            "018f47a2-6b2d-7c11-8a44-00112233446a",
+        ),
+    );
+    assert!(matches!(
+        prepare_project_playback(&duplicate.root, limits()),
+        Err(ProjectPlaybackError::DeviceChainBinding(source))
+            if source.kind() == DeviceChainBindingErrorKind::DuplicateTrackChain
+    ));
+
+    let unroutable = Fixture::new();
+    unroutable.add_resource(
+        DEVICE_CHAIN_ID,
+        "device-chain",
+        "devices/audio.json",
+        &device_chain(DEVICE_CHAIN_ID, FOREIGN_ID, NATIVE_DEVICE_ID),
+    );
+    assert!(matches!(
+        prepare_project_playback(&unroutable.root, limits()),
+        Err(ProjectPlaybackError::DeviceChainBinding(source))
+            if source.kind() == DeviceChainBindingErrorKind::TrackUnavailable
+    ));
+
+    let collision = Fixture::new();
+    collision.add_resource(
+        DEVICE_CHAIN_ID,
+        "device-chain",
+        "devices/audio.json",
+        &device_chain(DEVICE_CHAIN_ID, TRACK_ID, CLIP_ID),
+    );
+    assert!(matches!(
+        prepare_project_playback(&collision.root, limits()),
+        Err(ProjectPlaybackError::DeviceChainBinding(source))
+            if source.kind() == DeviceChainBindingErrorKind::IdentityCollision
+    ));
+}
+
 fn replace_case_symbols(value: &mut Value) {
     match value {
         Value::String(text) if text == "$asset_id" => ASSET_ID.clone_into(text),
@@ -808,12 +906,14 @@ fn loads_and_binds_one_verified_control_mapping() {
             parameter: hyper_control_mappings::ChannelParameter::Gain,
         }
     ));
-    let (package, session, mapping, compiled, recording_metadata) = prepared.into_parts();
+    let (package, session, mapping, compiled, recording_metadata, device_chains) =
+        prepared.into_parts();
     assert_eq!(package.manifest().project_id(), PROJECT_ID);
     assert_eq!(session.parts().0.project_id(), PROJECT_ID);
     assert_eq!(mapping.unwrap().id(), MAPPING_ID);
     assert_eq!(compiled.unwrap().bindings().len(), 1);
     assert!(recording_metadata.is_empty());
+    assert!(device_chains.is_empty());
 }
 
 #[test]
