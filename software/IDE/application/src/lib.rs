@@ -2700,6 +2700,31 @@ impl Error for IdeRecordingClipCreationError {
 }
 
 #[derive(Debug)]
+pub struct IdeAudioClipRemovalCommittedWarning {
+    source: Box<dyn Error + Send + Sync>,
+}
+
+impl IdeAudioClipRemovalCommittedWarning {
+    fn new(source: impl Error + Send + Sync + 'static) -> Self {
+        Self {
+            source: Box::new(source),
+        }
+    }
+}
+
+impl fmt::Display for IdeAudioClipRemovalCommittedWarning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl Error for IdeAudioClipRemovalCommittedWarning {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[derive(Debug)]
 pub enum IdeAudioClipRemovalError {
     InvalidClipIdentity,
     MixerSave(Box<IdeProjectSaveError>),
@@ -2711,6 +2736,7 @@ pub enum IdeAudioClipRemovalError {
     Serialization(AudioClipRemovalSerializationError),
     CapacityUnavailable,
     Publication(Box<ProjectResourcePublicationError>),
+    PublicationCommittedWithWarning(IdeAudioClipRemovalCommittedWarning),
     NativeClose(IdeNativeCloseFailure),
     NativeCloseAndReopen {
         close: IdeNativeCloseFailure,
@@ -2728,6 +2754,29 @@ pub enum IdeAudioClipRemovalError {
         publication: Box<ProjectResourcePublicationError>,
         reopen: Box<IdeProjectOpenError>,
     },
+    PublicationCommittedWithWarningAndReopen {
+        warning: IdeAudioClipRemovalCommittedWarning,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeAudioClipRemovalError {
+    /// Returns whether the structural clip removal crossed its durable manifest
+    /// boundary, even when cleanup, verification, or the final reopen failed.
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        match self {
+            Self::PublicationCommittedWithWarning(_)
+            | Self::PublicationCommittedWithWarningAndReopen { .. }
+            | Self::ReopenAfterPublication { .. } => true,
+            Self::Publication(source) => source.published(),
+            Self::PublicationAndReopen { publication, .. } => publication.published(),
+            Self::ReopenAfterPreparation { preparation, .. } => {
+                preparation.publication_committed()
+            }
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for IdeAudioClipRemovalError {
@@ -2756,6 +2805,14 @@ impl fmt::Display for IdeAudioClipRemovalError {
             Self::CapacityUnavailable => {
                 formatter.write_str("audio-clip removal capacity is unavailable")
             }
+            Self::PublicationCommittedWithWarning(source) => write!(
+                formatter,
+                "the audio clip was removed, but project verification or transaction recovery is incomplete: {source}"
+            ),
+            Self::Publication(source) if source.published() => write!(
+                formatter,
+                "the audio clip was removed, but project verification or transaction recovery is incomplete: {source}"
+            ),
             Self::Publication(source) => source.fmt(formatter),
             Self::NativeClose(source) => write!(
                 formatter,
@@ -2781,9 +2838,20 @@ impl fmt::Display for IdeAudioClipRemovalError {
             Self::PublicationAndReopen {
                 publication,
                 reopen,
+            } if publication.published() => write!(
+                formatter,
+                "the audio clip was removed, but project verification or transaction recovery is incomplete ({publication}) and the project could not be reopened ({reopen})"
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
             } => write!(
                 formatter,
                 "audio-clip removal failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+            Self::PublicationCommittedWithWarningAndReopen { warning, reopen } => write!(
+                formatter,
+                "the audio clip was removed, but project verification or transaction recovery is incomplete ({warning}) and the project could not be reopened ({reopen})"
             ),
         }
     }
@@ -2796,10 +2864,12 @@ impl Error for IdeAudioClipRemovalError {
             Self::Storage(source) => Some(source),
             Self::Serialization(source) => Some(source),
             Self::Publication(source) => Some(source.as_ref()),
+            Self::PublicationCommittedWithWarning(source) => Some(source),
             Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
             Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
             Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::PublicationCommittedWithWarningAndReopen { warning, .. } => Some(warning),
             Self::InvalidClipIdentity
             | Self::ClipResourceMissing
             | Self::ClipResourceRoleMismatch
@@ -5713,7 +5783,15 @@ impl IdeAudioClipRemovalPlan {
                 track_bytes: &self.track_bytes,
             },
         )
-        .map_err(|source| IdeAudioClipRemovalError::Publication(Box::new(source)))
+        .map_err(|source| {
+            if source.published() {
+                IdeAudioClipRemovalError::PublicationCommittedWithWarning(
+                    IdeAudioClipRemovalCommittedWarning::new(source),
+                )
+            } else {
+                IdeAudioClipRemovalError::Publication(Box::new(source))
+            }
+        })
     }
 }
 

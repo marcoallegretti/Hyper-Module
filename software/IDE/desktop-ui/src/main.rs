@@ -2869,10 +2869,29 @@ fn bind_audio_clip_removal_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
+    let project_state = Rc::clone(project_state);
+    let worker = Rc::clone(worker);
+    bind_audio_clip_removal_callback_with(
+        ui,
+        move |clip_id| {
+            project_state
+                .audio_clips
+                .borrow()
+                .iter()
+                .find(|clip| clip.id() == clip_id)
+                .map(|clip| clip.id().to_owned())
+        },
+        move |ui, command| submit_to_ui(ui, &worker, command),
+    );
+}
+
+fn bind_audio_clip_removal_callback_with(
+    ui: &MainWindow,
+    resolve_clip: impl Fn(&str) -> Option<String> + 'static,
+    submit: impl Fn(&MainWindow, IdeWorkerCommand) + 'static,
+) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
-    let worker_for_removal = Rc::clone(worker);
-    let project_state_for_removal = Rc::clone(project_state);
     actions.on_remove_audio_clip(move |clip_id| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -2884,16 +2903,12 @@ fn bind_audio_clip_removal_callback(
             ui.set_error_text("Audio-clip removal confirmation is no longer current".into());
             return;
         }
-        let clips = project_state_for_removal.audio_clips.borrow();
-        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+        let Some(owned_clip_id) = resolve_clip(clip_id.as_str()) else {
             ui.set_error_text("The selected audio clip is no longer available".into());
             return;
         };
-        let owned_clip_id = clip.id().to_owned();
-        drop(clips);
-        submit_to_ui(
+        submit(
             &ui,
-            &worker_for_removal,
             IdeWorkerCommand::RemoveAudioClip {
                 clip_id: owned_clip_id,
             },
@@ -3644,6 +3659,7 @@ fn apply_event(
             apply_audio_clip_duplication_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioClipRemoved { .. }
+        | IdeWorkerEvent::AudioClipRemovalCommittedWithWarning { .. }
         | IdeWorkerEvent::AudioClipRemoving) => {
             apply_audio_clip_removal_event(ui, &event);
         }
@@ -4754,6 +4770,13 @@ fn apply_audio_clip_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
                 .into(),
             );
             ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipRemovalCommittedWithWarning { warning } => {
+            reset_audio_clip_removal_form(ui);
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), "Reusable audio clip removal").into(),
+            );
+            ui.set_error_text(warning.to_string().into());
         }
         IdeWorkerEvent::AudioClipRemoving => {
             ui.set_app_mode(AppMode::RemovingClip);
@@ -11658,6 +11681,38 @@ mod tests {
             .invoke_remove_audio_clip("clip-a".into());
         assert!(ui.get_error_text().contains("no longer available"));
         assert!(ui.get_clip_remove_visible());
+
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_audio_clip_removal_callback_with(
+            ui,
+            |clip_id| (clip_id == "clip-a").then(|| clip_id.to_owned()),
+            move |_, command| submitted_by_callback.borrow_mut().push(command),
+        );
+        ui.set_error_text(SharedString::default());
+        ui.set_app_mode(AppMode::Closed);
+        ui.global::<IdeActions>()
+            .invoke_remove_audio_clip("clip-a".into());
+        assert!(submitted.borrow().is_empty());
+        assert!(ui.get_error_text().contains("no longer current"));
+
+        ui.set_error_text(SharedString::default());
+        ui.set_app_mode(AppMode::Running);
+        ui.set_clip_remove_visible(false);
+        ui.global::<IdeActions>()
+            .invoke_remove_audio_clip("clip-a".into());
+        assert!(submitted.borrow().is_empty());
+        assert!(ui.get_error_text().contains("no longer current"));
+
+        ui.set_error_text(SharedString::default());
+        ui.set_clip_remove_visible(true);
+        ui.global::<IdeActions>()
+            .invoke_remove_audio_clip("clip-a".into());
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::RemoveAudioClip { clip_id }] if clip_id == "clip-a"
+        ));
+        assert!(ui.get_error_text().is_empty());
 
         apply_audio_clip_removal_event(ui, &IdeWorkerEvent::AudioClipRemoving);
         assert_eq!(ui.get_app_mode(), AppMode::RemovingClip);

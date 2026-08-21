@@ -55,6 +55,9 @@ use super::{
     OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication, RunningIdeSnapshot,
 };
 
+#[cfg(test)]
+use super::IdeAudioClipRemovalCommittedWarning;
+
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
 const MIXER_SAVE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1779,6 +1782,9 @@ pub enum IdeWorkerEvent {
     AudioClipRemoved {
         revision: u64,
         clip_id: String,
+    },
+    AudioClipRemovalCommittedWithWarning {
+        warning: Box<IdeAudioClipRemovalError>,
     },
     AudioClipDuplicationCommittedWithWarning {
         name: String,
@@ -5773,6 +5779,11 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::EditControlMapping { result: Ok(_), .. } => {
             HistoryEffect::Invalidate
         }
+        ProjectMutationAttempt::RemoveAudioClip(Err(reason))
+            if reason.publication_committed() =>
+        {
+            HistoryEffect::Invalidate
+        }
         ProjectMutationAttempt::Save(Err(_))
         | ProjectMutationAttempt::AddAudioTrack(Err(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Err(_))
@@ -7061,6 +7072,21 @@ fn audio_clip_edit_failure_event<E>(
     }
 }
 
+pub(super) fn audio_clip_removal_failure_event(
+    reason: IdeAudioClipRemovalError,
+) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::AudioClipRemovalCommittedWithWarning {
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::RemoveAudioClip,
+            reason: IdeWorkerCommandFailure::AudioClipRemoval(Box::new(reason)),
+        }
+    }
+}
+
 pub(super) fn audio_clip_rename_edit_failure_event(
     reason: IdeAudioClipRenameEditError,
 ) -> IdeWorkerEvent {
@@ -7447,11 +7473,9 @@ fn complete_project_mutation(
                         clip_id: outcome.clip_id().to_owned(),
                     },
                 ),
-                ProjectMutationAttempt::RemoveAudioClip(Err(reason)) => publish_failure(
-                    events,
-                    IdeWorkerCommandKind::RemoveAudioClip,
-                    IdeWorkerCommandFailure::AudioClipRemoval(Box::new(reason)),
-                ),
+                ProjectMutationAttempt::RemoveAudioClip(Err(reason)) => {
+                    send_event(events, audio_clip_removal_failure_event(reason))
+                }
                 ProjectMutationAttempt::AddArrangementPlacement {
                     start_tick,
                     result: Ok(publication),
@@ -9256,6 +9280,14 @@ fn project_mutation_reopen_failure(
                 },
             ))
         }
+        ProjectMutationAttempt::RemoveAudioClip(Err(
+            IdeAudioClipRemovalError::PublicationCommittedWithWarning(warning),
+        )) => IdeWorkerCommandFailure::AudioClipRemoval(Box::new(
+            IdeAudioClipRemovalError::PublicationCommittedWithWarningAndReopen {
+                warning,
+                reopen: Box::new(reopen),
+            },
+        )),
         ProjectMutationAttempt::RemoveAudioClip(Err(IdeAudioClipRemovalError::Publication(
             publication,
         ))) => IdeWorkerCommandFailure::AudioClipRemoval(Box::new(
@@ -10897,6 +10929,72 @@ mod tests {
         assert_eq!(decoded_assets[1].channels(), 1);
     }
 
+    fn assert_worker_clip_removal_lifecycle(
+        worker: &DesktopIdeWorker,
+        project: &Path,
+        initial_revision: u64,
+        import: &IdeAudioImportBatchOutcome,
+    ) {
+        let retained_clip_id = import.clip_ids()[0].clone();
+        let removed_clip_id = import.clip_ids()[1].clone();
+        worker
+            .try_send(IdeWorkerCommand::RenameAudioClip {
+                clip_id: retained_clip_id.clone(),
+                name: "Stereo retained".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(recv(worker), IdeWorkerEvent::AudioClipRenaming));
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some(_),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(renamed) = recv(worker) else {
+            panic!("the renamed project must reopen before completion");
+        };
+        assert!(renamed
+            .audio_clips()
+            .iter()
+            .any(|clip| clip.id() == retained_clip_id && clip.name() == "Stereo retained"));
+        let renamed_generation = renamed.playback_session_generation();
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::AudioClipRenamed { changed: true, .. }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::RemoveAudioClip {
+                clip_id: removed_clip_id.clone(),
+            })
+            .unwrap();
+        assert!(matches!(recv(worker), IdeWorkerEvent::AudioClipRemoving));
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(after_removal) = recv(worker) else {
+            panic!("the removed project must reopen before completion");
+        };
+        assert_eq!(after_removal.audio_clips().len(), 1);
+        assert_eq!(after_removal.audio_clips()[0].id(), retained_clip_id);
+        assert_ne!(
+            after_removal.playback_session_generation(),
+            renamed_generation,
+            "removal must reopen under a new native playback owner"
+        );
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::AudioClipRemoved { revision, clip_id }
+                if revision == initial_revision + 4 && clip_id == removed_clip_id
+        ));
+        assert_imported_audio_assets(project, initial_revision + 4);
+    }
+
     fn output_testing_application(
         stop_failure: Option<IdeNativeCloseFailure>,
     ) -> OutputTestingDesktopIdeApplication {
@@ -11340,6 +11438,8 @@ mod tests {
         assert_eq!(outcome.clip_ids().len(), 2);
         assert_eq!(outcome.final_revision(), initial_revision + 2);
         assert_imported_audio_assets(&project, initial_revision + 2);
+
+        assert_worker_clip_removal_lifecycle(&worker, &project, initial_revision, &outcome);
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
@@ -14303,6 +14403,68 @@ mod tests {
             1,
             "a failed mutation changed nothing, so history stands"
         );
+    }
+
+    #[test]
+    fn committed_audio_clip_removal_warning_invalidates_history_and_stays_truthful() {
+        let committed_warning = || {
+            IdeAudioClipRemovalError::PublicationCommittedWithWarning(
+                IdeAudioClipRemovalCommittedWarning::new(std::io::Error::other(
+                    "simulated cleanup warning",
+                )),
+            )
+        };
+        let attempt = ProjectMutationAttempt::RemoveAudioClip(Err(committed_warning()));
+        assert!(matches!(history_effect(&attempt), HistoryEffect::Invalidate));
+
+        let (events, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut history = UndoHistory::default();
+        history.record_edit(labelled("scene", "scene rename"));
+        history.record_restore(false, labelled("undone", "clip gain"));
+        observe_history(
+            &mut history,
+            &attempt,
+            IdeWorkerCommandKind::RemoveAudioClip,
+            &events,
+        );
+        assert!(history.undo.is_empty() && history.redo.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: None,
+            })
+        ));
+
+        assert!(matches!(
+            audio_clip_removal_failure_event(committed_warning()),
+            IdeWorkerEvent::AudioClipRemovalCommittedWithWarning { warning }
+                if warning.publication_committed()
+                    && warning.to_string().contains("audio clip was removed")
+        ));
+        let reopen = project_mutation_reopen_failure(
+            ProjectMutationAttempt::RemoveAudioClip(Err(committed_warning())),
+            IdeProjectOpenError::SelectedOutputUnavailable,
+        );
+        assert!(matches!(
+            reopen,
+            IdeWorkerCommandFailure::AudioClipRemoval(reason)
+                if reason.publication_committed()
+                    && reason.to_string().contains("was removed")
+                    && reason.to_string().contains("could not be reopened")
+        ));
+
+        let unpublished = ProjectMutationAttempt::RemoveAudioClip(Err(
+            IdeAudioClipRemovalError::InvalidClipIdentity,
+        ));
+        assert!(matches!(history_effect(&unpublished), HistoryEffect::None));
+        assert!(matches!(
+            audio_clip_removal_failure_event(IdeAudioClipRemovalError::InvalidClipIdentity),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RemoveAudioClip,
+                ..
+            }
+        ));
     }
 
     #[test]
