@@ -12271,6 +12271,173 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker scenario keeps import, placement, persisted device edit, and both exported signals at the actual composition boundary"
+    )]
+    fn real_worker_offline_export_renders_the_saved_native_filter() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-native-filter-export-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+        let source = fixture.join("Alternating.wav");
+        let source_samples = (0..500)
+            .map(|frame| if frame % 2 == 0 { 20_000 } else { -20_000 })
+            .collect::<Vec<_>>();
+        std::fs::write(&source, mono_pcm16_wav(48_000, &source_samples)).unwrap();
+
+        let worker = DesktopIdeWorker::start_state(
+            WorkerState::Closed(audio_import_application()),
+            2,
+            8,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the verified project must open before export");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .unwrap()
+            .id()
+            .to_owned();
+
+        worker
+            .try_send(IdeWorkerCommand::ImportAudio {
+                paths: vec![source],
+                track_id: track_id.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioImporting { files: 1 }
+        ));
+        let IdeWorkerEvent::Running(imported) = recv(&worker) else {
+            panic!("the imported clip must reopen before placement");
+        };
+        let clip_id = imported.audio_clips()[0].id().to_owned();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioImported(ref outcome) if outcome.imported() == 1
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::AddArrangementPlacement {
+                clip_id,
+                start_tick: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ArrangementPlacementAdding { start_tick: 0 }
+        ));
+        let IdeWorkerEvent::Running(placed) = recv(&worker) else {
+            panic!("the placement mutation must publish its reopened project");
+        };
+        assert_eq!(placed.arrangement().placements().len(), 1);
+        let placement_result = recv(&worker);
+        assert!(
+            matches!(placement_result, IdeWorkerEvent::ArrangementPlacementAdded { start_tick: 0, .. }),
+            "unexpected placement result for {placed:?}: {placement_result:?}"
+        );
+
+        let baseline_path = fixture.join("baseline.wav");
+        worker
+            .try_send(IdeWorkerCommand::ExportProject {
+                wav_path: baseline_path.clone(),
+                block_frames: 64,
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectExporting));
+        let baseline_export = recv(&worker);
+        assert!(
+            matches!(baseline_export, IdeWorkerEvent::ProjectExported { ref report } if report.frame_count > 0),
+            "unexpected baseline export result: {baseline_export:?}"
+        );
+
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::Add {
+                    track_id,
+                    mode: NativeFilterMode::LowPass,
+                    cutoff_millihertz: 1_000_000,
+                    resonance_millionths: 707_000,
+                },
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { .. }));
+
+        let filtered_path = fixture.join("filtered.wav");
+        worker
+            .try_send(IdeWorkerCommand::ExportProject {
+                wav_path: filtered_path.clone(),
+                block_frames: 64,
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectExporting));
+        let filtered_export = recv(&worker);
+        assert!(
+            matches!(filtered_export, IdeWorkerEvent::ProjectExported { ref report } if report.frame_count > 0),
+            "unexpected filtered export result: {filtered_export:?}"
+        );
+
+        let decode_limits = DecodeLimits::new(1_048_576, 1_024, 16_384).unwrap();
+        let baseline = decode_bytes(
+            std::fs::read(&baseline_path).unwrap(),
+            AudioContainer::Wav,
+            48_000,
+            decode_limits,
+        )
+        .unwrap();
+        let filtered = decode_bytes(
+            std::fs::read(&filtered_path).unwrap(),
+            AudioContainer::Wav,
+            48_000,
+            decode_limits,
+        )
+        .unwrap();
+        assert_eq!(baseline.frame_count(), 500);
+        assert_eq!(filtered.frame_count(), baseline.frame_count());
+        let baseline_peak = baseline
+            .plane(0)
+            .unwrap()
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        let filtered_peak = filtered
+            .plane(0)
+            .unwrap()
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        assert!(baseline_peak > 0.4, "the source must exercise the filter");
+        assert!(
+            filtered_peak < baseline_peak * 0.2,
+            "the saved low-pass chain must attenuate the alternating source: {filtered_peak} versus {baseline_peak}"
+        );
+
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
     fn running_worker_stops_audio_batch_at_the_first_failure_and_keeps_prior_commits() {
         let fixture = std::env::temp_dir().join(format!(
             "hyper-desktop-ide-audio-import-partial-{}",
