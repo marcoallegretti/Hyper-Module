@@ -652,15 +652,15 @@ export component OperatorWindow inherits Window {
             border-color: #2c3445;
             border-width: 1px;
             border-radius: 8px;
-            min-height: 184px;
+            min-height: 196px;
             VerticalLayout {
                 padding: 12px;
                 spacing: 7px;
                 Text { text: "LIVE SENDS · SESSION ONLY"; color: #8d99ad; font-size: 11px; font-weight: 700; }
                 ListView {
-                    height: 148px;
+                    height: 160px;
                     for send[index] in root.mixer-sends : MixerSendRow {
-                        source-name: send.source-name;
+                        source-name: (index + 1) + " · " + send.source-name;
                         target-name: send.target-name;
                         tap: send.tap;
                         gain-percent: send.gain-percent;

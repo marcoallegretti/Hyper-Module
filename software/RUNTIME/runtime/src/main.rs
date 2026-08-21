@@ -3123,13 +3123,18 @@ mod tests {
         }"#;
         const SCENE_TRACK: &[u8] = br#"{
             "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339508",
-            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Scene group","kind":"group",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Meter source","kind":"group",
             "order":1,"active":true,"clip_ids":[],"extensions":{}
         }"#;
         const RETURN_TRACK: &[u8] = br#"{
             "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-00112233950a",
             "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Ritorno \u03a9","kind":"return",
             "order":2,"active":true,"clip_ids":[],"extensions":{}
+        }"#;
+        const SECOND_RETURN_TRACK: &[u8] = br#"{
+            "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-00112233950c",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Return Delta","kind":"return",
+            "order":3,"active":true,"clip_ids":[],"extensions":{}
         }"#;
         const CLIP: &[u8] = br#"{
             "format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339503",
@@ -3162,12 +3167,20 @@ mod tests {
             {"track_id":"018f47a2-6b2d-7c11-8a44-001122339502","gain_millionths":1000000,
             "pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},
             "sends":[{"id":"018f47a2-6b2d-7c11-8a44-00112233950b","bus":"a","tap":"post-fader",
-            "gain_millionths":800000,"pan_millionths":-300000,"enabled":true}]},
+            "gain_millionths":800000,"pan_millionths":-300000,"enabled":true},
+            {"id":"018f47a2-6b2d-7c11-8a44-00112233950d","bus":"b","tap":"pre-fader",
+            "gain_millionths":400000,"pan_millionths":600000,"enabled":false}]},
             {"track_id":"018f47a2-6b2d-7c11-8a44-001122339508","gain_millionths":1000000,
-            "pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},"sends":[]},
+            "pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},
+            "sends":[{"id":"018f47a2-6b2d-7c11-8a44-00112233950e","bus":"a","tap":"pre-fader",
+            "gain_millionths":1250000,"pan_millionths":-700000,"enabled":true}]},
             {"track_id":"018f47a2-6b2d-7c11-8a44-00112233950a","gain_millionths":1000000,
+            "pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},"sends":[]},
+            {"track_id":"018f47a2-6b2d-7c11-8a44-00112233950c","gain_millionths":1000000,
             "pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},"sends":[]}],
-            "return_buses":[{"bus":"a","track_id":"018f47a2-6b2d-7c11-8a44-00112233950a"}],
+            "return_buses":[
+            {"bus":"a","track_id":"018f47a2-6b2d-7c11-8a44-00112233950a"},
+            {"bus":"b","track_id":"018f47a2-6b2d-7c11-8a44-00112233950c"}],
             "main":{"gain_millionths":1000000,"mute":false},
             "cue":{"source":"main","gain_millionths":1000000,"mute":false},"extensions":{}
         }"#;
@@ -3183,7 +3196,12 @@ mod tests {
                 project_id: PROJECT_ID.to_owned(),
                 sample_rate_hz: SAMPLE_RATE_HZ,
                 timeline: TIMELINE.to_vec(),
-                tracks: vec![TRACK.to_vec(), SCENE_TRACK.to_vec(), RETURN_TRACK.to_vec()],
+                tracks: vec![
+                    TRACK.to_vec(),
+                    SCENE_TRACK.to_vec(),
+                    RETURN_TRACK.to_vec(),
+                    SECOND_RETURN_TRACK.to_vec(),
+                ],
                 clips: vec![CLIP.to_vec()],
                 scenes: vec![SCENE.to_vec()],
                 arrangement: Some(ARRANGEMENT.to_vec()),
@@ -3222,10 +3240,16 @@ mod tests {
         let mut scene_scratch_right = [0.0_f32; 480];
         let mut return_scratch_left = [0.0_f32; 480];
         let mut return_scratch_right = [0.0_f32; 480];
+        let mut second_return_scratch_left = [0.0_f32; 480];
+        let mut second_return_scratch_right = [0.0_f32; 480];
         let mut scratch = [
             RenderScratchSlot::new(&mut scratch_left, &mut scratch_right),
             RenderScratchSlot::new(&mut scene_scratch_left, &mut scene_scratch_right),
             RenderScratchSlot::new(&mut return_scratch_left, &mut return_scratch_right),
+            RenderScratchSlot::new(
+                &mut second_return_scratch_left,
+                &mut second_return_scratch_right,
+            ),
         ];
         let mut interleaved = [0.0_f32; 960];
         let mut operator_scenes = build_operator_scene_catalog(
@@ -3314,7 +3338,12 @@ mod tests {
                 .iter()
                 .map(|channel| (channel.index, channel.name.as_str()))
                 .collect::<Vec<_>>(),
-            [(0, "Meter source"), (1, "Scene group"), (2, "Ritorno Ω")]
+            [
+                (0, "Meter source"),
+                (1, "Meter source"),
+                (2, "Ritorno Ω"),
+                (3, "Return Delta"),
+            ]
         );
         let mixer_sends = build_operator_mixer_send_catalog(
             &mixer_channels,
@@ -3344,10 +3373,44 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(mixer_sends.len(), 1);
-        assert_eq!(mixer_sends[0].source_name, "Meter source");
-        assert_eq!(mixer_sends[0].target_name, "Ritorno Ω");
-        assert_eq!(mixer_sends[0].tap, DesktopMixerSendTap::PostFader);
+        assert_eq!(session.mixer_send_count_at(0), Some(2));
+        assert_eq!(session.mixer_send_count_at(1), Some(1));
+        assert_eq!(mixer_sends.len(), 3);
+        assert_eq!(
+            mixer_sends
+                .iter()
+                .map(|send| (
+                    send.channel_index,
+                    send.send_index,
+                    send.source_name.as_str(),
+                    send.target_name.as_str(),
+                    send.tap,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    0,
+                    0,
+                    "Meter source",
+                    "Ritorno Ω",
+                    DesktopMixerSendTap::PostFader
+                ),
+                (
+                    0,
+                    1,
+                    "Meter source",
+                    "Return Delta",
+                    DesktopMixerSendTap::PreFader
+                ),
+                (
+                    1,
+                    0,
+                    "Meter source",
+                    "Ritorno Ω",
+                    DesktopMixerSendTap::PreFader
+                ),
+            ]
+        );
         assert!(
             build_operator_mixer_send_catalog(
                 &mixer_channels,
@@ -3396,7 +3459,7 @@ mod tests {
         );
         assert!(
             build_operator_mixer_catalog(
-                4,
+                5,
                 |index| Some(format!("Channel {index}")),
                 |index| mixer_sender
                     .resolve_channel_index(index)
@@ -3591,8 +3654,13 @@ mod tests {
         assert!(!ui.get_main_muted());
         assert!(ui.get_main_mute_enabled());
         let generated_mixer = ui.get_mixer_channels();
-        assert_eq!(generated_mixer.row_count(), 3);
-        for (row, name) in [(0, "Meter source"), (1, "Scene group"), (2, "Ritorno Ω")] {
+        assert_eq!(generated_mixer.row_count(), 4);
+        for (row, name) in [
+            (0, "Meter source"),
+            (1, "Meter source"),
+            (2, "Ritorno Ω"),
+            (3, "Return Delta"),
+        ] {
             let channel = generated_mixer.row_data(row).unwrap();
             assert_eq!(channel.name.as_str(), name);
             assert_operator_float(channel.gain_percent, 100.0);
@@ -3602,7 +3670,7 @@ mod tests {
             assert!(channel.controls_enabled);
         }
         let generated_sends = ui.get_mixer_sends();
-        assert_eq!(generated_sends.row_count(), 1);
+        assert_eq!(generated_sends.row_count(), 3);
         let send_row = generated_sends.row_data(0).unwrap();
         assert_eq!(send_row.source_name.as_str(), "Meter source");
         assert_eq!(send_row.target_name.as_str(), "Ritorno Ω");
@@ -3614,6 +3682,28 @@ mod tests {
         );
         assert!(send_row.enabled);
         assert!(send_row.controls_enabled);
+        let second_send_row = generated_sends.row_data(1).unwrap();
+        assert_eq!(second_send_row.source_name.as_str(), "Meter source");
+        assert_eq!(second_send_row.target_name.as_str(), "Return Delta");
+        assert_eq!(second_send_row.tap.as_str(), "PRE");
+        assert_operator_float(second_send_row.gain_percent, 40.0);
+        assert_operator_float(
+            second_send_row.pan_percent,
+            Pan::from_millionths(600_000).unwrap().value() * 100.0,
+        );
+        assert!(!second_send_row.enabled);
+        assert!(second_send_row.controls_enabled);
+        let later_channel_send_row = generated_sends.row_data(2).unwrap();
+        assert_eq!(later_channel_send_row.source_name.as_str(), "Meter source");
+        assert_eq!(later_channel_send_row.target_name.as_str(), "Ritorno Ω");
+        assert_eq!(later_channel_send_row.tap.as_str(), "PRE");
+        assert_operator_float(later_channel_send_row.gain_percent, 125.0);
+        assert_operator_float(
+            later_channel_send_row.pan_percent,
+            Pan::from_millionths(-700_000).unwrap().value() * 100.0,
+        );
+        assert!(later_channel_send_row.enabled);
+        assert!(later_channel_send_row.controls_enabled);
 
         assert!(generated_mixer.row_data(0).unwrap().solo_available);
         assert!(!generated_mixer.row_data(1).unwrap().solo_available);
@@ -3653,30 +3743,30 @@ mod tests {
                 solo: true,
             }
         );
-        ui.invoke_set_mixer_send_gain_requested(0, 55.5);
+        ui.invoke_set_mixer_send_gain_requested(2, 55.5);
         let send_gain = mixer_command_receiver.try_recv().unwrap();
         assert_eq!(
             send_gain,
             OperatorCommand::SetMixerSendGain {
-                send: mixer_sends[0].handle,
+                send: mixer_sends[2].handle,
                 gain_millionths: 555_000,
             }
         );
-        ui.invoke_set_mixer_send_pan_requested(0, 25.0);
+        ui.invoke_set_mixer_send_pan_requested(2, 25.0);
         let send_pan = mixer_command_receiver.try_recv().unwrap();
         assert_eq!(
             send_pan,
             OperatorCommand::SetMixerSendPan {
-                send: mixer_sends[0].handle,
+                send: mixer_sends[2].handle,
                 pan_millionths: 250_000,
             }
         );
-        ui.invoke_toggle_mixer_send_requested(0);
+        ui.invoke_toggle_mixer_send_requested(2);
         let send_enabled = mixer_command_receiver.try_recv().unwrap();
         assert_eq!(
             send_enabled,
             OperatorCommand::SetMixerSendEnabled {
-                send: mixer_sends[0].handle,
+                send: mixer_sends[2].handle,
                 enabled: false,
             }
         );
@@ -3708,12 +3798,19 @@ mod tests {
         assert!(generated_sends.row_data(0).unwrap().enabled);
         for invalid_gain in [f32::NAN, -0.1, 200.1] {
             ui.invoke_set_mixer_channel_gain_requested(0, invalid_gain);
+            ui.invoke_set_mixer_send_gain_requested(0, invalid_gain);
             ui.invoke_set_main_gain_requested(invalid_gain);
         }
         for invalid_pan in [f32::NAN, -100.1, 100.1] {
             ui.invoke_set_mixer_channel_pan_requested(0, invalid_pan);
+            ui.invoke_set_mixer_send_pan_requested(0, invalid_pan);
         }
         assert_eq!(mixer_command_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            mixer_diagnostic.lock().unwrap().as_str(),
+            "mixer send pan refused: value is outside -100..=100%"
+        );
+        assert_operator_float(generated_sends.row_data(0).unwrap().gain_percent, 80.0);
 
         let mismatched_channels = &mixer_channels[..1];
         let mismatched_model = VecModel::from(operator_mixer_rows(mismatched_channels));
@@ -3895,9 +3992,10 @@ mod tests {
         assert_operator_float(generated_mixer.row_data(0).unwrap().pan_percent, -25.25);
         assert!(generated_mixer.row_data(1).unwrap().muted);
         assert!(generated_mixer.row_data(0).unwrap().soloed);
-        assert_operator_float(generated_sends.row_data(0).unwrap().gain_percent, 55.5);
-        assert_operator_float(generated_sends.row_data(0).unwrap().pan_percent, 25.0);
-        assert!(!generated_sends.row_data(0).unwrap().enabled);
+        assert_operator_float(generated_sends.row_data(0).unwrap().gain_percent, 80.0);
+        assert_operator_float(generated_sends.row_data(2).unwrap().gain_percent, 55.5);
+        assert_operator_float(generated_sends.row_data(2).unwrap().pan_percent, 25.0);
+        assert!(!generated_sends.row_data(2).unwrap().enabled);
 
         ui.invoke_toggle_mixer_channel_solo_requested(1);
         assert_eq!(mixer_command_receiver.try_recv(), Err(TryRecvError::Empty));
@@ -3910,9 +4008,9 @@ mod tests {
         ui.invoke_set_mixer_channel_pan_requested(0, 0.0);
         ui.invoke_toggle_mixer_channel_mute_requested(1);
         ui.invoke_toggle_mixer_channel_solo_requested(0);
-        ui.invoke_set_mixer_send_gain_requested(0, 80.0);
-        ui.invoke_set_mixer_send_pan_requested(0, -30.0);
-        ui.invoke_toggle_mixer_send_requested(0);
+        ui.invoke_set_mixer_send_gain_requested(2, 125.0);
+        ui.invoke_set_mixer_send_pan_requested(2, -70.0);
+        ui.invoke_toggle_mixer_send_requested(2);
         ui.invoke_set_main_gain_requested(100.0);
         ui.invoke_toggle_main_mute_requested();
         for expected in [
@@ -3933,15 +4031,15 @@ mod tests {
                 solo: false,
             },
             MixerParameterCommand::SendGain {
-                send: mixer_sends[0].handle,
-                gain: LinearGain::from_millionths(800_000).unwrap(),
+                send: mixer_sends[2].handle,
+                gain: LinearGain::from_millionths(1_250_000).unwrap(),
             },
             MixerParameterCommand::SendPan {
-                send: mixer_sends[0].handle,
-                pan: Pan::from_millionths(-300_000).unwrap(),
+                send: mixer_sends[2].handle,
+                pan: Pan::from_millionths(-700_000).unwrap(),
             },
             MixerParameterCommand::SendEnabled {
-                send: mixer_sends[0].handle,
+                send: mixer_sends[2].handle,
                 enabled: true,
             },
             MixerParameterCommand::MainGain {
@@ -4034,13 +4132,19 @@ mod tests {
             Pan::from_millionths(-300_000).unwrap().value() * 100.0,
         );
         assert!(generated_sends.row_data(0).unwrap().enabled);
-        for stale_row in [-1, 3, 9] {
+        assert_operator_float(generated_sends.row_data(2).unwrap().gain_percent, 125.0);
+        assert_operator_float(
+            generated_sends.row_data(2).unwrap().pan_percent,
+            Pan::from_millionths(-700_000).unwrap().value() * 100.0,
+        );
+        assert!(generated_sends.row_data(2).unwrap().enabled);
+        for stale_row in [-1, 4, 9] {
             ui.invoke_set_mixer_channel_gain_requested(stale_row, 50.0);
             ui.invoke_set_mixer_channel_pan_requested(stale_row, 25.0);
             ui.invoke_toggle_mixer_channel_mute_requested(stale_row);
             ui.invoke_toggle_mixer_channel_solo_requested(stale_row);
         }
-        for stale_row in [-1, 1, 9] {
+        for stale_row in [-1, 3, 9] {
             ui.invoke_set_mixer_send_gain_requested(stale_row, 50.0);
             ui.invoke_set_mixer_send_pan_requested(stale_row, 25.0);
             ui.invoke_toggle_mixer_send_requested(stale_row);
