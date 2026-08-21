@@ -38,7 +38,7 @@ use super::{
     IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioTrackAdditionError,
     IdeAudioTrackEditError, IdeAudioTrackRemovalError, IdeAutomationTakeCreationError,
     IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
-    IdeNativeFilterEdit, IdeNativeFilterEditError, NativeFilterMode,
+    IdeHistoryOperation, IdeNativeFilterEdit, IdeNativeFilterEditError, NativeFilterMode,
     IdeControlMappingEdit, IdeControlMappingEditError, IdeInputDiscoveryError, IdeInputSelection,
     IdeInputSelectionError, IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessCommandError,
     IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
@@ -2927,11 +2927,64 @@ const MAX_UNDO_DEPTH: usize = 20;
 struct UndoEntry {
     resource_id: String,
     bytes: Vec<u8>,
+    kind: UndoEntryKind,
     label: &'static str,
 }
 
-/// Ardour's two bounded lists, holding complete previous documents rather than
-/// inverse operations. History is per-session and dies with the project.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UndoEntryKind {
+    ResourceReplacement,
+    DeviceChainAddition,
+    DeviceChainRemoval,
+}
+
+impl UndoEntry {
+    fn from_operation(operation: IdeHistoryOperation, label: &'static str) -> Self {
+        match operation {
+            IdeHistoryOperation::ResourceReplacement { resource_id, bytes } => Self {
+                resource_id,
+                bytes,
+                kind: UndoEntryKind::ResourceReplacement,
+                label,
+            },
+            IdeHistoryOperation::DeviceChainAddition { chain_id, bytes } => Self {
+                resource_id: chain_id,
+                bytes,
+                kind: UndoEntryKind::DeviceChainAddition,
+                label,
+            },
+            IdeHistoryOperation::DeviceChainRemoval {
+                chain_id,
+                expected_bytes,
+            } => Self {
+                resource_id: chain_id,
+                bytes: expected_bytes,
+                kind: UndoEntryKind::DeviceChainRemoval,
+                label,
+            },
+        }
+    }
+
+    fn operation(&self) -> IdeHistoryOperation {
+        match self.kind {
+            UndoEntryKind::ResourceReplacement => IdeHistoryOperation::ResourceReplacement {
+                resource_id: self.resource_id.clone(),
+                bytes: self.bytes.clone(),
+            },
+            UndoEntryKind::DeviceChainAddition => IdeHistoryOperation::DeviceChainAddition {
+                chain_id: self.resource_id.clone(),
+                bytes: self.bytes.clone(),
+            },
+            UndoEntryKind::DeviceChainRemoval => IdeHistoryOperation::DeviceChainRemoval {
+                chain_id: self.resource_id.clone(),
+                expected_bytes: self.bytes.clone(),
+            },
+        }
+    }
+}
+
+/// Two bounded per-session lists retain complete resource states or explicit
+/// device-chain presence transitions. History dies with the open project.
 #[derive(Debug, Default)]
 struct UndoHistory {
     undo: Vec<UndoEntry>,
@@ -5682,10 +5735,11 @@ fn restore_failure_event(
     history: &mut UndoHistory,
     entry: &UndoEntry,
     redo: bool,
+    displaced: Option<UndoEntry>,
     reason: IdeResourceRestoreError,
 ) -> (IdeWorkerEvent, bool) {
     if reason.publication_committed() {
-        history.complete_restore(redo, None);
+        history.complete_restore(redo, displaced);
         return (
             IdeWorkerEvent::EditRestoreCommittedWithWarning {
                 redo,
@@ -5723,29 +5777,47 @@ fn observe_history(
     events: &SyncSender<IdeWorkerEvent>,
 ) {
     let changed = match attempt {
-        ProjectMutationAttempt::RestoreResource {
-            entry,
-            redo,
+        ProjectMutationAttempt::EditNativeFilter {
+            inverse: Some(inverse),
             result: Ok(outcome),
+            ..
+        } if outcome.changed() => {
+            history.record_edit(UndoEntry::from_operation(
+                inverse.clone(),
+                undo_label(command),
+            ));
+            true
+        }
+        ProjectMutationAttempt::EditNativeFilter {
+            inverse: Some(inverse),
+            result: Err(reason),
+            ..
+        } if reason.publication_committed() => {
+            history.record_edit(UndoEntry::from_operation(
+                inverse.clone(),
+                undo_label(command),
+            ));
+            true
+        }
+        ProjectMutationAttempt::RestoreResource {
+            redo,
+            displaced,
+            result: Ok(_),
+            ..
         } => {
-            history.complete_restore(
-                *redo,
-                outcome.previous_resource().map(|previous| UndoEntry {
-                    resource_id: entry.resource_id.clone(),
-                    bytes: previous.to_vec(),
-                    label: entry.label,
-                }),
-            );
+            history.complete_restore(*redo, displaced.clone());
             true
         }
         other => match history_effect(other) {
             HistoryEffect::Replacement(outcome) => match outcome.previous_resource() {
                 Some(previous) => {
-                    history.record_edit(UndoEntry {
-                        resource_id: outcome.resource_id().to_owned(),
-                        bytes: previous.to_vec(),
-                        label: undo_label(command),
-                    });
+                    history.record_edit(UndoEntry::from_operation(
+                        IdeHistoryOperation::ResourceReplacement {
+                            resource_id: outcome.resource_id().to_owned(),
+                            bytes: previous.to_vec(),
+                        },
+                        undo_label(command),
+                    ));
                     true
                 }
                 None => false,
@@ -5923,11 +5995,6 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::EditControlMapping { result: Ok(_), .. } => {
             HistoryEffect::Invalidate
         }
-        ProjectMutationAttempt::EditNativeFilter { result: Ok(_), .. } => HistoryEffect::Invalidate,
-        ProjectMutationAttempt::EditNativeFilter {
-            result: Err(reason),
-            ..
-        } if reason.publication_committed() => HistoryEffect::Invalidate,
         ProjectMutationAttempt::RemoveAudioClip(Err(reason))
             if reason.publication_committed() =>
         {
@@ -5938,7 +6005,8 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         {
             HistoryEffect::Invalidate
         }
-        ProjectMutationAttempt::Save(Err(_))
+        ProjectMutationAttempt::EditNativeFilter { .. }
+        | ProjectMutationAttempt::Save(Err(_))
         | ProjectMutationAttempt::AddAudioTrack(Err(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Err(_))
         | ProjectMutationAttempt::ImportAudio(Err(IdeAudioImportBatchFailure {
@@ -5977,7 +6045,6 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::AddScene { result: Err(_), .. }
         | ProjectMutationAttempt::AddAutomationTake { result: Err(_), .. }
         | ProjectMutationAttempt::SetAutomationTakeActive { result: Err(_), .. }
-        | ProjectMutationAttempt::EditNativeFilter { result: Err(_), .. }
         | ProjectMutationAttempt::EditControlMapping { result: Err(_), .. }
         | ProjectMutationAttempt::DuplicateScene { result: Err(_), .. }
         | ProjectMutationAttempt::RenameScene { result: Err(_), .. }
@@ -7191,6 +7258,7 @@ enum ProjectMutationAttempt {
     },
     EditNativeFilter {
         edit: IdeNativeFilterEdit,
+        inverse: Option<IdeHistoryOperation>,
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeNativeFilterEditError,
@@ -7203,6 +7271,7 @@ enum ProjectMutationAttempt {
     RestoreResource {
         entry: UndoEntry,
         redo: bool,
+        displaced: Option<UndoEntry>,
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeResourceRestoreError,
@@ -8139,6 +8208,7 @@ fn complete_project_mutation(
                 ProjectMutationAttempt::EditNativeFilter {
                     edit,
                     result: Ok(outcome),
+                    ..
                 } => send_event(
                     events,
                     IdeWorkerEvent::NativeFilterEdited {
@@ -8150,6 +8220,7 @@ fn complete_project_mutation(
                 ProjectMutationAttempt::EditNativeFilter {
                     edit,
                     result: Err(reason),
+                    ..
                 } if reason.publication_committed() => send_event(
                     events,
                     IdeWorkerEvent::NativeFilterEditCommittedWithWarning {
@@ -8186,6 +8257,7 @@ fn complete_project_mutation(
                     entry,
                     redo,
                     result: Ok(outcome),
+                    ..
                 } => send_event(
                     events,
                     IdeWorkerEvent::EditRestored {
@@ -8197,10 +8269,11 @@ fn complete_project_mutation(
                 ProjectMutationAttempt::RestoreResource {
                     entry,
                     redo,
+                    displaced,
                     result: Err(reason),
                 } => {
                     let (event, consumed) =
-                        restore_failure_event(&mut *history, &entry, redo, reason);
+                        restore_failure_event(&mut *history, &entry, redo, displaced, reason);
                     (!consumed || send_event(events, history.state_event()))
                         && send_event(events, event)
                 }
@@ -8783,26 +8856,61 @@ fn attempt_project_mutation(
             }
         }
         ProjectMutation::EditNativeFilter { edit } => {
+            let (inverse, result) =
+                attempt_native_filter_edit(application, recovery, &edit, native_failure);
             ProjectMutationAttempt::EditNativeFilter {
                 edit: edit.clone(),
-                result: attempt_native_filter_edit(application, recovery, &edit, native_failure),
+                inverse,
+                result,
             }
         }
         ProjectMutation::RestoreResource { entry, redo } => {
-            let result = if let Some(failure) = native_failure {
-                Err(IdeResourceRestoreError::NativeClose(failure))
+            let (displaced, result) = if let Some(failure) = native_failure {
+                (None, Err(IdeResourceRestoreError::NativeClose(failure)))
             } else {
-                RunningDesktopIdeApplication::prepare_resource_restore(
-                    application,
-                    recovery,
-                    &entry.resource_id,
-                    &entry.bytes,
-                )
-                .and_then(|plan| plan.publish())
+                let operation = entry.operation();
+                match &operation {
+                    IdeHistoryOperation::ResourceReplacement { resource_id, bytes } => {
+                        match RunningDesktopIdeApplication::prepare_resource_restore(
+                            application,
+                            recovery,
+                            resource_id,
+                            bytes,
+                        ) {
+                            Ok(plan) => {
+                                let displaced = plan
+                                    .displaced()
+                                    .map(|operation| {
+                                        UndoEntry::from_operation(operation, entry.label)
+                                    });
+                                (displaced, plan.publish())
+                            }
+                            Err(reason) => (None, Err(reason)),
+                        }
+                    }
+                    IdeHistoryOperation::DeviceChainAddition { .. }
+                    | IdeHistoryOperation::DeviceChainRemoval { .. } => {
+                        match RunningDesktopIdeApplication::prepare_device_chain_history_restore(
+                            application,
+                            recovery,
+                            &operation,
+                        ) {
+                            Ok(plan) => {
+                                let displaced = Some(UndoEntry::from_operation(
+                                    plan.displaced(),
+                                    entry.label,
+                                ));
+                                (displaced, plan.publish())
+                            }
+                            Err(reason) => (None, Err(reason)),
+                        }
+                    }
+                }
             };
             ProjectMutationAttempt::RestoreResource {
                 entry,
                 redo,
+                displaced,
                 result,
             }
         }
@@ -9789,12 +9897,20 @@ fn attempt_native_filter_edit(
     recovery: &DesktopPlaybackRecovery,
     edit: &IdeNativeFilterEdit,
     native_failure: Option<IdeNativeCloseFailure>,
-) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeNativeFilterEditError> {
+) -> (
+    Option<IdeHistoryOperation>,
+    Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeNativeFilterEditError>,
+) {
     if let Some(failure) = native_failure {
-        return Err(IdeNativeFilterEditError::NativeClose(failure));
+        return (None, Err(IdeNativeFilterEditError::NativeClose(failure)));
     }
-    RunningDesktopIdeApplication::prepare_native_filter_edit(application, recovery, edit)
-        .and_then(|plan| plan.publish())
+    match RunningDesktopIdeApplication::prepare_native_filter_edit(application, recovery, edit) {
+        Ok(plan) => {
+            let inverse = plan.inverse();
+            (Some(inverse), plan.publish())
+        }
+        Err(reason) => (None, Err(reason)),
+    }
 }
 
 fn native_filter_edit_reopen_failure(
@@ -11896,6 +12012,260 @@ mod tests {
         assert_imported_audio_assets(&project, initial_revision + 2);
 
         assert_worker_clip_removal_lifecycle(&worker, &project, initial_revision, &outcome);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker scenario proves replacement and structural device-chain undo/redo without hiding event ordering behind a helper"
+    )]
+    fn native_filter_edits_are_undoable_and_redoable_through_the_real_worker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-native-filter-history-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+
+        let worker = DesktopIdeWorker::start_state(
+            WorkerState::Closed(closed_application()),
+            2,
+            8,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the verified project must open before native editing");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .unwrap()
+            .id()
+            .to_owned();
+
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::Add {
+                    track_id,
+                    mode: NativeFilterMode::LowPass,
+                    cutoff_millihertz: 1_000_000,
+                    resonance_millionths: 707_000,
+                },
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("native filter"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(added) = recv(&worker) else {
+            panic!("the added native filter must reopen before completion");
+        };
+        assert_eq!(added.native_filters().len(), 1);
+        let chain_id = added.native_filters()[0].chain_id().to_owned();
+        let device_id = added.native_filters()[0].device_instance_id().to_owned();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEdited {
+                revision: 2,
+                changed: true,
+                ..
+            }
+        ));
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "native filter",
+            }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: Some("native filter"),
+            }
+        ));
+        let IdeWorkerEvent::Running(undone) = recv(&worker) else {
+            panic!("the undone native filter must reopen before completion");
+        };
+        assert!(undone.native_filters().is_empty());
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 3,
+                redo: false,
+                label: "native filter",
+            }
+        ));
+        assert!(!project.join("devices").exists());
+
+        worker.try_send(IdeWorkerCommand::Redo).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: true,
+                label: "native filter",
+            }
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("native filter"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(redone) = recv(&worker) else {
+            panic!("the redone native filter must reopen before completion");
+        };
+        assert_eq!(redone.native_filters().len(), 1);
+        assert_eq!(redone.native_filters()[0].chain_id(), chain_id);
+        assert_eq!(redone.native_filters()[0].device_instance_id(), device_id);
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 4,
+                redo: true,
+                label: "native filter",
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::Update {
+                    chain_id: chain_id.clone(),
+                    device_instance_id: device_id.clone(),
+                    enabled: false,
+                    mode: NativeFilterMode::HighPass,
+                    cutoff_millihertz: 2_000_000,
+                    resonance_millionths: 1_000_000,
+                },
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        let IdeWorkerEvent::Running(updated) = recv(&worker) else {
+            panic!("the updated native filter must reopen before completion");
+        };
+        assert!(!updated.native_filters()[0].enabled());
+        assert_eq!(updated.native_filters()[0].mode(), NativeFilterMode::HighPass);
+        assert_eq!(updated.native_filters()[0].cutoff_millihertz(), 2_000_000);
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEdited { revision: 5, .. }
+        ));
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        let IdeWorkerEvent::Running(update_undone) = recv(&worker) else {
+            panic!("the undone filter update must reopen before completion");
+        };
+        assert!(update_undone.native_filters()[0].enabled());
+        assert_eq!(update_undone.native_filters()[0].mode(), NativeFilterMode::LowPass);
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 6,
+                redo: false,
+                ..
+            }
+        ));
+
+        worker.try_send(IdeWorkerCommand::Redo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: true, .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        let IdeWorkerEvent::Running(update_redone) = recv(&worker) else {
+            panic!("the redone filter update must reopen before completion");
+        };
+        assert!(!update_redone.native_filters()[0].enabled());
+        assert_eq!(update_redone.native_filters()[0].mode(), NativeFilterMode::HighPass);
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 7,
+                redo: true,
+                ..
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::Remove {
+                    chain_id: chain_id.clone(),
+                    device_instance_id: device_id.clone(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        let IdeWorkerEvent::Running(removed) = recv(&worker) else {
+            panic!("the removed native filter must reopen before completion");
+        };
+        assert!(removed.native_filters().is_empty());
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::NativeFilterEdited { revision: 8, .. }
+        ));
+        assert!(!project.join("devices").exists());
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        let IdeWorkerEvent::Running(removal_undone) = recv(&worker) else {
+            panic!("the undone filter removal must reopen before completion");
+        };
+        assert_eq!(removal_undone.native_filters().len(), 1);
+        assert_eq!(removal_undone.native_filters()[0].chain_id(), chain_id);
+        assert_eq!(removal_undone.native_filters()[0].device_instance_id(), device_id);
+        assert!(!removal_undone.native_filters()[0].enabled());
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 9,
+                redo: false,
+                ..
+            }
+        ));
+
+        worker.try_send(IdeWorkerCommand::Redo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: true, .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        let IdeWorkerEvent::Running(removal_redone) = recv(&worker) else {
+            panic!("the redone filter removal must reopen before completion");
+        };
+        assert!(removal_redone.native_filters().is_empty());
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 10,
+                redo: true,
+                ..
+            }
+        ));
+        assert!(!project.join("devices").exists());
+
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
@@ -14392,6 +14762,7 @@ mod tests {
         UndoEntry {
             resource_id: id.to_owned(),
             bytes: id.as_bytes().to_vec(),
+            kind: UndoEntryKind::ResourceReplacement,
             label,
         }
     }
@@ -14549,6 +14920,13 @@ mod tests {
             &ProjectMutationAttempt::RestoreResource {
                 entry: entry.clone(),
                 redo: false,
+                displaced: Some(UndoEntry::from_operation(
+                    IdeHistoryOperation::ResourceReplacement {
+                        resource_id: mixer_id.clone(),
+                        bytes: original.clone(),
+                    },
+                    entry.label,
+                )),
                 result: Ok(outcome.clone()),
             },
             IdeWorkerCommandKind::Undo,
@@ -14605,6 +14983,46 @@ mod tests {
             receiver.try_recv().is_err(),
             "and announces no history change"
         );
+    }
+
+    #[test]
+    fn committed_native_filter_warning_records_its_exact_inverse() {
+        let edit = captured_mixer_edit("native-committed-warning");
+        let inverse = IdeHistoryOperation::DeviceChainRemoval {
+            chain_id: "018f47a2-6b2d-7c11-8a44-001122336470".to_owned(),
+            expected_bytes: br#"{"format":"hyper-device-chain"}"#.to_vec(),
+        };
+        let attempt = ProjectMutationAttempt::EditNativeFilter {
+            edit: IdeNativeFilterEdit::Remove {
+                chain_id: "018f47a2-6b2d-7c11-8a44-001122336470".to_owned(),
+                device_instance_id: "018f47a2-6b2d-7c11-8a44-001122336471".to_owned(),
+            },
+            inverse: Some(inverse.clone()),
+            result: Err(IdeNativeFilterEditError::ReopenAfterPublication {
+                outcome: Box::new(edit.outcome.clone()),
+                source: Box::new(IdeProjectOpenError::SelectedOutputUnavailable),
+            }),
+        };
+        let (events, receiver) = std::sync::mpsc::sync_channel(4);
+        let mut history = UndoHistory::default();
+
+        observe_history(
+            &mut history,
+            &attempt,
+            IdeWorkerCommandKind::EditNativeFilter,
+            &events,
+        );
+
+        assert_eq!(history.undo.len(), 1);
+        assert_eq!(history.undo[0].operation(), inverse);
+        assert_eq!(history.undo[0].label, "native filter");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("native filter"),
+                redo_label: None,
+            })
+        ));
     }
 
     #[test]
@@ -15196,6 +15614,7 @@ mod tests {
             &mut history,
             &labelled("dead", "track rename"),
             false,
+            None,
             IdeResourceRestoreError::ResourceMissing,
         );
         assert!(consumed, "a refusal that can never succeed is discarded");
@@ -15216,6 +15635,7 @@ mod tests {
             &mut history,
             &labelled("older", "clip gain"),
             false,
+            None,
             IdeResourceRestoreError::CapacityUnavailable,
         );
         assert!(!kept, "a retryable refusal keeps its entry");
@@ -15244,6 +15664,7 @@ mod tests {
             &mut history,
             &labelled("scene", "scene rename"),
             false,
+            None,
             reason,
         );
         assert!(consumed);

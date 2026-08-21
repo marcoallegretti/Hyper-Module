@@ -9438,6 +9438,32 @@ mod tests {
         assert_eq!(ui.get_app_mode(), AppMode::Running);
         assert!(ui.get_status_text().contains("revision 4"));
         assert!(ui.get_error_text().is_empty());
+
+        assert_native_filter_committed_warning(ui);
+    }
+
+    fn assert_native_filter_committed_warning(ui: &MainWindow) {
+        ui.set_native_filter_add_visible(true);
+        ui.set_native_filter_edit_visible(true);
+        ui.set_native_filter_edit_index(0);
+        ui.set_native_filter_remove_confirming_index(0);
+        apply_native_filter_event(
+            ui,
+            &IdeWorkerEvent::NativeFilterEditCommittedWithWarning {
+                edit: IdeNativeFilterEdit::Remove {
+                    chain_id: "chain-a".to_owned(),
+                    device_instance_id: "device-a".to_owned(),
+                },
+                warning: Box::new(hyper_desktop_ide::IdeNativeFilterEditError::InvalidIdentity),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(!ui.get_native_filter_add_visible());
+        assert!(!ui.get_native_filter_edit_visible());
+        assert_eq!(ui.get_native_filter_edit_index(), -1);
+        assert_eq!(ui.get_native_filter_remove_confirming_index(), -1);
+        assert!(ui.get_status_text().contains("committed"));
+        assert!(ui.get_error_text().contains("saved"));
     }
 
     fn assert_native_filter_pending_modes() {

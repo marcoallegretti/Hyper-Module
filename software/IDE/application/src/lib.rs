@@ -6288,9 +6288,61 @@ struct IdeResourceRestorePlan {
     resource_id: String,
     role: ResourceRole,
     resource_bytes: Vec<u8>,
+    displaced_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct IdeDeviceChainHistoryRestorePlan {
+    mixer: IdeMixerSavePlan,
+    chain_id: String,
+    publication: IdeNativeFilterPublication,
+    displaced: IdeHistoryOperation,
+}
+
+impl IdeDeviceChainHistoryRestorePlan {
+    fn displaced(&self) -> IdeHistoryOperation {
+        self.displaced.clone()
+    }
+
+    fn publish(&self) -> Result<ProjectResourcePublicationOutcome, IdeResourceRestoreError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeResourceRestoreError::MixerPublication(Box::new(source)))?;
+        let result = match &self.publication {
+            IdeNativeFilterPublication::Addition(bytes) => publish_device_chain(
+                &self.mixer.project_path,
+                DeviceChainPublicationRequest {
+                    expected_project_sha256: *mixer.project_identity(),
+                    chain_id: &self.chain_id,
+                    chain_bytes: bytes,
+                },
+            ),
+            IdeNativeFilterPublication::Removal => remove_device_chain(
+                &self.mixer.project_path,
+                DeviceChainRemovalRequest {
+                    expected_project_sha256: *mixer.project_identity(),
+                    chain_id: &self.chain_id,
+                },
+            ),
+            IdeNativeFilterPublication::Replacement(_) => {
+                unreachable!("device-chain structural history cannot replace a resource")
+            }
+        };
+        result.map_err(|source| IdeResourceRestoreError::Publication(Box::new(source)))
+    }
 }
 
 impl IdeResourceRestorePlan {
+    fn displaced(&self) -> Option<IdeHistoryOperation> {
+        self.displaced_bytes.as_ref().map(|bytes| {
+            IdeHistoryOperation::ResourceReplacement {
+                resource_id: self.resource_id.clone(),
+                bytes: bytes.clone(),
+            }
+        })
+    }
+
     fn publish(&self) -> Result<ProjectResourcePublicationOutcome, IdeResourceRestoreError> {
         let mixer = self
             .mixer
@@ -6350,11 +6402,28 @@ enum IdeNativeFilterPublication {
     Removal,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum IdeHistoryOperation {
+    ResourceReplacement {
+        resource_id: String,
+        bytes: Vec<u8>,
+    },
+    DeviceChainAddition {
+        chain_id: String,
+        bytes: Vec<u8>,
+    },
+    DeviceChainRemoval {
+        chain_id: String,
+        expected_bytes: Vec<u8>,
+    },
+}
+
 #[derive(Debug)]
 struct IdeNativeFilterEditPlan {
     mixer: IdeMixerSavePlan,
     chain_id: String,
     publication: IdeNativeFilterPublication,
+    inverse: IdeHistoryOperation,
 }
 
 fn find_native_filter_chain<'a>(
@@ -6398,6 +6467,10 @@ fn serialize_native_filter_chain(
 }
 
 impl IdeNativeFilterEditPlan {
+    fn inverse(&self) -> IdeHistoryOperation {
+        self.inverse.clone()
+    }
+
     fn publish(
         &self,
     ) -> Result<ProjectResourcePublicationOutcome, IdeNativeFilterEditError> {
@@ -8883,6 +8956,91 @@ impl RunningDesktopIdeApplication {
         )
     }
 
+    fn prepare_device_chain_history_restore(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        operation: &IdeHistoryOperation,
+    ) -> Result<IdeDeviceChainHistoryRestorePlan, IdeResourceRestoreError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeResourceRestoreError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeResourceRestoreError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let invalid = |message: &'static str| {
+            IdeResourceRestoreError::CandidateInvalid(Box::new(std::io::Error::other(message)))
+        };
+        match operation {
+            IdeHistoryOperation::DeviceChainAddition { chain_id, bytes } => {
+                let chain = DeviceChain::parse(bytes)
+                    .map_err(|source| IdeResourceRestoreError::CandidateInvalid(Box::new(source)))?;
+                let canonical = chain
+                    .to_canonical_vec()
+                    .map_err(|source| IdeResourceRestoreError::CandidateInvalid(Box::new(source)))?;
+                if canonical != *bytes
+                    || chain.id() != chain_id
+                    || chain.project_id() != prepared.package().manifest().project_id()
+                {
+                    return Err(invalid("device-chain undo bytes do not match their authority"));
+                }
+                let (_, compiled_mixer, _, _) = prepared.session().parts();
+                if !compiled_mixer
+                    .slots()
+                    .iter()
+                    .any(|slot| slot.track_id() == chain.track_id())
+                    || prepared
+                        .device_chains()
+                        .iter()
+                        .any(|active| active.id() == chain_id || active.track_id() == chain.track_id())
+                {
+                    return Err(invalid(
+                        "device-chain undo addition conflicts with the active project",
+                    ));
+                }
+                Ok(IdeDeviceChainHistoryRestorePlan {
+                    mixer,
+                    chain_id: chain_id.clone(),
+                    publication: IdeNativeFilterPublication::Addition(bytes.clone()),
+                    displaced: IdeHistoryOperation::DeviceChainRemoval {
+                        chain_id: chain_id.clone(),
+                        expected_bytes: bytes.clone(),
+                    },
+                })
+            }
+            IdeHistoryOperation::DeviceChainRemoval {
+                chain_id,
+                expected_bytes,
+            } => {
+                let active = prepared
+                    .device_chains()
+                    .iter()
+                    .find(|chain| chain.id() == chain_id)
+                    .ok_or(IdeResourceRestoreError::ResourceMissing)?;
+                let active_bytes = active
+                    .to_canonical_vec()
+                    .map_err(|source| IdeResourceRestoreError::CandidateInvalid(Box::new(source)))?;
+                if active_bytes != *expected_bytes {
+                    return Err(invalid(
+                        "device-chain undo removal no longer matches the active resource",
+                    ));
+                }
+                Ok(IdeDeviceChainHistoryRestorePlan {
+                    mixer,
+                    chain_id: chain_id.clone(),
+                    publication: IdeNativeFilterPublication::Removal,
+                    displaced: IdeHistoryOperation::DeviceChainAddition {
+                        chain_id: chain_id.clone(),
+                        bytes: active_bytes,
+                    },
+                })
+            }
+            IdeHistoryOperation::ResourceReplacement { .. } => Err(invalid(
+                "resource replacement was sent to structural device-chain undo",
+            )),
+        }
+    }
+
     fn prepare_resource_restore_from_project(
         application: &DesktopIdeApplication,
         mixer: IdeMixerSavePlan,
@@ -8898,6 +9056,9 @@ impl RunningDesktopIdeApplication {
             .find(|descriptor| descriptor.id() == resource_id)
             .ok_or(IdeResourceRestoreError::ResourceMissing)?;
         let role = descriptor.role();
+        let active_bytes = package
+            .read_resource(resource_id)
+            .map_err(IdeResourceRestoreError::Storage)?;
         Self::validate_restore_candidate(application, prepared, resource_id, resource_bytes)?;
         let mut owned_id = String::new();
         owned_id
@@ -8909,11 +9070,13 @@ impl RunningDesktopIdeApplication {
             .try_reserve_exact(resource_bytes.len())
             .map_err(|_| IdeResourceRestoreError::CapacityUnavailable)?;
         owned_bytes.extend_from_slice(resource_bytes);
+        let displaced_bytes = (active_bytes != resource_bytes).then_some(active_bytes);
         Ok(IdeResourceRestorePlan {
             mixer,
             resource_id: owned_id,
             role,
             resource_bytes: owned_bytes,
+            displaced_bytes,
         })
     }
 
@@ -9146,12 +9309,16 @@ impl RunningDesktopIdeApplication {
         Self::prepare_native_filter_edit_from_project(mixer, prepared, edit)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive edit match keeps each publication and its exact history inverse adjacent"
+    )]
     fn prepare_native_filter_edit_from_project(
         mixer: IdeMixerSavePlan,
         prepared: &PreparedProjectPlayback,
         edit: &IdeNativeFilterEdit,
     ) -> Result<IdeNativeFilterEditPlan, IdeNativeFilterEditError> {
-        let (chain_id, publication) = match edit {
+        let (chain_id, publication, inverse) = match edit {
             IdeNativeFilterEdit::Add {
                 track_id,
                 mode,
@@ -9180,11 +9347,16 @@ impl RunningDesktopIdeApplication {
                     let changed = chain
                         .try_with_appended_filter(device_id, true, filter_state)
                         .map_err(IdeNativeFilterEditError::Device)?;
+                    let previous = serialize_native_filter_chain(chain)?;
                     (
                         chain.id().to_owned(),
                         IdeNativeFilterPublication::Replacement(
                             serialize_native_filter_chain(&changed)?,
                         ),
+                        IdeHistoryOperation::ResourceReplacement {
+                            resource_id: chain.id().to_owned(),
+                            bytes: previous,
+                        },
                     )
                 } else {
                     let chain_id = uuid::Uuid::new_v4().to_string();
@@ -9198,11 +9370,14 @@ impl RunningDesktopIdeApplication {
                         ],
                     )
                     .map_err(IdeNativeFilterEditError::Device)?;
+                    let bytes = serialize_native_filter_chain(&chain)?;
                     (
                         chain_id,
-                        IdeNativeFilterPublication::Addition(
-                            serialize_native_filter_chain(&chain)?,
-                        ),
+                        IdeNativeFilterPublication::Addition(bytes.clone()),
+                        IdeHistoryOperation::DeviceChainRemoval {
+                            chain_id: chain.id().to_owned(),
+                            expected_bytes: bytes,
+                        },
                     )
                 }
             }
@@ -9227,6 +9402,10 @@ impl RunningDesktopIdeApplication {
                     IdeNativeFilterPublication::Replacement(
                         serialize_native_filter_chain(&changed)?,
                     ),
+                    IdeHistoryOperation::ResourceReplacement {
+                        resource_id: chain.id().to_owned(),
+                        bytes: serialize_native_filter_chain(chain)?,
+                    },
                 )
             }
             IdeNativeFilterEdit::Remove {
@@ -9234,22 +9413,36 @@ impl RunningDesktopIdeApplication {
                 device_instance_id,
             } => {
                 let chain = find_native_filter_chain(prepared, chain_id, device_instance_id)?;
-                let publication = match chain
+                let previous = serialize_native_filter_chain(chain)?;
+                let (publication, inverse) = match chain
                     .try_without_device(device_instance_id)
                     .map_err(IdeNativeFilterEditError::Device)?
                 {
-                    Some(changed) => IdeNativeFilterPublication::Replacement(
-                        serialize_native_filter_chain(&changed)?,
+                    Some(changed) => (
+                        IdeNativeFilterPublication::Replacement(
+                            serialize_native_filter_chain(&changed)?,
+                        ),
+                        IdeHistoryOperation::ResourceReplacement {
+                            resource_id: chain.id().to_owned(),
+                            bytes: previous.clone(),
+                        },
                     ),
-                    None => IdeNativeFilterPublication::Removal,
+                    None => (
+                        IdeNativeFilterPublication::Removal,
+                        IdeHistoryOperation::DeviceChainAddition {
+                            chain_id: chain.id().to_owned(),
+                            bytes: previous,
+                        },
+                    ),
                 };
-                (chain_id.clone(), publication)
+                (chain_id.clone(), publication, inverse)
             }
         };
         Ok(IdeNativeFilterEditPlan {
             mixer,
             chain_id,
             publication,
+            inverse,
         })
     }
 
