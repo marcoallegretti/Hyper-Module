@@ -158,8 +158,26 @@ export component OperatorWindow inherits Window {
     callback loudness-run-requested();
     callback loudness-standby-requested();
     callback loudness-reset-requested();
+    callback begin-loudness-reset();
+    callback cancel-loudness-reset();
+    callback confirm-loudness-reset();
     callback launch-scene-requested(int);
     callback quit-requested();
+
+    begin-loudness-reset => {
+        if root.loudness-reset-enabled {
+            root.loudness-reset-confirming = true;
+        }
+    }
+    cancel-loudness-reset => {
+        root.loudness-reset-confirming = false;
+    }
+    confirm-loudness-reset => {
+        if root.loudness-reset-enabled {
+            root.loudness-reset-confirming = false;
+            root.loudness-reset-requested();
+        }
+    }
 
     VerticalLayout {
         padding: 24px;
@@ -252,13 +270,13 @@ export component OperatorWindow inherits Window {
                         spacing: 5px;
                         Button { text: "Run"; enabled: root.loudness-run-enabled; clicked => { root.loudness-run-requested(); } }
                         Button { text: "Standby"; enabled: root.loudness-standby-enabled; clicked => { root.loudness-standby-requested(); } }
-                        Button { text: "Reset programme"; enabled: root.loudness-reset-enabled; clicked => { root.loudness-reset-confirming = true; } }
+                        Button { text: "Reset programme"; enabled: root.loudness-reset-enabled; clicked => { root.begin-loudness-reset(); } }
                     }
                     if root.loudness-reset-confirming : HorizontalLayout {
                         spacing: 5px;
                         Text { text: "Clear programme history?"; color: #f5b83d; font-size: 10px; vertical-alignment: center; }
-                        Button { text: "Cancel"; clicked => { root.loudness-reset-confirming = false; } }
-                        Button { text: "Confirm reset"; enabled: root.loudness-reset-enabled; clicked => { root.loudness-reset-confirming = false; root.loudness-reset-requested(); } }
+                        Button { text: "Cancel"; clicked => { root.cancel-loudness-reset(); } }
+                        Button { text: "Confirm reset"; enabled: root.loudness-reset-enabled; clicked => { root.confirm-loudness-reset(); } }
                     }
                 }
                 HorizontalLayout {

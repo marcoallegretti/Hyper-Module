@@ -1649,6 +1649,9 @@ fn apply_operator_meter_observation(
         .flatten()
         .map(LoudnessPresentationSnapshot::state);
     loudness_authority.set(authority);
+    if terminal_latched {
+        ui.set_loudness_reset_confirming(false);
+    }
     ui.set_loudness_run_enabled(authority == Some(LoudnessMeasurementState::Standby));
     ui.set_loudness_standby_enabled(authority == Some(LoudnessMeasurementState::Running));
     ui.set_loudness_reset_enabled(authority.is_some());
@@ -2696,15 +2699,31 @@ mod tests {
             "meter frame 1440 · 0 coalesced · 0 dropped"
         );
 
-        for _ in 0..297 {
-            transport
-                .process_interleaved_cycle(
+        let mut newest_loudness = None;
+        for cycle_index in 0..297 {
+            let programme_gain = match cycle_index {
+                0..=98 => 0.08,
+                99..=197 => 0.25,
+                _ => 0.9,
+            };
+            let cycle = transport
+                .process_interleaved_cycle_with_post_mix(
                     &mut callback,
                     &mut scratch,
                     &mut interleaved,
                     &mut meter_sender,
+                    |output| {
+                        for sample in output.left.iter_mut().chain(output.right.iter_mut()) {
+                            *sample *= programme_gain;
+                        }
+                    },
                 )
                 .unwrap();
+            newest_loudness = Some(
+                cycle
+                    .snapshot()
+                    .present_loudness(EbuLoudnessPresentationConfig::default()),
+            );
             apply_operator_meter_observation(
                 ui,
                 &mut meter_observer.borrow_mut(),
@@ -2723,13 +2742,106 @@ mod tests {
                 .as_str()
                 .starts_with("Stabilizing · 00:00:03.000")
         );
-        let accepted_loudness = (
-            ui.get_loudness_momentary(),
-            ui.get_loudness_short_term(),
-            ui.get_loudness_integrated(),
-            ui.get_loudness_maximum_true_peak(),
-        );
+        let shaped_loudness = newest_loudness.unwrap();
+        let shaped_values = [
+            shaped_loudness.momentary().unwrap().displayed(),
+            shaped_loudness.short_term().unwrap().displayed(),
+            shaped_loudness.integrated().unwrap().displayed(),
+        ];
+        for left in 0..shaped_values.len() {
+            for right in (left + 1)..shaped_values.len() {
+                assert!(
+                    (shaped_values[left] - shaped_values[right]).abs() >= 0.1,
+                    "the deterministic programme must keep M/S/I distinct at display precision"
+                );
+            }
+        }
 
+        transport
+            .process_interleaved_cycle_with_post_mix(
+                &mut callback,
+                &mut scratch,
+                &mut interleaved,
+                &mut meter_sender,
+                |output| {
+                    for sample in output.left.iter_mut().chain(output.right.iter_mut()) {
+                        *sample *= 0.05;
+                    }
+                },
+            )
+            .unwrap();
+        let newest_cycle = transport
+            .process_interleaved_cycle_with_post_mix(
+                &mut callback,
+                &mut scratch,
+                &mut interleaved,
+                &mut meter_sender,
+                |output| {
+                    for sample in output.left.iter_mut().chain(output.right.iter_mut()) {
+                        *sample *= 0.8;
+                    }
+                },
+            )
+            .unwrap();
+        let newest_loudness = newest_cycle
+            .snapshot()
+            .present_loudness(EbuLoudnessPresentationConfig::default());
+        apply_operator_meter_observation(
+            ui,
+            &mut meter_observer.borrow_mut(),
+            &loudness_authority,
+            false,
+        );
+        let expected_scaled = |value: Option<ScaledLoudnessValue>| {
+            value.map_or_else(
+                || "— LUFS".to_owned(),
+                |value| {
+                    let prefix = match value.region() {
+                        LoudnessScaleRegion::Below => "<",
+                        LoudnessScaleRegion::OnScale => "",
+                        LoudnessScaleRegion::Above => ">",
+                    };
+                    format!("{prefix}{:.1} LUFS", value.displayed())
+                },
+            )
+        };
+        let expected_true_peak = newest_loudness.maximum_true_peak().map_or_else(
+            || "— dBTP".to_owned(),
+            |value| {
+                value.displayed_dbtp().map_or_else(
+                    || "−∞ dBTP".to_owned(),
+                    |displayed| format!("{displayed:.1} dBTP"),
+                )
+            },
+        );
+        assert_eq!(
+            ui.get_output_meter_telemetry().as_str(),
+            "meter frame 144960 · 1 coalesced · 0 dropped"
+        );
+        assert_eq!(ui.get_loudness_state().as_str(), "RUNNING");
+        assert_eq!(
+            ui.get_loudness_momentary().as_str(),
+            expected_scaled(newest_loudness.momentary())
+        );
+        assert_eq!(
+            ui.get_loudness_short_term().as_str(),
+            expected_scaled(newest_loudness.short_term())
+        );
+        assert_eq!(
+            ui.get_loudness_integrated().as_str(),
+            expected_scaled(newest_loudness.integrated())
+        );
+        assert_eq!(
+            ui.get_loudness_range().as_str(),
+            newest_loudness
+                .loudness_range_lu()
+                .map_or_else(|| "— LU".to_owned(), |value| format!("{value:.1} LU"))
+        );
+        assert_eq!(
+            ui.get_loudness_maximum_true_peak().as_str(),
+            expected_true_peak
+        );
+        assert_eq!(ui.get_loudness_programme_time().as_str(), "00:00:03.020");
         ui.invoke_loudness_standby_requested();
         assert_eq!(
             loudness_command_receiver.try_recv(),
@@ -2737,13 +2849,133 @@ mod tests {
                 state: LoudnessMeasurementState::Standby,
             })
         );
-        ui.invoke_loudness_reset_requested();
+        callback.apply_loudness_command(LoudnessMeasurementCommand::SetState(
+            LoudnessMeasurementState::Standby,
+        ));
+        let standby_cycle = transport
+            .process_interleaved_cycle(
+                &mut callback,
+                &mut scratch,
+                &mut interleaved,
+                &mut meter_sender,
+            )
+            .unwrap();
+        let standby_loudness = standby_cycle
+            .snapshot()
+            .present_loudness(EbuLoudnessPresentationConfig::default());
+        apply_operator_meter_observation(
+            ui,
+            &mut meter_observer.borrow_mut(),
+            &loudness_authority,
+            false,
+        );
+        assert_eq!(ui.get_loudness_state().as_str(), "STANDBY");
+        assert!(ui.get_loudness_run_enabled());
+        assert!(!ui.get_loudness_standby_enabled());
+        assert!(ui.get_loudness_reset_enabled());
+        assert_eq!(
+            ui.get_loudness_momentary().as_str(),
+            expected_scaled(standby_loudness.momentary())
+        );
+        assert_eq!(
+            ui.get_loudness_short_term().as_str(),
+            expected_scaled(standby_loudness.short_term())
+        );
+        assert_eq!(
+            ui.get_loudness_integrated().as_str(),
+            expected_scaled(standby_loudness.integrated())
+        );
+        assert_eq!(ui.get_loudness_programme_time().as_str(), "00:00:03.020");
+
+        let loudness_before_peak_reset = (
+            ui.get_loudness_momentary(),
+            ui.get_loudness_short_term(),
+            ui.get_loudness_integrated(),
+            ui.get_loudness_range(),
+            ui.get_loudness_maximum_true_peak(),
+            ui.get_loudness_programme_time(),
+            ui.get_loudness_lra_status(),
+        );
+        let authority_before_peak_reset = loudness_authority.get();
+        ui.invoke_reset_output_peak_requested();
+        assert_eq!(loudness_authority.get(), authority_before_peak_reset);
+        assert_eq!(
+            loudness_before_peak_reset,
+            (
+                ui.get_loudness_momentary(),
+                ui.get_loudness_short_term(),
+                ui.get_loudness_integrated(),
+                ui.get_loudness_range(),
+                ui.get_loudness_maximum_true_peak(),
+                ui.get_loudness_programme_time(),
+                ui.get_loudness_lra_status(),
+            )
+        );
+        assert_eq!(loudness_command_receiver.try_recv(), Err(TryRecvError::Empty));
+
+        ui.invoke_begin_loudness_reset();
+        assert!(ui.get_loudness_reset_confirming());
+        assert_eq!(loudness_command_receiver.try_recv(), Err(TryRecvError::Empty));
+        ui.invoke_cancel_loudness_reset();
+        assert!(!ui.get_loudness_reset_confirming());
+        assert_eq!(loudness_command_receiver.try_recv(), Err(TryRecvError::Empty));
+        ui.invoke_begin_loudness_reset();
+        let peaks_before_programme_reset = (
+            ui.get_left_output_reading(),
+            ui.get_left_output_peak_reading(),
+            ui.get_right_output_reading(),
+            ui.get_right_output_peak_reading(),
+            ui.get_output_overload_latched(),
+        );
+        ui.invoke_confirm_loudness_reset();
+        assert!(!ui.get_loudness_reset_confirming());
         assert_eq!(
             loudness_command_receiver.try_recv(),
             Ok(OperatorCommand::ResetLoudness)
         );
-        assert_eq!(ui.get_loudness_state().as_str(), "RUNNING");
-        loudness_authority.set(Some(LoudnessMeasurementState::Standby));
+        assert_eq!(
+            peaks_before_programme_reset,
+            (
+                ui.get_left_output_reading(),
+                ui.get_left_output_peak_reading(),
+                ui.get_right_output_reading(),
+                ui.get_right_output_peak_reading(),
+                ui.get_output_overload_latched(),
+            )
+        );
+        assert_eq!(ui.get_loudness_state().as_str(), "STANDBY");
+        assert_eq!(
+            loudness_before_peak_reset,
+            (
+                ui.get_loudness_momentary(),
+                ui.get_loudness_short_term(),
+                ui.get_loudness_integrated(),
+                ui.get_loudness_range(),
+                ui.get_loudness_maximum_true_peak(),
+                ui.get_loudness_programme_time(),
+                ui.get_loudness_lra_status(),
+            )
+        );
+        callback.apply_loudness_command(LoudnessMeasurementCommand::Reset);
+        transport
+            .process_interleaved_cycle(
+                &mut callback,
+                &mut scratch,
+                &mut interleaved,
+                &mut meter_sender,
+            )
+            .unwrap();
+        apply_operator_meter_observation(
+            ui,
+            &mut meter_observer.borrow_mut(),
+            &loudness_authority,
+            false,
+        );
+        assert_eq!(ui.get_loudness_state().as_str(), "STANDBY");
+        assert_eq!(ui.get_loudness_integrated().as_str(), "— LUFS");
+        assert_eq!(ui.get_loudness_range().as_str(), "— LU");
+        assert_eq!(ui.get_loudness_programme_time().as_str(), "00:00:00.000");
+
         ui.invoke_loudness_run_requested();
         assert_eq!(
             loudness_command_receiver.try_recv(),
@@ -2751,7 +2983,33 @@ mod tests {
                 state: LoudnessMeasurementState::Running,
             })
         );
+        callback.apply_loudness_command(LoudnessMeasurementCommand::SetState(
+            LoudnessMeasurementState::Running,
+        ));
+        transport
+            .process_interleaved_cycle(
+                &mut callback,
+                &mut scratch,
+                &mut interleaved,
+                &mut meter_sender,
+            )
+            .unwrap();
+        apply_operator_meter_observation(
+            ui,
+            &mut meter_observer.borrow_mut(),
+            &loudness_authority,
+            false,
+        );
         assert_eq!(ui.get_loudness_state().as_str(), "RUNNING");
+        let accepted_loudness_after_run = (
+            ui.get_loudness_momentary(),
+            ui.get_loudness_short_term(),
+            ui.get_loudness_integrated(),
+            ui.get_loudness_range(),
+            ui.get_loudness_maximum_true_peak(),
+            ui.get_loudness_programme_time(),
+            ui.get_loudness_lra_status(),
+        );
 
         loudness_authority.set(Some(LoudnessMeasurementState::Running));
         let (saturated_loudness_sender, saturated_loudness_receiver) =
@@ -2780,14 +3038,95 @@ mod tests {
                 .contains("operator command refused")
         );
         assert_eq!(
-            accepted_loudness,
+            accepted_loudness_after_run,
             (
                 ui.get_loudness_momentary(),
                 ui.get_loudness_short_term(),
                 ui.get_loudness_integrated(),
+                ui.get_loudness_range(),
                 ui.get_loudness_maximum_true_peak(),
+                ui.get_loudness_programme_time(),
+                ui.get_loudness_lra_status(),
             )
         );
+
+        let terminal_peak_measurements = (
+            ui.get_left_output_level(),
+            ui.get_left_output_reading(),
+            ui.get_left_output_peak_reading(),
+            ui.get_right_output_level(),
+            ui.get_right_output_reading(),
+            ui.get_right_output_peak_reading(),
+            ui.get_output_overload_latched(),
+            ui.get_output_meter_state(),
+            ui.get_output_meter_telemetry(),
+        );
+        let terminal_loudness_measurements = (
+            ui.get_loudness_state(),
+            ui.get_loudness_momentary(),
+            ui.get_loudness_short_term(),
+            ui.get_loudness_integrated(),
+            ui.get_loudness_range(),
+            ui.get_loudness_maximum_true_peak(),
+            ui.get_loudness_programme_time(),
+            ui.get_loudness_lra_status(),
+        );
+        ui.invoke_begin_loudness_reset();
+        assert!(ui.get_loudness_reset_confirming());
+        apply_operator_meter_observation(
+            ui,
+            &mut meter_observer.borrow_mut(),
+            &loudness_authority,
+            true,
+        );
+        assert_eq!(
+            terminal_peak_measurements,
+            (
+                ui.get_left_output_level(),
+                ui.get_left_output_reading(),
+                ui.get_left_output_peak_reading(),
+                ui.get_right_output_level(),
+                ui.get_right_output_reading(),
+                ui.get_right_output_peak_reading(),
+                ui.get_output_overload_latched(),
+                ui.get_output_meter_state(),
+                ui.get_output_meter_telemetry(),
+            )
+        );
+        assert_eq!(
+            terminal_loudness_measurements,
+            (
+                ui.get_loudness_state(),
+                ui.get_loudness_momentary(),
+                ui.get_loudness_short_term(),
+                ui.get_loudness_integrated(),
+                ui.get_loudness_range(),
+                ui.get_loudness_maximum_true_peak(),
+                ui.get_loudness_programme_time(),
+                ui.get_loudness_lra_status(),
+            )
+        );
+        assert!(!ui.get_loudness_reset_confirming());
+        assert_eq!(loudness_authority.get(), None);
+        assert!(!ui.get_loudness_run_enabled());
+        assert!(!ui.get_loudness_standby_enabled());
+        assert!(!ui.get_loudness_reset_enabled());
+        ui.invoke_loudness_run_requested();
+        ui.invoke_loudness_standby_requested();
+        ui.invoke_begin_loudness_reset();
+        ui.invoke_confirm_loudness_reset();
+        assert!(!ui.get_loudness_reset_confirming());
+        assert_eq!(
+            saturated_loudness_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        );
+        apply_operator_meter_observation(
+            ui,
+            &mut meter_observer.borrow_mut(),
+            &loudness_authority,
+            true,
+        );
+        assert_eq!(loudness_authority.get(), None);
 
         drop(meter_sender);
         apply_operator_meter_observation(
@@ -2802,7 +3141,7 @@ mod tests {
         );
         assert_eq!(
             ui.get_output_meter_telemetry().as_str(),
-            "meter frame 144000 · 0 coalesced · 0 dropped"
+            "meter frame 146400 · 1 coalesced · 0 dropped"
         );
         assert_eq!(ui.get_loudness_state().as_str(), "RUNNING");
         assert_eq!(loudness_authority.get(), None);
