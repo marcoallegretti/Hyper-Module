@@ -7155,6 +7155,19 @@ pub(super) fn audio_clip_removal_failure_event(
     }
 }
 
+fn unused_sample_cleanup_failure_event(reason: IdeUnusedSampleCleanupError) -> IdeWorkerEvent {
+    if reason.publication_committed() {
+        IdeWorkerEvent::UnusedSampleCleanupCommittedWithWarning {
+            warning: Box::new(reason),
+        }
+    } else {
+        IdeWorkerEvent::CommandFailed {
+            command: IdeWorkerCommandKind::CleanUnusedSamples,
+            reason: IdeWorkerCommandFailure::UnusedSampleCleanup(Box::new(reason)),
+        }
+    }
+}
+
 pub(super) fn audio_clip_rename_edit_failure_event(
     reason: IdeAudioClipRenameEditError,
 ) -> IdeWorkerEvent {
@@ -7553,20 +7566,7 @@ fn complete_project_mutation(
                     },
                 ),
                 ProjectMutationAttempt::CleanUnusedSamples(Err(reason)) => {
-                    if reason.publication_committed() {
-                        send_event(
-                            events,
-                            IdeWorkerEvent::UnusedSampleCleanupCommittedWithWarning {
-                                warning: Box::new(reason),
-                            },
-                        )
-                    } else {
-                        publish_failure(
-                            events,
-                            IdeWorkerCommandKind::CleanUnusedSamples,
-                            IdeWorkerCommandFailure::UnusedSampleCleanup(Box::new(reason)),
-                        )
-                    }
+                    send_event(events, unused_sample_cleanup_failure_event(reason))
                 }
                 ProjectMutationAttempt::AddArrangementPlacement {
                     start_tick,
@@ -11160,6 +11160,35 @@ mod tests {
             IdeWorkerEvent::AudioClipRenamed { changed: true, .. }
         ));
 
+        let stale = IdeUnusedSampleCleanupSummary::new(
+            *cleanup.project_identity(),
+            cleanup.project_revision() + 1,
+            cleanup.assets(),
+            cleanup.bytes(),
+        );
+        worker
+            .try_send(IdeWorkerCommand::CleanUnusedSamples {
+                confirmation: stale,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::UnusedSampleCleanupStarting { assets: 1, bytes }
+                if bytes == cleanup.bytes()
+        ));
+        let IdeWorkerEvent::Running(after_refusal) = recv(worker) else {
+            panic!("the unchanged project must reopen after stale cleanup refusal");
+        };
+        assert_eq!(after_refusal.unused_sample_cleanup(), cleanup);
+        assert!(matches!(
+            recv(worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::CleanUnusedSamples,
+                reason: IdeWorkerCommandFailure::UnusedSampleCleanup(reason),
+            } if matches!(*reason, IdeUnusedSampleCleanupError::StaleConfirmation)
+        ));
+        let cleanup = after_refusal.unused_sample_cleanup();
+
         worker
             .try_send(IdeWorkerCommand::CleanUnusedSamples {
                 confirmation: cleanup,
@@ -14659,6 +14688,68 @@ mod tests {
             audio_clip_removal_failure_event(IdeAudioClipRemovalError::InvalidClipIdentity),
             IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::RemoveAudioClip,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn committed_unused_sample_cleanup_warning_invalidates_history_and_stays_truthful() {
+        let committed_warning = || {
+            IdeUnusedSampleCleanupError::PublicationCommittedWithWarning(
+                crate::IdeUnusedSampleCleanupCommittedWarning::new(std::io::Error::other(
+                    "simulated cleanup warning",
+                )),
+            )
+        };
+        let attempt = ProjectMutationAttempt::CleanUnusedSamples(Err(committed_warning()));
+        assert!(matches!(history_effect(&attempt), HistoryEffect::Invalidate));
+
+        let (events, receiver) = std::sync::mpsc::sync_channel(8);
+        let mut history = UndoHistory::default();
+        history.record_edit(labelled("scene", "scene rename"));
+        history.record_restore(false, labelled("undone", "clip gain"));
+        observe_history(
+            &mut history,
+            &attempt,
+            IdeWorkerCommandKind::CleanUnusedSamples,
+            &events,
+        );
+        assert!(history.undo.is_empty() && history.redo.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: None,
+            })
+        ));
+        assert!(matches!(
+            unused_sample_cleanup_failure_event(committed_warning()),
+            IdeWorkerEvent::UnusedSampleCleanupCommittedWithWarning { warning }
+                if warning.publication_committed()
+                    && warning.to_string().contains("sample media was removed")
+        ));
+
+        let reopen = project_mutation_reopen_failure(
+            ProjectMutationAttempt::CleanUnusedSamples(Err(committed_warning())),
+            IdeProjectOpenError::SelectedOutputUnavailable,
+        );
+        assert!(matches!(
+            reopen,
+            IdeWorkerCommandFailure::UnusedSampleCleanup(reason)
+                if reason.publication_committed()
+                    && reason.to_string().contains("was removed")
+                    && reason.to_string().contains("could not be reopened")
+        ));
+
+        let unpublished = ProjectMutationAttempt::CleanUnusedSamples(Err(
+            IdeUnusedSampleCleanupError::StaleConfirmation,
+        ));
+        assert!(matches!(history_effect(&unpublished), HistoryEffect::None));
+        assert!(matches!(
+            unused_sample_cleanup_failure_event(IdeUnusedSampleCleanupError::StaleConfirmation),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::CleanUnusedSamples,
                 ..
             }
         ));

@@ -11851,6 +11851,11 @@ mod tests {
             move |_, command| submitted_by_callback.borrow_mut().push(command),
         );
 
+        ui.set_app_mode(AppMode::Closed);
+        ui.set_unused_sample_cleanup_confirming(true);
+        ui.global::<IdeActions>().invoke_clean_unused_samples();
+        assert!(submitted.borrow().is_empty());
+
         ui.set_app_mode(AppMode::Running);
         ui.set_unused_sample_assets(2);
         ui.set_unused_sample_bytes("4096 bytes".into());
@@ -11859,6 +11864,27 @@ mod tests {
         assert!(submitted.borrow().is_empty());
         assert!(ui.get_error_text().contains("no longer current"));
 
+        bind_unused_sample_cleanup_callback_with(ui, || None, |_, _| {
+            panic!("missing cleanup authority must not submit")
+        });
+        ui.set_unused_sample_cleanup_confirming(true);
+        ui.global::<IdeActions>().invoke_clean_unused_samples();
+        assert!(ui.get_error_text().contains("authority is unavailable"));
+
+        bind_unused_sample_cleanup_callback_with(
+            ui,
+            || Some(IdeUnusedSampleCleanupSummary::new([7; 32], 9, 0, 0)),
+            |_, _| panic!("empty cleanup authority must not submit"),
+        );
+        ui.global::<IdeActions>().invoke_clean_unused_samples();
+        assert!(ui.get_error_text().contains("no unused sample media"));
+
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_unused_sample_cleanup_callback_with(
+            ui,
+            move || Some(confirmation),
+            move |_, command| submitted_by_callback.borrow_mut().push(command),
+        );
         ui.set_error_text(SharedString::default());
         ui.set_unused_sample_cleanup_confirming(true);
         ui.global::<IdeActions>().invoke_clean_unused_samples();

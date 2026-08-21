@@ -2751,12 +2751,42 @@ impl IdeUnusedSampleCleanupSummary {
 }
 
 #[derive(Debug)]
+pub struct IdeUnusedSampleCleanupCommittedWarning {
+    source: Box<dyn Error + Send + Sync>,
+}
+
+impl IdeUnusedSampleCleanupCommittedWarning {
+    fn new(source: impl Error + Send + Sync + 'static) -> Self {
+        Self {
+            source: Box::new(source),
+        }
+    }
+}
+
+impl fmt::Display for IdeUnusedSampleCleanupCommittedWarning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "unused sample media was removed, but verification or transaction recovery is incomplete: {}",
+            self.source
+        )
+    }
+}
+
+impl Error for IdeUnusedSampleCleanupCommittedWarning {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[derive(Debug)]
 pub enum IdeUnusedSampleCleanupError {
     Empty,
     StaleConfirmation,
     CapacityUnavailable,
     MixerSave(Box<IdeProjectSaveError>),
     Publication(Box<ProjectResourcePublicationError>),
+    PublicationCommittedWithWarning(IdeUnusedSampleCleanupCommittedWarning),
     NativeClose(IdeNativeCloseFailure),
     ReopenAfterPublication {
         outcome: SampleCleanupOutcome,
@@ -2772,8 +2802,7 @@ impl IdeUnusedSampleCleanupError {
     #[must_use]
     pub fn publication_committed(&self) -> bool {
         match self {
-            Self::Publication(source) => source.published(),
-            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationCommittedWithWarning(_) | Self::ReopenAfterPublication { .. } => true,
             Self::ReopenAfterFailure { cleanup, .. } => cleanup.publication_committed(),
             _ => false,
         }
@@ -2794,11 +2823,8 @@ impl fmt::Display for IdeUnusedSampleCleanupError {
                 formatter,
                 "live mixer state could not be preserved: {source}"
             ),
-            Self::Publication(source) if source.published() => write!(
-                formatter,
-                "unused sample media was removed, but verification or transaction recovery is incomplete: {source}"
-            ),
             Self::Publication(source) => source.fmt(formatter),
+            Self::PublicationCommittedWithWarning(source) => source.fmt(formatter),
             Self::NativeClose(source) => write!(
                 formatter,
                 "native playback did not close cleanly before unused-media cleanup: {source:?}"
@@ -2828,6 +2854,7 @@ impl Error for IdeUnusedSampleCleanupError {
         match self {
             Self::MixerSave(source) => Some(source.as_ref()),
             Self::Publication(source) => Some(source.as_ref()),
+            Self::PublicationCommittedWithWarning(source) => Some(source),
             Self::ReopenAfterPublication { source, .. }
             | Self::ReopenAfterFailure { source, .. } => Some(source.as_ref()),
             Self::Empty
@@ -5918,7 +5945,15 @@ impl IdeUnusedSampleCleanupPlan {
                 asset_ids: &self.asset_ids,
             },
         )
-        .map_err(|source| IdeUnusedSampleCleanupError::Publication(Box::new(source)))
+        .map_err(|source| {
+            if source.published() {
+                IdeUnusedSampleCleanupError::PublicationCommittedWithWarning(
+                    IdeUnusedSampleCleanupCommittedWarning::new(source),
+                )
+            } else {
+                IdeUnusedSampleCleanupError::Publication(Box::new(source))
+            }
+        })
     }
 }
 
