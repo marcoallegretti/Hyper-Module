@@ -44,6 +44,7 @@ use hyper_desktop_ide::{
     IdeArrangementPlacementEditError, IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError,
     IdeAudioClipLoopEditError, IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError,
     IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome, IdeAudioImportError,
+    IdeAutomationTakeEditError,
     IdeSceneCreationError, IdeSceneDuplicationError, IdeSceneRenameError, IdeSceneSlotEditError,
     IdeWorkerCommandFailure,
 };
@@ -104,6 +105,7 @@ struct ProjectUiState {
     scenes: RefCell<Vec<IdeScene>>,
     scene_launch_evidence: RefCell<SceneLaunchEvidence>,
     automation_channels: RefCell<Vec<MixerChannelFacts>>,
+    automation_take_ids: RefCell<Vec<String>>,
     control_targets: RefCell<Vec<ControlTargetChoice>>,
     unused_sample_cleanup: Cell<Option<IdeUnusedSampleCleanupSummary>>,
     native_filter_tracks: RefCell<Vec<String>>,
@@ -2032,6 +2034,7 @@ fn bind_arrangement_scene_launch_callback(
     bind_arrangement_scene_launch_move_callback(ui, worker, project_state);
     bind_automation_take_callback(ui, worker, project_state);
     bind_automation_take_activation_callback(ui, worker);
+    bind_automation_take_removal_callback(ui, worker, project_state);
     bind_control_mapping_callbacks(ui, worker, project_state);
     bind_project_export_callback(ui, worker);
     bind_undo_callbacks(ui, worker);
@@ -3520,6 +3523,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::SetAutomationTakeActive => {
             AppMode::ChangingAutomationTakeActivation
         }
+        IdeWorkerCommandKind::RemoveAutomationTake => AppMode::RemovingAutomationTake,
         IdeWorkerCommandKind::EditControlMapping => AppMode::EditingControlMapping,
         IdeWorkerCommandKind::EditNativeFilter => AppMode::EditingNativeFilter,
         IdeWorkerCommandKind::ExportProject => AppMode::ExportingProject,
@@ -3685,6 +3689,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetAutomationTakeActive => {
             "Preserving mixer state, editing the automation take, and reopening project..."
+        }
+        IdeWorkerCommandKind::RemoveAutomationTake => {
+            "Preserving mixer state, removing the automation take, and reopening project..."
         }
         IdeWorkerCommandKind::EditControlMapping => {
             "Preserving mixer state, editing control mappings, and reopening project..."
@@ -3960,6 +3967,11 @@ fn apply_event(
         | IdeWorkerEvent::AutomationTakeActivationCommittedWithWarning { .. }
         | IdeWorkerEvent::AutomationTakeActivationChanging { .. }) => {
             apply_automation_take_activation_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AutomationTakeRemoved { .. }
+        | IdeWorkerEvent::AutomationTakeRemovalCommittedWithWarning { .. }
+        | IdeWorkerEvent::AutomationTakeRemoving { .. }) => {
+            apply_automation_take_removal_event(ui, &event);
         }
         event @ (IdeWorkerEvent::ControlMappingEdited { .. }
         | IdeWorkerEvent::ControlMappingEditCommittedWithWarning { .. }
@@ -6605,6 +6617,7 @@ fn reset_project(
     ui.set_unused_sample_cleanup_confirming(false);
     project_state.scenes.borrow_mut().clear();
     project_state.automation_channels.borrow_mut().clear();
+    project_state.automation_take_ids.borrow_mut().clear();
     project_state.control_targets.borrow_mut().clear();
     project_state.scene_launch_evidence.borrow_mut().clear();
     ui.set_transport_extent_bounded(false);
@@ -6753,6 +6766,11 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         }
         IdeWorkerCommandKind::SetAutomationTakeActive
             if current == AppMode::ChangingAutomationTakeActivation =>
+        {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::RemoveAutomationTake
+            if current == AppMode::RemovingAutomationTake =>
         {
             AppMode::Running
         }
@@ -7805,6 +7823,8 @@ fn set_automation(
     let channels = mixer_channel_facts(observation.mixer_channels());
     set_automation_targets(ui, project_state, &channels);
     let owner = observation.automation();
+    *project_state.automation_take_ids.borrow_mut() =
+        owner.takes().iter().map(|take| take.id().to_owned()).collect();
     let choices = automation_target_choices(&channels);
     let labels = owner
         .takes()
@@ -8006,6 +8026,86 @@ fn bind_automation_take_activation_callback(ui: &MainWindow, worker: &WorkerCell
             },
         );
     });
+}
+
+fn bind_automation_take_removal_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let worker_for_submitter = Rc::clone(worker);
+    bind_automation_take_removal_callback_with(
+        ui,
+        project_state,
+        Rc::new(move |ui, command| submit_to_ui(ui, &worker_for_submitter, command)),
+    );
+}
+
+fn bind_automation_take_removal_callback_with(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    submitter: UiCommandSubmitter,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let project_state_for_removal = Rc::clone(project_state);
+    actions.on_remove_automation_take(move |take_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let current = ui.get_automation_take_remove_confirming_id();
+        let authoritative = project_state_for_removal
+            .automation_take_ids
+            .borrow()
+            .iter()
+            .any(|id| id == take_id.as_str());
+        if ui.get_app_mode() != AppMode::Running
+            || take_id.is_empty()
+            || current != take_id
+            || !authoritative
+        {
+            ui.set_automation_take_remove_confirming_id(SharedString::default());
+            ui.set_error_text("Automation take removal request is no longer current".into());
+            return;
+        }
+        ui.set_automation_take_remove_confirming_id(SharedString::default());
+        submitter(
+            &ui,
+            IdeWorkerCommand::RemoveAutomationTake {
+                take_id: take_id.to_string(),
+            },
+        );
+    });
+}
+
+fn apply_automation_take_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AutomationTakeRemoved {
+            revision,
+            take_id: _,
+        } => {
+            ui.set_automation_take_remove_confirming_id(SharedString::default());
+            ui.set_status_text(
+                format!("Automation take removed in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AutomationTakeRemovalCommittedWithWarning { warning, .. } => {
+            ui.set_automation_take_remove_confirming_id(SharedString::default());
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), "Automation take removal").into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        IdeWorkerEvent::AutomationTakeRemoving { .. } => {
+            ui.set_automation_take_remove_confirming_id(SharedString::default());
+            ui.set_app_mode(AppMode::RemovingAutomationTake);
+            ui.set_status_text(
+                "Waiting for native output before removing the automation take…".into(),
+            );
+        }
+        _ => unreachable!("automation removal event dispatcher received another event"),
+    }
 }
 
 fn parse_automation_tick(value: &str) -> Result<u64, &'static str> {
@@ -9440,6 +9540,81 @@ mod tests {
         assert!(ui.get_error_text().is_empty());
 
         assert_native_filter_committed_warning(ui);
+    }
+
+    fn assert_automation_take_removal_window_contract(ui: &MainWindow) {
+        let take_id = "018f47a2-6b2d-7c11-8a44-0011223344a0";
+        let project_state = Rc::new(ProjectUiState::default());
+        project_state
+            .automation_take_ids
+            .borrow_mut()
+            .push(take_id.to_owned());
+        ui.set_automation_takes(ModelRc::from(Rc::new(VecModel::from(vec![
+            AutomationTakeRow {
+                id: take_id.into(),
+                name: "Main fade".into(),
+                enabled: true,
+                range: "TICK 0 to 960".into(),
+                target: "Main gain".into(),
+                interpolation: "Linear".into(),
+                points: "2 points".into(),
+            },
+        ]))));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_automation_take_removal_callback_with(
+            ui,
+            &project_state,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+        let actions = ui.global::<IdeActions>();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_automation_take_remove_confirming_id(take_id.into());
+        actions.invoke_remove_automation_take(take_id.into());
+        assert!(ui.get_automation_take_remove_confirming_id().is_empty());
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::RemoveAutomationTake { take_id: observed }]
+                if observed == take_id
+        ));
+
+        ui.set_automation_take_remove_confirming_id("stale".into());
+        actions.invoke_remove_automation_take(take_id.into());
+        ui.set_app_mode(AppMode::Closed);
+        ui.set_automation_take_remove_confirming_id(take_id.into());
+        actions.invoke_remove_automation_take(take_id.into());
+        ui.set_app_mode(AppMode::Running);
+        project_state.automation_take_ids.borrow_mut().clear();
+        ui.set_automation_take_remove_confirming_id(take_id.into());
+        actions.invoke_remove_automation_take(take_id.into());
+        assert_eq!(submitted.borrow().len(), 1);
+        assert!(ui.get_error_text().contains("no longer current"));
+
+        apply_automation_take_removal_event(
+            ui,
+            &IdeWorkerEvent::AutomationTakeRemoving {
+                take_id: take_id.to_owned(),
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::RemovingAutomationTake);
+        apply_automation_take_removal_event(
+            ui,
+            &IdeWorkerEvent::AutomationTakeRemoved {
+                revision: 7,
+                take_id: take_id.to_owned(),
+            },
+        );
+        assert!(ui.get_status_text().contains("revision 7"));
+        assert!(ui.get_error_text().is_empty());
+        apply_automation_take_removal_event(
+            ui,
+            &IdeWorkerEvent::AutomationTakeRemovalCommittedWithWarning {
+                take_id: take_id.to_owned(),
+                warning: Box::new(IdeAutomationTakeEditError::TakeUnavailable),
+            },
+        );
+        assert!(ui.get_status_text().contains("committed"));
+        assert!(ui.get_error_text().contains("unavailable"));
     }
 
     fn assert_native_filter_committed_warning(ui: &MainWindow) {
@@ -12164,6 +12339,7 @@ mod tests {
         assert_audio_clip_removal_window_contract(ui);
         assert_unused_sample_cleanup_window_contract(ui);
         assert_native_filter_window_contract(ui);
+        assert_automation_take_removal_window_contract(ui);
     }
 
     fn assert_recent_project_window_contract(ui: &MainWindow) {
