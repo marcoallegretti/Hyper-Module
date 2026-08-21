@@ -1,4 +1,4 @@
-import { Button, HorizontalBox, ListView, ScrollView, VerticalBox } from "std-widgets.slint";
+import { Button, HorizontalBox, ListView, ScrollView, Slider, VerticalBox } from "std-widgets.slint";
 
 export struct OperatorSceneRow {
     name: string,
@@ -10,6 +10,8 @@ export struct OperatorSceneRow {
 
 export struct OperatorMixerRow {
     name: string,
+    gain-percent: float,
+    pan-percent: float,
     muted: bool,
     soloed: bool,
     controls-enabled: bool,
@@ -111,35 +113,63 @@ component SceneLaunchTile inherits Rectangle {
 
 component MixerChannelRow inherits Rectangle {
     in property <string> name;
+    in property <float> gain-percent;
+    in property <float> pan-percent;
     in property <bool> muted;
     in property <bool> soloed;
     in property <bool> controls-enabled;
     in property <bool> solo-available;
     callback mute-requested();
     callback solo-requested();
-    min-height: 38px;
+    callback gain-requested(float);
+    callback pan-requested(float);
+    min-height: 74px;
     background: #111620;
     border-color: #2c3445;
     border-width: 1px;
     border-radius: 5px;
 
-    HorizontalLayout {
+    VerticalLayout {
         padding: 6px;
-        spacing: 7px;
-        Text { text: root.name; color: #edf2f8; font-size: 11px; font-weight: 700; overflow: elide; }
-        Button {
-            text: root.muted ? "Unmute" : "Mute";
-            accessible-label: (root.muted ? "Unmute " : "Mute ") + root.name;
-            enabled: root.controls-enabled;
-            clicked => { root.mute-requested(); }
+        spacing: 5px;
+        HorizontalLayout {
+            spacing: 7px;
+            Text { text: root.name; color: #edf2f8; font-size: 11px; font-weight: 700; overflow: elide; }
+            Button {
+                text: root.muted ? "Unmute" : "Mute";
+                accessible-label: (root.muted ? "Unmute " : "Mute ") + root.name;
+                enabled: root.controls-enabled;
+                clicked => { root.mute-requested(); }
+            }
+            Button {
+                text: root.soloed ? "Unsolo" : "Solo";
+                accessible-label: root.solo-available
+                    ? (root.soloed ? "Unsolo " : "Solo ") + root.name
+                    : "Solo unavailable for " + root.name;
+                enabled: root.controls-enabled && root.solo-available;
+                clicked => { root.solo-requested(); }
+            }
         }
-        Button {
-            text: root.soloed ? "Unsolo" : "Solo";
-            accessible-label: root.solo-available
-                ? (root.soloed ? "Unsolo " : "Solo ") + root.name
-                : "Solo unavailable for " + root.name;
-            enabled: root.controls-enabled && root.solo-available;
-            clicked => { root.solo-requested(); }
+        HorizontalLayout {
+            spacing: 7px;
+            Text { text: "GAIN " + Math.round(root.gain-percent) + "%"; color: #8d99ad; font-size: 9px; width: 68px; }
+            Slider {
+                minimum: 0;
+                maximum: 200;
+                value: root.gain-percent;
+                enabled: root.controls-enabled;
+                accessible-label: root.name + " live gain";
+                released(value) => { root.gain-requested(value); }
+            }
+            Text { text: "PAN " + Math.round(root.pan-percent); color: #8d99ad; font-size: 9px; width: 58px; }
+            Slider {
+                minimum: -100;
+                maximum: 100;
+                value: root.pan-percent;
+                enabled: root.controls-enabled;
+                accessible-label: root.name + " live pan";
+                released(value) => { root.pan-requested(value); }
+            }
         }
     }
 }
@@ -192,6 +222,7 @@ export component OperatorWindow inherits Window {
     in property <[OperatorSceneRow]> scenes;
     in property <string> scene-feedback;
     in property <[OperatorMixerRow]> mixer-channels;
+    in property <float> main-gain-percent: 0;
     in property <bool> main-muted: false;
     in property <bool> main-mute-enabled: false;
     in property <string> mixer-state: "Mixer state unavailable";
@@ -210,6 +241,9 @@ export component OperatorWindow inherits Window {
     callback confirm-loudness-reset();
     callback toggle-mixer-channel-mute-requested(int);
     callback toggle-mixer-channel-solo-requested(int);
+    callback set-mixer-channel-gain-requested(int, float);
+    callback set-mixer-channel-pan-requested(int, float);
+    callback set-main-gain-requested(float);
     callback toggle-main-mute-requested();
     callback launch-scene-requested(int);
     callback quit-requested();
@@ -348,7 +382,7 @@ export component OperatorWindow inherits Window {
             border-color: #2c3445;
             border-width: 1px;
             border-radius: 8px;
-            min-height: 162px;
+            min-height: 278px;
             VerticalLayout {
                 padding: 12px;
                 spacing: 7px;
@@ -356,6 +390,20 @@ export component OperatorWindow inherits Window {
                     Text { text: "LIVE MIXER · SESSION ONLY"; color: #8d99ad; font-size: 11px; font-weight: 700; }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
                     Text { text: root.mixer-state; color: #8d99ad; font-size: 10px; overflow: elide; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Text { text: "MAIN " + Math.round(root.main-gain-percent) + "%"; color: #8d99ad; font-size: 9px; }
+                    Slider {
+                        width: 128px;
+                        minimum: 0;
+                        maximum: 200;
+                        value: root.main-gain-percent;
+                        enabled: root.main-mute-enabled;
+                        accessible-label: "Main live gain";
+                        released(value) => { root.set-main-gain-requested(value); }
+                    }
                     Button {
                         text: root.main-muted ? "Unmute main" : "Mute main";
                         accessible-label: self.text;
@@ -364,15 +412,19 @@ export component OperatorWindow inherits Window {
                     }
                 }
                 ListView {
-                    height: 112px;
+                    height: 192px;
                     for channel[index] in root.mixer-channels : MixerChannelRow {
                         name: (index + 1) + " · " + channel.name;
+                        gain-percent: channel.gain-percent;
+                        pan-percent: channel.pan-percent;
                         muted: channel.muted;
                         soloed: channel.soloed;
                         controls-enabled: channel.controls-enabled;
                         solo-available: channel.solo-available;
                         mute-requested => { root.toggle-mixer-channel-mute-requested(index); }
                         solo-requested => { root.toggle-mixer-channel-solo-requested(index); }
+                        gain-requested(value) => { root.set-mixer-channel-gain-requested(index, value); }
+                        pan-requested(value) => { root.set-mixer-channel-pan-requested(index, value); }
                     }
                 }
             }
