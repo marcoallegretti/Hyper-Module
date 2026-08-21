@@ -57,6 +57,23 @@ component OutputMeterBar inherits Rectangle {
     }
 }
 
+component LoudnessValue inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    background: #111620;
+    border-color: #2c3445;
+    border-width: 1px;
+    border-radius: 5px;
+    min-height: 48px;
+
+    VerticalLayout {
+        padding: 7px;
+        spacing: 3px;
+        Text { text: root.label; color: #69778c; font-size: 9px; font-weight: 700; }
+        Text { text: root.value; color: #edf2f8; font-size: 12px; overflow: elide; }
+    }
+}
+
 component SceneLaunchTile inherits Rectangle {
     in property <string> name;
     in property <string> status;
@@ -87,7 +104,7 @@ component SceneLaunchTile inherits Rectangle {
 export component OperatorWindow inherits Window {
     title: "Hyper Runtime";
     width: 880px;
-    height: 806px;
+    height: 948px;
     background: #0d1016;
 
     in property <string> project-name;
@@ -117,6 +134,18 @@ export component OperatorWindow inherits Window {
     in property <bool> output-overload-latched;
     in property <string> output-meter-state;
     in property <string> output-meter-telemetry;
+    in property <string> loudness-state: "UNAVAILABLE";
+    in property <string> loudness-momentary: "— LUFS";
+    in property <string> loudness-short-term: "— LUFS";
+    in property <string> loudness-integrated: "— LUFS";
+    in property <string> loudness-range: "— LU";
+    in property <string> loudness-maximum-true-peak: "— dBTP";
+    in property <string> loudness-programme-time: "00:00:00.000";
+    in property <string> loudness-lra-status: "Waiting for final-output evidence";
+    in property <bool> loudness-run-enabled: false;
+    in property <bool> loudness-standby-enabled: false;
+    in property <bool> loudness-reset-enabled: false;
+    in-out property <bool> loudness-reset-confirming: false;
     in property <[OperatorSceneRow]> scenes;
     in property <string> scene-feedback;
     in property <string> diagnostic;
@@ -126,6 +155,9 @@ export component OperatorWindow inherits Window {
     callback return-to-start-requested();
     callback toggle-loop-requested();
     callback reset-output-peak-requested();
+    callback loudness-run-requested();
+    callback loudness-standby-requested();
+    callback loudness-reset-requested();
     callback launch-scene-requested(int);
     callback quit-requested();
 
@@ -200,6 +232,44 @@ export component OperatorWindow inherits Window {
                     peak-reading: root.right-output-peak-reading;
                 }
                 Text { text: root.output-meter-telemetry; color: #69778c; font-size: 10px; overflow: elide; }
+            }
+        }
+
+        Rectangle {
+            background: #171b24;
+            border-color: #2c3445;
+            border-width: 1px;
+            border-radius: 8px;
+            min-height: 124px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 7px;
+                HorizontalLayout {
+                    Text { text: "PROGRAMME LOUDNESS · EBU +9"; color: #8d99ad; font-size: 11px; font-weight: 700; }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Text { text: root.loudness-state; color: root.loudness-state == "RUNNING" ? #3ddc97 : root.loudness-state == "STANDBY" ? #f5b83d : #8d99ad; font-size: 10px; font-weight: 700; }
+                    if !root.loudness-reset-confirming : HorizontalLayout {
+                        spacing: 5px;
+                        Button { text: "Run"; enabled: root.loudness-run-enabled; clicked => { root.loudness-run-requested(); } }
+                        Button { text: "Standby"; enabled: root.loudness-standby-enabled; clicked => { root.loudness-standby-requested(); } }
+                        Button { text: "Reset programme"; enabled: root.loudness-reset-enabled; clicked => { root.loudness-reset-confirming = true; } }
+                    }
+                    if root.loudness-reset-confirming : HorizontalLayout {
+                        spacing: 5px;
+                        Text { text: "Clear programme history?"; color: #f5b83d; font-size: 10px; vertical-alignment: center; }
+                        Button { text: "Cancel"; clicked => { root.loudness-reset-confirming = false; } }
+                        Button { text: "Confirm reset"; enabled: root.loudness-reset-enabled; clicked => { root.loudness-reset-confirming = false; root.loudness-reset-requested(); } }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 7px;
+                    LoudnessValue { label: "M · 400 MS"; value: root.loudness-momentary; }
+                    LoudnessValue { label: "S · 3 S"; value: root.loudness-short-term; }
+                    LoudnessValue { label: "I · GATED"; value: root.loudness-integrated; }
+                    LoudnessValue { label: "LOUDNESS RANGE"; value: root.loudness-range; }
+                    LoudnessValue { label: "MAX TRUE PEAK"; value: root.loudness-maximum-true-peak; }
+                }
+                Text { text: "Programme " + root.loudness-programme-time + " · " + root.loudness-lra-status; color: #69778c; font-size: 10px; overflow: elide; }
             }
         }
 

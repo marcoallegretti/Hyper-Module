@@ -14,6 +14,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+hyper-audio-engine = { path = "../../../crates/audio-engine" }
 hyper-audio-source = { path = "../../../crates/audio-source" }
 hyper-control-runtime = { path = "../control-runtime" }
 hyper-desktop-audio = { path = "../../IDE/audio-backend" }

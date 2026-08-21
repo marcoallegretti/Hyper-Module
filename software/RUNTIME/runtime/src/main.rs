@@ -12,6 +12,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use hyper_audio_engine::{LoudnessMeasurementCommand, LoudnessMeasurementState};
 use hyper_audio_source::DecodeLimits;
 use hyper_control_runtime::{
     PanelBinding, PanelConnectError, PanelConnection, PanelDispatchError, PanelDispatchOutcome,
@@ -23,10 +24,11 @@ use hyper_desktop_audio::{
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
-    ChannelSamplePeakBallistics, LocateState, OutputMeterReceiver, PlaybackCycleObservation,
-    PlaybackRecoveryCheckpoint, PlaybackRecoveryTransportState, SamplePeakBallisticsConfig,
-    StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot, TransportCommand,
-    TransportLoopRange,
+    ChannelSamplePeakBallistics, EbuLoudnessPresentationConfig, LoudnessPresentationSnapshot,
+    LoudnessScaleRegion, LocateState, MaximumTruePeakDisplay, OutputMeterReceiver,
+    PlaybackCycleObservation, PlaybackRecoveryCheckpoint, PlaybackRecoveryTransportState,
+    SamplePeakBallisticsConfig, ScaledLoudnessValue, StereoSamplePeakBallistics,
+    StereoSamplePeakBallisticsSnapshot, TransportCommand, TransportLoopRange,
 };
 use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
 use hyper_playback_json::LoaderLimits;
@@ -174,6 +176,7 @@ struct OperatorMeterObserver {
     receiver: OutputMeterReceiver,
     ballistics: StereoSamplePeakBallistics,
     latest: Option<StereoSamplePeakBallisticsSnapshot>,
+    latest_loudness: Option<LoudnessPresentationSnapshot>,
     peak_hold_available: bool,
     coalesced_snapshot_count: u64,
     dropped_snapshot_count: u64,
@@ -186,6 +189,7 @@ impl OperatorMeterObserver {
             receiver,
             ballistics: StereoSamplePeakBallistics::new(config),
             latest: None,
+            latest_loudness: None,
             peak_hold_available: false,
             coalesced_snapshot_count: 0,
             dropped_snapshot_count: 0,
@@ -203,6 +207,11 @@ impl OperatorMeterObserver {
             .dropped_snapshot_count
             .saturating_add(u64::try_from(latest.dropped_snapshot_count()).unwrap_or(u64::MAX));
         self.sender_disconnected |= latest.sender_disconnected();
+        if let Some(snapshot) = latest.snapshot() {
+            self.latest_loudness = Some(
+                snapshot.present_loudness(EbuLoudnessPresentationConfig::default()),
+            );
+        }
         if let Some(snapshot) = read.ballistics() {
             self.latest = Some(snapshot);
             self.peak_hold_available = true;
@@ -213,6 +222,7 @@ impl OperatorMeterObserver {
             self.coalesced_snapshot_count,
             self.dropped_snapshot_count,
             self.sender_disconnected,
+            self.latest_loudness,
         )
     }
 
@@ -234,6 +244,8 @@ enum OperatorCommand {
     ReturnToStart,
     LaunchScene { scene_index: usize },
     SetLoopEnabled { enabled: bool },
+    SetLoudnessState { state: LoudnessMeasurementState },
+    ResetLoudness,
     Quit,
 }
 
@@ -247,6 +259,7 @@ const OPERATOR_COMMAND_CAPACITY: usize = 8;
 
 trait RuntimeOperatorControl {
     fn queue_transport(&mut self, command: TransportCommand) -> Result<(), String>;
+    fn queue_loudness(&mut self, command: LoudnessMeasurementCommand) -> Result<(), String>;
 }
 
 trait RuntimeOutputObservation {
@@ -263,6 +276,13 @@ impl RuntimeOperatorControl for SessionHost {
     fn queue_transport(&mut self, command: TransportCommand) -> Result<(), String> {
         self.session
             .try_send_transport_command(command)
+            .map_err(|error| error.to_string())
+    }
+
+    fn queue_loudness(&mut self, command: LoudnessMeasurementCommand) -> Result<(), String> {
+        self.session
+            .loudness_command_sender()
+            .try_send(command)
             .map_err(|error| error.to_string())
     }
 }
@@ -529,6 +549,29 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
                     Err(error) => diagnostic(format!("project loop toggle refused: {error}")),
                 }
             }
+            OperatorCommand::SetLoudnessState { state } => {
+                match host.queue_loudness(LoudnessMeasurementCommand::SetState(state)) {
+                    Ok(()) => diagnostic(match state {
+                        LoudnessMeasurementState::Running => {
+                            "programme loudness run queued".to_owned()
+                        }
+                        LoudnessMeasurementState::Standby => {
+                            "programme loudness standby queued".to_owned()
+                        }
+                    }),
+                    Err(error) => {
+                        diagnostic(format!("programme loudness state refused: {error}"));
+                    }
+                }
+            }
+            OperatorCommand::ResetLoudness => {
+                match host.queue_loudness(LoudnessMeasurementCommand::Reset) {
+                    Ok(()) => diagnostic("programme loudness reset queued".to_owned()),
+                    Err(error) => {
+                        diagnostic(format!("programme loudness reset refused: {error}"));
+                    }
+                }
+            }
             OperatorCommand::Quit => stop.store(true, Ordering::Release),
         }
     }
@@ -674,6 +717,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     )));
     let scene_model = Rc::new(VecModel::from(operator_scene_rows(&scenes)));
     let loop_authority = Rc::new(Cell::new(None));
+    let loudness_authority = Rc::new(Cell::new(None));
     ui.set_scenes(ModelRc::from(Rc::clone(&scene_model)));
 
     apply_static_facts(&ui, &observers.facts);
@@ -681,7 +725,13 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_stop(&ui, &commands_tx, &diagnostic);
     wire_operator_return_to_start(&ui, &commands_tx, &diagnostic);
     wire_operator_quit(&ui, &commands_tx, &stop, &diagnostic);
-    wire_operator_peak_reset(&ui, &meter_observer);
+    wire_operator_peak_reset(&ui, &meter_observer, &loudness_authority);
+    wire_operator_loudness_controls(
+        &ui,
+        &commands_tx,
+        &diagnostic,
+        &loudness_authority,
+    );
     wire_operator_scene_launch(&ui, &commands_tx, &diagnostic, &scenes);
     wire_operator_loop_toggle(&ui, &commands_tx, &diagnostic, &loop_authority);
 
@@ -693,13 +743,19 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &scene_model,
         false,
     );
-    apply_operator_meter_observation(&ui, &mut meter_observer.borrow_mut());
+    apply_operator_meter_observation(
+        &ui,
+        &mut meter_observer.borrow_mut(),
+        &loudness_authority,
+        false,
+    );
 
     let weak = ui.as_weak();
     let timer_observers = observers.clone();
     let timer_meter_observer = Rc::clone(&meter_observer);
     let timer_scene_model = Rc::clone(&scene_model);
     let timer_loop_authority = Rc::clone(&loop_authority);
+    let timer_loudness_authority = Rc::clone(&loudness_authority);
     let timer_diagnostic = Arc::clone(&diagnostic);
     let timer_close_error = Arc::clone(&completion_close_error);
     let mut completion_observed = false;
@@ -714,7 +770,14 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &timer_scene_model,
                 completion_observed,
             );
-            apply_operator_meter_observation(&ui, &mut timer_meter_observer.borrow_mut());
+            let terminal_latched = completion_observed
+                || timer_observers.output_status.state() == OutputStreamState::Failed;
+            apply_operator_meter_observation(
+                &ui,
+                &mut timer_meter_observer.borrow_mut(),
+                &timer_loudness_authority,
+                terminal_latched,
+            );
             if !completion_observed
                 && let Some(close_result) = apply_operator_worker_completion(
                     &ui,
@@ -738,6 +801,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
             {
                 completion_observed = true;
                 revoke_operator_loop_authority(&ui, &timer_loop_authority);
+                revoke_operator_loudness_authority(&ui, &timer_loudness_authority);
                 if let Err(error) = close_result {
                     set_first_error(&timer_close_error, error);
                 }
@@ -920,15 +984,92 @@ fn wire_operator_quit(
     });
 }
 
-fn wire_operator_peak_reset(ui: &OperatorWindow, observer: &Rc<RefCell<OperatorMeterObserver>>) {
+fn wire_operator_peak_reset(
+    ui: &OperatorWindow,
+    observer: &Rc<RefCell<OperatorMeterObserver>>,
+    loudness_authority: &Rc<Cell<Option<LoudnessMeasurementState>>>,
+) {
     let observer = Rc::clone(observer);
+    let loudness_authority = Rc::clone(loudness_authority);
     let weak = ui.as_weak();
     ui.on_reset_output_peak_requested(move || {
         let mut observer = observer.borrow_mut();
         observer.reset_peak_hold();
         if let Some(ui) = weak.upgrade() {
-            apply_operator_meter_observation(&ui, &mut observer);
+            let terminal_latched = loudness_authority.get().is_none();
+            apply_operator_meter_observation(
+                &ui,
+                &mut observer,
+                &loudness_authority,
+                terminal_latched,
+            );
         }
+    });
+}
+
+fn wire_operator_loudness_controls(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    authority: &Rc<Cell<Option<LoudnessMeasurementState>>>,
+) {
+    let run_sender = sender.clone();
+    let run_diagnostic = Arc::clone(diagnostic);
+    let run_authority = Rc::clone(authority);
+    ui.on_loudness_run_requested(move || {
+        if run_authority.get() != Some(LoudnessMeasurementState::Standby) {
+            set_diagnostic(
+                &run_diagnostic,
+                "programme loudness run refused: accepted standby state is unavailable".to_owned(),
+            );
+            return;
+        }
+        send_operator_command(
+            &run_sender,
+            OperatorCommand::SetLoudnessState {
+                state: LoudnessMeasurementState::Running,
+            },
+            &run_diagnostic,
+        );
+    });
+
+    let standby_sender = sender.clone();
+    let standby_diagnostic = Arc::clone(diagnostic);
+    let standby_authority = Rc::clone(authority);
+    ui.on_loudness_standby_requested(move || {
+        if standby_authority.get() != Some(LoudnessMeasurementState::Running) {
+            set_diagnostic(
+                &standby_diagnostic,
+                "programme loudness standby refused: accepted running state is unavailable"
+                    .to_owned(),
+            );
+            return;
+        }
+        send_operator_command(
+            &standby_sender,
+            OperatorCommand::SetLoudnessState {
+                state: LoudnessMeasurementState::Standby,
+            },
+            &standby_diagnostic,
+        );
+    });
+
+    let reset_sender = sender.clone();
+    let reset_diagnostic = Arc::clone(diagnostic);
+    let reset_authority = Rc::clone(authority);
+    ui.on_loudness_reset_requested(move || {
+        if reset_authority.get().is_none() {
+            set_diagnostic(
+                &reset_diagnostic,
+                "programme loudness reset refused: accepted state is unavailable".to_owned(),
+            );
+            return;
+        }
+        send_operator_command(
+            &reset_sender,
+            OperatorCommand::ResetLoudness,
+            &reset_diagnostic,
+        );
     });
 }
 
@@ -1144,6 +1285,17 @@ fn revoke_operator_loop_authority(
     ui.set_loop_toggle_enabled(false);
 }
 
+fn revoke_operator_loudness_authority(
+    ui: &OperatorWindow,
+    authority: &Cell<Option<LoudnessMeasurementState>>,
+) {
+    authority.set(None);
+    ui.set_loudness_run_enabled(false);
+    ui.set_loudness_standby_enabled(false);
+    ui.set_loudness_reset_enabled(false);
+    ui.set_loudness_reset_confirming(false);
+}
+
 fn apply_static_facts(ui: &OperatorWindow, facts: &RuntimeFacts) {
     ui.set_project_name(facts.project_name.clone().into());
     ui.set_project_identity(facts.project_id.clone().into());
@@ -1186,6 +1338,19 @@ struct OperatorMeterPresentation {
     overload_latched: bool,
     state: &'static str,
     telemetry: String,
+    loudness: OperatorLoudnessPresentation,
+}
+
+#[derive(Debug, PartialEq)]
+struct OperatorLoudnessPresentation {
+    state: &'static str,
+    momentary: String,
+    short_term: String,
+    integrated: String,
+    loudness_range: String,
+    maximum_true_peak: String,
+    programme_time: String,
+    lra_status: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1202,6 +1367,7 @@ fn operator_meter_presentation(
     coalesced_snapshot_count: u64,
     dropped_snapshot_count: u64,
     sender_disconnected: bool,
+    loudness: Option<LoudnessPresentationSnapshot>,
 ) -> OperatorMeterPresentation {
     let (left, right, frame) = snapshot.map_or_else(
         || {
@@ -1238,7 +1404,70 @@ fn operator_meter_presentation(
         telemetry: format!(
             "meter frame {frame} · {coalesced_snapshot_count} coalesced · {dropped_snapshot_count} dropped"
         ),
+        loudness: operator_loudness_presentation(loudness),
     }
+}
+
+fn operator_loudness_presentation(
+    snapshot: Option<LoudnessPresentationSnapshot>,
+) -> OperatorLoudnessPresentation {
+    let Some(snapshot) = snapshot else {
+        return OperatorLoudnessPresentation {
+            state: "UNAVAILABLE",
+            momentary: "— LUFS".to_owned(),
+            short_term: "— LUFS".to_owned(),
+            integrated: "— LUFS".to_owned(),
+            loudness_range: "— LU".to_owned(),
+            maximum_true_peak: "— dBTP".to_owned(),
+            programme_time: "00:00:00.000".to_owned(),
+            lra_status: "Waiting for final-output evidence".to_owned(),
+        };
+    };
+    let programme_time = format_transport_time(snapshot.programme_frame_count());
+    OperatorLoudnessPresentation {
+        state: match snapshot.state() {
+            LoudnessMeasurementState::Running => "RUNNING",
+            LoudnessMeasurementState::Standby => "STANDBY",
+        },
+        momentary: format_loudness(snapshot.momentary()),
+        short_term: format_loudness(snapshot.short_term()),
+        integrated: format_loudness(snapshot.integrated()),
+        loudness_range: snapshot
+            .loudness_range_lu()
+            .map_or_else(|| "— LU".to_owned(), |value| format!("{value:.1} LU")),
+        maximum_true_peak: format_maximum_true_peak(snapshot.maximum_true_peak()),
+        programme_time: programme_time.clone(),
+        lra_status: if snapshot.lra_stable() {
+            "Stable (60 s programme minimum)".to_owned()
+        } else {
+            format!("Stabilizing · {programme_time} / 00:01:00.000")
+        },
+    }
+}
+
+fn format_loudness(value: Option<ScaledLoudnessValue>) -> String {
+    value.map_or_else(
+        || "— LUFS".to_owned(),
+        |value| {
+            let bound = match value.region() {
+                LoudnessScaleRegion::Below => "<",
+                LoudnessScaleRegion::OnScale => "",
+                LoudnessScaleRegion::Above => ">",
+            };
+            format!("{bound}{:.1} LUFS", value.displayed())
+        },
+    )
+}
+
+fn format_maximum_true_peak(value: Option<MaximumTruePeakDisplay>) -> String {
+    value.map_or_else(
+        || "— dBTP".to_owned(),
+        |value| {
+            value
+                .displayed_dbtp()
+                .map_or_else(|| "−∞ dBTP".to_owned(), |dbtp| format!("{dbtp:.1} dBTP"))
+        },
+    )
 }
 
 fn operator_meter_channel_presentation(
@@ -1391,7 +1620,12 @@ fn apply_observations(
     cycle
 }
 
-fn apply_operator_meter_observation(ui: &OperatorWindow, observer: &mut OperatorMeterObserver) {
+fn apply_operator_meter_observation(
+    ui: &OperatorWindow,
+    observer: &mut OperatorMeterObserver,
+    loudness_authority: &Cell<Option<LoudnessMeasurementState>>,
+    terminal_latched: bool,
+) {
     let presentation = observer.observe();
     ui.set_left_output_level(presentation.left_level);
     ui.set_left_output_reading(presentation.left_reading.into());
@@ -1402,6 +1636,22 @@ fn apply_operator_meter_observation(ui: &OperatorWindow, observer: &mut Operator
     ui.set_output_overload_latched(presentation.overload_latched);
     ui.set_output_meter_state(presentation.state.into());
     ui.set_output_meter_telemetry(presentation.telemetry.into());
+    ui.set_loudness_state(presentation.loudness.state.into());
+    ui.set_loudness_momentary(presentation.loudness.momentary.into());
+    ui.set_loudness_short_term(presentation.loudness.short_term.into());
+    ui.set_loudness_integrated(presentation.loudness.integrated.into());
+    ui.set_loudness_range(presentation.loudness.loudness_range.into());
+    ui.set_loudness_maximum_true_peak(presentation.loudness.maximum_true_peak.into());
+    ui.set_loudness_programme_time(presentation.loudness.programme_time.into());
+    ui.set_loudness_lra_status(presentation.loudness.lra_status.into());
+    let authority = (!terminal_latched && !observer.sender_disconnected)
+        .then_some(observer.latest_loudness)
+        .flatten()
+        .map(LoudnessPresentationSnapshot::state);
+    loudness_authority.set(authority);
+    ui.set_loudness_run_enabled(authority == Some(LoudnessMeasurementState::Standby));
+    ui.set_loudness_standby_enabled(authority == Some(LoudnessMeasurementState::Running));
+    ui.set_loudness_reset_enabled(authority.is_some());
 }
 
 /// Enforces the process startup boundary: artifact acceptance and semantic
@@ -1752,6 +2002,7 @@ mod tests {
     #[derive(Default)]
     struct OperatorControl {
         commands: Vec<TransportCommand>,
+        loudness_commands: Vec<LoudnessMeasurementCommand>,
         reject: bool,
         disconnects: usize,
     }
@@ -1762,6 +2013,15 @@ mod tests {
                 Err("owner busy".to_owned())
             } else {
                 self.commands.push(command);
+                Ok(())
+            }
+        }
+
+        fn queue_loudness(&mut self, command: LoudnessMeasurementCommand) -> Result<(), String> {
+            if self.reject {
+                Err("owner busy".to_owned())
+            } else {
+                self.loudness_commands.push(command);
                 Ok(())
             }
         }
@@ -1824,6 +2084,12 @@ mod tests {
         sender
             .send(OperatorCommand::SetLoopEnabled { enabled: false })
             .unwrap();
+        sender
+            .send(OperatorCommand::SetLoudnessState {
+                state: LoudnessMeasurementState::Standby,
+            })
+            .unwrap();
+        sender.send(OperatorCommand::ResetLoudness).unwrap();
         let stop = AtomicBool::new(false);
         let mut owner = OperatorControl::default();
         let diagnostics = RefCell::new(Vec::new());
@@ -1847,6 +2113,13 @@ mod tests {
             ]
         );
         assert_eq!(
+            owner.loudness_commands,
+            [
+                LoudnessMeasurementCommand::SetState(LoudnessMeasurementState::Standby),
+                LoudnessMeasurementCommand::Reset,
+            ]
+        );
+        assert_eq!(
             diagnostics.into_inner(),
             [
                 "transport start queued",
@@ -1855,6 +2128,8 @@ mod tests {
                 "scene 4 launch queued",
                 "project loop enable queued",
                 "project loop disable queued",
+                "programme loudness standby queued",
+                "programme loudness reset queued",
             ]
         );
         assert!(!stop.load(Ordering::Acquire));
@@ -2141,8 +2416,23 @@ mod tests {
             meter_receiver,
             meter_config,
         )));
-        wire_operator_peak_reset(ui, &meter_observer);
-        apply_operator_meter_observation(ui, &mut meter_observer.borrow_mut());
+        let loudness_authority = Rc::new(Cell::new(None));
+        let (loudness_commands, loudness_command_receiver) =
+            std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        let loudness_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_peak_reset(ui, &meter_observer, &loudness_authority);
+        wire_operator_loudness_controls(
+            ui,
+            &loudness_commands,
+            &loudness_diagnostic,
+            &loudness_authority,
+        );
+        apply_operator_meter_observation(
+            ui,
+            &mut meter_observer.borrow_mut(),
+            &loudness_authority,
+            false,
+        );
 
         assert!(ui.get_left_output_level().abs() <= f32::EPSILON);
         assert_eq!(ui.get_left_output_reading().as_str(), "— dBFS");
@@ -2158,6 +2448,24 @@ mod tests {
         assert_eq!(
             ui.get_output_meter_telemetry().as_str(),
             "meter frame unavailable · 0 coalesced · 0 dropped"
+        );
+        assert_eq!(ui.get_loudness_state().as_str(), "UNAVAILABLE");
+        assert_eq!(ui.get_loudness_momentary().as_str(), "— LUFS");
+        assert_eq!(ui.get_loudness_short_term().as_str(), "— LUFS");
+        assert_eq!(ui.get_loudness_integrated().as_str(), "— LUFS");
+        assert_eq!(ui.get_loudness_range().as_str(), "— LU");
+        assert_eq!(ui.get_loudness_maximum_true_peak().as_str(), "— dBTP");
+        assert_eq!(ui.get_loudness_programme_time().as_str(), "00:00:00.000");
+        assert!(!ui.get_loudness_run_enabled());
+        assert!(!ui.get_loudness_standby_enabled());
+        assert!(!ui.get_loudness_reset_enabled());
+        ui.invoke_loudness_run_requested();
+        ui.invoke_loudness_standby_requested();
+        ui.invoke_loudness_reset_requested();
+        assert_eq!(loudness_command_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            loudness_diagnostic.lock().unwrap().as_str(),
+            "programme loudness reset refused: accepted state is unavailable"
         );
 
         let launched = transport
@@ -2227,7 +2535,12 @@ mod tests {
             ui.get_scene_feedback().as_str(),
             "Scene 1 was last launched"
         );
-        apply_operator_meter_observation(ui, &mut meter_observer.borrow_mut());
+        apply_operator_meter_observation(
+            ui,
+            &mut meter_observer.borrow_mut(),
+            &loudness_authority,
+            false,
+        );
         let first_left_peak = interleaved
             .iter()
             .step_by(2)
@@ -2264,6 +2577,15 @@ mod tests {
             ui.get_output_meter_telemetry().as_str(),
             "meter frame 480 · 0 coalesced · 0 dropped"
         );
+        assert_eq!(ui.get_loudness_state().as_str(), "RUNNING");
+        assert_eq!(ui.get_loudness_momentary().as_str(), "— LUFS");
+        assert_eq!(ui.get_loudness_short_term().as_str(), "— LUFS");
+        assert_eq!(ui.get_loudness_integrated().as_str(), "— LUFS");
+        assert_ne!(ui.get_loudness_maximum_true_peak().as_str(), "— dBTP");
+        assert_eq!(ui.get_loudness_programme_time().as_str(), "00:00:00.010");
+        assert!(!ui.get_loudness_run_enabled());
+        assert!(ui.get_loudness_standby_enabled());
+        assert!(ui.get_loudness_reset_enabled());
 
         transport
             .process_interleaved_cycle(
@@ -2273,7 +2595,12 @@ mod tests {
                 &mut meter_sender,
             )
             .unwrap();
-        apply_operator_meter_observation(ui, &mut meter_observer.borrow_mut());
+        apply_operator_meter_observation(
+            ui,
+            &mut meter_observer.borrow_mut(),
+            &loudness_authority,
+            false,
+        );
         let live_left_before_reset = ui.get_left_output_reading();
         let live_right_before_reset = ui.get_right_output_reading();
         let expected_left_after_falloff =
@@ -2324,7 +2651,12 @@ mod tests {
                 &mut meter_sender,
             )
             .unwrap();
-        apply_operator_meter_observation(ui, &mut meter_observer.borrow_mut());
+        apply_operator_meter_observation(
+            ui,
+            &mut meter_observer.borrow_mut(),
+            &loudness_authority,
+            false,
+        );
         let overload_left_peak = interleaved
             .iter()
             .step_by(2)
@@ -2364,15 +2696,123 @@ mod tests {
             "meter frame 1440 · 0 coalesced · 0 dropped"
         );
 
+        for _ in 0..297 {
+            transport
+                .process_interleaved_cycle(
+                    &mut callback,
+                    &mut scratch,
+                    &mut interleaved,
+                    &mut meter_sender,
+                )
+                .unwrap();
+            apply_operator_meter_observation(
+                ui,
+                &mut meter_observer.borrow_mut(),
+                &loudness_authority,
+                false,
+            );
+        }
+        assert_eq!(ui.get_loudness_state().as_str(), "RUNNING");
+        assert_ne!(ui.get_loudness_momentary().as_str(), "— LUFS");
+        assert_ne!(ui.get_loudness_short_term().as_str(), "— LUFS");
+        assert_ne!(ui.get_loudness_integrated().as_str(), "— LUFS");
+        assert_eq!(ui.get_loudness_programme_time().as_str(), "00:00:03.000");
+        assert_ne!(ui.get_loudness_range().as_str(), "— LU");
+        assert!(
+            ui.get_loudness_lra_status()
+                .as_str()
+                .starts_with("Stabilizing · 00:00:03.000")
+        );
+        let accepted_loudness = (
+            ui.get_loudness_momentary(),
+            ui.get_loudness_short_term(),
+            ui.get_loudness_integrated(),
+            ui.get_loudness_maximum_true_peak(),
+        );
+
+        ui.invoke_loudness_standby_requested();
+        assert_eq!(
+            loudness_command_receiver.try_recv(),
+            Ok(OperatorCommand::SetLoudnessState {
+                state: LoudnessMeasurementState::Standby,
+            })
+        );
+        ui.invoke_loudness_reset_requested();
+        assert_eq!(
+            loudness_command_receiver.try_recv(),
+            Ok(OperatorCommand::ResetLoudness)
+        );
+        assert_eq!(ui.get_loudness_state().as_str(), "RUNNING");
+        loudness_authority.set(Some(LoudnessMeasurementState::Standby));
+        ui.invoke_loudness_run_requested();
+        assert_eq!(
+            loudness_command_receiver.try_recv(),
+            Ok(OperatorCommand::SetLoudnessState {
+                state: LoudnessMeasurementState::Running,
+            })
+        );
+        assert_eq!(ui.get_loudness_state().as_str(), "RUNNING");
+
+        loudness_authority.set(Some(LoudnessMeasurementState::Running));
+        let (saturated_loudness_sender, saturated_loudness_receiver) =
+            std::sync::mpsc::sync_channel(1);
+        saturated_loudness_sender.send(OperatorCommand::Start).unwrap();
+        let saturated_loudness_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_loudness_controls(
+            ui,
+            &saturated_loudness_sender,
+            &saturated_loudness_diagnostic,
+            &loudness_authority,
+        );
+        ui.invoke_loudness_standby_requested();
+        assert_eq!(
+            saturated_loudness_receiver.try_recv(),
+            Ok(OperatorCommand::Start)
+        );
+        assert_eq!(
+            saturated_loudness_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        );
+        assert!(
+            saturated_loudness_diagnostic
+                .lock()
+                .unwrap()
+                .contains("operator command refused")
+        );
+        assert_eq!(
+            accepted_loudness,
+            (
+                ui.get_loudness_momentary(),
+                ui.get_loudness_short_term(),
+                ui.get_loudness_integrated(),
+                ui.get_loudness_maximum_true_peak(),
+            )
+        );
+
         drop(meter_sender);
-        apply_operator_meter_observation(ui, &mut meter_observer.borrow_mut());
+        apply_operator_meter_observation(
+            ui,
+            &mut meter_observer.borrow_mut(),
+            &loudness_authority,
+            false,
+        );
         assert_eq!(
             ui.get_output_meter_state().as_str(),
             "Final meter snapshot · producer ended"
         );
         assert_eq!(
             ui.get_output_meter_telemetry().as_str(),
-            "meter frame 1440 · 0 coalesced · 0 dropped"
+            "meter frame 144000 · 0 coalesced · 0 dropped"
+        );
+        assert_eq!(ui.get_loudness_state().as_str(), "RUNNING");
+        assert_eq!(loudness_authority.get(), None);
+        assert!(!ui.get_loudness_run_enabled());
+        assert!(!ui.get_loudness_standby_enabled());
+        assert!(!ui.get_loudness_reset_enabled());
+        ui.invoke_loudness_reset_requested();
+        assert_eq!(
+            saturated_loudness_receiver.try_recv(),
+            Err(TryRecvError::Empty)
         );
     }
 
@@ -2793,7 +3233,8 @@ mod tests {
         assert!(observer.sender_disconnected);
         assert!(observer.latest.is_none());
 
-        let unavailable = operator_meter_presentation(None, false, u64::MAX, u64::MAX - 1, true);
+        let unavailable =
+            operator_meter_presentation(None, false, u64::MAX, u64::MAX - 1, true, None);
         assert_eq!(unavailable.state, "Meter producer ended before a snapshot");
         assert!(!unavailable.overload_latched);
         assert_eq!(
