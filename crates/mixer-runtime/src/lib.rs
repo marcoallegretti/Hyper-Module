@@ -822,6 +822,16 @@ impl MixerParameterLayout {
             .ok_or(MixerParameterResolveError::ChannelNotFound)
     }
 
+    fn channel_supports_solo(
+        &self,
+        channel_index: usize,
+    ) -> Result<bool, MixerParameterResolveError> {
+        self.channels
+            .get(channel_index)
+            .map(|channel| channel.audio)
+            .ok_or(MixerParameterResolveError::ChannelNotFound)
+    }
+
     fn resolve_channel(
         &self,
         track_id: &str,
@@ -998,6 +1008,23 @@ impl MixerParameterCommandSender {
         channel_index: usize,
     ) -> Result<MixerChannelHandle, MixerParameterResolveError> {
         self.layout.resolve_channel_index(channel_index)
+    }
+
+    /// Reports whether one compiled mixer slot accepts live Solo commands.
+    ///
+    /// This capability is retained by the same immutable layout that resolves
+    /// the channel handle, so clients do not need to duplicate track-kind
+    /// policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MixerParameterResolveError::ChannelNotFound`] when
+    /// `channel_index` is outside the prepared mixer layout.
+    pub fn channel_supports_solo(
+        &self,
+        channel_index: usize,
+    ) -> Result<bool, MixerParameterResolveError> {
+        self.layout.channel_supports_solo(channel_index)
     }
 
     /// Resolves one persisted send identity into a handle bound to this runtime.

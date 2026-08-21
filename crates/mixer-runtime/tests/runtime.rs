@@ -11,12 +11,13 @@ use hyper_mixer_runtime::{
     GraphTransportRuntime, LocateState, LoudnessCommandSendError, LoudnessCommandSender,
     LoudnessDisplayUnit, MAX_QUEUED_LOUDNESS_COMMANDS, MAX_QUEUED_MIXER_PARAMETER_COMMANDS,
     MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, MixerParameterCommand,
-    MixerParameterCommandSendError, MixerParameterResolveError, MixerParameterStateRestoreError,
-    MixerParameterTargetError, OutputMeterPublication, OutputMeterReceiver, OutputMeterSender,
-    OutputMeterSnapshot, PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime,
-    RuntimeCreationError, RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig,
-    SceneLaunchState, StereoSamplePeakBallistics, TransportCommand, TransportCommandSendError,
-    TransportCycle, TransportLoopRange, TransportLoopRangeError, TransportOutputCreationError,
+    MixerChannelHandle, MixerParameterCommandSendError, MixerParameterCommandSender,
+    MixerParameterResolveError, MixerParameterStateRestoreError, MixerParameterTargetError,
+    OutputMeterPublication, OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot,
+    PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime, RuntimeCreationError,
+    RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig, SceneLaunchState,
+    StereoSamplePeakBallistics, TransportCommand, TransportCommandSendError, TransportCycle,
+    TransportLoopRange, TransportLoopRangeError, TransportOutputCreationError,
     TransportOutputProcessor, TransportState,
     loudness_command_channel, output_meter_channel, playback_recovery_channel,
 };
@@ -2045,6 +2046,25 @@ fn queued_transport_commands_preserve_fifo_order_across_threads() {
     sender.try_send(TransportCommand::Stop).unwrap();
 }
 
+fn assert_channel_solo_capabilities(
+    sender: &MixerParameterCommandSender,
+    audio: MixerChannelHandle,
+    group: MixerChannelHandle,
+) {
+    assert_eq!(
+        sender.channel_supports_solo(sender.channel_index(audio).unwrap()),
+        Ok(true)
+    );
+    assert_eq!(
+        sender.channel_supports_solo(sender.channel_index(group).unwrap()),
+        Ok(false)
+    );
+    assert_eq!(
+        sender.channel_supports_solo(usize::MAX),
+        Err(MixerParameterResolveError::ChannelNotFound)
+    );
+}
+
 #[test]
 fn live_mixer_command_queue_validates_targets_backpressure_and_disconnection() {
     let fixture = graph_fixture();
@@ -2055,6 +2075,7 @@ fn live_mixer_command_queue_validates_targets_backpressure_and_disconnection() {
     let source = sender.resolve_channel(GRAPH_SOURCE_TRACK_ID).unwrap();
     let group = sender.resolve_channel(GRAPH_GROUP_TRACK_ID).unwrap();
     let send_a = sender.resolve_send(GRAPH_SEND_A_ID).unwrap();
+    assert_channel_solo_capabilities(&sender, source, group);
     assert_eq!(
         sender.resolve_channel("missing"),
         Err(MixerParameterResolveError::ChannelNotFound)

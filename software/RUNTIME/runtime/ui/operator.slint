@@ -13,6 +13,7 @@ export struct OperatorMixerRow {
     muted: bool,
     soloed: bool,
     controls-enabled: bool,
+    solo-available: bool,
 }
 
 component FactCard inherits Rectangle {
@@ -113,6 +114,7 @@ component MixerChannelRow inherits Rectangle {
     in property <bool> muted;
     in property <bool> soloed;
     in property <bool> controls-enabled;
+    in property <bool> solo-available;
     callback mute-requested();
     callback solo-requested();
     min-height: 38px;
@@ -133,8 +135,10 @@ component MixerChannelRow inherits Rectangle {
         }
         Button {
             text: root.soloed ? "Unsolo" : "Solo";
-            accessible-label: (root.soloed ? "Unsolo " : "Solo ") + root.name;
-            enabled: root.controls-enabled;
+            accessible-label: root.solo-available
+                ? (root.soloed ? "Unsolo " : "Solo ") + root.name
+                : "Solo unavailable for " + root.name;
+            enabled: root.controls-enabled && root.solo-available;
             clicked => { root.solo-requested(); }
         }
     }
@@ -354,6 +358,7 @@ export component OperatorWindow inherits Window {
                     Text { text: root.mixer-state; color: #8d99ad; font-size: 10px; overflow: elide; }
                     Button {
                         text: root.main-muted ? "Unmute main" : "Mute main";
+                        accessible-label: self.text;
                         enabled: root.main-mute-enabled;
                         clicked => { root.toggle-main-mute-requested(); }
                     }
@@ -365,6 +370,7 @@ export component OperatorWindow inherits Window {
                         muted: channel.muted;
                         soloed: channel.soloed;
                         controls-enabled: channel.controls-enabled;
+                        solo-available: channel.solo-available;
                         mute-requested => { root.toggle-mixer-channel-mute-requested(index); }
                         solo-requested => { root.toggle-mixer-channel-solo-requested(index); }
                     }

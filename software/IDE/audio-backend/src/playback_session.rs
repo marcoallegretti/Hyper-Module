@@ -1607,6 +1607,18 @@ impl DesktopPlaybackSession {
         self.controls.resolve_channel_index(channel_index)
     }
 
+    /// Reports whether one compiled mixer channel accepts live Solo commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing-channel rejection for an out-of-range index.
+    pub fn mixer_channel_supports_solo(
+        &self,
+        channel_index: usize,
+    ) -> Result<bool, MixerParameterResolveError> {
+        self.controls.mixer().channel_supports_solo(channel_index)
+    }
+
     /// Resolves one track identity through this session's mixer layout.
     ///
     /// # Errors

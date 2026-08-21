@@ -41,3 +41,4 @@ slint-build = "=1.17.1"
 hyper-arrangement-renderer = { path = "../../../crates/arrangement-renderer" }
 hyper-audio-engine = { path = "../../../crates/audio-engine" }
 hyper-playback-compiler = { path = "../../../crates/playback-compiler" }
+i-slint-backend-testing = "=1.17.1"

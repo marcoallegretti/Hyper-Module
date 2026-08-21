@@ -173,6 +173,7 @@ struct OperatorMixerChannel {
     index: usize,
     name: String,
     handle: MixerChannelHandle,
+    solo_available: bool,
 }
 
 struct OperatorWorker {
@@ -280,6 +281,7 @@ struct OperatorMixerChannelAuthority {
     handle: MixerChannelHandle,
     muted: bool,
     solo: bool,
+    solo_available: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -689,6 +691,11 @@ fn operator_mixer_catalog(
                 .resolve_mixer_channel_index(index)
                 .map_err(|error| error.to_string())
         },
+        |index| {
+            session
+                .mixer_channel_supports_solo(index)
+                .map_err(|error| error.to_string())
+        },
     )
 }
 
@@ -696,6 +703,7 @@ fn build_operator_mixer_catalog(
     channel_count: usize,
     mut channel_name: impl FnMut(usize) -> Option<String>,
     mut channel_handle: impl FnMut(usize) -> Result<MixerChannelHandle, String>,
+    mut channel_solo_available: impl FnMut(usize) -> Result<bool, String>,
 ) -> Result<Vec<OperatorMixerChannel>, String> {
     let mut channels = Vec::new();
     channels
@@ -706,10 +714,14 @@ fn build_operator_mixer_catalog(
             .ok_or_else(|| format!("prepared mixer channel {index} has no retained track name"))?;
         let handle = channel_handle(index)
             .map_err(|error| format!("prepared mixer channel {index} cannot be controlled: {error}"))?;
+        let solo_available = channel_solo_available(index).map_err(|error| {
+            format!("prepared mixer channel {index} has no Solo capability: {error}")
+        })?;
         channels.push(OperatorMixerChannel {
             index,
             name,
             handle,
+            solo_available,
         });
     }
     Ok(channels)
@@ -1303,6 +1315,13 @@ fn wire_operator_mixer_controls(
             );
             return;
         };
+        if !channel.solo_available {
+            set_diagnostic(
+                &solo_diagnostic,
+                "mixer solo refused: channel does not support Solo".to_owned(),
+            );
+            return;
+        }
         send_operator_command(
             &solo_sender,
             OperatorCommand::SetMixerChannelSolo {
@@ -1410,6 +1429,7 @@ fn operator_mixer_rows(channels: &[OperatorMixerChannel]) -> Vec<OperatorMixerRo
             muted: false,
             soloed: false,
             controls_enabled: false,
+            solo_available: channel.solo_available,
         })
         .collect()
 }
@@ -1429,6 +1449,7 @@ fn mixer_authority(
             handle: channel.handle,
             muted: accepted.muted(),
             solo: accepted.solo(),
+            solo_available: channel.solo_available,
         });
     }
     Some(OperatorMixerAuthority {
@@ -2517,7 +2538,7 @@ mod tests {
         }"#;
         const SCENE_TRACK: &[u8] = br#"{
             "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339508",
-            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Scene layer","kind":"audio",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Scene group","kind":"group",
             "order":1,"active":true,"clip_ids":[],"extensions":{}
         }"#;
         const CLIP: &[u8] = br#"{
@@ -2683,6 +2704,11 @@ mod tests {
                     .resolve_channel_index(index)
                     .map_err(|error| error.to_string())
             },
+            |index| {
+                mixer_sender
+                    .channel_supports_solo(index)
+                    .map_err(|error| error.to_string())
+            },
         )
         .unwrap();
         assert_eq!(
@@ -2690,7 +2716,7 @@ mod tests {
                 .iter()
                 .map(|channel| (channel.index, channel.name.as_str()))
                 .collect::<Vec<_>>(),
-            [(0, "Meter source"), (1, "Scene layer")]
+            [(0, "Meter source"), (1, "Scene group")]
         );
         assert!(
             build_operator_mixer_catalog(
@@ -2698,6 +2724,9 @@ mod tests {
                 |index| (index == 0).then(|| "Only one name".to_owned()),
                 |index| mixer_sender
                     .resolve_channel_index(index)
+                    .map_err(|error| error.to_string()),
+                |index| mixer_sender
+                    .channel_supports_solo(index)
                     .map_err(|error| error.to_string()),
             )
             .is_err()
@@ -2709,20 +2738,70 @@ mod tests {
                 |index| mixer_sender
                     .resolve_channel_index(index)
                     .map_err(|error| error.to_string()),
+                |index| mixer_sender
+                    .channel_supports_solo(index)
+                    .map_err(|error| error.to_string()),
             )
             .is_err()
         );
+        assert!(
+            build_operator_mixer_catalog(
+                2,
+                |index| Some(format!("Channel {index}")),
+                |index| mixer_sender
+                    .resolve_channel_index(index)
+                    .map_err(|error| error.to_string()),
+                |index| {
+                    if index == 0 {
+                        Ok(true)
+                    } else {
+                        Err("capability unavailable".to_owned())
+                    }
+                },
+            )
+            .is_err()
+        );
+        let empty_mixer = build_operator_mixer_catalog(
+            0,
+            |_| panic!("an empty catalog cannot query a name"),
+            |_| panic!("an empty catalog cannot query a handle"),
+            |_| panic!("an empty catalog cannot query a capability"),
+        )
+        .unwrap();
+        assert!(operator_mixer_rows(&empty_mixer).is_empty());
+        let boundary_names = [
+            "Canale Ω molto lungo 0",
+            "Canal 1",
+            "Canal 2",
+            "Canal 3",
+            "Canal 4",
+            "Canal 5",
+            "Canal 6",
+            "Canal 7",
+        ];
+        let boundary_mixer = build_operator_mixer_catalog(
+            boundary_names.len(),
+            |index| Some(boundary_names[index].to_owned()),
+            |index| Ok(mixer_channels[index % mixer_channels.len()].handle),
+            |index| Ok(index.is_multiple_of(2)),
+        )
+        .unwrap();
+        let boundary_rows = operator_mixer_rows(&boundary_mixer);
+        assert_eq!(boundary_rows.len(), 8);
+        assert_eq!(boundary_rows[0].name.as_str(), boundary_names[0]);
+        assert!(boundary_rows[0].solo_available);
+        assert!(!boundary_rows[1].solo_available);
         let (owner_mixer_commands, owner_mixer_receiver) =
             std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
         owner_mixer_commands
             .send(OperatorCommand::SetMixerChannelMute {
-                channel: mixer_channels[0].handle,
+                channel: mixer_channels[1].handle,
                 muted: true,
             })
             .unwrap();
         owner_mixer_commands
             .send(OperatorCommand::SetMixerChannelSolo {
-                channel: mixer_channels[1].handle,
+                channel: mixer_channels[0].handle,
                 solo: true,
             })
             .unwrap();
@@ -2736,11 +2815,11 @@ mod tests {
             owner.mixer_commands,
             [
                 MixerParameterCommand::ChannelMute {
-                    channel: mixer_channels[0].handle,
+                    channel: mixer_channels[1].handle,
                     muted: true,
                 },
                 MixerParameterCommand::ChannelSolo {
-                    channel: mixer_channels[1].handle,
+                    channel: mixer_channels[0].handle,
                     solo: true,
                 },
                 MixerParameterCommand::MainMute { muted: true },
@@ -2786,7 +2865,7 @@ mod tests {
         assert!(ui.get_main_mute_enabled());
         let generated_mixer = ui.get_mixer_channels();
         assert_eq!(generated_mixer.row_count(), 2);
-        for (row, name) in [(0, "Meter source"), (1, "Scene layer")] {
+        for (row, name) in [(0, "Meter source"), (1, "Scene group")] {
             let channel = generated_mixer.row_data(row).unwrap();
             assert_eq!(channel.name.as_str(), name);
             assert!(!channel.muted);
@@ -2794,21 +2873,23 @@ mod tests {
             assert!(channel.controls_enabled);
         }
 
-        ui.invoke_toggle_mixer_channel_mute_requested(0);
+        assert!(generated_mixer.row_data(0).unwrap().solo_available);
+        assert!(!generated_mixer.row_data(1).unwrap().solo_available);
+        ui.invoke_toggle_mixer_channel_mute_requested(1);
         let mute = mixer_command_receiver.try_recv().unwrap();
         assert_eq!(
             mute,
             OperatorCommand::SetMixerChannelMute {
-                channel: mixer_channels[0].handle,
+                channel: mixer_channels[1].handle,
                 muted: true,
             }
         );
-        ui.invoke_toggle_mixer_channel_solo_requested(1);
+        ui.invoke_toggle_mixer_channel_solo_requested(0);
         let solo = mixer_command_receiver.try_recv().unwrap();
         assert_eq!(
             solo,
             OperatorCommand::SetMixerChannelSolo {
-                channel: mixer_channels[1].handle,
+                channel: mixer_channels[0].handle,
                 solo: true,
             }
         );
@@ -2816,8 +2897,38 @@ mod tests {
         let main_mute = mixer_command_receiver.try_recv().unwrap();
         assert_eq!(main_mute, OperatorCommand::SetMainMute { muted: true });
         assert!(!ui.get_main_muted(), "command acceptance is not publication");
-        assert!(!generated_mixer.row_data(0).unwrap().muted);
-        assert!(!generated_mixer.row_data(1).unwrap().soloed);
+        assert!(!generated_mixer.row_data(1).unwrap().muted);
+        assert!(!generated_mixer.row_data(0).unwrap().soloed);
+
+        let mismatched_channels = &mixer_channels[..1];
+        let mismatched_model = VecModel::from(operator_mixer_rows(mismatched_channels));
+        let mut retained_row = mismatched_model.row_data(0).unwrap();
+        retained_row.muted = true;
+        retained_row.soloed = true;
+        retained_row.controls_enabled = true;
+        mismatched_model.set_row_data(0, retained_row);
+        let mismatched_authority = RefCell::new(Some(OperatorMixerAuthority {
+            channels: vec![OperatorMixerChannelAuthority {
+                handle: mismatched_channels[0].handle,
+                muted: true,
+                solo: true,
+                solo_available: true,
+            }],
+            main_muted: true,
+        }));
+        apply_operator_mixer_observation(
+            ui,
+            &mismatched_model,
+            mismatched_channels,
+            &mismatched_authority,
+            &recovery.snapshot(),
+            false,
+        );
+        let retained_row = mismatched_model.row_data(0).unwrap();
+        assert!(retained_row.muted);
+        assert!(retained_row.soloed);
+        assert!(!retained_row.controls_enabled);
+        assert_eq!(*mismatched_authority.borrow(), None);
         for command in [mute, solo, main_mute] {
             match command {
                 OperatorCommand::SetMixerChannelMute { channel, muted } => mixer_sender
@@ -2872,19 +2983,26 @@ mod tests {
         );
         assert_eq!(ui.get_mixer_state().as_str(), "Committed cycle 1");
         assert!(ui.get_main_muted());
-        assert!(generated_mixer.row_data(0).unwrap().muted);
-        assert!(generated_mixer.row_data(1).unwrap().soloed);
+        assert!(generated_mixer.row_data(1).unwrap().muted);
+        assert!(generated_mixer.row_data(0).unwrap().soloed);
 
-        ui.invoke_toggle_mixer_channel_mute_requested(0);
         ui.invoke_toggle_mixer_channel_solo_requested(1);
+        assert_eq!(mixer_command_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            mixer_diagnostic.lock().unwrap().as_str(),
+            "mixer solo refused: channel does not support Solo"
+        );
+
+        ui.invoke_toggle_mixer_channel_mute_requested(1);
+        ui.invoke_toggle_mixer_channel_solo_requested(0);
         ui.invoke_toggle_main_mute_requested();
         for expected in [
             MixerParameterCommand::ChannelMute {
-                channel: mixer_channels[0].handle,
+                channel: mixer_channels[1].handle,
                 muted: false,
             },
             MixerParameterCommand::ChannelSolo {
-                channel: mixer_channels[1].handle,
+                channel: mixer_channels[0].handle,
                 solo: false,
             },
             MixerParameterCommand::MainMute { muted: false },
@@ -2927,8 +3045,8 @@ mod tests {
             false,
         );
         assert!(!ui.get_main_muted());
-        assert!(!generated_mixer.row_data(0).unwrap().muted);
-        assert!(!generated_mixer.row_data(1).unwrap().soloed);
+        assert!(!generated_mixer.row_data(1).unwrap().muted);
+        assert!(!generated_mixer.row_data(0).unwrap().soloed);
         for stale_row in [-1, 2, 9] {
             ui.invoke_toggle_mixer_channel_mute_requested(stale_row);
             ui.invoke_toggle_mixer_channel_solo_requested(stale_row);
@@ -2989,6 +3107,29 @@ mod tests {
                 .contains("operator command refused")
         );
         assert!(!generated_mixer.row_data(0).unwrap().muted);
+
+        let (disconnected_mixer_sender, disconnected_mixer_receiver) =
+            std::sync::mpsc::sync_channel(1);
+        drop(disconnected_mixer_receiver);
+        let disconnected_mixer_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_mixer_controls(
+            ui,
+            &disconnected_mixer_sender,
+            &disconnected_mixer_diagnostic,
+            &mixer_authority,
+        );
+        ui.invoke_toggle_mixer_channel_mute_requested(1);
+        ui.invoke_toggle_mixer_channel_solo_requested(0);
+        ui.invoke_toggle_main_mute_requested();
+        assert!(
+            disconnected_mixer_diagnostic
+                .lock()
+                .unwrap()
+                .contains("operator command refused")
+        );
+        assert!(!generated_mixer.row_data(1).unwrap().muted);
+        assert!(!generated_mixer.row_data(0).unwrap().soloed);
+        assert!(!ui.get_main_muted());
         assert_eq!(ui.get_loop_state().as_str(), "Loop armed");
         assert_eq!(ui.get_loop_range().as_str(), "frames 0–1500");
         assert_eq!(ui.get_loop_toggle_label().as_str(), "Enable loop");

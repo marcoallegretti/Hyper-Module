@@ -2445,6 +2445,7 @@ dependencies = [
  "hyper-project-loader",
  "hyper-runtime-deployment",
  "hyper-runtime-host",
+ "i-slint-backend-testing",
  "slint",
  "slint-build",
 ]
@@ -2605,6 +2606,18 @@ dependencies = [
  "i-slint-core",
  "i-slint-core-macros",
  "i-slint-renderer-femtovg",
+]
+
+[[package]]
+name = "i-slint-backend-testing"
+version = "1.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521e901e3d47ab829c0ef500c63155776208707cd93259e6a7803ed627fa2786"
+dependencies = [
+ "cfg_aliases",
+ "i-slint-common",
+ "i-slint-core",
+ "vtable",
 ]
 
 [[package]]
