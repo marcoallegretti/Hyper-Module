@@ -1556,6 +1556,12 @@ impl DesktopPlaybackSession {
         self.controls.transport().scene_count()
     }
 
+    /// Returns one validated scene's retained project name.
+    #[must_use]
+    pub fn scene_name(&self, scene_index: usize) -> Option<&str> {
+        self.source.session().arrangement().scene_name(scene_index)
+    }
+
     #[must_use]
     pub fn scene_availability(&self, scene_index: usize) -> Option<DesktopSceneAvailability> {
         self.controls

@@ -1,5 +1,13 @@
 import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
 
+export struct OperatorSceneRow {
+    name: string,
+    status: string,
+    available: bool,
+    queued: bool,
+    last-launched: bool,
+}
+
 component FactCard inherits Rectangle {
     in property <string> label;
     in property <string> value;
@@ -49,10 +57,37 @@ component OutputMeterBar inherits Rectangle {
     }
 }
 
+component SceneLaunchTile inherits Rectangle {
+    in property <string> name;
+    in property <string> status;
+    in property <bool> available;
+    in property <bool> queued;
+    in property <bool> last-launched;
+    callback launch-requested();
+    width: 96px;
+    min-height: 62px;
+    background: root.queued ? #44306f : root.last-launched ? #174c42 : root.available ? #202836 : #141923;
+    border-color: root.queued ? #a88cff : root.last-launched ? #3ddc97 : #2c3445;
+    border-width: 1px;
+    border-radius: 5px;
+    opacity: root.available ? 1 : 0.72;
+
+    VerticalLayout {
+        padding: 7px;
+        spacing: 4px;
+        Text { text: root.name; color: #edf2f8; font-size: 11px; font-weight: 700; overflow: elide; }
+        Text { text: root.status; color: #8d99ad; font-size: 9px; overflow: elide; }
+    }
+    TouchArea {
+        enabled: root.available;
+        clicked => { root.launch-requested(); }
+    }
+}
+
 export component OperatorWindow inherits Window {
     title: "Hyper Runtime";
     width: 880px;
-    height: 700px;
+    height: 806px;
     background: #0d1016;
 
     in property <string> project-name;
@@ -78,12 +113,15 @@ export component OperatorWindow inherits Window {
     in property <bool> output-overload-latched;
     in property <string> output-meter-state;
     in property <string> output-meter-telemetry;
+    in property <[OperatorSceneRow]> scenes;
+    in property <string> scene-feedback;
     in property <string> diagnostic;
 
     callback start-requested();
     callback stop-requested();
     callback return-to-start-requested();
     callback reset-output-peak-requested();
+    callback launch-scene-requested(int);
     callback quit-requested();
 
     VerticalLayout {
@@ -156,6 +194,34 @@ export component OperatorWindow inherits Window {
                     peak-reading: root.right-output-peak-reading;
                 }
                 Text { text: root.output-meter-telemetry; color: #69778c; font-size: 10px; overflow: elide; }
+            }
+        }
+
+        if root.scenes.length > 0 : Rectangle {
+            background: #171b24;
+            border-color: #2c3445;
+            border-width: 1px;
+            border-radius: 8px;
+            min-height: 90px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 7px;
+                HorizontalLayout {
+                    Text { text: "SCENES"; color: #8d99ad; font-size: 11px; font-weight: 700; }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Text { text: root.scene-feedback; color: #8d99ad; font-size: 10px; overflow: elide; }
+                }
+                HorizontalLayout {
+                    spacing: 7px;
+                    for scene[index] in root.scenes : SceneLaunchTile {
+                        name: (index + 1) + " · " + scene.name;
+                        status: scene.status;
+                        available: scene.available;
+                        queued: scene.queued;
+                        last-launched: scene.last-launched;
+                        launch-requested => { root.launch-scene-requested(index); }
+                    }
+                }
             }
         }
 

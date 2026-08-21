@@ -18,14 +18,14 @@ use hyper_control_runtime::{
     PanelDisplay, PanelReleaseFailure,
 };
 use hyper_desktop_audio::{
-    DesktopControlSinkError, DesktopOutputConfig, DesktopPlaybackSession, OutputStreamCounters,
-    OutputStreamSnapshot, OutputStreamState, OutputStreamStatus,
+    DesktopControlSinkError, DesktopOutputConfig, DesktopPlaybackSession, DesktopSceneAvailability,
+    OutputStreamCounters, OutputStreamSnapshot, OutputStreamState, OutputStreamStatus,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
-    ChannelSamplePeakBallistics, LocateState, OutputMeterReceiver, PlaybackRecoveryCheckpoint,
-    PlaybackRecoveryTransportState, SamplePeakBallisticsConfig, StereoSamplePeakBallistics,
-    StereoSamplePeakBallisticsSnapshot, TransportCommand,
+    ChannelSamplePeakBallistics, LocateState, OutputMeterReceiver, PlaybackCycleObservation,
+    PlaybackRecoveryCheckpoint, PlaybackRecoveryTransportState, SamplePeakBallisticsConfig,
+    StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot, TransportCommand,
 };
 use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
 use hyper_playback_json::LoaderLimits;
@@ -33,7 +33,7 @@ use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::ProjectPlaybackLimits;
 use hyper_runtime_deployment::resolve_runtime_deployment;
 use hyper_runtime_host::{PanelHost, RuntimeArguments, ServedPanel, serve_panels_with_idle};
-use slint::{CloseRequestResponse, ComponentHandle, Timer, TimerMode};
+use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, Timer, TimerMode, VecModel};
 
 slint::include_modules!();
 
@@ -153,6 +153,14 @@ struct RuntimeObservers {
 struct OperatorReady {
     observers: RuntimeObservers,
     meters: OutputMeterReceiver,
+    scenes: Vec<OperatorScene>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperatorScene {
+    index: usize,
+    name: String,
+    availability: DesktopSceneAvailability,
 }
 
 struct OperatorWorker {
@@ -223,6 +231,7 @@ enum OperatorCommand {
     Start,
     Stop,
     ReturnToStart,
+    LaunchScene { scene_index: usize },
     Quit,
 }
 
@@ -493,9 +502,48 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
                 Ok(()) => diagnostic("transport return to start queued".to_owned()),
                 Err(error) => diagnostic(format!("transport return to start refused: {error}")),
             },
+            OperatorCommand::LaunchScene { scene_index } => {
+                match host.queue_transport(TransportCommand::LaunchScene { scene_index }) {
+                    Ok(()) => diagnostic(format!("scene {} launch queued", scene_index + 1)),
+                    Err(error) => {
+                        diagnostic(format!("scene {} launch refused: {error}", scene_index + 1));
+                    }
+                }
+            }
             OperatorCommand::Quit => stop.store(true, Ordering::Release),
         }
     }
+}
+
+fn operator_scene_catalog(session: &DesktopPlaybackSession) -> Result<Vec<OperatorScene>, String> {
+    build_operator_scene_catalog(
+        session.scene_count(),
+        |index| session.scene_name(index).map(str::to_owned),
+        |index| session.scene_availability(index),
+    )
+}
+
+fn build_operator_scene_catalog(
+    scene_count: usize,
+    mut scene_name: impl FnMut(usize) -> Option<String>,
+    mut scene_availability: impl FnMut(usize) -> Option<DesktopSceneAvailability>,
+) -> Result<Vec<OperatorScene>, String> {
+    let mut scenes = Vec::new();
+    scenes
+        .try_reserve_exact(scene_count)
+        .map_err(|_| "operator scene catalog capacity is unavailable".to_owned())?;
+    for index in 0..scene_count {
+        let name = scene_name(index)
+            .ok_or_else(|| format!("prepared scene {index} has no retained name"))?;
+        let availability = scene_availability(index)
+            .ok_or_else(|| format!("prepared scene {index} has no launch status"))?;
+        scenes.push(OperatorScene {
+            index,
+            name,
+            availability,
+        });
+    }
+    Ok(scenes)
 }
 
 fn spawn_operator_worker(
@@ -509,15 +557,19 @@ fn spawn_operator_worker(
     let handle = std::thread::spawn(move || {
         let result = match start_runtime(&arguments) {
             Ok(mut runtime) => {
-                let ready_model = runtime
-                    .host
-                    .take_meter_receiver()
-                    .map(|meters| OperatorReady {
-                        observers: runtime.observers.clone(),
-                        meters,
-                    })
-                    .ok_or_else(|| {
-                        "operator output meter authority was already transferred".to_owned()
+                let ready_model =
+                    operator_scene_catalog(&runtime.host.session).and_then(|scenes| {
+                        runtime
+                            .host
+                            .take_meter_receiver()
+                            .map(|meters| OperatorReady {
+                                observers: runtime.observers.clone(),
+                                meters,
+                                scenes,
+                            })
+                            .ok_or_else(|| {
+                                "operator output meter authority was already transferred".to_owned()
+                            })
                     });
                 match ready_model {
                     Ok(ready_model) => {
@@ -588,11 +640,17 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
             );
         }
     };
-    let OperatorReady { observers, meters } = ready;
+    let OperatorReady {
+        observers,
+        meters,
+        scenes,
+    } = ready;
     let meter_observer = Rc::new(RefCell::new(OperatorMeterObserver::new(
         meters,
         meter_config,
     )));
+    let scene_model = Rc::new(VecModel::from(operator_scene_rows(&scenes)));
+    ui.set_scenes(ModelRc::from(Rc::clone(&scene_model)));
 
     apply_static_facts(&ui, &observers.facts);
     wire_operator_action(&ui, &commands_tx, &diagnostic, OperatorCommand::Start);
@@ -600,20 +658,24 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_return_to_start(&ui, &commands_tx, &diagnostic);
     wire_operator_quit(&ui, &commands_tx, &stop, &diagnostic);
     wire_operator_peak_reset(&ui, &meter_observer);
+    wire_operator_scene_launch(&ui, &commands_tx, &diagnostic, &scenes);
 
-    apply_observations(&ui, &observers, &diagnostic);
+    let observation = apply_observations(&ui, &observers, &diagnostic);
+    apply_operator_scene_observation(&ui, &scene_model, observation);
     apply_operator_meter_observation(&ui, &mut meter_observer.borrow_mut());
 
     let weak = ui.as_weak();
     let timer_observers = observers.clone();
     let timer_meter_observer = Rc::clone(&meter_observer);
+    let timer_scene_model = Rc::clone(&scene_model);
     let timer_diagnostic = Arc::clone(&diagnostic);
     let timer_close_error = Arc::clone(&completion_close_error);
     let mut completion_observed = false;
     let timer = Timer::default();
     timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
         if let Some(ui) = weak.upgrade() {
-            apply_observations(&ui, &timer_observers, &timer_diagnostic);
+            let observation = apply_observations(&ui, &timer_observers, &timer_diagnostic);
+            apply_operator_scene_observation(&ui, &timer_scene_model, observation);
             apply_operator_meter_observation(&ui, &mut timer_meter_observer.borrow_mut());
             if !completion_observed
                 && let Some(close_result) = apply_operator_worker_completion(
@@ -831,6 +893,41 @@ fn wire_operator_peak_reset(ui: &OperatorWindow, observer: &Rc<RefCell<OperatorM
     });
 }
 
+fn wire_operator_scene_launch(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    scenes: &[OperatorScene],
+) {
+    let sender = sender.clone();
+    let diagnostic = Arc::clone(diagnostic);
+    let scenes = scenes.to_vec();
+    ui.on_launch_scene_requested(move |row| {
+        let Ok(row) = usize::try_from(row) else {
+            set_diagnostic(&diagnostic, "scene launch refused: invalid row".to_owned());
+            return;
+        };
+        let Some(scene) = scenes.get(row) else {
+            set_diagnostic(&diagnostic, "scene launch refused: stale row".to_owned());
+            return;
+        };
+        if scene.availability != DesktopSceneAvailability::Ready {
+            set_diagnostic(
+                &diagnostic,
+                format!("scene {} is not launchable", scene.index + 1),
+            );
+            return;
+        }
+        send_operator_command(
+            &sender,
+            OperatorCommand::LaunchScene {
+                scene_index: scene.index,
+            },
+            &diagnostic,
+        );
+    });
+}
+
 fn request_operator_shutdown(
     stop: &AtomicBool,
     sender: &SyncSender<OperatorCommand>,
@@ -848,6 +945,70 @@ fn send_operator_command(
     if let Err(error) = sender.try_send(command) {
         set_diagnostic(diagnostic, format!("operator command refused: {error}"));
     }
+}
+
+fn operator_scene_rows(scenes: &[OperatorScene]) -> Vec<OperatorSceneRow> {
+    scenes
+        .iter()
+        .map(|scene| OperatorSceneRow {
+            name: scene.name.clone().into(),
+            status: operator_scene_availability_text(scene.availability).into(),
+            available: scene.availability == DesktopSceneAvailability::Ready,
+            queued: false,
+            last_launched: false,
+        })
+        .collect()
+}
+
+const fn operator_scene_availability_text(availability: DesktopSceneAvailability) -> &'static str {
+    match availability {
+        DesktopSceneAvailability::Ready => "Ready",
+        DesktopSceneAvailability::Disabled => "Disabled",
+        DesktopSceneAvailability::ConsolidationRequired => "Needs consolidation",
+        DesktopSceneAvailability::NotPrepared => "Audio unavailable",
+    }
+}
+
+fn apply_operator_scene_observation(
+    ui: &OperatorWindow,
+    scenes: &VecModel<OperatorSceneRow>,
+    observation: PlaybackCycleObservation,
+) {
+    for row in 0..scenes.row_count() {
+        let Some(mut scene) = scenes.row_data(row) else {
+            continue;
+        };
+        scene.queued = observation.queued_scene_index() == Some(row);
+        scene.last_launched = observation.last_launched_scene_index() == Some(row);
+        scene.status = if scene.queued {
+            observation.queued_scene_launch_frame().map_or_else(
+                || "Queued".into(),
+                |frame| format!("Queued for frame {frame}").into(),
+            )
+        } else if scene.last_launched {
+            "Last launched".into()
+        } else if scene.available {
+            "Ready".into()
+        } else {
+            scene.status
+        };
+        scenes.set_row_data(row, scene);
+    }
+    let feedback = observation.queued_scene_index().map_or_else(
+        || {
+            observation.last_launched_scene_index().map_or_else(
+                || "No interactive scene launch observed".to_owned(),
+                |index| format!("Scene {} was last launched", index + 1),
+            )
+        },
+        |index| {
+            observation.queued_scene_launch_frame().map_or_else(
+                || format!("Scene {} is queued", index + 1),
+                |frame| format!("Scene {} queued for frame {frame}", index + 1),
+            )
+        },
+    );
+    ui.set_scene_feedback(feedback.into());
 }
 
 fn apply_static_facts(ui: &OperatorWindow, facts: &RuntimeFacts) {
@@ -1063,8 +1224,8 @@ fn apply_observations(
     ui: &OperatorWindow,
     observers: &RuntimeObservers,
     diagnostic: &Mutex<String>,
-) {
-    let recovery = observers.recovery.snapshot();
+) -> PlaybackCycleObservation {
+    let cycle = observers.recovery.observe_cycle();
     let stream_state = observers.output_status.state();
     let counters = observers.output_counters.snapshot();
     if stream_state == OutputStreamState::Failed {
@@ -1078,8 +1239,8 @@ fn apply_observations(
         |value| value.clone(),
     );
     let presentation = operator_observation_presentation(
-        recovery.state(),
-        recovery.position_frame(),
+        cycle.state(),
+        cycle.position_frame(),
         stream_state,
         counters,
         observers.panel_connected.load(Ordering::Acquire),
@@ -1094,6 +1255,7 @@ fn apply_observations(
     ui.set_native_xruns(presentation.native_xruns.into());
     ui.set_panel_state(presentation.panel_state.into());
     ui.set_diagnostic(presentation.diagnostic.into());
+    cycle
 }
 
 fn apply_operator_meter_observation(ui: &OperatorWindow, observer: &mut OperatorMeterObserver) {
@@ -1212,7 +1374,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use hyper_arrangement_renderer::RenderScratchSlot;
-    use hyper_audio_engine::InterleavedStereoCallback;
+    use hyper_audio_engine::{InterleavedStereoCallback, StereoOutput};
     use hyper_audio_source::DecodedAudio;
     use hyper_mixer_runtime::{PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime};
     use hyper_playback_compiler::{graph::GraphLimits, scene::SceneLimits};
@@ -1442,6 +1604,9 @@ mod tests {
         sender.send(OperatorCommand::Start).unwrap();
         sender.send(OperatorCommand::Stop).unwrap();
         sender.send(OperatorCommand::ReturnToStart).unwrap();
+        sender
+            .send(OperatorCommand::LaunchScene { scene_index: 3 })
+            .unwrap();
         let stop = AtomicBool::new(false);
         let mut owner = OperatorControl::default();
         let diagnostics = RefCell::new(Vec::new());
@@ -1459,6 +1624,7 @@ mod tests {
                     frame: 0,
                     state: LocateState::Preserve,
                 },
+                TransportCommand::LaunchScene { scene_index: 3 },
             ]
         );
         assert_eq!(
@@ -1467,6 +1633,7 @@ mod tests {
                 "transport start queued",
                 "transport stop queued",
                 "transport return to start queued",
+                "scene 4 launch queued",
             ]
         );
         assert!(!stop.load(Ordering::Acquire));
@@ -1517,6 +1684,11 @@ mod tests {
             "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Meter source","kind":"audio",
             "order":0,"active":true,"clip_ids":["018f47a2-6b2d-7c11-8a44-001122339503"],"extensions":{}
         }"#;
+        const SCENE_TRACK: &[u8] = br#"{
+            "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339508",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Scene layer","kind":"audio",
+            "order":1,"active":true,"clip_ids":[],"extensions":{}
+        }"#;
         const CLIP: &[u8] = br#"{
             "format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339503",
             "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","track_id":"018f47a2-6b2d-7c11-8a44-001122339502",
@@ -1535,10 +1707,19 @@ mod tests {
             "clip_id":"018f47a2-6b2d-7c11-8a44-001122339503","start_tick":0,"clip_start_tick":0,"duration_ticks":60,"enabled":true}],
             "scene_launches":[],"extensions":{}
         }"#;
+        const SCENE: &[u8] = br#"{
+            "format":"hyper-scene","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339509",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Stop layer","order":0,"enabled":true,
+            "launch_quantization":{"mode":"immediate"},
+            "slots":[{"track_id":"018f47a2-6b2d-7c11-8a44-001122339508","action":"stop"}],"extensions":{}
+        }"#;
         const MIXER: &[u8] = br#"{
             "format":"hyper-mixer","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339507",
             "project_id":"018f47a2-6b2d-7c11-8a44-001122339500",
-            "channels":[{"track_id":"018f47a2-6b2d-7c11-8a44-001122339502","gain_millionths":1000000,
+            "channels":[
+            {"track_id":"018f47a2-6b2d-7c11-8a44-001122339502","gain_millionths":1000000,
+            "pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},"sends":[]},
+            {"track_id":"018f47a2-6b2d-7c11-8a44-001122339508","gain_millionths":1000000,
             "pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},"sends":[]}],
             "return_buses":[],"main":{"gain_millionths":1000000,"mute":false},
             "cue":{"source":"main","gain_millionths":1000000,"mute":false},"extensions":{}
@@ -1555,9 +1736,9 @@ mod tests {
                 project_id: PROJECT_ID.to_owned(),
                 sample_rate_hz: SAMPLE_RATE_HZ,
                 timeline: TIMELINE.to_vec(),
-                tracks: vec![TRACK.to_vec()],
+                tracks: vec![TRACK.to_vec(), SCENE_TRACK.to_vec()],
                 clips: vec![CLIP.to_vec()],
-                scenes: Vec::new(),
+                scenes: vec![SCENE.to_vec()],
                 arrangement: Some(ARRANGEMENT.to_vec()),
                 mixer: MIXER.to_vec(),
                 automation_takes: Vec::new(),
@@ -1586,15 +1767,111 @@ mod tests {
             PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, mixer, 480).unwrap();
         let (mut transport_sender, mut transport) =
             PreparedPlaybackTransportRuntime::with_command_queue(runtime);
-        transport_sender.try_send(TransportCommand::Start).unwrap();
         let mut callback = InterleavedStereoCallback::try_new(480, SAMPLE_RATE_HZ).unwrap();
         let mut scratch_left = [0.0_f32; 480];
         let mut scratch_right = [0.0_f32; 480];
-        let mut scratch = [RenderScratchSlot::new(
-            &mut scratch_left,
-            &mut scratch_right,
-        )];
+        let mut scene_scratch_left = [0.0_f32; 480];
+        let mut scene_scratch_right = [0.0_f32; 480];
+        let mut scratch = [
+            RenderScratchSlot::new(&mut scratch_left, &mut scratch_right),
+            RenderScratchSlot::new(&mut scene_scratch_left, &mut scene_scratch_right),
+        ];
         let mut interleaved = [0.0_f32; 960];
+        let mut operator_scenes = build_operator_scene_catalog(
+            transport_sender.scene_count(),
+            |index| session.arrangement().scene_name(index).map(str::to_owned),
+            |index| {
+                transport_sender
+                    .scene_availability(index)
+                    .map(DesktopSceneAvailability::from)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            operator_scenes,
+            [OperatorScene {
+                index: 0,
+                name: "Stop layer".to_owned(),
+                availability: DesktopSceneAvailability::Ready,
+            }]
+        );
+        operator_scenes.extend([
+            OperatorScene {
+                index: 1,
+                name: "Disabled scene".to_owned(),
+                availability: DesktopSceneAvailability::Disabled,
+            },
+            OperatorScene {
+                index: 2,
+                name: "Desktop instrument".to_owned(),
+                availability: DesktopSceneAvailability::ConsolidationRequired,
+            },
+            OperatorScene {
+                index: 3,
+                name: "Missing audio".to_owned(),
+                availability: DesktopSceneAvailability::NotPrepared,
+            },
+        ]);
+        let scene_model = Rc::new(VecModel::from(operator_scene_rows(&operator_scenes)));
+        ui.set_scenes(ModelRc::from(Rc::clone(&scene_model)));
+        let (scene_commands, scene_command_receiver) =
+            std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        let scene_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_scene_launch(ui, &scene_commands, &scene_diagnostic, &operator_scenes);
+        let generated_scenes = ui.get_scenes();
+        assert_eq!(generated_scenes.row_count(), 4);
+        for (row, expected) in [
+            (0, (true, "Ready")),
+            (1, (false, "Disabled")),
+            (2, (false, "Needs consolidation")),
+            (3, (false, "Audio unavailable")),
+        ] {
+            let scene = generated_scenes.row_data(row).unwrap();
+            assert_eq!((scene.available, scene.status.as_str()), expected);
+        }
+        ui.invoke_launch_scene_requested(0);
+        assert_eq!(
+            scene_command_receiver.try_recv(),
+            Ok(OperatorCommand::LaunchScene { scene_index: 0 })
+        );
+        for refused_row in [1, 2, 3, -1, 9] {
+            ui.invoke_launch_scene_requested(refused_row);
+            assert_eq!(scene_command_receiver.try_recv(), Err(TryRecvError::Empty));
+        }
+        assert_eq!(
+            scene_diagnostic.lock().unwrap().as_str(),
+            "scene launch refused: stale row"
+        );
+
+        let (mut recovery_publisher, recovery) =
+            hyper_mixer_runtime::playback_recovery_channel(None, None);
+        apply_operator_scene_observation(ui, &scene_model, recovery.observe_cycle());
+        transport_sender
+            .try_send(TransportCommand::LaunchScene { scene_index: 0 })
+            .unwrap();
+        let mut stopped_left = [0.0_f32; 480];
+        let mut stopped_right = [0.0_f32; 480];
+        let queued = transport
+            .process_cycle(
+                &mut scratch,
+                StereoOutput {
+                    left: &mut stopped_left,
+                    right: &mut stopped_right,
+                },
+            )
+            .unwrap();
+        recovery_publisher.publish_cycle(queued, None);
+        apply_operator_scene_observation(ui, &scene_model, recovery.observe_cycle());
+        let queued_row = ui.get_scenes().row_data(0).unwrap();
+        assert!(queued_row.queued);
+        assert!(!queued_row.last_launched);
+        assert_eq!(queued_row.status.as_str(), "Queued for frame 0");
+        assert_eq!(
+            ui.get_scene_feedback().as_str(),
+            "Scene 1 queued for frame 0"
+        );
+
+        transport_sender.try_send(TransportCommand::Start).unwrap();
         let (mut meter_sender, meter_receiver) = hyper_mixer_runtime::output_meter_channel();
         let meter_config = SamplePeakBallisticsConfig::try_new(
             SAMPLE_RATE_HZ,
@@ -1626,7 +1903,7 @@ mod tests {
             "meter frame unavailable · 0 coalesced · 0 dropped"
         );
 
-        transport
+        let launched = transport
             .process_interleaved_cycle(
                 &mut callback,
                 &mut scratch,
@@ -1634,6 +1911,16 @@ mod tests {
                 &mut meter_sender,
             )
             .unwrap();
+        recovery_publisher.publish_cycle(launched.snapshot().cycle(), None);
+        apply_operator_scene_observation(ui, &scene_model, recovery.observe_cycle());
+        let launched_row = ui.get_scenes().row_data(0).unwrap();
+        assert!(!launched_row.queued);
+        assert!(launched_row.last_launched);
+        assert_eq!(launched_row.status.as_str(), "Last launched");
+        assert_eq!(
+            ui.get_scene_feedback().as_str(),
+            "Scene 1 was last launched"
+        );
         apply_operator_meter_observation(ui, &mut meter_observer.borrow_mut());
         let first_left_peak = interleaved
             .iter()
@@ -1810,7 +2097,7 @@ mod tests {
             panel_connected: Arc::new(AtomicBool::new(false)),
         };
         apply_static_facts(&ui, &facts);
-        apply_observations(&ui, &observers, &diagnostic);
+        let _ = apply_observations(&ui, &observers, &diagnostic);
         assert_generated_operator_meter_contract(&ui);
 
         ui.invoke_start_requested();
