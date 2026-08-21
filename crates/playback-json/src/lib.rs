@@ -5173,6 +5173,14 @@ impl LoadedPlaybackProject {
             .map(|clip| clip.track_id.as_str())
     }
 
+    /// Returns the source-asset identity for one validated reusable audio clip.
+    #[must_use]
+    pub fn clip_asset_id_at(&self, clip_index: usize) -> Option<&str> {
+        self.clips
+            .get(clip_index)
+            .map(|clip| clip.asset_id.as_str())
+    }
+
     /// Returns the complete reusable clip duration in project ticks.
     #[must_use]
     pub fn clip_duration_ticks_at(&self, clip_index: usize) -> Option<u64> {

@@ -20,7 +20,9 @@ use hyper_playback_session::{
     PlaybackSessionAssemblyInput, PlaybackSessionAssemblyLimits, PreparedPlaybackSession,
     assemble_playback_session,
 };
-use hyper_project_model::{AssetRole, AudioMediaType, ResourceDescriptor, ResourceRole};
+use hyper_project_model::{
+    AssetDescriptor, AssetRole, AudioMediaType, ResourceDescriptor, ResourceRole,
+};
 use hyper_recording_metadata::{RecordingMetadataDocument, RecordingMetadataParseError};
 use hyper_storage_engine::{
     ProjectPackageLimit, ProjectPackageVerificationLimits, StorageError,
@@ -108,6 +110,22 @@ impl PreparedProjectPlayback {
     #[must_use]
     pub fn recording_metadata(&self) -> &[RecordingMetadataDocument] {
         &self.recording_metadata
+    }
+
+    /// Returns verified project-owned sample assets that no reusable audio
+    /// clip references. Recording assets are deliberately outside this
+    /// cleanup domain because they carry independent provenance metadata.
+    pub fn unused_sample_assets(&self) -> impl Iterator<Item = &AssetDescriptor> {
+        let loaded = self.session.parts().0;
+        self.package
+            .manifest()
+            .assets()
+            .iter()
+            .filter(move |asset| {
+                asset.role() == AssetRole::Sample
+                    && !(0..loaded.clip_count())
+                        .any(|clip_index| loaded.clip_asset_id_at(clip_index) == Some(asset.id()))
+            })
     }
 
     #[must_use]

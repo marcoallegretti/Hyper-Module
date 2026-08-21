@@ -486,6 +486,27 @@ fn prepares_one_verified_owned_playback_session() {
 }
 
 #[test]
+fn classifies_only_unreferenced_sample_assets_for_cleanup() {
+    let fixture = Fixture::new();
+    fixture.add_sample_asset();
+
+    let mut cleanup_limits = limits();
+    cleanup_limits.session.media_cache.max_assets = 2;
+    cleanup_limits.session.media_cache.max_decoded_sample_bytes = 800;
+    let prepared = prepare_project_playback(&fixture.root, cleanup_limits).unwrap();
+    let unused = prepared
+        .unused_sample_assets()
+        .map(|asset| (asset.id(), asset.path(), asset.byte_length()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(unused.len(), 1);
+    assert_eq!(unused[0].0, SECOND_ASSET_ID);
+    assert_eq!(unused[0].1, "assets/samples/second.wav");
+    assert!(unused[0].2 > 0);
+    assert!(unused.iter().all(|(id, _, _)| *id != ASSET_ID));
+}
+
+#[test]
 fn prepares_from_an_existing_structural_authority() {
     let fixture = Fixture::new();
     let package = verify_project_package(&fixture.root).unwrap();
