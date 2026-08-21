@@ -79,6 +79,12 @@ pub struct AutomationTakePublicationRequest<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct AutomationTakeRemovalRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub take_id: &'a str,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct DeviceChainPublicationRequest<'a> {
     pub expected_project_sha256: [u8; 32],
     pub chain_id: &'a str,
@@ -424,8 +430,15 @@ enum ProjectResourcePublicationMode {
     ArrangementAddition,
     SceneAddition,
     AutomationTakeAddition,
+    AutomationTakeRemoval,
     DeviceChainAddition,
     DeviceChainRemoval,
+}
+
+impl ProjectResourcePublicationMode {
+    const fn is_removal(self) -> bool {
+        matches!(self, Self::AutomationTakeRemoval | Self::DeviceChainRemoval)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -527,6 +540,30 @@ pub fn publish_automation_take(
             resource_bytes: request.take_bytes,
         },
         ProjectResourcePublicationMode::AutomationTakeAddition,
+        |_, _| Ok(()),
+    )
+}
+
+/// Removes one automation take through the serialized, recoverable
+/// manifest-last resource transaction family.
+///
+/// # Errors
+///
+/// Returns a classified validation, conflict, integrity, I/O, or recovery
+/// error. Only an existing automation-take resource can be removed.
+pub fn remove_automation_take(
+    project_path: impl AsRef<Path>,
+    request: AutomationTakeRemovalRequest<'_>,
+) -> Result<ProjectResourcePublicationOutcome, ProjectResourcePublicationError> {
+    publish_project_resource_observed(
+        project_path.as_ref(),
+        ProjectResourcePublicationRequest {
+            expected_project_sha256: request.expected_project_sha256,
+            resource_id: request.take_id,
+            expected_role: ResourceRole::AutomationTake,
+            resource_bytes: &[],
+        },
+        ProjectResourcePublicationMode::AutomationTakeRemoval,
         |_, _| Ok(()),
     )
 }
@@ -1089,7 +1126,7 @@ fn publish_project_resource_observed(
     mode: ProjectResourcePublicationMode,
     mut observer: impl FnMut(PublicationPhase, &Path) -> Result<(), ProjectResourcePublicationError>,
 ) -> Result<ProjectResourcePublicationOutcome, ProjectResourcePublicationError> {
-    if mode != ProjectResourcePublicationMode::DeviceChainRemoval {
+    if !mode.is_removal() {
         validate_canonical_resource(request.resource_bytes)?;
     }
     let verified = verify_project_package(project_path).map_err(|error| {
@@ -1115,6 +1152,9 @@ fn publish_project_resource_observed(
         }
         ProjectResourcePublicationMode::AutomationTakeAddition => {
             validate_automation_take_addition_request(&verified, request)?;
+        }
+        ProjectResourcePublicationMode::AutomationTakeRemoval => {
+            unique_resource(&verified, request.resource_id, ResourceRole::AutomationTake)?;
         }
         ProjectResourcePublicationMode::DeviceChainAddition => {
             validate_device_chain_addition_request(&verified, request)?;
@@ -1214,15 +1254,19 @@ fn publish_project_resource_observed(
                 candidate_addition_manifest(&active_project, request, &path, next_revision)?;
             (path, None, created_parent_directory, candidate)
         }
-        ProjectResourcePublicationMode::DeviceChainRemoval => {
-            let descriptor =
-                unique_resource(&verified, request.resource_id, ResourceRole::DeviceChain)?;
+        ProjectResourcePublicationMode::AutomationTakeRemoval
+        | ProjectResourcePublicationMode::DeviceChainRemoval => {
+            let descriptor = unique_resource(
+                &verified,
+                request.resource_id,
+                request.expected_role,
+            )?;
             let previous = verified
                 .read_resource(request.resource_id)
                 .map_err(|error| {
                     caused(
                         ProjectResourcePublicationErrorKind::Integrity,
-                        "read current device-chain resource",
+                        "read current removable project resource",
                         error,
                     )
                 })?;
@@ -1235,7 +1279,7 @@ fn publish_project_resource_observed(
                 .manifest()
                 .resources()
                 .iter()
-                .filter(|resource| resource.role() == ResourceRole::DeviceChain)
+                .filter(|resource| resource.role() == request.expected_role)
                 .count()
                 == 1;
             (
@@ -1296,7 +1340,7 @@ fn publish_project_resource_observed(
                 error,
             )
         })?;
-    let result = if mode == ProjectResourcePublicationMode::DeviceChainRemoval {
+    let result = if mode.is_removal() {
         run_resource_removal(
             &verified,
             &backups,
@@ -1307,7 +1351,7 @@ fn publish_project_resource_observed(
             previous.as_deref().ok_or_else(|| {
                 failure(
                     ProjectResourcePublicationErrorKind::Integrity,
-                    "device-chain removal lost its previous resource evidence",
+                    "resource removal lost its previous resource evidence",
                 )
             })?,
             created_parent_directory,
@@ -1608,19 +1652,25 @@ fn run_resource_removal(
     if digest(&active) != digest(previous_resource) {
         return Err(failure(
             ProjectResourcePublicationErrorKind::ProjectChanged,
-            "device-chain resource changed before removal",
+            "project resource changed before removal",
         ));
     }
     parent
         .remove_file(file_name(resource_path)?)
-        .map_err(|error| caused(ProjectResourcePublicationErrorKind::Io, "remove device-chain resource", error))?;
+        .map_err(|error| caused(ProjectResourcePublicationErrorKind::Io, "remove project resource", error))?;
     sync_dir(&parent)?;
     if removed_parent_directory {
         drop(parent);
-        verified.root_dir.remove_dir("devices").map_err(|error| {
+        let directory = addition_directory(request.expected_role).ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "removed project resource has no managed directory",
+            )
+        })?;
+        verified.root_dir.remove_dir(directory).map_err(|error| {
             caused(
                 ProjectResourcePublicationErrorKind::Io,
-                "remove empty device-chain directory",
+                "remove empty project-resource directory",
                 error,
             )
         })?;
@@ -3571,7 +3621,8 @@ fn finish_removed_resource(
         return Ok(());
     }
     drop(parent);
-    match root.remove_dir("devices") {
+    let directory = removal_directory(tx)?;
+    match root.remove_dir(directory) {
         Ok(()) => sync_dir(root),
         Err(error)
             if matches!(
@@ -3583,7 +3634,7 @@ fn finish_removed_resource(
         }
         Err(error) => Err(caused(
             ProjectResourcePublicationErrorKind::Recovery,
-            "remove empty device-chain directory",
+            "remove empty project-resource directory",
             error,
         )),
     }
@@ -3595,13 +3646,14 @@ fn rollback_removed_resource(
     tx: &TransactionRecord,
 ) -> Result<(), ProjectResourcePublicationError> {
     if tx.removed_parent_directory {
-        match root.create_dir("devices") {
+        let directory = removal_directory(tx)?;
+        match root.create_dir(directory) {
             Ok(()) => sync_dir(root)?,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(caused(
                     ProjectResourcePublicationErrorKind::Recovery,
-                    "restore removed device-chain directory",
+                    "restore removed project-resource directory",
                     error,
                 ));
             }
@@ -3965,8 +4017,7 @@ fn read_transaction(
         || tx.operation == TransactionOperation::Removal
             && (tx.previous_resource.is_some()
                 || tx.created_parent_directory
-                || tx.resource_role != "device-chain"
-                || !addition_path_matches(&tx, "devices"))
+                || removal_directory(&tx).is_err())
         || decode_digest(&tx.before_project_sha256).is_err()
         || decode_digest(&tx.after_project_sha256).is_err()
         || tx.before_project_revision.checked_add(1) != Some(tx.after_project_revision)
@@ -3977,6 +4028,17 @@ fn read_transaction(
         ));
     }
     Ok(tx)
+}
+
+fn removal_directory(tx: &TransactionRecord) -> Result<&'static str, ProjectResourcePublicationError> {
+    match tx.resource_role.as_str() {
+        "automation-take" if addition_path_matches(tx, "takes") => Ok("takes"),
+        "device-chain" if addition_path_matches(tx, "devices") => Ok("devices"),
+        _ => Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "resource removal transaction directory is invalid",
+        )),
+    }
 }
 
 fn is_valid_addition_destination(tx: &TransactionRecord) -> bool {
@@ -5308,6 +5370,25 @@ mod tests {
                 resource_bytes: request.take_bytes,
             }
         }
+
+        fn removal_request(&self) -> AutomationTakeRemovalRequest<'_> {
+            AutomationTakeRemovalRequest {
+                expected_project_sha256: *verify_project_package(&self.root)
+                    .unwrap()
+                    .manifest_sha256(),
+                take_id: AUTOMATION_TAKE_ID,
+            }
+        }
+
+        fn removal_resource_request(&self) -> ProjectResourcePublicationRequest<'_> {
+            let request = self.removal_request();
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: request.expected_project_sha256,
+                resource_id: request.take_id,
+                expected_role: ResourceRole::AutomationTake,
+                resource_bytes: &[],
+            }
+        }
     }
 
     impl Drop for AutomationTakeFixture {
@@ -5556,6 +5637,76 @@ mod tests {
             error.kind(),
             ProjectResourcePublicationErrorKind::ResourceConflict
         );
+    }
+
+    #[test]
+    fn removes_the_last_automation_take_without_leaving_a_resource_directory() {
+        let fixture = AutomationTakeFixture::new();
+        publish_automation_take(&fixture.root, fixture.request()).unwrap();
+
+        let removed = remove_automation_take(&fixture.root, fixture.removal_request()).unwrap();
+
+        assert!(removed.changed());
+        assert_eq!(removed.project_revision(), 3);
+        assert_eq!(removed.resource_id(), AUTOMATION_TAKE_ID);
+        assert_eq!(removed.previous_resource(), Some(fixture.take.as_slice()));
+        assert!(!fixture.root.join(removed.resource_path()).exists());
+        assert!(!fixture.root.join("takes").exists());
+        let verified = verify_project_package(&fixture.root).unwrap();
+        assert!(
+            verified
+                .manifest()
+                .resources()
+                .iter()
+                .all(|resource| resource.id() != AUTOMATION_TAKE_ID)
+        );
+    }
+
+    #[test]
+    fn automation_take_removal_recovers_every_durable_phase() {
+        for crash_phase in [
+            PublicationPhase::Transaction,
+            PublicationPhase::Resource,
+            PublicationPhase::Manifest,
+        ] {
+            let fixture = AutomationTakeFixture::new();
+            publish_automation_take(&fixture.root, fixture.request()).unwrap();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = publish_project_resource_observed(
+                    &fixture.root,
+                    fixture.removal_resource_request(),
+                    ProjectResourcePublicationMode::AutomationTakeRemoval,
+                    |phase, _| {
+                        assert_ne!(phase, crash_phase, "simulated process crash");
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+
+            let recovered = recover_project_resource_publications(&fixture.root).unwrap();
+            assert_eq!(recovered.len(), 1);
+            let committed = crash_phase == PublicationPhase::Manifest;
+            assert_eq!(
+                recovered[0].disposition(),
+                if committed {
+                    ProjectResourcePublicationRecoveryDisposition::Committed
+                } else {
+                    ProjectResourcePublicationRecoveryDisposition::RolledBack
+                }
+            );
+            let verified = verify_project_package(&fixture.root).unwrap();
+            assert_eq!(verified.manifest().revision(), if committed { 3 } else { 2 });
+            assert_eq!(
+                fixture
+                    .root
+                    .join("takes")
+                    .join(format!("{AUTOMATION_TAKE_ID}.json"))
+                    .exists(),
+                !committed
+            );
+            assert_eq!(fixture.root.join("takes").exists(), !committed);
+        }
     }
 
     #[test]
