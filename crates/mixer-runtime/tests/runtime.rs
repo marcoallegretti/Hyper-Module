@@ -446,7 +446,53 @@ fn assert_meter_delivery_and_backpressure(
     );
     assert!(!recovery_ballistics.ballistics_reset());
 
-    drop(meter_receiver);
+    assert_terminal_meter_drop_delivery(
+        transport,
+        callback,
+        scratch,
+        interleaved,
+        meter_sender,
+        &mut meter_receiver,
+    );
+}
+
+fn assert_terminal_meter_drop_delivery(
+    transport: &mut GraphTransportRuntime<'_, '_, '_>,
+    callback: &mut InterleavedStereoCallback,
+    scratch: &mut [RenderScratchSlot<'_>],
+    interleaved: &mut [f32],
+    meter_sender: &mut OutputMeterSender,
+    meter_receiver: &mut OutputMeterReceiver,
+) {
+    for _ in 0..MAX_QUEUED_OUTPUT_METER_SNAPSHOTS {
+        let report = transport
+            .process_interleaved_cycle(callback, scratch, interleaved, meter_sender)
+            .unwrap();
+        assert_eq!(report.publication(), OutputMeterPublication::Published);
+    }
+    for _ in 0..2 {
+        let report = transport
+            .process_interleaved_cycle(callback, scratch, interleaved, meter_sender)
+            .unwrap();
+        assert_eq!(report.publication(), OutputMeterPublication::QueueFull);
+    }
+    let (replacement_sender, replacement_receiver) = output_meter_channel();
+    let terminal_sender = std::mem::replace(meter_sender, replacement_sender);
+    drop(terminal_sender);
+
+    let terminal = meter_receiver.read_latest();
+    assert!(terminal.snapshot().is_some());
+    assert_eq!(
+        terminal.coalesced_snapshot_count(),
+        MAX_QUEUED_OUTPUT_METER_SNAPSHOTS - 1
+    );
+    assert_eq!(terminal.dropped_snapshot_count(), 2);
+    assert!(terminal.sender_disconnected());
+    let terminal_already_consumed = meter_receiver.read_latest();
+    assert_eq!(terminal_already_consumed.dropped_snapshot_count(), 0);
+    assert!(terminal_already_consumed.sender_disconnected());
+
+    drop(replacement_receiver);
     let disconnected = transport
         .process_interleaved_cycle(callback, scratch, interleaved, meter_sender)
         .unwrap();

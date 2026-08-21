@@ -165,6 +165,7 @@ struct OperatorMeterObserver {
     receiver: OutputMeterReceiver,
     ballistics: StereoSamplePeakBallistics,
     latest: Option<StereoSamplePeakBallisticsSnapshot>,
+    peak_hold_available: bool,
     coalesced_snapshot_count: u64,
     dropped_snapshot_count: u64,
     sender_disconnected: bool,
@@ -176,6 +177,7 @@ impl OperatorMeterObserver {
             receiver,
             ballistics: StereoSamplePeakBallistics::new(config),
             latest: None,
+            peak_hold_available: false,
             coalesced_snapshot_count: 0,
             dropped_snapshot_count: 0,
             sender_disconnected: false,
@@ -194,9 +196,11 @@ impl OperatorMeterObserver {
         self.sender_disconnected |= latest.sender_disconnected();
         if let Some(snapshot) = read.ballistics() {
             self.latest = Some(snapshot);
+            self.peak_hold_available = true;
         }
         operator_meter_presentation(
             self.latest,
+            self.peak_hold_available,
             self.coalesced_snapshot_count,
             self.dropped_snapshot_count,
             self.sender_disconnected,
@@ -204,8 +208,8 @@ impl OperatorMeterObserver {
     }
 
     fn reset_peak_hold(&mut self) {
-        self.ballistics.reset();
-        self.latest = None;
+        self.ballistics.reset_peak_hold();
+        self.peak_hold_available = false;
     }
 }
 
@@ -900,6 +904,7 @@ struct OperatorMeterChannelPresentation {
 
 fn operator_meter_presentation(
     snapshot: Option<StereoSamplePeakBallisticsSnapshot>,
+    peak_hold_available: bool,
     coalesced_snapshot_count: u64,
     dropped_snapshot_count: u64,
     sender_disconnected: bool,
@@ -914,8 +919,8 @@ fn operator_meter_presentation(
         },
         |snapshot| {
             (
-                operator_meter_channel_presentation(snapshot.left()),
-                operator_meter_channel_presentation(snapshot.right()),
+                operator_meter_channel_presentation(snapshot.left(), peak_hold_available),
+                operator_meter_channel_presentation(snapshot.right(), peak_hold_available),
                 Some(snapshot.processed_frame_end()),
             )
         },
@@ -944,9 +949,11 @@ fn operator_meter_presentation(
 
 fn operator_meter_channel_presentation(
     channel: ChannelSamplePeakBallistics,
+    peak_hold_available: bool,
 ) -> OperatorMeterChannelPresentation {
-    operator_meter_channel_values(
+    operator_meter_channel_values_with_hold(
         channel.measurement_available(),
+        peak_hold_available,
         channel.level_dbfs(),
         channel.held_peak_dbfs(),
     )
@@ -957,9 +964,23 @@ fn operator_meter_channel_values(
     level_dbfs: f32,
     held_peak_dbfs: f32,
 ) -> OperatorMeterChannelPresentation {
+    operator_meter_channel_values_with_hold(
+        measurement_available,
+        measurement_available,
+        level_dbfs,
+        held_peak_dbfs,
+    )
+}
+
+fn operator_meter_channel_values_with_hold(
+    measurement_available: bool,
+    peak_hold_available: bool,
+    level_dbfs: f32,
+    held_peak_dbfs: f32,
+) -> OperatorMeterChannelPresentation {
     let (level, reading) = operator_meter_level_presentation(measurement_available, level_dbfs);
     let (peak_reading, overload_latched) =
-        operator_peak_hold_presentation(measurement_available, held_peak_dbfs);
+        operator_peak_hold_presentation(peak_hold_available, held_peak_dbfs);
     OperatorMeterChannelPresentation {
         level,
         reading,
@@ -1189,6 +1210,16 @@ fn hex_digest(value: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+
+    use hyper_arrangement_renderer::RenderScratchSlot;
+    use hyper_audio_engine::InterleavedStereoCallback;
+    use hyper_audio_source::DecodedAudio;
+    use hyper_mixer_runtime::{PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime};
+    use hyper_playback_compiler::{graph::GraphLimits, scene::SceneLimits};
+    use hyper_playback_session::{
+        DecodedPlaybackAsset, PlaybackDocumentBytes, PlaybackSessionAssemblyInput,
+        assemble_playback_session,
+    };
 
     use super::*;
 
@@ -1468,8 +1499,103 @@ mod tests {
         );
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear fixture keeps the real mixer-to-generated-window evidence auditable"
+    )]
     fn assert_generated_operator_meter_contract(ui: &OperatorWindow) {
-        let (meter_sender, meter_receiver) = hyper_mixer_runtime::output_meter_channel();
+        const PROJECT_ID: &str = "018f47a2-6b2d-7c11-8a44-001122339500";
+        const ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-001122339504";
+        const TIMELINE: &[u8] = br#"{
+            "format":"hyper-timeline","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339501",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","ticks_per_quarter":1920,
+            "tempo_events":[{"tick":0,"microseconds_per_quarter":1000000}],
+            "meter_events":[{"tick":0,"numerator":4,"denominator":4}],"extensions":{}
+        }"#;
+        const TRACK: &[u8] = br#"{
+            "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339502",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Meter source","kind":"audio",
+            "order":0,"active":true,"clip_ids":["018f47a2-6b2d-7c11-8a44-001122339503"],"extensions":{}
+        }"#;
+        const CLIP: &[u8] = br#"{
+            "format":"hyper-audio-clip","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339503",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","track_id":"018f47a2-6b2d-7c11-8a44-001122339502",
+            "name":"Meter clip","enabled":true,"duration_ticks":60,
+            "source":{"asset_id":"018f47a2-6b2d-7c11-8a44-001122339504","start_frame":0,"frame_count":1500},
+            "loop":{"enabled":false,"start_tick":0,"end_tick":60},
+            "playback":{"gain_decibels":0,"reverse":false,"transpose_cents":0},
+            "fades":{"curve":"linear-amplitude","in_ticks":0,"out_ticks":0},
+            "warp_markers":[{"tick":0,"source_frame_offset":0},{"tick":60,"source_frame_offset":1500}],
+            "extensions":{}
+        }"#;
+        const ARRANGEMENT: &[u8] = br#"{
+            "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339505",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Main","enabled":true,
+            "placements":[{"id":"018f47a2-6b2d-7c11-8a44-001122339506","track_id":"018f47a2-6b2d-7c11-8a44-001122339502",
+            "clip_id":"018f47a2-6b2d-7c11-8a44-001122339503","start_tick":0,"clip_start_tick":0,"duration_ticks":60,"enabled":true}],
+            "scene_launches":[],"extensions":{}
+        }"#;
+        const MIXER: &[u8] = br#"{
+            "format":"hyper-mixer","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339507",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500",
+            "channels":[{"track_id":"018f47a2-6b2d-7c11-8a44-001122339502","gain_millionths":1000000,
+            "pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},"sends":[]}],
+            "return_buses":[],"main":{"gain_millionths":1000000,"mute":false},
+            "cue":{"source":"main","gain_millionths":1000000,"mute":false},"extensions":{}
+        }"#;
+
+        let mut left = vec![0.5_f32; 480];
+        left.extend([0.05; 480]);
+        left.extend([2.0; 540]);
+        let mut right = vec![0.25_f32; 480];
+        right.extend([0.025; 480]);
+        right.extend([1.5; 540]);
+        let session = assemble_playback_session(PlaybackSessionAssemblyInput {
+            documents: PlaybackDocumentBytes {
+                project_id: PROJECT_ID.to_owned(),
+                sample_rate_hz: SAMPLE_RATE_HZ,
+                timeline: TIMELINE.to_vec(),
+                tracks: vec![TRACK.to_vec()],
+                clips: vec![CLIP.to_vec()],
+                scenes: Vec::new(),
+                arrangement: Some(ARRANGEMENT.to_vec()),
+                mixer: MIXER.to_vec(),
+                automation_takes: Vec::new(),
+            },
+            decoded_assets: vec![DecodedPlaybackAsset::new(
+                ASSET_ID.to_owned(),
+                DecodedAudio::from_stereo(SAMPLE_RATE_HZ, left, right).unwrap(),
+            )],
+            limits: PlaybackSessionAssemblyLimits {
+                documents: LoaderLimits::VERSION_1,
+                media_cache: CacheLimits {
+                    max_assets: 1,
+                    max_frames_per_asset: 1_500,
+                    max_decoded_sample_bytes: 12_000,
+                },
+            },
+        })
+        .unwrap();
+        let (project, mixer, _, media) = session.parts();
+        let facts: Vec<_> = media.media_asset_facts().collect();
+        let graph = project
+            .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+            .unwrap();
+        let prepared = media.prepare_playback(&graph).unwrap();
+        let runtime =
+            PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, mixer, 480).unwrap();
+        let (mut transport_sender, mut transport) =
+            PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+        transport_sender.try_send(TransportCommand::Start).unwrap();
+        let mut callback = InterleavedStereoCallback::try_new(480, SAMPLE_RATE_HZ).unwrap();
+        let mut scratch_left = [0.0_f32; 480];
+        let mut scratch_right = [0.0_f32; 480];
+        let mut scratch = [RenderScratchSlot::new(
+            &mut scratch_left,
+            &mut scratch_right,
+        )];
+        let mut interleaved = [0.0_f32; 960];
+        let (mut meter_sender, meter_receiver) = hyper_mixer_runtime::output_meter_channel();
         let meter_config = SamplePeakBallisticsConfig::try_new(
             SAMPLE_RATE_HZ,
             OUTPUT_METER_FLOOR_DBFS,
@@ -1500,18 +1626,160 @@ mod tests {
             "meter frame unavailable · 0 coalesced · 0 dropped"
         );
 
-        ui.set_output_meter_state("stale peak presentation".into());
+        transport
+            .process_interleaved_cycle(
+                &mut callback,
+                &mut scratch,
+                &mut interleaved,
+                &mut meter_sender,
+            )
+            .unwrap();
+        apply_operator_meter_observation(ui, &mut meter_observer.borrow_mut());
+        let first_left_peak = interleaved
+            .iter()
+            .step_by(2)
+            .copied()
+            .map(f32::abs)
+            .fold(0.0_f32, f32::max);
+        let first_right_peak = interleaved
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .copied()
+            .map(f32::abs)
+            .fold(0.0_f32, f32::max);
+        let first_left_dbfs = 20.0 * first_left_peak.log10();
+        let first_right_dbfs = 20.0 * first_right_peak.log10();
+        assert_eq!(
+            ui.get_left_output_reading().as_str(),
+            format!("{first_left_dbfs:.1} dBFS")
+        );
+        assert_eq!(
+            ui.get_right_output_reading().as_str(),
+            format!("{first_right_dbfs:.1} dBFS")
+        );
+        assert_ne!(ui.get_left_output_reading(), ui.get_right_output_reading());
+        assert_eq!(
+            ui.get_left_output_peak_reading().as_str(),
+            format!("hold {first_left_dbfs:.1}")
+        );
+        assert_eq!(
+            ui.get_right_output_peak_reading().as_str(),
+            format!("hold {first_right_dbfs:.1}")
+        );
+        assert_eq!(
+            ui.get_output_meter_telemetry().as_str(),
+            "meter frame 480 · 0 coalesced · 0 dropped"
+        );
+
+        transport
+            .process_interleaved_cycle(
+                &mut callback,
+                &mut scratch,
+                &mut interleaved,
+                &mut meter_sender,
+            )
+            .unwrap();
+        apply_operator_meter_observation(ui, &mut meter_observer.borrow_mut());
+        let live_left_before_reset = ui.get_left_output_reading();
+        let live_right_before_reset = ui.get_right_output_reading();
+        let expected_left_after_falloff =
+            first_left_dbfs - OUTPUT_METER_FALLOFF_DB_PER_SECOND * 480.0 / 48_000.0;
+        let expected_right_after_falloff =
+            first_right_dbfs - OUTPUT_METER_FALLOFF_DB_PER_SECOND * 480.0 / 48_000.0;
+        assert_eq!(
+            live_left_before_reset.as_str(),
+            format!("{expected_left_after_falloff:.1} dBFS")
+        );
+        assert_eq!(
+            live_right_before_reset.as_str(),
+            format!("{expected_right_after_falloff:.1} dBFS")
+        );
+        assert_eq!(
+            ui.get_left_output_peak_reading().as_str(),
+            format!("hold {first_left_dbfs:.1}")
+        );
+        assert_eq!(
+            ui.get_right_output_peak_reading().as_str(),
+            format!("hold {first_right_dbfs:.1}")
+        );
+        assert_eq!(
+            ui.get_output_meter_telemetry().as_str(),
+            "meter frame 960 · 0 coalesced · 0 dropped"
+        );
+
         ui.invoke_reset_output_peak_requested();
+        assert_eq!(ui.get_left_output_reading(), live_left_before_reset);
+        assert_eq!(ui.get_right_output_reading(), live_right_before_reset);
+        assert_eq!(ui.get_left_output_peak_reading().as_str(), "hold —");
+        assert_eq!(ui.get_right_output_peak_reading().as_str(), "hold —");
+        assert!(!ui.get_output_overload_latched());
         assert_eq!(
             ui.get_output_meter_state().as_str(),
-            "Waiting for final-output evidence"
+            "Live final-output sample peak"
+        );
+        assert_eq!(
+            ui.get_output_meter_telemetry().as_str(),
+            "meter frame 960 · 0 coalesced · 0 dropped"
+        );
+
+        transport
+            .process_interleaved_cycle(
+                &mut callback,
+                &mut scratch,
+                &mut interleaved,
+                &mut meter_sender,
+            )
+            .unwrap();
+        apply_operator_meter_observation(ui, &mut meter_observer.borrow_mut());
+        let overload_left_peak = interleaved
+            .iter()
+            .step_by(2)
+            .copied()
+            .map(f32::abs)
+            .fold(0.0_f32, f32::max);
+        let overload_right_peak = interleaved
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .copied()
+            .map(f32::abs)
+            .fold(0.0_f32, f32::max);
+        let overload_left_dbfs = 20.0 * overload_left_peak.log10();
+        let overload_right_dbfs = 20.0 * overload_right_peak.log10();
+        assert!(ui.get_output_overload_latched());
+        assert!((ui.get_left_output_level() - 1.0).abs() <= f32::EPSILON);
+        assert!((ui.get_right_output_level() - 1.0).abs() <= f32::EPSILON);
+        assert_eq!(
+            ui.get_left_output_reading().as_str(),
+            format!("{overload_left_dbfs:.1} dBFS")
+        );
+        assert_eq!(
+            ui.get_right_output_reading().as_str(),
+            format!("{overload_right_dbfs:.1} dBFS")
+        );
+        assert_eq!(
+            ui.get_left_output_peak_reading().as_str(),
+            format!("hold {overload_left_dbfs:.1}")
+        );
+        assert_eq!(
+            ui.get_right_output_peak_reading().as_str(),
+            format!("hold {overload_right_dbfs:.1}")
+        );
+        assert_eq!(
+            ui.get_output_meter_telemetry().as_str(),
+            "meter frame 1440 · 0 coalesced · 0 dropped"
         );
 
         drop(meter_sender);
         apply_operator_meter_observation(ui, &mut meter_observer.borrow_mut());
         assert_eq!(
             ui.get_output_meter_state().as_str(),
-            "Meter producer ended before a snapshot"
+            "Final meter snapshot · producer ended"
+        );
+        assert_eq!(
+            ui.get_output_meter_telemetry().as_str(),
+            "meter frame 1440 · 0 coalesced · 0 dropped"
         );
     }
 
@@ -1874,7 +2142,7 @@ mod tests {
         assert!(observer.sender_disconnected);
         assert!(observer.latest.is_none());
 
-        let unavailable = operator_meter_presentation(None, u64::MAX, u64::MAX - 1, true);
+        let unavailable = operator_meter_presentation(None, false, u64::MAX, u64::MAX - 1, true);
         assert_eq!(unavailable.state, "Meter producer ended before a snapshot");
         assert!(!unavailable.overload_latched);
         assert_eq!(

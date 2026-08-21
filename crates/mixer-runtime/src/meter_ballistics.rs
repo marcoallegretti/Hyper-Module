@@ -143,6 +143,11 @@ impl ChannelState {
             measurement_available: measured_dbfs.is_some(),
         }
     }
+
+    fn reset_peak_hold(&mut self, floor_dbfs: f32) {
+        self.held_peak_dbfs = floor_dbfs;
+        self.hold_until_frame = 0;
+    }
 }
 
 /// Persistent display values for one channel.
@@ -245,6 +250,13 @@ impl StereoSamplePeakBallistics {
     pub const fn reset(&mut self) {
         self.channel_id = None;
         self.clear_display();
+    }
+
+    /// Clears only held maxima while preserving live levels and frame-clock
+    /// continuity.
+    pub fn reset_peak_hold(&mut self) {
+        self.left.reset_peak_hold(self.config.floor_dbfs);
+        self.right.reset_peak_hold(self.config.floor_dbfs);
     }
 
     const fn clear_display(&mut self) {
@@ -443,6 +455,24 @@ mod tests {
         let after_hold = ballistics.update(1, &snapshot(80, 40, 0.0, 0.0)).snapshot();
         assert_near(after_hold.left().level_dbfs(), -14.0);
         assert_near(after_hold.left().held_peak_dbfs(), -4.0);
+    }
+
+    #[test]
+    fn peak_hold_reset_preserves_live_level_and_frame_clock() {
+        let mut ballistics = StereoSamplePeakBallistics::new(config(20.0, u64::MAX));
+        let _ = ballistics.update(1, &snapshot(10, 10, 1.0, 1.0));
+        let before_reset = ballistics.update(1, &snapshot(20, 10, 0.1, 0.1)).snapshot();
+        assert_near(before_reset.left().level_dbfs(), -2.0);
+        assert_near(before_reset.left().held_peak_dbfs(), 0.0);
+
+        ballistics.reset_peak_hold();
+        let after_reset = ballistics
+            .update(1, &snapshot(30, 10, 0.01, 0.01))
+            .snapshot();
+
+        assert_eq!(after_reset.processed_frame_end(), 30);
+        assert_near(after_reset.left().level_dbfs(), -4.0);
+        assert_near(after_reset.left().held_peak_dbfs(), -40.0);
     }
 
     #[test]

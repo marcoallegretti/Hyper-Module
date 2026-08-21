@@ -35,3 +35,8 @@ slint = { version = "=1.17.1", default-features = false, features = [
 
 [build-dependencies]
 slint-build = "=1.17.1"
+
+[dev-dependencies]
+hyper-arrangement-renderer = { path = "../../../crates/arrangement-renderer" }
+hyper-audio-engine = { path = "../../../crates/audio-engine" }
+hyper-playback-compiler = { path = "../../../crates/playback-compiler" }

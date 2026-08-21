@@ -2431,12 +2431,15 @@ dependencies = [
 name = "hyper-runtime"
 version = "0.1.0"
 dependencies = [
+ "hyper-arrangement-renderer",
+ "hyper-audio-engine",
  "hyper-audio-source",
  "hyper-control-runtime",
  "hyper-desktop-audio",
  "hyper-media-cache",
  "hyper-mixer-runtime",
  "hyper-panel-protocol",
+ "hyper-playback-compiler",
  "hyper-playback-json",
  "hyper-playback-session",
  "hyper-project-loader",

@@ -3,7 +3,7 @@
 
 use core::error::Error;
 use core::fmt;
-use core::sync::atomic::{AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::Arc;
 
 use hyper_arrangement_renderer::{
@@ -1453,6 +1453,7 @@ pub struct OutputMeterSender {
     producer: Producer<OutputMeterSnapshot>,
     processed_frame_end: u64,
     dropped_snapshot_count: usize,
+    pending_dropped_snapshot_count: Arc<AtomicUsize>,
 }
 
 impl OutputMeterSender {
@@ -1477,7 +1478,9 @@ impl OutputMeterSender {
     /// Returns the published snapshot on success, including drop telemetry.
     /// Returns the snapshot if the queue is full or its receiver has been
     /// destroyed. A full queue increments a local saturating counter that is
-    /// attached to the next successfully published snapshot.
+    /// attached to the next successfully published snapshot. Preallocated
+    /// shared evidence preserves an otherwise unpublished pending count if the
+    /// producer ends first.
     #[allow(
         clippy::result_large_err,
         reason = "returning the fixed-size snapshot preserves ownership without a real-time allocation"
@@ -1495,11 +1498,17 @@ impl OutputMeterSender {
         snapshot.dropped_before = self.dropped_snapshot_count;
         match self.producer.push(snapshot) {
             Ok(()) => {
-                self.dropped_snapshot_count = 0;
+                if self.dropped_snapshot_count != 0 {
+                    self.dropped_snapshot_count = 0;
+                    self.pending_dropped_snapshot_count
+                        .store(0, Ordering::Release);
+                }
                 Ok(snapshot)
             }
             Err(PushError::Full(snapshot)) => {
                 self.dropped_snapshot_count = self.dropped_snapshot_count.saturating_add(1);
+                self.pending_dropped_snapshot_count
+                    .store(self.dropped_snapshot_count, Ordering::Release);
                 Err(OutputMeterPublishError::Full(snapshot))
             }
         }
@@ -1542,6 +1551,7 @@ impl LatestOutputMeterSnapshot {
 pub struct OutputMeterReceiver {
     consumer: Consumer<OutputMeterSnapshot>,
     channel_id: u64,
+    pending_dropped_snapshot_count: Arc<AtomicUsize>,
 }
 
 impl OutputMeterReceiver {
@@ -1554,7 +1564,8 @@ impl OutputMeterReceiver {
     ///
     /// Coalesced snapshots were successfully delivered but superseded during
     /// this read. Dropped snapshots were rejected earlier because the queue
-    /// was full. Both counts are explicit and independent.
+    /// was full, including pending terminal drops when the producer has ended.
+    /// Both counts are explicit and independent.
     #[must_use]
     pub fn read_latest(&mut self) -> LatestOutputMeterSnapshot {
         self.drain_with(|_| {})
@@ -1608,6 +1619,10 @@ impl OutputMeterReceiver {
         let sender_disconnected = self.consumer.is_abandoned();
         if sender_disconnected {
             fence(Ordering::Acquire);
+            dropped_snapshot_count = dropped_snapshot_count.saturating_add(
+                self.pending_dropped_snapshot_count
+                    .swap(0, Ordering::AcqRel),
+            );
         }
         LatestOutputMeterSnapshot {
             snapshot,
@@ -1650,15 +1665,18 @@ impl OutputMeterBallisticsRead {
 pub fn output_meter_channel() -> (OutputMeterSender, OutputMeterReceiver) {
     let (producer, consumer) = RingBuffer::new(MAX_QUEUED_OUTPUT_METER_SNAPSHOTS);
     let channel_id = next_output_meter_channel_id();
+    let pending_dropped_snapshot_count = Arc::new(AtomicUsize::new(0));
     (
         OutputMeterSender {
             producer,
             processed_frame_end: 0,
             dropped_snapshot_count: 0,
+            pending_dropped_snapshot_count: Arc::clone(&pending_dropped_snapshot_count),
         },
         OutputMeterReceiver {
             consumer,
             channel_id,
+            pending_dropped_snapshot_count,
         },
     )
 }
