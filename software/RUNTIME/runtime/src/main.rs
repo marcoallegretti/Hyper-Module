@@ -2355,6 +2355,40 @@ mod tests {
     }
 
     #[test]
+    fn operator_mixer_value_conversion_is_bounded_finite_and_rounded() {
+        for (percent, expected) in [(0.0, 0), (200.0, 2_000_000), (12.345_67, 123_457)] {
+            assert_eq!(operator_gain_percent_to_millionths(percent), Ok(expected));
+        }
+        for (percent, expected) in [
+            (-100.0, -1_000_000),
+            (100.0, 1_000_000),
+            (-12.345_67, -123_457),
+            (12.345_67, 123_457),
+        ] {
+            assert_eq!(operator_pan_percent_to_millionths(percent), Ok(expected));
+        }
+
+        for percent in [
+            f32::from_bits(0.0_f32.to_bits() | 0x8000_0001),
+            f32::from_bits(200.0_f32.to_bits() + 1),
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            assert_eq!(operator_gain_percent_to_millionths(percent), Err(()));
+        }
+        for percent in [
+            f32::from_bits((-100.0_f32).to_bits() + 1),
+            f32::from_bits(100.0_f32.to_bits() + 1),
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            assert_eq!(operator_pan_percent_to_millionths(percent), Err(()));
+        }
+    }
+
+    #[test]
     fn rejected_bundle_preparation_cannot_open_output() {
         let events = RefCell::new(Vec::new());
 
