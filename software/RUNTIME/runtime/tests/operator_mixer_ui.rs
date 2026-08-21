@@ -68,6 +68,7 @@ fn generated_mixer_controls_forward_exact_rows_values_and_capability() {
     ui.set_mixer_sends(ModelRc::from(Rc::clone(&sends)));
     ui.set_main_gain_percent(40.0);
     ui.set_main_mute_enabled(true);
+    let seek_intents = configure_transport_seek(&ui);
 
     let intents = Rc::new(RefCell::new(Vec::new()));
     let mute_intents = Rc::clone(&intents);
@@ -120,8 +121,40 @@ fn generated_mixer_controls_forward_exact_rows_values_and_capability() {
     });
     ui.show().unwrap();
 
+    verify_committed_transport_seek(&ui, &seek_intents);
     verify_enabled_controls(&ui, &intents);
     verify_recovery_and_disabled_controls(&ui, &rows, &sends, &intents);
+}
+
+fn configure_transport_seek(ui: &OperatorWindow) -> Rc<RefCell<Vec<u32>>> {
+    ui.set_transport_position_percent(20.0);
+    ui.set_transport_seek_enabled(true);
+    let intents = Rc::new(RefCell::new(Vec::new()));
+    let requested = Rc::clone(&intents);
+    ui.on_locate_percent_requested(move |percent| {
+        requested.borrow_mut().push(percent.to_bits());
+    });
+    intents
+}
+
+fn verify_committed_transport_seek(ui: &OperatorWindow, intents: &RefCell<Vec<u32>>) {
+    let seek = find_control(ui, "Committed transport position percent");
+    assert_eq!(seek.accessible_enabled(), Some(true));
+    assert_accessible_value(&seek, 20.0);
+    click_committed_marker(ui, &seek, 0.2);
+    assert_eq!(intents.borrow().len(), 1);
+    assert!((f32::from_bits(intents.borrow()[0]) - 20.0).abs() <= 0.001);
+    assert_accessible_value(&seek, 20.0);
+    drag_to_right_edge(&seek);
+    assert_eq!(intents.borrow().len(), 2, "seek emits only on release");
+    assert_eq!(intents.borrow()[1], 100.0_f32.to_bits());
+    assert_accessible_value(&seek, 20.0);
+    ui.set_transport_position_percent(50.0);
+    assert_accessible_value(&seek, 50.0);
+    ui.set_transport_seek_enabled(false);
+    assert_eq!(seek.accessible_enabled(), Some(false));
+    drag_to_right_edge(&seek);
+    assert_eq!(intents.borrow().len(), 2);
 }
 
 fn verify_enabled_controls(ui: &OperatorWindow, intents: &RefCell<Vec<MixerIntent>>) {
@@ -173,6 +206,7 @@ fn verify_enabled_controls(ui: &OperatorWindow, intents: &RefCell<Vec<MixerInten
     assert_eq!(unavailable.accessible_enabled(), Some(false));
     unavailable.mock_single_click(PointerEventButton::Left);
 
+    scroll_down(ui);
     click_enabled(ui, "Disable send 1 · Audio Ω to Return β");
     let send_gain = find_control(ui, "1 · Audio Ω to Return β send gain");
     let send_pan = find_control(ui, "1 · Audio Ω to Return β send pan");

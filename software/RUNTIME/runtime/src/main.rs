@@ -35,7 +35,7 @@ use hyper_mixer_runtime::{
 };
 use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
 use hyper_playback_json::LoaderLimits;
-use hyper_playback_session::PlaybackSessionAssemblyLimits;
+use hyper_playback_session::{PlaybackExtent, PlaybackSessionAssemblyLimits};
 use hyper_project_loader::ProjectPlaybackLimits;
 use hyper_runtime_deployment::resolve_runtime_deployment;
 use hyper_runtime_host::{PanelHost, RuntimeArguments, ServedPanel, serve_panels_with_idle};
@@ -145,6 +145,7 @@ struct RuntimeFacts {
     project_name: String,
     project_id: String,
     project_revision: u64,
+    playback_extent: PlaybackExtent,
 }
 
 #[derive(Clone, Debug)]
@@ -264,6 +265,9 @@ enum OperatorCommand {
     Start,
     Stop,
     ReturnToStart,
+    Locate {
+        frame: usize,
+    },
     LaunchScene {
         scene_index: usize,
     },
@@ -406,6 +410,7 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
                 project_name: manifest.name().to_owned(),
                 project_id: manifest.project_id().to_owned(),
                 project_revision: manifest.revision(),
+                playback_extent: deployment.bundle().project().session().extent(),
             };
             Ok((facts, deployment.into_bundle().into_project()))
         },
@@ -626,6 +631,15 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
                 Ok(()) => diagnostic("transport return to start queued".to_owned()),
                 Err(error) => diagnostic(format!("transport return to start refused: {error}")),
             },
+            OperatorCommand::Locate { frame } => {
+                match host.queue_transport(TransportCommand::Locate {
+                    frame,
+                    state: LocateState::Preserve,
+                }) {
+                    Ok(()) => diagnostic(format!("transport locate to frame {frame} queued")),
+                    Err(error) => diagnostic(format!("transport locate refused: {error}")),
+                }
+            }
             OperatorCommand::LaunchScene { scene_index } => {
                 match host.queue_transport(TransportCommand::LaunchScene { scene_index }) {
                     Ok(()) => diagnostic(format!("scene {} launch queued", scene_index + 1)),
@@ -1077,6 +1091,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let mixer_model = Rc::new(VecModel::from(operator_mixer_rows(&mixer_channels)));
     let mixer_send_model = Rc::new(VecModel::from(operator_mixer_send_rows(&mixer_sends)));
     let loop_authority = Rc::new(Cell::new(None));
+    let seek_authority = Rc::new(Cell::new(None));
     let loudness_authority = Rc::new(Cell::new(None));
     let mixer_authority = Rc::new(RefCell::new(None));
     ui.set_scenes(ModelRc::from(Rc::clone(&scene_model)));
@@ -1087,6 +1102,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_action(&ui, &commands_tx, &diagnostic, OperatorCommand::Start);
     wire_operator_stop(&ui, &commands_tx, &diagnostic);
     wire_operator_return_to_start(&ui, &commands_tx, &diagnostic);
+    wire_operator_seek(&ui, &commands_tx, &diagnostic, &seek_authority);
     wire_operator_quit(&ui, &commands_tx, &stop, &diagnostic);
     wire_operator_peak_reset(&ui, &meter_observer, &loudness_authority);
     wire_operator_loudness_controls(&ui, &commands_tx, &diagnostic, &loudness_authority);
@@ -1099,6 +1115,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &observers,
         &diagnostic,
         &loop_authority,
+        &seek_authority,
         &scene_model,
         false,
     );
@@ -1124,6 +1141,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer_meter_observer = Rc::clone(&meter_observer);
     let timer_scene_model = Rc::clone(&scene_model);
     let timer_loop_authority = Rc::clone(&loop_authority);
+    let timer_seek_authority = Rc::clone(&seek_authority);
     let timer_loudness_authority = Rc::clone(&loudness_authority);
     let timer_mixer_model = Rc::clone(&mixer_model);
     let timer_mixer_send_model = Rc::clone(&mixer_send_model);
@@ -1141,6 +1159,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &timer_observers,
                 &timer_diagnostic,
                 &timer_loop_authority,
+                &timer_seek_authority,
                 &timer_scene_model,
                 completion_observed,
             );
@@ -1185,6 +1204,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
             {
                 completion_observed = true;
                 revoke_operator_loop_authority(&ui, &timer_loop_authority);
+                revoke_operator_seek_authority(&ui, &timer_seek_authority);
                 revoke_operator_loudness_authority(&ui, &timer_loudness_authority);
                 revoke_operator_mixer_authority(
                     &ui,
@@ -1346,6 +1366,34 @@ fn wire_operator_return_to_start(
     let diagnostic = Arc::clone(diagnostic);
     ui.on_return_to_start_requested(move || {
         send_operator_command(&sender, OperatorCommand::ReturnToStart, &diagnostic);
+    });
+}
+
+fn wire_operator_seek(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    authority: &Rc<Cell<Option<usize>>>,
+) {
+    let sender = sender.clone();
+    let diagnostic = Arc::clone(diagnostic);
+    let authority = Rc::clone(authority);
+    ui.on_locate_percent_requested(move |percent| {
+        let Some(end_frame) = authority.get() else {
+            set_diagnostic(
+                &diagnostic,
+                "transport locate refused: bounded playback extent is unavailable".to_owned(),
+            );
+            return;
+        };
+        let Some(frame) = operator_seek_frame(end_frame, percent) else {
+            set_diagnostic(
+                &diagnostic,
+                "transport locate refused: position is outside 0..=100%".to_owned(),
+            );
+            return;
+        };
+        send_operator_command(&sender, OperatorCommand::Locate { frame }, &diagnostic);
     });
 }
 
@@ -2143,11 +2191,69 @@ fn apply_operator_loop_observation(
     }
 }
 
+fn apply_operator_seek_observation(
+    ui: &OperatorWindow,
+    authority: &Cell<Option<usize>>,
+    extent: PlaybackExtent,
+    position_frame: usize,
+) {
+    match extent {
+        PlaybackExtent::Bounded { end_frame: 0 } => {
+            authority.set(None);
+            ui.set_transport_position_percent(0.0);
+            ui.set_transport_seek_state("Empty project · seek unavailable".into());
+            ui.set_transport_seek_enabled(false);
+        }
+        PlaybackExtent::Bounded { end_frame } => {
+            authority.set(Some(end_frame));
+            ui.set_transport_position_percent(operator_seek_percent(position_frame, end_frame));
+            ui.set_transport_seek_state(format!("POSITION · 0–{end_frame} frames").into());
+            ui.set_transport_seek_enabled(true);
+        }
+        PlaybackExtent::Unbounded => {
+            authority.set(None);
+            ui.set_transport_position_percent(0.0);
+            ui.set_transport_seek_state("Unbounded playback · seek unavailable".into());
+            ui.set_transport_seek_enabled(false);
+        }
+    }
+}
+
+fn operator_seek_frame(end_frame: usize, percent: f32) -> Option<usize> {
+    if end_frame == 0 || !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+        return None;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "finite bounded percent is checked before rounding to one-millionth authority"
+    )]
+    let millionths = (percent * 10_000.0).round() as u32;
+    let scaled = (end_frame as u128)
+        .checked_mul(u128::from(millionths))?
+        .checked_add(500_000)?
+        / 1_000_000;
+    usize::try_from(scaled).ok()
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "the exact frame remains visible; the bounded f32 value only positions a percent marker"
+)]
+fn operator_seek_percent(position_frame: usize, end_frame: usize) -> f32 {
+    if end_frame == 0 {
+        return 0.0;
+    }
+    ((position_frame.min(end_frame) as f64 / end_frame as f64) * 100.0) as f32
+}
+
 fn apply_operator_cycle_observation(
     ui: &OperatorWindow,
     observers: &RuntimeObservers,
     diagnostic: &Mutex<String>,
     loop_authority: &Cell<Option<OperatorLoopAuthority>>,
+    seek_authority: &Cell<Option<usize>>,
     scene_model: &VecModel<OperatorSceneRow>,
     terminal_latched: bool,
 ) {
@@ -2157,10 +2263,23 @@ fn apply_operator_cycle_observation(
     let observation = apply_observations(ui, observers, diagnostic);
     if observers.output_status.state() == OutputStreamState::Failed {
         revoke_operator_loop_authority(ui, loop_authority);
+        revoke_operator_seek_authority(ui, seek_authority);
         return;
     }
+    apply_operator_seek_observation(
+        ui,
+        seek_authority,
+        observers.facts.playback_extent,
+        observation.position_frame(),
+    );
     apply_operator_loop_observation(ui, loop_authority, observation);
     apply_operator_scene_observation(ui, scene_model, observation);
+}
+
+fn revoke_operator_seek_authority(ui: &OperatorWindow, authority: &Cell<Option<usize>>) {
+    authority.set(None);
+    ui.set_transport_seek_state("Runtime stopped · seek unavailable".into());
+    ui.set_transport_seek_enabled(false);
 }
 
 fn revoke_operator_loop_authority(
@@ -3074,6 +3193,39 @@ mod tests {
             ]
         );
         assert!(!stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn operator_seek_conversion_and_owner_delivery_are_bounded_and_exact() {
+        assert_eq!(operator_seek_frame(1_500, 0.0), Some(0));
+        assert_eq!(operator_seek_frame(1_500, 50.0), Some(750));
+        assert_eq!(operator_seek_frame(1_500, 100.0), Some(1_500));
+        assert_eq!(operator_seek_frame(3, 50.0), Some(2));
+        assert_eq!(operator_seek_frame(usize::MAX, 100.0), Some(usize::MAX));
+        for invalid in [f32::NAN, f32::INFINITY, -0.1, 100.1] {
+            assert_eq!(operator_seek_frame(1_500, invalid), None);
+        }
+        assert_eq!(operator_seek_frame(0, 50.0), None);
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        sender.send(OperatorCommand::Locate { frame: 751 }).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut owner = OperatorControl::default();
+        let diagnostic = RefCell::new(String::new());
+        drain_operator_commands(&mut owner, &receiver, &stop, &|message| {
+            *diagnostic.borrow_mut() = message;
+        });
+        assert_eq!(
+            owner.commands,
+            [TransportCommand::Locate {
+                frame: 751,
+                state: LocateState::Preserve,
+            }]
+        );
+        assert_eq!(
+            diagnostic.into_inner(),
+            "transport locate to frame 751 queued"
+        );
     }
 
     #[test]
@@ -4155,6 +4307,7 @@ mod tests {
             Pan::from_millionths(-700_000).unwrap().value() * 100.0,
         );
         assert!(generated_sends.row_data(2).unwrap().enabled);
+
         for stale_row in [-1, 4, 9] {
             ui.invoke_set_mixer_channel_gain_requested(stale_row, 50.0);
             ui.invoke_set_mixer_channel_pan_requested(stale_row, 25.0);
@@ -5061,6 +5214,55 @@ mod tests {
             Err(TryRecvError::Empty)
         );
 
+        let seek_authority = Rc::new(Cell::new(None));
+        let (seek_commands, seek_receiver) =
+            std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        let seek_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_seek(ui, &seek_commands, &seek_diagnostic, &seek_authority);
+        let before_seek = recovery.snapshot();
+        apply_operator_seek_observation(
+            ui,
+            &seek_authority,
+            PlaybackExtent::Bounded { end_frame: 1_500 },
+            before_seek.position_frame(),
+        );
+        let committed_percent = ui.get_transport_position_percent();
+        ui.invoke_locate_percent_requested(50.0);
+        assert_operator_float(ui.get_transport_position_percent(), committed_percent);
+        let locate = seek_receiver.try_recv().unwrap();
+        assert_eq!(locate, OperatorCommand::Locate { frame: 750 });
+        let OperatorCommand::Locate { frame } = locate else {
+            unreachable!("the seek fixture emits one exact locate")
+        };
+        transport_sender.try_send(TransportCommand::Stop).unwrap();
+        transport_sender
+            .try_send(TransportCommand::Locate {
+                frame,
+                state: LocateState::Preserve,
+            })
+            .unwrap();
+        let seek_cycle = transport
+            .process_cycle(
+                &mut scratch,
+                StereoOutput {
+                    left: &mut mixer_left,
+                    right: &mut mixer_right,
+                },
+            )
+            .unwrap();
+        let committed_mixer = transport.mixer_parameter_state();
+        recovery_publisher.publish_cycle(seek_cycle, Some(&committed_mixer));
+        let sought = recovery.observe_cycle();
+        assert_eq!(sought.position_frame(), 750);
+        assert_eq!(sought.state(), PlaybackRecoveryTransportState::Stopped);
+        apply_operator_seek_observation(
+            ui,
+            &seek_authority,
+            PlaybackExtent::Bounded { end_frame: 1_500 },
+            sought.position_frame(),
+        );
+        assert_operator_float(ui.get_transport_position_percent(), 50.0);
+
         drop(meter_sender);
         apply_operator_meter_observation(
             ui,
@@ -5103,7 +5305,9 @@ mod tests {
         wire_operator_return_to_start(&ui, &sender, &diagnostic);
         wire_operator_quit(&ui, &sender, &stop, &diagnostic);
         let loop_authority = Rc::new(Cell::new(None));
+        let seek_authority = Rc::new(Cell::new(None));
         wire_operator_loop_toggle(&ui, &sender, &diagnostic, &loop_authority);
+        wire_operator_seek(&ui, &sender, &diagnostic, &seek_authority);
 
         let facts = RuntimeFacts {
             bundle_identity: "f".repeat(64),
@@ -5112,6 +5316,7 @@ mod tests {
             project_name: "Night Drive".to_owned(),
             project_id: "project-night-drive".to_owned(),
             project_revision: u64::MAX - 1,
+            playback_extent: PlaybackExtent::Bounded { end_frame: 1_500 },
         };
         let observers = RuntimeObservers {
             facts: facts.clone(),
@@ -5123,10 +5328,90 @@ mod tests {
         apply_static_facts(&ui, &facts);
         let observation = apply_observations(&ui, &observers, &diagnostic);
         apply_operator_loop_observation(&ui, &loop_authority, observation);
+        apply_operator_seek_observation(
+            &ui,
+            &seek_authority,
+            facts.playback_extent,
+            observation.position_frame(),
+        );
         assert_eq!(ui.get_loop_state().as_str(), "No project loop");
         assert_eq!(ui.get_loop_range().as_str(), "No saved range");
         assert_eq!(ui.get_loop_toggle_label().as_str(), "Loop unavailable");
         assert!(!ui.get_loop_toggle_enabled());
+        assert!(ui.get_transport_seek_enabled());
+        assert_operator_float(ui.get_transport_position_percent(), 0.0);
+        ui.invoke_locate_percent_requested(50.0);
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::Locate { frame: 750 })
+        );
+        assert_operator_float(ui.get_transport_position_percent(), 0.0);
+        ui.invoke_locate_percent_requested(f32::NAN);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "transport locate refused: position is outside 0..=100%"
+        );
+
+        let (full_seek_sender, full_seek_receiver) = std::sync::mpsc::sync_channel(1);
+        full_seek_sender.send(OperatorCommand::Start).unwrap();
+        let full_seek_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_seek(
+            &ui,
+            &full_seek_sender,
+            &full_seek_diagnostic,
+            &seek_authority,
+        );
+        ui.invoke_locate_percent_requested(50.0);
+        assert_eq!(full_seek_receiver.try_recv(), Ok(OperatorCommand::Start));
+        assert_eq!(full_seek_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert!(
+            full_seek_diagnostic
+                .lock()
+                .unwrap()
+                .contains("operator command refused")
+        );
+
+        let (lost_seek_sender, lost_seek_receiver) = std::sync::mpsc::sync_channel(1);
+        drop(lost_seek_receiver);
+        let lost_seek_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_seek(
+            &ui,
+            &lost_seek_sender,
+            &lost_seek_diagnostic,
+            &seek_authority,
+        );
+        ui.invoke_locate_percent_requested(50.0);
+        assert!(
+            lost_seek_diagnostic
+                .lock()
+                .unwrap()
+                .contains("operator command refused")
+        );
+        assert_operator_float(ui.get_transport_position_percent(), 0.0);
+        wire_operator_seek(&ui, &sender, &diagnostic, &seek_authority);
+
+        apply_operator_seek_observation(
+            &ui,
+            &seek_authority,
+            PlaybackExtent::Bounded { end_frame: 0 },
+            0,
+        );
+        assert_eq!(seek_authority.get(), None);
+        assert!(!ui.get_transport_seek_enabled());
+        apply_operator_seek_observation(&ui, &seek_authority, PlaybackExtent::Unbounded, 0);
+        assert_eq!(seek_authority.get(), None);
+        assert_eq!(
+            ui.get_transport_seek_state().as_str(),
+            "Unbounded playback · seek unavailable"
+        );
+        apply_operator_seek_observation(
+            &ui,
+            &seek_authority,
+            facts.playback_extent,
+            observation.position_frame(),
+        );
+        *diagnostic.lock().unwrap() = "authoritative diagnostic".to_owned();
         assert_generated_operator_meter_contract(&ui);
 
         let terminal_range = TransportLoopRange::new(120, 360).unwrap();
@@ -5151,6 +5436,7 @@ mod tests {
             &terminal_observers,
             &diagnostic,
             &loop_authority,
+            &seek_authority,
             &terminal_scenes,
             false,
         );
@@ -5167,12 +5453,17 @@ mod tests {
             &terminal_observers,
             &diagnostic,
             &loop_authority,
+            &seek_authority,
             &terminal_scenes,
             true,
         );
         assert_eq!(loop_authority.get(), None);
+        revoke_operator_seek_authority(&ui, &seek_authority);
         assert_eq!(ui.get_loop_toggle_label().as_str(), "Runtime stopped");
         assert!(!ui.get_loop_toggle_enabled());
+        assert_eq!(seek_authority.get(), None);
+        assert!(!ui.get_transport_seek_enabled());
+        ui.invoke_locate_percent_requested(50.0);
         ui.invoke_toggle_loop_requested();
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
 
