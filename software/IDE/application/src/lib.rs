@@ -136,7 +136,8 @@ use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
     AudioClipRemovalOutcome, AudioClipRemovalRequest,
     AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
-    AudioTrackRemovalRequest, AutomationTakePublicationRequest, ControlMappingPublicationRequest,
+    AudioTrackRemovalRequest, AutomationTakePublicationRequest, AutomationTakeRemovalRequest,
+    ControlMappingPublicationRequest,
     DeviceChainPublicationRequest, DeviceChainRemovalRequest,
     ImportedAudioClipPublicationRequest, ProjectResourcePublicationError,
     ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest,
@@ -144,7 +145,7 @@ use hyper_storage_engine::{
     ScenePublicationRequest, StorageError, clean_unused_samples, publish_arrangement,
     publish_audio_clip, publish_audio_track, publish_automation_take, publish_control_mapping,
     publish_device_chain, publish_imported_audio_clip, publish_project_resource, publish_scene,
-    remove_audio_clip, remove_audio_track, remove_device_chain,
+    remove_audio_clip, remove_audio_track, remove_automation_take, remove_device_chain,
 };
 
 mod recording;
@@ -3881,15 +3882,15 @@ impl fmt::Display for IdeAutomationTakePublicationError {
             ),
             Self::Mixer(source) => write!(
                 formatter,
-                "live mixer could not be preserved before publishing the automation take: {source}"
+                "live mixer could not be preserved before changing automation takes: {source}"
             ),
             Self::Take { source, .. } if source.published() => write!(
                 formatter,
-                "automation take was published, but project verification or transaction recovery is incomplete: {source}"
+                "automation take change committed, but project verification or transaction recovery is incomplete: {source}"
             ),
             Self::Take { mixer, source } if mixer.changed() => write!(
                 formatter,
-                "live mixer was preserved in project revision {} but automation take publication failed: {source}",
+                "live mixer was preserved in project revision {} but the automation take change failed: {source}",
                 mixer.project_revision()
             ),
             Self::Take { source, .. } => source.fmt(formatter),
@@ -4030,6 +4031,7 @@ impl Error for IdeAutomationTakeCreationError {
 #[derive(Debug)]
 pub enum IdeAutomationTakeEditError {
     InvalidTakeIdentity,
+    TakeUnavailable,
     MixerSave(Box<IdeProjectSaveError>),
     Storage(StorageError),
     MixerDocument(PlaybackDocumentLoadError),
@@ -4073,6 +4075,7 @@ impl fmt::Display for IdeAutomationTakeEditError {
             Self::InvalidTakeIdentity => {
                 formatter.write_str("the automation take identity is empty")
             }
+            Self::TakeUnavailable => formatter.write_str("the automation take is unavailable"),
             Self::MixerSave(source) => {
                 write!(
                     formatter,
@@ -4137,7 +4140,10 @@ impl Error for IdeAutomationTakeEditError {
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
             Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
             Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
-            Self::InvalidTakeIdentity | Self::CapacityUnavailable | Self::NativeClose(_) => None,
+            Self::InvalidTakeIdentity
+            | Self::TakeUnavailable
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
         }
     }
 }
@@ -6299,6 +6305,51 @@ struct IdeDeviceChainHistoryRestorePlan {
     displaced: IdeHistoryOperation,
 }
 
+#[derive(Debug)]
+enum IdeAutomationTakeHistoryPublication {
+    Addition(Vec<u8>),
+    Removal,
+}
+
+#[derive(Debug)]
+struct IdeAutomationTakeHistoryRestorePlan {
+    mixer: IdeMixerSavePlan,
+    take_id: String,
+    publication: IdeAutomationTakeHistoryPublication,
+    displaced: IdeHistoryOperation,
+}
+
+impl IdeAutomationTakeHistoryRestorePlan {
+    fn displaced(&self) -> IdeHistoryOperation {
+        self.displaced.clone()
+    }
+
+    fn publish(&self) -> Result<ProjectResourcePublicationOutcome, IdeResourceRestoreError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeResourceRestoreError::MixerPublication(Box::new(source)))?;
+        let result = match &self.publication {
+            IdeAutomationTakeHistoryPublication::Addition(bytes) => publish_automation_take(
+                &self.mixer.project_path,
+                AutomationTakePublicationRequest {
+                    expected_project_sha256: *mixer.project_identity(),
+                    take_id: &self.take_id,
+                    take_bytes: bytes,
+                },
+            ),
+            IdeAutomationTakeHistoryPublication::Removal => remove_automation_take(
+                &self.mixer.project_path,
+                AutomationTakeRemovalRequest {
+                    expected_project_sha256: *mixer.project_identity(),
+                    take_id: &self.take_id,
+                },
+            ),
+        };
+        result.map_err(|source| IdeResourceRestoreError::Publication(Box::new(source)))
+    }
+}
+
 impl IdeDeviceChainHistoryRestorePlan {
     fn displaced(&self) -> IdeHistoryOperation {
         self.displaced.clone()
@@ -6396,6 +6447,13 @@ struct IdeAutomationTakeEditPlan {
 }
 
 #[derive(Debug)]
+struct IdeAutomationTakeRemovalPlan {
+    mixer: IdeMixerSavePlan,
+    take_id: String,
+    take_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
 enum IdeNativeFilterPublication {
     Addition(Vec<u8>),
     Replacement(Vec<u8>),
@@ -6414,6 +6472,14 @@ pub(crate) enum IdeHistoryOperation {
     },
     DeviceChainRemoval {
         chain_id: String,
+        expected_bytes: Vec<u8>,
+    },
+    AutomationTakeAddition {
+        take_id: String,
+        bytes: Vec<u8>,
+    },
+    AutomationTakeRemoval {
+        take_id: String,
         expected_bytes: Vec<u8>,
     },
 }
@@ -6526,6 +6592,35 @@ impl IdeAutomationTakeEditPlan {
                 resource_id: &self.take_id,
                 expected_role: ResourceRole::AutomationTake,
                 resource_bytes: &self.take_bytes,
+            },
+        )
+        .map_err(|source| IdeAutomationTakePublicationError::Take {
+            mixer: Box::new(mixer),
+            source: Box::new(source),
+        })
+    }
+}
+
+impl IdeAutomationTakeRemovalPlan {
+    fn inverse(&self) -> IdeHistoryOperation {
+        IdeHistoryOperation::AutomationTakeAddition {
+            take_id: self.take_id.clone(),
+            bytes: self.take_bytes.clone(),
+        }
+    }
+
+    fn publish(
+        &self,
+    ) -> Result<ProjectResourcePublicationOutcome, IdeAutomationTakePublicationError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeAutomationTakePublicationError::Mixer(Box::new(source)))?;
+        remove_automation_take(
+            &self.mixer.project_path,
+            AutomationTakeRemovalRequest {
+                expected_project_sha256: *mixer.project_identity(),
+                take_id: &self.take_id,
             },
         )
         .map_err(|source| IdeAutomationTakePublicationError::Take {
@@ -9035,10 +9130,161 @@ impl RunningDesktopIdeApplication {
                     },
                 })
             }
-            IdeHistoryOperation::ResourceReplacement { .. } => Err(invalid(
-                "resource replacement was sent to structural device-chain undo",
+            IdeHistoryOperation::ResourceReplacement { .. }
+            | IdeHistoryOperation::AutomationTakeAddition { .. }
+            | IdeHistoryOperation::AutomationTakeRemoval { .. } => Err(invalid(
+                "non-device-chain operation was sent to structural device-chain undo",
             )),
         }
+    }
+
+    fn prepare_automation_take_history_restore(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        operation: &IdeHistoryOperation,
+    ) -> Result<IdeAutomationTakeHistoryRestorePlan, IdeResourceRestoreError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeResourceRestoreError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeResourceRestoreError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        Self::prepare_automation_take_history_restore_from_project(
+            application,
+            mixer,
+            prepared,
+            operation,
+        )
+    }
+
+    fn prepare_automation_take_history_restore_from_project(
+        application: &DesktopIdeApplication,
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        operation: &IdeHistoryOperation,
+    ) -> Result<IdeAutomationTakeHistoryRestorePlan, IdeResourceRestoreError> {
+        let invalid = |message: &'static str| {
+            IdeResourceRestoreError::CandidateInvalid(Box::new(std::io::Error::other(message)))
+        };
+        match operation {
+            IdeHistoryOperation::AutomationTakeAddition { take_id, bytes } => {
+                if take_id.is_empty()
+                    || prepared
+                        .package()
+                        .manifest()
+                        .resources()
+                        .iter()
+                        .any(|descriptor| descriptor.id() == take_id)
+                {
+                    return Err(invalid(
+                        "automation-take undo addition conflicts with the active project",
+                    ));
+                }
+                Self::validate_automation_take_addition_candidate(
+                    application,
+                    &mixer,
+                    prepared,
+                    take_id,
+                    bytes,
+                )?;
+                Ok(IdeAutomationTakeHistoryRestorePlan {
+                    mixer,
+                    take_id: take_id.clone(),
+                    publication: IdeAutomationTakeHistoryPublication::Addition(bytes.clone()),
+                    displaced: IdeHistoryOperation::AutomationTakeRemoval {
+                        take_id: take_id.clone(),
+                        expected_bytes: bytes.clone(),
+                    },
+                })
+            }
+            IdeHistoryOperation::AutomationTakeRemoval {
+                take_id,
+                expected_bytes,
+            } => {
+                let package = prepared.package();
+                let descriptor = package
+                    .manifest()
+                    .resources()
+                    .iter()
+                    .find(|descriptor| {
+                        descriptor.id() == take_id
+                            && descriptor.role() == ResourceRole::AutomationTake
+                    })
+                    .ok_or(IdeResourceRestoreError::ResourceMissing)?;
+                let active_bytes = package
+                    .read_resource(descriptor.id())
+                    .map_err(IdeResourceRestoreError::Storage)?;
+                if active_bytes != *expected_bytes {
+                    return Err(invalid(
+                        "automation-take undo removal no longer matches the active resource",
+                    ));
+                }
+                Ok(IdeAutomationTakeHistoryRestorePlan {
+                    mixer,
+                    take_id: take_id.clone(),
+                    publication: IdeAutomationTakeHistoryPublication::Removal,
+                    displaced: IdeHistoryOperation::AutomationTakeAddition {
+                        take_id: take_id.clone(),
+                        bytes: active_bytes,
+                    },
+                })
+            }
+            IdeHistoryOperation::ResourceReplacement { .. }
+            | IdeHistoryOperation::DeviceChainAddition { .. }
+            | IdeHistoryOperation::DeviceChainRemoval { .. } => Err(invalid(
+                "non-automation operation was sent to structural automation undo",
+            )),
+        }
+    }
+
+    fn validate_automation_take_addition_candidate(
+        application: &DesktopIdeApplication,
+        mixer: &IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        take_id: &str,
+        candidate: &[u8],
+    ) -> Result<(), IdeResourceRestoreError> {
+        let package = prepared.package();
+        let (project, _, _, media) = prepared.session().parts();
+        let limits = application.config.project_limits.session.documents;
+        let facts: Vec<_> = media.media_asset_facts().collect();
+        let loaded_mixer = project
+            .load_mixer(&mixer.resource_bytes, &facts, limits)
+            .map_err(|source| IdeResourceRestoreError::CandidateInvalid(Box::new(source)))?;
+        let mut takes = Vec::new();
+        for descriptor in package.manifest().resources() {
+            if descriptor.role() == ResourceRole::AutomationTake {
+                takes
+                    .try_reserve(1)
+                    .map_err(|_| IdeResourceRestoreError::CapacityUnavailable)?;
+                takes.push(
+                    package
+                        .read_resource(descriptor.id())
+                        .map_err(IdeResourceRestoreError::Storage)?,
+                );
+            }
+        }
+        takes
+            .try_reserve(1)
+            .map_err(|_| IdeResourceRestoreError::CapacityUnavailable)?;
+        takes.push(candidate.to_vec());
+        let references: Vec<_> = takes.iter().map(Vec::as_slice).collect();
+        let automation = project
+            .load_automation_takes(&loaded_mixer, &facts, &references, limits)
+            .map_err(|source| IdeResourceRestoreError::CandidateInvalid(Box::new(source)))?;
+        if !automation.takes().iter().any(|take| take.id() == take_id) {
+            return Err(IdeResourceRestoreError::CandidateInvalid(Box::new(
+                std::io::Error::other("automation-take undo bytes do not match their authority"),
+            )));
+        }
+        let compiled_mixer = loaded_mixer
+            .compile_main_graph()
+            .map_err(|source| IdeResourceRestoreError::CandidateInvalid(Box::new(source)))?;
+        project
+            .compile_main_automation(&compiled_mixer, &automation)
+            .map_err(|source| IdeResourceRestoreError::CandidateInvalid(Box::new(source)))?;
+        Ok(())
     }
 
     fn prepare_resource_restore_from_project(
@@ -9606,6 +9852,56 @@ impl RunningDesktopIdeApplication {
             .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
         owned_take_id.push_str(take_id);
         Ok(IdeAutomationTakeEditPlan {
+            mixer,
+            take_id: owned_take_id,
+            take_bytes,
+        })
+    }
+
+    fn prepare_automation_take_removal(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        take_id: &str,
+    ) -> Result<IdeAutomationTakeRemovalPlan, IdeAutomationTakeEditError> {
+        if take_id.is_empty() {
+            return Err(IdeAutomationTakeEditError::InvalidTakeIdentity);
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAutomationTakeEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAutomationTakeEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        Self::prepare_automation_take_removal_from_project(mixer, prepared, take_id)
+    }
+
+    fn prepare_automation_take_removal_from_project(
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        take_id: &str,
+    ) -> Result<IdeAutomationTakeRemovalPlan, IdeAutomationTakeEditError> {
+        if take_id.is_empty() {
+            return Err(IdeAutomationTakeEditError::InvalidTakeIdentity);
+        }
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| {
+                descriptor.id() == take_id && descriptor.role() == ResourceRole::AutomationTake
+            })
+            .ok_or(IdeAutomationTakeEditError::TakeUnavailable)?;
+        let take_bytes = package
+            .read_resource(descriptor.id())
+            .map_err(IdeAutomationTakeEditError::Storage)?;
+        let mut owned_take_id = String::new();
+        owned_take_id
+            .try_reserve_exact(take_id.len())
+            .map_err(|_| IdeAutomationTakeEditError::CapacityUnavailable)?;
+        owned_take_id.push_str(take_id);
+        Ok(IdeAutomationTakeRemovalPlan {
             mixer,
             take_id: owned_take_id,
             take_bytes,
@@ -13517,6 +13813,90 @@ mod tests {
         assert!(!published[0].enabled());
         let (_, _, automation, _) = reopened.session().parts();
         assert_eq!(automation.unwrap().target_count(), 0);
+    }
+
+    #[test]
+    fn automation_take_removal_and_history_restore_reopen_verified_playback() {
+        let fixture = ArrangementProjectFixture::with_two_scenes();
+        let project_path = fixture.root().to_path_buf();
+        let config = desktop_ide_application_config().unwrap();
+        let limits = config.project_limits();
+        let take_id = "018f47a2-6b2d-7c11-8a44-00112233850a";
+        publish_main_gain_automation(&project_path, limits, take_id);
+        let application = DesktopIdeApplication::from_inventories(
+            config,
+            IdeAudioOutputInventory::try_new(&[("route", "Output")]).unwrap(),
+            IdeAudioInputInventory::try_new(&[]).unwrap(),
+        );
+
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let mixer = prepared
+            .package()
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let plan = RunningDesktopIdeApplication::prepare_automation_take_removal_from_project(
+            IdeMixerSavePlan {
+                project_path: project_path.clone(),
+                expected_project_sha256: *prepared.package().manifest_sha256(),
+                resource_id: mixer.id().to_owned(),
+                resource_bytes: prepared.package().read_resource(mixer.id()).unwrap(),
+            },
+            &prepared,
+            take_id,
+        )
+        .unwrap();
+        let inverse = plan.inverse();
+        drop(prepared);
+
+        let removal = plan.publish().unwrap();
+        assert!(removal.changed());
+        assert_eq!(removal.resource_id(), take_id);
+        assert!(!project_path.join("takes").exists());
+        let removed =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert!(!removed.session().has_automation());
+        let mixer = removed
+            .package()
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let restore_mixer = IdeMixerSavePlan {
+            project_path: project_path.clone(),
+            expected_project_sha256: *removed.package().manifest_sha256(),
+            resource_id: mixer.id().to_owned(),
+            resource_bytes: removed.package().read_resource(mixer.id()).unwrap(),
+        };
+        let restore =
+            RunningDesktopIdeApplication::prepare_automation_take_history_restore_from_project(
+            &application,
+            restore_mixer,
+            &removed,
+            &inverse,
+        )
+        .unwrap();
+        assert_eq!(
+            restore.displaced(),
+            IdeHistoryOperation::AutomationTakeRemoval {
+                take_id: take_id.to_owned(),
+                expected_bytes: match inverse {
+                    IdeHistoryOperation::AutomationTakeAddition { bytes, .. } => bytes,
+                    _ => unreachable!(),
+                },
+            }
+        );
+        drop(removed);
+        restore.publish().unwrap();
+
+        let restored =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert!(restored.session().has_automation());
+        assert_eq!(restored.session().automation_takes().takes()[0].id(), take_id);
     }
 
     #[test]

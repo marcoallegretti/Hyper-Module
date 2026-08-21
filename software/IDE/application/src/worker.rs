@@ -181,6 +181,7 @@ pub enum IdeWorkerCommandKind {
     SetSceneActive,
     AddAutomationTake,
     SetAutomationTakeActive,
+    RemoveAutomationTake,
     EditNativeFilter,
     EditControlMapping,
     ExportProject,
@@ -368,6 +369,9 @@ pub enum IdeWorkerCommand {
         take_id: String,
         enabled: bool,
     },
+    RemoveAutomationTake {
+        take_id: String,
+    },
     EditNativeFilter {
         edit: IdeNativeFilterEdit,
     },
@@ -491,6 +495,7 @@ impl IdeWorkerCommand {
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
+            Self::RemoveAutomationTake { .. } => IdeWorkerCommandKind::RemoveAutomationTake,
             Self::EditNativeFilter { .. } => IdeWorkerCommandKind::EditNativeFilter,
             Self::EditControlMapping { .. } => IdeWorkerCommandKind::EditControlMapping,
             Self::ExportProject { .. } => IdeWorkerCommandKind::ExportProject,
@@ -1578,6 +1583,7 @@ pub enum IdeWorkerCommandFailure {
     SceneCreation(Box<IdeSceneCreationError>),
     AutomationTakeCreation(Box<IdeAutomationTakeCreationError>),
     AutomationTakeActivation(Box<IdeAutomationTakeEditError>),
+    AutomationTakeRemoval(Box<IdeAutomationTakeEditError>),
     NativeFilterEdit(Box<IdeNativeFilterEditError>),
     ControlMappingEdit(Box<IdeControlMappingEditError>),
     ProjectExport(Box<IdeProjectExportError>),
@@ -1664,7 +1670,9 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioClipSourceSlip(source) => source.fmt(formatter),
             Self::SceneCreation(source) => source.fmt(formatter),
             Self::AutomationTakeCreation(source) => source.fmt(formatter),
-            Self::AutomationTakeActivation(source) => source.fmt(formatter),
+            Self::AutomationTakeActivation(source) | Self::AutomationTakeRemoval(source) => {
+                source.fmt(formatter)
+            }
             Self::NativeFilterEdit(source) => source.fmt(formatter),
             Self::ControlMappingEdit(source) => source.fmt(formatter),
             Self::ProjectExport(source) => source.fmt(formatter),
@@ -1741,7 +1749,9 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioClipSourceSlip(source) => Some(source),
             Self::SceneCreation(source) => Some(source),
             Self::AutomationTakeCreation(source) => Some(source),
-            Self::AutomationTakeActivation(source) => Some(source),
+            Self::AutomationTakeActivation(source) | Self::AutomationTakeRemoval(source) => {
+                Some(source)
+            }
             Self::NativeFilterEdit(source) => Some(source),
             Self::ControlMappingEdit(source) => Some(source),
             Self::ProjectExport(source) => Some(source),
@@ -2008,6 +2018,14 @@ pub enum IdeWorkerEvent {
     AutomationTakeActivationCommittedWithWarning {
         warning: Box<IdeAutomationTakeEditError>,
     },
+    AutomationTakeRemoved {
+        revision: u64,
+        take_id: String,
+    },
+    AutomationTakeRemovalCommittedWithWarning {
+        take_id: String,
+        warning: Box<IdeAutomationTakeEditError>,
+    },
     NativeFilterEditing {
         edit: IdeNativeFilterEdit,
     },
@@ -2186,6 +2204,9 @@ pub enum IdeWorkerEvent {
     AutomationTakeAdding,
     AutomationTakeActivationChanging {
         enabled: bool,
+    },
+    AutomationTakeRemoving {
+        take_id: String,
     },
     ControlMappingEditing {
         edit: IdeControlMappingEdit,
@@ -2687,6 +2708,9 @@ enum ProjectMutation {
         take_id: String,
         enabled: bool,
     },
+    RemoveAutomationTake {
+        take_id: String,
+    },
     EditNativeFilter {
         edit: IdeNativeFilterEdit,
     },
@@ -2775,6 +2799,7 @@ impl ProjectMutation {
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
+            Self::RemoveAutomationTake { .. } => IdeWorkerCommandKind::RemoveAutomationTake,
             Self::EditNativeFilter { .. } => IdeWorkerCommandKind::EditNativeFilter,
             Self::EditControlMapping { .. } => IdeWorkerCommandKind::EditControlMapping,
             Self::RestoreResource { redo: false, .. } => IdeWorkerCommandKind::Undo,
@@ -2899,6 +2924,9 @@ impl ProjectMutation {
             Self::SetAutomationTakeActive { enabled, .. } => {
                 IdeWorkerEvent::AutomationTakeActivationChanging { enabled: *enabled }
             }
+            Self::RemoveAutomationTake { take_id } => IdeWorkerEvent::AutomationTakeRemoving {
+                take_id: take_id.clone(),
+            },
             Self::EditNativeFilter { edit } => {
                 IdeWorkerEvent::NativeFilterEditing { edit: edit.clone() }
             }
@@ -2936,6 +2964,8 @@ enum UndoEntryKind {
     ResourceReplacement,
     DeviceChainAddition,
     DeviceChainRemoval,
+    AutomationTakeAddition,
+    AutomationTakeRemoval,
 }
 
 impl UndoEntry {
@@ -2962,6 +2992,21 @@ impl UndoEntry {
                 kind: UndoEntryKind::DeviceChainRemoval,
                 label,
             },
+            IdeHistoryOperation::AutomationTakeAddition { take_id, bytes } => Self {
+                resource_id: take_id,
+                bytes,
+                kind: UndoEntryKind::AutomationTakeAddition,
+                label,
+            },
+            IdeHistoryOperation::AutomationTakeRemoval {
+                take_id,
+                expected_bytes,
+            } => Self {
+                resource_id: take_id,
+                bytes: expected_bytes,
+                kind: UndoEntryKind::AutomationTakeRemoval,
+                label,
+            },
         }
     }
 
@@ -2977,6 +3022,14 @@ impl UndoEntry {
             },
             UndoEntryKind::DeviceChainRemoval => IdeHistoryOperation::DeviceChainRemoval {
                 chain_id: self.resource_id.clone(),
+                expected_bytes: self.bytes.clone(),
+            },
+            UndoEntryKind::AutomationTakeAddition => IdeHistoryOperation::AutomationTakeAddition {
+                take_id: self.resource_id.clone(),
+                bytes: self.bytes.clone(),
+            },
+            UndoEntryKind::AutomationTakeRemoval => IdeHistoryOperation::AutomationTakeRemoval {
+                take_id: self.resource_id.clone(),
                 expected_bytes: self.bytes.clone(),
             },
         }
@@ -3077,6 +3130,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SetSceneSlot => "scene slot edit",
         IdeWorkerCommandKind::SetSceneActive => "scene activation",
         IdeWorkerCommandKind::SetAutomationTakeActive => "automation activation",
+        IdeWorkerCommandKind::RemoveAutomationTake => "automation take removal",
         IdeWorkerCommandKind::EditNativeFilter => "native filter",
         IdeWorkerCommandKind::AddArrangementPlacement => "placement",
         IdeWorkerCommandKind::AddArrangementSceneLaunch => "scene marker",
@@ -3433,6 +3487,7 @@ fn process_command(
         | IdeWorkerCommand::AddScene { .. }
         | IdeWorkerCommand::AddAutomationTake { .. }
         | IdeWorkerCommand::SetAutomationTakeActive { .. }
+        | IdeWorkerCommand::RemoveAutomationTake { .. }
         | IdeWorkerCommand::EditNativeFilter { .. }
         | IdeWorkerCommand::EditControlMapping { .. }
         | IdeWorkerCommand::Undo
@@ -3609,6 +3664,9 @@ fn process_project_mutation_command(
         }
         IdeWorkerCommand::SetAutomationTakeActive { take_id, enabled } => {
             set_automation_take_active(state, events, &take_id, enabled)
+        }
+        IdeWorkerCommand::RemoveAutomationTake { take_id } => {
+            remove_automation_take_request(state, events, &take_id)
         }
         IdeWorkerCommand::EditNativeFilter { edit } => {
             edit_native_filter(state, events, edit)
@@ -5788,6 +5846,28 @@ fn observe_history(
             ));
             true
         }
+        ProjectMutationAttempt::RemoveAutomationTake {
+            inverse: Some(inverse),
+            result: Ok(outcome),
+            ..
+        } if outcome.changed() => {
+            history.record_edit(UndoEntry::from_operation(
+                inverse.clone(),
+                undo_label(command),
+            ));
+            true
+        }
+        ProjectMutationAttempt::RemoveAutomationTake {
+            inverse: Some(inverse),
+            result: Err(reason),
+            ..
+        } if reason.publication_committed() => {
+            history.record_edit(UndoEntry::from_operation(
+                inverse.clone(),
+                undo_label(command),
+            ));
+            true
+        }
         ProjectMutationAttempt::EditNativeFilter {
             inverse: Some(inverse),
             result: Err(reason),
@@ -6006,6 +6086,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             HistoryEffect::Invalidate
         }
         ProjectMutationAttempt::EditNativeFilter { .. }
+        | ProjectMutationAttempt::RemoveAutomationTake { .. }
         | ProjectMutationAttempt::Save(Err(_))
         | ProjectMutationAttempt::AddAudioTrack(Err(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Err(_))
@@ -6179,6 +6260,33 @@ fn set_automation_take_active(
         ProjectMutation::SetAutomationTakeActive {
             take_id: owned_take_id,
             enabled,
+        },
+    )
+}
+
+fn remove_automation_take_request(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    take_id: &str,
+) -> bool {
+    let mut owned_take_id = String::new();
+    if take_id.is_empty() || owned_take_id.try_reserve_exact(take_id.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RemoveAutomationTake,
+            IdeWorkerCommandFailure::AutomationTakeRemoval(Box::new(if take_id.is_empty() {
+                IdeAutomationTakeEditError::InvalidTakeIdentity
+            } else {
+                IdeAutomationTakeEditError::CapacityUnavailable
+            })),
+        );
+    }
+    owned_take_id.push_str(take_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::RemoveAutomationTake {
+            take_id: owned_take_id,
         },
     )
 }
@@ -6768,6 +6876,11 @@ fn project_mutation_save_failure(
                 IdeAutomationTakeEditError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::RemoveAutomationTake { .. } => {
+            IdeWorkerCommandFailure::AutomationTakeRemoval(Box::new(
+                IdeAutomationTakeEditError::MixerSave(Box::new(reason)),
+            ))
+        }
         ProjectMutation::EditNativeFilter { .. } => {
             IdeWorkerCommandFailure::NativeFilterEdit(Box::new(
                 IdeNativeFilterEditError::MixerSave(Box::new(reason)),
@@ -7020,6 +7133,11 @@ fn project_mutation_native_close_failure(
                 IdeAutomationTakeEditError::NativeClose(failure),
             ))
         }
+        ProjectMutation::RemoveAutomationTake { .. } => {
+            IdeWorkerCommandFailure::AutomationTakeRemoval(Box::new(
+                IdeAutomationTakeEditError::NativeClose(failure),
+            ))
+        }
         ProjectMutation::EditNativeFilter { .. } => {
             IdeWorkerCommandFailure::NativeFilterEdit(Box::new(
                 IdeNativeFilterEditError::NativeClose(failure),
@@ -7251,6 +7369,14 @@ enum ProjectMutationAttempt {
     },
     SetAutomationTakeActive {
         enabled: bool,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeAutomationTakeEditError,
+        >,
+    },
+    RemoveAutomationTake {
+        take_id: String,
+        inverse: Option<IdeHistoryOperation>,
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeAutomationTakeEditError,
@@ -8242,6 +8368,38 @@ fn complete_project_mutation(
                     result: Err(reason),
                     ..
                 } => send_event(events, automation_take_activation_failure_event(reason)),
+                ProjectMutationAttempt::RemoveAutomationTake {
+                    take_id,
+                    result: Ok(outcome),
+                    ..
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::AutomationTakeRemoved {
+                        revision: outcome.project_revision(),
+                        take_id,
+                    },
+                ),
+                ProjectMutationAttempt::RemoveAutomationTake {
+                    take_id,
+                    result: Err(reason),
+                    ..
+                } if reason.publication_committed() => send_event(
+                    events,
+                    IdeWorkerEvent::AutomationTakeRemovalCommittedWithWarning {
+                        take_id,
+                        warning: Box::new(reason),
+                    },
+                ),
+                ProjectMutationAttempt::RemoveAutomationTake {
+                    result: Err(reason),
+                    ..
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::CommandFailed {
+                        command: IdeWorkerCommandKind::RemoveAutomationTake,
+                        reason: IdeWorkerCommandFailure::AutomationTakeRemoval(Box::new(reason)),
+                    },
+                ),
                 ProjectMutationAttempt::EditControlMapping {
                     edit,
                     result: Ok(revision),
@@ -8905,6 +9063,23 @@ fn attempt_project_mutation(
                             Err(reason) => (None, Err(reason)),
                         }
                     }
+                    IdeHistoryOperation::AutomationTakeAddition { .. }
+                    | IdeHistoryOperation::AutomationTakeRemoval { .. } => {
+                        match RunningDesktopIdeApplication::prepare_automation_take_history_restore(
+                            application,
+                            recovery,
+                            &operation,
+                        ) {
+                            Ok(plan) => {
+                                let displaced = Some(UndoEntry::from_operation(
+                                    plan.displaced(),
+                                    entry.label,
+                                ));
+                                (displaced, plan.publish())
+                            }
+                            Err(reason) => (None, Err(reason)),
+                        }
+                    }
                 }
             };
             ProjectMutationAttempt::RestoreResource {
@@ -8924,6 +9099,19 @@ fn attempt_project_mutation(
                     enabled,
                     native_failure,
                 ),
+            }
+        }
+        ProjectMutation::RemoveAutomationTake { take_id } => {
+            let (inverse, result) = attempt_automation_take_removal(
+                application,
+                recovery,
+                &take_id,
+                native_failure,
+            );
+            ProjectMutationAttempt::RemoveAutomationTake {
+                take_id,
+                inverse,
+                result,
             }
         }
         ProjectMutation::AddAutomationTake { request } => {
@@ -9830,6 +10018,9 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::SetAutomationTakeActive { result, .. } => {
             automation_take_activation_reopen_failure(result, reopen)
         }
+        ProjectMutationAttempt::RemoveAutomationTake { result, .. } => {
+            automation_take_removal_reopen_failure(result, reopen)
+        }
         ProjectMutationAttempt::EditNativeFilter { result, .. } => {
             native_filter_edit_reopen_failure(result, reopen)
         }
@@ -9890,6 +10081,35 @@ fn attempt_automation_take_activation(
         plan.publish()
             .map_err(|source| IdeAutomationTakeEditError::Publication(Box::new(source)))
     })
+}
+
+fn attempt_automation_take_removal(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    take_id: &str,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> (
+    Option<IdeHistoryOperation>,
+    Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAutomationTakeEditError>,
+) {
+    if let Some(failure) = native_failure {
+        return (None, Err(IdeAutomationTakeEditError::NativeClose(failure)));
+    }
+    match RunningDesktopIdeApplication::prepare_automation_take_removal(
+        application,
+        recovery,
+        take_id,
+    ) {
+        Ok(plan) => {
+            let inverse = plan.inverse();
+            (
+                Some(inverse),
+                plan.publish()
+                    .map_err(|source| IdeAutomationTakeEditError::Publication(Box::new(source))),
+            )
+        }
+        Err(reason) => (None, Err(reason)),
+    }
 }
 
 fn attempt_native_filter_edit(
@@ -9976,6 +10196,21 @@ fn automation_take_activation_reopen_failure(
         },
     };
     IdeWorkerCommandFailure::AutomationTakeActivation(Box::new(reason))
+}
+
+fn automation_take_removal_reopen_failure(
+    result: Result<
+        hyper_storage_engine::ProjectResourcePublicationOutcome,
+        IdeAutomationTakeEditError,
+    >,
+    reopen: IdeProjectOpenError,
+) -> IdeWorkerCommandFailure {
+    let IdeWorkerCommandFailure::AutomationTakeActivation(reason) =
+        automation_take_activation_reopen_failure(result, reopen)
+    else {
+        unreachable!("automation reopen mapping has one failure variant")
+    };
+    IdeWorkerCommandFailure::AutomationTakeRemoval(reason)
 }
 
 fn automation_take_creation_reopen_failure(
@@ -12266,6 +12501,151 @@ mod tests {
         ));
         assert!(!project.join("devices").exists());
 
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker scenario keeps remove, undo, redo, filesystem state, and event ordering visible"
+    )]
+    fn automation_take_removal_is_undoable_and_redoable_through_the_real_worker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-automation-removal-history-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+        let worker = DesktopIdeWorker::start_state(
+            WorkerState::Closed(closed_application()),
+            2,
+            8,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
+        worker
+            .try_send(IdeWorkerCommand::AddAutomationTake {
+                request: IdeAutomationTakeRequest {
+                    name: "Main fade".to_owned(),
+                    start_tick: 0,
+                    end_tick: 960,
+                    target: IdeAutomationTarget::Main {
+                        parameter: crate::AutomationMainParameter::Gain,
+                    },
+                    interpolation: crate::AutomationInterpolation::Linear,
+                    points: vec![
+                        crate::AutomationPoint::new(
+                            0,
+                            crate::AutomationValue::Integer(1_000_000),
+                        ),
+                        crate::AutomationPoint::new(
+                            959,
+                            crate::AutomationValue::Integer(0),
+                        ),
+                    ],
+                },
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::AutomationTakeAdding));
+        let IdeWorkerEvent::Running(_) = recv(&worker) else {
+            panic!("the added automation take must reopen before completion");
+        };
+        let added_event = recv(&worker);
+        let IdeWorkerEvent::AutomationTakeAdded {
+            revision: 2,
+            take_id,
+            ..
+        } = added_event
+        else {
+            panic!("the automation-take identity must be reported after reopen: {added_event:?}");
+        };
+
+        worker
+            .try_send(IdeWorkerCommand::RemoveAutomationTake {
+                take_id: take_id.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AutomationTakeRemoving { take_id: observed }
+                if observed == take_id
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("automation take removal"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(_) = recv(&worker) else {
+            panic!("the removed automation take must reopen before completion");
+        };
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AutomationTakeRemoved {
+                revision: 3,
+                take_id: observed,
+            } if observed == take_id
+        ));
+        assert!(!project.join("takes").exists());
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "automation take removal",
+            }
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        let IdeWorkerEvent::Running(_) = recv(&worker) else {
+            panic!("the restored automation take must reopen before completion");
+        };
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 4,
+                redo: false,
+                ..
+            }
+        ));
+        let reopened = hyper_project_loader::prepare_project_playback(
+            &project,
+            closed_application().config.project_limits,
+        )
+        .unwrap();
+        assert_eq!(reopened.session().automation_takes().takes()[0].id(), take_id);
+        drop(reopened);
+
+        worker.try_send(IdeWorkerCommand::Redo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: true, .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        let IdeWorkerEvent::Running(_) = recv(&worker) else {
+            panic!("the redone automation removal must reopen before completion");
+        };
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::EditRestored {
+                revision: 5,
+                redo: true,
+                ..
+            }
+        ));
+        assert!(!project.join("takes").exists());
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
