@@ -99,6 +99,10 @@ export component OperatorWindow inherits Window {
     in property <string> transport-state;
     in property <string> transport-time;
     in property <string> transport-frame;
+    in property <string> loop-state;
+    in property <string> loop-range;
+    in property <string> loop-toggle-label;
+    in property <bool> loop-toggle-enabled;
     in property <string> stream-state;
     in property <string> callback-count;
     in property <string> stream-failures;
@@ -120,6 +124,7 @@ export component OperatorWindow inherits Window {
     callback start-requested();
     callback stop-requested();
     callback return-to-start-requested();
+    callback toggle-loop-requested();
     callback reset-output-peak-requested();
     callback launch-scene-requested(int);
     callback quit-requested();
@@ -142,6 +147,7 @@ export component OperatorWindow inherits Window {
                 value: root.transport-state + "  ·  " + root.transport-time;
                 detail: "frame " + root.transport-frame;
             }
+            FactCard { label: "PROJECT LOOP"; value: root.loop-state; detail: root.loop-range; }
             FactCard { label: "AUDIO OWNER"; value: root.stream-state; }
             FactCard { label: "PANEL LINK"; value: root.panel-state; }
         }
@@ -258,6 +264,11 @@ export component OperatorWindow inherits Window {
             Button { text: "Start"; clicked => { root.start-requested(); } }
             Button { text: "Stop"; clicked => { root.stop-requested(); } }
             Button { text: "Return to start"; clicked => { root.return-to-start-requested(); } }
+            Button {
+                text: root.loop-toggle-label;
+                enabled: root.loop-toggle-enabled;
+                clicked => { root.toggle-loop-requested(); }
+            }
             Rectangle { horizontal-stretch: 1; }
             Button { text: "Shut down Runtime"; clicked => { root.quit-requested(); } }
         }

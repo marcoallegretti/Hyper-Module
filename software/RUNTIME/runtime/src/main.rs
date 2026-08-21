@@ -2,7 +2,7 @@
 
 #![deny(unsafe_code)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::BufRead;
 use std::net::TcpListener;
 use std::process::ExitCode;
@@ -26,6 +26,7 @@ use hyper_mixer_runtime::{
     ChannelSamplePeakBallistics, LocateState, OutputMeterReceiver, PlaybackCycleObservation,
     PlaybackRecoveryCheckpoint, PlaybackRecoveryTransportState, SamplePeakBallisticsConfig,
     StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot, TransportCommand,
+    TransportLoopRange,
 };
 use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
 use hyper_playback_json::LoaderLimits;
@@ -232,7 +233,14 @@ enum OperatorCommand {
     Stop,
     ReturnToStart,
     LaunchScene { scene_index: usize },
+    SetLoopEnabled { enabled: bool },
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OperatorLoopAuthority {
+    range: Option<TransportLoopRange>,
+    enabled: bool,
 }
 
 const OPERATOR_COMMAND_CAPACITY: usize = 8;
@@ -510,6 +518,16 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
                     }
                 }
             }
+            OperatorCommand::SetLoopEnabled { enabled } => {
+                match host.queue_transport(TransportCommand::SetLoopEnabled(enabled)) {
+                    Ok(()) => diagnostic(if enabled {
+                        "project loop enable queued".to_owned()
+                    } else {
+                        "project loop disable queued".to_owned()
+                    }),
+                    Err(error) => diagnostic(format!("project loop toggle refused: {error}")),
+                }
+            }
             OperatorCommand::Quit => stop.store(true, Ordering::Release),
         }
     }
@@ -608,6 +626,10 @@ fn spawn_operator_worker(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the linear scope makes Slint timer and worker ownership explicit"
+)]
 fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let ui =
         OperatorWindow::new().map_err(|error| format!("operator UI could not open: {error}"))?;
@@ -650,6 +672,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         meter_config,
     )));
     let scene_model = Rc::new(VecModel::from(operator_scene_rows(&scenes)));
+    let loop_authority = Rc::new(Cell::new(None));
     ui.set_scenes(ModelRc::from(Rc::clone(&scene_model)));
 
     apply_static_facts(&ui, &observers.facts);
@@ -659,23 +682,29 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_quit(&ui, &commands_tx, &stop, &diagnostic);
     wire_operator_peak_reset(&ui, &meter_observer);
     wire_operator_scene_launch(&ui, &commands_tx, &diagnostic, &scenes);
+    wire_operator_loop_toggle(&ui, &commands_tx, &diagnostic, &loop_authority);
 
-    let observation = apply_observations(&ui, &observers, &diagnostic);
-    apply_operator_scene_observation(&ui, &scene_model, observation);
+    apply_operator_cycle_observation(&ui, &observers, &diagnostic, &loop_authority, &scene_model);
     apply_operator_meter_observation(&ui, &mut meter_observer.borrow_mut());
 
     let weak = ui.as_weak();
     let timer_observers = observers.clone();
     let timer_meter_observer = Rc::clone(&meter_observer);
     let timer_scene_model = Rc::clone(&scene_model);
+    let timer_loop_authority = Rc::clone(&loop_authority);
     let timer_diagnostic = Arc::clone(&diagnostic);
     let timer_close_error = Arc::clone(&completion_close_error);
     let mut completion_observed = false;
     let timer = Timer::default();
     timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
         if let Some(ui) = weak.upgrade() {
-            let observation = apply_observations(&ui, &timer_observers, &timer_diagnostic);
-            apply_operator_scene_observation(&ui, &timer_scene_model, observation);
+            apply_operator_cycle_observation(
+                &ui,
+                &timer_observers,
+                &timer_diagnostic,
+                &timer_loop_authority,
+                &timer_scene_model,
+            );
             apply_operator_meter_observation(&ui, &mut timer_meter_observer.borrow_mut());
             if !completion_observed
                 && let Some(close_result) = apply_operator_worker_completion(
@@ -699,6 +728,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 )
             {
                 completion_observed = true;
+                timer_loop_authority.set(None);
                 if let Err(error) = close_result {
                     set_first_error(&timer_close_error, error);
                 }
@@ -928,6 +958,40 @@ fn wire_operator_scene_launch(
     });
 }
 
+fn wire_operator_loop_toggle(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    authority: &Rc<Cell<Option<OperatorLoopAuthority>>>,
+) {
+    let sender = sender.clone();
+    let diagnostic = Arc::clone(diagnostic);
+    let authority = Rc::clone(authority);
+    ui.on_toggle_loop_requested(move || {
+        let Some(current) = authority.get() else {
+            set_diagnostic(
+                &diagnostic,
+                "project loop toggle refused: accepted state is unavailable".to_owned(),
+            );
+            return;
+        };
+        if current.range.is_none() {
+            set_diagnostic(
+                &diagnostic,
+                "project loop toggle refused: no project loop is armed".to_owned(),
+            );
+            return;
+        }
+        send_operator_command(
+            &sender,
+            OperatorCommand::SetLoopEnabled {
+                enabled: !current.enabled,
+            },
+            &diagnostic,
+        );
+    });
+}
+
 fn request_operator_shutdown(
     stop: &AtomicBool,
     sender: &SyncSender<OperatorCommand>,
@@ -1009,6 +1073,49 @@ fn apply_operator_scene_observation(
         },
     );
     ui.set_scene_feedback(feedback.into());
+}
+
+fn apply_operator_loop_observation(
+    ui: &OperatorWindow,
+    authority: &Cell<Option<OperatorLoopAuthority>>,
+    observation: PlaybackCycleObservation,
+) {
+    let current = OperatorLoopAuthority {
+        range: observation.loop_range(),
+        enabled: observation.loop_enabled(),
+    };
+    authority.set(Some(current));
+    if let Some(range) = current.range {
+        ui.set_loop_state(if current.enabled {
+            "Looping".into()
+        } else {
+            "Loop armed".into()
+        });
+        ui.set_loop_range(format!("frames {}–{}", range.start_frame(), range.end_frame()).into());
+        ui.set_loop_toggle_label(if current.enabled {
+            "Disable loop".into()
+        } else {
+            "Enable loop".into()
+        });
+        ui.set_loop_toggle_enabled(true);
+    } else {
+        ui.set_loop_state("No project loop".into());
+        ui.set_loop_range("No saved range".into());
+        ui.set_loop_toggle_label("Loop unavailable".into());
+        ui.set_loop_toggle_enabled(false);
+    }
+}
+
+fn apply_operator_cycle_observation(
+    ui: &OperatorWindow,
+    observers: &RuntimeObservers,
+    diagnostic: &Mutex<String>,
+    loop_authority: &Cell<Option<OperatorLoopAuthority>>,
+    scene_model: &VecModel<OperatorSceneRow>,
+) {
+    let observation = apply_observations(ui, observers, diagnostic);
+    apply_operator_loop_observation(ui, loop_authority, observation);
+    apply_operator_scene_observation(ui, scene_model, observation);
 }
 
 fn apply_static_facts(ui: &OperatorWindow, facts: &RuntimeFacts) {
@@ -1677,6 +1784,12 @@ mod tests {
         sender
             .send(OperatorCommand::LaunchScene { scene_index: 3 })
             .unwrap();
+        sender
+            .send(OperatorCommand::SetLoopEnabled { enabled: true })
+            .unwrap();
+        sender
+            .send(OperatorCommand::SetLoopEnabled { enabled: false })
+            .unwrap();
         let stop = AtomicBool::new(false);
         let mut owner = OperatorControl::default();
         let diagnostics = RefCell::new(Vec::new());
@@ -1695,6 +1808,8 @@ mod tests {
                     state: LocateState::Preserve,
                 },
                 TransportCommand::LaunchScene { scene_index: 3 },
+                TransportCommand::SetLoopEnabled(true),
+                TransportCommand::SetLoopEnabled(false),
             ]
         );
         assert_eq!(
@@ -1704,6 +1819,8 @@ mod tests {
                 "transport stop queued",
                 "transport return to start queued",
                 "scene 4 launch queued",
+                "project loop enable queued",
+                "project loop disable queued",
             ]
         );
         assert!(!stop.load(Ordering::Acquire));
@@ -1915,9 +2032,31 @@ mod tests {
 
         let (mut recovery_publisher, recovery) =
             hyper_mixer_runtime::playback_recovery_channel(None, None);
-        apply_operator_scene_observation(ui, &scene_model, recovery.observe_cycle());
+        let loop_authority = Rc::new(Cell::new(None));
+        let (loop_commands, loop_command_receiver) =
+            std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        let loop_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_loop_toggle(ui, &loop_commands, &loop_diagnostic, &loop_authority);
+        let initial_observation = recovery.observe_cycle();
+        apply_operator_loop_observation(ui, &loop_authority, initial_observation);
+        apply_operator_scene_observation(ui, &scene_model, initial_observation);
+        assert_eq!(ui.get_loop_state().as_str(), "No project loop");
+        assert_eq!(ui.get_loop_range().as_str(), "No saved range");
+        assert_eq!(ui.get_loop_toggle_label().as_str(), "Loop unavailable");
+        assert!(!ui.get_loop_toggle_enabled());
+        ui.invoke_toggle_loop_requested();
+        assert_eq!(loop_command_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            loop_diagnostic.lock().unwrap().as_str(),
+            "project loop toggle refused: no project loop is armed"
+        );
         transport_sender
             .try_send(TransportCommand::LaunchScene { scene_index: 0 })
+            .unwrap();
+        transport_sender
+            .try_send(TransportCommand::SetLoopRange(Some(
+                TransportLoopRange::new(0, 1_500).unwrap(),
+            )))
             .unwrap();
         let mut stopped_left = [0.0_f32; 480];
         let mut stopped_right = [0.0_f32; 480];
@@ -1931,7 +2070,18 @@ mod tests {
             )
             .unwrap();
         recovery_publisher.publish_cycle(queued, None);
-        apply_operator_scene_observation(ui, &scene_model, recovery.observe_cycle());
+        let queued_observation = recovery.observe_cycle();
+        apply_operator_loop_observation(ui, &loop_authority, queued_observation);
+        apply_operator_scene_observation(ui, &scene_model, queued_observation);
+        assert_eq!(ui.get_loop_state().as_str(), "Loop armed");
+        assert_eq!(ui.get_loop_range().as_str(), "frames 0–1500");
+        assert_eq!(ui.get_loop_toggle_label().as_str(), "Enable loop");
+        assert!(ui.get_loop_toggle_enabled());
+        ui.invoke_toggle_loop_requested();
+        assert_eq!(
+            loop_command_receiver.try_recv(),
+            Ok(OperatorCommand::SetLoopEnabled { enabled: true })
+        );
         let queued_row = ui.get_scenes().row_data(0).unwrap();
         assert!(queued_row.queued);
         assert!(!queued_row.last_launched);
@@ -1941,6 +2091,9 @@ mod tests {
             "Scene 1 queued for frame 0"
         );
 
+        transport_sender
+            .try_send(TransportCommand::SetLoopEnabled(true))
+            .unwrap();
         transport_sender.try_send(TransportCommand::Start).unwrap();
         let (mut meter_sender, meter_receiver) = hyper_mixer_runtime::output_meter_channel();
         let meter_config = SamplePeakBallisticsConfig::try_new(
@@ -1982,7 +2135,25 @@ mod tests {
             )
             .unwrap();
         recovery_publisher.publish_cycle(launched.snapshot().cycle(), None);
-        apply_operator_scene_observation(ui, &scene_model, recovery.observe_cycle());
+        let launched_observation = recovery.observe_cycle();
+        apply_operator_loop_observation(ui, &loop_authority, launched_observation);
+        apply_operator_scene_observation(ui, &scene_model, launched_observation);
+        assert_eq!(ui.get_loop_state().as_str(), "Looping");
+        assert_eq!(ui.get_loop_range().as_str(), "frames 0–1500");
+        assert_eq!(ui.get_loop_toggle_label().as_str(), "Disable loop");
+        assert!(ui.get_loop_toggle_enabled());
+        ui.invoke_toggle_loop_requested();
+        assert_eq!(
+            loop_command_receiver.try_recv(),
+            Ok(OperatorCommand::SetLoopEnabled { enabled: false })
+        );
+        loop_authority.set(None);
+        ui.invoke_toggle_loop_requested();
+        assert_eq!(loop_command_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            loop_diagnostic.lock().unwrap().as_str(),
+            "project loop toggle refused: accepted state is unavailable"
+        );
         let launched_row = ui.get_scenes().row_data(0).unwrap();
         assert!(!launched_row.queued);
         assert!(launched_row.last_launched);
@@ -2141,6 +2312,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear test proves generated command and authority wiring"
+    )]
     fn operator_ui_wires_commands_and_authoritative_properties() {
         let ui = OperatorWindow::new().unwrap();
         let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
@@ -2150,6 +2325,8 @@ mod tests {
         wire_operator_stop(&ui, &sender, &diagnostic);
         wire_operator_return_to_start(&ui, &sender, &diagnostic);
         wire_operator_quit(&ui, &sender, &stop, &diagnostic);
+        let loop_authority = Rc::new(Cell::new(None));
+        wire_operator_loop_toggle(&ui, &sender, &diagnostic, &loop_authority);
 
         let facts = RuntimeFacts {
             bundle_identity: "f".repeat(64),
@@ -2167,7 +2344,12 @@ mod tests {
             panel_connected: Arc::new(AtomicBool::new(false)),
         };
         apply_static_facts(&ui, &facts);
-        let _ = apply_observations(&ui, &observers, &diagnostic);
+        let observation = apply_observations(&ui, &observers, &diagnostic);
+        apply_operator_loop_observation(&ui, &loop_authority, observation);
+        assert_eq!(ui.get_loop_state().as_str(), "No project loop");
+        assert_eq!(ui.get_loop_range().as_str(), "No saved range");
+        assert_eq!(ui.get_loop_toggle_label().as_str(), "Loop unavailable");
+        assert!(!ui.get_loop_toggle_enabled());
         assert_generated_operator_meter_contract(&ui);
 
         ui.invoke_start_requested();
