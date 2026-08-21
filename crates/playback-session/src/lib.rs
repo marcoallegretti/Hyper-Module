@@ -14,7 +14,7 @@ use hyper_playback_compiler::scene::{RecordedSceneExtent, SceneLimits};
 use hyper_playback_compiler::{FrameTimelineError, graph::GraphLimits};
 use hyper_playback_json::{
     AdapterCompileError, AutomationCompileError, AutomationInterpolation, AutomationTarget,
-    CompiledAutomation, CompiledMixerGraph, CompiledPlaybackGraph, LoadError,
+    CompiledAutomation, CompiledMixerGraph, CompiledMixerTap, CompiledPlaybackGraph, LoadError,
     LoadedAutomationSet, LoadedPlaybackProject, LoaderLimits, MediaAssetFact, MixerCompileError,
     PlaybackJsonInput, load,
 };
@@ -87,6 +87,38 @@ pub struct PreparedPlaybackSession {
     extent: PlaybackExtent,
     arrangement: Arc<PlaybackArrangement>,
     automation_view: Arc<PlaybackAutomation>,
+}
+
+/// Immutable placement metadata for one send in the prepared mixer graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaybackMixerSend<'a> {
+    id: &'a str,
+    target_name: &'a str,
+    tap: PlaybackMixerSendTap,
+}
+
+impl<'a> PlaybackMixerSend<'a> {
+    #[must_use]
+    pub const fn id(self) -> &'a str {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn target_name(self) -> &'a str {
+        self.target_name
+    }
+
+    #[must_use]
+    pub const fn tap(self) -> PlaybackMixerSendTap {
+        self.tap
+    }
+}
+
+/// Fixed tap position retained by a compiled mixer send.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackMixerSendTap {
+    PreFader,
+    PostFader,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -549,6 +581,37 @@ impl PreparedPlaybackSession {
     pub fn mixer_channel_name_at(&self, channel_index: usize) -> Option<&str> {
         let track_id = self.mixer.slots().get(channel_index)?.track_id();
         self.project.track_name(track_id)
+    }
+
+    /// Returns the fixed send count for one compiled mixer channel.
+    #[must_use]
+    pub fn mixer_send_count_at(&self, channel_index: usize) -> Option<usize> {
+        Some(self.mixer.slots().get(channel_index)?.sends().len())
+    }
+
+    /// Returns immutable routing metadata for one compiled mixer send.
+    #[must_use]
+    pub fn mixer_send_at(
+        &self,
+        channel_index: usize,
+        send_index: usize,
+    ) -> Option<PlaybackMixerSend<'_>> {
+        let send = self
+            .mixer
+            .slots()
+            .get(channel_index)?
+            .sends()
+            .get(send_index)?;
+        let target_track_id = self.mixer.slots().get(send.target_slot())?.track_id();
+        let target_name = self.project.track_name(target_track_id)?;
+        Some(PlaybackMixerSend {
+            id: send.id(),
+            target_name,
+            tap: match send.tap() {
+                CompiledMixerTap::PreFader => PlaybackMixerSendTap::PreFader,
+                CompiledMixerTap::PostFader => PlaybackMixerSendTap::PostFader,
+            },
+        })
     }
 
     #[must_use]
@@ -1125,6 +1188,33 @@ mod tests {
         "cue":{"source":"main","gain_millionths":1000000,"mute":false},
         "extensions":{}
     }"#;
+    const RETURN_TRACK: &[u8] = br#"{
+        "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337510",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Return A","kind":"return","order":1,
+        "active":true,"clip_ids":[],"extensions":{}
+    }"#;
+    const SEND_MIXER: &[u8] = br#"{
+        "format":"hyper-mixer","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337507",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122337500",
+        "channels":[
+            {
+                "track_id":"018f47a2-6b2d-7c11-8a44-001122337502","gain_millionths":1000000,
+                "pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},
+                "sends":[{
+                    "id":"018f47a2-6b2d-7c11-8a44-001122337511","bus":"a","tap":"pre-fader",
+                    "gain_millionths":750000,"pan_millionths":-250000,"enabled":true
+                }]
+            },
+            {
+                "track_id":"018f47a2-6b2d-7c11-8a44-001122337510","gain_millionths":1000000,
+                "pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},"sends":[]
+            }
+        ],
+        "return_buses":[{"bus":"a","track_id":"018f47a2-6b2d-7c11-8a44-001122337510"}],
+        "main":{"gain_millionths":1000000,"mute":false},
+        "cue":{"source":"main","gain_millionths":1000000,"mute":false},
+        "extensions":{}
+    }"#;
     const AUTOMATION: &[u8] = br#"{
         "format":"hyper-automation-take","format_version":1,
         "id":"018f47a2-6b2d-7c11-8a44-001122337508","project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Pass","enabled":true,
@@ -1184,6 +1274,8 @@ mod tests {
         assert_eq!(session.mixer_channel_count(), 1);
         assert_eq!(session.mixer_channel_name_at(0), Some("Audio"));
         assert_eq!(session.mixer_channel_name_at(1), None);
+        assert_eq!(session.mixer_send_count_at(0), Some(0));
+        assert_eq!(session.mixer_send_count_at(1), None);
         let takes = session.automation_takes().takes();
         assert_eq!(takes.len(), 1);
         assert_eq!(takes[0].id(), "018f47a2-6b2d-7c11-8a44-001122337508");
@@ -1240,6 +1332,25 @@ mod tests {
             Some(project.project_id())
         );
         assert!(media.contains("018f47a2-6b2d-7c11-8a44-001122337504"));
+    }
+
+    #[test]
+    fn prepared_send_metadata_uses_compiled_order_and_target_authority() {
+        let mut input = input(vec![asset("018f47a2-6b2d-7c11-8a44-001122337504")]);
+        input.documents.tracks.push(RETURN_TRACK.to_vec());
+        input.documents.mixer = SEND_MIXER.to_vec();
+        let session = assemble_playback_session(input).unwrap();
+
+        assert_eq!(session.mixer_channel_count(), 2);
+        assert_eq!(session.mixer_send_count_at(0), Some(1));
+        assert_eq!(session.mixer_send_count_at(1), Some(0));
+        assert_eq!(session.mixer_send_count_at(2), None);
+        let send = session.mixer_send_at(0, 0).unwrap();
+        assert_eq!(send.id(), "018f47a2-6b2d-7c11-8a44-001122337511");
+        assert_eq!(send.target_name(), "Return A");
+        assert_eq!(send.tap(), PlaybackMixerSendTap::PreFader);
+        assert_eq!(session.mixer_send_at(0, 1), None);
+        assert_eq!(session.mixer_send_at(2, 0), None);
     }
 
     #[test]

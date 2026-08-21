@@ -42,7 +42,7 @@ use hyper_native_device::DeviceChain;
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
 use hyper_playback_json::{AdapterCompileError, LoadedPlaybackProject, MediaAssetFact};
-use hyper_playback_session::PreparedPlaybackSession;
+use hyper_playback_session::{PlaybackMixerSendTap, PreparedPlaybackSession};
 use hyper_project_loader::{
     PreparedProjectPlayback, ProjectPlaybackError, ProjectPlaybackLimits, prepare_project_playback,
 };
@@ -57,6 +57,44 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use hyper_mixer_runtime::playback_recovery_channel;
 
 pub type DesktopPlaybackSessionInput = PreparedPlaybackSession;
+
+/// Immutable prepared routing facts and live handle for one mixer send.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DesktopMixerSend<'a> {
+    id: &'a str,
+    target_name: &'a str,
+    tap: DesktopMixerSendTap,
+    handle: MixerSendHandle,
+}
+
+impl<'a> DesktopMixerSend<'a> {
+    #[must_use]
+    pub const fn id(self) -> &'a str {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn target_name(self) -> &'a str {
+        self.target_name
+    }
+
+    #[must_use]
+    pub const fn tap(self) -> DesktopMixerSendTap {
+        self.tap
+    }
+
+    #[must_use]
+    pub const fn handle(self) -> MixerSendHandle {
+        self.handle
+    }
+}
+
+/// Fixed tap position of a prepared desktop mixer send.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DesktopMixerSendTap {
+    PreFader,
+    PostFader,
+}
 
 trait DesktopPlaybackSource: fmt::Debug + Send + Sync {
     fn session(&self) -> &PreparedPlaybackSession;
@@ -1593,6 +1631,43 @@ impl DesktopPlaybackSession {
     #[must_use]
     pub fn mixer_channel_name(&self, channel_index: usize) -> Option<&str> {
         self.source.session().mixer_channel_name_at(channel_index)
+    }
+
+    /// Returns the fixed send count for one compiled mixer channel.
+    #[must_use]
+    pub fn mixer_send_count(&self, channel_index: usize) -> Option<usize> {
+        self.source.session().mixer_send_count_at(channel_index)
+    }
+
+    /// Returns immutable routing facts and the generation-bound live handle
+    /// for one compiled mixer send.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing-channel or missing-send rejection when the live
+    /// control layout disagrees with the prepared mixer graph.
+    pub fn mixer_send(
+        &self,
+        channel_index: usize,
+        send_index: usize,
+    ) -> Result<Option<DesktopMixerSend<'_>>, MixerParameterResolveError> {
+        let Some(send) = self
+            .source
+            .session()
+            .mixer_send_at(channel_index, send_index)
+        else {
+            return Ok(None);
+        };
+        let handle = self.resolve_mixer_send_address(channel_index, send_index)?;
+        Ok(Some(DesktopMixerSend {
+            id: send.id(),
+            target_name: send.target_name(),
+            tap: match send.tap() {
+                PlaybackMixerSendTap::PreFader => DesktopMixerSendTap::PreFader,
+                PlaybackMixerSendTap::PostFader => DesktopMixerSendTap::PostFader,
+            },
+            handle,
+        }))
     }
 
     /// Resolves one compiled channel index through this session's mixer layout.
