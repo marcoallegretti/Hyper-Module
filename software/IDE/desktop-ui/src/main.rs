@@ -2499,6 +2499,7 @@ fn bind_audio_clip_callback(
 ) {
     bind_audio_clip_rename_callback(ui, worker, project_state);
     bind_audio_clip_duplication_callback(ui, worker, project_state);
+    bind_audio_clip_removal_callback(ui, worker, project_state);
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_activation = Rc::clone(worker);
@@ -2860,6 +2861,43 @@ fn bind_audio_clip_duplication_callback(
         };
         drop(clips);
         submit_to_ui(&ui, &worker_for_duplication, command);
+    });
+}
+
+fn bind_audio_clip_removal_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_removal = Rc::clone(worker);
+    let project_state_for_removal = Rc::clone(project_state);
+    actions.on_remove_audio_clip(move |clip_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_clip_remove_visible()
+            || ui.get_clip_remove_id() != clip_id
+        {
+            ui.set_error_text("Audio-clip removal confirmation is no longer current".into());
+            return;
+        }
+        let clips = project_state_for_removal.audio_clips.borrow();
+        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+            ui.set_error_text("The selected audio clip is no longer available".into());
+            return;
+        };
+        let owned_clip_id = clip.id().to_owned();
+        drop(clips);
+        submit_to_ui(
+            &ui,
+            &worker_for_removal,
+            IdeWorkerCommand::RemoveAudioClip {
+                clip_id: owned_clip_id,
+            },
+        );
     });
 }
 
@@ -3239,6 +3277,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::SplitArrangementPlacement => AppMode::SplittingArrangementPlacement,
         IdeWorkerCommandKind::RenameAudioClip => AppMode::RenamingClip,
         IdeWorkerCommandKind::DuplicateAudioClip => AppMode::DuplicatingClip,
+        IdeWorkerCommandKind::RemoveAudioClip => AppMode::RemovingClip,
         IdeWorkerCommandKind::SetAudioClipActive => AppMode::ChangingClipActivation,
         IdeWorkerCommandKind::SetAudioClipGain => AppMode::ChangingClipGain,
         IdeWorkerCommandKind::SetAudioClipFades => AppMode::ChangingClipFades,
@@ -3354,6 +3393,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::DuplicateAudioClip => {
             "Preserving mixer state, duplicating the audio clip, and reopening project…"
+        }
+        IdeWorkerCommandKind::RemoveAudioClip => {
+            "Preserving mixer state, removing the unused audio clip, and reopening project…"
         }
         IdeWorkerCommandKind::SetAudioClipActive => {
             "Preserving mixer state, updating audio-clip activation, and reopening project…"
@@ -3600,6 +3642,10 @@ fn apply_event(
         | IdeWorkerEvent::AudioClipDuplicationCommittedWithWarning { .. }
         | IdeWorkerEvent::AudioClipDuplicating) => {
             apply_audio_clip_duplication_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioClipRemoved { .. }
+        | IdeWorkerEvent::AudioClipRemoving) => {
+            apply_audio_clip_removal_event(ui, &event);
         }
         event @ IdeWorkerEvent::AudioClipEditCommittedWithWarning { .. } => {
             apply_audio_clip_edit_committed_warning(ui, &event);
@@ -4695,6 +4741,35 @@ fn reset_audio_clip_duplication_form(ui: &MainWindow) {
     ui.set_clip_duplicate_id(SharedString::default());
     ui.set_clip_duplicate_source_name(SharedString::default());
     ui.set_clip_duplicate_name(SharedString::default());
+}
+
+fn apply_audio_clip_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioClipRemoved { revision, clip_id } => {
+            reset_audio_clip_removal_form(ui);
+            ui.set_status_text(
+                format!(
+                    "Reusable audio clip {clip_id} removed in project revision {revision}; source media was retained"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioClipRemoving => {
+            ui.set_app_mode(AppMode::RemovingClip);
+            ui.set_status_text(
+                "Waiting for native output before removing the unused reusable clip…".into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        _ => unreachable!("audio-clip removal event dispatcher received another event"),
+    }
+}
+
+fn reset_audio_clip_removal_form(ui: &MainWindow) {
+    ui.set_clip_remove_visible(false);
+    ui.set_clip_remove_id(SharedString::default());
+    ui.set_clip_remove_name(SharedString::default());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6032,6 +6107,7 @@ fn reset_project(
     ui.set_clip_rename_original(SharedString::default());
     ui.set_clip_rename_name(SharedString::default());
     reset_audio_clip_duplication_form(ui);
+    reset_audio_clip_removal_form(ui);
     ui.set_clip_gain_visible(false);
     ui.set_clip_gain_id(SharedString::default());
     ui.set_clip_gain_name(SharedString::default());
@@ -6248,6 +6324,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::DuplicateAudioClip if current == AppMode::DuplicatingClip => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::RemoveAudioClip if current == AppMode::RemovingClip => {
             AppMode::Running
         }
         IdeWorkerCommandKind::SetAudioClipActive if current == AppMode::ChangingClipActivation => {
@@ -11212,6 +11291,21 @@ mod tests {
     }
 
     #[test]
+    fn audio_clip_removal_submission_and_failure_use_a_dedicated_mode() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::RemoveAudioClip,
+            ),
+            AppMode::RemovingClip
+        );
+        assert_eq!(
+            mode_after_failure(AppMode::RemovingClip, IdeWorkerCommandKind::RemoveAudioClip),
+            AppMode::Running
+        );
+    }
+
+    #[test]
     fn audio_clip_gain_failure_restores_running_mode() {
         assert_eq!(
             mode_after_failure(
@@ -11346,6 +11440,7 @@ mod tests {
         );
         assert_recent_project_window_contract(&ui);
         assert_audio_import_window_contract(&ui);
+        assert_audio_clip_removal_window_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);
         ui.set_status_text("Choose a Runtime destination".into());
         ui.set_error_text("retained message".into());
@@ -11541,6 +11636,43 @@ mod tests {
 
         assert_audio_import_callback_contract(ui, &routes);
         assert_audio_import_event_contract(ui, &routes);
+    }
+
+    fn assert_audio_clip_removal_window_contract(ui: &MainWindow) {
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        let project_state = Rc::new(ProjectUiState::default());
+        bind_audio_clip_removal_callback(ui, &worker, &project_state);
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_clip_remove_visible(true);
+        ui.set_clip_remove_id("clip-a".into());
+        ui.set_clip_remove_name("Unused clip".into());
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>()
+            .invoke_remove_audio_clip("stale-clip".into());
+        assert!(ui.get_error_text().contains("no longer current"));
+        assert!(ui.get_clip_remove_visible());
+
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>()
+            .invoke_remove_audio_clip("clip-a".into());
+        assert!(ui.get_error_text().contains("no longer available"));
+        assert!(ui.get_clip_remove_visible());
+
+        apply_audio_clip_removal_event(ui, &IdeWorkerEvent::AudioClipRemoving);
+        assert_eq!(ui.get_app_mode(), AppMode::RemovingClip);
+        assert!(ui.get_clip_remove_visible());
+        apply_audio_clip_removal_event(
+            ui,
+            &IdeWorkerEvent::AudioClipRemoved {
+                revision: 9,
+                clip_id: "clip-a".to_owned(),
+            },
+        );
+        assert!(!ui.get_clip_remove_visible());
+        assert!(ui.get_clip_remove_id().is_empty());
+        assert!(ui.get_status_text().contains("source media was retained"));
+        assert!(ui.get_error_text().is_empty());
     }
 
     fn assert_audio_import_callback_contract(ui: &MainWindow, routes: &AudioImportRoutes) {

@@ -27,6 +27,7 @@ export enum AppMode {
     removing-arrangement-placement,
     renaming-clip,
     duplicating-clip,
+    removing-clip,
     changing-clip-activation,
     changing-clip-gain,
     changing-clip-fades,
@@ -219,6 +220,7 @@ export global IdeActions {
     callback split-arrangement-placement(string, string);
     callback rename-audio-clip(string, string);
     callback duplicate-audio-clip(string, string);
+    callback remove-audio-clip(string);
     callback set-audio-clip-active(string, bool);
     callback set-audio-clip-gain(string, string);
     callback set-audio-clip-fades(string, string, string);
@@ -448,6 +450,9 @@ export component MainWindow inherits Window {
     in-out property <string> clip-duplicate-id: "";
     in-out property <string> clip-duplicate-source-name: "";
     in-out property <string> clip-duplicate-name: "";
+    in-out property <bool> clip-remove-visible: false;
+    in-out property <string> clip-remove-id: "";
+    in-out property <string> clip-remove-name: "";
     in-out property <bool> clip-gain-visible: false;
     in-out property <string> clip-gain-id: "";
     in-out property <string> clip-gain-name: "";
@@ -3006,7 +3011,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.clip-loop-visible && !root.clip-source-slip-visible && !root.add-arrangement-placement-visible : Panel {
+                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-remove-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.clip-loop-visible && !root.clip-source-slip-visible && !root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -3067,7 +3072,7 @@ export component MainWindow inherits Window {
                         if root.audio-clips.length > 0 : ListView {
                             vertical-stretch: 1;
                             for clip in root.audio-clips : Rectangle {
-                                height: 116px;
+                                height: 144px;
                                 width: parent.width;
                                 background: #0e141b;
                                 border-color: #27313d;
@@ -3134,6 +3139,20 @@ export component MainWindow inherits Window {
                                                     root.add-arrangement-placement-duration-ticks = clip.duration-ticks;
                                                     root.add-arrangement-placement-start-tick = "0";
                                                     root.add-arrangement-placement-visible = true;
+                                                }
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 4px;
+                                            Button {
+                                                width: 116px;
+                                                text: "Remove unused";
+                                                accessible-label: "Remove unused reusable clip " + clip.name + " without deleting its source audio";
+                                                enabled: root.app-mode == AppMode.running;
+                                                clicked => {
+                                                    root.clip-remove-id = clip.id;
+                                                    root.clip-remove-name = clip.name;
+                                                    root.clip-remove-visible = true;
                                                 }
                                             }
                                         }
@@ -3224,7 +3243,7 @@ export component MainWindow inherits Window {
                         }
 
                         Text {
-                            text: "Import copies WAV or FLAC into project-owned 48 kHz media and creates one full-file reusable clip per file; it creates no arrangement placement. Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Place creates one full-length non-ripple reference. Activation, direction, source slip, gain, loop, and fades affect every existing reference.";
+                            text: "Import copies WAV or FLAC into project-owned 48 kHz media and creates one full-file reusable clip per file; it creates no arrangement placement. Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Remove unused deletes only an unreferenced reusable clip and keeps its source media. Place creates one full-length non-ripple reference. Activation, direction, source slip, gain, loop, and fades affect every existing reference.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;
@@ -3310,6 +3329,40 @@ export component MainWindow inherits Window {
                                     && root.clip-duplicate-id != ""
                                     && root.clip-duplicate-name != "";
                                 clicked => { IdeActions.duplicate-audio-clip(root.clip-duplicate-id, root.clip-duplicate-name); }
+                            }
+                        }
+                    }
+                }
+
+                if root.clips-visible && root.clip-remove-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 16px;
+                        Text { text: "REMOVE UNUSED AUDIO CLIP"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.clip-remove-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                        Text {
+                            text: "This removes the reusable clip only when no arrangement placement or scene Play action still references it.";
+                            color: #aebccc;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: "The immutable source audio and its asset declaration are retained. This action does not clean up media files and cannot be undone.";
+                            color: #65758a;
+                            font-size: 9px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Cancel"; clicked => { root.clip-remove-visible = false; } }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: root.app-mode == AppMode.removing-clip ? "Removing clip..." : "Remove unused clip";
+                                enabled: root.app-mode == AppMode.running && root.clip-remove-id != "";
+                                clicked => { IdeActions.remove-audio-clip(root.clip-remove-id); }
                             }
                         }
                     }
