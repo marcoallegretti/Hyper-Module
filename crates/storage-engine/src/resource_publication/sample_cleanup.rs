@@ -2,9 +2,10 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 
-use cap_fs_ext::DirExt;
-use cap_std::fs::Dir;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions};
 use hyper_project_model::{AssetRole, ProjectManifest, ResourceRole, is_valid_entity_id};
+use same_file::Handle;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -24,6 +25,7 @@ use crate::project_lock::{
     ProjectLock, ProjectTransactionFamily, SAMPLE_CLEANUP_TRANSACTION_PREFIX,
     find_unhandled_project_transaction,
 };
+use crate::stable_file::verify_open_stable;
 
 const FORMAT: &str = "hyper-sample-cleanup-transaction";
 const INTENT_FORMAT: &str = "hyper-sample-cleanup-intent";
@@ -88,6 +90,9 @@ impl SampleCleanupRecovery {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SampleCleanupPhase {
     Transaction,
+    Asset(usize),
+    SampleDirectory,
+    AssetDirectory,
     Assets,
     Manifest,
 }
@@ -227,17 +232,10 @@ fn clean_unused_samples_observed(
             "active project identity changed before sample cleanup staging",
         ));
     }
-    for asset in &assets {
-        verified
-            .read_asset(&asset.id, asset.byte_length)
-            .map_err(|error| {
-                caused(
-                    ProjectResourcePublicationErrorKind::ProjectChanged,
-                    "sample asset changed before cleanup staging",
-                    error,
-                )
-            })?;
-    }
+    let authorities = assets
+        .iter()
+        .map(|asset| verified_asset_authority(&verified.root_dir, asset))
+        .collect::<Result<Vec<_>, _>>()?;
     let next_revision = verified
         .manifest()
         .revision()
@@ -286,6 +284,7 @@ fn clean_unused_samples_observed(
         &transaction,
         &name,
         &assets,
+        &authorities,
         removed_sample_directory,
         removed_asset_directory,
         &active_project,
@@ -311,18 +310,135 @@ struct SelectedAsset {
     sha256: String,
 }
 
+fn verified_asset_authority(
+    root: &Dir,
+    asset: &SelectedAsset,
+) -> Result<Handle, ProjectResourcePublicationError> {
+    let parent = open_relative_parent(root, &asset.path)?;
+    verified_file_authority(
+        &parent,
+        file_name(&asset.path)?,
+        asset.byte_length,
+        &asset.sha256,
+        ProjectResourcePublicationErrorKind::ProjectChanged,
+        "verify sample asset before cleanup staging",
+    )
+}
+
+fn verified_file_authority(
+    directory: &Dir,
+    name: &str,
+    byte_length: u64,
+    sha256: &str,
+    kind: ProjectResourcePublicationErrorKind,
+    operation: &'static str,
+) -> Result<Handle, ProjectResourcePublicationError> {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = directory
+        .open_with(name, &options)
+        .map_err(|error| caused(kind, operation, error))?;
+    let retained = file
+        .try_clone()
+        .map_err(|error| caused(kind, "retain sample file authority", error))?;
+    let authority = Handle::from_file(retained.into_std())
+        .map_err(|error| caused(kind, "identify sample file authority", error))?;
+    verify_open_stable(
+        file.into_std(),
+        operation,
+        byte_length,
+        decode_digest(sha256)?,
+        false,
+    )
+    .map_err(|error| caused(kind, operation, error))?;
+    Ok(authority)
+}
+
+fn move_verified_asset(
+    root: &Dir,
+    transaction: &Dir,
+    asset: &TransactionAsset,
+    authority: &Handle,
+) -> Result<(), ProjectResourcePublicationError> {
+    let parent = open_relative_parent(root, &asset.path)?;
+    let name = file_name(&asset.path)?;
+    parent
+        .rename(name, transaction, &asset.backup_name)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::ProjectChanged,
+                "move unused sample into cleanup transaction",
+                error,
+            )
+        })?;
+    sync_dir(&parent)?;
+    sync_dir(transaction)?;
+    let moved = verified_file_authority(
+        transaction,
+        &asset.backup_name,
+        asset.byte_length,
+        &asset.sha256,
+        ProjectResourcePublicationErrorKind::ProjectChanged,
+        "verify moved sample cleanup asset",
+    );
+    if moved.as_ref().is_ok_and(|moved| moved == authority) {
+        return Ok(());
+    }
+    transaction
+        .rename(&asset.backup_name, &parent, name)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "restore changed sample after cleanup authority mismatch",
+                error,
+            )
+        })?;
+    sync_dir(&parent)?;
+    sync_dir(transaction)?;
+    match moved {
+        Ok(_) => Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "sample asset path changed before cleanup removal",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn verify_moved_assets(
+    transaction: &Dir,
+    assets: &[TransactionAsset],
+    authorities: &[Handle],
+) -> Result<(), ProjectResourcePublicationError> {
+    if assets.len() != authorities.len() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "sample cleanup retained authority count changed",
+        ));
+    }
+    for (asset, authority) in assets.iter().zip(authorities) {
+        let current = verified_file_authority(
+            transaction,
+            &asset.backup_name,
+            asset.byte_length,
+            &asset.sha256,
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "revalidate moved sample cleanup asset",
+        )?;
+        if &current != authority {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::ProjectChanged,
+                "moved sample cleanup asset authority changed",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_request(
     verified: &StructurallyVerifiedProject,
     ids: &[String],
 ) -> Result<Vec<SelectedAsset>, ProjectResourcePublicationError> {
     let mut previous: Option<&str> = None;
-    let mut selected = Vec::new();
-    selected.try_reserve_exact(ids.len()).map_err(|_| {
-        failure(
-            ProjectResourcePublicationErrorKind::ResourceConflict,
-            "sample cleanup capacity is unavailable",
-        )
-    })?;
     for id in ids {
         if !is_valid_entity_id(id) || previous.is_some_and(|value| value >= id.as_str()) {
             return Err(failure(
@@ -331,31 +447,8 @@ fn validate_request(
             ));
         }
         previous = Some(id);
-        let mut matches = verified
-            .manifest()
-            .assets()
-            .iter()
-            .filter(|asset| asset.id() == id);
-        let asset = matches.next().ok_or_else(|| {
-            failure(
-                ProjectResourcePublicationErrorKind::InvalidResource,
-                "sample cleanup asset is absent",
-            )
-        })?;
-        if matches.next().is_some() || asset.role() != AssetRole::Sample {
-            return Err(failure(
-                ProjectResourcePublicationErrorKind::InvalidResource,
-                "sample cleanup accepts unique sample assets only",
-            ));
-        }
-        selected.push(SelectedAsset {
-            id: id.clone(),
-            path: asset.path().to_owned(),
-            byte_length: asset.byte_length(),
-            sha256: asset.sha256().to_owned(),
-        });
     }
-    let selected_ids = ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut referenced = BTreeSet::new();
     for descriptor in verified
         .manifest()
         .resources()
@@ -386,12 +479,31 @@ fn validate_request(
                     "audio clip has no source asset identity",
                 )
             })?;
-        if selected_ids.contains(asset_id) {
-            return Err(failure(
-                ProjectResourcePublicationErrorKind::InvalidResource,
-                "sample cleanup asset is still referenced by an audio clip",
-            ));
-        }
+        referenced.insert(asset_id.to_owned());
+    }
+    let mut selected = verified
+        .manifest()
+        .assets()
+        .iter()
+        .filter(|asset| asset.role() == AssetRole::Sample && !referenced.contains(asset.id()))
+        .map(|asset| SelectedAsset {
+            id: asset.id().to_owned(),
+            path: asset.path().to_owned(),
+            byte_length: asset.byte_length(),
+            sha256: asset.sha256().to_owned(),
+        })
+        .collect::<Vec<_>>();
+    selected.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    if selected.len() != ids.len()
+        || selected
+            .iter()
+            .zip(ids)
+            .any(|(asset, requested)| asset.id != *requested)
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "sample cleanup request does not match the complete unused sample set",
+        ));
     }
     Ok(selected)
 }
@@ -461,6 +573,7 @@ fn run_cleanup(
     transaction: &Dir,
     name: &str,
     assets: &[SelectedAsset],
+    authorities: &[Handle],
     removed_sample_directory: bool,
     removed_asset_directory: bool,
     previous_project: &[u8],
@@ -506,20 +619,11 @@ fn run_cleanup(
     sync_dir(transaction)?;
     sync_dir(backups)?;
     observer(SampleCleanupPhase::Transaction, verified.root())?;
-    for asset in &tx.assets {
-        let parent = open_relative_parent(&verified.root_dir, &asset.path)?;
-        parent
-            .rename(file_name(&asset.path)?, transaction, &asset.backup_name)
-            .map_err(|error| {
-                caused(
-                    ProjectResourcePublicationErrorKind::ProjectChanged,
-                    "move unused sample into cleanup transaction",
-                    error,
-                )
-            })?;
-        sync_dir(&parent)?;
-        sync_dir(transaction)?;
+    for (index, (asset, authority)) in tx.assets.iter().zip(authorities).enumerate() {
+        move_verified_asset(&verified.root_dir, transaction, asset, authority)?;
+        observer(SampleCleanupPhase::Asset(index), verified.root())?;
     }
+    verify_moved_assets(transaction, &tx.assets, authorities)?;
     if removed_sample_directory {
         let assets_dir = verified
             .root_dir
@@ -539,6 +643,7 @@ fn run_cleanup(
             )
         })?;
         sync_dir(&assets_dir)?;
+        observer(SampleCleanupPhase::SampleDirectory, verified.root())?;
     }
     if removed_asset_directory {
         verified.root_dir.remove_dir("assets").map_err(|error| {
@@ -549,6 +654,7 @@ fn run_cleanup(
             )
         })?;
         sync_dir(&verified.root_dir)?;
+        observer(SampleCleanupPhase::AssetDirectory, verified.root())?;
     }
     observer(SampleCleanupPhase::Assets, verified.root())?;
     let candidate =
@@ -567,6 +673,7 @@ fn run_cleanup(
             "sample-cleanup candidate revision changed",
         ));
     }
+    verify_moved_assets(transaction, &tx.assets, authorities)?;
     publish_staged_file(
         transaction,
         PROJECT_STAGING_NAME,
@@ -698,6 +805,7 @@ fn recover_one(
     let before = decode_digest(&tx.before_project_sha256)?;
     let after = decode_digest(&tx.after_project_sha256)?;
     if active_digest == before {
+        let asset_states = preflight_rollback_assets(root, transaction, &tx.assets)?;
         if tx.removed_asset_directory {
             create_directory_if_missing(root, "assets", "restore asset directory")?;
         }
@@ -712,35 +820,15 @@ fn recover_one(
             create_directory_if_missing(&assets_dir, "samples", "restore sample directory")?;
             sync_dir(&assets_dir)?;
         }
-        for asset in &tx.assets {
-            restore_asset(root, transaction, asset)?;
+        for (asset, state) in tx.assets.iter().zip(&asset_states) {
+            restore_asset(root, transaction, asset, state)?;
         }
         sync_dir(root)?;
         verify_committed(root_path, root, before)?;
         Ok(SampleCleanupRecoveryDisposition::RolledBack)
     } else if active_digest == after {
-        let committed = (|| {
-            if !tx.removed_sample_directory {
-                for asset in &tx.assets {
-                    let parent = open_relative_parent(root, &asset.path)?;
-                    match parent.symlink_metadata(file_name(&asset.path)?) {
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Ok(_) => {
-                            return Err(failure(
-                                ProjectResourcePublicationErrorKind::Recovery,
-                                "committed sample cleanup retained an active sample file",
-                            ));
-                        }
-                        Err(error) => {
-                            return Err(caused(
-                                ProjectResourcePublicationErrorKind::Recovery,
-                                "inspect committed sample cleanup path",
-                                error,
-                            ));
-                        }
-                    }
-                }
-            }
+        let committed = (|| -> Result<_, ProjectResourcePublicationError> {
+            validate_committed_residue(root, transaction, &tx.assets)?;
             verify_committed(root_path, root, after)?;
             Ok(SampleCleanupRecoveryDisposition::Committed)
         })();
@@ -760,19 +848,147 @@ fn recover_one(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryAssetSide {
+    Active,
+    Backup,
+}
+
+struct RecoveryAssetState {
+    side: RecoveryAssetSide,
+    authority: Handle,
+}
+
+fn preflight_rollback_assets(
+    root: &Dir,
+    transaction: &Dir,
+    assets: &[TransactionAsset],
+) -> Result<Vec<RecoveryAssetState>, ProjectResourcePublicationError> {
+    let mut states = Vec::new();
+    states.try_reserve_exact(assets.len()).map_err(|_| {
+        failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "sample-cleanup recovery capacity is unavailable",
+        )
+    })?;
+    for asset in assets {
+        let active = entry_present(root, &asset.path, "inspect active sample during recovery")?;
+        let backup = entry_present(
+            transaction,
+            &asset.backup_name,
+            "inspect backup sample during recovery",
+        )?;
+        let (side, authority) = match (active, backup) {
+            (true, false) => {
+                let parent = open_relative_parent(root, &asset.path)?;
+                let authority = verified_file_authority(
+                    &parent,
+                    file_name(&asset.path)?,
+                    asset.byte_length,
+                    &asset.sha256,
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "preflight active sample during cleanup rollback",
+                )?;
+                (RecoveryAssetSide::Active, authority)
+            }
+            (false, true) => {
+                let authority = verified_file_authority(
+                    transaction,
+                    &asset.backup_name,
+                    asset.byte_length,
+                    &asset.sha256,
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "preflight backup sample during cleanup rollback",
+                )?;
+                (RecoveryAssetSide::Backup, authority)
+            }
+            _ => {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "sample-cleanup asset exists on both or neither transaction side",
+                ));
+            }
+        };
+        states.push(RecoveryAssetState { side, authority });
+    }
+    Ok(states)
+}
+
+fn validate_committed_residue(
+    root: &Dir,
+    transaction: &Dir,
+    assets: &[TransactionAsset],
+) -> Result<(), ProjectResourcePublicationError> {
+    for asset in assets {
+        if entry_present(root, &asset.path, "inspect committed sample cleanup path")? {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "committed sample cleanup retained an active sample file",
+            ));
+        }
+        if entry_present(
+            transaction,
+            &asset.backup_name,
+            "inspect committed sample cleanup backup",
+        )? {
+            verified_file_authority(
+                transaction,
+                &asset.backup_name,
+                asset.byte_length,
+                &asset.sha256,
+                ProjectResourcePublicationErrorKind::Recovery,
+                "verify committed sample cleanup backup",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn entry_present(
+    directory: &Dir,
+    name: &str,
+    operation: &'static str,
+) -> Result<bool, ProjectResourcePublicationError> {
+    match directory.symlink_metadata(name) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            operation,
+            error,
+        )),
+    }
+}
+
 fn restore_asset(
     root: &Dir,
     transaction: &Dir,
     asset: &TransactionAsset,
+    state: &RecoveryAssetState,
 ) -> Result<(), ProjectResourcePublicationError> {
     let parent = open_relative_parent(root, &asset.path)?;
     let name = file_name(&asset.path)?;
-    match (
-        parent.symlink_metadata(name),
-        transaction.symlink_metadata(&asset.backup_name),
-    ) {
-        (Ok(_), Err(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        (Err(error), Ok(_)) if error.kind() == io::ErrorKind::NotFound => {
+    let (directory, current_name) = match state.side {
+        RecoveryAssetSide::Active => (&parent, name),
+        RecoveryAssetSide::Backup => (transaction, asset.backup_name.as_str()),
+    };
+    let current = verified_file_authority(
+        directory,
+        current_name,
+        asset.byte_length,
+        &asset.sha256,
+        ProjectResourcePublicationErrorKind::Recovery,
+        "revalidate sample cleanup rollback authority",
+    )?;
+    if current != state.authority {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "sample-cleanup asset authority changed during rollback",
+        ));
+    }
+    match state.side {
+        RecoveryAssetSide::Active => Ok(()),
+        RecoveryAssetSide::Backup => {
             transaction
                 .rename(&asset.backup_name, &parent, name)
                 .map_err(|error| {
@@ -785,10 +1001,6 @@ fn restore_asset(
             sync_dir(&parent)?;
             sync_dir(transaction)
         }
-        _ => Err(failure(
-            ProjectResourcePublicationErrorKind::Recovery,
-            "sample-cleanup asset exists on both or neither transaction side",
-        )),
     }
 }
 
@@ -1157,6 +1369,7 @@ fn clear_and_remove(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1164,9 +1377,13 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::{ProjectCreationRequest, create_project, verify_project_package};
+    use crate::{
+        ProjectCreationRequest, create_project, recover_project_transactions,
+        verify_project_package,
+    };
 
     const ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334478";
+    const SECOND_ASSET_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334480";
     const CLIP_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334479";
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -1256,6 +1473,58 @@ mod tests {
             (*verified.manifest_sha256(), vec![ASSET_ID.to_owned()])
         }
 
+        fn add_unused_sample(&self) -> Vec<u8> {
+            let sample = b"second-project-owned-sample-copy".to_vec();
+            fs::write(self.root.join("assets/samples/second.wav"), &sample).unwrap();
+            let mut manifest: Value =
+                serde_json::from_slice(&fs::read(self.root.join(MANIFEST_NAME)).unwrap()).unwrap();
+            manifest["assets"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "id": SECOND_ASSET_ID,
+                    "role": "sample",
+                    "path": "assets/samples/second.wav",
+                    "media_type": "audio/wav",
+                    "byte_length": sample.len(),
+                    "sha256": sha256(&sample),
+                    "extensions": {}
+                }));
+            fs::write(
+                self.root.join(MANIFEST_NAME),
+                serde_json_canonicalizer::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            verify_project_package(&self.root).unwrap();
+            sample
+        }
+
+        fn transaction_path(&self) -> PathBuf {
+            fs::read_dir(self.root.join("backups"))
+                .unwrap()
+                .map(Result::unwrap)
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(SAMPLE_CLEANUP_TRANSACTION_PREFIX)
+                })
+                .unwrap()
+                .path()
+        }
+
+        fn assert_no_cleanup_transaction(&self) {
+            assert!(
+                fs::read_dir(self.root.join("backups"))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .all(|entry| !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(SAMPLE_CLEANUP_TRANSACTION_PREFIX))
+            );
+        }
+
         fn assert_previous(&self) {
             let verified = verify_project_package(&self.root).unwrap();
             assert_eq!(verified.manifest().assets().len(), 1);
@@ -1296,6 +1565,191 @@ mod tests {
         assert_eq!(outcome.removed_bytes(), fixture.sample.len() as u64);
         assert_eq!(outcome.project_revision(), 2);
         fixture.assert_cleaned();
+    }
+
+    #[test]
+    fn requires_the_complete_current_unused_sample_set() {
+        for ids in [
+            vec![ASSET_ID.to_owned()],
+            vec![SECOND_ASSET_ID.to_owned()],
+            vec![SECOND_ASSET_ID.to_owned(), ASSET_ID.to_owned()],
+            vec![ASSET_ID.to_owned(), ASSET_ID.to_owned()],
+            vec![ASSET_ID.to_owned(), CLIP_ID.to_owned()],
+        ] {
+            let fixture = Fixture::new(false);
+            let second = fixture.add_unused_sample();
+            let before = fs::read(fixture.root.join(MANIFEST_NAME)).unwrap();
+            let identity = digest(&before);
+
+            let error = clean_unused_samples(
+                &fixture.root,
+                SampleCleanupRequest {
+                    expected_project_sha256: identity,
+                    asset_ids: &ids,
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                error.kind(),
+                ProjectResourcePublicationErrorKind::InvalidResource
+            );
+            assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), before);
+            let verified = verify_project_package(&fixture.root).unwrap();
+            assert_eq!(verified.manifest().assets().len(), 2);
+            assert_eq!(
+                fs::read(fixture.root.join("assets/samples/unused.wav")).unwrap(),
+                fixture.sample
+            );
+            assert_eq!(
+                fs::read(fixture.root.join("assets/samples/second.wav")).unwrap(),
+                second
+            );
+        }
+
+        let fixture = Fixture::new(false);
+        let second = fixture.add_unused_sample();
+        let identity = digest(&fs::read(fixture.root.join(MANIFEST_NAME)).unwrap());
+        let ids = vec![ASSET_ID.to_owned(), SECOND_ASSET_ID.to_owned()];
+        let outcome = clean_unused_samples(
+            &fixture.root,
+            SampleCleanupRequest {
+                expected_project_sha256: identity,
+                asset_ids: &ids,
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.removed_assets(), 2);
+        assert_eq!(
+            outcome.removed_bytes(),
+            (fixture.sample.len() + second.len()) as u64
+        );
+        fixture.assert_cleaned();
+    }
+
+    #[test]
+    fn refuses_changed_asset_bytes_without_committing_or_deleting_them() {
+        let fixture = Fixture::new(false);
+        let (identity, ids) = fixture.request();
+        let replacement = vec![b'X'; fixture.sample.len()];
+
+        let error = clean_unused_samples_observed(
+            &fixture.root,
+            SampleCleanupRequest {
+                expected_project_sha256: identity,
+                asset_ids: &ids,
+            },
+            |phase, root| {
+                if phase == SampleCleanupPhase::Transaction {
+                    fs::write(root.join("assets/samples/unused.wav"), &replacement).unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(!error.published());
+        assert_eq!(
+            fs::read(fixture.root.join("assets/samples/unused.wav")).unwrap(),
+            replacement
+        );
+        let manifest = fs::read(fixture.root.join(MANIFEST_NAME)).unwrap();
+        assert_eq!(digest(&manifest), identity);
+    }
+
+    #[test]
+    fn refuses_replaced_asset_object_without_committing_or_deleting_it() {
+        let fixture = Fixture::new(false);
+        let (identity, ids) = fixture.request();
+        let active = fixture.root.join("assets/samples/unused.wav");
+        let staged = fixture.root.join("assets/samples/replacement.wav");
+        let replacement = vec![b'R'; fixture.sample.len()];
+
+        let error = clean_unused_samples_observed(
+            &fixture.root,
+            SampleCleanupRequest {
+                expected_project_sha256: identity,
+                asset_ids: &ids,
+            },
+            |phase, _| {
+                if phase == SampleCleanupPhase::Transaction {
+                    fs::write(&staged, &replacement).unwrap();
+                    fs::remove_file(&active).unwrap();
+                    fs::rename(&staged, &active).unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(!error.published());
+        assert_eq!(fs::read(&active).unwrap(), replacement);
+        assert!(!staged.exists());
+        let manifest = fs::read(fixture.root.join(MANIFEST_NAME)).unwrap();
+        assert_eq!(digest(&manifest), identity);
+    }
+
+    #[test]
+    fn corrupt_rollback_backup_is_rejected_before_restore_and_retained() {
+        let fixture = Fixture::new(false);
+        let (identity, ids) = fixture.request();
+        let interrupted = catch_unwind(AssertUnwindSafe(|| {
+            let _ = clean_unused_samples_observed(
+                &fixture.root,
+                SampleCleanupRequest {
+                    expected_project_sha256: identity,
+                    asset_ids: &ids,
+                },
+                |phase, _| {
+                    assert_ne!(phase, SampleCleanupPhase::Asset(0));
+                    Ok(())
+                },
+            );
+        }));
+        assert!(interrupted.is_err());
+        let transaction = fixture.transaction_path();
+        let backup = transaction.join("asset-00000.bin");
+        let corrupt = vec![b'Y'; fixture.sample.len()];
+        fs::write(&backup, &corrupt).unwrap();
+
+        let error = recover_sample_cleanups(&fixture.root).unwrap_err();
+
+        assert!(!error.published());
+        assert_eq!(fs::read(&backup).unwrap(), corrupt);
+        assert!(!fixture.root.join("assets/samples/unused.wav").exists());
+        assert!(transaction.is_dir());
+    }
+
+    #[test]
+    fn corrupt_committed_backup_remains_a_published_recovery_warning() {
+        let fixture = Fixture::new(false);
+        let (identity, ids) = fixture.request();
+        let interrupted = catch_unwind(AssertUnwindSafe(|| {
+            let _ = clean_unused_samples_observed(
+                &fixture.root,
+                SampleCleanupRequest {
+                    expected_project_sha256: identity,
+                    asset_ids: &ids,
+                },
+                |phase, _| {
+                    assert_ne!(phase, SampleCleanupPhase::Manifest);
+                    Ok(())
+                },
+            );
+        }));
+        assert!(interrupted.is_err());
+        let transaction = fixture.transaction_path();
+        let backup = transaction.join("asset-00000.bin");
+        let corrupt = vec![b'Z'; fixture.sample.len()];
+        fs::write(&backup, &corrupt).unwrap();
+
+        let error = recover_sample_cleanups(&fixture.root).unwrap_err();
+
+        assert!(error.published());
+        assert_eq!(fs::read(&backup).unwrap(), corrupt);
+        assert!(transaction.is_dir());
+        let verified = verify_project_package(&fixture.root).unwrap();
+        assert!(verified.manifest().assets().is_empty());
     }
 
     #[test]
@@ -1373,6 +1827,85 @@ mod tests {
     }
 
     #[test]
+    fn global_restart_recovery_covers_each_asset_and_directory_boundary() {
+        for interrupted_phase in [
+            SampleCleanupPhase::Transaction,
+            SampleCleanupPhase::Asset(0),
+            SampleCleanupPhase::Asset(1),
+            SampleCleanupPhase::SampleDirectory,
+            SampleCleanupPhase::AssetDirectory,
+        ] {
+            let fixture = Fixture::new(false);
+            let second = fixture.add_unused_sample();
+            let identity = digest(&fs::read(fixture.root.join(MANIFEST_NAME)).unwrap());
+            let ids = vec![ASSET_ID.to_owned(), SECOND_ASSET_ID.to_owned()];
+            let interrupted = catch_unwind(AssertUnwindSafe(|| {
+                let _ = clean_unused_samples_observed(
+                    &fixture.root,
+                    SampleCleanupRequest {
+                        expected_project_sha256: identity,
+                        asset_ids: &ids,
+                    },
+                    |phase, _| {
+                        assert_ne!(phase, interrupted_phase);
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(interrupted.is_err(), "{interrupted_phase:?}");
+
+            let report = recover_project_transactions(&fixture.root).unwrap();
+
+            assert_eq!(report.sample_cleanups().len(), 1, "{interrupted_phase:?}");
+            assert_eq!(
+                report.sample_cleanups()[0].disposition(),
+                SampleCleanupRecoveryDisposition::RolledBack,
+                "{interrupted_phase:?}"
+            );
+            let verified = verify_project_package(&fixture.root).unwrap();
+            assert_eq!(verified.manifest().assets().len(), 2);
+            assert_eq!(
+                fs::read(fixture.root.join("assets/samples/unused.wav")).unwrap(),
+                fixture.sample
+            );
+            assert_eq!(
+                fs::read(fixture.root.join("assets/samples/second.wav")).unwrap(),
+                second
+            );
+            fixture.assert_no_cleanup_transaction();
+        }
+
+        let fixture = Fixture::new(false);
+        fixture.add_unused_sample();
+        let identity = digest(&fs::read(fixture.root.join(MANIFEST_NAME)).unwrap());
+        let ids = vec![ASSET_ID.to_owned(), SECOND_ASSET_ID.to_owned()];
+        let interrupted = catch_unwind(AssertUnwindSafe(|| {
+            let _ = clean_unused_samples_observed(
+                &fixture.root,
+                SampleCleanupRequest {
+                    expected_project_sha256: identity,
+                    asset_ids: &ids,
+                },
+                |phase, _| {
+                    assert_ne!(phase, SampleCleanupPhase::Manifest);
+                    Ok(())
+                },
+            );
+        }));
+        assert!(interrupted.is_err());
+
+        let report = recover_project_transactions(&fixture.root).unwrap();
+
+        assert_eq!(report.sample_cleanups().len(), 1);
+        assert_eq!(
+            report.sample_cleanups()[0].disposition(),
+            SampleCleanupRecoveryDisposition::Committed
+        );
+        fixture.assert_cleaned();
+        fixture.assert_no_cleanup_transaction();
+    }
+
+    #[test]
     fn committed_cleanup_reports_incomplete_recovery_as_published() {
         let fixture = Fixture::new(false);
         let (identity, ids) = fixture.request();
@@ -1442,6 +1975,36 @@ mod tests {
             ProjectResourcePublicationErrorKind::InvalidResource
         );
         assert!(fixture.root.join("assets/recordings/unused.wav").is_file());
+    }
+
+    #[test]
+    fn foreign_project_transaction_blocks_cleanup_before_mutation() {
+        let fixture = Fixture::new(false);
+        let before = fs::read(fixture.root.join(MANIFEST_NAME)).unwrap();
+        let (identity, ids) = fixture.request();
+        let foreign = fixture.root.join("backups").join(format!(
+            "{}{}",
+            crate::project_lock::PROJECT_RESOURCE_TRANSACTION_PREFIX,
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&foreign).unwrap();
+
+        let error = clean_unused_samples(
+            &fixture.root,
+            SampleCleanupRequest {
+                expected_project_sha256: identity,
+                asset_ids: &ids,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::ProjectChanged
+        );
+        assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), before);
+        fixture.assert_previous();
+        assert!(foreign.is_dir());
     }
 
     fn sha256(bytes: &[u8]) -> String {

@@ -177,10 +177,10 @@ impl Error for ProjectTransactionRecoveryError {
 /// Recovers every known editable-project transaction family in deterministic
 /// order before normal project verification.
 ///
-/// Existing-resource publication is recovered first because it may repair a
-/// manifest/resource pair needed by later package verification. Audio-track,
-/// audio-clip, mapping, and recording transactions then follow in that order
-/// through the same shared lock.
+/// Sample cleanup is recovered first because it may restore asset files needed
+/// by later package verification. Existing-resource, audio-track, audio-clip,
+/// mapping, and recording transactions then follow in that order through the
+/// same shared lock.
 ///
 /// Recovery is fail-closed when another project storage transaction owns that
 /// lock. Callers may retry after the competing transaction has completed; this
