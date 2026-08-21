@@ -271,6 +271,98 @@ impl DeviceChain {
         &self.devices
     }
 
+    /// Returns a copy with one validated Native Filter appended in processing
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when the instance identity is duplicated or the
+    /// version-1 chain bound would be exceeded.
+    pub fn try_with_appended_filter(
+        &self,
+        id: String,
+        enabled: bool,
+        state: NativeFilterState,
+    ) -> Result<Self, DeviceChainError> {
+        let mut devices = self.devices.clone();
+        devices.push(NativeDeviceInstance::try_new_filter(id, enabled, state)?);
+        Self::try_new(
+            self.id.clone(),
+            self.project_id.clone(),
+            self.track_id.clone(),
+            devices,
+        )
+    }
+
+    /// Returns a copy with one existing Native Filter state replaced without
+    /// changing chain order or device identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when the device identity is absent or the state
+    /// is outside the version-1 filter domain.
+    pub fn try_with_filter_state(
+        &self,
+        device_instance_id: &str,
+        enabled: bool,
+        state: NativeFilterState,
+    ) -> Result<Self, DeviceChainError> {
+        let mut devices = self.devices.clone();
+        let Some(device) = devices
+            .iter_mut()
+            .find(|device| device.id() == device_instance_id)
+        else {
+            return Err(DeviceChainError {
+                kind: DeviceChainErrorKind::InvalidDomain,
+                message: "native device instance does not exist in this chain".to_owned(),
+            });
+        };
+        *device = NativeDeviceInstance::try_new_filter(
+            device_instance_id.to_owned(),
+            enabled,
+            state,
+        )?;
+        Self::try_new(
+            self.id.clone(),
+            self.project_id.clone(),
+            self.track_id.clone(),
+            devices,
+        )
+    }
+
+    /// Returns a copy without one device, or `None` when removing it empties
+    /// the chain and therefore requires deleting the chain resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when the device identity is absent.
+    pub fn try_without_device(
+        &self,
+        device_instance_id: &str,
+    ) -> Result<Option<Self>, DeviceChainError> {
+        let Some(index) = self
+            .devices
+            .iter()
+            .position(|device| device.id() == device_instance_id)
+        else {
+            return Err(DeviceChainError {
+                kind: DeviceChainErrorKind::InvalidDomain,
+                message: "native device instance does not exist in this chain".to_owned(),
+            });
+        };
+        if self.devices.len() == 1 {
+            return Ok(None);
+        }
+        let mut devices = self.devices.clone();
+        devices.remove(index);
+        Ok(Some(Self::try_new(
+            self.id.clone(),
+            self.project_id.clone(),
+            self.track_id.clone(),
+            devices,
+        )?))
+    }
+
     #[must_use]
     pub const fn extensions(&self) -> &BTreeMap<String, Value> {
         &self.extensions
@@ -661,6 +753,35 @@ mod tests {
                 "org.hyper-module.native-filter/enabled",
             ]
         );
+    }
+
+    #[test]
+    fn chain_edits_preserve_order_identity_and_non_empty_ownership() {
+        let original = chain(true);
+        let second_id = "018f47a2-6b2d-7c11-8a44-001122338004";
+        let two = original
+            .try_with_appended_filter(
+                second_id.to_owned(),
+                false,
+                state(NativeFilterMode::HighPass),
+            )
+            .unwrap();
+        assert_eq!(two.devices().len(), 2);
+        assert_eq!(two.devices()[0].id(), DEVICE_ID);
+        assert_eq!(two.devices()[1].id(), second_id);
+
+        let changed = two
+            .try_with_filter_state(second_id, true, state(NativeFilterMode::LowPass))
+            .unwrap();
+        assert!(changed.devices()[1].enabled());
+        assert_eq!(
+            changed.devices()[1].state().mode(),
+            NativeFilterMode::LowPass
+        );
+        let reduced = changed.try_without_device(DEVICE_ID).unwrap().unwrap();
+        assert_eq!(reduced.devices()[0].id(), second_id);
+        assert!(reduced.try_without_device(second_id).unwrap().is_none());
+        assert!(reduced.try_without_device(DEVICE_ID).is_err());
     }
 
     #[test]

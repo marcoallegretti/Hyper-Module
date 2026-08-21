@@ -78,6 +78,19 @@ pub struct AutomationTakePublicationRequest<'a> {
     pub take_bytes: &'a [u8],
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceChainPublicationRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub chain_id: &'a str,
+    pub chain_bytes: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceChainRemovalRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub chain_id: &'a str,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectResourcePublicationErrorKind {
     InvalidResource,
@@ -324,7 +337,29 @@ struct TransactionRecord {
     previous_resource: Option<TransactionFile>,
     #[serde(default, skip_serializing_if = "is_false")]
     created_parent_directory: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    removed_parent_directory: bool,
+    #[serde(default, skip_serializing_if = "TransactionOperation::is_publication")]
+    operation: TransactionOperation,
     extensions: serde_json::Map<String, Value>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum TransactionOperation {
+    #[default]
+    Publication,
+    Removal,
+}
+
+impl TransactionOperation {
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde skip_serializing_if requires a shared-reference predicate"
+    )]
+    const fn is_publication(&self) -> bool {
+        matches!(self, Self::Publication)
+    }
 }
 
 #[allow(
@@ -389,6 +424,8 @@ enum ProjectResourcePublicationMode {
     ArrangementAddition,
     SceneAddition,
     AutomationTakeAddition,
+    DeviceChainAddition,
+    DeviceChainRemoval,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -490,6 +527,55 @@ pub fn publish_automation_take(
             resource_bytes: request.take_bytes,
         },
         ProjectResourcePublicationMode::AutomationTakeAddition,
+        |_, _| Ok(()),
+    )
+}
+
+/// Publishes one new native-device chain through the serialized, recoverable
+/// manifest-last resource transaction family.
+///
+/// # Errors
+///
+/// Returns a classified validation, conflict, integrity, I/O, or recovery
+/// error. Publication is rejected if the stable identity or managed path
+/// collides with active project content.
+pub fn publish_device_chain(
+    project_path: impl AsRef<Path>,
+    request: DeviceChainPublicationRequest<'_>,
+) -> Result<ProjectResourcePublicationOutcome, ProjectResourcePublicationError> {
+    publish_project_resource_observed(
+        project_path.as_ref(),
+        ProjectResourcePublicationRequest {
+            expected_project_sha256: request.expected_project_sha256,
+            resource_id: request.chain_id,
+            expected_role: ResourceRole::DeviceChain,
+            resource_bytes: request.chain_bytes,
+        },
+        ProjectResourcePublicationMode::DeviceChainAddition,
+        |_, _| Ok(()),
+    )
+}
+
+/// Removes one native-device chain through the serialized, recoverable
+/// manifest-last resource transaction family.
+///
+/// # Errors
+///
+/// Returns a classified validation, conflict, integrity, I/O, or recovery
+/// error. Only an existing native-device-chain resource can be removed.
+pub fn remove_device_chain(
+    project_path: impl AsRef<Path>,
+    request: DeviceChainRemovalRequest<'_>,
+) -> Result<ProjectResourcePublicationOutcome, ProjectResourcePublicationError> {
+    publish_project_resource_observed(
+        project_path.as_ref(),
+        ProjectResourcePublicationRequest {
+            expected_project_sha256: request.expected_project_sha256,
+            resource_id: request.chain_id,
+            expected_role: ResourceRole::DeviceChain,
+            resource_bytes: &[],
+        },
+        ProjectResourcePublicationMode::DeviceChainRemoval,
         |_, _| Ok(()),
     )
 }
@@ -1003,7 +1089,9 @@ fn publish_project_resource_observed(
     mode: ProjectResourcePublicationMode,
     mut observer: impl FnMut(PublicationPhase, &Path) -> Result<(), ProjectResourcePublicationError>,
 ) -> Result<ProjectResourcePublicationOutcome, ProjectResourcePublicationError> {
-    validate_canonical_resource(request.resource_bytes)?;
+    if mode != ProjectResourcePublicationMode::DeviceChainRemoval {
+        validate_canonical_resource(request.resource_bytes)?;
+    }
     let verified = verify_project_package(project_path).map_err(|error| {
         caused(
             ProjectResourcePublicationErrorKind::Integrity,
@@ -1027,6 +1115,12 @@ fn publish_project_resource_observed(
         }
         ProjectResourcePublicationMode::AutomationTakeAddition => {
             validate_automation_take_addition_request(&verified, request)?;
+        }
+        ProjectResourcePublicationMode::DeviceChainAddition => {
+            validate_device_chain_addition_request(&verified, request)?;
+        }
+        ProjectResourcePublicationMode::DeviceChainRemoval => {
+            unique_resource(&verified, request.resource_id, ResourceRole::DeviceChain)?;
         }
     }
     let backups = open_or_create_dir(&verified.root_dir, "backups")?;
@@ -1120,6 +1214,37 @@ fn publish_project_resource_observed(
                 candidate_addition_manifest(&active_project, request, &path, next_revision)?;
             (path, None, created_parent_directory, candidate)
         }
+        ProjectResourcePublicationMode::DeviceChainRemoval => {
+            let descriptor =
+                unique_resource(&verified, request.resource_id, ResourceRole::DeviceChain)?;
+            let previous = verified
+                .read_resource(request.resource_id)
+                .map_err(|error| {
+                    caused(
+                        ProjectResourcePublicationErrorKind::Integrity,
+                        "read current device-chain resource",
+                        error,
+                    )
+                })?;
+            let candidate = candidate_removal_manifest(
+                &active_project,
+                request.resource_id,
+                next_revision,
+            )?;
+            let removed_parent_directory = verified
+                .manifest()
+                .resources()
+                .iter()
+                .filter(|resource| resource.role() == ResourceRole::DeviceChain)
+                .count()
+                == 1;
+            (
+                descriptor.path().to_owned(),
+                Some(previous),
+                removed_parent_directory,
+                candidate,
+            )
+        }
         ProjectResourcePublicationMode::SceneAddition => {
             let path = format!("scenes/{}.json", request.resource_id);
             let created_parent_directory =
@@ -1135,6 +1260,18 @@ fn publish_project_resource_observed(
                 "takes",
                 &path,
                 "automation take",
+            )?;
+            let candidate =
+                candidate_addition_manifest(&active_project, request, &path, next_revision)?;
+            (path, None, created_parent_directory, candidate)
+        }
+        ProjectResourcePublicationMode::DeviceChainAddition => {
+            let path = format!("devices/{}.json", request.resource_id);
+            let created_parent_directory = inspect_addition_destination(
+                &verified.root_dir,
+                "devices",
+                &path,
+                "device chain",
             )?;
             let candidate =
                 candidate_addition_manifest(&active_project, request, &path, next_revision)?;
@@ -1159,20 +1296,42 @@ fn publish_project_resource_observed(
                 error,
             )
         })?;
-    let result = run_publication(
-        &verified,
-        &backups,
-        &transaction,
-        &transaction_name,
-        request,
-        &resource_path,
-        previous.as_deref(),
-        created_parent_directory,
-        &active_project,
-        &candidate_project,
-        next_revision,
-        &mut observer,
-    );
+    let result = if mode == ProjectResourcePublicationMode::DeviceChainRemoval {
+        run_resource_removal(
+            &verified,
+            &backups,
+            &transaction,
+            &transaction_name,
+            request,
+            &resource_path,
+            previous.as_deref().ok_or_else(|| {
+                failure(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "device-chain removal lost its previous resource evidence",
+                )
+            })?,
+            created_parent_directory,
+            &active_project,
+            &candidate_project,
+            next_revision,
+            &mut observer,
+        )
+    } else {
+        run_publication(
+            &verified,
+            &backups,
+            &transaction,
+            &transaction_name,
+            request,
+            &resource_path,
+            previous.as_deref(),
+            created_parent_directory,
+            &active_project,
+            &candidate_project,
+            next_revision,
+            &mut observer,
+        )
+    };
     match result {
         Ok(mut outcome) => {
             clear_and_remove_transaction(&backups, transaction, &transaction_name).map_err(
@@ -1265,7 +1424,11 @@ fn reject_unhandled_resource_transactions(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the durable write order and every crash observation point remain visible in one coordinator"
+)]
 fn run_publication(
     verified: &StructurallyVerifiedProject,
     backups: &Dir,
@@ -1308,6 +1471,8 @@ fn run_publication(
             sha256: hex_digest(digest(bytes)),
         }),
         created_parent_directory,
+        removed_parent_directory: false,
+        operation: TransactionOperation::Publication,
         extensions: serde_json::Map::new(),
     };
     let transaction_bytes = serde_json_canonicalizer::to_vec(&tx).map_err(|error| {
@@ -1380,6 +1545,117 @@ fn run_publication(
         &verified.root_dir,
         digest(candidate_project),
     )?;
+    outcome_from_transaction(&tx, true)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the durable removal order and every crash observation point remain explicit in one coordinator"
+)]
+fn run_resource_removal(
+    verified: &StructurallyVerifiedProject,
+    backups: &Dir,
+    transaction: &Dir,
+    transaction_name: &str,
+    request: ProjectResourcePublicationRequest<'_>,
+    resource_path: &str,
+    previous_resource: &[u8],
+    removed_parent_directory: bool,
+    previous_project: &[u8],
+    candidate_project: &[u8],
+    next_revision: u64,
+    observer: &mut impl FnMut(PublicationPhase, &Path) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<ProjectResourcePublicationOutcome, ProjectResourcePublicationError> {
+    write_intent(transaction, transaction_name)?;
+    write_exclusive_synced(transaction, RESOURCE_STAGING_NAME, previous_resource)?;
+    write_exclusive_synced(transaction, PROJECT_STAGING_NAME, candidate_project)?;
+    write_exclusive_synced(transaction, PREVIOUS_PROJECT_NAME, previous_project)?;
+    let tx = TransactionRecord {
+        format: "hyper-project-resource-publication-transaction".to_owned(),
+        format_version: 1,
+        id: transaction_id(transaction_name)?,
+        before_project_sha256: hex_digest(*verified.manifest_sha256()),
+        after_project_sha256: hex_digest(digest(candidate_project)),
+        before_project_revision: verified.manifest().revision(),
+        after_project_revision: next_revision,
+        resource_id: request.resource_id.to_owned(),
+        resource_role: role_name(request.expected_role).to_owned(),
+        resource: TransactionFile {
+            path: resource_path.to_owned(),
+            byte_length: previous_resource.len() as u64,
+            sha256: hex_digest(digest(previous_resource)),
+        },
+        previous_resource: None,
+        created_parent_directory: false,
+        removed_parent_directory,
+        operation: TransactionOperation::Removal,
+        extensions: serde_json::Map::new(),
+    };
+    let transaction_bytes = serde_json_canonicalizer::to_vec(&tx).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "serialize resource-removal transaction",
+            error,
+        )
+    })?;
+    write_exclusive_synced(transaction, TRANSACTION_NAME, &transaction_bytes)?;
+    sync_dir(transaction)?;
+    sync_dir(backups)?;
+    observer(PublicationPhase::Transaction, verified.root())?;
+
+    let parent = open_relative_parent(&verified.root_dir, resource_path)?;
+    let active = read_bounded(&parent, file_name(resource_path)?, MAX_JSON_BYTES)?;
+    if digest(&active) != digest(previous_resource) {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "device-chain resource changed before removal",
+        ));
+    }
+    parent
+        .remove_file(file_name(resource_path)?)
+        .map_err(|error| caused(ProjectResourcePublicationErrorKind::Io, "remove device-chain resource", error))?;
+    sync_dir(&parent)?;
+    if removed_parent_directory {
+        drop(parent);
+        verified.root_dir.remove_dir("devices").map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "remove empty device-chain directory",
+                error,
+            )
+        })?;
+        sync_dir(&verified.root_dir)?;
+    }
+    observer(PublicationPhase::Resource, verified.root())?;
+
+    let candidate =
+        verify_project_candidate(verified.root(), &verified.root_dir, candidate_project).map_err(
+            |error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "resource-removal candidate does not verify",
+                    error,
+                )
+            },
+        )?;
+    if candidate.revision() != next_revision {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "resource-removal candidate revision changed",
+        ));
+    }
+    publish_staged_file(
+        transaction,
+        PROJECT_STAGING_NAME,
+        backups,
+        &verified.root_dir,
+        MANIFEST_NAME,
+        &format!(".project-{}.json", tx.id),
+        "project manifest",
+    )?;
+    observer(PublicationPhase::Manifest, verified.root())?;
+    verify_committed(verified.root(), &verified.root_dir, digest(candidate_project))?;
+    finish_removed_resource(&verified.root_dir, &tx)?;
     outcome_from_transaction(&tx, true)
 }
 
@@ -1775,6 +2051,49 @@ fn validate_automation_take_addition_request(
         return Err(failure(
             ProjectResourcePublicationErrorKind::InvalidResource,
             "automation take resource does not match the active project",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_device_chain_addition_request(
+    verified: &StructurallyVerifiedProject,
+    request: ProjectResourcePublicationRequest<'_>,
+) -> Result<(), ProjectResourcePublicationError> {
+    if request.expected_role != ResourceRole::DeviceChain
+        || !is_valid_entity_id(request.resource_id)
+        || request.resource_id == verified.manifest().project_id()
+        || verified
+            .manifest()
+            .resources()
+            .iter()
+            .any(|descriptor| descriptor.id() == request.resource_id)
+        || verified
+            .manifest()
+            .assets()
+            .iter()
+            .any(|descriptor| descriptor.id() == request.resource_id)
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "device-chain identity conflicts with the active project",
+        ));
+    }
+    let chain: Value = serde_json::from_slice(request.resource_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse new device-chain resource",
+            error,
+        )
+    })?;
+    if chain["format"].as_str() != Some("hyper-device-chain")
+        || chain["format_version"].as_u64() != Some(1)
+        || chain["id"].as_str() != Some(request.resource_id)
+        || chain["project_id"].as_str() != Some(verified.manifest().project_id())
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "device-chain resource does not match the active project",
         ));
     }
     Ok(())
@@ -2401,11 +2720,58 @@ fn candidate_addition_manifest(
     Ok(bytes)
 }
 
+fn candidate_removal_manifest(
+    active: &[u8],
+    resource_id: &str,
+    revision: u64,
+) -> Result<Vec<u8>, ProjectResourcePublicationError> {
+    let mut value: Value = serde_json::from_slice(active).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "parse active project manifest",
+            error,
+        )
+    })?;
+    value["revision"] = revision.into();
+    let resources = value["resources"].as_array_mut().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "project resource declarations are invalid",
+        )
+    })?;
+    let Some(index) = resources
+        .iter()
+        .position(|resource| resource["id"].as_str() == Some(resource_id))
+    else {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "removed resource descriptor disappeared",
+        ));
+    };
+    resources.remove(index);
+    let bytes = serde_json_canonicalizer::to_vec(&value).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "serialize resource-removal project manifest",
+            error,
+        )
+    })?;
+    ProjectManifest::parse(&bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "candidate resource-removal manifest is invalid",
+            error,
+        )
+    })?;
+    Ok(bytes)
+}
+
 const fn addition_directory(role: ResourceRole) -> Option<&'static str> {
     match role {
         ResourceRole::Arrangement => Some("arrangement"),
         ResourceRole::Scene => Some("scenes"),
         ResourceRole::AutomationTake => Some("takes"),
+        ResourceRole::DeviceChain => Some("devices"),
         _ => None,
     }
 }
@@ -3126,6 +3492,9 @@ fn recover_transaction(
         Err(error) => return Err(error),
     };
     if active == after {
+        if tx.operation == TransactionOperation::Removal {
+            finish_removed_resource(root, tx)?;
+        }
         cleanup_publication_temporaries(root, backups, transaction, tx)
             .and_then(|()| verify_committed(root_path, root, after))
             .map_err(|source| ProjectResourcePublicationError {
@@ -3143,7 +3512,11 @@ fn recover_transaction(
             "resource recovery found an unrelated project identity",
         ));
     }
-    rollback_resource(root, transaction, tx)?;
+    if tx.operation == TransactionOperation::Removal {
+        rollback_removed_resource(root, transaction, tx)?;
+    } else {
+        rollback_resource(root, transaction, tx)?;
+    }
     cleanup_publication_temporaries(root, backups, transaction, tx)?;
     remove_created_resource_parent(root, tx)?;
     let previous = read_bounded(transaction, PREVIOUS_PROJECT_NAME, MAX_JSON_BYTES)?;
@@ -3161,6 +3534,98 @@ fn recover_transaction(
         )
     })?;
     Ok(ProjectResourcePublicationRecoveryDisposition::RolledBack)
+}
+
+fn finish_removed_resource(
+    root: &Dir,
+    tx: &TransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    let parent = match open_relative_parent(root, &tx.resource.path) {
+        Ok(parent) => Some(parent),
+        Err(error) if tx.removed_parent_directory && error_is_not_found(&error) => None,
+        Err(error) => return Err(error),
+    };
+    let Some(parent) = parent else {
+        return Ok(());
+    };
+    let current = read_optional_file(&parent, file_name(&tx.resource.path)?)?;
+    if let Some(bytes) = current {
+        if digest(&bytes) != decode_digest(&tx.resource.sha256)? {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "committed resource removal refuses unrelated active content",
+            ));
+        }
+        parent
+            .remove_file(file_name(&tx.resource.path)?)
+            .map_err(|error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "finish committed resource removal",
+                    error,
+                )
+            })?;
+        sync_dir(&parent)?;
+    }
+    if !tx.removed_parent_directory {
+        return Ok(());
+    }
+    drop(parent);
+    match root.remove_dir("devices") {
+        Ok(()) => sync_dir(root),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "remove empty device-chain directory",
+            error,
+        )),
+    }
+}
+
+fn rollback_removed_resource(
+    root: &Dir,
+    transaction: &Dir,
+    tx: &TransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    if tx.removed_parent_directory {
+        match root.create_dir("devices") {
+            Ok(()) => sync_dir(root)?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(caused(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "restore removed device-chain directory",
+                    error,
+                ));
+            }
+        }
+    }
+    let parent = open_relative_parent(root, &tx.resource.path)?;
+    let current = read_optional_file(&parent, file_name(&tx.resource.path)?)?;
+    let before = decode_digest(&tx.resource.sha256)?;
+    match current.as_deref().map(digest) {
+        Some(found) if found == before => Ok(()),
+        Some(_) => Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "resource-removal rollback refuses unrelated active content",
+        )),
+        None => publish_staged_file(
+            transaction,
+            RESOURCE_STAGING_NAME,
+            &parent,
+            &parent,
+            file_name(&tx.resource.path)?,
+            &format!(".resource-rollback-{}.json", tx.id),
+            "removed project resource",
+        ),
+    }
 }
 
 fn rollback_resource(
@@ -3245,6 +3710,7 @@ fn transaction_addition_directory(
         "arrangement" if addition_path_matches(tx, "arrangement") => Ok("arrangement"),
         "scene" if addition_path_matches(tx, "scenes") => Ok("scenes"),
         "automation-take" if addition_path_matches(tx, "takes") => Ok("takes"),
+        "device-chain" if addition_path_matches(tx, "devices") => Ok("devices"),
         _ => Err(failure(
             ProjectResourcePublicationErrorKind::Recovery,
             "resource addition transaction directory is invalid",
@@ -3352,6 +3818,34 @@ fn validate_transaction_descriptors(
     candidate_bytes: &[u8],
     tx: &TransactionRecord,
 ) -> Result<(), ProjectResourcePublicationError> {
+    if tx.operation == TransactionOperation::Removal {
+        let previous = manifest_resource(previous_manifest, &tx.resource_id)?;
+        if role_name(previous.role()) != tx.resource_role
+            || previous.path() != tx.resource.path
+            || previous.byte_length() != candidate_bytes.len() as u64
+            || previous.sha256() != hex_digest(digest(candidate_bytes))
+            || candidate_manifest
+                .resources()
+                .iter()
+                .any(|descriptor| descriptor.id() == tx.resource_id)
+            || previous_manifest.resources().len()
+                != candidate_manifest.resources().len().saturating_add(1)
+            || !candidate_manifest.resources().iter().eq(
+                previous_manifest
+                    .resources()
+                    .iter()
+                    .filter(|descriptor| descriptor.id() != tx.resource_id),
+            )
+            || previous_bytes.is_some()
+            || tx.previous_resource.is_some()
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "removed resource descriptor does not match the transaction",
+            ));
+        }
+        return Ok(());
+    }
     let candidate = manifest_resource(candidate_manifest, &tx.resource_id)?;
     if candidate.path() != tx.resource.path
         || candidate.byte_length() != candidate_bytes.len() as u64
@@ -3465,7 +3959,14 @@ fn read_transaction(
                 || decode_digest(&previous.sha256).is_err()
         })
         || tx.created_parent_directory && tx.previous_resource.is_some()
-        || tx.previous_resource.is_none() && !is_valid_addition_destination(&tx)
+        || tx.operation == TransactionOperation::Publication
+            && (tx.removed_parent_directory
+                || tx.previous_resource.is_none() && !is_valid_addition_destination(&tx))
+        || tx.operation == TransactionOperation::Removal
+            && (tx.previous_resource.is_some()
+                || tx.created_parent_directory
+                || tx.resource_role != "device-chain"
+                || !addition_path_matches(&tx, "devices"))
         || decode_digest(&tx.before_project_sha256).is_err()
         || decode_digest(&tx.after_project_sha256).is_err()
         || tx.before_project_revision.checked_add(1) != Some(tx.after_project_revision)
@@ -3483,6 +3984,8 @@ fn is_valid_addition_destination(tx: &TransactionRecord) -> bool {
         || matches!(tx.resource_role.as_str(), "scene") && addition_path_matches(tx, "scenes")
         || matches!(tx.resource_role.as_str(), "automation-take")
             && addition_path_matches(tx, "takes")
+        || matches!(tx.resource_role.as_str(), "device-chain")
+            && addition_path_matches(tx, "devices")
 }
 
 fn addition_path_matches(tx: &TransactionRecord, directory: &str) -> bool {
@@ -3667,6 +4170,12 @@ fn cleanup_publication_temporaries(
                 &parent,
                 &format!(".resource-rollback-{}.json", tx.id),
                 decode_digest(&previous.sha256)?,
+            )?;
+        } else if tx.operation == TransactionOperation::Removal {
+            remove_optional_matching_file(
+                &parent,
+                &format!(".resource-rollback-{}.json", tx.id),
+                decode_digest(&tx.resource.sha256)?,
             )?;
         }
     }
@@ -4301,6 +4810,8 @@ mod tests {
     const SECOND_SCENE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334472";
     const AUTOMATION_TAKE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334479";
     const AUTOMATION_LANE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334481";
+    const DEVICE_CHAIN_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334482";
+    const DEVICE_INSTANCE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334483";
 
     struct Fixture {
         root: PathBuf,
@@ -4802,6 +5313,202 @@ mod tests {
     impl Drop for AutomationTakeFixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    struct DeviceChainFixture {
+        parent: PathBuf,
+        root: PathBuf,
+        chain: Vec<u8>,
+    }
+
+    impl DeviceChainFixture {
+        fn new() -> Self {
+            let parent = std::env::temp_dir().join(format!(
+                "hyper-device-chain-publication-{}-{}",
+                std::process::id(),
+                NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&parent).unwrap();
+            let created = crate::create_project(
+                &parent,
+                crate::ProjectCreationRequest {
+                    directory_name: "Session",
+                    project_name: "Session",
+                },
+            )
+            .unwrap();
+            let root = created.project().root().to_path_buf();
+            let project_id = created.project().manifest().project_id();
+            let track_id = created
+                .project()
+                .manifest()
+                .resources()
+                .iter()
+                .find(|resource| resource.role() == ResourceRole::Track)
+                .unwrap()
+                .id();
+            let chain = serde_json_canonicalizer::to_vec(&json!({
+                "format": "hyper-device-chain",
+                "format_version": 1,
+                "id": DEVICE_CHAIN_ID,
+                "project_id": project_id,
+                "track_id": track_id,
+                "devices": [{
+                    "id": DEVICE_INSTANCE_ID,
+                    "device_id": "org.hyper-module.native-filter",
+                    "state_version": 1,
+                    "dsp_version": 1,
+                    "enabled": true,
+                    "state": {
+                        "mode": "low-pass",
+                        "cutoff_millihertz": 1_000_000,
+                        "resonance_millionths": 707_107
+                    },
+                    "extensions": {}
+                }],
+                "extensions": {}
+            }))
+            .unwrap();
+            Self {
+                parent,
+                root,
+                chain,
+            }
+        }
+
+        fn request(&self) -> DeviceChainPublicationRequest<'_> {
+            DeviceChainPublicationRequest {
+                expected_project_sha256: *verify_project_package(&self.root)
+                    .unwrap()
+                    .manifest_sha256(),
+                chain_id: DEVICE_CHAIN_ID,
+                chain_bytes: &self.chain,
+            }
+        }
+
+        fn removal_request(&self) -> DeviceChainRemovalRequest<'_> {
+            DeviceChainRemovalRequest {
+                expected_project_sha256: *verify_project_package(&self.root)
+                    .unwrap()
+                    .manifest_sha256(),
+                chain_id: DEVICE_CHAIN_ID,
+            }
+        }
+
+        fn removal_resource_request(&self) -> ProjectResourcePublicationRequest<'_> {
+            let request = self.removal_request();
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: request.expected_project_sha256,
+                resource_id: request.chain_id,
+                expected_role: ResourceRole::DeviceChain,
+                resource_bytes: &[],
+            }
+        }
+    }
+
+    impl Drop for DeviceChainFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    #[test]
+    fn publishes_a_new_device_chain_manifest_last() {
+        let fixture = DeviceChainFixture::new();
+        assert!(!fixture.root.join("devices").exists());
+
+        let published = publish_device_chain(&fixture.root, fixture.request()).unwrap();
+
+        assert!(published.changed());
+        assert_eq!(published.project_revision(), 2);
+        assert_eq!(published.resource_id(), DEVICE_CHAIN_ID);
+        assert_eq!(
+            published.resource_path(),
+            format!("devices/{DEVICE_CHAIN_ID}.json")
+        );
+        assert_eq!(
+            fs::read(fixture.root.join(published.resource_path())).unwrap(),
+            fixture.chain
+        );
+        let verified = verify_project_package(&fixture.root).unwrap();
+        let descriptor = verified
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == DEVICE_CHAIN_ID)
+            .unwrap();
+        assert_eq!(descriptor.role(), ResourceRole::DeviceChain);
+        assert!(
+            recover_project_resource_publications(&fixture.root)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn removes_the_last_device_chain_without_leaving_a_resource_directory() {
+        let fixture = DeviceChainFixture::new();
+        publish_device_chain(&fixture.root, fixture.request()).unwrap();
+
+        let removed = remove_device_chain(&fixture.root, fixture.removal_request()).unwrap();
+
+        assert!(removed.changed());
+        assert_eq!(removed.project_revision(), 3);
+        assert_eq!(removed.resource_id(), DEVICE_CHAIN_ID);
+        assert_eq!(removed.previous_resource(), Some(fixture.chain.as_slice()));
+        assert!(!fixture.root.join(removed.resource_path()).exists());
+        assert!(!fixture.root.join("devices").exists());
+        let verified = verify_project_package(&fixture.root).unwrap();
+        assert!(
+            verified
+                .manifest()
+                .resources()
+                .iter()
+                .all(|resource| resource.id() != DEVICE_CHAIN_ID)
+        );
+    }
+
+    #[test]
+    fn device_chain_removal_recovers_every_durable_phase() {
+        for crash_phase in [
+            PublicationPhase::Transaction,
+            PublicationPhase::Resource,
+            PublicationPhase::Manifest,
+        ] {
+            let fixture = DeviceChainFixture::new();
+            publish_device_chain(&fixture.root, fixture.request()).unwrap();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = publish_project_resource_observed(
+                    &fixture.root,
+                    fixture.removal_resource_request(),
+                    ProjectResourcePublicationMode::DeviceChainRemoval,
+                    |phase, _| {
+                        assert_ne!(phase, crash_phase, "simulated process crash");
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+
+            let recovered = recover_project_resource_publications(&fixture.root).unwrap();
+            assert_eq!(recovered.len(), 1);
+            let committed = crash_phase == PublicationPhase::Manifest;
+            assert_eq!(
+                recovered[0].disposition(),
+                if committed {
+                    ProjectResourcePublicationRecoveryDisposition::Committed
+                } else {
+                    ProjectResourcePublicationRecoveryDisposition::RolledBack
+                }
+            );
+            let verified = verify_project_package(&fixture.root).unwrap();
+            assert_eq!(verified.manifest().revision(), if committed { 3 } else { 2 });
+            assert_eq!(
+                fixture.root.join("devices").join(format!("{DEVICE_CHAIN_ID}.json")).exists(),
+                !committed
+            );
+            assert_eq!(fixture.root.join("devices").exists(), !committed);
         }
     }
 
