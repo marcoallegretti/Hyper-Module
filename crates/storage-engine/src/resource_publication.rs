@@ -16,9 +16,9 @@ mod audio_clip_publication;
 
 pub use audio_clip_publication::{
     AudioClipPublicationOutcome, AudioClipPublicationRecovery,
-    AudioClipPublicationRecoveryDisposition, AudioClipPublicationRequest,
-    ImportedAudioClipPublicationRequest, publish_audio_clip, publish_imported_audio_clip,
-    recover_audio_clip_publications,
+    AudioClipPublicationRecoveryDisposition, AudioClipPublicationRequest, AudioClipRemovalOutcome,
+    AudioClipRemovalRequest, ImportedAudioClipPublicationRequest, publish_audio_clip,
+    publish_imported_audio_clip, recover_audio_clip_publications, remove_audio_clip,
 };
 
 use super::project_lock::{

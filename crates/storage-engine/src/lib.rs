@@ -31,7 +31,8 @@ pub use recording_import::{
 };
 pub use resource_publication::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRecovery,
-    AudioClipPublicationRecoveryDisposition, AudioClipPublicationRequest,
+    AudioClipPublicationRecoveryDisposition, AudioClipPublicationRequest, AudioClipRemovalOutcome,
+    AudioClipRemovalRequest,
     AudioTrackPublicationOutcome, AudioTrackPublicationRecovery,
     AudioTrackPublicationRecoveryDisposition, AudioTrackPublicationRequest,
     AudioTrackRemovalOutcome, AudioTrackRemovalRequest, AutomationTakePublicationRequest,
@@ -41,7 +42,8 @@ pub use resource_publication::{
     ProjectResourcePublicationRequest, ScenePublicationRequest, publish_arrangement,
     publish_audio_clip, publish_audio_track, publish_automation_take, publish_imported_audio_clip,
     publish_project_resource, publish_scene, recover_audio_clip_publications,
-    recover_audio_track_publications, recover_project_resource_publications, remove_audio_track,
+    recover_audio_track_publications, recover_project_resource_publications, remove_audio_clip,
+    remove_audio_track,
 };
 
 use core::error::Error;

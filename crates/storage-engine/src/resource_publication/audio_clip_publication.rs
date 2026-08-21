@@ -50,6 +50,14 @@ pub struct ImportedAudioClipPublicationRequest<'a> {
     pub sample_bytes: &'a [u8],
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct AudioClipRemovalRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub clip_id: &'a str,
+    pub track_id: &'a str,
+    pub track_bytes: &'a [u8],
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioClipPublicationOutcome {
     project_identity: [u8; 32],
@@ -86,6 +94,36 @@ impl AudioClipPublicationOutcome {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioClipRemovalOutcome {
+    project_identity: [u8; 32],
+    project_revision: u64,
+    clip_id: String,
+    track_id: String,
+}
+
+impl AudioClipRemovalOutcome {
+    #[must_use]
+    pub const fn project_identity(&self) -> &[u8; 32] {
+        &self.project_identity
+    }
+
+    #[must_use]
+    pub const fn project_revision(&self) -> u64 {
+        self.project_revision
+    }
+
+    #[must_use]
+    pub fn clip_id(&self) -> &str {
+        &self.clip_id
+    }
+
+    #[must_use]
+    pub fn track_id(&self) -> &str {
+        &self.track_id
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioClipPublicationRecoveryDisposition {
     Committed,
@@ -110,6 +148,10 @@ impl AudioClipPublicationRecovery {
     }
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent directory effects are persisted as backward-compatible journal evidence"
+)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AudioClipTransactionRecord {
@@ -133,7 +175,32 @@ struct AudioClipTransactionRecord {
     created_sample_directory: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     created_asset_directory: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    removed_clip_directory: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "AudioClipTransactionOperation::is_publication"
+    )]
+    operation: AudioClipTransactionOperation,
     extensions: serde_json::Map<String, Value>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AudioClipTransactionOperation {
+    #[default]
+    Publication,
+    Removal,
+}
+
+impl AudioClipTransactionOperation {
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde skip_serializing_if requires a shared-reference predicate"
+    )]
+    const fn is_publication(&self) -> bool {
+        matches!(self, Self::Publication)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,6 +250,21 @@ pub fn publish_imported_audio_clip(
         Some(request.sample_bytes),
         |_, _| Ok(()),
     )
+}
+
+/// Removes one reusable audio clip and its owning-track reference through the
+/// audio-clip transaction family. The source asset is deliberately retained.
+///
+/// # Errors
+///
+/// Returns a classified validation, conflict, integrity, I/O, or recovery
+/// error. The request must remove exactly the named clip reference while
+/// preserving every unrelated owning-track field.
+pub fn remove_audio_clip(
+    project_path: impl AsRef<Path>,
+    request: AudioClipRemovalRequest<'_>,
+) -> Result<AudioClipRemovalOutcome, ProjectResourcePublicationError> {
+    remove_audio_clip_observed(project_path.as_ref(), request, |_, _| Ok(()))
 }
 
 /// Recovers every durable audio-clip publication in one project.
@@ -458,6 +540,257 @@ fn publish_audio_clip_observed(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the coordinator keeps lock, recovery, staging, and disposition ordering visible as one fail-closed operation"
+)]
+fn remove_audio_clip_observed(
+    project_path: &Path,
+    request: AudioClipRemovalRequest<'_>,
+    mut observer: impl FnMut(
+        AudioClipPublicationPhase,
+        &Path,
+    ) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<AudioClipRemovalOutcome, ProjectResourcePublicationError> {
+    validate_canonical_resource(request.track_bytes)?;
+    let verified = verify_project_package(project_path).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "project verification failed before audio-clip removal",
+            error,
+        )
+    })?;
+    if request.expected_project_sha256 != *verified.manifest_sha256() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "project changed after the audio-clip removal began",
+        ));
+    }
+    if !is_valid_entity_id(request.clip_id) || !is_valid_entity_id(request.track_id) {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "audio-clip and owning-track identities must be valid",
+        ));
+    }
+    let clip_descriptor = unique_resource(&verified, request.clip_id, ResourceRole::Clip)?;
+    let track_descriptor = unique_resource(&verified, request.track_id, ResourceRole::Track)?;
+    let clip = verified.read_resource(request.clip_id).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "read current audio-clip resource",
+            error,
+        )
+    })?;
+    let previous_track = verified.read_resource(request.track_id).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "read current audio-clip owning track",
+            error,
+        )
+    })?;
+    let asset_id = validate_audio_clip_removal_documents(
+        request,
+        verified.manifest().project_id(),
+        &clip,
+        &previous_track,
+    )?;
+
+    let backups = open_or_create_dir(&verified.root_dir, "backups")?;
+    let _lock = ProjectLock::acquire(&backups).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::TransactionUnavailable,
+            "acquire project storage transaction lock",
+            error,
+        )
+    })?;
+    reject_unhandled_audio_clip_transactions(&backups)?;
+    let recovered_resources =
+        recover_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
+    let recovered_tracks =
+        recover_audio_track_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
+    let recovered_clips =
+        recover_audio_clip_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
+    if !recovered_resources.is_empty()
+        || !recovered_tracks.is_empty()
+        || !recovered_clips.is_empty()
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "a prior project transaction was recovered; reopen the current project revision",
+        ));
+    }
+    verified.confirm_unchanged().map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "project changed before audio-clip removal",
+            error,
+        )
+    })?;
+    let active_project = read_bounded(&verified.root_dir, MANIFEST_NAME, MAX_JSON_BYTES)?;
+    if digest(&active_project) != request.expected_project_sha256 {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "active project identity changed before audio-clip removal staging",
+        ));
+    }
+    let active_track = read_bounded(
+        &open_relative_parent(&verified.root_dir, track_descriptor.path())?,
+        file_name(track_descriptor.path())?,
+        MAX_JSON_BYTES,
+    )?;
+    let active_clip = read_bounded(
+        &open_relative_parent(&verified.root_dir, clip_descriptor.path())?,
+        file_name(clip_descriptor.path())?,
+        MAX_JSON_BYTES,
+    )?;
+    if active_track != previous_track || active_clip != clip {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "audio-clip resources changed before removal staging",
+        ));
+    }
+    let next_revision = verified
+        .manifest()
+        .revision()
+        .checked_add(1)
+        .filter(|revision| *revision <= MAX_SAFE_INTEGER)
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::ResourceConflict,
+                "project revision cannot be incremented",
+            )
+        })?;
+    let candidate_project = candidate_audio_clip_removal_manifest(
+        &active_project,
+        request,
+        clip_descriptor.path(),
+        next_revision,
+    )?;
+    let removed_clip_directory = verified
+        .manifest()
+        .resources()
+        .iter()
+        .filter(|descriptor| descriptor.role() == ResourceRole::Clip)
+        .count()
+        == 1;
+    let transaction_name = format!("{AUDIO_CLIP_TRANSACTION_PREFIX}{}", Uuid::new_v4());
+    backups.create_dir(&transaction_name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "create audio-clip removal transaction",
+            error,
+        )
+    })?;
+    sync_dir(&backups)?;
+    let transaction = backups
+        .open_dir_nofollow(&transaction_name)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "open audio-clip removal transaction",
+                error,
+            )
+        })?;
+    let result = run_audio_clip_removal(
+        &verified,
+        &backups,
+        &transaction,
+        &transaction_name,
+        request,
+        track_descriptor.path(),
+        clip_descriptor.path(),
+        &asset_id,
+        &clip,
+        &previous_track,
+        removed_clip_directory,
+        &active_project,
+        &candidate_project,
+        next_revision,
+        &mut observer,
+    );
+    match result {
+        Ok(outcome) => {
+            clear_and_remove_audio_clip_transaction(&backups, transaction, &transaction_name)
+                .map_err(|error| ProjectResourcePublicationError {
+                    kind: ProjectResourcePublicationErrorKind::Recovery,
+                    message: "audio clip was removed but transaction cleanup is incomplete"
+                        .to_owned(),
+                    published: true,
+                    source: Some(Box::new(error)),
+                })?;
+            Ok(outcome)
+        }
+        Err(operation_error) => {
+            let tx = match read_audio_clip_transaction(&transaction, &transaction_name) {
+                Ok(tx) => tx,
+                Err(_) if missing_file(&transaction, TRANSACTION_NAME)? => {
+                    validate_audio_clip_prepublication_residue(&transaction, &transaction_name)?;
+                    clear_and_remove_audio_clip_transaction(
+                        &backups,
+                        transaction,
+                        &transaction_name,
+                    )?;
+                    return Err(operation_error);
+                }
+                Err(source) => {
+                    return Err(ProjectResourcePublicationError {
+                        kind: ProjectResourcePublicationErrorKind::Recovery,
+                        message: "audio-clip removal failed and its durable transaction could not be read".to_owned(),
+                        published: false,
+                        source: Some(Box::new(source)),
+                    });
+                }
+            };
+            match recover_audio_clip_transaction(
+                verified.root(),
+                &verified.root_dir,
+                &backups,
+                &transaction,
+                &tx,
+            ) {
+                Ok(AudioClipPublicationRecoveryDisposition::RolledBack) => {
+                    clear_and_remove_audio_clip_transaction(
+                        &backups,
+                        transaction,
+                        &transaction_name,
+                    )?;
+                    Err(operation_error)
+                }
+                Ok(AudioClipPublicationRecoveryDisposition::Committed) => {
+                    let outcome = audio_clip_removal_outcome(&tx)?;
+                    clear_and_remove_audio_clip_transaction(
+                        &backups,
+                        transaction,
+                        &transaction_name,
+                    )
+                    .map_err(|error| ProjectResourcePublicationError {
+                        kind: ProjectResourcePublicationErrorKind::Recovery,
+                        message: "audio clip was removed but transaction cleanup is incomplete"
+                            .to_owned(),
+                        published: true,
+                        source: Some(Box::new(error)),
+                    })?;
+                    Ok(outcome)
+                }
+                Err(recovery_error) => {
+                    let published = recovery_error.published();
+                    Err(ProjectResourcePublicationError {
+                        kind: ProjectResourcePublicationErrorKind::Recovery,
+                        message: if published {
+                            "audio clip was removed but verification or transaction recovery is incomplete"
+                        } else {
+                            "audio-clip removal and recovery both failed"
+                        }
+                        .to_owned(),
+                        published,
+                        source: Some(Box::new(recovery_error)),
+                    })
+                }
+            }
+        }
+    }
+}
+
 fn reject_unhandled_audio_clip_transactions(
     backups: &Dir,
 ) -> Result<(), ProjectResourcePublicationError> {
@@ -556,6 +889,8 @@ fn run_audio_clip_publication(
         created_clip_directory,
         created_sample_directory: sample_destination.created_sample_directory,
         created_asset_directory: sample_destination.created_asset_directory,
+        removed_clip_directory: false,
+        operation: AudioClipTransactionOperation::Publication,
         extensions: serde_json::Map::new(),
     };
     let transaction_bytes = serde_json_canonicalizer::to_vec(&tx).map_err(|error| {
@@ -663,6 +998,141 @@ fn run_audio_clip_publication(
         digest(candidate_project),
     )?;
     audio_clip_outcome(&tx)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the durable removal order and every crash observation point remain visible in one coordinator"
+)]
+fn run_audio_clip_removal(
+    verified: &StructurallyVerifiedProject,
+    backups: &Dir,
+    transaction: &Dir,
+    transaction_name: &str,
+    request: AudioClipRemovalRequest<'_>,
+    track_path: &str,
+    clip_path: &str,
+    asset_id: &str,
+    clip: &[u8],
+    previous_track: &[u8],
+    removed_clip_directory: bool,
+    previous_project: &[u8],
+    candidate_project: &[u8],
+    next_revision: u64,
+    observer: &mut impl FnMut(
+        AudioClipPublicationPhase,
+        &Path,
+    ) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<AudioClipRemovalOutcome, ProjectResourcePublicationError> {
+    write_audio_clip_intent(transaction, transaction_name)?;
+    write_exclusive_synced(transaction, CLIP_STAGING_NAME, clip)?;
+    write_exclusive_synced(transaction, TRACK_STAGING_NAME, request.track_bytes)?;
+    write_exclusive_synced(transaction, PREVIOUS_TRACK_NAME, previous_track)?;
+    write_exclusive_synced(transaction, PROJECT_STAGING_NAME, candidate_project)?;
+    write_exclusive_synced(transaction, PREVIOUS_PROJECT_NAME, previous_project)?;
+    let tx = AudioClipTransactionRecord {
+        format: "hyper-audio-clip-removal-transaction".to_owned(),
+        format_version: 4,
+        id: audio_clip_transaction_id(transaction_name)?,
+        before_project_sha256: hex_digest(*verified.manifest_sha256()),
+        after_project_sha256: hex_digest(digest(candidate_project)),
+        before_project_revision: verified.manifest().revision(),
+        after_project_revision: next_revision,
+        clip_id: request.clip_id.to_owned(),
+        track_id: request.track_id.to_owned(),
+        asset_id: asset_id.to_owned(),
+        clip: TransactionFile {
+            path: clip_path.to_owned(),
+            byte_length: clip.len() as u64,
+            sha256: hex_digest(digest(clip)),
+        },
+        track: TransactionFile {
+            path: track_path.to_owned(),
+            byte_length: request.track_bytes.len() as u64,
+            sha256: hex_digest(digest(request.track_bytes)),
+        },
+        previous_track: TransactionFile {
+            path: track_path.to_owned(),
+            byte_length: previous_track.len() as u64,
+            sha256: hex_digest(digest(previous_track)),
+        },
+        sample: None,
+        created_clip_directory: false,
+        created_sample_directory: false,
+        created_asset_directory: false,
+        removed_clip_directory,
+        operation: AudioClipTransactionOperation::Removal,
+        extensions: serde_json::Map::new(),
+    };
+    let transaction_bytes = serde_json_canonicalizer::to_vec(&tx).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "serialize audio-clip removal transaction",
+            error,
+        )
+    })?;
+    write_exclusive_synced(transaction, TRANSACTION_NAME, &transaction_bytes)?;
+    sync_dir(transaction)?;
+    sync_dir(backups)?;
+    observer(AudioClipPublicationPhase::Transaction, verified.root())?;
+
+    let track_parent = open_relative_parent(&verified.root_dir, track_path)?;
+    publish_staged_file(
+        transaction,
+        TRACK_STAGING_NAME,
+        &track_parent,
+        &track_parent,
+        file_name(track_path)?,
+        &format!(".audio-clip-track-{}.json", tx.id),
+        "audio-clip removal owning track",
+    )?;
+    observer(AudioClipPublicationPhase::Track, verified.root())?;
+
+    remove_existing_audio_clip(&verified.root_dir, &tx)?;
+    if removed_clip_directory {
+        verified.root_dir.remove_dir("clips").map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::ProjectChanged,
+                "remove empty audio-clip directory",
+                error,
+            )
+        })?;
+        sync_dir(&verified.root_dir)?;
+    }
+    observer(AudioClipPublicationPhase::Clip, verified.root())?;
+    let candidate =
+        verify_project_candidate(verified.root(), &verified.root_dir, candidate_project).map_err(
+            |error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "audio-clip removal candidate does not verify",
+                    error,
+                )
+            },
+        )?;
+    if candidate.revision() != next_revision {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "audio-clip removal candidate revision changed",
+        ));
+    }
+    publish_staged_file(
+        transaction,
+        PROJECT_STAGING_NAME,
+        backups,
+        &verified.root_dir,
+        MANIFEST_NAME,
+        &format!(".audio-clip-project-{}.json", tx.id),
+        "audio-clip removal project manifest",
+    )?;
+    observer(AudioClipPublicationPhase::Manifest, verified.root())?;
+    verify_committed(
+        verified.root(),
+        &verified.root_dir,
+        digest(candidate_project),
+    )?;
+    audio_clip_removal_outcome(&tx)
 }
 
 fn validate_audio_clip_request(
@@ -918,6 +1388,93 @@ fn validate_audio_clip_documents(
     Ok(())
 }
 
+fn validate_audio_clip_removal_documents(
+    request: AudioClipRemovalRequest<'_>,
+    project_id: &str,
+    clip_bytes: &[u8],
+    previous_track_bytes: &[u8],
+) -> Result<String, ProjectResourcePublicationError> {
+    validate_canonical_resource(clip_bytes)?;
+    let clip: Value = serde_json::from_slice(clip_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "parse current audio-clip resource",
+            error,
+        )
+    })?;
+    let previous: Value = serde_json::from_slice(previous_track_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "parse current audio-clip owning track",
+            error,
+        )
+    })?;
+    let candidate: Value = serde_json::from_slice(request.track_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse audio-clip removal owning track",
+            error,
+        )
+    })?;
+    let asset_id = clip["source"]["asset_id"].as_str().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "current audio clip has no source asset identity",
+        )
+    })?;
+    if clip["format"].as_str() != Some("hyper-audio-clip")
+        || clip["format_version"].as_u64() != Some(1)
+        || clip["id"].as_str() != Some(request.clip_id)
+        || clip["project_id"].as_str() != Some(project_id)
+        || clip["track_id"].as_str() != Some(request.track_id)
+        || !is_valid_entity_id(asset_id)
+        || previous["format"].as_str() != Some("hyper-track")
+        || previous["format_version"].as_u64() != Some(1)
+        || previous["id"].as_str() != Some(request.track_id)
+        || previous["project_id"].as_str() != Some(project_id)
+        || previous["kind"].as_str() != Some("audio")
+        || candidate["format"].as_str() != Some("hyper-track")
+        || candidate["id"].as_str() != Some(request.track_id)
+        || candidate["project_id"].as_str() != Some(project_id)
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "audio-clip removal resources do not match the active project",
+        ));
+    }
+    let previous_ids = previous["clip_ids"].as_array().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "current audio-track clip collection is invalid",
+        )
+    })?;
+    if previous_ids
+        .iter()
+        .filter(|value| value.as_str() == Some(request.clip_id))
+        .count()
+        != 1
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "current audio track must contain exactly one matching clip reference",
+        ));
+    }
+    let expected_ids = previous_ids
+        .iter()
+        .filter(|value| value.as_str() != Some(request.clip_id))
+        .cloned()
+        .collect();
+    let mut expected = previous;
+    expected["clip_ids"] = Value::Array(expected_ids);
+    if candidate != expected {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "audio-clip removal must preserve the owning track and remove one clip reference",
+        ));
+    }
+    Ok(asset_id.to_owned())
+}
+
 fn inspect_clip_destination(
     root: &Dir,
     resource_path: &str,
@@ -1037,6 +1594,71 @@ fn candidate_audio_clip_manifest(
         caused(
             ProjectResourcePublicationErrorKind::Integrity,
             "candidate audio-clip project manifest is invalid",
+            error,
+        )
+    })?;
+    Ok(bytes)
+}
+
+fn candidate_audio_clip_removal_manifest(
+    active: &[u8],
+    request: AudioClipRemovalRequest<'_>,
+    clip_path: &str,
+    revision: u64,
+) -> Result<Vec<u8>, ProjectResourcePublicationError> {
+    let mut value: Value = serde_json::from_slice(active).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "parse active project manifest",
+            error,
+        )
+    })?;
+    value["revision"] = revision.into();
+    let resources = value["resources"].as_array_mut().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "project resource declarations are invalid",
+        )
+    })?;
+    let track = resources
+        .iter_mut()
+        .find(|resource| resource["id"].as_str() == Some(request.track_id))
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "current audio-clip track descriptor disappeared",
+            )
+        })?;
+    track["byte_length"] = request.track_bytes.len().into();
+    track["sha256"] = hex_digest(digest(request.track_bytes)).into();
+    let before = resources.len();
+    resources.retain(|resource| {
+        resource["id"].as_str() != Some(request.clip_id)
+            && resource["path"].as_str() != Some(clip_path)
+    });
+    if resources.len().checked_add(1) != Some(before) {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "audio-clip removal manifest must remove exactly one descriptor",
+        ));
+    }
+    let bytes = serde_json_canonicalizer::to_vec(&value).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "serialize audio-clip removal project manifest",
+            error,
+        )
+    })?;
+    if bytes.len() > MAX_JSON_BYTES {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "candidate project manifest exceeds its size limit",
+        ));
+    }
+    ProjectManifest::parse(&bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "candidate audio-clip removal manifest is invalid",
             error,
         )
     })?;
@@ -1173,8 +1795,13 @@ fn recover_audio_clip_transaction(
         ));
     }
     rollback_audio_clip_track(root, transaction, tx)?;
-    remove_published_audio_clip(root, tx)?;
-    remove_published_imported_sample(root, tx)?;
+    if tx.operation == AudioClipTransactionOperation::Removal {
+        restore_removed_clip_directory(root, tx)?;
+        restore_removed_audio_clip(root, transaction, tx)?;
+    } else {
+        remove_published_audio_clip(root, tx)?;
+        remove_published_imported_sample(root, tx)?;
+    }
     cleanup_audio_clip_temporaries(root, backups, transaction, tx)?;
     remove_created_clip_directory(root, tx)?;
     remove_created_sample_directory(root, tx)?;
@@ -1254,6 +1881,95 @@ fn remove_published_audio_clip(
         )
     })?;
     sync_dir(&parent)
+}
+
+fn remove_existing_audio_clip(
+    root: &Dir,
+    tx: &AudioClipTransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    let parent = open_relative_parent(root, &tx.clip.path)?;
+    let name = file_name(&tx.clip.path)?;
+    let bytes = read_bounded(&parent, name, MAX_JSON_BYTES)?;
+    if bytes.len() as u64 != tx.clip.byte_length
+        || digest(&bytes) != decode_digest(&tx.clip.sha256)?
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "audio-clip resource changed before removal",
+        ));
+    }
+    parent.remove_file(name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "remove audio-clip resource",
+            error,
+        )
+    })?;
+    sync_dir(&parent)
+}
+
+fn restore_removed_audio_clip(
+    root: &Dir,
+    transaction: &Dir,
+    tx: &AudioClipTransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    let parent = open_relative_parent(root, &tx.clip.path)?;
+    let name = file_name(&tx.clip.path)?;
+    let current = read_optional_file(&parent, name)?;
+    let before = decode_digest(&tx.clip.sha256)?;
+    match current.as_deref().map(digest) {
+        Some(found) if found == before => return Ok(()),
+        Some(_) => {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "audio-clip removal rollback refuses unrelated clip content",
+            ));
+        }
+        None => {}
+    }
+    transaction
+        .hard_link(CLIP_STAGING_NAME, &parent, name)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "restore removed audio-clip resource",
+                error,
+            )
+        })?;
+    sync_dir(&parent)
+}
+
+fn restore_removed_clip_directory(
+    root: &Dir,
+    tx: &AudioClipTransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    if !tx.removed_clip_directory {
+        return Ok(());
+    }
+    match root.create_dir("clips") {
+        Ok(()) => sync_dir(root),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = root.symlink_metadata("clips").map_err(|source| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "inspect restored audio-clip directory",
+                    source,
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "audio-clip rollback directory is not a real directory",
+                ));
+            }
+            Ok(())
+        }
+        Err(error) => Err(caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "restore removed audio-clip directory",
+            error,
+        )),
+    }
 }
 
 fn remove_published_imported_sample(
@@ -1436,6 +2152,18 @@ fn validate_staged_audio_clip_transaction(
             "audio-clip transaction project revisions are inconsistent",
         ));
     }
+    if tx.operation == AudioClipTransactionOperation::Removal {
+        return validate_staged_audio_clip_removal(
+            tx,
+            &clip,
+            &track,
+            &previous_track,
+            &previous_project,
+            &candidate_project,
+            &previous_manifest,
+            &candidate_manifest,
+        );
+    }
     let previous_track_descriptor = manifest_resource(&previous_manifest, &tx.track_id)?;
     let candidate_track_descriptor = manifest_resource(&candidate_manifest, &tx.track_id)?;
     let candidate_clip_descriptor = manifest_resource(&candidate_manifest, &tx.clip_id)?;
@@ -1519,6 +2247,102 @@ fn validate_staged_audio_clip_transaction(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "recovery validates both staged manifests and all three staged resources as one graph"
+)]
+fn validate_staged_audio_clip_removal(
+    tx: &AudioClipTransactionRecord,
+    clip: &[u8],
+    track: &[u8],
+    previous_track: &[u8],
+    previous_project: &[u8],
+    candidate_project: &[u8],
+    previous_manifest: &ProjectManifest,
+    candidate_manifest: &ProjectManifest,
+) -> Result<(), ProjectResourcePublicationError> {
+    if tx.sample.is_some()
+        || tx.created_clip_directory
+        || tx.created_sample_directory
+        || tx.created_asset_directory
+        || tx.removed_clip_directory
+            != (previous_manifest
+                .resources()
+                .iter()
+                .filter(|descriptor| descriptor.role() == ResourceRole::Clip)
+                .count()
+                == 1)
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "audio-clip removal transaction contains publication state",
+        ));
+    }
+    let previous_track_descriptor = manifest_resource(previous_manifest, &tx.track_id)?;
+    let previous_clip_descriptor = manifest_resource(previous_manifest, &tx.clip_id)?;
+    let candidate_track_descriptor = manifest_resource(candidate_manifest, &tx.track_id)?;
+    if previous_track_descriptor.role() != ResourceRole::Track
+        || candidate_track_descriptor.role() != ResourceRole::Track
+        || previous_clip_descriptor.role() != ResourceRole::Clip
+        || previous_track_descriptor.path() != tx.previous_track.path
+        || previous_track_descriptor.byte_length() != previous_track.len() as u64
+        || previous_track_descriptor.sha256() != hex_digest(digest(previous_track))
+        || candidate_track_descriptor.path() != tx.track.path
+        || candidate_track_descriptor.byte_length() != track.len() as u64
+        || candidate_track_descriptor.sha256() != hex_digest(digest(track))
+        || previous_clip_descriptor.path() != tx.clip.path
+        || previous_clip_descriptor.byte_length() != clip.len() as u64
+        || previous_clip_descriptor.sha256() != hex_digest(digest(clip))
+        || candidate_manifest
+            .resources()
+            .iter()
+            .any(|descriptor| descriptor.id() == tx.clip_id || descriptor.path() == tx.clip.path)
+        || previous_manifest
+            .assets()
+            .iter()
+            .filter(|descriptor| descriptor.id() == tx.asset_id)
+            .count()
+            != 1
+        || candidate_manifest.assets() != previous_manifest.assets()
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "audio-clip removal descriptors do not match the transaction",
+        ));
+    }
+    let request = AudioClipRemovalRequest {
+        expected_project_sha256: digest(previous_project),
+        clip_id: &tx.clip_id,
+        track_id: &tx.track_id,
+        track_bytes: track,
+    };
+    let asset_id = validate_audio_clip_removal_documents(
+        request,
+        previous_manifest.project_id(),
+        clip,
+        previous_track,
+    )?;
+    if asset_id != tx.asset_id {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "audio-clip removal source asset identity changed",
+        ));
+    }
+    let expected = candidate_audio_clip_removal_manifest(
+        previous_project,
+        request,
+        &tx.clip.path,
+        tx.after_project_revision,
+    )?;
+    if expected != candidate_project {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "audio-clip removal candidate manifest contains unrelated changes",
+        ));
+    }
+    Ok(())
+}
+
 fn read_audio_clip_transaction(
     transaction: &Dir,
     directory_name: &str,
@@ -1546,8 +2370,18 @@ fn read_audio_clip_transaction(
         || intent.format_version != 1
         || !intent.extensions.is_empty()
         || intent.id != expected_id
-        || tx.format != "hyper-audio-clip-publication-transaction"
-        || !matches!(tx.format_version, 1..=3)
+        || !matches!(
+            (tx.operation, tx.format.as_str(), tx.format_version),
+            (
+                AudioClipTransactionOperation::Publication,
+                "hyper-audio-clip-publication-transaction",
+                1..=3
+            ) | (
+                AudioClipTransactionOperation::Removal,
+                "hyper-audio-clip-removal-transaction",
+                4
+            )
+        )
         || (tx.format_version == 1
             && (tx.sample.is_some()
                 || tx.created_sample_directory
@@ -1556,6 +2390,13 @@ fn read_audio_clip_transaction(
         || (tx.format_version == 3
             && (tx.sample.is_none()
                 || (tx.created_asset_directory && !tx.created_sample_directory)))
+        || (tx.operation == AudioClipTransactionOperation::Removal
+            && (tx.sample.is_some()
+                || tx.created_clip_directory
+                || tx.created_sample_directory
+                || tx.created_asset_directory))
+        || (tx.operation == AudioClipTransactionOperation::Publication
+            && tx.removed_clip_directory)
         || !tx.extensions.is_empty()
         || tx.id != expected_id
         || !is_valid_entity_id(&tx.clip_id)
@@ -1651,11 +2492,34 @@ fn validate_audio_clip_prepublication_residue(
 fn audio_clip_outcome(
     tx: &AudioClipTransactionRecord,
 ) -> Result<AudioClipPublicationOutcome, ProjectResourcePublicationError> {
+    if tx.operation != AudioClipTransactionOperation::Publication {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "audio-clip transaction is not a publication",
+        ));
+    }
     Ok(AudioClipPublicationOutcome {
         project_identity: decode_digest(&tx.after_project_sha256)?,
         project_revision: tx.after_project_revision,
         clip_id: tx.clip_id.clone(),
         clip_path: tx.clip.path.clone(),
+        track_id: tx.track_id.clone(),
+    })
+}
+
+fn audio_clip_removal_outcome(
+    tx: &AudioClipTransactionRecord,
+) -> Result<AudioClipRemovalOutcome, ProjectResourcePublicationError> {
+    if tx.operation != AudioClipTransactionOperation::Removal {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "audio-clip transaction is not a removal",
+        ));
+    }
+    Ok(AudioClipRemovalOutcome {
+        project_identity: decode_digest(&tx.after_project_sha256)?,
+        project_revision: tx.after_project_revision,
+        clip_id: tx.clip_id.clone(),
         track_id: tx.track_id.clone(),
     })
 }
@@ -1960,6 +2824,21 @@ mod tests {
             }
         }
 
+        fn removal_request(&self) -> AudioClipRemovalRequest<'_> {
+            AudioClipRemovalRequest {
+                expected_project_sha256: *verify_project_package(&self.root)
+                    .unwrap()
+                    .manifest_sha256(),
+                clip_id: CLIP_ID,
+                track_id: TRACK_ID,
+                track_bytes: &self.original_track,
+            }
+        }
+
+        fn publish_clip(&self) {
+            publish_audio_clip(&self.root, self.request()).unwrap();
+        }
+
         fn transaction_names(&self) -> Vec<String> {
             let mut names: Vec<_> = fs::read_dir(self.root.join("backups"))
                 .unwrap()
@@ -2018,6 +2897,156 @@ mod tests {
             1
         );
         assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
+    fn removes_clip_and_owning_track_reference_but_retains_asset() {
+        let fixture = Fixture::new();
+        fixture.publish_clip();
+        let asset_path = fixture
+            .root
+            .join(format!("assets/recordings/{ASSET_ID}.wav"));
+        let asset_before = fs::read(&asset_path).unwrap();
+
+        let outcome = remove_audio_clip(&fixture.root, fixture.removal_request()).unwrap();
+
+        assert_eq!(outcome.project_revision(), 3);
+        assert_eq!(outcome.clip_id(), CLIP_ID);
+        assert_eq!(outcome.track_id(), TRACK_ID);
+        assert!(!fixture.root.join(format!("clips/{CLIP_ID}.json")).exists());
+        assert_eq!(
+            fs::read(fixture.root.join(format!("tracks/{TRACK_ID}.json"))).unwrap(),
+            fixture.original_track
+        );
+        assert_eq!(fs::read(asset_path).unwrap(), asset_before);
+        let verified = verify_project_package(&fixture.root).unwrap();
+        assert_eq!(verified.manifest().revision(), 3);
+        assert!(
+            verified
+                .manifest()
+                .resources()
+                .iter()
+                .all(|descriptor| descriptor.id() != CLIP_ID)
+        );
+        assert!(verified.manifest().assets().iter().any(|asset| asset.id() == ASSET_ID));
+        assert!(fixture.transaction_names().is_empty());
+    }
+
+    #[test]
+    fn audio_clip_removal_rejects_stale_identity_and_non_exact_track_delta() {
+        let fixture = Fixture::new();
+        fixture.publish_clip();
+        let mut stale = fixture.removal_request();
+        stale.expected_project_sha256 = [0; 32];
+        assert_eq!(
+            remove_audio_clip(&fixture.root, stale).unwrap_err().kind(),
+            ProjectResourcePublicationErrorKind::ProjectChanged
+        );
+
+        let mut changed: Value = serde_json::from_slice(&fixture.original_track).unwrap();
+        changed["name"] = "Changed too".into();
+        let changed = serde_json_canonicalizer::to_vec(&changed).unwrap();
+        let mut request = fixture.removal_request();
+        request.track_bytes = &changed;
+        assert_eq!(
+            remove_audio_clip(&fixture.root, request).unwrap_err().kind(),
+            ProjectResourcePublicationErrorKind::InvalidResource
+        );
+        assert_eq!(
+            fs::read(fixture.root.join(format!("clips/{CLIP_ID}.json"))).unwrap(),
+            fixture.clip
+        );
+        assert_eq!(
+            fs::read(fixture.root.join(format!("tracks/{TRACK_ID}.json"))).unwrap(),
+            fixture.track
+        );
+    }
+
+    #[test]
+    fn audio_clip_removal_crashes_before_manifest_restore_clip_and_track() {
+        for crash_phase in [
+            AudioClipPublicationPhase::Transaction,
+            AudioClipPublicationPhase::Track,
+            AudioClipPublicationPhase::Clip,
+        ] {
+            let fixture = Fixture::new();
+            fixture.publish_clip();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = remove_audio_clip_observed(
+                    &fixture.root,
+                    fixture.removal_request(),
+                    |phase, _| {
+                        assert_ne!(phase, crash_phase, "simulated process crash");
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+
+            let recovered = recover_audio_clip_publications(&fixture.root).unwrap();
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(
+                recovered[0].disposition(),
+                AudioClipPublicationRecoveryDisposition::RolledBack
+            );
+            assert_eq!(
+                fs::read(fixture.root.join(format!("clips/{CLIP_ID}.json"))).unwrap(),
+                fixture.clip
+            );
+            assert_eq!(
+                fs::read(fixture.root.join(format!("tracks/{TRACK_ID}.json"))).unwrap(),
+                fixture.track
+            );
+            assert_eq!(
+                verify_project_package(&fixture.root)
+                    .unwrap()
+                    .manifest()
+                    .revision(),
+                2
+            );
+            assert!(fixture.transaction_names().is_empty());
+        }
+    }
+
+    #[test]
+    fn audio_clip_removal_crash_after_manifest_recovers_as_committed() {
+        let fixture = Fixture::new();
+        fixture.publish_clip();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = remove_audio_clip_observed(
+                &fixture.root,
+                fixture.removal_request(),
+                |phase, _| {
+                    assert_ne!(
+                        phase,
+                        AudioClipPublicationPhase::Manifest,
+                        "simulated process crash"
+                    );
+                    Ok(())
+                },
+            );
+        }));
+        assert!(result.is_err());
+
+        let recovered = recover_audio_clip_publications(&fixture.root).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].disposition(),
+            AudioClipPublicationRecoveryDisposition::Committed
+        );
+        assert!(!fixture.root.join(format!("clips/{CLIP_ID}.json")).exists());
+        assert_eq!(
+            fs::read(fixture.root.join(format!("tracks/{TRACK_ID}.json"))).unwrap(),
+            fixture.original_track
+        );
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            3
+        );
+        assert!(fixture.transaction_names().is_empty());
     }
 
     #[test]
