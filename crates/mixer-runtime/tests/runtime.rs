@@ -18,7 +18,7 @@ use hyper_mixer_runtime::{
     StereoSamplePeakBallistics, TransportCommand, TransportCommandSendError, TransportCycle,
     TransportLoopRange, TransportLoopRangeError, TransportOutputCreationError,
     TransportOutputProcessor, TransportState,
-    loudness_command_channel, output_meter_channel,
+    loudness_command_channel, output_meter_channel, playback_recovery_channel,
 };
 use hyper_native_device::{
     DeviceChain, NativeDeviceInstance, NativeFilterMode, NativeFilterState,
@@ -1152,6 +1152,17 @@ fn combined_transport_renders_each_track_authority_and_reconstructs_scene_state_
     assert_samples(&output_right, &fixture.scene_samples[..50]);
 }
 
+fn assert_scene_observation(
+    observation: hyper_mixer_runtime::PlaybackCycleObservation,
+    queued: Option<usize>,
+    queued_frame: Option<usize>,
+    last_launched: Option<usize>,
+) {
+    assert_eq!(observation.queued_scene_index(), queued);
+    assert_eq!(observation.queued_scene_launch_frame(), queued_frame);
+    assert_eq!(observation.last_launched_scene_index(), last_launched);
+}
+
 #[test]
 fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() {
     let fixture = playback_fixture();
@@ -1161,6 +1172,7 @@ fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() 
         PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 50)
             .unwrap();
     let (mut sender, mut transport) = PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+    let (mut recovery_publisher, recovery) = playback_recovery_channel(None, None);
     assert_eq!(sender.scene_count(), 2);
     assert_eq!(
         sender.scene_availability(0),
@@ -1207,6 +1219,8 @@ fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() 
         queued.scene_launch_state().last_launched_scene_index(),
         None
     );
+    recovery_publisher.publish_cycle(queued, None);
+    assert_scene_observation(recovery.observe_cycle(), Some(0), Some(100), None);
     assert_samples(&output_left, &[0.0; 50]);
     assert_samples(&output_right, &[0.0; 50]);
 
@@ -1226,6 +1240,8 @@ fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() 
         launched.scene_launch_state().last_launched_scene_index(),
         Some(0)
     );
+    recovery_publisher.publish_cycle(launched, None);
+    assert_scene_observation(recovery.observe_cycle(), None, None, Some(0));
     assert_samples(&output_left, &[0.0; 50]);
     assert_samples(&output_right, &fixture.scene_samples[..50]);
 

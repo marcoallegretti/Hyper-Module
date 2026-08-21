@@ -59,6 +59,53 @@ impl PlaybackRecoverySnapshot {
     }
 }
 
+/// Coherent state from the last audio cycle accepted by the output owner.
+///
+/// Interactive scene feedback is observation-only. Reopening playback restores
+/// transport and mixer recovery authority but deliberately clears interactive
+/// scene state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaybackCycleObservation {
+    state: PlaybackRecoveryTransportState,
+    position_frame: usize,
+    committed_cycle_count: u64,
+    queued_scene_index: Option<usize>,
+    queued_scene_launch_frame: Option<usize>,
+    last_launched_scene_index: Option<usize>,
+}
+
+impl PlaybackCycleObservation {
+    #[must_use]
+    pub const fn state(self) -> PlaybackRecoveryTransportState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn position_frame(self) -> usize {
+        self.position_frame
+    }
+
+    #[must_use]
+    pub const fn committed_cycle_count(self) -> u64 {
+        self.committed_cycle_count
+    }
+
+    #[must_use]
+    pub const fn queued_scene_index(self) -> Option<usize> {
+        self.queued_scene_index
+    }
+
+    #[must_use]
+    pub const fn queued_scene_launch_frame(self) -> Option<usize> {
+        self.queued_scene_launch_frame
+    }
+
+    #[must_use]
+    pub const fn last_launched_scene_index(self) -> Option<usize> {
+        self.last_launched_scene_index
+    }
+}
+
 #[derive(Debug, Default)]
 struct AtomicChannelParameters {
     gain: AtomicU32,
@@ -218,11 +265,69 @@ impl AtomicMixerParameterState {
     }
 }
 
+const NO_SCENE_INDEX: u8 = u8::MAX;
+
+#[derive(Debug)]
+struct AtomicSceneLaunchObservation {
+    queued_scene_index: AtomicU8,
+    queued_launch_frame: AtomicUsize,
+    last_launched_scene_index: AtomicU8,
+}
+
+impl AtomicSceneLaunchObservation {
+    fn store(
+        &self,
+        queued_scene_index: Option<usize>,
+        queued_launch_frame: Option<usize>,
+        last_launched_scene_index: Option<usize>,
+    ) {
+        self.queued_scene_index.store(
+            queued_scene_index.map_or(NO_SCENE_INDEX, |index| {
+                u8::try_from(index).expect("a compiled scene index fits in u8")
+            }),
+            Ordering::Relaxed,
+        );
+        self.queued_launch_frame
+            .store(queued_launch_frame.unwrap_or(0), Ordering::Relaxed);
+        self.last_launched_scene_index.store(
+            last_launched_scene_index.map_or(NO_SCENE_INDEX, |index| {
+                u8::try_from(index).expect("a compiled scene index fits in u8")
+            }),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn load(&self) -> (Option<usize>, Option<usize>, Option<usize>) {
+        let queued_scene_index =
+            decode_scene_index(self.queued_scene_index.load(Ordering::Relaxed));
+        let queued_launch_frame =
+            queued_scene_index.map(|_| self.queued_launch_frame.load(Ordering::Relaxed));
+        let last_launched_scene_index =
+            decode_scene_index(self.last_launched_scene_index.load(Ordering::Relaxed));
+        (
+            queued_scene_index,
+            queued_launch_frame,
+            last_launched_scene_index,
+        )
+    }
+}
+
+impl Default for AtomicSceneLaunchObservation {
+    fn default() -> Self {
+        Self {
+            queued_scene_index: AtomicU8::new(NO_SCENE_INDEX),
+            queued_launch_frame: AtomicUsize::new(0),
+            last_launched_scene_index: AtomicU8::new(NO_SCENE_INDEX),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct PlaybackRecoveryState {
     sequence: AtomicU64,
     position_frame: AtomicUsize,
     transport_state: AtomicU8,
+    scene_launch: AtomicSceneLaunchObservation,
     mixer_parameters: AtomicMixerParameterState,
 }
 
@@ -271,6 +376,36 @@ impl PlaybackRecoveryCheckpoint {
             spin_loop();
         }
     }
+
+    /// Returns one coherent accepted-cycle observation including transient
+    /// interactive scene feedback.
+    #[must_use]
+    pub fn observe_cycle(&self) -> PlaybackCycleObservation {
+        loop {
+            let before = self.inner.sequence.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                spin_loop();
+                continue;
+            }
+            let position_frame = self.inner.position_frame.load(Ordering::Relaxed);
+            let state = decode_state(self.inner.transport_state.load(Ordering::Relaxed));
+            let (queued_scene_index, queued_scene_launch_frame, last_launched_scene_index) =
+                self.inner.scene_launch.load();
+            fence(Ordering::Acquire);
+            let after = self.inner.sequence.load(Ordering::Relaxed);
+            if before == after {
+                return PlaybackCycleObservation {
+                    state,
+                    position_frame,
+                    committed_cycle_count: after / 2,
+                    queued_scene_index,
+                    queued_scene_launch_frame,
+                    last_launched_scene_index,
+                };
+            }
+            spin_loop();
+        }
+    }
 }
 
 /// Sole publisher for recovery cycles accepted by the native audio output.
@@ -297,21 +432,45 @@ impl PlaybackRecoveryPublisher {
         cycle: TransportCycle,
         mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
     ) {
-        self.publish(
+        let scene = cycle.scene_launch_state();
+        self.publish_observation(
             match cycle.state() {
                 TransportState::Stopped => PlaybackRecoveryTransportState::Stopped,
                 TransportState::Rolling => PlaybackRecoveryTransportState::Rolling,
             },
             cycle.position_frame(),
             mixer_parameter_state,
+            scene.queued_scene_index(),
+            scene.queued_launch_frame(),
+            scene.last_launched_scene_index(),
         );
     }
 
+    #[cfg(test)]
     fn publish(
         &mut self,
         state: PlaybackRecoveryTransportState,
         position_frame: usize,
         mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
+    ) {
+        self.publish_observation(
+            state,
+            position_frame,
+            mixer_parameter_state,
+            None,
+            None,
+            None,
+        );
+    }
+
+    fn publish_observation(
+        &mut self,
+        state: PlaybackRecoveryTransportState,
+        position_frame: usize,
+        mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
+        queued_scene_index: Option<usize>,
+        queued_scene_launch_frame: Option<usize>,
+        last_launched_scene_index: Option<usize>,
     ) {
         let odd = self.inner.sequence.fetch_add(1, Ordering::Acquire) | 1;
         fence(Ordering::Release);
@@ -321,6 +480,11 @@ impl PlaybackRecoveryPublisher {
         self.inner
             .transport_state
             .store(state as u8, Ordering::Relaxed);
+        self.inner.scene_launch.store(
+            queued_scene_index,
+            queued_scene_launch_frame,
+            last_launched_scene_index,
+        );
         if let Some(mixer_parameter_state) = mixer_parameter_state {
             self.inner.mixer_parameters.store(mixer_parameter_state);
         }
@@ -356,6 +520,7 @@ pub fn playback_recovery_channel(
                 snapshot.state as u8
             }),
         ),
+        scene_launch: AtomicSceneLaunchObservation::default(),
         mixer_parameters,
     });
     (
@@ -412,6 +577,10 @@ fn decode_state(value: u8) -> PlaybackRecoveryTransportState {
     }
 }
 
+fn decode_scene_index(value: u8) -> Option<usize> {
+    (value != NO_SCENE_INDEX).then_some(usize::from(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +634,17 @@ mod tests {
                 position_frame: 0,
                 committed_cycle_count: 0,
                 mixer_parameter_state: None,
+            }
+        );
+        assert_eq!(
+            PlaybackRecoveryCheckpoint::default().observe_cycle(),
+            PlaybackCycleObservation {
+                state: PlaybackRecoveryTransportState::Stopped,
+                position_frame: 0,
+                committed_cycle_count: 0,
+                queued_scene_index: None,
+                queued_scene_launch_frame: None,
+                last_launched_scene_index: None,
             }
         );
     }
@@ -540,12 +720,34 @@ mod tests {
                     u8::from(generation.is_multiple_of(2)),
                     generation.is_multiple_of(2),
                 );
-                publisher.publish(state, generation, Some(&mixer));
+                publisher.publish_observation(
+                    state,
+                    generation,
+                    Some(&mixer),
+                    Some(generation % 8),
+                    Some(generation * 2),
+                    Some((generation + 7) % 8),
+                );
             }
         });
 
         barrier.wait();
         while checkpoint.snapshot().committed_cycle_count() < PUBLICATIONS as u64 {
+            let observation = checkpoint.observe_cycle();
+            if observation.committed_cycle_count() > 0 {
+                assert_eq!(
+                    observation.queued_scene_index(),
+                    Some(observation.position_frame() % 8)
+                );
+                assert_eq!(
+                    observation.queued_scene_launch_frame(),
+                    Some(observation.position_frame() * 2)
+                );
+                assert_eq!(
+                    observation.last_launched_scene_index(),
+                    Some((observation.position_frame() + 7) % 8)
+                );
+            }
             let snapshot = checkpoint.snapshot();
             let expected = if snapshot.position_frame().is_multiple_of(2) {
                 PlaybackRecoveryTransportState::Stopped
