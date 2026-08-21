@@ -367,11 +367,12 @@ where
     O: RuntimeOutputObservation,
 {
     let mut owner_turn = |host: &mut H| {
-        if let Some(commands) = commands {
-            drain_operator_commands(host, commands, stop, diagnostic);
-        }
         if output_status.output_state() == OutputStreamState::Failed {
             stop.store(true, Ordering::Release);
+            return;
+        }
+        if let Some(commands) = commands {
+            drain_operator_commands(host, commands, stop, diagnostic);
         }
     };
 
@@ -684,7 +685,14 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_scene_launch(&ui, &commands_tx, &diagnostic, &scenes);
     wire_operator_loop_toggle(&ui, &commands_tx, &diagnostic, &loop_authority);
 
-    apply_operator_cycle_observation(&ui, &observers, &diagnostic, &loop_authority, &scene_model);
+    apply_operator_cycle_observation(
+        &ui,
+        &observers,
+        &diagnostic,
+        &loop_authority,
+        &scene_model,
+        false,
+    );
     apply_operator_meter_observation(&ui, &mut meter_observer.borrow_mut());
 
     let weak = ui.as_weak();
@@ -704,6 +712,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &timer_diagnostic,
                 &timer_loop_authority,
                 &timer_scene_model,
+                completion_observed,
             );
             apply_operator_meter_observation(&ui, &mut timer_meter_observer.borrow_mut());
             if !completion_observed
@@ -728,7 +737,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 )
             {
                 completion_observed = true;
-                timer_loop_authority.set(None);
+                revoke_operator_loop_authority(&ui, &timer_loop_authority);
                 if let Err(error) = close_result {
                     set_first_error(&timer_close_error, error);
                 }
@@ -1112,10 +1121,27 @@ fn apply_operator_cycle_observation(
     diagnostic: &Mutex<String>,
     loop_authority: &Cell<Option<OperatorLoopAuthority>>,
     scene_model: &VecModel<OperatorSceneRow>,
+    terminal_latched: bool,
 ) {
+    if terminal_latched {
+        return;
+    }
     let observation = apply_observations(ui, observers, diagnostic);
+    if observers.output_status.state() == OutputStreamState::Failed {
+        revoke_operator_loop_authority(ui, loop_authority);
+        return;
+    }
     apply_operator_loop_observation(ui, loop_authority, observation);
     apply_operator_scene_observation(ui, scene_model, observation);
+}
+
+fn revoke_operator_loop_authority(
+    ui: &OperatorWindow,
+    authority: &Cell<Option<OperatorLoopAuthority>>,
+) {
+    authority.set(None);
+    ui.set_loop_toggle_label("Runtime stopped".into());
+    ui.set_loop_toggle_enabled(false);
 }
 
 fn apply_static_facts(ui: &OperatorWindow, facts: &RuntimeFacts) {
@@ -1696,13 +1722,17 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut owner = OperatorControl::default();
         let diagnostics = RefCell::new(Vec::new());
+        let (commands, command_receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        commands
+            .send(OperatorCommand::SetLoopEnabled { enabled: true })
+            .unwrap();
 
         let error = host_runtime(
             &arguments,
             &mut owner,
             &OutputObservation(OutputStreamState::Failed),
             &stop,
-            None,
+            Some(&command_receiver),
             &|message| diagnostics.borrow_mut().push(message),
         )
         .unwrap_err();
@@ -1712,6 +1742,10 @@ mod tests {
         assert_eq!(
             owner.disconnects, 0,
             "there was no panel service to release"
+        );
+        assert!(
+            owner.commands.is_empty(),
+            "terminal output is observed before queued controls are forwarded"
         );
     }
 
@@ -2147,13 +2181,44 @@ mod tests {
             loop_command_receiver.try_recv(),
             Ok(OperatorCommand::SetLoopEnabled { enabled: false })
         );
-        loop_authority.set(None);
+
+        let accepted_authority = loop_authority.get();
+        let accepted_state = ui.get_loop_state();
+        let accepted_range = ui.get_loop_range();
+        let accepted_label = ui.get_loop_toggle_label();
+        let (saturated_sender, saturated_receiver) = std::sync::mpsc::sync_channel(1);
+        saturated_sender.send(OperatorCommand::Start).unwrap();
+        let saturated_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_loop_toggle(
+            ui,
+            &saturated_sender,
+            &saturated_diagnostic,
+            &loop_authority,
+        );
         ui.invoke_toggle_loop_requested();
-        assert_eq!(loop_command_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(saturated_receiver.try_recv(), Ok(OperatorCommand::Start));
+        assert_eq!(saturated_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(loop_authority.get(), accepted_authority);
+        assert_eq!(ui.get_loop_state(), accepted_state);
+        assert_eq!(ui.get_loop_range(), accepted_range);
+        assert_eq!(ui.get_loop_toggle_label(), accepted_label);
+        assert!(ui.get_loop_toggle_enabled());
+        assert!(
+            saturated_diagnostic
+                .lock()
+                .unwrap()
+                .contains("operator command refused")
+        );
+
+        revoke_operator_loop_authority(ui, &loop_authority);
+        ui.invoke_toggle_loop_requested();
+        assert_eq!(saturated_receiver.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(
-            loop_diagnostic.lock().unwrap().as_str(),
+            saturated_diagnostic.lock().unwrap().as_str(),
             "project loop toggle refused: accepted state is unavailable"
         );
+        assert_eq!(ui.get_loop_toggle_label().as_str(), "Runtime stopped");
+        assert!(!ui.get_loop_toggle_enabled());
         let launched_row = ui.get_scenes().row_data(0).unwrap();
         assert!(!launched_row.queued);
         assert!(launched_row.last_launched);
@@ -2351,6 +2416,53 @@ mod tests {
         assert_eq!(ui.get_loop_toggle_label().as_str(), "Loop unavailable");
         assert!(!ui.get_loop_toggle_enabled());
         assert_generated_operator_meter_contract(&ui);
+
+        let terminal_range = TransportLoopRange::new(120, 360).unwrap();
+        let (_publisher, terminal_recovery) =
+            hyper_mixer_runtime::playback_recovery_channel_with_initial_loop(
+                None,
+                None,
+                Some(terminal_range),
+                true,
+            );
+        let terminal_observers = RuntimeObservers {
+            facts: facts.clone(),
+            output_status: OutputStreamStatus::default(),
+            output_counters: OutputStreamCounters::default(),
+            recovery: terminal_recovery,
+            panel_connected: Arc::new(AtomicBool::new(false)),
+        };
+        let terminal_scenes = Rc::new(VecModel::from(Vec::<OperatorSceneRow>::new()));
+        wire_operator_loop_toggle(&ui, &sender, &diagnostic, &loop_authority);
+        apply_operator_cycle_observation(
+            &ui,
+            &terminal_observers,
+            &diagnostic,
+            &loop_authority,
+            &terminal_scenes,
+            false,
+        );
+        assert_eq!(
+            loop_authority.get(),
+            Some(OperatorLoopAuthority {
+                range: Some(terminal_range),
+                enabled: true,
+            })
+        );
+        revoke_operator_loop_authority(&ui, &loop_authority);
+        apply_operator_cycle_observation(
+            &ui,
+            &terminal_observers,
+            &diagnostic,
+            &loop_authority,
+            &terminal_scenes,
+            true,
+        );
+        assert_eq!(loop_authority.get(), None);
+        assert_eq!(ui.get_loop_toggle_label().as_str(), "Runtime stopped");
+        assert!(!ui.get_loop_toggle_enabled());
+        ui.invoke_toggle_loop_requested();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
 
         ui.invoke_start_requested();
         ui.invoke_stop_requested();

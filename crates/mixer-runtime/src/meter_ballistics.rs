@@ -366,6 +366,7 @@ mod tests {
             cycle: TransportCycle {
                 state: TransportState::Rolling,
                 start_frame: 0,
+                position_frame: frame_count,
                 frame_count,
                 loop_wrap_count: 0,
                 loop_range: None,

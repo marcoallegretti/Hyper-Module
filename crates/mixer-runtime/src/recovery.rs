@@ -839,15 +839,15 @@ mod tests {
                     generation * 2,
                     (generation + 7) % 8,
                 ));
-                let loop_range = (!generation.is_multiple_of(2)).then(|| {
-                    TransportLoopRange::new(generation, generation + 10).unwrap()
-                });
+                let loop_range = (!generation.is_multiple_of(4))
+                    .then(|| TransportLoopRange::new(generation, generation + 10).unwrap());
+                let loop_enabled = generation % 4 == 1;
                 publisher.publish_observation(
                     PlaybackCyclePublication {
                         state,
                         position_frame: generation,
                         loop_range,
-                        loop_enabled: loop_range.is_some(),
+                        loop_enabled,
                         queued_scene_index: scene.map(|value| value.0),
                         queued_scene_launch_frame: scene.map(|value| value.1),
                         last_launched_scene_index: scene.map(|value| value.2),
@@ -869,11 +869,10 @@ mod tests {
                     PlaybackRecoveryTransportState::Rolling
                 };
                 assert_eq!(observation.state(), expected_state);
-                let expected_loop = (!generation.is_multiple_of(2)).then(|| {
-                    TransportLoopRange::new(generation, generation + 10).unwrap()
-                });
+                let expected_loop = (!generation.is_multiple_of(4))
+                    .then(|| TransportLoopRange::new(generation, generation + 10).unwrap());
                 assert_eq!(observation.loop_range(), expected_loop);
-                assert_eq!(observation.loop_enabled(), expected_loop.is_some());
+                assert_eq!(observation.loop_enabled(), generation % 4 == 1);
                 let expected_scene = (!generation.is_multiple_of(2)).then_some((
                     generation % 8,
                     generation * 2,
@@ -893,15 +892,21 @@ mod tests {
                 );
             }
             let snapshot = checkpoint.snapshot();
-            let expected = if snapshot.position_frame().is_multiple_of(2) {
+            let generation = snapshot.position_frame();
+            let expected = if generation.is_multiple_of(2) {
                 PlaybackRecoveryTransportState::Stopped
             } else {
                 PlaybackRecoveryTransportState::Rolling
             };
             assert_eq!(snapshot.state(), expected);
             if snapshot.committed_cycle_count() > 0 {
+                assert_eq!(snapshot.committed_cycle_count(), generation as u64);
+                let expected_loop = (!generation.is_multiple_of(4))
+                    .then(|| TransportLoopRange::new(generation, generation + 10).unwrap());
+                assert_eq!(snapshot.loop_range(), expected_loop);
+                assert_eq!(snapshot.loop_enabled(), generation % 4 == 1);
                 let mixer = snapshot.mixer_parameter_state().unwrap();
-                let even = snapshot.position_frame().is_multiple_of(2);
+                let even = generation.is_multiple_of(2);
                 assert_eq!(mixer, mixer_snapshot(u8::from(even), even));
             }
         }

@@ -1283,6 +1283,7 @@ impl TransportCommandSender {
 pub struct TransportCycle {
     state: TransportState,
     start_frame: usize,
+    position_frame: usize,
     frame_count: usize,
     loop_wrap_count: usize,
     loop_range: Option<TransportLoopRange>,
@@ -1328,13 +1329,7 @@ impl TransportCycle {
     /// Returns the committed transport position after this successful cycle.
     #[must_use]
     pub const fn position_frame(self) -> usize {
-        match self.state {
-            TransportState::Stopped => self.start_frame,
-            TransportState::Rolling => match self.start_frame.checked_add(self.frame_count) {
-                Some(position_frame) => position_frame,
-                None => unreachable!(),
-            },
-        }
+        self.position_frame
     }
 
     #[must_use]
@@ -3503,6 +3498,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             return Ok(TransportCycle {
                 state: self.state,
                 start_frame,
+                position_frame: start_frame,
                 frame_count,
                 loop_wrap_count: 0,
                 loop_range: self.loop_range,
@@ -3534,6 +3530,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         Ok(TransportCycle {
             state: self.state,
             start_frame,
+            position_frame: next_frame,
             frame_count,
             loop_wrap_count,
             loop_range: self.loop_range,

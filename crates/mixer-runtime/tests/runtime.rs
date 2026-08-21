@@ -15,8 +15,8 @@ use hyper_mixer_runtime::{
     MixerParameterTargetError, OutputMeterPublication, OutputMeterReceiver, OutputMeterSender,
     OutputMeterSnapshot, PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime,
     RuntimeCreationError, RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig,
-    StereoSamplePeakBallistics, TransportCommand, TransportCommandSendError, TransportCycle,
-    TransportLoopRange, TransportLoopRangeError, TransportOutputCreationError,
+    SceneLaunchState, StereoSamplePeakBallistics, TransportCommand, TransportCommandSendError,
+    TransportCycle, TransportLoopRange, TransportLoopRangeError, TransportOutputCreationError,
     TransportOutputProcessor, TransportState,
     loudness_command_channel, output_meter_channel, playback_recovery_channel,
 };
@@ -709,6 +709,10 @@ fn render_linear(fixture: &PlaybackFixture, start: usize, frames: usize) -> (Vec
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear test proves audio and recovery continuity across a real loop wrap"
+)]
 fn a_looped_cycle_matches_the_two_linear_cycles_it_replaces() {
     let fixture = playback_fixture();
     let graph = fixture.compile_playback();
@@ -763,6 +767,7 @@ fn a_looped_cycle_matches_the_two_linear_cycles_it_replaces() {
         40,
         "10 frames to the loop end, then 20 more from the loop start"
     );
+    assert_eq!(cycle.position_frame(), transport.position_frame());
 
     let (head_left, head_right) = render_linear(&fixture, 40, 10);
     let (tail_left, tail_right) = render_linear(&fixture, 20, 20);
@@ -774,6 +779,56 @@ fn a_looped_cycle_matches_the_two_linear_cycles_it_replaces() {
         expected_left.iter().any(|sample| sample.abs() > 0.0),
         "the fixture actually produces audio across the wrap"
     );
+
+    let (mut recovery_publisher, recovery) = playback_recovery_channel(None, None);
+    recovery_publisher.publish_cycle(cycle, None);
+    let checkpoint = recovery.snapshot();
+    assert_eq!(checkpoint.position_frame(), transport.position_frame());
+    assert_eq!(
+        checkpoint.loop_range(),
+        Some(TransportLoopRange::new(20, 50).unwrap())
+    );
+    assert!(checkpoint.loop_enabled());
+
+    let replacement =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 100)
+            .unwrap();
+    let mut replacement = PreparedPlaybackTransportRuntime::new(replacement);
+    for command in [
+        TransportCommand::SetLoopRange(checkpoint.loop_range()),
+        TransportCommand::SetLoopEnabled(checkpoint.loop_enabled()),
+        checkpoint.restore_command(),
+    ] {
+        replacement.apply_command(command).unwrap();
+    }
+    let mut resumed_arrangement_left = [9.0_f32; 100];
+    let mut resumed_arrangement_right = [9.0_f32; 100];
+    let mut resumed_scene_left = [9.0_f32; 100];
+    let mut resumed_scene_right = [9.0_f32; 100];
+    let mut resumed_scratch = [
+        RenderScratchSlot::new(
+            &mut resumed_arrangement_left,
+            &mut resumed_arrangement_right,
+        ),
+        RenderScratchSlot::new(&mut resumed_scene_left, &mut resumed_scene_right),
+    ];
+    let mut resumed_left = [9.0_f32; 30];
+    let mut resumed_right = [9.0_f32; 30];
+    let resumed = replacement
+        .process_cycle(
+            &mut resumed_scratch,
+            StereoOutput {
+                left: &mut resumed_left,
+                right: &mut resumed_right,
+            },
+        )
+        .unwrap();
+    assert_eq!(resumed.start_frame(), 40);
+    assert_eq!(resumed.position_frame(), 40);
+    assert_eq!(replacement.position_frame(), 40);
+    assert_eq!(resumed.loop_wrap_count(), 1);
+    assert_samples(&resumed_left, &expected_left);
+    assert_samples(&resumed_right, &expected_right);
 }
 
 #[test]
@@ -2837,6 +2892,81 @@ fn queued_start_is_rolled_back_when_track_rendering_fails() {
     let recovered = process_transport(&mut transport, &mut left, &mut right).unwrap();
     assert_eq!(recovered.loop_range(), Some(committed_range));
     assert!(!recovered.loop_enabled());
+}
+
+#[test]
+fn loop_commands_are_rolled_back_when_a_later_command_fails() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 25)
+            .unwrap();
+    let (mut sender, mut transport) = PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+    let committed_range = TransportLoopRange::new(0, 50).unwrap();
+    transport
+        .apply_command(TransportCommand::SetLoopRange(Some(committed_range)))
+        .unwrap();
+    let committed_mixer = transport.mixer_parameter_state();
+    sender
+        .try_send(TransportCommand::SetLoopRange(Some(
+            TransportLoopRange::new(50, 100).unwrap(),
+        )))
+        .unwrap();
+    sender
+        .try_send(TransportCommand::SetLoopEnabled(true))
+        .unwrap();
+    sender
+        .try_send(TransportCommand::Locate {
+            frame: usize::MAX - 1,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    sender
+        .try_send(TransportCommand::LaunchScene { scene_index: 0 })
+        .unwrap();
+    let mut arrangement_left = [9.0_f32; 25];
+    let mut arrangement_right = [9.0_f32; 25];
+    let mut scene_left = [9.0_f32; 25];
+    let mut scene_right = [9.0_f32; 25];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut output_left = [9.0_f32; 25];
+    let mut output_right = [9.0_f32; 25];
+
+    assert!(matches!(
+        transport.process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut output_left,
+                right: &mut output_right,
+            },
+        ),
+        Err(RuntimeProcessError::Scene(_))
+    ));
+    assert_eq!(transport.state(), TransportState::Stopped);
+    assert_eq!(transport.position_frame(), 0);
+    assert_eq!(transport.loop_range(), Some(committed_range));
+    assert!(!transport.loop_enabled());
+    assert_eq!(transport.mixer_parameter_state(), committed_mixer);
+    assert_constant(&output_left, 9.0);
+    assert_constant(&output_right, 9.0);
+
+    let recovered = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut output_left,
+                right: &mut output_right,
+            },
+        )
+        .unwrap();
+    assert_eq!(recovered.applied_command_count(), 0);
+    assert_eq!(recovered.loop_range(), Some(committed_range));
+    assert!(!recovered.loop_enabled());
+    assert_eq!(recovered.scene_launch_state(), SceneLaunchState::default());
 }
 
 #[test]
