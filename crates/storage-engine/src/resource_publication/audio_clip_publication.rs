@@ -2914,6 +2914,7 @@ mod tests {
         assert_eq!(outcome.clip_id(), CLIP_ID);
         assert_eq!(outcome.track_id(), TRACK_ID);
         assert!(!fixture.root.join(format!("clips/{CLIP_ID}.json")).exists());
+        assert!(!fixture.root.join("clips").exists());
         assert_eq!(
             fs::read(fixture.root.join(format!("tracks/{TRACK_ID}.json"))).unwrap(),
             fixture.original_track
@@ -2971,6 +2972,11 @@ mod tests {
         ] {
             let fixture = Fixture::new();
             fixture.publish_clip();
+            let manifest_before = fs::read(fixture.root.join(MANIFEST_NAME)).unwrap();
+            let asset_path = fixture
+                .root
+                .join(format!("assets/recordings/{ASSET_ID}.wav"));
+            let asset_before = fs::read(&asset_path).unwrap();
             let result = catch_unwind(AssertUnwindSafe(|| {
                 let _ = remove_audio_clip_observed(
                     &fixture.root,
@@ -2993,10 +2999,13 @@ mod tests {
                 fs::read(fixture.root.join(format!("clips/{CLIP_ID}.json"))).unwrap(),
                 fixture.clip
             );
+            assert!(fixture.root.join("clips").is_dir());
             assert_eq!(
                 fs::read(fixture.root.join(format!("tracks/{TRACK_ID}.json"))).unwrap(),
                 fixture.track
             );
+            assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), manifest_before);
+            assert_eq!(fs::read(asset_path).unwrap(), asset_before);
             assert_eq!(
                 verify_project_package(&fixture.root)
                     .unwrap()
@@ -3035,6 +3044,7 @@ mod tests {
             AudioClipPublicationRecoveryDisposition::Committed
         );
         assert!(!fixture.root.join(format!("clips/{CLIP_ID}.json")).exists());
+        assert!(!fixture.root.join("clips").exists());
         assert_eq!(
             fs::read(fixture.root.join(format!("tracks/{TRACK_ID}.json"))).unwrap(),
             fixture.original_track
@@ -3045,6 +3055,69 @@ mod tests {
                 .manifest()
                 .revision(),
             3
+        );
+        assert!(fixture.transaction_names().is_empty());
+    }
+
+    #[test]
+    fn committed_removal_retains_publication_authority_when_cleanup_is_incomplete() {
+        let fixture = Fixture::new();
+        fixture.publish_clip();
+        let asset_path = fixture
+            .root
+            .join(format!("assets/recordings/{ASSET_ID}.wav"));
+        let asset_before = fs::read(&asset_path).unwrap();
+        let error = remove_audio_clip_observed(
+            &fixture.root,
+            fixture.removal_request(),
+            |phase, _| {
+                if phase != AudioClipPublicationPhase::Manifest {
+                    return Ok(());
+                }
+                let name = fixture.transaction_names().pop().unwrap();
+                let id = name.strip_prefix(AUDIO_CLIP_TRANSACTION_PREFIX).unwrap();
+                fs::write(
+                    fixture
+                        .root
+                        .join("backups")
+                        .join(format!(".audio-clip-project-{id}.json")),
+                    b"unrelated cleanup residue",
+                )
+                .unwrap();
+                Err(failure(
+                    ProjectResourcePublicationErrorKind::Io,
+                    "simulated post-manifest removal failure",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
+        assert!(error.published());
+        assert!(!fixture.root.join(format!("clips/{CLIP_ID}.json")).exists());
+        assert!(!fixture.root.join("clips").exists());
+        assert_eq!(fs::read(asset_path).unwrap(), asset_before);
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .revision(),
+            3
+        );
+        let name = fixture.transaction_names().pop().unwrap();
+        let id = name.strip_prefix(AUDIO_CLIP_TRANSACTION_PREFIX).unwrap();
+        fs::remove_file(
+            fixture
+                .root
+                .join("backups")
+                .join(format!(".audio-clip-project-{id}.json")),
+        )
+        .unwrap();
+        let recovered = recover_audio_clip_publications(&fixture.root).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].disposition(),
+            AudioClipPublicationRecoveryDisposition::Committed
         );
         assert!(fixture.transaction_names().is_empty());
     }
