@@ -22,6 +22,7 @@ sha2 = "=0.10.9"
 hyper-audio-source = { path = "../../../crates/audio-source" }
 hyper-fs-authority = { path = "../../../crates/fs-authority" }
 hyper-media-cache = { path = "../../../crates/media-cache" }
+hyper-native-device = { path = "../../../crates/native-device" }
 hyper-playback-json = { path = "../../../crates/playback-json" }
 hyper-playback-session = { path = "../../../crates/playback-session" }
 hyper-storage-engine = { path = "../../../crates/storage-engine" }

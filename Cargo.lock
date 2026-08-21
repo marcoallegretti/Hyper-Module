@@ -2455,6 +2455,7 @@ dependencies = [
  "hyper-audio-source",
  "hyper-fs-authority",
  "hyper-media-cache",
+ "hyper-native-device",
  "hyper-playback-json",
  "hyper-playback-session",
  "hyper-project-loader",
