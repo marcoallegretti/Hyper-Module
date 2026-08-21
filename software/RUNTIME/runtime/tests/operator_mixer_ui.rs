@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use i_slint_backend_testing::ElementHandle;
-use slint::platform::PointerEventButton;
+use slint::platform::{PointerEventButton, WindowEvent};
 use slint::{ComponentHandle, LogicalPosition, Model, ModelRc, VecModel};
 
 slint::include_modules!();
@@ -89,17 +89,22 @@ fn verify_enabled_controls(ui: &OperatorWindow, intents: &RefCell<Vec<MixerInten
     assert_eq!(group_gain.accessible_value_minimum(), Some(0.0));
     assert_eq!(group_gain.accessible_value_maximum(), Some(200.0));
     assert_accessible_value(&group_gain, 40.0);
+    click_committed_marker(ui, &group_gain, 0.2);
+    assert_eq!(
+        intents.borrow()[2],
+        MixerIntent::Gain(1, 40.0_f32.to_bits())
+    );
+    assert_accessible_value(&group_gain, 40.0);
     drag_to_right_edge(&group_gain);
-    assert_eq!(intents.borrow().len(), 3, "drag emits only on release");
-    let drag_value = match intents.borrow()[2] {
-        MixerIntent::Gain(1, bits) => f32::from_bits(bits),
-        intent => panic!("unexpected drag intent {intent:?}"),
-    };
-    assert!((190.0..=200.0).contains(&drag_value));
+    assert_eq!(intents.borrow().len(), 4, "drag emits only on release");
+    assert_eq!(
+        intents.borrow()[3],
+        MixerIntent::Gain(1, 200.0_f32.to_bits())
+    );
     assert_accessible_value(&group_gain, 40.0);
     group_gain.set_accessible_value("200");
     assert_eq!(
-        intents.borrow()[3],
+        intents.borrow()[4],
         MixerIntent::Gain(1, 200.0_f32.to_bits())
     );
     assert_accessible_value(&group_gain, 40.0);
@@ -109,7 +114,7 @@ fn verify_enabled_controls(ui: &OperatorWindow, intents: &RefCell<Vec<MixerInten
     assert_accessible_value(&audio_pan, -50.0);
     audio_pan.set_accessible_value("-100");
     assert_eq!(
-        intents.borrow()[4],
+        intents.borrow()[5],
         MixerIntent::Pan(0, (-100.0_f32).to_bits())
     );
     assert_accessible_value(&audio_pan, -50.0);
@@ -117,7 +122,7 @@ fn verify_enabled_controls(ui: &OperatorWindow, intents: &RefCell<Vec<MixerInten
     assert_accessible_value(&main_gain, 40.0);
     main_gain.mock_single_click(PointerEventButton::Left);
     assert_eq!(
-        intents.borrow()[5],
+        intents.borrow()[6],
         MixerIntent::MainGain(100.0_f32.to_bits())
     );
     assert_accessible_value(&main_gain, 40.0);
@@ -126,10 +131,10 @@ fn verify_enabled_controls(ui: &OperatorWindow, intents: &RefCell<Vec<MixerInten
     assert_eq!(unavailable.accessible_enabled(), Some(false));
     unavailable.mock_single_click(PointerEventButton::Left);
 
-    assert_eq!(intents.borrow().len(), 7);
+    assert_eq!(intents.borrow().len(), 8);
     assert_eq!(intents.borrow()[0], MixerIntent::Mute(1));
     assert_eq!(intents.borrow()[1], MixerIntent::Solo(0));
-    assert_eq!(intents.borrow()[6], MixerIntent::MainMute);
+    assert_eq!(intents.borrow()[7], MixerIntent::MainMute);
     assert!((ui.get_main_gain_percent() - 40.0).abs() <= f32::EPSILON);
     let committed = ui.get_mixer_channels();
     assert!((committed.row_data(1).unwrap().gain_percent - 40.0).abs() <= f32::EPSILON);
@@ -193,6 +198,28 @@ fn drag_to_right_edge(element: &ElementHandle) {
         ),
         PointerEventButton::Left,
     );
+}
+
+fn click_committed_marker(ui: &OperatorWindow, element: &ElementHandle, normalized: f32) {
+    const THUMB_WIDTH: f32 = 18.0;
+    let position = element.absolute_position();
+    let size = element.size();
+    let marker = LogicalPosition::new(
+        position.x + THUMB_WIDTH / 2.0 + (size.width - THUMB_WIDTH) * normalized,
+        position.y + size.height / 2.0,
+    );
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position: marker });
+    ui.window().dispatch_event(WindowEvent::PointerPressed {
+        position: marker,
+        button: PointerEventButton::Left,
+    });
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position: marker });
+    ui.window().dispatch_event(WindowEvent::PointerReleased {
+        position: marker,
+        button: PointerEventButton::Left,
+    });
 }
 
 fn assert_accessible_value(element: &ElementHandle, expected: f32) {

@@ -244,7 +244,12 @@ component CommittedSlider inherits Rectangle {
     }
 
     pure function value-at(x: length) -> float {
-        root.minimum + clamp(x / max(1px, root.width), 0, 1) * (root.maximum - root.minimum)
+        root.minimum
+            + clamp(
+                (x - thumb.width / 2) / max(1px, root.width - thumb.width),
+                0,
+                1,
+            ) * (root.maximum - root.minimum)
     }
 
     public function submit(value: float) {
