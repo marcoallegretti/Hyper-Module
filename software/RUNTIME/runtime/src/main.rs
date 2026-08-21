@@ -3123,7 +3123,7 @@ mod tests {
         }"#;
         const SCENE_TRACK: &[u8] = br#"{
             "format":"hyper-track","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122339508",
-            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Meter source","kind":"group",
+            "project_id":"018f47a2-6b2d-7c11-8a44-001122339500","name":"Scene group","kind":"group",
             "order":1,"active":true,"clip_ids":[],"extensions":{}
         }"#;
         const RETURN_TRACK: &[u8] = br#"{
@@ -3340,7 +3340,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 (0, "Meter source"),
-                (1, "Meter source"),
+                (1, "Scene group"),
                 (2, "Ritorno Ω"),
                 (3, "Return Delta"),
             ]
@@ -3405,7 +3405,7 @@ mod tests {
                 (
                     1,
                     0,
-                    "Meter source",
+                    "Scene group",
                     "Ritorno Ω",
                     DesktopMixerSendTap::PreFader
                 ),
@@ -3657,7 +3657,7 @@ mod tests {
         assert_eq!(generated_mixer.row_count(), 4);
         for (row, name) in [
             (0, "Meter source"),
-            (1, "Meter source"),
+            (1, "Scene group"),
             (2, "Ritorno Ω"),
             (3, "Return Delta"),
         ] {
@@ -3694,7 +3694,7 @@ mod tests {
         assert!(!second_send_row.enabled);
         assert!(second_send_row.controls_enabled);
         let later_channel_send_row = generated_sends.row_data(2).unwrap();
-        assert_eq!(later_channel_send_row.source_name.as_str(), "Meter source");
+        assert_eq!(later_channel_send_row.source_name.as_str(), "Scene group");
         assert_eq!(later_channel_send_row.target_name.as_str(), "Ritorno Ω");
         assert_eq!(later_channel_send_row.tap.as_str(), "PRE");
         assert_operator_float(later_channel_send_row.gain_percent, 125.0);
@@ -3741,6 +3741,15 @@ mod tests {
             OperatorCommand::SetMixerChannelSolo {
                 channel: mixer_channels[0].handle,
                 solo: true,
+            }
+        );
+        ui.invoke_set_mixer_send_gain_requested(1, 65.25);
+        let second_send_gain = mixer_command_receiver.try_recv().unwrap();
+        assert_eq!(
+            second_send_gain,
+            OperatorCommand::SetMixerSendGain {
+                send: mixer_sends[1].handle,
+                gain_millionths: 652_500,
             }
         );
         ui.invoke_set_mixer_send_gain_requested(2, 55.5);
@@ -3884,6 +3893,7 @@ mod tests {
             solo,
             main_gain,
             main_mute,
+            second_send_gain,
             send_gain,
             send_pan,
             send_enabled,
@@ -3993,6 +4003,7 @@ mod tests {
         assert!(generated_mixer.row_data(1).unwrap().muted);
         assert!(generated_mixer.row_data(0).unwrap().soloed);
         assert_operator_float(generated_sends.row_data(0).unwrap().gain_percent, 80.0);
+        assert_operator_float(generated_sends.row_data(1).unwrap().gain_percent, 65.25);
         assert_operator_float(generated_sends.row_data(2).unwrap().gain_percent, 55.5);
         assert_operator_float(generated_sends.row_data(2).unwrap().pan_percent, 25.0);
         assert!(!generated_sends.row_data(2).unwrap().enabled);
@@ -4008,6 +4019,7 @@ mod tests {
         ui.invoke_set_mixer_channel_pan_requested(0, 0.0);
         ui.invoke_toggle_mixer_channel_mute_requested(1);
         ui.invoke_toggle_mixer_channel_solo_requested(0);
+        ui.invoke_set_mixer_send_gain_requested(1, 40.0);
         ui.invoke_set_mixer_send_gain_requested(2, 125.0);
         ui.invoke_set_mixer_send_pan_requested(2, -70.0);
         ui.invoke_toggle_mixer_send_requested(2);
@@ -4029,6 +4041,10 @@ mod tests {
             MixerParameterCommand::ChannelSolo {
                 channel: mixer_channels[0].handle,
                 solo: false,
+            },
+            MixerParameterCommand::SendGain {
+                send: mixer_sends[1].handle,
+                gain: LinearGain::from_millionths(400_000).unwrap(),
             },
             MixerParameterCommand::SendGain {
                 send: mixer_sends[2].handle,
@@ -4132,6 +4148,7 @@ mod tests {
             Pan::from_millionths(-300_000).unwrap().value() * 100.0,
         );
         assert!(generated_sends.row_data(0).unwrap().enabled);
+        assert_operator_float(generated_sends.row_data(1).unwrap().gain_percent, 40.0);
         assert_operator_float(generated_sends.row_data(2).unwrap().gain_percent, 125.0);
         assert_operator_float(
             generated_sends.row_data(2).unwrap().pan_percent,
