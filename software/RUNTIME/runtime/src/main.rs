@@ -1432,6 +1432,76 @@ mod tests {
     }
 
     #[test]
+    fn operator_scene_catalog_preserves_bounded_authority_and_fails_closed() {
+        let names = [
+            "Apertura",
+            "Caffè notturno",
+            "東京の雨",
+            "Στροφή",
+            "Затишье",
+            "ليلة",
+            "Pausa lunga",
+            "Finale ✦",
+        ];
+        let availabilities = [
+            DesktopSceneAvailability::Ready,
+            DesktopSceneAvailability::Disabled,
+            DesktopSceneAvailability::ConsolidationRequired,
+            DesktopSceneAvailability::NotPrepared,
+            DesktopSceneAvailability::Ready,
+            DesktopSceneAvailability::Disabled,
+            DesktopSceneAvailability::ConsolidationRequired,
+            DesktopSceneAvailability::NotPrepared,
+        ];
+        let name_queries = RefCell::new(Vec::new());
+        let availability_queries = RefCell::new(Vec::new());
+
+        let catalog = build_operator_scene_catalog(
+            names.len(),
+            |index| {
+                name_queries.borrow_mut().push(index);
+                names.get(index).map(|name| (*name).to_owned())
+            },
+            |index| {
+                availability_queries.borrow_mut().push(index);
+                availabilities.get(index).copied()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*name_queries.borrow(), (0..names.len()).collect::<Vec<_>>());
+        assert_eq!(
+            *availability_queries.borrow(),
+            (0..names.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(catalog.len(), names.len());
+        for (index, scene) in catalog.iter().enumerate() {
+            assert_eq!(scene.index, index);
+            assert_eq!(scene.name, names[index]);
+            assert_eq!(scene.availability, availabilities[index]);
+        }
+
+        assert_eq!(
+            build_operator_scene_catalog(
+                2,
+                |index| (index == 0).then(|| "Only name".to_owned()),
+                |_| Some(DesktopSceneAvailability::Ready),
+            )
+            .unwrap_err(),
+            "prepared scene 1 has no retained name"
+        );
+        assert_eq!(
+            build_operator_scene_catalog(
+                2,
+                |index| Some(format!("Scene {index}")),
+                |index| (index == 0).then_some(DesktopSceneAvailability::Ready),
+            )
+            .unwrap_err(),
+            "prepared scene 1 has no launch status"
+        );
+    }
+
+    #[test]
     fn startup_diagnostics_retain_the_bundle_rejection_cause() {
         let output_opened = Cell::new(false);
         let missing = std::env::temp_dir().join(format!(

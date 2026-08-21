@@ -720,13 +720,18 @@ mod tests {
                     u8::from(generation.is_multiple_of(2)),
                     generation.is_multiple_of(2),
                 );
+                let scene = (!generation.is_multiple_of(2)).then_some((
+                    generation % 8,
+                    generation * 2,
+                    (generation + 7) % 8,
+                ));
                 publisher.publish_observation(
                     state,
                     generation,
                     Some(&mixer),
-                    Some(generation % 8),
-                    Some(generation * 2),
-                    Some((generation + 7) % 8),
+                    scene.map(|value| value.0),
+                    scene.map(|value| value.1),
+                    scene.map(|value| value.2),
                 );
             }
         });
@@ -735,17 +740,30 @@ mod tests {
         while checkpoint.snapshot().committed_cycle_count() < PUBLICATIONS as u64 {
             let observation = checkpoint.observe_cycle();
             if observation.committed_cycle_count() > 0 {
+                let generation = observation.position_frame();
+                assert_eq!(observation.committed_cycle_count(), generation as u64);
+                let expected_state = if generation.is_multiple_of(2) {
+                    PlaybackRecoveryTransportState::Stopped
+                } else {
+                    PlaybackRecoveryTransportState::Rolling
+                };
+                assert_eq!(observation.state(), expected_state);
+                let expected_scene = (!generation.is_multiple_of(2)).then_some((
+                    generation % 8,
+                    generation * 2,
+                    (generation + 7) % 8,
+                ));
                 assert_eq!(
                     observation.queued_scene_index(),
-                    Some(observation.position_frame() % 8)
+                    expected_scene.map(|value| value.0)
                 );
                 assert_eq!(
                     observation.queued_scene_launch_frame(),
-                    Some(observation.position_frame() * 2)
+                    expected_scene.map(|value| value.1)
                 );
                 assert_eq!(
                     observation.last_launched_scene_index(),
-                    Some((observation.position_frame() + 7) % 8)
+                    expected_scene.map(|value| value.2)
                 );
             }
             let snapshot = checkpoint.snapshot();
