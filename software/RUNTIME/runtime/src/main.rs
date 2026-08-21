@@ -25,9 +25,10 @@ use hyper_desktop_audio::{
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
     ChannelSamplePeakBallistics, EbuLoudnessPresentationConfig, LoudnessPresentationSnapshot,
-    LoudnessScaleRegion, LocateState, MaximumTruePeakDisplay, OutputMeterReceiver,
+    LoudnessScaleRegion, LocateState, MaximumTruePeakDisplay, MixerChannelHandle,
+    MixerParameterCommand, MixerParameterStateSnapshot, OutputMeterReceiver,
     PlaybackCycleObservation, PlaybackRecoveryCheckpoint, PlaybackRecoveryTransportState,
-    SamplePeakBallisticsConfig, ScaledLoudnessValue, StereoSamplePeakBallistics,
+    PlaybackRecoverySnapshot, SamplePeakBallisticsConfig, ScaledLoudnessValue, StereoSamplePeakBallistics,
     StereoSamplePeakBallisticsSnapshot, TransportCommand, TransportLoopRange,
 };
 use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
@@ -157,6 +158,7 @@ struct OperatorReady {
     observers: RuntimeObservers,
     meters: OutputMeterReceiver,
     scenes: Vec<OperatorScene>,
+    mixer_channels: Vec<OperatorMixerChannel>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,6 +166,13 @@ struct OperatorScene {
     index: usize,
     name: String,
     availability: DesktopSceneAvailability,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperatorMixerChannel {
+    index: usize,
+    name: String,
+    handle: MixerChannelHandle,
 }
 
 struct OperatorWorker {
@@ -246,6 +255,17 @@ enum OperatorCommand {
     SetLoopEnabled { enabled: bool },
     SetLoudnessState { state: LoudnessMeasurementState },
     ResetLoudness,
+    SetMixerChannelMute {
+        channel: MixerChannelHandle,
+        muted: bool,
+    },
+    SetMixerChannelSolo {
+        channel: MixerChannelHandle,
+        solo: bool,
+    },
+    SetMainMute {
+        muted: bool,
+    },
     Quit,
 }
 
@@ -255,11 +275,25 @@ struct OperatorLoopAuthority {
     enabled: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OperatorMixerChannelAuthority {
+    handle: MixerChannelHandle,
+    muted: bool,
+    solo: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperatorMixerAuthority {
+    channels: Vec<OperatorMixerChannelAuthority>,
+    main_muted: bool,
+}
+
 const OPERATOR_COMMAND_CAPACITY: usize = 8;
 
 trait RuntimeOperatorControl {
     fn queue_transport(&mut self, command: TransportCommand) -> Result<(), String>;
     fn queue_loudness(&mut self, command: LoudnessMeasurementCommand) -> Result<(), String>;
+    fn queue_mixer(&mut self, command: MixerParameterCommand) -> Result<(), String>;
 }
 
 trait RuntimeOutputObservation {
@@ -283,6 +317,12 @@ impl RuntimeOperatorControl for SessionHost {
         self.session
             .loudness_command_sender()
             .try_send(command)
+            .map_err(|error| error.to_string())
+    }
+
+    fn queue_mixer(&mut self, command: MixerParameterCommand) -> Result<(), String> {
+        self.session
+            .try_send_mixer_parameter_command(command)
             .map_err(|error| error.to_string())
     }
 }
@@ -572,6 +612,36 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
                     }
                 }
             }
+            OperatorCommand::SetMixerChannelMute { channel, muted } => {
+                match host.queue_mixer(MixerParameterCommand::ChannelMute { channel, muted }) {
+                    Ok(()) => diagnostic(if muted {
+                        "mixer channel mute queued".to_owned()
+                    } else {
+                        "mixer channel unmute queued".to_owned()
+                    }),
+                    Err(error) => diagnostic(format!("mixer channel mute refused: {error}")),
+                }
+            }
+            OperatorCommand::SetMixerChannelSolo { channel, solo } => {
+                match host.queue_mixer(MixerParameterCommand::ChannelSolo { channel, solo }) {
+                    Ok(()) => diagnostic(if solo {
+                        "mixer channel solo queued".to_owned()
+                    } else {
+                        "mixer channel unsolo queued".to_owned()
+                    }),
+                    Err(error) => diagnostic(format!("mixer channel solo refused: {error}")),
+                }
+            }
+            OperatorCommand::SetMainMute { muted } => {
+                match host.queue_mixer(MixerParameterCommand::MainMute { muted }) {
+                    Ok(()) => diagnostic(if muted {
+                        "main output mute queued".to_owned()
+                    } else {
+                        "main output unmute queued".to_owned()
+                    }),
+                    Err(error) => diagnostic(format!("main output mute refused: {error}")),
+                }
+            }
             OperatorCommand::Quit => stop.store(true, Ordering::Release),
         }
     }
@@ -608,6 +678,43 @@ fn build_operator_scene_catalog(
     Ok(scenes)
 }
 
+fn operator_mixer_catalog(
+    session: &DesktopPlaybackSession,
+) -> Result<Vec<OperatorMixerChannel>, String> {
+    build_operator_mixer_catalog(
+        session.mixer_channel_count(),
+        |index| session.mixer_channel_name(index).map(str::to_owned),
+        |index| {
+            session
+                .resolve_mixer_channel_index(index)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn build_operator_mixer_catalog(
+    channel_count: usize,
+    mut channel_name: impl FnMut(usize) -> Option<String>,
+    mut channel_handle: impl FnMut(usize) -> Result<MixerChannelHandle, String>,
+) -> Result<Vec<OperatorMixerChannel>, String> {
+    let mut channels = Vec::new();
+    channels
+        .try_reserve_exact(channel_count)
+        .map_err(|_| "operator mixer catalog capacity is unavailable".to_owned())?;
+    for index in 0..channel_count {
+        let name = channel_name(index)
+            .ok_or_else(|| format!("prepared mixer channel {index} has no retained track name"))?;
+        let handle = channel_handle(index)
+            .map_err(|error| format!("prepared mixer channel {index} cannot be controlled: {error}"))?;
+        channels.push(OperatorMixerChannel {
+            index,
+            name,
+            handle,
+        });
+    }
+    Ok(channels)
+}
+
 fn spawn_operator_worker(
     arguments: RuntimeArguments,
     stop: Arc<AtomicBool>,
@@ -619,8 +726,8 @@ fn spawn_operator_worker(
     let handle = std::thread::spawn(move || {
         let result = match start_runtime(&arguments) {
             Ok(mut runtime) => {
-                let ready_model =
-                    operator_scene_catalog(&runtime.host.session).and_then(|scenes| {
+                let ready_model = operator_scene_catalog(&runtime.host.session).and_then(|scenes| {
+                    operator_mixer_catalog(&runtime.host.session).and_then(|mixer_channels| {
                         runtime
                             .host
                             .take_meter_receiver()
@@ -628,11 +735,13 @@ fn spawn_operator_worker(
                                 observers: runtime.observers.clone(),
                                 meters,
                                 scenes,
+                                mixer_channels,
                             })
                             .ok_or_else(|| {
                                 "operator output meter authority was already transferred".to_owned()
                             })
-                    });
+                    })
+                });
                 match ready_model {
                     Ok(ready_model) => {
                         announce_runtime(&arguments, &runtime);
@@ -710,15 +819,19 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         observers,
         meters,
         scenes,
+        mixer_channels,
     } = ready;
     let meter_observer = Rc::new(RefCell::new(OperatorMeterObserver::new(
         meters,
         meter_config,
     )));
     let scene_model = Rc::new(VecModel::from(operator_scene_rows(&scenes)));
+    let mixer_model = Rc::new(VecModel::from(operator_mixer_rows(&mixer_channels)));
     let loop_authority = Rc::new(Cell::new(None));
     let loudness_authority = Rc::new(Cell::new(None));
+    let mixer_authority = Rc::new(RefCell::new(None));
     ui.set_scenes(ModelRc::from(Rc::clone(&scene_model)));
+    ui.set_mixer_channels(ModelRc::from(Rc::clone(&mixer_model)));
 
     apply_static_facts(&ui, &observers.facts);
     wire_operator_action(&ui, &commands_tx, &diagnostic, OperatorCommand::Start);
@@ -732,6 +845,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &diagnostic,
         &loudness_authority,
     );
+    wire_operator_mixer_controls(&ui, &commands_tx, &diagnostic, &mixer_authority);
     wire_operator_scene_launch(&ui, &commands_tx, &diagnostic, &scenes);
     wire_operator_loop_toggle(&ui, &commands_tx, &diagnostic, &loop_authority);
 
@@ -749,6 +863,14 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &loudness_authority,
         false,
     );
+    apply_operator_mixer_observation(
+        &ui,
+        &mixer_model,
+        &mixer_channels,
+        &mixer_authority,
+        &observers.recovery.snapshot(),
+        false,
+    );
 
     let weak = ui.as_weak();
     let timer_observers = observers.clone();
@@ -756,6 +878,9 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer_scene_model = Rc::clone(&scene_model);
     let timer_loop_authority = Rc::clone(&loop_authority);
     let timer_loudness_authority = Rc::clone(&loudness_authority);
+    let timer_mixer_model = Rc::clone(&mixer_model);
+    let timer_mixer_authority = Rc::clone(&mixer_authority);
+    let timer_mixer_channels = mixer_channels;
     let timer_diagnostic = Arc::clone(&diagnostic);
     let timer_close_error = Arc::clone(&completion_close_error);
     let mut completion_observed = false;
@@ -776,6 +901,14 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &ui,
                 &mut timer_meter_observer.borrow_mut(),
                 &timer_loudness_authority,
+                terminal_latched,
+            );
+            apply_operator_mixer_observation(
+                &ui,
+                &timer_mixer_model,
+                &timer_mixer_channels,
+                &timer_mixer_authority,
+                &timer_observers.recovery.snapshot(),
                 terminal_latched,
             );
             if !completion_observed
@@ -802,6 +935,12 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 completion_observed = true;
                 revoke_operator_loop_authority(&ui, &timer_loop_authority);
                 revoke_operator_loudness_authority(&ui, &timer_loudness_authority);
+                revoke_operator_mixer_authority(
+                    &ui,
+                    &timer_mixer_model,
+                    &timer_mixer_authority,
+                    true,
+                );
                 if let Err(error) = close_result {
                     set_first_error(&timer_close_error, error);
                 }
@@ -1108,6 +1247,95 @@ fn wire_operator_scene_launch(
     });
 }
 
+fn wire_operator_mixer_controls(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    authority: &Rc<RefCell<Option<OperatorMixerAuthority>>>,
+) {
+    let mute_sender = sender.clone();
+    let mute_diagnostic = Arc::clone(diagnostic);
+    let mute_authority = Rc::clone(authority);
+    ui.on_toggle_mixer_channel_mute_requested(move |row| {
+        let Ok(row) = usize::try_from(row) else {
+            set_diagnostic(&mute_diagnostic, "mixer mute refused: stale row".to_owned());
+            return;
+        };
+        let Some(channel) = mute_authority
+            .borrow()
+            .as_ref()
+            .and_then(|authority| authority.channels.get(row))
+            .copied()
+        else {
+            set_diagnostic(
+                &mute_diagnostic,
+                "mixer mute refused: accepted state is unavailable".to_owned(),
+            );
+            return;
+        };
+        send_operator_command(
+            &mute_sender,
+            OperatorCommand::SetMixerChannelMute {
+                channel: channel.handle,
+                muted: !channel.muted,
+            },
+            &mute_diagnostic,
+        );
+    });
+
+    let solo_sender = sender.clone();
+    let solo_diagnostic = Arc::clone(diagnostic);
+    let solo_authority = Rc::clone(authority);
+    ui.on_toggle_mixer_channel_solo_requested(move |row| {
+        let Ok(row) = usize::try_from(row) else {
+            set_diagnostic(&solo_diagnostic, "mixer solo refused: stale row".to_owned());
+            return;
+        };
+        let Some(channel) = solo_authority
+            .borrow()
+            .as_ref()
+            .and_then(|authority| authority.channels.get(row))
+            .copied()
+        else {
+            set_diagnostic(
+                &solo_diagnostic,
+                "mixer solo refused: accepted state is unavailable".to_owned(),
+            );
+            return;
+        };
+        send_operator_command(
+            &solo_sender,
+            OperatorCommand::SetMixerChannelSolo {
+                channel: channel.handle,
+                solo: !channel.solo,
+            },
+            &solo_diagnostic,
+        );
+    });
+
+    let main_sender = sender.clone();
+    let main_diagnostic = Arc::clone(diagnostic);
+    let main_authority = Rc::clone(authority);
+    ui.on_toggle_main_mute_requested(move || {
+        let Some(muted) = main_authority
+            .borrow()
+            .as_ref()
+            .map(|authority| authority.main_muted)
+        else {
+            set_diagnostic(
+                &main_diagnostic,
+                "main output mute refused: accepted state is unavailable".to_owned(),
+            );
+            return;
+        };
+        send_operator_command(
+            &main_sender,
+            OperatorCommand::SetMainMute { muted: !muted },
+            &main_diagnostic,
+        );
+    });
+}
+
 fn wire_operator_loop_toggle(
     ui: &OperatorWindow,
     sender: &SyncSender<OperatorCommand>,
@@ -1172,6 +1400,100 @@ fn operator_scene_rows(scenes: &[OperatorScene]) -> Vec<OperatorSceneRow> {
             last_launched: false,
         })
         .collect()
+}
+
+fn operator_mixer_rows(channels: &[OperatorMixerChannel]) -> Vec<OperatorMixerRow> {
+    channels
+        .iter()
+        .map(|channel| OperatorMixerRow {
+            name: channel.name.clone().into(),
+            muted: false,
+            soloed: false,
+            controls_enabled: false,
+        })
+        .collect()
+}
+
+fn mixer_authority(
+    channels: &[OperatorMixerChannel],
+    state: &MixerParameterStateSnapshot,
+) -> Option<OperatorMixerAuthority> {
+    if state.channel_count() != channels.len() {
+        return None;
+    }
+    let mut authority = Vec::new();
+    authority.try_reserve_exact(channels.len()).ok()?;
+    for channel in channels {
+        let accepted = state.channel(channel.index)?;
+        authority.push(OperatorMixerChannelAuthority {
+            handle: channel.handle,
+            muted: accepted.muted(),
+            solo: accepted.solo(),
+        });
+    }
+    Some(OperatorMixerAuthority {
+        channels: authority,
+        main_muted: state.main_muted(),
+    })
+}
+
+fn apply_operator_mixer_observation(
+    ui: &OperatorWindow,
+    model: &VecModel<OperatorMixerRow>,
+    channels: &[OperatorMixerChannel],
+    authority: &RefCell<Option<OperatorMixerAuthority>>,
+    snapshot: &PlaybackRecoverySnapshot,
+    terminal_latched: bool,
+) {
+    if terminal_latched {
+        revoke_operator_mixer_authority(ui, model, authority, true);
+        return;
+    }
+    let Some(state) = snapshot.mixer_parameter_state() else {
+        revoke_operator_mixer_authority(ui, model, authority, false);
+        return;
+    };
+    let Some(next) = mixer_authority(channels, &state) else {
+        revoke_operator_mixer_authority(ui, model, authority, false);
+        return;
+    };
+    for (row, channel) in next.channels.iter().enumerate() {
+        let Some(mut model_row) = model.row_data(row) else {
+            revoke_operator_mixer_authority(ui, model, authority, false);
+            return;
+        };
+        model_row.muted = channel.muted;
+        model_row.soloed = channel.solo;
+        model_row.controls_enabled = true;
+        model.set_row_data(row, model_row);
+    }
+    ui.set_main_muted(next.main_muted);
+    ui.set_main_mute_enabled(true);
+    ui.set_mixer_state(
+        format!("Committed cycle {}", snapshot.committed_cycle_count()).into(),
+    );
+    *authority.borrow_mut() = Some(next);
+}
+
+fn revoke_operator_mixer_authority(
+    ui: &OperatorWindow,
+    model: &VecModel<OperatorMixerRow>,
+    authority: &RefCell<Option<OperatorMixerAuthority>>,
+    terminal_latched: bool,
+) {
+    authority.borrow_mut().take();
+    for row in 0..model.row_count() {
+        if let Some(mut channel) = model.row_data(row) {
+            channel.controls_enabled = false;
+            model.set_row_data(row, channel);
+        }
+    }
+    ui.set_main_mute_enabled(false);
+    ui.set_mixer_state(if terminal_latched {
+        "Final committed mixer · Runtime stopped".into()
+    } else {
+        "Mixer state unavailable".into()
+    });
 }
 
 const fn operator_scene_availability_text(availability: DesktopSceneAvailability) -> &'static str {
@@ -2006,6 +2328,7 @@ mod tests {
     struct OperatorControl {
         commands: Vec<TransportCommand>,
         loudness_commands: Vec<LoudnessMeasurementCommand>,
+        mixer_commands: Vec<MixerParameterCommand>,
         reject: bool,
         disconnects: usize,
     }
@@ -2025,6 +2348,15 @@ mod tests {
                 Err("owner busy".to_owned())
             } else {
                 self.loudness_commands.push(command);
+                Ok(())
+            }
+        }
+
+        fn queue_mixer(&mut self, command: MixerParameterCommand) -> Result<(), String> {
+            if self.reject {
+                Err("owner busy".to_owned())
+            } else {
+                self.mixer_commands.push(command);
                 Ok(())
             }
         }
@@ -2264,8 +2596,9 @@ mod tests {
         let prepared = media.prepare_playback(&graph).unwrap();
         let runtime =
             PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, mixer, 480).unwrap();
-        let (mut transport_sender, mut transport) =
-            PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+        let (mut transport_sender, mut mixer_sender, mut transport) =
+            PreparedPlaybackTransportRuntime::with_command_queues(runtime);
+        let initial_mixer_state = transport.mixer_parameter_state();
         let mut callback = InterleavedStereoCallback::try_new(480, SAMPLE_RATE_HZ).unwrap();
         let mut scratch_left = [0.0_f32; 480];
         let mut scratch_right = [0.0_f32; 480];
@@ -2342,8 +2675,92 @@ mod tests {
             "scene launch refused: stale row"
         );
 
+        let mixer_channels = build_operator_mixer_catalog(
+            mixer_sender.channel_count(),
+            |index| session.mixer_channel_name_at(index).map(str::to_owned),
+            |index| {
+                mixer_sender
+                    .resolve_channel_index(index)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            mixer_channels
+                .iter()
+                .map(|channel| (channel.index, channel.name.as_str()))
+                .collect::<Vec<_>>(),
+            [(0, "Meter source"), (1, "Scene layer")]
+        );
+        assert!(
+            build_operator_mixer_catalog(
+                2,
+                |index| (index == 0).then(|| "Only one name".to_owned()),
+                |index| mixer_sender
+                    .resolve_channel_index(index)
+                    .map_err(|error| error.to_string()),
+            )
+            .is_err()
+        );
+        assert!(
+            build_operator_mixer_catalog(
+                3,
+                |index| Some(format!("Channel {index}")),
+                |index| mixer_sender
+                    .resolve_channel_index(index)
+                    .map_err(|error| error.to_string()),
+            )
+            .is_err()
+        );
+        let (owner_mixer_commands, owner_mixer_receiver) =
+            std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        owner_mixer_commands
+            .send(OperatorCommand::SetMixerChannelMute {
+                channel: mixer_channels[0].handle,
+                muted: true,
+            })
+            .unwrap();
+        owner_mixer_commands
+            .send(OperatorCommand::SetMixerChannelSolo {
+                channel: mixer_channels[1].handle,
+                solo: true,
+            })
+            .unwrap();
+        owner_mixer_commands
+            .send(OperatorCommand::SetMainMute { muted: true })
+            .unwrap();
+        let owner_stop = AtomicBool::new(false);
+        let mut owner = OperatorControl::default();
+        drain_operator_commands(&mut owner, &owner_mixer_receiver, &owner_stop, &|_| {});
+        assert_eq!(
+            owner.mixer_commands,
+            [
+                MixerParameterCommand::ChannelMute {
+                    channel: mixer_channels[0].handle,
+                    muted: true,
+                },
+                MixerParameterCommand::ChannelSolo {
+                    channel: mixer_channels[1].handle,
+                    solo: true,
+                },
+                MixerParameterCommand::MainMute { muted: true },
+            ]
+        );
+        let mixer_model = Rc::new(VecModel::from(operator_mixer_rows(&mixer_channels)));
+        let mixer_authority = Rc::new(RefCell::new(None));
+        ui.set_mixer_channels(ModelRc::from(Rc::clone(&mixer_model)));
+        let (mixer_commands, mixer_command_receiver) =
+            std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        let mixer_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_mixer_controls(
+            ui,
+            &mixer_commands,
+            &mixer_diagnostic,
+            &mixer_authority,
+        );
+
         let (mut recovery_publisher, recovery) =
-            hyper_mixer_runtime::playback_recovery_channel(None, None);
+            hyper_mixer_runtime::playback_recovery_channel(None, Some(&initial_mixer_state));
         let loop_authority = Rc::new(Cell::new(None));
         let (loop_commands, loop_command_receiver) =
             std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
@@ -2352,10 +2769,69 @@ mod tests {
         let initial_observation = recovery.observe_cycle();
         apply_operator_loop_observation(ui, &loop_authority, initial_observation);
         apply_operator_scene_observation(ui, &scene_model, initial_observation);
+        apply_operator_mixer_observation(
+            ui,
+            &mixer_model,
+            &mixer_channels,
+            &mixer_authority,
+            &recovery.snapshot(),
+            false,
+        );
         assert_eq!(ui.get_loop_state().as_str(), "No project loop");
         assert_eq!(ui.get_loop_range().as_str(), "No saved range");
         assert_eq!(ui.get_loop_toggle_label().as_str(), "Loop unavailable");
         assert!(!ui.get_loop_toggle_enabled());
+        assert_eq!(ui.get_mixer_state().as_str(), "Committed cycle 0");
+        assert!(!ui.get_main_muted());
+        assert!(ui.get_main_mute_enabled());
+        let generated_mixer = ui.get_mixer_channels();
+        assert_eq!(generated_mixer.row_count(), 2);
+        for (row, name) in [(0, "Meter source"), (1, "Scene layer")] {
+            let channel = generated_mixer.row_data(row).unwrap();
+            assert_eq!(channel.name.as_str(), name);
+            assert!(!channel.muted);
+            assert!(!channel.soloed);
+            assert!(channel.controls_enabled);
+        }
+
+        ui.invoke_toggle_mixer_channel_mute_requested(0);
+        let mute = mixer_command_receiver.try_recv().unwrap();
+        assert_eq!(
+            mute,
+            OperatorCommand::SetMixerChannelMute {
+                channel: mixer_channels[0].handle,
+                muted: true,
+            }
+        );
+        ui.invoke_toggle_mixer_channel_solo_requested(1);
+        let solo = mixer_command_receiver.try_recv().unwrap();
+        assert_eq!(
+            solo,
+            OperatorCommand::SetMixerChannelSolo {
+                channel: mixer_channels[1].handle,
+                solo: true,
+            }
+        );
+        ui.invoke_toggle_main_mute_requested();
+        let main_mute = mixer_command_receiver.try_recv().unwrap();
+        assert_eq!(main_mute, OperatorCommand::SetMainMute { muted: true });
+        assert!(!ui.get_main_muted(), "command acceptance is not publication");
+        assert!(!generated_mixer.row_data(0).unwrap().muted);
+        assert!(!generated_mixer.row_data(1).unwrap().soloed);
+        for command in [mute, solo, main_mute] {
+            match command {
+                OperatorCommand::SetMixerChannelMute { channel, muted } => mixer_sender
+                    .try_send(MixerParameterCommand::ChannelMute { channel, muted })
+                    .unwrap(),
+                OperatorCommand::SetMixerChannelSolo { channel, solo } => mixer_sender
+                    .try_send(MixerParameterCommand::ChannelSolo { channel, solo })
+                    .unwrap(),
+                OperatorCommand::SetMainMute { muted } => mixer_sender
+                    .try_send(MixerParameterCommand::MainMute { muted })
+                    .unwrap(),
+                _ => unreachable!("the mixer fixture routes only mixer commands"),
+            }
+        }
         ui.invoke_toggle_loop_requested();
         assert_eq!(loop_command_receiver.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(
@@ -2381,10 +2857,138 @@ mod tests {
                 },
             )
             .unwrap();
-        recovery_publisher.publish_cycle(queued, None);
+        let committed_mixer = transport.mixer_parameter_state();
+        recovery_publisher.publish_cycle(queued, Some(&committed_mixer));
         let queued_observation = recovery.observe_cycle();
         apply_operator_loop_observation(ui, &loop_authority, queued_observation);
         apply_operator_scene_observation(ui, &scene_model, queued_observation);
+        apply_operator_mixer_observation(
+            ui,
+            &mixer_model,
+            &mixer_channels,
+            &mixer_authority,
+            &recovery.snapshot(),
+            false,
+        );
+        assert_eq!(ui.get_mixer_state().as_str(), "Committed cycle 1");
+        assert!(ui.get_main_muted());
+        assert!(generated_mixer.row_data(0).unwrap().muted);
+        assert!(generated_mixer.row_data(1).unwrap().soloed);
+
+        ui.invoke_toggle_mixer_channel_mute_requested(0);
+        ui.invoke_toggle_mixer_channel_solo_requested(1);
+        ui.invoke_toggle_main_mute_requested();
+        for expected in [
+            MixerParameterCommand::ChannelMute {
+                channel: mixer_channels[0].handle,
+                muted: false,
+            },
+            MixerParameterCommand::ChannelSolo {
+                channel: mixer_channels[1].handle,
+                solo: false,
+            },
+            MixerParameterCommand::MainMute { muted: false },
+        ] {
+            let command = mixer_command_receiver.try_recv().unwrap();
+            let actual = match command {
+                OperatorCommand::SetMixerChannelMute { channel, muted } => {
+                    MixerParameterCommand::ChannelMute { channel, muted }
+                }
+                OperatorCommand::SetMixerChannelSolo { channel, solo } => {
+                    MixerParameterCommand::ChannelSolo { channel, solo }
+                }
+                OperatorCommand::SetMainMute { muted } => {
+                    MixerParameterCommand::MainMute { muted }
+                }
+                _ => unreachable!("the mixer fixture routes only mixer commands"),
+            };
+            assert_eq!(actual, expected);
+            mixer_sender.try_send(actual).unwrap();
+        }
+        let mut mixer_left = [0.0_f32; 480];
+        let mut mixer_right = [0.0_f32; 480];
+        let mixer_cycle = transport
+            .process_cycle(
+                &mut scratch,
+                StereoOutput {
+                    left: &mut mixer_left,
+                    right: &mut mixer_right,
+                },
+            )
+            .unwrap();
+        let committed_mixer = transport.mixer_parameter_state();
+        recovery_publisher.publish_cycle(mixer_cycle, Some(&committed_mixer));
+        apply_operator_mixer_observation(
+            ui,
+            &mixer_model,
+            &mixer_channels,
+            &mixer_authority,
+            &recovery.snapshot(),
+            false,
+        );
+        assert!(!ui.get_main_muted());
+        assert!(!generated_mixer.row_data(0).unwrap().muted);
+        assert!(!generated_mixer.row_data(1).unwrap().soloed);
+        for stale_row in [-1, 2, 9] {
+            ui.invoke_toggle_mixer_channel_mute_requested(stale_row);
+            ui.invoke_toggle_mixer_channel_solo_requested(stale_row);
+        }
+        assert_eq!(mixer_command_receiver.try_recv(), Err(TryRecvError::Empty));
+
+        let (_missing_mixer_publisher, missing_mixer) =
+            hyper_mixer_runtime::playback_recovery_channel(None, None);
+        apply_operator_mixer_observation(
+            ui,
+            &mixer_model,
+            &mixer_channels,
+            &mixer_authority,
+            &missing_mixer.snapshot(),
+            false,
+        );
+        assert_eq!(ui.get_mixer_state().as_str(), "Mixer state unavailable");
+        assert!(!ui.get_main_muted(), "last committed state remains visible");
+        assert!(!ui.get_main_mute_enabled());
+        assert!(!generated_mixer.row_data(0).unwrap().muted);
+        assert!(!generated_mixer.row_data(0).unwrap().controls_enabled);
+        ui.invoke_toggle_mixer_channel_mute_requested(0);
+        ui.invoke_toggle_mixer_channel_solo_requested(1);
+        ui.invoke_toggle_main_mute_requested();
+        assert_eq!(mixer_command_receiver.try_recv(), Err(TryRecvError::Empty));
+
+        apply_operator_mixer_observation(
+            ui,
+            &mixer_model,
+            &mixer_channels,
+            &mixer_authority,
+            &recovery.snapshot(),
+            false,
+        );
+        let (saturated_mixer_sender, saturated_mixer_receiver) =
+            std::sync::mpsc::sync_channel(1);
+        saturated_mixer_sender.send(OperatorCommand::Start).unwrap();
+        let saturated_mixer_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_mixer_controls(
+            ui,
+            &saturated_mixer_sender,
+            &saturated_mixer_diagnostic,
+            &mixer_authority,
+        );
+        ui.invoke_toggle_mixer_channel_mute_requested(0);
+        assert_eq!(
+            saturated_mixer_receiver.try_recv(),
+            Ok(OperatorCommand::Start)
+        );
+        assert_eq!(
+            saturated_mixer_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        );
+        assert!(
+            saturated_mixer_diagnostic
+                .lock()
+                .unwrap()
+                .contains("operator command refused")
+        );
+        assert!(!generated_mixer.row_data(0).unwrap().muted);
         assert_eq!(ui.get_loop_state().as_str(), "Loop armed");
         assert_eq!(ui.get_loop_range().as_str(), "frames 0–1500");
         assert_eq!(ui.get_loop_toggle_label().as_str(), "Enable loop");
@@ -3127,6 +3731,29 @@ mod tests {
             true,
         );
         assert_eq!(loudness_authority.get(), None);
+        apply_operator_mixer_observation(
+            ui,
+            &mixer_model,
+            &mixer_channels,
+            &mixer_authority,
+            &recovery.snapshot(),
+            true,
+        );
+        assert_eq!(
+            ui.get_mixer_state().as_str(),
+            "Final committed mixer · Runtime stopped"
+        );
+        assert!(!ui.get_main_muted());
+        assert!(!ui.get_main_mute_enabled());
+        assert!(!generated_mixer.row_data(0).unwrap().muted);
+        assert!(!generated_mixer.row_data(0).unwrap().controls_enabled);
+        ui.invoke_toggle_mixer_channel_mute_requested(0);
+        ui.invoke_toggle_mixer_channel_solo_requested(1);
+        ui.invoke_toggle_main_mute_requested();
+        assert_eq!(
+            saturated_mixer_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        );
 
         drop(meter_sender);
         apply_operator_meter_observation(

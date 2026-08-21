@@ -1,4 +1,4 @@
-import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
+import { Button, HorizontalBox, ListView, ScrollView, VerticalBox } from "std-widgets.slint";
 
 export struct OperatorSceneRow {
     name: string,
@@ -6,6 +6,13 @@ export struct OperatorSceneRow {
     available: bool,
     queued: bool,
     last-launched: bool,
+}
+
+export struct OperatorMixerRow {
+    name: string,
+    muted: bool,
+    soloed: bool,
+    controls-enabled: bool,
 }
 
 component FactCard inherits Rectangle {
@@ -101,6 +108,38 @@ component SceneLaunchTile inherits Rectangle {
     }
 }
 
+component MixerChannelRow inherits Rectangle {
+    in property <string> name;
+    in property <bool> muted;
+    in property <bool> soloed;
+    in property <bool> controls-enabled;
+    callback mute-requested();
+    callback solo-requested();
+    min-height: 38px;
+    background: #111620;
+    border-color: #2c3445;
+    border-width: 1px;
+    border-radius: 5px;
+
+    HorizontalLayout {
+        padding: 6px;
+        spacing: 7px;
+        Text { text: root.name; color: #edf2f8; font-size: 11px; font-weight: 700; overflow: elide; }
+        Button {
+            text: root.muted ? "Unmute" : "Mute";
+            accessible-label: (root.muted ? "Unmute " : "Mute ") + root.name;
+            enabled: root.controls-enabled;
+            clicked => { root.mute-requested(); }
+        }
+        Button {
+            text: root.soloed ? "Unsolo" : "Solo";
+            accessible-label: (root.soloed ? "Unsolo " : "Solo ") + root.name;
+            enabled: root.controls-enabled;
+            clicked => { root.solo-requested(); }
+        }
+    }
+}
+
 export component OperatorWindow inherits Window {
     title: "Hyper Runtime";
     width: 880px;
@@ -148,6 +187,10 @@ export component OperatorWindow inherits Window {
     in-out property <bool> loudness-reset-confirming: false;
     in property <[OperatorSceneRow]> scenes;
     in property <string> scene-feedback;
+    in property <[OperatorMixerRow]> mixer-channels;
+    in property <bool> main-muted: false;
+    in property <bool> main-mute-enabled: false;
+    in property <string> mixer-state: "Mixer state unavailable";
     in property <string> diagnostic;
 
     callback start-requested();
@@ -161,6 +204,9 @@ export component OperatorWindow inherits Window {
     callback begin-loudness-reset();
     callback cancel-loudness-reset();
     callback confirm-loudness-reset();
+    callback toggle-mixer-channel-mute-requested(int);
+    callback toggle-mixer-channel-solo-requested(int);
+    callback toggle-main-mute-requested();
     callback launch-scene-requested(int);
     callback quit-requested();
 
@@ -179,9 +225,11 @@ export component OperatorWindow inherits Window {
         }
     }
 
-    VerticalLayout {
-        padding: 24px;
-        spacing: 18px;
+    ScrollView {
+        horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+        VerticalLayout {
+            padding: 24px;
+            spacing: 18px;
 
         VerticalLayout {
             spacing: 4px;
@@ -291,6 +339,39 @@ export component OperatorWindow inherits Window {
             }
         }
 
+        Rectangle {
+            background: #171b24;
+            border-color: #2c3445;
+            border-width: 1px;
+            border-radius: 8px;
+            min-height: 162px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 7px;
+                HorizontalLayout {
+                    Text { text: "LIVE MIXER · SESSION ONLY"; color: #8d99ad; font-size: 11px; font-weight: 700; }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Text { text: root.mixer-state; color: #8d99ad; font-size: 10px; overflow: elide; }
+                    Button {
+                        text: root.main-muted ? "Unmute main" : "Mute main";
+                        enabled: root.main-mute-enabled;
+                        clicked => { root.toggle-main-mute-requested(); }
+                    }
+                }
+                ListView {
+                    height: 112px;
+                    for channel[index] in root.mixer-channels : MixerChannelRow {
+                        name: (index + 1) + " · " + channel.name;
+                        muted: channel.muted;
+                        soloed: channel.soloed;
+                        controls-enabled: channel.controls-enabled;
+                        mute-requested => { root.toggle-mixer-channel-mute-requested(index); }
+                        solo-requested => { root.toggle-mixer-channel-solo-requested(index); }
+                    }
+                }
+            }
+        }
+
         if root.scenes.length > 0 : Rectangle {
             background: #171b24;
             border-color: #2c3445;
@@ -347,18 +428,19 @@ export component OperatorWindow inherits Window {
             }
         }
 
-        HorizontalLayout {
-            spacing: 10px;
-            Button { text: "Start"; clicked => { root.start-requested(); } }
-            Button { text: "Stop"; clicked => { root.stop-requested(); } }
-            Button { text: "Return to start"; clicked => { root.return-to-start-requested(); } }
-            Button {
-                text: root.loop-toggle-label;
-                enabled: root.loop-toggle-enabled;
-                clicked => { root.toggle-loop-requested(); }
+            HorizontalLayout {
+                spacing: 10px;
+                Button { text: "Start"; clicked => { root.start-requested(); } }
+                Button { text: "Stop"; clicked => { root.stop-requested(); } }
+                Button { text: "Return to start"; clicked => { root.return-to-start-requested(); } }
+                Button {
+                    text: root.loop-toggle-label;
+                    enabled: root.loop-toggle-enabled;
+                    clicked => { root.toggle-loop-requested(); }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Button { text: "Shut down Runtime"; clicked => { root.quit-requested(); } }
             }
-            Rectangle { horizontal-stretch: 1; }
-            Button { text: "Shut down Runtime"; clicked => { root.quit-requested(); } }
         }
     }
 }
