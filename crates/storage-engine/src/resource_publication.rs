@@ -420,6 +420,7 @@ impl AudioTrackTransactionOperation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublicationPhase {
     Transaction,
+    ResourceFile,
     Resource,
     Manifest,
 }
@@ -1381,7 +1382,7 @@ fn publish_project_resource_observed(
             clear_and_remove_transaction(&backups, transaction, &transaction_name).map_err(
                 |error| ProjectResourcePublicationError {
                     kind: ProjectResourcePublicationErrorKind::Recovery,
-                    message: "resource was published but transaction cleanup is incomplete"
+                    message: "resource change committed but transaction cleanup is incomplete"
                         .to_owned(),
                     published: true,
                     source: Some(Box::new(error)),
@@ -1401,7 +1402,7 @@ fn publish_project_resource_observed(
                 Err(source) => {
                     return Err(ProjectResourcePublicationError {
                         kind: ProjectResourcePublicationErrorKind::Recovery,
-                        message: "resource publication failed and its durable transaction could not be read"
+                        message: "resource change failed and its durable transaction could not be read"
                             .to_owned(),
                         published: false,
                         source: Some(Box::new(source)),
@@ -1425,7 +1426,7 @@ fn publish_project_resource_observed(
                     clear_and_remove_transaction(&backups, transaction, &transaction_name)
                         .map_err(|error| ProjectResourcePublicationError {
                             kind: ProjectResourcePublicationErrorKind::Recovery,
-                            message: "resource was published but transaction cleanup is incomplete"
+                            message: "resource change committed but transaction cleanup is incomplete"
                                 .to_owned(),
                             published: true,
                             source: Some(Box::new(error)),
@@ -1433,8 +1434,8 @@ fn publish_project_resource_observed(
                     Ok(outcome)
                 }
                 Err(recovery_error) => Err(publication_recovery_failure(
-                    "resource publication and recovery both failed",
-                    "resource was published but verification or transaction recovery is incomplete",
+                    "resource change and recovery both failed",
+                    "resource change committed but verification or transaction recovery is incomplete",
                     recovery_error,
                 )),
             }
@@ -1659,6 +1660,7 @@ fn run_resource_removal(
         .remove_file(file_name(resource_path)?)
         .map_err(|error| caused(ProjectResourcePublicationErrorKind::Io, "remove project resource", error))?;
     sync_dir(&parent)?;
+    observer(PublicationPhase::ResourceFile, verified.root())?;
     if removed_parent_directory {
         drop(parent);
         let directory = addition_directory(request.expected_role).ok_or_else(|| {
@@ -5389,6 +5391,43 @@ mod tests {
                 resource_bytes: &[],
             }
         }
+
+        fn transaction_count(&self) -> usize {
+            fs::read_dir(self.root.join("backups"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(TRANSACTION_PREFIX)
+                })
+                .count()
+        }
+
+        fn transaction_path(&self) -> PathBuf {
+            fs::read_dir(self.root.join("backups"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(TRANSACTION_PREFIX)
+                })
+                .unwrap()
+                .path()
+        }
+
+        fn transaction_id(&self) -> String {
+            self.transaction_path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .strip_prefix(TRANSACTION_PREFIX)
+                .unwrap()
+                .to_owned()
+        }
     }
 
     impl Drop for AutomationTakeFixture {
@@ -5554,6 +5593,7 @@ mod tests {
     fn device_chain_removal_recovers_every_durable_phase() {
         for crash_phase in [
             PublicationPhase::Transaction,
+            PublicationPhase::ResourceFile,
             PublicationPhase::Resource,
             PublicationPhase::Manifest,
         ] {
@@ -5666,6 +5706,7 @@ mod tests {
     fn automation_take_removal_recovers_every_durable_phase() {
         for crash_phase in [
             PublicationPhase::Transaction,
+            PublicationPhase::ResourceFile,
             PublicationPhase::Resource,
             PublicationPhase::Manifest,
         ] {
@@ -5707,6 +5748,94 @@ mod tests {
             );
             assert_eq!(fixture.root.join("takes").exists(), !committed);
         }
+    }
+
+    #[test]
+    fn automation_take_removal_recovery_rejects_tampered_evidence_without_mutation() {
+        for tamper in ["bytes", "identity", "role", "path"] {
+            let fixture = AutomationTakeFixture::new();
+            publish_automation_take(&fixture.root, fixture.request()).unwrap();
+            let active_path = fixture
+                .root
+                .join("takes")
+                .join(format!("{AUTOMATION_TAKE_ID}.json"));
+            let manifest_before = fs::read(fixture.root.join(MANIFEST_NAME)).unwrap();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = publish_project_resource_observed(
+                    &fixture.root,
+                    fixture.removal_resource_request(),
+                    ProjectResourcePublicationMode::AutomationTakeRemoval,
+                    |phase, _| {
+                        assert_ne!(
+                            phase,
+                            PublicationPhase::Transaction,
+                            "simulated process crash"
+                        );
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+            let transaction_path = fixture.transaction_path();
+            if tamper == "bytes" {
+                fs::write(transaction_path.join(RESOURCE_STAGING_NAME), b"tampered").unwrap();
+            } else {
+                let record_path = transaction_path.join(TRANSACTION_NAME);
+                let mut record: Value =
+                    serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+                match tamper {
+                    "identity" => record["resource_id"] = SCENE_ID.into(),
+                    "role" => record["resource_role"] = "device-chain".into(),
+                    "path" => record["resource"]["path"] = "takes/other.json".into(),
+                    _ => unreachable!(),
+                }
+                fs::write(
+                    record_path,
+                    serde_json_canonicalizer::to_vec(&record).unwrap(),
+                )
+                .unwrap();
+            }
+
+            let error = recover_project_resource_publications(&fixture.root).unwrap_err();
+            assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
+            assert_eq!(fs::read(&active_path).unwrap(), fixture.take);
+            assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), manifest_before);
+            assert_eq!(fixture.transaction_count(), 1);
+        }
+    }
+
+    #[test]
+    fn committed_automation_take_removal_warning_uses_neutral_change_wording() {
+        let fixture = AutomationTakeFixture::new();
+        publish_automation_take(&fixture.root, fixture.request()).unwrap();
+        let error = publish_project_resource_observed(
+            &fixture.root,
+            fixture.removal_resource_request(),
+            ProjectResourcePublicationMode::AutomationTakeRemoval,
+            |phase, _| {
+                if phase != PublicationPhase::Manifest {
+                    return Ok(());
+                }
+                fs::write(
+                    fixture
+                        .root
+                        .join("backups")
+                        .join(format!(".project-{}.json", fixture.transaction_id())),
+                    b"unrelated cleanup residue",
+                )
+                .unwrap();
+                Err(failure(
+                    ProjectResourcePublicationErrorKind::Io,
+                    "simulated post-manifest failure",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.published());
+        assert!(error.to_string().contains("resource change committed"));
+        assert!(!error.to_string().contains("published"));
+        assert!(!fixture.root.join("takes").exists());
     }
 
     #[test]
