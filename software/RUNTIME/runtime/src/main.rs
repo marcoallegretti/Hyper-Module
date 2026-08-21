@@ -21,7 +21,7 @@ use hyper_desktop_audio::{
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
-    PlaybackRecoveryCheckpoint, PlaybackRecoveryTransportState, TransportCommand,
+    LocateState, PlaybackRecoveryCheckpoint, PlaybackRecoveryTransportState, TransportCommand,
 };
 use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
 use hyper_playback_json::LoaderLimits;
@@ -147,6 +147,7 @@ struct StartedRuntime {
 enum OperatorCommand {
     Start,
     Stop,
+    ReturnToStart,
     Quit,
 }
 
@@ -410,6 +411,13 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
                 Ok(()) => diagnostic("transport stop queued".to_owned()),
                 Err(error) => diagnostic(format!("transport stop refused: {error}")),
             },
+            OperatorCommand::ReturnToStart => match host.queue_transport(TransportCommand::Locate {
+                frame: 0,
+                state: LocateState::Preserve,
+            }) {
+                Ok(()) => diagnostic("transport return to start queued".to_owned()),
+                Err(error) => diagnostic(format!("transport return to start refused: {error}")),
+            },
             OperatorCommand::Quit => stop.store(true, Ordering::Release),
         }
     }
@@ -452,6 +460,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     apply_static_facts(&ui, &observers.facts);
     wire_operator_action(&ui, &commands_tx, &diagnostic, OperatorCommand::Start);
     wire_operator_stop(&ui, &commands_tx, &diagnostic);
+    wire_operator_return_to_start(&ui, &commands_tx, &diagnostic);
     wire_operator_quit(&ui, &commands_tx, &stop, &diagnostic);
 
     let weak = ui.as_weak();
@@ -513,6 +522,18 @@ fn wire_operator_stop(
     let diagnostic = Arc::clone(diagnostic);
     ui.on_stop_requested(move || {
         send_operator_command(&sender, OperatorCommand::Stop, &diagnostic);
+    });
+}
+
+fn wire_operator_return_to_start(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+) {
+    let sender = sender.clone();
+    let diagnostic = Arc::clone(diagnostic);
+    ui.on_return_to_start_requested(move || {
+        send_operator_command(&sender, OperatorCommand::ReturnToStart, &diagnostic);
     });
 }
 
@@ -983,6 +1004,7 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
         sender.send(OperatorCommand::Start).unwrap();
         sender.send(OperatorCommand::Stop).unwrap();
+        sender.send(OperatorCommand::ReturnToStart).unwrap();
         let stop = AtomicBool::new(false);
         let mut owner = OperatorControl::default();
         let diagnostics = RefCell::new(Vec::new());
@@ -993,11 +1015,22 @@ mod tests {
 
         assert_eq!(
             owner.commands,
-            [TransportCommand::Start, TransportCommand::Stop]
+            [
+                TransportCommand::Start,
+                TransportCommand::Stop,
+                TransportCommand::Locate {
+                    frame: 0,
+                    state: LocateState::Preserve,
+                },
+            ]
         );
         assert_eq!(
             diagnostics.into_inner(),
-            ["transport start queued", "transport stop queued"]
+            [
+                "transport start queued",
+                "transport stop queued",
+                "transport return to start queued",
+            ]
         );
         assert!(!stop.load(Ordering::Acquire));
     }
@@ -1037,6 +1070,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         wire_operator_action(&ui, &sender, &diagnostic, OperatorCommand::Start);
         wire_operator_stop(&ui, &sender, &diagnostic);
+        wire_operator_return_to_start(&ui, &sender, &diagnostic);
         wire_operator_quit(&ui, &sender, &stop, &diagnostic);
 
         let facts = RuntimeFacts {
@@ -1059,10 +1093,12 @@ mod tests {
 
         ui.invoke_start_requested();
         ui.invoke_stop_requested();
+        ui.invoke_return_to_start_requested();
         ui.invoke_quit_requested();
 
         assert_eq!(receiver.try_recv(), Ok(OperatorCommand::Start));
         assert_eq!(receiver.try_recv(), Ok(OperatorCommand::Stop));
+        assert_eq!(receiver.try_recv(), Ok(OperatorCommand::ReturnToStart));
         assert_eq!(receiver.try_recv(), Ok(OperatorCommand::Quit));
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
         assert!(stop.load(Ordering::Acquire));
