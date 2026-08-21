@@ -6,9 +6,11 @@ use super::{
     AudioClipPublicationRecovery, AudioTrackPublicationRecovery, ControlMappingPublicationError,
     ControlMappingPublicationRecovery, ProjectResourcePublicationError,
     ProjectResourcePublicationRecovery, RecordingImportError, RecordingImportRecovery,
+    SampleCleanupRecovery,
     recover_audio_clip_publications, recover_audio_track_publications,
     recover_control_mapping_publications, recover_project_resource_publications,
     recover_recording_imports,
+    recover_sample_cleanups,
 };
 
 /// Complete transaction-recovery evidence produced before an editable project
@@ -20,6 +22,7 @@ pub struct ProjectTransactionRecoveryReport {
 
 #[derive(Debug, Default)]
 struct ProjectTransactionRecoveryFamilies {
+    sample_cleanups: Vec<SampleCleanupRecovery>,
     resources: Vec<ProjectResourcePublicationRecovery>,
     audio_tracks: Vec<AudioTrackPublicationRecovery>,
     audio_clips: Vec<AudioClipPublicationRecovery>,
@@ -29,6 +32,7 @@ struct ProjectTransactionRecoveryFamilies {
 
 impl ProjectTransactionRecoveryReport {
     fn from_parts(
+        sample_cleanups: Vec<SampleCleanupRecovery>,
         resources: Vec<ProjectResourcePublicationRecovery>,
         audio_tracks: Vec<AudioTrackPublicationRecovery>,
         audio_clips: Vec<AudioClipPublicationRecovery>,
@@ -37,6 +41,7 @@ impl ProjectTransactionRecoveryReport {
     ) -> Self {
         Self {
             families: Box::new(ProjectTransactionRecoveryFamilies {
+                sample_cleanups,
                 resources,
                 audio_tracks,
                 audio_clips,
@@ -49,6 +54,11 @@ impl ProjectTransactionRecoveryReport {
     #[must_use]
     pub fn resources(&self) -> &[ProjectResourcePublicationRecovery] {
         &self.families.resources
+    }
+
+    #[must_use]
+    pub fn sample_cleanups(&self) -> &[SampleCleanupRecovery] {
+        &self.families.sample_cleanups
     }
 
     #[must_use]
@@ -73,7 +83,8 @@ impl ProjectTransactionRecoveryReport {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.families.resources.is_empty()
+        self.families.sample_cleanups.is_empty()
+            && self.families.resources.is_empty()
             && self.families.audio_tracks.is_empty()
             && self.families.audio_clips.is_empty()
             && self.families.control_mappings.is_empty()
@@ -84,6 +95,7 @@ impl ProjectTransactionRecoveryReport {
 #[derive(Debug)]
 pub enum ProjectTransactionRecoveryErrorSource {
     Resource(ProjectResourcePublicationError),
+    SampleCleanup(ProjectResourcePublicationError),
     AudioTrack(ProjectResourcePublicationError),
     AudioClip(ProjectResourcePublicationError),
     ControlMapping(ControlMappingPublicationError),
@@ -94,6 +106,7 @@ impl fmt::Display for ProjectTransactionRecoveryErrorSource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Resource(source) => write!(formatter, "resource recovery failed: {source}"),
+            Self::SampleCleanup(source) => write!(formatter, "sample cleanup recovery failed: {source}"),
             Self::AudioTrack(source) => write!(formatter, "audio-track recovery failed: {source}"),
             Self::AudioClip(source) => write!(formatter, "audio-clip recovery failed: {source}"),
             Self::ControlMapping(source) => {
@@ -107,7 +120,10 @@ impl fmt::Display for ProjectTransactionRecoveryErrorSource {
 impl Error for ProjectTransactionRecoveryErrorSource {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Resource(source) | Self::AudioTrack(source) | Self::AudioClip(source) => {
+            Self::Resource(source)
+            | Self::SampleCleanup(source)
+            | Self::AudioTrack(source)
+            | Self::AudioClip(source) => {
                 Some(source)
             }
             Self::ControlMapping(source) => Some(source),
@@ -178,17 +194,30 @@ pub fn recover_project_transactions(
     project_path: impl AsRef<Path>,
 ) -> Result<ProjectTransactionRecoveryReport, ProjectTransactionRecoveryError> {
     let project_path = project_path.as_ref();
-    let resources = recover_project_resource_publications(project_path).map_err(|source| {
+    let sample_cleanups = recover_sample_cleanups(project_path).map_err(|source| {
         ProjectTransactionRecoveryError {
             completed: ProjectTransactionRecoveryReport::default(),
-            source: Box::new(ProjectTransactionRecoveryErrorSource::Resource(source)),
+            source: Box::new(ProjectTransactionRecoveryErrorSource::SampleCleanup(source)),
         }
     })?;
+    let resources = match recover_project_resource_publications(project_path) {
+        Ok(resources) => resources,
+        Err(source) => {
+            return Err(ProjectTransactionRecoveryError {
+                completed: ProjectTransactionRecoveryReport::from_parts(
+                    sample_cleanups,
+                    Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+                ),
+                source: Box::new(ProjectTransactionRecoveryErrorSource::Resource(source)),
+            });
+        }
+    };
     let audio_tracks = match recover_audio_track_publications(project_path) {
         Ok(audio_tracks) => audio_tracks,
         Err(source) => {
             return Err(ProjectTransactionRecoveryError {
                 completed: ProjectTransactionRecoveryReport::from_parts(
+                    sample_cleanups,
                     resources,
                     Vec::new(),
                     Vec::new(),
@@ -204,6 +233,7 @@ pub fn recover_project_transactions(
         Err(source) => {
             return Err(ProjectTransactionRecoveryError {
                 completed: ProjectTransactionRecoveryReport::from_parts(
+                    sample_cleanups,
                     resources,
                     audio_tracks,
                     Vec::new(),
@@ -219,6 +249,7 @@ pub fn recover_project_transactions(
         Err(source) => {
             return Err(ProjectTransactionRecoveryError {
                 completed: ProjectTransactionRecoveryReport::from_parts(
+                    sample_cleanups,
                     resources,
                     audio_tracks,
                     audio_clips,
@@ -232,6 +263,7 @@ pub fn recover_project_transactions(
         }
     };
     let report = ProjectTransactionRecoveryReport::from_parts(
+        sample_cleanups,
         resources,
         audio_tracks,
         audio_clips,
@@ -242,6 +274,7 @@ pub fn recover_project_transactions(
         Ok(recordings) => {
             let families = *report.families;
             Ok(ProjectTransactionRecoveryReport::from_parts(
+                families.sample_cleanups,
                 families.resources,
                 families.audio_tracks,
                 families.audio_clips,
@@ -300,7 +333,7 @@ mod tests {
         assert!(error.completed().is_empty());
         assert!(matches!(
             error.recovery_source(),
-            ProjectTransactionRecoveryErrorSource::Resource(_)
+            ProjectTransactionRecoveryErrorSource::SampleCleanup(_)
         ));
         drop(lock);
         assert!(recover_project_transactions(&root).unwrap().is_empty());

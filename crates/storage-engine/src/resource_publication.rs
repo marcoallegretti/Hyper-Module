@@ -13,12 +13,17 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 mod audio_clip_publication;
+mod sample_cleanup;
 
 pub use audio_clip_publication::{
     AudioClipPublicationOutcome, AudioClipPublicationRecovery,
     AudioClipPublicationRecoveryDisposition, AudioClipPublicationRequest, AudioClipRemovalOutcome,
     AudioClipRemovalRequest, ImportedAudioClipPublicationRequest, publish_audio_clip,
     publish_imported_audio_clip, recover_audio_clip_publications, remove_audio_clip,
+};
+pub use sample_cleanup::{
+    SampleCleanupOutcome, SampleCleanupRecovery, SampleCleanupRecoveryDisposition,
+    SampleCleanupRequest, clean_unused_samples, recover_sample_cleanups,
 };
 
 use super::project_lock::{
