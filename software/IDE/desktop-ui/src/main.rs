@@ -27,6 +27,7 @@ use hyper_desktop_ide::{
     OfflineExportReport,
     IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent, IdeRecordingAbortOutcome,
     IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation,
+    IdeUnusedSampleCleanupSummary,
     IdeScaledLoudnessValue, IdeScene, IdeSceneAvailability, IdeSceneLaunchQuantization,
     IdeSceneLaunchState, IdeSceneSlotEdit, IdeSceneTrackAction, IdeWorkerCommand,
     IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError,
@@ -100,6 +101,7 @@ struct ProjectUiState {
     scene_launch_evidence: RefCell<SceneLaunchEvidence>,
     automation_channels: RefCell<Vec<MixerChannelFacts>>,
     control_targets: RefCell<Vec<ControlTargetChoice>>,
+    unused_sample_cleanup: Cell<Option<IdeUnusedSampleCleanupSummary>>,
 }
 
 /// The two marks a user sets independently. They only become a transport range
@@ -2500,6 +2502,7 @@ fn bind_audio_clip_callback(
     bind_audio_clip_rename_callback(ui, worker, project_state);
     bind_audio_clip_duplication_callback(ui, worker, project_state);
     bind_audio_clip_removal_callback(ui, worker, project_state);
+    bind_unused_sample_cleanup_callback(ui, worker, project_state);
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_activation = Rc::clone(worker);
@@ -2916,6 +2919,47 @@ fn bind_audio_clip_removal_callback_with(
     });
 }
 
+fn bind_unused_sample_cleanup_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let state = Rc::clone(project_state);
+    let worker = Rc::clone(worker);
+    bind_unused_sample_cleanup_callback_with(
+        ui,
+        move || state.unused_sample_cleanup.get(),
+        move |ui, command| submit_to_ui(ui, &worker, command),
+    );
+}
+
+fn bind_unused_sample_cleanup_callback_with(
+    ui: &MainWindow,
+    resolve: impl Fn() -> Option<IdeUnusedSampleCleanupSummary> + 'static,
+    submit: impl Fn(&MainWindow, IdeWorkerCommand) + 'static,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    actions.on_clean_unused_samples(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_unused_sample_cleanup_confirming() {
+            ui.set_error_text("Unused-media cleanup confirmation is no longer current".into());
+            return;
+        }
+        let Some(confirmation) = resolve() else {
+            ui.set_error_text("Unused-media cleanup authority is unavailable".into());
+            return;
+        };
+        if confirmation.is_empty() {
+            ui.set_error_text("The project has no unused sample media".into());
+            return;
+        }
+        submit(&ui, IdeWorkerCommand::CleanUnusedSamples { confirmation });
+    });
+}
+
 fn bind_arrangement_placement_addition_callback(
     ui: &MainWindow,
     worker: &WorkerCell,
@@ -3293,6 +3337,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::RenameAudioClip => AppMode::RenamingClip,
         IdeWorkerCommandKind::DuplicateAudioClip => AppMode::DuplicatingClip,
         IdeWorkerCommandKind::RemoveAudioClip => AppMode::RemovingClip,
+        IdeWorkerCommandKind::CleanUnusedSamples => AppMode::CleaningSamples,
         IdeWorkerCommandKind::SetAudioClipActive => AppMode::ChangingClipActivation,
         IdeWorkerCommandKind::SetAudioClipGain => AppMode::ChangingClipGain,
         IdeWorkerCommandKind::SetAudioClipFades => AppMode::ChangingClipFades,
@@ -3411,6 +3456,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::RemoveAudioClip => {
             "Preserving mixer state, removing the unused audio clip, and reopening project…"
+        }
+        IdeWorkerCommandKind::CleanUnusedSamples => {
+            "Preserving mixer state, permanently removing unused sample copies, and reopening project…"
         }
         IdeWorkerCommandKind::SetAudioClipActive => {
             "Preserving mixer state, updating audio-clip activation, and reopening project…"
@@ -3662,6 +3710,11 @@ fn apply_event(
         | IdeWorkerEvent::AudioClipRemovalCommittedWithWarning { .. }
         | IdeWorkerEvent::AudioClipRemoving) => {
             apply_audio_clip_removal_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::UnusedSamplesCleaned { .. }
+        | IdeWorkerEvent::UnusedSampleCleanupCommittedWithWarning { .. }
+        | IdeWorkerEvent::UnusedSampleCleanupStarting { .. }) => {
+            apply_unused_sample_cleanup_event(ui, &event);
         }
         event @ IdeWorkerEvent::AudioClipEditCommittedWithWarning { .. } => {
             apply_audio_clip_edit_committed_warning(ui, &event);
@@ -4795,6 +4848,43 @@ fn reset_audio_clip_removal_form(ui: &MainWindow) {
     ui.set_clip_remove_name(SharedString::default());
 }
 
+fn apply_unused_sample_cleanup_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::UnusedSampleCleanupStarting { assets, bytes } => {
+            ui.set_app_mode(AppMode::CleaningSamples);
+            ui.set_status_text(
+                format!(
+                    "Waiting for native output before permanently removing {assets} unused sample copies ({bytes} bytes)…"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::UnusedSamplesCleaned {
+            revision,
+            assets,
+            bytes,
+        } => {
+            ui.set_unused_sample_cleanup_confirming(false);
+            ui.set_status_text(
+                format!(
+                    "Permanently removed {assets} unused project sample copies ({bytes} bytes) in revision {revision}; recording takes and external originals were retained"
+                )
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::UnusedSampleCleanupCommittedWithWarning { warning } => {
+            ui.set_unused_sample_cleanup_confirming(false);
+            ui.set_status_text(
+                committed_warning_status(ui.get_app_mode(), "Unused sample cleanup").into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        _ => unreachable!("unused-sample cleanup event dispatcher received another event"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AudioClipEditWarningForm {
     None,
@@ -5297,6 +5387,7 @@ fn apply_running_event(
     apply_mixer_observation(ui, observation);
     set_recording_targets(ui, recording_routes, observation.mixer_channels());
     set_audio_import_targets(ui, audio_import_routes, observation.mixer_channels());
+    apply_unused_sample_cleanup_observation(ui, project_state, observation);
     set_recording_takes(ui, take_routes, observation);
     set_playback_extent(ui, project_state, observation);
     set_tempo_and_loop(ui, project_state, observation);
@@ -5381,6 +5472,18 @@ fn apply_running_event(
             apply_idle_running_event(ui);
         }
     }
+}
+
+fn apply_unused_sample_cleanup_observation(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    observation: &IdeRunningObservation,
+) {
+    let unused = observation.unused_sample_cleanup();
+    project_state.unused_sample_cleanup.set(Some(unused));
+    ui.set_unused_sample_assets(i32::try_from(unused.assets()).unwrap_or(i32::MAX));
+    ui.set_unused_sample_bytes(format!("{} bytes", unused.bytes()).into());
+    ui.set_unused_sample_cleanup_confirming(false);
 }
 
 fn next_audio_track_name(track_count: i32) -> SharedString {
@@ -6151,6 +6254,10 @@ fn reset_project(
     *project_state.playback_end_frame.borrow_mut() = None;
     *project_state.arrangement.borrow_mut() = None;
     project_state.audio_clips.borrow_mut().clear();
+    project_state.unused_sample_cleanup.set(None);
+    ui.set_unused_sample_assets(0);
+    ui.set_unused_sample_bytes("0 bytes".into());
+    ui.set_unused_sample_cleanup_confirming(false);
     project_state.scenes.borrow_mut().clear();
     project_state.automation_channels.borrow_mut().clear();
     project_state.control_targets.borrow_mut().clear();
@@ -6350,6 +6457,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::RemoveAudioClip if current == AppMode::RemovingClip => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::CleanUnusedSamples if current == AppMode::CleaningSamples => {
             AppMode::Running
         }
         IdeWorkerCommandKind::SetAudioClipActive if current == AppMode::ChangingClipActivation => {
@@ -11464,6 +11574,7 @@ mod tests {
         assert_recent_project_window_contract(&ui);
         assert_audio_import_window_contract(&ui);
         assert_audio_clip_removal_window_contract(&ui);
+        assert_unused_sample_cleanup_window_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);
         ui.set_status_text("Choose a Runtime destination".into());
         ui.set_error_text("retained message".into());
@@ -11728,6 +11839,56 @@ mod tests {
         assert!(ui.get_clip_remove_id().is_empty());
         assert!(ui.get_status_text().contains("source media was retained"));
         assert!(ui.get_error_text().is_empty());
+    }
+
+    fn assert_unused_sample_cleanup_window_contract(ui: &MainWindow) {
+        let confirmation = IdeUnusedSampleCleanupSummary::new([7; 32], 9, 2, 4_096);
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_unused_sample_cleanup_callback_with(
+            ui,
+            move || Some(confirmation),
+            move |_, command| submitted_by_callback.borrow_mut().push(command),
+        );
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_unused_sample_assets(2);
+        ui.set_unused_sample_bytes("4096 bytes".into());
+        ui.set_unused_sample_cleanup_confirming(false);
+        ui.global::<IdeActions>().invoke_clean_unused_samples();
+        assert!(submitted.borrow().is_empty());
+        assert!(ui.get_error_text().contains("no longer current"));
+
+        ui.set_error_text(SharedString::default());
+        ui.set_unused_sample_cleanup_confirming(true);
+        ui.global::<IdeActions>().invoke_clean_unused_samples();
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::CleanUnusedSamples { confirmation: submitted }]
+                if *submitted == confirmation
+        ));
+
+        apply_unused_sample_cleanup_event(
+            ui,
+            &IdeWorkerEvent::UnusedSampleCleanupStarting {
+                assets: 2,
+                bytes: 4_096,
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::CleaningSamples);
+        apply_unused_sample_cleanup_event(
+            ui,
+            &IdeWorkerEvent::UnusedSamplesCleaned {
+                revision: 10,
+                assets: 2,
+                bytes: 4_096,
+            },
+        );
+        assert!(!ui.get_unused_sample_cleanup_confirming());
+        assert!(
+            ui.get_status_text()
+                .contains("external originals were retained")
+        );
     }
 
     fn assert_audio_import_callback_contract(ui: &MainWindow, routes: &AudioImportRoutes) {

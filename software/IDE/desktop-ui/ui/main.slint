@@ -28,6 +28,7 @@ export enum AppMode {
     renaming-clip,
     duplicating-clip,
     removing-clip,
+    cleaning-samples,
     changing-clip-activation,
     changing-clip-gain,
     changing-clip-fades,
@@ -221,6 +222,7 @@ export global IdeActions {
     callback rename-audio-clip(string, string);
     callback duplicate-audio-clip(string, string);
     callback remove-audio-clip(string);
+    callback clean-unused-samples();
     callback set-audio-clip-active(string, bool);
     callback set-audio-clip-gain(string, string);
     callback set-audio-clip-fades(string, string, string);
@@ -557,6 +559,9 @@ export component MainWindow inherits Window {
     in property <[ArrangementSceneLaunchRow]> arrangement-scene-launches: [];
     in property <[string]> scene-names: [];
     in property <[ClipRow]> audio-clips: [];
+    in property <int> unused-sample-assets: 0;
+    in property <string> unused-sample-bytes: "0 bytes";
+    in-out property <bool> unused-sample-cleanup-confirming: false;
     in property <[string]> audio-import-track-names: [];
     in-out property <int> selected-audio-import-track-index: 0;
     in property <string> arrangement-span-clock: "—";
@@ -3060,6 +3065,36 @@ export component MainWindow inherits Window {
 
                         Rectangle { height: 1px; background: #27313d; }
 
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: root.unused-sample-assets == 0
+                                    ? "No unreferenced imported media"
+                                    : root.unused-sample-assets + " unreferenced sample " + (root.unused-sample-assets == 1 ? "copy" : "copies") + " · " + root.unused-sample-bytes;
+                                color: root.unused-sample-assets == 0 ? #65758a : #e5b567;
+                                font-size: 10px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            if !root.unused-sample-cleanup-confirming : Button {
+                                text: "Clean unused media";
+                                enabled: root.app-mode == AppMode.running && root.unused-sample-assets > 0;
+                                accessible-label: "Permanently remove unreferenced project-owned sample copies";
+                                clicked => { root.unused-sample-cleanup-confirming = true; }
+                            }
+                            if root.unused-sample-cleanup-confirming : Button {
+                                text: "Cancel";
+                                clicked => { root.unused-sample-cleanup-confirming = false; }
+                            }
+                            if root.unused-sample-cleanup-confirming : Button {
+                                text: "Delete copies permanently";
+                                enabled: root.app-mode == AppMode.running && root.unused-sample-assets > 0;
+                                accessible-label: "Confirm permanent deletion of " + root.unused-sample-assets + " unreferenced project sample copies";
+                                clicked => { IdeActions.clean-unused-samples(); }
+                            }
+                        }
+
                         if root.audio-clips.length == 0 : Text {
                             text: "This project contains no audio clips. Import WAV or FLAC into an audio track to create reusable clips.";
                             color: #8fa0b4;
@@ -3243,7 +3278,7 @@ export component MainWindow inherits Window {
                         }
 
                         Text {
-                            text: "Import copies WAV or FLAC into project-owned 48 kHz media and creates one full-file reusable clip per file; it creates no arrangement placement. Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Remove unused deletes only an unreferenced reusable clip and keeps its source media. Place creates one full-length non-ripple reference. Activation, direction, source slip, gain, loop, and fades affect every existing reference.";
+                            text: "Import copies WAV or FLAC into project-owned 48 kHz media and creates one full-file reusable clip per file; it creates no arrangement placement. Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Remove unused deletes only an unreferenced reusable clip and keeps its source media. Clean unused media permanently deletes only project-owned sample copies referenced by no clip; recording takes and external originals are never included. Place creates one full-length non-ripple reference. Activation, direction, source slip, gain, loop, and fades affect every existing reference.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;
