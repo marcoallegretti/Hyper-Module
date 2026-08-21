@@ -429,33 +429,47 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let stop = Arc::new(AtomicBool::new(false));
     let (commands_tx, commands_rx) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
     let diagnostic = Arc::new(Mutex::new(
         "starting verified Runtime deployment".to_owned(),
     ));
     let worker_diagnostic = Arc::clone(&diagnostic);
     let worker_stop = Arc::clone(&stop);
     let worker = std::thread::spawn(move || {
-        let mut runtime = match start_runtime(&arguments) {
-            Ok(runtime) => runtime,
+        let result = match start_runtime(&arguments) {
+            Ok(mut runtime) => {
+                announce_runtime(&arguments, &runtime);
+                if ready_tx.send(Ok(runtime.observers.clone())).is_err() {
+                    Err("operator UI ended before accepting startup evidence".to_owned())
+                } else {
+                    host_runtime(
+                        &arguments,
+                        &mut runtime.host,
+                        &runtime.observers.output_status,
+                        &worker_stop,
+                        Some(&commands_rx),
+                        &|message| set_diagnostic(&worker_diagnostic, message),
+                    )
+                }
+            }
             Err(error) => {
                 let _ = ready_tx.send(Err(error.clone()));
-                return Err(error);
+                Err(error)
             }
         };
-        announce_runtime(&arguments, &runtime);
-        let _ = ready_tx.send(Ok(runtime.observers.clone()));
-        host_runtime(
-            &arguments,
-            &mut runtime.host,
-            &runtime.observers.output_status,
-            &worker_stop,
-            Some(&commands_rx),
-            &|message| set_diagnostic(&worker_diagnostic, message),
-        )
+        let _ = completion_tx.send(result.clone());
+        result
     });
-    let observers = ready_rx
-        .recv()
-        .map_err(|_| "Runtime worker ended before publishing startup evidence".to_owned())??;
+    let observers = match ready_rx.recv() {
+        Ok(Ok(observers)) => observers,
+        Ok(Err(error)) => return finish_failed_operator_startup(error, worker),
+        Err(_) => {
+            return finish_failed_operator_startup(
+                "Runtime worker ended before publishing startup evidence".to_owned(),
+                worker,
+            );
+        }
+    };
 
     apply_static_facts(&ui, &observers.facts);
     wire_operator_action(&ui, &commands_tx, &diagnostic, OperatorCommand::Start);
@@ -470,6 +484,9 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
         if let Some(ui) = weak.upgrade() {
             apply_observations(&ui, &timer_observers, &timer_diagnostic);
+            apply_operator_worker_completion(&ui, &completion_rx, &timer_diagnostic, || {
+                let _ = ui.hide();
+            });
         }
     });
     apply_observations(&ui, &observers, &diagnostic);
@@ -479,6 +496,17 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         .map_err(|error| format!("operator UI failed: {error}"));
     drop(timer);
     finish_operator_worker(ui_result, &stop, &commands_tx, worker)
+}
+
+fn finish_failed_operator_startup(
+    reported_error: String,
+    worker: std::thread::JoinHandle<Result<(), String>>,
+) -> Result<(), String> {
+    match worker.join() {
+        Ok(Ok(())) => Err(reported_error),
+        Ok(Err(worker_error)) => Err(worker_error),
+        Err(_) => Err("Runtime worker panicked during startup".to_owned()),
+    }
 }
 
 fn finish_operator_worker(
@@ -500,6 +528,26 @@ fn set_diagnostic(diagnostic: &Mutex<String>, message: String) {
     if let Ok(mut current) = diagnostic.lock() {
         *current = message;
     }
+}
+
+fn apply_operator_worker_completion(
+    ui: &OperatorWindow,
+    completion: &Receiver<Result<(), String>>,
+    diagnostic: &Mutex<String>,
+    close_operator_surface: impl FnOnce(),
+) -> bool {
+    let message = match completion.try_recv() {
+        Ok(Ok(())) => "Runtime worker stopped".to_owned(),
+        Ok(Err(error)) => format!("Runtime worker stopped: {error}"),
+        Err(TryRecvError::Empty) => return false,
+        Err(TryRecvError::Disconnected) => {
+            "Runtime worker ended without publishing its result".to_owned()
+        }
+    };
+    set_diagnostic(diagnostic, message.clone());
+    ui.set_diagnostic(message.into());
+    close_operator_surface();
+    true
 }
 
 fn wire_operator_action(
@@ -1136,6 +1184,45 @@ mod tests {
         assert_eq!(ui.get_native_xruns().as_str(), "unavailable");
         assert_eq!(ui.get_panel_state().as_str(), "Disconnected");
         assert_eq!(ui.get_diagnostic().as_str(), "authoritative diagnostic");
+
+        let (completion_sender, completion_receiver) = std::sync::mpsc::sync_channel(1);
+        let surface_closed = Cell::new(false);
+        assert!(!apply_operator_worker_completion(
+            &ui,
+            &completion_receiver,
+            &diagnostic,
+            || surface_closed.set(true),
+        ));
+        assert!(!surface_closed.get());
+        completion_sender
+            .send(Err("native audio ownership ended unexpectedly".to_owned()))
+            .unwrap();
+        assert!(apply_operator_worker_completion(
+            &ui,
+            &completion_receiver,
+            &diagnostic,
+            || surface_closed.set(true),
+        ));
+        assert!(surface_closed.get());
+        assert_eq!(
+            ui.get_diagnostic().as_str(),
+            "Runtime worker stopped: native audio ownership ended unexpectedly"
+        );
+
+        let (lost_sender, lost_receiver) = std::sync::mpsc::sync_channel(1);
+        drop(lost_sender);
+        surface_closed.set(false);
+        assert!(apply_operator_worker_completion(
+            &ui,
+            &lost_receiver,
+            &diagnostic,
+            || surface_closed.set(true),
+        ));
+        assert!(surface_closed.get());
+        assert_eq!(
+            ui.get_diagnostic().as_str(),
+            "Runtime worker ended without publishing its result"
+        );
     }
 
     #[test]
@@ -1157,6 +1244,23 @@ mod tests {
             joined.load(Ordering::Acquire),
             "the join observed worker exit"
         );
+    }
+
+    #[test]
+    fn failed_operator_startup_joins_the_worker_and_returns_its_error() {
+        let joined = Arc::new(AtomicBool::new(false));
+        let worker_joined = Arc::clone(&joined);
+        let worker = std::thread::spawn(move || {
+            worker_joined.store(true, Ordering::Release);
+            Err("verified deployment was rejected".to_owned())
+        });
+
+        let error =
+            finish_failed_operator_startup("startup evidence channel closed".to_owned(), worker)
+                .unwrap_err();
+
+        assert_eq!(error, "verified deployment was rejected");
+        assert!(joined.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1204,9 +1308,6 @@ mod tests {
             format_transport_time(48_000 * (3 * 3_600 + 2 * 60 + 1) + 24_000),
             "03:02:01.500"
         );
-        assert_eq!(
-            format_transport_time(u64::MAX),
-            "106751991167:18:02.325"
-        );
+        assert_eq!(format_transport_time(u64::MAX), "106751991167:18:02.325");
     }
 }
