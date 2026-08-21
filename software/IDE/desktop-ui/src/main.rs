@@ -16,7 +16,8 @@ use hyper_desktop_ide::{
     IdeInputSelection, IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
     IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
     IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelKind, IdeMixerCommand,
-    IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeOutputSelection,
+    IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeFilter,
+    IdeNativeFilterEdit, NativeFilterMode, IdeOutputSelection,
     ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
     IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
     IdeControlMappingEdit, IdeLoopRangeFrames, IdeResourceRestoreError, MeterEvent, SceneAction,
@@ -32,6 +33,8 @@ use hyper_desktop_ide::{
     IdeSceneLaunchState, IdeSceneSlotEdit, IdeSceneTrackAction, IdeWorkerCommand,
     IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerPendingShutdownWait, IdeWorkerSendError,
     IdeWorkerShutdownOutcome, IdeWorkerShutdownReport, LocateState, MAX_IDE_SCENES,
+    MAX_FILTER_CUTOFF_MILLIHERTZ, MAX_FILTER_RESONANCE_MILLIONTHS,
+    MIN_FILTER_CUTOFF_MILLIHERTZ, MIN_FILTER_RESONANCE_MILLIONTHS,
     PlaybackRecoveryTransportState, TransportCommand, TransportLoopRange,
     desktop_ide_application_config,
     ide_audio_clip_gain_is_supported,
@@ -70,6 +73,7 @@ type RecordingRoutes = Rc<RefCell<Vec<usize>>>;
 type TakeRoutes = Rc<RefCell<Vec<TakeRoute>>>;
 type AudioImportRoutes = Rc<RefCell<Vec<String>>>;
 type ProjectUiStateCell = Rc<ProjectUiState>;
+type UiCommandSubmitter = Rc<dyn Fn(&MainWindow, IdeWorkerCommand)>;
 
 #[derive(Debug)]
 enum AudioImportChoice {
@@ -102,6 +106,7 @@ struct ProjectUiState {
     automation_channels: RefCell<Vec<MixerChannelFacts>>,
     control_targets: RefCell<Vec<ControlTargetChoice>>,
     unused_sample_cleanup: Cell<Option<IdeUnusedSampleCleanupSummary>>,
+    native_filter_tracks: RefCell<Vec<String>>,
 }
 
 /// The two marks a user sets independently. They only become a transport range
@@ -1184,6 +1189,202 @@ fn bind_playback_callbacks(
     });
 
     bind_mixer_callbacks(ui, worker);
+    bind_native_filter_callbacks(ui, worker, project_state);
+}
+
+fn bind_native_filter_callbacks(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let worker = Rc::clone(worker);
+    bind_native_filter_callbacks_with(
+        ui,
+        project_state,
+        Rc::new(move |ui, command| submit_to_ui(ui, &worker, command)),
+    );
+}
+
+fn bind_native_filter_callbacks_with(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    submitter: UiCommandSubmitter,
+) {
+    let actions = ui.global::<IdeActions>();
+
+    let weak = ui.as_weak();
+    let submit_add = Rc::clone(&submitter);
+    let state_for_add = Rc::clone(project_state);
+    actions.on_add_native_filter(move |track_index, mode_index, cutoff, resonance| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let edit = native_filter_addition(
+            ui.get_app_mode(),
+            &state_for_add.native_filter_tracks.borrow(),
+            track_index,
+            mode_index,
+            cutoff.as_str(),
+            resonance.as_str(),
+        );
+        match edit {
+            Ok(edit) => submit_add(&ui, IdeWorkerCommand::EditNativeFilter { edit }),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+
+    let weak = ui.as_weak();
+    let submit_update = Rc::clone(&submitter);
+    actions.on_update_native_filter(move |index, enabled, mode_index, cutoff, resonance| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let edit = native_filter_update(
+            ui.get_app_mode(),
+            &ui.get_native_filters(),
+            index,
+            enabled,
+            mode_index,
+            cutoff.as_str(),
+            resonance.as_str(),
+        );
+        match edit {
+            Ok(edit) => submit_update(&ui, IdeWorkerCommand::EditNativeFilter { edit }),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+
+    let weak = ui.as_weak();
+    let submit_remove = submitter;
+    actions.on_remove_native_filter(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        match native_filter_removal(ui.get_app_mode(), &ui.get_native_filters(), index) {
+            Ok(edit) => submit_remove(&ui, IdeWorkerCommand::EditNativeFilter { edit }),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+}
+
+fn native_filter_addition(
+    mode: AppMode,
+    track_ids: &[String],
+    track_index: i32,
+    mode_index: i32,
+    cutoff: &str,
+    resonance: &str,
+) -> Result<IdeNativeFilterEdit, &'static str> {
+    if mode != AppMode::Running {
+        return Err("Native Filter editing is unavailable in the current state");
+    }
+    let track_id = usize::try_from(track_index)
+        .ok()
+        .and_then(|index| track_ids.get(index))
+        .filter(|track_id| !track_id.is_empty())
+        .ok_or("The selected audio track is no longer available")?;
+    let (mode, cutoff_millihertz, resonance_millionths) =
+        parse_native_filter_state(mode_index, cutoff, resonance)?;
+    Ok(IdeNativeFilterEdit::Add {
+        track_id: track_id.clone(),
+        mode,
+        cutoff_millihertz,
+        resonance_millionths,
+    })
+}
+
+fn native_filter_update(
+    mode: AppMode,
+    filters: &ModelRc<NativeFilterRow>,
+    index: i32,
+    enabled: bool,
+    mode_index: i32,
+    cutoff: &str,
+    resonance: &str,
+) -> Result<IdeNativeFilterEdit, &'static str> {
+    let row = native_filter_row(mode, filters, index)?;
+    let (mode, cutoff_millihertz, resonance_millionths) =
+        parse_native_filter_state(mode_index, cutoff, resonance)?;
+    Ok(IdeNativeFilterEdit::Update {
+        chain_id: row.chain_id.to_string(),
+        device_instance_id: row.device_instance_id.to_string(),
+        enabled,
+        mode,
+        cutoff_millihertz,
+        resonance_millionths,
+    })
+}
+
+fn native_filter_removal(
+    mode: AppMode,
+    filters: &ModelRc<NativeFilterRow>,
+    index: i32,
+) -> Result<IdeNativeFilterEdit, &'static str> {
+    let row = native_filter_row(mode, filters, index)?;
+    Ok(IdeNativeFilterEdit::Remove {
+        chain_id: row.chain_id.to_string(),
+        device_instance_id: row.device_instance_id.to_string(),
+    })
+}
+
+fn native_filter_row(
+    mode: AppMode,
+    filters: &ModelRc<NativeFilterRow>,
+    index: i32,
+) -> Result<NativeFilterRow, &'static str> {
+    if mode != AppMode::Running {
+        return Err("Native Filter editing is unavailable in the current state");
+    }
+    let row = usize::try_from(index)
+        .ok()
+        .and_then(|index| filters.row_data(index))
+        .filter(|row| row.index == index)
+        .filter(|row| !row.chain_id.is_empty() && !row.device_instance_id.is_empty())
+        .ok_or("The selected Native Filter is no longer available")?;
+    Ok(row)
+}
+
+fn parse_native_filter_state(
+    mode_index: i32,
+    cutoff: &str,
+    resonance: &str,
+) -> Result<(NativeFilterMode, u32, u32), &'static str> {
+    let mode = match mode_index {
+        0 => NativeFilterMode::LowPass,
+        1 => NativeFilterMode::HighPass,
+        _ => return Err("Native Filter mode is invalid"),
+    };
+    let cutoff_millihertz = parse_bounded_u32(
+        cutoff,
+        MIN_FILTER_CUTOFF_MILLIHERTZ,
+        MAX_FILTER_CUTOFF_MILLIHERTZ,
+        "Cutoff must be whole millihertz from 20000 through 20000000",
+    )?;
+    let resonance_millionths = parse_bounded_u32(
+        resonance,
+        MIN_FILTER_RESONANCE_MILLIONTHS,
+        MAX_FILTER_RESONANCE_MILLIONTHS,
+        "Resonance must be whole millionths from 100000 through 20000000",
+    )?;
+    Ok((mode, cutoff_millihertz, resonance_millionths))
+}
+
+fn parse_bounded_u32(
+    value: &str,
+    minimum: u32,
+    maximum: u32,
+    message: &'static str,
+) -> Result<u32, &'static str> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(message);
+    }
+    let parsed = value.parse::<u32>().map_err(|_| message)?;
+    if (minimum..=maximum).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(message)
+    }
 }
 
 fn bind_scene_creation_callbacks(
@@ -3320,6 +3521,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
             AppMode::ChangingAutomationTakeActivation
         }
         IdeWorkerCommandKind::EditControlMapping => AppMode::EditingControlMapping,
+        IdeWorkerCommandKind::EditNativeFilter => AppMode::EditingNativeFilter,
         IdeWorkerCommandKind::ExportProject => AppMode::ExportingProject,
         IdeWorkerCommandKind::PrepareRuntime => AppMode::PreparingRuntime,
         IdeWorkerCommandKind::Undo | IdeWorkerCommandKind::Redo => AppMode::RestoringEdit,
@@ -3486,6 +3688,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::EditControlMapping => {
             "Preserving mixer state, editing control mappings, and reopening project..."
+        }
+        IdeWorkerCommandKind::EditNativeFilter => {
+            "Preserving mixer state, editing the Native Filter chain, and reopening project..."
         }
         IdeWorkerCommandKind::ExportProject => {
             "Rendering the project through the playback runtime..."
@@ -3760,6 +3965,11 @@ fn apply_event(
         | IdeWorkerEvent::ControlMappingEditCommittedWithWarning { .. }
         | IdeWorkerEvent::ControlMappingEditing { .. }) => {
             apply_control_mapping_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::NativeFilterEditing { .. }
+        | IdeWorkerEvent::NativeFilterEdited { .. }
+        | IdeWorkerEvent::NativeFilterEditCommittedWithWarning { .. }) => {
+            apply_native_filter_event(ui, &event);
         }
         event @ (IdeWorkerEvent::ProjectExporting | IdeWorkerEvent::ProjectExported { .. }) => {
             apply_project_export_event(ui, &event);
@@ -5384,6 +5594,7 @@ fn apply_running_event(
         ui.set_new_track_name(next_audio_track_name(ui.get_track_count()));
     }
     let scenes_changed = set_observed_scenes(ui, project_state, observation);
+    set_native_filter_observation(ui, project_state, observation);
     apply_mixer_observation(ui, observation);
     set_recording_targets(ui, recording_routes, observation.mixer_channels());
     set_audio_import_targets(ui, audio_import_routes, observation.mixer_channels());
@@ -6075,6 +6286,139 @@ fn apply_mixer_observation(ui: &MainWindow, observation: &IdeRunningObservation)
     }
 }
 
+fn reset_native_filter_ui(ui: &MainWindow, project_state: &ProjectUiStateCell) {
+    ui.set_native_filters(ModelRc::default());
+    ui.set_native_filter_track_names(ModelRc::default());
+    ui.set_mixer_native_filter_visible(false);
+    ui.set_native_filter_add_visible(false);
+    ui.set_native_filter_edit_visible(false);
+    ui.set_native_filter_edit_index(-1);
+    ui.set_native_filter_remove_confirming_index(-1);
+    project_state.native_filter_tracks.borrow_mut().clear();
+}
+
+fn set_native_filter_observation(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    observation: &IdeRunningObservation,
+) {
+    *project_state.native_filter_tracks.borrow_mut() = observation
+        .mixer_channels()
+        .iter()
+        .filter(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+        .map(|channel| channel.id().to_owned())
+        .collect();
+    set_native_filters(ui, observation.native_filters(), observation.mixer_channels());
+}
+
+fn set_native_filters(
+    ui: &MainWindow,
+    filters: &[IdeNativeFilter],
+    channels: &[IdeMixerChannel],
+) {
+    let track_names = channels
+        .iter()
+        .filter(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+        .map(|channel| SharedString::from(channel.name()))
+        .collect::<Vec<_>>();
+    ui.set_native_filter_track_names(ModelRc::from(Rc::new(VecModel::from(track_names))));
+    ui.set_native_filters(ModelRc::from(Rc::new(VecModel::from(native_filter_rows(
+        filters, channels,
+    )))));
+}
+
+fn native_filter_rows(
+    filters: &[IdeNativeFilter],
+    channels: &[IdeMixerChannel],
+) -> Vec<NativeFilterRow> {
+    filters
+        .iter()
+        .enumerate()
+        .map(|(index, filter)| {
+            let track_name = channels
+                .iter()
+                .find(|channel| channel.id() == filter.track_id())
+                .map_or(filter.track_id(), IdeMixerChannel::name);
+            NativeFilterRow {
+                index: i32::try_from(index).unwrap_or(-1),
+                chain_id: filter.chain_id().into(),
+                device_instance_id: filter.device_instance_id().into(),
+                track_id: filter.track_id().into(),
+                track_name: track_name.into(),
+                enabled: filter.enabled(),
+                mode_index: match filter.mode() {
+                    NativeFilterMode::LowPass => 0,
+                    NativeFilterMode::HighPass => 1,
+                },
+                mode_name: match filter.mode() {
+                    NativeFilterMode::LowPass => "LOW-PASS",
+                    NativeFilterMode::HighPass => "HIGH-PASS",
+                }
+                .into(),
+                cutoff_millihertz: filter.cutoff_millihertz().to_string().into(),
+                cutoff_label: format_millihertz(filter.cutoff_millihertz()).into(),
+                resonance_millionths: filter.resonance_millionths().to_string().into(),
+                resonance_label: format!(
+                    "Q {:.3}",
+                    f64::from(filter.resonance_millionths()) / 1_000_000.0
+                )
+                .into(),
+            }
+        })
+        .collect()
+}
+
+fn format_millihertz(value: u32) -> String {
+    if value.is_multiple_of(1_000) {
+        format!("{} Hz", value / 1_000)
+    } else {
+        format!("{:.3} Hz", f64::from(value) / 1_000.0)
+    }
+}
+
+fn apply_native_filter_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::NativeFilterEditing { .. } => {
+            ui.set_app_mode(AppMode::EditingNativeFilter);
+            ui.set_status_text("Saving the Native Filter chain...".into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::NativeFilterEdited {
+            revision, changed, ..
+        } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_native_filter_add_visible(false);
+            ui.set_native_filter_edit_visible(false);
+            ui.set_native_filter_edit_index(-1);
+            ui.set_native_filter_remove_confirming_index(-1);
+            ui.set_status_text(
+                if *changed {
+                    format!("Native Filter chain saved in project revision {revision}")
+                } else {
+                    format!("Native Filter chain already matched project revision {revision}")
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::NativeFilterEditCommittedWithWarning { warning, .. } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_native_filter_add_visible(false);
+            ui.set_native_filter_edit_visible(false);
+            ui.set_native_filter_edit_index(-1);
+            ui.set_native_filter_remove_confirming_index(-1);
+            ui.set_status_text("Native Filter change committed".into());
+            ui.set_error_text(
+                format!(
+                    "The Native Filter change was saved but the project may need attention: {warning}"
+                )
+                .into(),
+            );
+        }
+        _ => unreachable!("native-filter event dispatcher received another event"),
+    }
+}
+
 fn apply_output_inventory(
     ui: &MainWindow,
     output_routes: &OutputRoutes,
@@ -6208,6 +6552,7 @@ fn reset_project(
     ui.set_mixer_sends_visible(false);
     ui.set_mixer_channels(ModelRc::default());
     ui.set_mixer_sends(ModelRc::default());
+    reset_native_filter_ui(ui, project_state);
     ui.set_mixer_main_state_available(false);
     ui.set_mixer_main_gain_percent(0.0);
     ui.set_mixer_main_muted(false);
@@ -6412,6 +6757,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::EditControlMapping if current == AppMode::EditingControlMapping => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::EditNativeFilter if current == AppMode::EditingNativeFilter => {
             AppMode::Running
         }
         IdeWorkerCommandKind::ExportProject if current == AppMode::ExportingProject => {
@@ -8998,6 +9346,117 @@ impl Error for DesktopUiExitError {
 mod tests {
     use super::*;
 
+    fn assert_native_filter_window_contract(ui: &MainWindow) {
+        let project_state = Rc::new(ProjectUiState::default());
+        project_state
+            .native_filter_tracks
+            .borrow_mut()
+            .push("track-a".to_owned());
+        ui.set_native_filters(ModelRc::from(Rc::new(VecModel::from(vec![
+            NativeFilterRow {
+                index: 0,
+                chain_id: "chain-a".into(),
+                device_instance_id: "device-a".into(),
+                track_id: "track-a".into(),
+                track_name: "Audio".into(),
+                enabled: true,
+                mode_index: 0,
+                mode_name: "LOW-PASS".into(),
+                cutoff_millihertz: "1250000".into(),
+                cutoff_label: "1250 Hz".into(),
+                resonance_millionths: "707000".into(),
+                resonance_label: "Q 0.707".into(),
+            },
+        ]))));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_native_filter_callbacks_with(
+            ui,
+            &project_state,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+        ui.set_app_mode(AppMode::Running);
+
+        let actions = ui.global::<IdeActions>();
+        actions.invoke_add_native_filter(0, 1, "80000".into(), "2000000".into());
+        actions.invoke_update_native_filter(0, false, 1, "90000".into(), "1500000".into());
+        actions.invoke_remove_native_filter(0);
+        actions.invoke_add_native_filter(0, 0, "19999".into(), "707000".into());
+        assert!(ui.get_error_text().contains("Cutoff"));
+        actions.invoke_remove_native_filter(-1);
+
+        let commands = submitted.borrow();
+        assert_eq!(commands.len(), 3);
+        assert!(matches!(
+            &commands[0],
+            IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::Add {
+                    track_id,
+                    mode: NativeFilterMode::HighPass,
+                    cutoff_millihertz: 80_000,
+                    resonance_millionths: 2_000_000,
+                },
+            } if track_id == "track-a"
+        ));
+        assert!(matches!(
+            &commands[1],
+            IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::Update {
+                    chain_id,
+                    device_instance_id,
+                    enabled: false,
+                    mode: NativeFilterMode::HighPass,
+                    cutoff_millihertz: 90_000,
+                    resonance_millionths: 1_500_000,
+                },
+            } if chain_id == "chain-a" && device_instance_id == "device-a"
+        ));
+        assert!(matches!(
+            &commands[2],
+            IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::Remove {
+                    chain_id,
+                    device_instance_id,
+                },
+            } if chain_id == "chain-a" && device_instance_id == "device-a"
+        ));
+        drop(commands);
+        assert!(ui.get_error_text().contains("no longer available"));
+        assert_native_filter_pending_modes();
+
+        apply_native_filter_event(
+            ui,
+            &IdeWorkerEvent::NativeFilterEdited {
+                revision: 4,
+                changed: true,
+                edit: IdeNativeFilterEdit::Remove {
+                    chain_id: "chain-a".to_owned(),
+                    device_instance_id: "device-a".to_owned(),
+                },
+            },
+        );
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert!(ui.get_status_text().contains("revision 4"));
+        assert!(ui.get_error_text().is_empty());
+    }
+
+    fn assert_native_filter_pending_modes() {
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::EditNativeFilter,
+            ),
+            AppMode::EditingNativeFilter
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::EditingNativeFilter,
+                IdeWorkerCommandKind::EditNativeFilter,
+            ),
+            AppMode::Running
+        );
+    }
+
     #[test]
     fn next_audio_track_name_uses_the_reopened_structural_count() {
         assert_eq!(next_audio_track_name(2).as_str(), "Audio 3");
@@ -11571,10 +12030,7 @@ mod tests {
             usize::try_from(ui.get_max_scene_count()).unwrap(),
             MAX_IDE_SCENES
         );
-        assert_recent_project_window_contract(&ui);
-        assert_audio_import_window_contract(&ui);
-        assert_audio_clip_removal_window_contract(&ui);
-        assert_unused_sample_cleanup_window_contract(&ui);
+        assert_window_contracts(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);
         ui.set_status_text("Choose a Runtime destination".into());
         ui.set_error_text("retained message".into());
@@ -11674,6 +12130,14 @@ mod tests {
         assert_automation_targets_repopulate_after_a_project_reset(&ui);
         assert_control_targets_repopulate_after_a_project_reset(&ui);
         assert_control_mapping_events_report_durable_outcomes(&ui);
+    }
+
+    fn assert_window_contracts(ui: &MainWindow) {
+        assert_recent_project_window_contract(ui);
+        assert_audio_import_window_contract(ui);
+        assert_audio_clip_removal_window_contract(ui);
+        assert_unused_sample_cleanup_window_contract(ui);
+        assert_native_filter_window_contract(ui);
     }
 
     fn assert_recent_project_window_contract(ui: &MainWindow) {

@@ -127,18 +127,24 @@ pub use hyper_project_history::{
 };
 use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackError, ProjectPlaybackLimits};
 use hyper_project_model::ResourceRole;
+pub use hyper_native_device::{
+    MAX_FILTER_CUTOFF_MILLIHERTZ, MAX_FILTER_RESONANCE_MILLIONTHS,
+    MIN_FILTER_CUTOFF_MILLIHERTZ, MIN_FILTER_RESONANCE_MILLIONTHS, NativeFilterMode,
+};
+use hyper_native_device::{DeviceChain, DeviceChainError, NativeDeviceInstance, NativeFilterState};
 use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
     AudioClipRemovalOutcome, AudioClipRemovalRequest,
     AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
     AudioTrackRemovalRequest, AutomationTakePublicationRequest, ControlMappingPublicationRequest,
+    DeviceChainPublicationRequest, DeviceChainRemovalRequest,
     ImportedAudioClipPublicationRequest, ProjectResourcePublicationError,
     ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest,
     RequiredControlCapabilities, SampleCleanupOutcome, SampleCleanupRequest,
     ScenePublicationRequest, StorageError, clean_unused_samples, publish_arrangement,
     publish_audio_clip, publish_audio_track, publish_automation_take, publish_control_mapping,
-    publish_imported_audio_clip, publish_project_resource, publish_scene, remove_audio_clip,
-    remove_audio_track,
+    publish_device_chain, publish_imported_audio_clip, publish_project_resource, publish_scene,
+    remove_audio_clip, remove_audio_track, remove_device_chain,
 };
 
 mod recording;
@@ -153,7 +159,7 @@ pub use recording::{
 pub use worker::{
     DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeAudioClip,
     IdeAudioClipEditCommittedWarning, IdeAudioPreviewObservation, IdeClosedSnapshot,
-    IdeMixerChannel, IdeMixerSend, IdeProjectCreationError, IdeRecordingCaptureKind,
+    IdeMixerChannel, IdeMixerSend, IdeNativeFilter, IdeProjectCreationError, IdeRecordingCaptureKind,
     IdeRecordingState, IdeRecordingTake, IdeRunningObservation, IdeRuntimePreparationError,
     IdeScene, IdeSceneTrackAction, IdeSceneTrackSlot, IdeWorkerCommand, IdeWorkerCommandFailure,
     IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
@@ -3722,6 +3728,131 @@ pub struct IdeAutomationTakeRequest {
     pub points: Vec<AutomationPoint>,
 }
 
+/// One complete Native Filter mutation submitted through the project's
+/// close-publish-reopen lifecycle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdeNativeFilterEdit {
+    Add {
+        track_id: String,
+        mode: NativeFilterMode,
+        cutoff_millihertz: u32,
+        resonance_millionths: u32,
+    },
+    Update {
+        chain_id: String,
+        device_instance_id: String,
+        enabled: bool,
+        mode: NativeFilterMode,
+        cutoff_millihertz: u32,
+        resonance_millionths: u32,
+    },
+    Remove {
+        chain_id: String,
+        device_instance_id: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum IdeNativeFilterEditError {
+    InvalidIdentity,
+    TrackUnavailable,
+    ChainUnavailable,
+    MixerSave(Box<IdeProjectSaveError>),
+    Device(DeviceChainError),
+    Serialization(DeviceChainError),
+    MixerPublication(Box<ProjectResourcePublicationError>),
+    Publication {
+        mixer: Box<ProjectResourcePublicationOutcome>,
+        source: Box<ProjectResourcePublicationError>,
+    },
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<Self>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: Box<ProjectResourcePublicationOutcome>,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<Self>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeNativeFilterEditError {
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        match self {
+            Self::Publication { source, .. } => source.published(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::PublicationAndReopen { publication, .. }
+            | Self::ReopenAfterPreparation {
+                preparation: publication,
+                ..
+            } => publication.publication_committed(),
+            Self::InvalidIdentity
+            | Self::TrackUnavailable
+            | Self::ChainUnavailable
+            | Self::MixerSave(_)
+            | Self::Device(_)
+            | Self::Serialization(_)
+            | Self::MixerPublication(_)
+            | Self::NativeClose(_)
+            | Self::NativeCloseAndReopen { .. } => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeNativeFilterEditError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidIdentity => formatter.write_str("native filter identity is invalid"),
+            Self::TrackUnavailable => formatter.write_str("native filter track is unavailable"),
+            Self::ChainUnavailable => formatter.write_str("native filter chain is unavailable"),
+            Self::MixerSave(source) => write!(formatter, "live mixer state could not be preserved: {source}"),
+            Self::Device(source) | Self::Serialization(source) => source.fmt(formatter),
+            Self::MixerPublication(source) => write!(formatter, "live mixer state could not be published: {source}"),
+            Self::Publication { mixer, source } if mixer.changed() => write!(
+                formatter,
+                "live mixer was preserved in project revision {} but native filter publication failed: {source}",
+                mixer.project_revision()
+            ),
+            Self::Publication { source, .. } => source.fmt(formatter),
+            Self::NativeClose(source) => write!(formatter, "native playback did not close cleanly before editing native filters: {source:?}"),
+            Self::NativeCloseAndReopen { close, reopen } => write!(formatter, "native playback did not close cleanly before editing native filters ({close:?}) and authoritative playback could not be reopened: {reopen}"),
+            Self::ReopenAfterPreparation { preparation, reopen } => write!(formatter, "native filter edit was refused ({preparation}) and authoritative playback could not be reopened: {reopen}"),
+            Self::ReopenAfterPublication { outcome, source } => write!(formatter, "native filter edit committed as project revision {}, but playback could not be reopened: {source}", outcome.project_revision()),
+            Self::PublicationAndReopen { publication, reopen } => write!(formatter, "native filter publication failed ({publication}) and authoritative playback could not be reopened: {reopen}"),
+        }
+    }
+}
+
+impl Error for IdeNativeFilterEditError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source),
+            Self::Device(source) | Self::Serialization(source) => Some(source),
+            Self::MixerPublication(source) | Self::Publication { source, .. } => Some(source),
+            Self::ReopenAfterPreparation { preparation, .. }
+            | Self::PublicationAndReopen {
+                publication: preparation,
+                ..
+            } => Some(preparation),
+            Self::ReopenAfterPublication { source, .. } => Some(source),
+            Self::InvalidIdentity
+            | Self::TrackUnavailable
+            | Self::ChainUnavailable
+            | Self::NativeClose(_)
+            | Self::NativeCloseAndReopen { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum IdeAutomationTakePublicationError {
     Mixer(Box<ProjectResourcePublicationError>),
@@ -6212,6 +6343,101 @@ struct IdeAutomationTakeEditPlan {
     take_bytes: Vec<u8>,
 }
 
+#[derive(Debug)]
+enum IdeNativeFilterPublication {
+    Addition(Vec<u8>),
+    Replacement(Vec<u8>),
+    Removal,
+}
+
+#[derive(Debug)]
+struct IdeNativeFilterEditPlan {
+    mixer: IdeMixerSavePlan,
+    chain_id: String,
+    publication: IdeNativeFilterPublication,
+}
+
+fn find_native_filter_chain<'a>(
+    prepared: &'a PreparedProjectPlayback,
+    chain_id: &str,
+    device_instance_id: &str,
+) -> Result<&'a DeviceChain, IdeNativeFilterEditError> {
+    if chain_id.is_empty() || device_instance_id.is_empty() {
+        return Err(IdeNativeFilterEditError::InvalidIdentity);
+    }
+    let chain = prepared
+        .device_chains()
+        .iter()
+        .find(|chain| chain.id() == chain_id)
+        .ok_or(IdeNativeFilterEditError::ChainUnavailable)?;
+    if !chain
+        .devices()
+        .iter()
+        .any(|device| device.id() == device_instance_id)
+    {
+        return Err(IdeNativeFilterEditError::InvalidIdentity);
+    }
+    Ok(chain)
+}
+
+fn native_filter_state(
+    mode: NativeFilterMode,
+    cutoff_millihertz: u32,
+    resonance_millionths: u32,
+) -> Result<NativeFilterState, IdeNativeFilterEditError> {
+    NativeFilterState::try_new(mode, cutoff_millihertz, resonance_millionths)
+        .map_err(IdeNativeFilterEditError::Device)
+}
+
+fn serialize_native_filter_chain(
+    chain: &DeviceChain,
+) -> Result<Vec<u8>, IdeNativeFilterEditError> {
+    chain
+        .to_canonical_vec()
+        .map_err(IdeNativeFilterEditError::Serialization)
+}
+
+impl IdeNativeFilterEditPlan {
+    fn publish(
+        &self,
+    ) -> Result<ProjectResourcePublicationOutcome, IdeNativeFilterEditError> {
+        let mixer = self
+            .mixer
+            .publish()
+            .map_err(|source| IdeNativeFilterEditError::MixerPublication(Box::new(source)))?;
+        let result = match &self.publication {
+            IdeNativeFilterPublication::Addition(bytes) => publish_device_chain(
+                &self.mixer.project_path,
+                DeviceChainPublicationRequest {
+                    expected_project_sha256: *mixer.project_identity(),
+                    chain_id: &self.chain_id,
+                    chain_bytes: bytes,
+                },
+            ),
+            IdeNativeFilterPublication::Replacement(bytes) => publish_project_resource(
+                &self.mixer.project_path,
+                ProjectResourcePublicationRequest {
+                    expected_project_sha256: *mixer.project_identity(),
+                    resource_id: &self.chain_id,
+                    expected_role: ResourceRole::DeviceChain,
+                    resource_bytes: bytes,
+                },
+            ),
+            IdeNativeFilterPublication::Removal => remove_device_chain(
+                &self.mixer.project_path,
+                DeviceChainRemovalRequest {
+                    expected_project_sha256: *mixer.project_identity(),
+                    chain_id: &self.chain_id,
+                },
+            ),
+        };
+        result.map_err(|source| IdeNativeFilterEditError::Publication {
+            mixer: Box::new(mixer),
+            source: Box::new(source),
+        })
+    }
+}
+
 impl IdeAutomationTakeEditPlan {
     fn publish(
         &self,
@@ -6802,6 +7028,7 @@ pub struct RunningIdeSnapshot<'a> {
     pub arrangement: Arc<IdePlaybackArrangement>,
     pub automation: Arc<IdePlaybackAutomation>,
     pub recording_metadata: &'a [hyper_recording_metadata::RecordingMetadataDocument],
+    pub device_chains: &'a [DeviceChain],
     pub unused_sample_cleanup: IdeUnusedSampleCleanupSummary,
     pub scene_count: usize,
     pub track_count: usize,
@@ -8904,6 +9131,128 @@ impl RunningDesktopIdeApplication {
         Self::prepare_automation_take_creation_from_project(application, mixer, prepared, request)
     }
 
+    fn prepare_native_filter_edit(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        edit: &IdeNativeFilterEdit,
+    ) -> Result<IdeNativeFilterEditPlan, IdeNativeFilterEditError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeNativeFilterEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeNativeFilterEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        Self::prepare_native_filter_edit_from_project(mixer, prepared, edit)
+    }
+
+    fn prepare_native_filter_edit_from_project(
+        mixer: IdeMixerSavePlan,
+        prepared: &PreparedProjectPlayback,
+        edit: &IdeNativeFilterEdit,
+    ) -> Result<IdeNativeFilterEditPlan, IdeNativeFilterEditError> {
+        let (chain_id, publication) = match edit {
+            IdeNativeFilterEdit::Add {
+                track_id,
+                mode,
+                cutoff_millihertz,
+                resonance_millionths,
+            } => {
+                if track_id.is_empty() {
+                    return Err(IdeNativeFilterEditError::InvalidIdentity);
+                }
+                let (_, compiled_mixer, _, _) = prepared.session().parts();
+                if !compiled_mixer
+                    .slots()
+                    .iter()
+                    .any(|slot| slot.track_id() == track_id)
+                {
+                    return Err(IdeNativeFilterEditError::TrackUnavailable);
+                }
+                let filter_state =
+                    native_filter_state(*mode, *cutoff_millihertz, *resonance_millionths)?;
+                let device_id = uuid::Uuid::new_v4().to_string();
+                if let Some(chain) = prepared
+                    .device_chains()
+                    .iter()
+                    .find(|chain| chain.track_id() == track_id)
+                {
+                    let changed = chain
+                        .try_with_appended_filter(device_id, true, filter_state)
+                        .map_err(IdeNativeFilterEditError::Device)?;
+                    (
+                        chain.id().to_owned(),
+                        IdeNativeFilterPublication::Replacement(
+                            serialize_native_filter_chain(&changed)?,
+                        ),
+                    )
+                } else {
+                    let chain_id = uuid::Uuid::new_v4().to_string();
+                    let chain = DeviceChain::try_new(
+                        chain_id.clone(),
+                        prepared.package().manifest().project_id().to_owned(),
+                        track_id.clone(),
+                        vec![
+                            NativeDeviceInstance::try_new_filter(device_id, true, filter_state)
+                                .map_err(IdeNativeFilterEditError::Device)?,
+                        ],
+                    )
+                    .map_err(IdeNativeFilterEditError::Device)?;
+                    (
+                        chain_id,
+                        IdeNativeFilterPublication::Addition(
+                            serialize_native_filter_chain(&chain)?,
+                        ),
+                    )
+                }
+            }
+            IdeNativeFilterEdit::Update {
+                chain_id,
+                device_instance_id,
+                enabled,
+                mode,
+                cutoff_millihertz,
+                resonance_millionths,
+            } => {
+                let chain = find_native_filter_chain(prepared, chain_id, device_instance_id)?;
+                let changed = chain
+                    .try_with_filter_state(
+                        device_instance_id,
+                        *enabled,
+                        native_filter_state(*mode, *cutoff_millihertz, *resonance_millionths)?,
+                    )
+                    .map_err(IdeNativeFilterEditError::Device)?;
+                (
+                    chain_id.clone(),
+                    IdeNativeFilterPublication::Replacement(
+                        serialize_native_filter_chain(&changed)?,
+                    ),
+                )
+            }
+            IdeNativeFilterEdit::Remove {
+                chain_id,
+                device_instance_id,
+            } => {
+                let chain = find_native_filter_chain(prepared, chain_id, device_instance_id)?;
+                let publication = match chain
+                    .try_without_device(device_instance_id)
+                    .map_err(IdeNativeFilterEditError::Device)?
+                {
+                    Some(changed) => IdeNativeFilterPublication::Replacement(
+                        serialize_native_filter_chain(&changed)?,
+                    ),
+                    None => IdeNativeFilterPublication::Removal,
+                };
+                (chain_id.clone(), publication)
+            }
+        };
+        Ok(IdeNativeFilterEditPlan {
+            mixer,
+            chain_id,
+            publication,
+        })
+    }
+
     fn prepare_automation_take_creation_from_project(
         application: &DesktopIdeApplication,
         mixer: IdeMixerSavePlan,
@@ -9543,6 +9892,7 @@ impl RunningDesktopIdeApplication {
             arrangement: project.session().shared_arrangement(),
             automation: project.session().shared_automation_takes(),
             recording_metadata: project.recording_metadata(),
+            device_chains: project.device_chains(),
             unused_sample_cleanup: unused_sample_cleanup_summary(project).ok()?,
             scene_count,
             track_count: loaded.track_count(),
@@ -10721,6 +11071,24 @@ mod tests {
 
         fn root(&self) -> &Path {
             &self.directory.0
+        }
+    }
+
+    fn fixture_mixer_save_plan(prepared: &PreparedProjectPlayback) -> IdeMixerSavePlan {
+        let package = prepared.package();
+        let mixer_id = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap()
+            .id()
+            .to_owned();
+        IdeMixerSavePlan {
+            project_path: package.root().to_path_buf(),
+            expected_project_sha256: *package.manifest_sha256(),
+            resource_bytes: package.read_resource(&mixer_id).unwrap(),
+            resource_id: mixer_id,
         }
     }
 
@@ -12956,6 +13324,84 @@ mod tests {
         assert!(!published[0].enabled());
         let (_, _, automation, _) = reopened.session().parts();
         assert_eq!(automation.unwrap().target_count(), 0);
+    }
+
+    #[test]
+    fn native_filter_edits_survive_add_update_bypass_and_final_removal() {
+        let fixture = ArrangementProjectFixture::new();
+        let project_path = fixture.root().to_path_buf();
+        let limits = desktop_ide_application_config().unwrap().project_limits();
+
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let addition = RunningDesktopIdeApplication::prepare_native_filter_edit_from_project(
+            fixture_mixer_save_plan(&prepared),
+            &prepared,
+            &IdeNativeFilterEdit::Add {
+                track_id: ARRANGEMENT_TEST_TRACK_ID.to_owned(),
+                mode: NativeFilterMode::LowPass,
+                cutoff_millihertz: 1_250_000,
+                resonance_millionths: 707_000,
+            },
+        )
+        .unwrap();
+        drop(prepared);
+        let added = addition.publish().unwrap();
+        assert!(added.changed());
+
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let chain = prepared.device_chains().first().unwrap();
+        assert_eq!(chain.track_id(), ARRANGEMENT_TEST_TRACK_ID);
+        assert_eq!(chain.devices().len(), 1);
+        let chain_id = chain.id().to_owned();
+        let device_id = chain.devices()[0].id().to_owned();
+        assert!(chain.devices()[0].enabled());
+        assert_eq!(chain.devices()[0].state().mode(), NativeFilterMode::LowPass);
+        assert_eq!(chain.devices()[0].state().cutoff_millihertz(), 1_250_000);
+
+        let update = RunningDesktopIdeApplication::prepare_native_filter_edit_from_project(
+            fixture_mixer_save_plan(&prepared),
+            &prepared,
+            &IdeNativeFilterEdit::Update {
+                chain_id: chain_id.clone(),
+                device_instance_id: device_id.clone(),
+                enabled: false,
+                mode: NativeFilterMode::HighPass,
+                cutoff_millihertz: 80_000,
+                resonance_millionths: 2_000_000,
+            },
+        )
+        .unwrap();
+        drop(prepared);
+        assert!(update.publish().unwrap().changed());
+
+        let prepared =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        let device = &prepared.device_chains()[0].devices()[0];
+        assert_eq!(device.id(), device_id);
+        assert!(!device.enabled());
+        assert_eq!(device.state().mode(), NativeFilterMode::HighPass);
+        assert_eq!(device.state().cutoff_millihertz(), 80_000);
+        assert_eq!(device.state().resonance_millionths(), 2_000_000);
+
+        let removal = RunningDesktopIdeApplication::prepare_native_filter_edit_from_project(
+            fixture_mixer_save_plan(&prepared),
+            &prepared,
+            &IdeNativeFilterEdit::Remove {
+                chain_id,
+                device_instance_id: device_id,
+            },
+        )
+        .unwrap();
+        drop(prepared);
+        assert!(removal.publish().unwrap().changed());
+
+        let reopened =
+            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
+        assert!(reopened.device_chains().is_empty());
+        assert!(!project_path.join("devices").exists());
+        hyper_storage_engine::verify_project_package(&project_path).unwrap();
     }
 
     #[test]

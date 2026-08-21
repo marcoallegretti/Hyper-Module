@@ -38,6 +38,7 @@ use super::{
     IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioTrackAdditionError,
     IdeAudioTrackEditError, IdeAudioTrackRemovalError, IdeAutomationTakeCreationError,
     IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
+    IdeNativeFilterEdit, IdeNativeFilterEditError, NativeFilterMode,
     IdeControlMappingEdit, IdeControlMappingEditError, IdeInputDiscoveryError, IdeInputSelection,
     IdeInputSelectionError, IdeLoopRangeFrames, IdeLoudnessCommand, IdeLoudnessCommandError,
     IdeMixerChannelKind, IdeMixerChannelState, IdeMixerCommand, IdeMixerCommandError,
@@ -180,6 +181,7 @@ pub enum IdeWorkerCommandKind {
     SetSceneActive,
     AddAutomationTake,
     SetAutomationTakeActive,
+    EditNativeFilter,
     EditControlMapping,
     ExportProject,
     Undo,
@@ -366,6 +368,9 @@ pub enum IdeWorkerCommand {
         take_id: String,
         enabled: bool,
     },
+    EditNativeFilter {
+        edit: IdeNativeFilterEdit,
+    },
     EditControlMapping {
         edit: IdeControlMappingEdit,
     },
@@ -486,6 +491,7 @@ impl IdeWorkerCommand {
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
+            Self::EditNativeFilter { .. } => IdeWorkerCommandKind::EditNativeFilter,
             Self::EditControlMapping { .. } => IdeWorkerCommandKind::EditControlMapping,
             Self::ExportProject { .. } => IdeWorkerCommandKind::ExportProject,
             Self::Undo => IdeWorkerCommandKind::Undo,
@@ -676,6 +682,7 @@ pub struct IdeRunningObservation {
     control_bindings: Vec<IdeControlBinding>,
     audio_clips: Vec<IdeAudioClip>,
     recording_takes: Vec<IdeRecordingTake>,
+    native_filters: Vec<IdeNativeFilter>,
     unused_sample_cleanup: IdeUnusedSampleCleanupSummary,
     preview: IdeAudioPreviewObservation,
     scenes: Vec<IdeScene>,
@@ -687,6 +694,54 @@ pub struct IdeRunningObservation {
     monitoring: Option<IdeMonitoringState>,
     recovery: PlaybackRecoverySnapshot,
     meter: LatestOutputMeterSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdeNativeFilter {
+    chain_id: String,
+    device_instance_id: String,
+    track_id: String,
+    enabled: bool,
+    mode: NativeFilterMode,
+    cutoff_millihertz: u32,
+    resonance_millionths: u32,
+}
+
+impl IdeNativeFilter {
+    #[must_use]
+    pub fn chain_id(&self) -> &str {
+        &self.chain_id
+    }
+
+    #[must_use]
+    pub fn device_instance_id(&self) -> &str {
+        &self.device_instance_id
+    }
+
+    #[must_use]
+    pub fn track_id(&self) -> &str {
+        &self.track_id
+    }
+
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> NativeFilterMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub const fn cutoff_millihertz(&self) -> u32 {
+        self.cutoff_millihertz
+    }
+
+    #[must_use]
+    pub const fn resonance_millionths(&self) -> u32 {
+        self.resonance_millionths
+    }
 }
 
 #[derive(Debug)]
@@ -1266,6 +1321,11 @@ impl IdeRunningObservation {
     }
 
     #[must_use]
+    pub fn native_filters(&self) -> &[IdeNativeFilter] {
+        &self.native_filters
+    }
+
+    #[must_use]
     pub const fn unused_sample_cleanup(&self) -> IdeUnusedSampleCleanupSummary {
         self.unused_sample_cleanup
     }
@@ -1518,6 +1578,7 @@ pub enum IdeWorkerCommandFailure {
     SceneCreation(Box<IdeSceneCreationError>),
     AutomationTakeCreation(Box<IdeAutomationTakeCreationError>),
     AutomationTakeActivation(Box<IdeAutomationTakeEditError>),
+    NativeFilterEdit(Box<IdeNativeFilterEditError>),
     ControlMappingEdit(Box<IdeControlMappingEditError>),
     ProjectExport(Box<IdeProjectExportError>),
     EditRestore(Box<IdeResourceRestoreError>),
@@ -1604,6 +1665,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::SceneCreation(source) => source.fmt(formatter),
             Self::AutomationTakeCreation(source) => source.fmt(formatter),
             Self::AutomationTakeActivation(source) => source.fmt(formatter),
+            Self::NativeFilterEdit(source) => source.fmt(formatter),
             Self::ControlMappingEdit(source) => source.fmt(formatter),
             Self::ProjectExport(source) => source.fmt(formatter),
             Self::EditRestore(source) => source.fmt(formatter),
@@ -1680,6 +1742,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::SceneCreation(source) => Some(source),
             Self::AutomationTakeCreation(source) => Some(source),
             Self::AutomationTakeActivation(source) => Some(source),
+            Self::NativeFilterEdit(source) => Some(source),
             Self::ControlMappingEdit(source) => Some(source),
             Self::ProjectExport(source) => Some(source),
             Self::EditRestore(source) => Some(source),
@@ -1944,6 +2007,18 @@ pub enum IdeWorkerEvent {
     },
     AutomationTakeActivationCommittedWithWarning {
         warning: Box<IdeAutomationTakeEditError>,
+    },
+    NativeFilterEditing {
+        edit: IdeNativeFilterEdit,
+    },
+    NativeFilterEdited {
+        revision: u64,
+        changed: bool,
+        edit: IdeNativeFilterEdit,
+    },
+    NativeFilterEditCommittedWithWarning {
+        edit: IdeNativeFilterEdit,
+        warning: Box<IdeNativeFilterEditError>,
     },
     ControlMappingEdited {
         revision: u64,
@@ -2612,6 +2687,9 @@ enum ProjectMutation {
         take_id: String,
         enabled: bool,
     },
+    EditNativeFilter {
+        edit: IdeNativeFilterEdit,
+    },
     EditControlMapping {
         edit: IdeControlMappingEdit,
     },
@@ -2697,6 +2775,7 @@ impl ProjectMutation {
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
+            Self::EditNativeFilter { .. } => IdeWorkerCommandKind::EditNativeFilter,
             Self::EditControlMapping { .. } => IdeWorkerCommandKind::EditControlMapping,
             Self::RestoreResource { redo: false, .. } => IdeWorkerCommandKind::Undo,
             Self::RestoreResource { redo: true, .. } => IdeWorkerCommandKind::Redo,
@@ -2820,6 +2899,9 @@ impl ProjectMutation {
             Self::SetAutomationTakeActive { enabled, .. } => {
                 IdeWorkerEvent::AutomationTakeActivationChanging { enabled: *enabled }
             }
+            Self::EditNativeFilter { edit } => {
+                IdeWorkerEvent::NativeFilterEditing { edit: edit.clone() }
+            }
             Self::EditControlMapping { edit } => {
                 IdeWorkerEvent::ControlMappingEditing { edit: edit.clone() }
             }
@@ -2942,6 +3024,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SetSceneSlot => "scene slot edit",
         IdeWorkerCommandKind::SetSceneActive => "scene activation",
         IdeWorkerCommandKind::SetAutomationTakeActive => "automation activation",
+        IdeWorkerCommandKind::EditNativeFilter => "native filter",
         IdeWorkerCommandKind::AddArrangementPlacement => "placement",
         IdeWorkerCommandKind::AddArrangementSceneLaunch => "scene marker",
         IdeWorkerCommandKind::DuplicateArrangementPlacement => "placement duplication",
@@ -3297,6 +3380,7 @@ fn process_command(
         | IdeWorkerCommand::AddScene { .. }
         | IdeWorkerCommand::AddAutomationTake { .. }
         | IdeWorkerCommand::SetAutomationTakeActive { .. }
+        | IdeWorkerCommand::EditNativeFilter { .. }
         | IdeWorkerCommand::EditControlMapping { .. }
         | IdeWorkerCommand::Undo
         | IdeWorkerCommand::Redo
@@ -3472,6 +3556,9 @@ fn process_project_mutation_command(
         }
         IdeWorkerCommand::SetAutomationTakeActive { take_id, enabled } => {
             set_automation_take_active(state, events, &take_id, enabled)
+        }
+        IdeWorkerCommand::EditNativeFilter { edit } => {
+            edit_native_filter(state, events, edit)
         }
         IdeWorkerCommand::EditControlMapping { edit } => edit_control_mapping(state, events, edit),
         IdeWorkerCommand::Undo => restore_edit(state, events, history, false),
@@ -5551,6 +5638,14 @@ fn add_automation_take(
     )
 }
 
+fn edit_native_filter(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    edit: IdeNativeFilterEdit,
+) -> bool {
+    begin_project_mutation_request(state, events, ProjectMutation::EditNativeFilter { edit })
+}
+
 fn export_project(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -5828,6 +5923,11 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::EditControlMapping { result: Ok(_), .. } => {
             HistoryEffect::Invalidate
         }
+        ProjectMutationAttempt::EditNativeFilter { result: Ok(_), .. } => HistoryEffect::Invalidate,
+        ProjectMutationAttempt::EditNativeFilter {
+            result: Err(reason),
+            ..
+        } if reason.publication_committed() => HistoryEffect::Invalidate,
         ProjectMutationAttempt::RemoveAudioClip(Err(reason))
             if reason.publication_committed() =>
         {
@@ -5877,6 +5977,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::AddScene { result: Err(_), .. }
         | ProjectMutationAttempt::AddAutomationTake { result: Err(_), .. }
         | ProjectMutationAttempt::SetAutomationTakeActive { result: Err(_), .. }
+        | ProjectMutationAttempt::EditNativeFilter { result: Err(_), .. }
         | ProjectMutationAttempt::EditControlMapping { result: Err(_), .. }
         | ProjectMutationAttempt::DuplicateScene { result: Err(_), .. }
         | ProjectMutationAttempt::RenameScene { result: Err(_), .. }
@@ -6600,6 +6701,11 @@ fn project_mutation_save_failure(
                 IdeAutomationTakeEditError::MixerSave(Box::new(reason)),
             ))
         }
+        ProjectMutation::EditNativeFilter { .. } => {
+            IdeWorkerCommandFailure::NativeFilterEdit(Box::new(
+                IdeNativeFilterEditError::MixerSave(Box::new(reason)),
+            ))
+        }
         ProjectMutation::EditControlMapping { .. } => IdeWorkerCommandFailure::ControlMappingEdit(
             Box::new(IdeControlMappingEditError::MixerSave(Box::new(reason))),
         ),
@@ -6847,6 +6953,11 @@ fn project_mutation_native_close_failure(
                 IdeAutomationTakeEditError::NativeClose(failure),
             ))
         }
+        ProjectMutation::EditNativeFilter { .. } => {
+            IdeWorkerCommandFailure::NativeFilterEdit(Box::new(
+                IdeNativeFilterEditError::NativeClose(failure),
+            ))
+        }
         ProjectMutation::EditControlMapping { .. } => IdeWorkerCommandFailure::ControlMappingEdit(
             Box::new(IdeControlMappingEditError::NativeClose(failure)),
         ),
@@ -7076,6 +7187,13 @@ enum ProjectMutationAttempt {
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeAutomationTakeEditError,
+        >,
+    },
+    EditNativeFilter {
+        edit: IdeNativeFilterEdit,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeNativeFilterEditError,
         >,
     },
     EditControlMapping {
@@ -8018,6 +8136,37 @@ fn complete_project_mutation(
                         enabled,
                     },
                 ),
+                ProjectMutationAttempt::EditNativeFilter {
+                    edit,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::NativeFilterEdited {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                        edit,
+                    },
+                ),
+                ProjectMutationAttempt::EditNativeFilter {
+                    edit,
+                    result: Err(reason),
+                } if reason.publication_committed() => send_event(
+                    events,
+                    IdeWorkerEvent::NativeFilterEditCommittedWithWarning {
+                        edit,
+                        warning: Box::new(reason),
+                    },
+                ),
+                ProjectMutationAttempt::EditNativeFilter {
+                    result: Err(reason),
+                    ..
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::CommandFailed {
+                        command: IdeWorkerCommandKind::EditNativeFilter,
+                        reason: IdeWorkerCommandFailure::NativeFilterEdit(Box::new(reason)),
+                    },
+                ),
                 ProjectMutationAttempt::SetAutomationTakeActive {
                     result: Err(reason),
                     ..
@@ -8631,6 +8780,12 @@ fn attempt_project_mutation(
             ProjectMutationAttempt::EditControlMapping {
                 edit: edit.clone(),
                 result: attempt_control_mapping_edit(application, recovery, &edit, native_failure),
+            }
+        }
+        ProjectMutation::EditNativeFilter { edit } => {
+            ProjectMutationAttempt::EditNativeFilter {
+                edit: edit.clone(),
+                result: attempt_native_filter_edit(application, recovery, &edit, native_failure),
             }
         }
         ProjectMutation::RestoreResource { entry, redo } => {
@@ -9567,6 +9722,9 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::SetAutomationTakeActive { result, .. } => {
             automation_take_activation_reopen_failure(result, reopen)
         }
+        ProjectMutationAttempt::EditNativeFilter { result, .. } => {
+            native_filter_edit_reopen_failure(result, reopen)
+        }
         ProjectMutationAttempt::EditControlMapping { result, .. } => {
             control_mapping_edit_reopen_failure(result, reopen)
         }
@@ -9624,6 +9782,52 @@ fn attempt_automation_take_activation(
         plan.publish()
             .map_err(|source| IdeAutomationTakeEditError::Publication(Box::new(source)))
     })
+}
+
+fn attempt_native_filter_edit(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    edit: &IdeNativeFilterEdit,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeNativeFilterEditError> {
+    if let Some(failure) = native_failure {
+        return Err(IdeNativeFilterEditError::NativeClose(failure));
+    }
+    RunningDesktopIdeApplication::prepare_native_filter_edit(application, recovery, edit)
+        .and_then(|plan| plan.publish())
+}
+
+fn native_filter_edit_reopen_failure(
+    result: Result<
+        hyper_storage_engine::ProjectResourcePublicationOutcome,
+        IdeNativeFilterEditError,
+    >,
+    reopen: IdeProjectOpenError,
+) -> IdeWorkerCommandFailure {
+    let reason = match result {
+        Ok(outcome) => IdeNativeFilterEditError::ReopenAfterPublication {
+            outcome: Box::new(outcome),
+            source: Box::new(reopen),
+        },
+        Err(IdeNativeFilterEditError::NativeClose(close)) => {
+            IdeNativeFilterEditError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(publication @ (IdeNativeFilterEditError::Publication { .. }
+        | IdeNativeFilterEditError::MixerPublication(_))) => {
+            IdeNativeFilterEditError::PublicationAndReopen {
+                publication: Box::new(publication),
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(preparation) => IdeNativeFilterEditError::ReopenAfterPreparation {
+            preparation: Box::new(preparation),
+            reopen: Box::new(reopen),
+        },
+    };
+    IdeWorkerCommandFailure::NativeFilterEdit(Box::new(reason))
 }
 
 fn automation_take_activation_reopen_failure(
@@ -10633,6 +10837,31 @@ fn running_observation(
             .cmp(&left.captured_at_utc)
             .then_with(|| right.id.cmp(&left.id))
     });
+    let native_filter_count = snapshot
+        .device_chains
+        .iter()
+        .try_fold(0_usize, |count, chain| {
+            count.checked_add(chain.devices().len())
+        })
+        .ok_or(IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
+    let mut native_filters = Vec::new();
+    native_filters
+        .try_reserve_exact(native_filter_count)
+        .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
+    for chain in snapshot.device_chains {
+        for device in chain.devices() {
+            let state = device.state();
+            native_filters.push(IdeNativeFilter {
+                chain_id: try_project_owned(chain.id())?,
+                device_instance_id: try_project_owned(device.id())?,
+                track_id: try_project_owned(chain.track_id())?,
+                enabled: device.enabled(),
+                mode: state.mode(),
+                cutoff_millihertz: state.cutoff_millihertz(),
+                resonance_millionths: state.resonance_millionths(),
+            });
+        }
+    }
     let mut scenes = Vec::new();
     scenes
         .try_reserve_exact(snapshot.scene_count)
@@ -10722,6 +10951,7 @@ fn running_observation(
         control_bindings,
         audio_clips,
         recording_takes,
+        native_filters,
         unused_sample_cleanup: snapshot.unused_sample_cleanup,
         preview: IdeAudioPreviewObservation {
             snapshot: snapshot.preview,

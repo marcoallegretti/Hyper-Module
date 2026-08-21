@@ -37,6 +37,7 @@ export enum AppMode {
     changing-clip-source,
     adding-automation-take,
     editing-control-mapping,
+    editing-native-filter,
     exporting-project,
     preparing-runtime,
     restoring-edit,
@@ -105,6 +106,21 @@ export struct MixerSendRow {
     gain-percent: float,
     pan-percent: float,
     enabled: bool,
+}
+
+export struct NativeFilterRow {
+    index: int,
+    chain-id: string,
+    device-instance-id: string,
+    track-id: string,
+    track-name: string,
+    enabled: bool,
+    mode-index: int,
+    mode-name: string,
+    cutoff-millihertz: string,
+    cutoff-label: string,
+    resonance-millionths: string,
+    resonance-label: string,
 }
 
 export struct TakeRow {
@@ -250,6 +266,9 @@ export global IdeActions {
     callback mixer-send-gain(int, float);
     callback mixer-send-pan(int, float);
     callback mixer-send-enabled(int);
+    callback add-native-filter(int, int, string, string);
+    callback update-native-filter(int, bool, int, string, string);
+    callback remove-native-filter(int);
     callback add-automation-take(string, int, int, string, string, string);
     callback set-automation-take-active(string, bool);
     callback add-control-binding(int, int, bool, string, string);
@@ -511,6 +530,21 @@ export component MainWindow inherits Window {
     in property <string> loudness-lra-status: "Waiting for final-output meter evidence";
     in property <[MixerChannelRow]> mixer-channels: [];
     in property <[MixerSendRow]> mixer-sends: [];
+    in property <[NativeFilterRow]> native-filters: [];
+    in property <[string]> native-filter-track-names: [];
+    in-out property <bool> mixer-native-filter-visible: false;
+    in-out property <bool> native-filter-add-visible: false;
+    in-out property <int> native-filter-add-track-index: 0;
+    in-out property <int> native-filter-add-mode-index: 0;
+    in-out property <string> native-filter-add-cutoff: "1000000";
+    in-out property <string> native-filter-add-resonance: "707000";
+    in-out property <bool> native-filter-edit-visible: false;
+    in-out property <int> native-filter-edit-index: -1;
+    in-out property <bool> native-filter-edit-enabled: true;
+    in-out property <int> native-filter-edit-mode-index: 0;
+    in-out property <string> native-filter-edit-cutoff: "";
+    in-out property <string> native-filter-edit-resonance: "";
+    in-out property <int> native-filter-remove-confirming-index: -1;
     in property <[AutomationTakeRow]> automation-takes: [];
     in property <[ControlBindingRow]> control-bindings: [];
     in property <[string]> control-source-names: [];
@@ -1666,7 +1700,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && !root.rename-track-visible && !root.remove-track-visible && !root.mixer-sends-visible && !root.mixer-automation-visible && !root.mixer-control-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && !root.rename-track-visible && !root.remove-track-visible && !root.mixer-sends-visible && !root.mixer-automation-visible && !root.mixer-control-visible && !root.mixer-native-filter-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1683,6 +1717,16 @@ export component MainWindow inherits Window {
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         Button { text: "Performance"; clicked => { root.mixer-visible = false; } }
                         Button { text: "Sends"; enabled: root.mixer-sends.length > 0; clicked => { root.mixer-sends-visible = true; } }
+                        Button {
+                            text: "Devices (" + root.native-filters.length + ")";
+                            enabled: root.native-filter-track-names.length > 0;
+                            clicked => {
+                                root.native-filter-add-visible = false;
+                                root.native-filter-edit-visible = false;
+                                root.native-filter-remove-confirming-index = -1;
+                                root.mixer-native-filter-visible = true;
+                            }
+                        }
                         Button {
                             text: "Control (" + root.control-bindings.length + ")";
                             enabled: root.control-source-names.length > 0;
@@ -1806,6 +1850,125 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
+                    }
+                }
+
+                if root.mixer-visible && root.mixer-native-filter-visible && !root.mixer-sends-visible && !root.mixer-automation-visible && !root.mixer-control-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 10px;
+
+                        HorizontalLayout {
+                            height: 48px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                Text { text: "NATIVE DEVICES"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                                Text { text: "Portable pre-fader filters · identical project state in IDE and Runtime"; color: #aebccc; font-size: 12px; }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: "Channels";
+                                clicked => {
+                                    root.native-filter-add-visible = false;
+                                    root.native-filter-edit-visible = false;
+                                    root.native-filter-remove-confirming-index = -1;
+                                    root.mixer-native-filter-visible = false;
+                                }
+                            }
+                            Button {
+                                text: "Add filter";
+                                enabled: root.app-mode == AppMode.running && root.native-filter-track-names.length > 0 && !root.native-filter-edit-visible;
+                                clicked => { root.native-filter-remove-confirming-index = -1; root.native-filter-add-visible = true; }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: #27313d; }
+
+                        if root.native-filter-add-visible : HorizontalLayout {
+                            height: 48px;
+                            spacing: 8px;
+                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "TRACK"; color: #65758a; font-size: 8px; } ComboBox { model: root.native-filter-track-names; current-index <=> root.native-filter-add-track-index; } }
+                            VerticalLayout { min-width: 130px; max-width: 130px; spacing: 2px; Text { text: "MODE"; color: #65758a; font-size: 8px; } ComboBox { model: ["Low-pass", "High-pass"]; current-index <=> root.native-filter-add-mode-index; } }
+                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "CUTOFF · mHz"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-filter-add-cutoff; } }
+                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "RESONANCE · millionths"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-filter-add-resonance; } }
+                            Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.native-filter-add-visible = false; } }
+                            Button {
+                                text: root.app-mode == AppMode.editing-native-filter ? "Adding…" : "Add";
+                                enabled: root.app-mode == AppMode.running && root.native-filter-add-track-index >= 0 && root.native-filter-add-cutoff != "" && root.native-filter-add-resonance != "";
+                                clicked => { IdeActions.add-native-filter(root.native-filter-add-track-index, root.native-filter-add-mode-index, root.native-filter-add-cutoff, root.native-filter-add-resonance); }
+                            }
+                        }
+
+                        if root.native-filter-edit-visible : HorizontalLayout {
+                            height: 48px;
+                            spacing: 8px;
+                            VerticalLayout { min-width: 130px; max-width: 130px; spacing: 2px; Text { text: "MODE"; color: #65758a; font-size: 8px; } ComboBox { model: ["Low-pass", "High-pass"]; current-index <=> root.native-filter-edit-mode-index; } }
+                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "CUTOFF · mHz"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-filter-edit-cutoff; } }
+                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "RESONANCE · millionths"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-filter-edit-resonance; } }
+                            Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.native-filter-edit-visible = false; root.native-filter-edit-index = -1; } }
+                            Button {
+                                text: root.app-mode == AppMode.editing-native-filter ? "Saving…" : "Save";
+                                enabled: root.app-mode == AppMode.running && root.native-filter-edit-index >= 0 && root.native-filter-edit-cutoff != "" && root.native-filter-edit-resonance != "";
+                                clicked => { IdeActions.update-native-filter(root.native-filter-edit-index, root.native-filter-edit-enabled, root.native-filter-edit-mode-index, root.native-filter-edit-cutoff, root.native-filter-edit-resonance); }
+                            }
+                        }
+
+                        ListView {
+                            vertical-stretch: 1;
+                            for filter in root.native-filters : Rectangle {
+                                height: 56px;
+                                background: filter.enabled ? #0e1c20 : #0e141b;
+                                border-color: filter.enabled ? #315a58 : #27313d;
+                                border-width: 1px;
+                                border-radius: 6px;
+                                HorizontalLayout {
+                                    padding: 8px;
+                                    spacing: 10px;
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        Text { text: filter.track-name + " · " + filter.mode-name; color: filter.enabled ? #dce5ef : #8290a2; font-size: 12px; font-weight: 600; overflow: elide; }
+                                        Text { text: filter.cutoff-label + " · " + filter.resonance-label + (filter.enabled ? "" : " · BYPASSED"); color: #8290a2; font-size: 10px; overflow: elide; }
+                                    }
+                                    Button {
+                                        text: filter.enabled ? "Bypass" : "Enable";
+                                        enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible;
+                                        clicked => { IdeActions.update-native-filter(filter.index, !filter.enabled, filter.mode-index, filter.cutoff-millihertz, filter.resonance-millionths); }
+                                    }
+                                    Button {
+                                        text: "Edit";
+                                        enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible;
+                                        clicked => {
+                                            root.native-filter-edit-index = filter.index;
+                                            root.native-filter-edit-enabled = filter.enabled;
+                                            root.native-filter-edit-mode-index = filter.mode-index;
+                                            root.native-filter-edit-cutoff = filter.cutoff-millihertz;
+                                            root.native-filter-edit-resonance = filter.resonance-millionths;
+                                            root.native-filter-remove-confirming-index = -1;
+                                            root.native-filter-edit-visible = true;
+                                        }
+                                    }
+                                    Button {
+                                        text: root.native-filter-remove-confirming-index == filter.index ? "Confirm" : "Remove";
+                                        enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible;
+                                        clicked => {
+                                            if root.native-filter-remove-confirming-index == filter.index {
+                                                IdeActions.remove-native-filter(filter.index);
+                                            } else {
+                                                root.native-filter-remove-confirming-index = filter.index;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.native-filters.length == 0 : Rectangle {
+                            vertical-stretch: 1;
+                            background: transparent;
+                            Text { text: "No Native Filters on audio tracks"; color: #65758a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                        }
                     }
                 }
 

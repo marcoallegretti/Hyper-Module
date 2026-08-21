@@ -2183,6 +2183,7 @@ dependencies = [
  "hyper-mapping-editor",
  "hyper-media-cache",
  "hyper-mixer-runtime",
+ "hyper-native-device",
  "hyper-playback-compiler",
  "hyper-playback-json",
  "hyper-playback-session",
