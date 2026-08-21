@@ -1063,11 +1063,10 @@ impl DesktopIdeApplication {
         match opened {
             Ok(session) => {
                 self.playback_session_generation = next_playback_session_generation;
-                let mut running = RunningDesktopIdeApplication {
+                let running = RunningDesktopIdeApplication {
                     application: self,
                     session: IdePlaybackSessionOwner::Native(session),
                 };
-                running.arm_persisted_loop();
                 Ok(running)
             }
             Err(source) => Err(IdeProjectOpenFailure {
@@ -4175,24 +4174,6 @@ pub struct IdeLoopRangeFrames {
     pub start_frame: usize,
     pub end_frame: usize,
     pub enabled: bool,
-}
-
-/// The transport commands a reopened project needs so the runtime loops where
-/// the controls say it loops. A project with no usable range arms nothing.
-fn persisted_loop_commands(
-    range: Option<hyper_playback_session::PlaybackArrangementLoopRange>,
-) -> Vec<TransportCommand> {
-    let Some(range) = range else {
-        return Vec::new();
-    };
-    let Ok(transport_range) = TransportLoopRange::new(range.start_frame(), range.end_frame())
-    else {
-        return Vec::new();
-    };
-    vec![
-        TransportCommand::SetLoopRange(Some(transport_range)),
-        TransportCommand::SetLoopEnabled(range.enabled()),
-    ]
 }
 
 #[derive(Debug)]
@@ -10419,22 +10400,6 @@ impl RunningDesktopIdeApplication {
         })
     }
 
-    /// Arms the runtime with the loop the project carries, so a reopened
-    /// project loops where it says it loops. Without this the controls would
-    /// show a range the transport never received.
-    fn arm_persisted_loop(&mut self) {
-        let range = match &self.session {
-            IdePlaybackSessionOwner::Native(session) => session
-                .prepared_project()
-                .and_then(|prepared| prepared.session().arrangement().loop_range()),
-            #[cfg(test)]
-            IdePlaybackSessionOwner::Test(_) => None,
-        };
-        for command in persisted_loop_commands(range) {
-            let _ = self.try_send_transport(command);
-        }
-    }
-
     /// Sends a bounded transport or scene command through the only live owner.
     ///
     /// # Errors
@@ -14689,77 +14654,6 @@ mod tests {
             "each loop failure reads differently, so the user can tell them apart"
         );
         drop(prepared);
-    }
-
-    #[test]
-    fn a_reopened_project_arms_the_loop_it_displays() {
-        assert!(
-            persisted_loop_commands(None).is_empty(),
-            "a project with no loop arms nothing"
-        );
-
-        let fixture = ArrangementProjectFixture::with_two_scenes();
-        let project_path = fixture.root().to_path_buf();
-        let config = desktop_ide_application_config().unwrap();
-        let limits = config.project_limits();
-        let prepared =
-            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
-        assert!(prepared.session().arrangement().loop_range().is_none());
-
-        let package = prepared.package();
-        let descriptor = package
-            .manifest()
-            .resources()
-            .iter()
-            .find(|descriptor| descriptor.role() == ResourceRole::Arrangement)
-            .unwrap();
-        let arrangement_id = descriptor.id().to_owned();
-        let source = package.read_resource(&arrangement_id).unwrap();
-        let sha = *package.manifest_sha256();
-        let (project, _, _, media) = prepared.session().parts();
-        let facts: Vec<_> = media.media_asset_facts().collect();
-        let written = serialize_arrangement_loop_range(
-            project,
-            &facts,
-            &source,
-            Some((1_920, 7_680, true)),
-            limits.session.documents,
-        )
-        .unwrap();
-        drop(prepared);
-        publish_project_resource(
-            &project_path,
-            ProjectResourcePublicationRequest {
-                expected_project_sha256: sha,
-                resource_id: &arrangement_id,
-                expected_role: ResourceRole::Arrangement,
-                resource_bytes: &written,
-            },
-        )
-        .unwrap();
-
-        let reopened =
-            hyper_project_loader::prepare_project_playback(&project_path, limits).unwrap();
-        let range = reopened
-            .session()
-            .arrangement()
-            .loop_range()
-            .expect("the reopened project carries the loop");
-        let commands = persisted_loop_commands(Some(range));
-        assert_eq!(
-            commands.len(),
-            2,
-            "a reopened loop arms both the range and whether it is engaged"
-        );
-        assert!(matches!(
-            commands[0],
-            TransportCommand::SetLoopRange(Some(_))
-        ));
-        assert!(
-            matches!(commands[1], TransportCommand::SetLoopEnabled(true)),
-            "a loop saved as engaged is armed as engaged, not merely displayed"
-        );
-        drop(reopened);
     }
 
     #[test]

@@ -34,9 +34,9 @@ use hyper_mixer_runtime::{
     LoudnessCommandSender, MixerChannelHandle, MixerParameterCommand, MixerParameterCommandSender,
     MixerParameterResolveError, MixerParameterStateRestoreError, MixerSendHandle,
     OutputMeterReceiver, RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError,
-    TransportCommand, TransportCommandSender, TransportOutputCreationError,
-    TransportOutputProcessor, loudness_command_channel, output_meter_channel,
-    playback_recovery_channel,
+    TransportCommand, TransportCommandSendError, TransportCommandSender, TransportLoopRange,
+    TransportLoopRangeError, TransportOutputCreationError, TransportOutputProcessor,
+    loudness_command_channel, output_meter_channel, playback_recovery_channel_with_initial_loop,
 };
 use hyper_native_device::DeviceChain;
 use hyper_playback_compiler::graph::GraphLimits;
@@ -52,6 +52,9 @@ use hyper_storage_engine::{
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+
+#[cfg(test)]
+use hyper_mixer_runtime::playback_recovery_channel;
 
 pub type DesktopPlaybackSessionInput = PreparedPlaybackSession;
 
@@ -214,6 +217,8 @@ pub enum DesktopPlaybackSessionBuildError {
     Playback(AdapterCompileError),
     Media(PreparePlaybackError),
     Runtime(RuntimeCreationError),
+    PersistedLoopRange(TransportLoopRangeError),
+    PersistedLoopCommand(TransportCommandSendError),
     MixerRecovery(MixerParameterStateRestoreError),
     ControlMappingCopy(ControlMappingCompileError),
     ControlMapping(DesktopControlMappingBuildError),
@@ -272,6 +277,12 @@ impl fmt::Display for DesktopPlaybackSessionBuildError {
             Self::Playback(source) => write!(formatter, "playback compilation failed: {source}"),
             Self::Media(source) => write!(formatter, "media preparation failed: {source}"),
             Self::Runtime(source) => write!(formatter, "runtime construction failed: {source}"),
+            Self::PersistedLoopRange(source) => {
+                write!(formatter, "persisted loop range is invalid: {source}")
+            }
+            Self::PersistedLoopCommand(source) => {
+                write!(formatter, "persisted loop cannot be armed: {source}")
+            }
             Self::MixerRecovery(source) => {
                 write!(formatter, "mixer recovery failed: {source}")
             }
@@ -306,6 +317,8 @@ impl Error for DesktopPlaybackSessionBuildError {
             Self::Playback(source) => Some(source),
             Self::Media(source) => Some(source),
             Self::Runtime(source) => Some(source),
+            Self::PersistedLoopRange(source) => Some(source),
+            Self::PersistedLoopCommand(source) => Some(source),
             Self::MixerRecovery(source) => Some(source),
             Self::ControlMappingCopy(source) => Some(source),
             Self::ControlMapping(source) => Some(source),
@@ -1979,6 +1992,7 @@ fn initialize_session(
         monitoring,
     } = initialization;
     let (project, mixer, automation, media) = input.parts();
+    let persisted_loop = input.arrangement().loop_range();
     validate_session_sample_rate(project, sample_rate_hz)
         .or_else(|source| fail_build(publication, source))?;
 
@@ -2031,10 +2045,14 @@ fn initialize_session(
 
     let (commands, mixer_parameter_commands, mut transport) =
         RoutedTransportRuntime::with_command_queues(runtime);
+    configure_persisted_loop(&commands, &mut transport, persisted_loop)
+        .or_else(|source| fail_build(publication, source))?;
     restore_transport_checkpoint(&mut transport, initial_checkpoint)
         .map_err(DesktopPlaybackSessionBuildError::MixerRecovery)
         .or_else(|source| fail_build(publication, source))?;
     let initial_mixer_parameter_state = transport.mixer_parameter_state();
+    let initial_loop_range = transport.loop_range();
+    let initial_loop_enabled = transport.loop_enabled();
     let (mut meter_sender, meters) = output_meter_channel();
     let (loudness_commands, loudness_command_receiver) = loudness_command_channel();
     let processor = TransportOutputProcessor::try_new(
@@ -2052,8 +2070,12 @@ fn initialize_session(
         .or_else(|source| fail_build(publication, source))?;
     let (preview_control, preview) =
         prepare_audio_preview(media, recordings, sample_rate_hz, publication)?;
-    let (publisher, recovery) =
-        playback_recovery_channel(initial_checkpoint, Some(&initial_mixer_parameter_state));
+    let (publisher, recovery) = playback_recovery_channel_with_initial_loop(
+        initial_checkpoint,
+        Some(&initial_mixer_parameter_state),
+        initial_loop_range,
+        initial_loop_enabled,
+    );
     let controls = build_session_controls(
         commands,
         mixer_parameter_commands,
@@ -2150,12 +2172,41 @@ fn restore_transport_checkpoint<R: hyper_mixer_runtime::TrackWindowRenderer>(
     let Some(checkpoint) = checkpoint else {
         return Ok(());
     };
-    transport
-        .apply_command(checkpoint.restore_command())
-        .expect("recovery checkpoints never contain scene-launch commands");
+    for command in [
+        TransportCommand::SetLoopRange(checkpoint.loop_range()),
+        TransportCommand::SetLoopEnabled(checkpoint.loop_enabled()),
+        checkpoint.restore_command(),
+    ] {
+        transport
+            .apply_command(command)
+            .expect("recovery checkpoints never contain scene-launch commands");
+    }
     if let Some(mixer_parameter_state) = checkpoint.mixer_parameter_state() {
         transport.restore_mixer_parameter_state(&mixer_parameter_state)?;
     }
+    Ok(())
+}
+
+fn configure_persisted_loop<R: hyper_mixer_runtime::TrackWindowRenderer>(
+    sender: &TransportCommandSender,
+    transport: &mut RoutedTransportRuntime<R>,
+    persisted: Option<hyper_playback_session::PlaybackArrangementLoopRange>,
+) -> Result<(), DesktopPlaybackSessionBuildError> {
+    let Some(persisted) = persisted else {
+        return Ok(());
+    };
+    let range = TransportLoopRange::new(persisted.start_frame(), persisted.end_frame())
+        .map_err(DesktopPlaybackSessionBuildError::PersistedLoopRange)?;
+    let range_command = TransportCommand::SetLoopRange(Some(range));
+    sender
+        .validate_command(range_command)
+        .map_err(DesktopPlaybackSessionBuildError::PersistedLoopCommand)?;
+    transport
+        .apply_command(range_command)
+        .expect("a validated loop command cannot contain a scene failure");
+    transport
+        .apply_command(TransportCommand::SetLoopEnabled(persisted.enabled()))
+        .expect("a loop toggle cannot contain a scene failure");
     Ok(())
 }
 
@@ -2309,6 +2360,12 @@ mod tests {
         "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Main","enabled":true,
         "placements":[{"id":"018f47a2-6b2d-7c11-8a44-001122337506","track_id":"018f47a2-6b2d-7c11-8a44-001122337502","clip_id":"018f47a2-6b2d-7c11-8a44-001122337503","start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}],
         "scene_launches":[],"extensions":{}
+    }"#;
+    const LIVE_LOOPED_ARRANGEMENT: &[u8] = br#"{
+        "format":"hyper-arrangement","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337505",
+        "project_id":"018f47a2-6b2d-7c11-8a44-001122337500","name":"Main","enabled":true,
+        "placements":[{"id":"018f47a2-6b2d-7c11-8a44-001122337506","track_id":"018f47a2-6b2d-7c11-8a44-001122337502","clip_id":"018f47a2-6b2d-7c11-8a44-001122337503","start_tick":0,"clip_start_tick":0,"duration_ticks":4,"enabled":true}],
+        "scene_launches":[],"loop_range":{"enabled":true,"start_tick":0,"end_tick":4},"extensions":{}
     }"#;
     const LIVE_MIXER: &[u8] = br#"{
         "format":"hyper-mixer","format_version":1,"id":"018f47a2-6b2d-7c11-8a44-001122337507",
@@ -2607,6 +2664,10 @@ mod tests {
     }
 
     fn live_session_input() -> PreparedPlaybackSession {
+        live_session_input_with_arrangement(LIVE_ARRANGEMENT)
+    }
+
+    fn live_session_input_with_arrangement(arrangement: &[u8]) -> PreparedPlaybackSession {
         assemble_playback_session(PlaybackSessionAssemblyInput {
             documents: PlaybackDocumentBytes {
                 project_id: LIVE_PROJECT_ID.to_owned(),
@@ -2615,7 +2676,7 @@ mod tests {
                 tracks: vec![LIVE_TRACK.to_vec()],
                 clips: vec![LIVE_CLIP.to_vec()],
                 scenes: Vec::new(),
-                arrangement: Some(LIVE_ARRANGEMENT.to_vec()),
+                arrangement: Some(arrangement.to_vec()),
                 mixer: LIVE_MIXER.to_vec(),
                 automation_takes: Vec::new(),
             },
@@ -2633,6 +2694,100 @@ mod tests {
             },
         })
         .unwrap()
+    }
+
+    #[test]
+    fn persisted_loop_is_initial_authority_and_recovery_overrides_its_toggle() {
+        let input = live_session_input_with_arrangement(LIVE_LOOPED_ARRANGEMENT);
+        let persisted = input.arrangement().loop_range().unwrap();
+        assert_eq!((persisted.start_frame(), persisted.end_frame()), (0, 100));
+        assert!(persisted.enabled());
+        let (project, mixer, _, media) = input.parts();
+        let facts = collect_media_asset_facts(media).unwrap();
+        let graph = project
+            .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+            .unwrap();
+        let prepared = media.prepare_playback(&graph).unwrap();
+        let runtime = RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, 64).unwrap();
+        let (sender, _mixer, mut transport) =
+            RoutedTransportRuntime::with_command_queues(runtime);
+
+        configure_persisted_loop(&sender, &mut transport, Some(persisted)).unwrap();
+        assert_eq!(
+            transport.loop_range(),
+            Some(TransportLoopRange::new(0, 100).unwrap())
+        );
+        assert!(transport.loop_enabled());
+
+        transport
+            .apply_command(TransportCommand::SetLoopEnabled(false))
+            .unwrap();
+        let mut scratch_left = [0.0_f32; 64];
+        let mut scratch_right = [0.0_f32; 64];
+        let mut scratch = [RenderScratchSlot::new(
+            &mut scratch_left,
+            &mut scratch_right,
+        )];
+        let mut output_left = [0.0_f32; 64];
+        let mut output_right = [0.0_f32; 64];
+        let cycle = transport
+            .process_cycle(
+                &mut scratch,
+                StereoOutput {
+                    left: &mut output_left,
+                    right: &mut output_right,
+                },
+            )
+            .unwrap();
+        let (mut publisher, recovery) = playback_recovery_channel_with_initial_loop(
+            None,
+            None,
+            transport.loop_range(),
+            transport.loop_enabled(),
+        );
+        publisher.publish_cycle(cycle, None);
+        let checkpoint = recovery.snapshot();
+        assert_eq!(checkpoint.loop_range(), transport.loop_range());
+        assert!(!checkpoint.loop_enabled());
+
+        let replacement = RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, 64).unwrap();
+        let (replacement_sender, _mixer, mut replacement) =
+            RoutedTransportRuntime::with_command_queues(replacement);
+        configure_persisted_loop(&replacement_sender, &mut replacement, Some(persisted)).unwrap();
+        assert!(replacement.loop_enabled());
+        restore_transport_checkpoint(&mut replacement, Some(&checkpoint)).unwrap();
+        assert_eq!(replacement.loop_range(), checkpoint.loop_range());
+        assert!(!replacement.loop_enabled());
+    }
+
+    #[test]
+    fn persisted_loop_below_the_native_block_contract_fails_closed() {
+        let short = String::from_utf8(LIVE_LOOPED_ARRANGEMENT.to_vec())
+            .unwrap()
+            .replace("\"end_tick\":4", "\"end_tick\":1");
+        let input = live_session_input_with_arrangement(short.as_bytes());
+        let persisted = input.arrangement().loop_range().unwrap();
+        let (project, mixer, _, media) = input.parts();
+        let facts = collect_media_asset_facts(media).unwrap();
+        let graph = project
+            .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+            .unwrap();
+        let prepared = media.prepare_playback(&graph).unwrap();
+        let runtime = RoutedMainRuntime::try_new_prepared_playback(&prepared, mixer, 64).unwrap();
+        let (sender, _mixer, mut transport) =
+            RoutedTransportRuntime::with_command_queues(runtime);
+
+        assert!(matches!(
+            configure_persisted_loop(&sender, &mut transport, Some(persisted)),
+            Err(DesktopPlaybackSessionBuildError::PersistedLoopCommand(
+                TransportCommandSendError::LoopRangeShorterThanBlock {
+                    block_frames: 64,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(transport.loop_range(), None);
+        assert!(!transport.loop_enabled());
     }
 
     #[test]

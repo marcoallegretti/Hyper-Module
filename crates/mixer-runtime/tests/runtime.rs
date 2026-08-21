@@ -2803,6 +2803,18 @@ fn queued_start_is_rolled_back_when_track_rendering_fails() {
     let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
     let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
     let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(runtime);
+    let committed_range = TransportLoopRange::new(0, 8).unwrap();
+    transport
+        .apply_command(TransportCommand::SetLoopRange(Some(committed_range)))
+        .unwrap();
+    sender
+        .try_send(TransportCommand::SetLoopRange(Some(
+            TransportLoopRange::new(8, 16).unwrap(),
+        )))
+        .unwrap();
+    sender
+        .try_send(TransportCommand::SetLoopEnabled(true))
+        .unwrap();
     sender.try_send(TransportCommand::Start).unwrap();
     let mut scratch = [];
     let mut left = [9.0_f32; 1];
@@ -2821,6 +2833,10 @@ fn queued_start_is_rolled_back_when_track_rendering_fails() {
     assert_eq!(transport.position_frame(), 0);
     assert_constant(&left, 9.0);
     assert_constant(&right, 9.0);
+
+    let recovered = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(recovered.loop_range(), Some(committed_range));
+    assert!(!recovered.loop_enabled());
 }
 
 #[test]

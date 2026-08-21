@@ -46,6 +46,7 @@ pub use meter_ballistics::{
 pub use recovery::{
     PlaybackCycleObservation, PlaybackRecoveryCheckpoint, PlaybackRecoveryPublisher,
     PlaybackRecoverySnapshot, PlaybackRecoveryTransportState, playback_recovery_channel,
+    playback_recovery_channel_with_initial_loop,
 };
 
 pub const MAX_MAIN_MIXER_SLOTS: usize = 8;
@@ -1284,6 +1285,8 @@ pub struct TransportCycle {
     start_frame: usize,
     frame_count: usize,
     loop_wrap_count: usize,
+    loop_range: Option<TransportLoopRange>,
+    loop_enabled: bool,
     active_slot_count: usize,
     scene_launch_state: SceneLaunchState,
     applied_command_count: usize,
@@ -1298,6 +1301,18 @@ impl TransportCycle {
     #[must_use]
     pub const fn loop_wrap_count(self) -> usize {
         self.loop_wrap_count
+    }
+
+    /// The armed loop range after commands accepted by this cycle.
+    #[must_use]
+    pub const fn loop_range(self) -> Option<TransportLoopRange> {
+        self.loop_range
+    }
+
+    /// Whether loop playback is engaged after commands accepted by this cycle.
+    #[must_use]
+    pub const fn loop_enabled(self) -> bool {
+        self.loop_enabled
     }
 
     #[must_use]
@@ -3271,6 +3286,16 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     }
 
     #[must_use]
+    pub const fn loop_range(&self) -> Option<TransportLoopRange> {
+        self.loop_range
+    }
+
+    #[must_use]
+    pub const fn loop_enabled(&self) -> bool {
+        self.loop_enabled
+    }
+
+    #[must_use]
     pub const fn position_frame(&self) -> usize {
         self.position_frame
     }
@@ -3448,6 +3473,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         }
         let committed_state = self.state;
         let committed_position = self.position_frame;
+        let committed_loop_range = self.loop_range;
+        let committed_loop_enabled = self.loop_enabled;
         let committed_parameters = self.runtime.capture_parameter_state();
         let committed_renderer = self.runtime.renderer_checkpoint();
         let applied_command_count = match self.drain_commands() {
@@ -3455,6 +3482,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             Err(source) => {
                 self.state = committed_state;
                 self.position_frame = committed_position;
+                self.loop_range = committed_loop_range;
+                self.loop_enabled = committed_loop_enabled;
                 self.runtime.restore_renderer(committed_renderer);
                 self.runtime
                     .restore_parameter_state_unchecked(&committed_parameters);
@@ -3476,6 +3505,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 start_frame,
                 frame_count,
                 loop_wrap_count: 0,
+                loop_range: self.loop_range,
+                loop_enabled: self.loop_enabled,
                 active_slot_count: 0,
                 scene_launch_state: self.runtime.scene_launch_state(),
                 applied_command_count,
@@ -3490,6 +3521,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             Err(source) => {
                 self.state = committed_state;
                 self.position_frame = committed_position;
+                self.loop_range = committed_loop_range;
+                self.loop_enabled = committed_loop_enabled;
                 self.runtime.restore_renderer(committed_renderer);
                 self.runtime
                     .restore_parameter_state_unchecked(&committed_parameters);
@@ -3503,6 +3536,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             start_frame,
             frame_count,
             loop_wrap_count,
+            loop_range: self.loop_range,
+            loop_enabled: self.loop_enabled,
             active_slot_count: rendered.active_slot_count,
             scene_launch_state: self.runtime.scene_launch_state(),
             applied_command_count,

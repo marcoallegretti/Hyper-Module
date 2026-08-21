@@ -1,7 +1,7 @@
 use super::{
     LocateState, MAX_MAIN_MIXER_SLOTS, MAX_MIXER_SENDS_PER_SLOT, MixerChannelParameterState,
     MixerParameterStateSnapshot, MixerSendParameterState, TransportCommand, TransportCycle,
-    TransportState,
+    TransportLoopRange, TransportState,
 };
 use core::hint::spin_loop;
 use core::sync::atomic::{
@@ -22,6 +22,8 @@ pub struct PlaybackRecoverySnapshot {
     state: PlaybackRecoveryTransportState,
     position_frame: usize,
     committed_cycle_count: u64,
+    loop_range: Option<TransportLoopRange>,
+    loop_enabled: bool,
     mixer_parameter_state: Option<MixerParameterStateSnapshot>,
 }
 
@@ -39,6 +41,16 @@ impl PlaybackRecoverySnapshot {
     #[must_use]
     pub const fn committed_cycle_count(&self) -> u64 {
         self.committed_cycle_count
+    }
+
+    #[must_use]
+    pub const fn loop_range(&self) -> Option<TransportLoopRange> {
+        self.loop_range
+    }
+
+    #[must_use]
+    pub const fn loop_enabled(&self) -> bool {
+        self.loop_enabled
     }
 
     #[must_use]
@@ -69,6 +81,8 @@ pub struct PlaybackCycleObservation {
     state: PlaybackRecoveryTransportState,
     position_frame: usize,
     committed_cycle_count: u64,
+    loop_range: Option<TransportLoopRange>,
+    loop_enabled: bool,
     queued_scene_index: Option<usize>,
     queued_scene_launch_frame: Option<usize>,
     last_launched_scene_index: Option<usize>,
@@ -88,6 +102,16 @@ impl PlaybackCycleObservation {
     #[must_use]
     pub const fn committed_cycle_count(self) -> u64 {
         self.committed_cycle_count
+    }
+
+    #[must_use]
+    pub const fn loop_range(self) -> Option<TransportLoopRange> {
+        self.loop_range
+    }
+
+    #[must_use]
+    pub const fn loop_enabled(self) -> bool {
+        self.loop_enabled
     }
 
     #[must_use]
@@ -323,10 +347,42 @@ impl Default for AtomicSceneLaunchObservation {
 }
 
 #[derive(Debug, Default)]
+struct AtomicLoopObservation {
+    start_frame: AtomicUsize,
+    end_frame: AtomicUsize,
+    present: AtomicBool,
+    enabled: AtomicBool,
+}
+
+impl AtomicLoopObservation {
+    fn store(&self, range: Option<TransportLoopRange>, enabled: bool) {
+        if let Some(range) = range {
+            self.start_frame
+                .store(range.start_frame(), Ordering::Relaxed);
+            self.end_frame.store(range.end_frame(), Ordering::Relaxed);
+        }
+        self.present.store(range.is_some(), Ordering::Relaxed);
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn load(&self) -> (Option<TransportLoopRange>, bool) {
+        let range = self.present.load(Ordering::Relaxed).then(|| {
+            TransportLoopRange::new(
+                self.start_frame.load(Ordering::Relaxed),
+                self.end_frame.load(Ordering::Relaxed),
+            )
+            .expect("a recovery checkpoint stores only validated loop ranges")
+        });
+        (range, self.enabled.load(Ordering::Relaxed))
+    }
+}
+
+#[derive(Debug, Default)]
 struct PlaybackRecoveryState {
     sequence: AtomicU64,
     position_frame: AtomicUsize,
     transport_state: AtomicU8,
+    loop_observation: AtomicLoopObservation,
     scene_launch: AtomicSceneLaunchObservation,
     mixer_parameters: AtomicMixerParameterState,
 }
@@ -362,6 +418,7 @@ impl PlaybackRecoveryCheckpoint {
             }
             let position_frame = self.inner.position_frame.load(Ordering::Relaxed);
             let state = decode_state(self.inner.transport_state.load(Ordering::Relaxed));
+            let (loop_range, loop_enabled) = self.inner.loop_observation.load();
             let mixer_parameter_state = self.inner.mixer_parameters.load();
             fence(Ordering::Acquire);
             let after = self.inner.sequence.load(Ordering::Relaxed);
@@ -370,6 +427,8 @@ impl PlaybackRecoveryCheckpoint {
                     state,
                     position_frame,
                     committed_cycle_count: after / 2,
+                    loop_range,
+                    loop_enabled,
                     mixer_parameter_state,
                 };
             }
@@ -389,6 +448,7 @@ impl PlaybackRecoveryCheckpoint {
             }
             let position_frame = self.inner.position_frame.load(Ordering::Relaxed);
             let state = decode_state(self.inner.transport_state.load(Ordering::Relaxed));
+            let (loop_range, loop_enabled) = self.inner.loop_observation.load();
             let (queued_scene_index, queued_scene_launch_frame, last_launched_scene_index) =
                 self.inner.scene_launch.load();
             fence(Ordering::Acquire);
@@ -398,6 +458,8 @@ impl PlaybackRecoveryCheckpoint {
                     state,
                     position_frame,
                     committed_cycle_count: after / 2,
+                    loop_range,
+                    loop_enabled,
                     queued_scene_index,
                     queued_scene_launch_frame,
                     last_launched_scene_index,
@@ -425,6 +487,17 @@ pub struct PlaybackRecoveryPublisher {
     inner: Arc<PlaybackRecoveryState>,
 }
 
+#[derive(Clone, Copy)]
+struct PlaybackCyclePublication {
+    state: PlaybackRecoveryTransportState,
+    position_frame: usize,
+    loop_range: Option<TransportLoopRange>,
+    loop_enabled: bool,
+    queued_scene_index: Option<usize>,
+    queued_scene_launch_frame: Option<usize>,
+    last_launched_scene_index: Option<usize>,
+}
+
 impl PlaybackRecoveryPublisher {
     /// Publishes one committed transport cycle and its optional mixer state.
     pub fn publish_cycle(
@@ -434,15 +507,19 @@ impl PlaybackRecoveryPublisher {
     ) {
         let scene = cycle.scene_launch_state();
         self.publish_observation(
-            match cycle.state() {
+            PlaybackCyclePublication {
+                state: match cycle.state() {
                 TransportState::Stopped => PlaybackRecoveryTransportState::Stopped,
                 TransportState::Rolling => PlaybackRecoveryTransportState::Rolling,
+                },
+                position_frame: cycle.position_frame(),
+                loop_range: cycle.loop_range(),
+                loop_enabled: cycle.loop_enabled(),
+                queued_scene_index: scene.queued_scene_index(),
+                queued_scene_launch_frame: scene.queued_launch_frame(),
+                last_launched_scene_index: scene.last_launched_scene_index(),
             },
-            cycle.position_frame(),
             mixer_parameter_state,
-            scene.queued_scene_index(),
-            scene.queued_launch_frame(),
-            scene.last_launched_scene_index(),
         );
     }
 
@@ -454,36 +531,39 @@ impl PlaybackRecoveryPublisher {
         mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
     ) {
         self.publish_observation(
-            state,
-            position_frame,
+            PlaybackCyclePublication {
+                state,
+                position_frame,
+                loop_range: None,
+                loop_enabled: false,
+                queued_scene_index: None,
+                queued_scene_launch_frame: None,
+                last_launched_scene_index: None,
+            },
             mixer_parameter_state,
-            None,
-            None,
-            None,
         );
     }
 
     fn publish_observation(
         &mut self,
-        state: PlaybackRecoveryTransportState,
-        position_frame: usize,
+        publication: PlaybackCyclePublication,
         mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
-        queued_scene_index: Option<usize>,
-        queued_scene_launch_frame: Option<usize>,
-        last_launched_scene_index: Option<usize>,
     ) {
         let odd = self.inner.sequence.fetch_add(1, Ordering::Acquire) | 1;
         fence(Ordering::Release);
         self.inner
             .position_frame
-            .store(position_frame, Ordering::Relaxed);
+            .store(publication.position_frame, Ordering::Relaxed);
         self.inner
             .transport_state
-            .store(state as u8, Ordering::Relaxed);
+            .store(publication.state as u8, Ordering::Relaxed);
+        self.inner
+            .loop_observation
+            .store(publication.loop_range, publication.loop_enabled);
         self.inner.scene_launch.store(
-            queued_scene_index,
-            queued_scene_launch_frame,
-            last_launched_scene_index,
+            publication.queued_scene_index,
+            publication.queued_scene_launch_frame,
+            publication.last_launched_scene_index,
         );
         if let Some(mixer_parameter_state) = mixer_parameter_state {
             self.inner.mixer_parameters.store(mixer_parameter_state);
@@ -505,6 +585,23 @@ pub fn playback_recovery_channel(
     snapshot: Option<&PlaybackRecoverySnapshot>,
     initial_mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
 ) -> (PlaybackRecoveryPublisher, PlaybackRecoveryCheckpoint) {
+    playback_recovery_channel_with_initial_loop(
+        snapshot,
+        initial_mixer_parameter_state,
+        None,
+        false,
+    )
+}
+
+/// Creates a recovery channel whose zero-cycle observation carries the
+/// transport's already-validated initial loop state.
+#[must_use]
+pub fn playback_recovery_channel_with_initial_loop(
+    snapshot: Option<&PlaybackRecoverySnapshot>,
+    initial_mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
+    initial_loop_range: Option<TransportLoopRange>,
+    initial_loop_enabled: bool,
+) -> (PlaybackRecoveryPublisher, PlaybackRecoveryCheckpoint) {
     let mixer_parameters = AtomicMixerParameterState::default();
     if let Some(state) = snapshot
         .and_then(|snapshot| snapshot.mixer_parameter_state.as_ref())
@@ -520,6 +617,15 @@ pub fn playback_recovery_channel(
                 snapshot.state as u8
             }),
         ),
+        loop_observation: {
+            let observation = AtomicLoopObservation::default();
+            let (range, enabled) = snapshot.map_or(
+                (initial_loop_range, initial_loop_enabled),
+                |snapshot| (snapshot.loop_range, snapshot.loop_enabled),
+            );
+            observation.store(range, enabled);
+            observation
+        },
         scene_launch: AtomicSceneLaunchObservation::default(),
         mixer_parameters,
     });
@@ -633,6 +739,8 @@ mod tests {
                 state: PlaybackRecoveryTransportState::Stopped,
                 position_frame: 0,
                 committed_cycle_count: 0,
+                loop_range: None,
+                loop_enabled: false,
                 mixer_parameter_state: None,
             }
         );
@@ -642,6 +750,8 @@ mod tests {
                 state: PlaybackRecoveryTransportState::Stopped,
                 position_frame: 0,
                 committed_cycle_count: 0,
+                loop_range: None,
+                loop_enabled: false,
                 queued_scene_index: None,
                 queued_scene_launch_frame: None,
                 last_launched_scene_index: None,
@@ -659,6 +769,8 @@ mod tests {
                 state: PlaybackRecoveryTransportState::Rolling,
                 position_frame: 256,
                 committed_cycle_count: 1,
+                loop_range: None,
+                loop_enabled: false,
                 mixer_parameter_state: None,
             }
         );
@@ -676,6 +788,8 @@ mod tests {
                 state: PlaybackRecoveryTransportState::Stopped,
                 position_frame: 256,
                 committed_cycle_count: 2,
+                loop_range: None,
+                loop_enabled: false,
                 mixer_parameter_state: None,
             }
         );
@@ -725,13 +839,20 @@ mod tests {
                     generation * 2,
                     (generation + 7) % 8,
                 ));
+                let loop_range = (!generation.is_multiple_of(2)).then(|| {
+                    TransportLoopRange::new(generation, generation + 10).unwrap()
+                });
                 publisher.publish_observation(
-                    state,
-                    generation,
+                    PlaybackCyclePublication {
+                        state,
+                        position_frame: generation,
+                        loop_range,
+                        loop_enabled: loop_range.is_some(),
+                        queued_scene_index: scene.map(|value| value.0),
+                        queued_scene_launch_frame: scene.map(|value| value.1),
+                        last_launched_scene_index: scene.map(|value| value.2),
+                    },
                     Some(&mixer),
-                    scene.map(|value| value.0),
-                    scene.map(|value| value.1),
-                    scene.map(|value| value.2),
                 );
             }
         });
@@ -748,6 +869,11 @@ mod tests {
                     PlaybackRecoveryTransportState::Rolling
                 };
                 assert_eq!(observation.state(), expected_state);
+                let expected_loop = (!generation.is_multiple_of(2)).then(|| {
+                    TransportLoopRange::new(generation, generation + 10).unwrap()
+                });
+                assert_eq!(observation.loop_range(), expected_loop);
+                assert_eq!(observation.loop_enabled(), expected_loop.is_some());
                 let expected_scene = (!generation.is_multiple_of(2)).then_some((
                     generation % 8,
                     generation * 2,
@@ -789,6 +915,8 @@ mod tests {
             state: PlaybackRecoveryTransportState::Rolling,
             position_frame: 512,
             committed_cycle_count: 7,
+            loop_range: Some(TransportLoopRange::new(128, 640).unwrap()),
+            loop_enabled: true,
             mixer_parameter_state: Some(mixer),
         };
         let different_initial = mixer_snapshot(3, false);
@@ -801,6 +929,8 @@ mod tests {
                 state: PlaybackRecoveryTransportState::Rolling,
                 position_frame: 512,
                 committed_cycle_count: 7,
+                loop_range: Some(TransportLoopRange::new(128, 640).unwrap()),
+                loop_enabled: true,
                 mixer_parameter_state: Some(mixer),
             }
         );
