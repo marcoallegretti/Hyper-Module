@@ -21,7 +21,9 @@ use hyper_desktop_audio::{
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{
-    LocateState, PlaybackRecoveryCheckpoint, PlaybackRecoveryTransportState, TransportCommand,
+    ChannelSamplePeakBallistics, LocateState, OutputMeterReceiver, PlaybackRecoveryCheckpoint,
+    PlaybackRecoveryTransportState, SamplePeakBallisticsConfig, StereoSamplePeakBallistics,
+    StereoSamplePeakBallisticsSnapshot, TransportCommand,
 };
 use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
 use hyper_playback_json::LoaderLimits;
@@ -44,6 +46,8 @@ const MAX_AUDIO_DECODED_BYTES: usize = 1_024 * 1_024 * 1_024;
 const MAX_PROJECT_RESOURCE_BYTES: usize = 1_024 * 1_024 * 1_024;
 const MAX_PROJECT_DECODED_BYTES: usize = 1_024 * 1_024 * 1_024;
 const MAX_RUNTIME_BUNDLE_BYTES: u64 = 1_024 * 1_024 * 1_024;
+const OUTPUT_METER_FLOOR_DBFS: f32 = -90.0;
+const OUTPUT_METER_FALLOFF_DB_PER_SECOND: f32 = 13.3;
 
 const HEARTBEAT_INTERVAL_MS: u32 = 50;
 const HEARTBEAT_TIMEOUT_MS: u32 = 500;
@@ -95,6 +99,12 @@ impl PanelHost for SessionHost {
     }
 }
 
+impl SessionHost {
+    fn take_meter_receiver(&mut self) -> Option<OutputMeterReceiver> {
+        self.session.take_meter_receiver()
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -136,6 +146,60 @@ struct RuntimeObservers {
     output_counters: OutputStreamCounters,
     recovery: PlaybackRecoveryCheckpoint,
     panel_connected: Arc<AtomicBool>,
+}
+
+struct OperatorReady {
+    observers: RuntimeObservers,
+    meters: OutputMeterReceiver,
+}
+
+struct OperatorWorker {
+    ready: Receiver<Result<OperatorReady, String>>,
+    completion: Receiver<Result<(), String>>,
+    handle: std::thread::JoinHandle<Result<(), String>>,
+}
+
+struct OperatorMeterObserver {
+    receiver: OutputMeterReceiver,
+    ballistics: StereoSamplePeakBallistics,
+    latest: Option<StereoSamplePeakBallisticsSnapshot>,
+    coalesced_snapshot_count: u64,
+    dropped_snapshot_count: u64,
+    sender_disconnected: bool,
+}
+
+impl OperatorMeterObserver {
+    fn new(receiver: OutputMeterReceiver, config: SamplePeakBallisticsConfig) -> Self {
+        Self {
+            receiver,
+            ballistics: StereoSamplePeakBallistics::new(config),
+            latest: None,
+            coalesced_snapshot_count: 0,
+            dropped_snapshot_count: 0,
+            sender_disconnected: false,
+        }
+    }
+
+    fn observe(&mut self) -> OperatorMeterPresentation {
+        let read = self.receiver.read_ballistics(&mut self.ballistics);
+        let latest = read.latest();
+        self.coalesced_snapshot_count = self
+            .coalesced_snapshot_count
+            .saturating_add(u64::try_from(latest.coalesced_snapshot_count()).unwrap_or(u64::MAX));
+        self.dropped_snapshot_count = self
+            .dropped_snapshot_count
+            .saturating_add(u64::try_from(latest.dropped_snapshot_count()).unwrap_or(u64::MAX));
+        self.sender_disconnected |= latest.sender_disconnected();
+        if let Some(snapshot) = read.ballistics() {
+            self.latest = Some(snapshot);
+        }
+        operator_meter_presentation(
+            self.latest,
+            self.coalesced_snapshot_count,
+            self.dropped_snapshot_count,
+            self.sender_disconnected,
+        )
+    }
 }
 
 struct StartedRuntime {
@@ -423,34 +487,47 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
     }
 }
 
-fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
-    let ui =
-        OperatorWindow::new().map_err(|error| format!("operator UI could not open: {error}"))?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let (commands_tx, commands_rx) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
-    let diagnostic = Arc::new(Mutex::new(
-        "starting verified Runtime deployment".to_owned(),
-    ));
-    let completion_close_error = Arc::new(Mutex::new(None));
-    let worker_diagnostic = Arc::clone(&diagnostic);
-    let worker_stop = Arc::clone(&stop);
-    let worker = std::thread::spawn(move || {
+fn spawn_operator_worker(
+    arguments: RuntimeArguments,
+    stop: Arc<AtomicBool>,
+    commands: Receiver<OperatorCommand>,
+    diagnostic: Arc<Mutex<String>>,
+) -> OperatorWorker {
+    let (ready_tx, ready) = std::sync::mpsc::sync_channel(1);
+    let (completion_tx, completion) = std::sync::mpsc::sync_channel(1);
+    let handle = std::thread::spawn(move || {
         let result = match start_runtime(&arguments) {
             Ok(mut runtime) => {
-                announce_runtime(&arguments, &runtime);
-                if ready_tx.send(Ok(runtime.observers.clone())).is_err() {
-                    Err("operator UI ended before accepting startup evidence".to_owned())
-                } else {
-                    host_runtime(
-                        &arguments,
-                        &mut runtime.host,
-                        &runtime.observers.output_status,
-                        &worker_stop,
-                        Some(&commands_rx),
-                        &|message| set_diagnostic(&worker_diagnostic, message),
-                    )
+                let ready_model = runtime
+                    .host
+                    .take_meter_receiver()
+                    .map(|meters| OperatorReady {
+                        observers: runtime.observers.clone(),
+                        meters,
+                    })
+                    .ok_or_else(|| {
+                        "operator output meter authority was already transferred".to_owned()
+                    });
+                match ready_model {
+                    Ok(ready_model) => {
+                        announce_runtime(&arguments, &runtime);
+                        if ready_tx.send(Ok(ready_model)).is_err() {
+                            Err("operator UI ended before accepting startup evidence".to_owned())
+                        } else {
+                            host_runtime(
+                                &arguments,
+                                &mut runtime.host,
+                                &runtime.observers.output_status,
+                                &stop,
+                                Some(&commands),
+                                &|message| set_diagnostic(&diagnostic, message),
+                            )
+                        }
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error.clone()));
+                        Err(error)
+                    }
                 }
             }
             Err(error) => {
@@ -461,16 +538,47 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         let _ = completion_tx.send(result.clone());
         result
     });
-    let observers = match ready_rx.recv() {
-        Ok(Ok(observers)) => observers,
-        Ok(Err(error)) => return finish_failed_operator_startup(error, worker),
+    OperatorWorker {
+        ready,
+        completion,
+        handle,
+    }
+}
+
+fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
+    let ui =
+        OperatorWindow::new().map_err(|error| format!("operator UI could not open: {error}"))?;
+    let meter_config = SamplePeakBallisticsConfig::try_new(
+        SAMPLE_RATE_HZ,
+        OUTPUT_METER_FLOOR_DBFS,
+        OUTPUT_METER_FALLOFF_DB_PER_SECOND,
+        0,
+    )
+    .map_err(|error| format!("operator output meter policy is invalid: {error}"))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let (commands_tx, commands_rx) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+    let diagnostic = Arc::new(Mutex::new(
+        "starting verified Runtime deployment".to_owned(),
+    ));
+    let completion_close_error = Arc::new(Mutex::new(None));
+    let worker = spawn_operator_worker(
+        arguments,
+        Arc::clone(&stop),
+        commands_rx,
+        Arc::clone(&diagnostic),
+    );
+    let ready = match worker.ready.recv() {
+        Ok(Ok(ready)) => ready,
+        Ok(Err(error)) => return finish_failed_operator_startup(error, worker.handle),
         Err(_) => {
             return finish_failed_operator_startup(
                 "Runtime worker ended before publishing startup evidence".to_owned(),
-                worker,
+                worker.handle,
             );
         }
     };
+    let OperatorReady { observers, meters } = ready;
+    let mut meter_observer = OperatorMeterObserver::new(meters, meter_config);
 
     apply_static_facts(&ui, &observers.facts);
     wire_operator_action(&ui, &commands_tx, &diagnostic, OperatorCommand::Start);
@@ -478,8 +586,12 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_return_to_start(&ui, &commands_tx, &diagnostic);
     wire_operator_quit(&ui, &commands_tx, &stop, &diagnostic);
 
+    apply_observations(&ui, &observers, &diagnostic);
+    apply_operator_meter_observation(&ui, &mut meter_observer);
+
     let weak = ui.as_weak();
     let timer_observers = observers.clone();
+    let mut timer_meter_observer = meter_observer;
     let timer_diagnostic = Arc::clone(&diagnostic);
     let timer_close_error = Arc::clone(&completion_close_error);
     let mut completion_observed = false;
@@ -487,9 +599,13 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
         if let Some(ui) = weak.upgrade() {
             apply_observations(&ui, &timer_observers, &timer_diagnostic);
+            apply_operator_meter_observation(&ui, &mut timer_meter_observer);
             if !completion_observed
-                && let Some(close_result) =
-                    apply_operator_worker_completion(&ui, &completion_rx, &timer_diagnostic, || {
+                && let Some(close_result) = apply_operator_worker_completion(
+                    &ui,
+                    &worker.completion,
+                    &timer_diagnostic,
+                    || {
                         close_operator_surface(
                             || {
                                 ui.hide().map_err(|error| {
@@ -502,7 +618,8 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                                 })
                             },
                         )
-                    })
+                    },
+                )
             {
                 completion_observed = true;
                 if let Err(error) = close_result {
@@ -511,14 +628,13 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
             }
         }
     });
-    apply_observations(&ui, &observers, &diagnostic);
 
     let ui_result = ui
         .run()
         .map_err(|error| format!("operator UI failed: {error}"));
     drop(timer);
     let ui_result = reconcile_operator_ui_close(ui_result, &completion_close_error);
-    finish_operator_worker(ui_result, &stop, &commands_tx, worker)
+    finish_operator_worker(ui_result, &stop, &commands_tx, worker.handle)
 }
 
 fn finish_failed_operator_startup(
@@ -738,6 +854,73 @@ struct OperatorObservationPresentation {
     diagnostic: String,
 }
 
+#[derive(Debug, PartialEq)]
+struct OperatorMeterPresentation {
+    left_level: f32,
+    left_reading: String,
+    right_level: f32,
+    right_reading: String,
+    state: &'static str,
+    telemetry: String,
+}
+
+fn operator_meter_presentation(
+    snapshot: Option<StereoSamplePeakBallisticsSnapshot>,
+    coalesced_snapshot_count: u64,
+    dropped_snapshot_count: u64,
+    sender_disconnected: bool,
+) -> OperatorMeterPresentation {
+    let (left_level, left_reading, right_level, right_reading, frame) = snapshot.map_or_else(
+        || (0.0, "— dBFS".to_owned(), 0.0, "— dBFS".to_owned(), None),
+        |snapshot| {
+            let (left_level, left_reading) = operator_meter_channel_presentation(snapshot.left());
+            let (right_level, right_reading) =
+                operator_meter_channel_presentation(snapshot.right());
+            (
+                left_level,
+                left_reading,
+                right_level,
+                right_reading,
+                Some(snapshot.processed_frame_end()),
+            )
+        },
+    );
+    let state = match (snapshot.is_some(), sender_disconnected) {
+        (false, false) => "Waiting for final-output evidence",
+        (false, true) => "Meter producer ended before a snapshot",
+        (true, false) => "Live final-output sample peak",
+        (true, true) => "Final meter snapshot · producer ended",
+    };
+    let frame = frame.map_or_else(|| "unavailable".to_owned(), |frame| frame.to_string());
+    OperatorMeterPresentation {
+        left_level,
+        left_reading,
+        right_level,
+        right_reading,
+        state,
+        telemetry: format!(
+            "meter frame {frame} · {coalesced_snapshot_count} coalesced · {dropped_snapshot_count} dropped"
+        ),
+    }
+}
+
+fn operator_meter_channel_presentation(channel: ChannelSamplePeakBallistics) -> (f32, String) {
+    operator_meter_level_presentation(channel.measurement_available(), channel.level_dbfs())
+}
+
+fn operator_meter_level_presentation(measurement_available: bool, dbfs: f32) -> (f32, String) {
+    if !measurement_available || !dbfs.is_finite() {
+        return (0.0, "— dBFS".to_owned());
+    }
+    let level = ((dbfs - OUTPUT_METER_FLOOR_DBFS) / -OUTPUT_METER_FLOOR_DBFS).clamp(0.0, 1.0);
+    let reading = if dbfs <= OUTPUT_METER_FLOOR_DBFS {
+        format!("≤ {OUTPUT_METER_FLOOR_DBFS:.1} dBFS")
+    } else {
+        format!("{dbfs:.1} dBFS")
+    };
+    (level, reading)
+}
+
 fn operator_observation_presentation(
     transport_state: PlaybackRecoveryTransportState,
     transport_frame: usize,
@@ -818,6 +1001,16 @@ fn apply_observations(
     ui.set_native_xruns(presentation.native_xruns.into());
     ui.set_panel_state(presentation.panel_state.into());
     ui.set_diagnostic(presentation.diagnostic.into());
+}
+
+fn apply_operator_meter_observation(ui: &OperatorWindow, observer: &mut OperatorMeterObserver) {
+    let presentation = observer.observe();
+    ui.set_left_output_level(presentation.left_level);
+    ui.set_left_output_reading(presentation.left_reading.into());
+    ui.set_right_output_level(presentation.right_level);
+    ui.set_right_output_reading(presentation.right_reading.into());
+    ui.set_output_meter_state(presentation.state.into());
+    ui.set_output_meter_telemetry(presentation.telemetry.into());
 }
 
 /// Enforces the process startup boundary: artifact acceptance and semantic
@@ -1200,6 +1393,39 @@ mod tests {
         );
     }
 
+    fn assert_generated_operator_meter_contract(ui: &OperatorWindow) {
+        let (meter_sender, meter_receiver) = hyper_mixer_runtime::output_meter_channel();
+        let meter_config = SamplePeakBallisticsConfig::try_new(
+            SAMPLE_RATE_HZ,
+            OUTPUT_METER_FLOOR_DBFS,
+            OUTPUT_METER_FALLOFF_DB_PER_SECOND,
+            0,
+        )
+        .unwrap();
+        let mut meter_observer = OperatorMeterObserver::new(meter_receiver, meter_config);
+        apply_operator_meter_observation(ui, &mut meter_observer);
+
+        assert!(ui.get_left_output_level().abs() <= f32::EPSILON);
+        assert_eq!(ui.get_left_output_reading().as_str(), "— dBFS");
+        assert!(ui.get_right_output_level().abs() <= f32::EPSILON);
+        assert_eq!(ui.get_right_output_reading().as_str(), "— dBFS");
+        assert_eq!(
+            ui.get_output_meter_state().as_str(),
+            "Waiting for final-output evidence"
+        );
+        assert_eq!(
+            ui.get_output_meter_telemetry().as_str(),
+            "meter frame unavailable · 0 coalesced · 0 dropped"
+        );
+
+        drop(meter_sender);
+        apply_operator_meter_observation(ui, &mut meter_observer);
+        assert_eq!(
+            ui.get_output_meter_state().as_str(),
+            "Meter producer ended before a snapshot"
+        );
+    }
+
     #[test]
     fn operator_ui_wires_commands_and_authoritative_properties() {
         let ui = OperatorWindow::new().unwrap();
@@ -1228,6 +1454,7 @@ mod tests {
         };
         apply_static_facts(&ui, &facts);
         apply_observations(&ui, &observers, &diagnostic);
+        assert_generated_operator_meter_contract(&ui);
 
         ui.invoke_start_requested();
         ui.invoke_stop_requested();
@@ -1497,5 +1724,40 @@ mod tests {
             "03:02:01.500"
         );
         assert_eq!(format_transport_time(u64::MAX), "106751991167:18:02.325");
+    }
+
+    #[test]
+    fn runtime_output_meter_presentation_preserves_floor_and_overload_evidence() {
+        assert_eq!(
+            operator_meter_level_presentation(false, -20.0),
+            (0.0, "— dBFS".to_owned())
+        );
+        assert_eq!(
+            operator_meter_level_presentation(true, f32::NAN),
+            (0.0, "— dBFS".to_owned())
+        );
+        assert_eq!(
+            operator_meter_level_presentation(true, OUTPUT_METER_FLOOR_DBFS),
+            (0.0, "≤ -90.0 dBFS".to_owned())
+        );
+        assert_eq!(
+            operator_meter_level_presentation(true, -45.0),
+            (0.5, "-45.0 dBFS".to_owned())
+        );
+        assert_eq!(
+            operator_meter_level_presentation(true, 3.0),
+            (1.0, "3.0 dBFS".to_owned())
+        );
+
+        let unavailable = operator_meter_presentation(None, u64::MAX, u64::MAX - 1, true);
+        assert_eq!(unavailable.state, "Meter producer ended before a snapshot");
+        assert_eq!(
+            unavailable.telemetry,
+            format!(
+                "meter frame unavailable · {} coalesced · {} dropped",
+                u64::MAX,
+                u64::MAX - 1
+            )
+        );
     }
 }

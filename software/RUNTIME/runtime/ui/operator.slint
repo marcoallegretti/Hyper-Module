@@ -19,10 +19,38 @@ component FactCard inherits Rectangle {
     }
 }
 
+component OutputMeterBar inherits Rectangle {
+    in property <string> channel;
+    in property <float> level;
+    in property <string> reading;
+    background: #0c1118;
+    border-radius: 5px;
+    min-height: 30px;
+
+    HorizontalLayout {
+        padding: 7px;
+        spacing: 10px;
+        Text { text: root.channel; color: #8d99ad; font-size: 10px; font-weight: 700; width: 16px; }
+        Rectangle {
+            background: #202836;
+            border-radius: 3px;
+            Rectangle {
+                x: 0;
+                y: 0;
+                width: parent.width * root.level;
+                height: parent.height;
+                border-radius: 3px;
+                background: root.level >= 1 ? #ff5a55 : root.level > 0.76 ? #f5b83d : #3ddc97;
+            }
+        }
+        Text { text: root.reading; color: #edf2f8; font-size: 11px; width: 96px; horizontal-alignment: right; }
+    }
+}
+
 export component OperatorWindow inherits Window {
     title: "Hyper Runtime";
     width: 880px;
-    height: 560px;
+    height: 700px;
     background: #0d1016;
 
     in property <string> project-name;
@@ -39,6 +67,12 @@ export component OperatorWindow inherits Window {
     in property <string> stream-failures;
     in property <string> native-xruns;
     in property <string> panel-state;
+    in property <float> left-output-level;
+    in property <string> left-output-reading;
+    in property <float> right-output-level;
+    in property <string> right-output-reading;
+    in property <string> output-meter-state;
+    in property <string> output-meter-telemetry;
     in property <string> diagnostic;
 
     callback start-requested();
@@ -53,8 +87,8 @@ export component OperatorWindow inherits Window {
         VerticalLayout {
             spacing: 4px;
             Text { text: "HYPER RUNTIME"; color: #6fd6bd; font-size: 13px; font-weight: 700; }
-            Text { text: root.project-name; color: #f7f9fc; font-size: 28px; font-weight: 700; }
-            Text { text: root.project-identity + "  ·  revision " + root.project-revision; color: #8d99ad; font-size: 12px; }
+            Text { text: root.project-name; color: #f7f9fc; font-size: 28px; font-weight: 700; overflow: elide; }
+            Text { text: root.project-identity + "  ·  revision " + root.project-revision; color: #8d99ad; font-size: 12px; overflow: elide; }
         }
 
         HorizontalLayout {
@@ -73,6 +107,26 @@ export component OperatorWindow inherits Window {
             FactCard { label: "DEPLOYMENT"; value: "generation " + root.deployment-generation; }
             FactCard { label: "CALLBACKS"; value: root.callback-count; }
             FactCard { label: "STREAM FAILURES / XRUNS"; value: root.stream-failures + " / " + root.native-xruns; }
+        }
+
+        Rectangle {
+            background: #171b24;
+            border-color: #2c3445;
+            border-width: 1px;
+            border-radius: 8px;
+            min-height: 124px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 6px;
+                HorizontalLayout {
+                    Text { text: "FINAL OUTPUT · SAMPLE PEAK"; color: #8d99ad; font-size: 11px; font-weight: 700; }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Text { text: root.output-meter-state; color: #8d99ad; font-size: 11px; overflow: elide; }
+                }
+                OutputMeterBar { channel: "L"; level: root.left-output-level; reading: root.left-output-reading; }
+                OutputMeterBar { channel: "R"; level: root.right-output-level; reading: root.right-output-reading; }
+                Text { text: root.output-meter-telemetry; color: #69778c; font-size: 10px; overflow: elide; }
+            }
         }
 
         Rectangle {

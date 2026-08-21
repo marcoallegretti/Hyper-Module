@@ -594,7 +594,7 @@ pub struct DesktopPlaybackSession {
     output: DesktopOutputStream,
     controls: SessionControlHandles,
     loudness_commands: LoudnessCommandSender,
-    meters: OutputMeterReceiver,
+    meters: Option<OutputMeterReceiver>,
     recovery: PlaybackRecoveryCheckpoint,
     preview: super::DesktopAudioPreviewControl,
     config: DesktopOutputConfig,
@@ -1476,7 +1476,7 @@ impl DesktopPlaybackSession {
                     output,
                     controls: handles.controls,
                     loudness_commands: handles.loudness_commands,
-                    meters: handles.meters,
+                    meters: Some(handles.meters),
                     recovery: handles.recovery,
                     preview: handles.preview,
                     config,
@@ -1741,9 +1741,27 @@ impl DesktopPlaybackSession {
         &mut self.loudness_commands
     }
 
+    /// Borrows the final-output meter consumer while this session still owns it.
+    ///
+    /// # Panics
+    ///
+    /// Panics after [`Self::take_meter_receiver`] explicitly transferred the
+    /// single consumer to another presentation owner.
     #[must_use]
     pub fn meter_receiver(&mut self) -> &mut OutputMeterReceiver {
-        &mut self.meters
+        self.meters
+            .as_mut()
+            .expect("the output meter receiver was explicitly transferred")
+    }
+
+    /// Transfers the final-output meter consumer away from the session owner.
+    ///
+    /// The audio thread keeps the only producer. A presentation owner may take
+    /// the bounded consumer once without receiving playback or control
+    /// authority.
+    #[must_use]
+    pub fn take_meter_receiver(&mut self) -> Option<OutputMeterReceiver> {
+        self.meters.take()
     }
 
     /// Returns the verified project retained by this session when it was
