@@ -9933,15 +9933,37 @@ impl Error for DesktopUiExitError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slint::platform::{Key, WindowEvent};
+    use i_slint_backend_testing::ElementHandle;
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
 
     fn dispatch_ide_shortcut(ui: &MainWindow, text: &str, shift: bool, repeated: bool) {
+        dispatch_ide_shortcut_with_modifiers(ui, text, shift, false, false, repeated);
+    }
+
+    fn dispatch_ide_shortcut_with_modifiers(
+        ui: &MainWindow,
+        text: &str,
+        shift: bool,
+        alt: bool,
+        meta: bool,
+        repeated: bool,
+    ) {
         ui.window().dispatch_event(WindowEvent::KeyPressed {
             text: Key::Control.into(),
         });
         if shift {
             ui.window().dispatch_event(WindowEvent::KeyPressed {
                 text: Key::Shift.into(),
+            });
+        }
+        if alt {
+            ui.window().dispatch_event(WindowEvent::KeyPressed {
+                text: Key::Alt.into(),
+            });
+        }
+        if meta {
+            ui.window().dispatch_event(WindowEvent::KeyPressed {
+                text: Key::Meta.into(),
             });
         }
         ui.window().dispatch_event(if repeated {
@@ -9953,6 +9975,16 @@ mod tests {
         if shift {
             ui.window().dispatch_event(WindowEvent::KeyReleased {
                 text: Key::Shift.into(),
+            });
+        }
+        if alt {
+            ui.window().dispatch_event(WindowEvent::KeyReleased {
+                text: Key::Alt.into(),
+            });
+        }
+        if meta {
+            ui.window().dispatch_event(WindowEvent::KeyReleased {
+                text: Key::Meta.into(),
             });
         }
         ui.window().dispatch_event(WindowEvent::KeyReleased {
@@ -10180,6 +10212,8 @@ mod tests {
         dispatch_ide_shortcut(ui, "w", false, false);
         dispatch_ide_shortcut(ui, "w", false, true);
         dispatch_ide_shortcut(ui, "W", true, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "w", false, true, false, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "w", false, false, true, false);
         assert_eq!(
             closed.get(),
             1,
@@ -10208,6 +10242,35 @@ mod tests {
             "pending work and local forms keep the close shortcut unavailable"
         );
         ui.set_new_track_visible(false);
+    }
+
+    #[test]
+    fn focused_line_edits_consume_the_project_close_chord() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_scene_rename_visible(true);
+        ui.show().unwrap();
+
+        let mut matches = ElementHandle::find_by_element_id(&ui, "MainWindow::scene-rename-input");
+        let editor = matches
+            .next()
+            .expect("the visible scene editor must expose its LineEdit");
+        assert!(matches.next().is_none(), "the scene editor id is unique");
+        editor.mock_single_click(PointerEventButton::Left);
+
+        let closed = Rc::new(Cell::new(0_usize));
+        let closed_by_callback = Rc::clone(&closed);
+        ui.global::<IdeActions>().on_close_project(move || {
+            closed_by_callback.set(closed_by_callback.get() + 1);
+        });
+        dispatch_ide_shortcut(&ui, "w", false, false);
+        assert_eq!(
+            closed.get(),
+            0,
+            "a focused LineEdit owns the primary close chord instead of abandoning its editor"
+        );
     }
 
     fn assert_form_cancellation_shortcut_contract(ui: &MainWindow) {

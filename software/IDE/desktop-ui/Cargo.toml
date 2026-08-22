@@ -11,6 +11,7 @@ workspace = true
 
 [dev-dependencies]
 hyper-desktop-ide = { path = "../application", features = ["ui-test-support"] }
+i-slint-backend-testing = "=1.17.1"
 
 [dependencies]
 hyper-desktop-ide = { path = "../application" }

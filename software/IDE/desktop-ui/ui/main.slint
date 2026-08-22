@@ -1,5 +1,14 @@
 import { Button, ComboBox, LineEdit, ListView, Slider } from "std-widgets.slint";
 
+component IdeLineEdit inherits LineEdit {
+    key-pressed(event) => {
+        if event.modifiers.control && !event.modifiers.shift && !event.modifiers.alt && !event.modifiers.meta && !event.repeat && (event.text == "w" || event.text == "W") {
+            return accept;
+        }
+        reject
+    }
+}
+
 export enum AppMode {
     discovering,
     closed,
@@ -735,7 +744,7 @@ export component MainWindow inherits Window {
                 }
                 return accept;
             }
-            if event.modifiers.control && !event.modifiers.shift && !event.repeat && (event.text == "w" || event.text == "W") {
+            if event.modifiers.control && !event.modifiers.shift && !event.modifiers.alt && !event.modifiers.meta && !event.repeat && (event.text == "w" || event.text == "W") {
                 if (root.app-mode == AppMode.running || root.app-mode == AppMode.previewing) && !root.new-project-visible && !root.new-track-visible {
                     IdeActions.close-project();
                 }
@@ -966,7 +975,7 @@ export component MainWindow inherits Window {
                             vertical-stretch: 1;
                             spacing: 6px;
                             Text { text: "NEW PROJECT NAME"; color: #65758a; font-size: 9px; font-weight: 700; letter-spacing: 0.6px; }
-                            LineEdit {
+                            IdeLineEdit {
                                 text <=> root.new-project-name;
                                 enabled: root.app-mode == AppMode.closed;
                                 accessible-label: "New project name";
@@ -1001,7 +1010,7 @@ export component MainWindow inherits Window {
                                 vertical-stretch: 1;
                                 spacing: 6px;
                                 Text { text: "NEW AUDIO TRACK"; color: #65758a; font-size: 9px; font-weight: 700; letter-spacing: 0.6px; }
-                                LineEdit {
+                                IdeLineEdit {
                                     text <=> root.new-track-name;
                                     enabled: root.app-mode == AppMode.running;
                                     accessible-label: "New audio track name";
@@ -1284,7 +1293,7 @@ export component MainWindow inherits Window {
                                         font-size: 9px;
                                         vertical-alignment: center;
                                     }
-                                    tempo-input := LineEdit {
+                                    tempo-input := IdeLineEdit {
                                         width: 74px;
                                         text: root.tempo-bpm;
                                         enabled: root.tempo-available;
@@ -1304,7 +1313,7 @@ export component MainWindow inherits Window {
                                         font-size: 9px;
                                         vertical-alignment: center;
                                     }
-                                    meter-input := LineEdit {
+                                    meter-input := IdeLineEdit {
                                         width: 62px;
                                         text: root.meter-signature;
                                         enabled: root.meter-available;
@@ -1505,7 +1514,7 @@ export component MainWindow inherits Window {
                         GridLayout {
                             spacing: 8px;
                             Text { row: 0; col: 0; text: "Scene name"; color: #8fa0b4; vertical-alignment: center; }
-                            LineEdit { row: 0; col: 1; text <=> root.scene-create-name; placeholder-text: "Verse"; accessible-label: "New scene name"; }
+                            IdeLineEdit { row: 0; col: 1; text <=> root.scene-create-name; placeholder-text: "Verse"; accessible-label: "New scene name"; }
                             Text { row: 1; col: 0; text: "Launch timing"; color: #8fa0b4; vertical-alignment: center; }
                             ComboBox {
                                 row: 1;
@@ -1515,7 +1524,7 @@ export component MainWindow inherits Window {
                                 accessible-label: "New scene launch timing";
                             }
                             if root.scene-create-quantization-index == 1 : Text { row: 2; col: 0; text: "Grid quantum"; color: #8fa0b4; vertical-alignment: center; }
-                            if root.scene-create-quantization-index == 1 : LineEdit {
+                            if root.scene-create-quantization-index == 1 : IdeLineEdit {
                                 row: 2;
                                 col: 1;
                                 text <=> root.scene-create-quantum-ticks;
@@ -1678,7 +1687,7 @@ export component MainWindow inherits Window {
                         GridLayout {
                             spacing: 8px;
                             Text { text: "Scene name"; color: #8fa0b4; vertical-alignment: center; }
-                            LineEdit { text <=> root.scene-rename-name; placeholder-text: "Verse"; accessible-label: "Scene name"; }
+                            scene-rename-input := IdeLineEdit { text <=> root.scene-rename-name; placeholder-text: "Verse"; accessible-label: "Scene name"; }
                         }
                         Text { text: "1 to 120 characters. Leading and trailing whitespace is removed."; color: #65758a; font-size: 9px; }
                         Rectangle { vertical-stretch: 1; background: transparent; }
@@ -1712,7 +1721,7 @@ export component MainWindow inherits Window {
                             font-size: 11px;
                             wrap: word-wrap;
                         }
-                        LineEdit {
+                        IdeLineEdit {
                             text <=> root.scene-duplicate-name;
                             placeholder-text: "New scene name";
                             accessible-label: "Duplicated scene name";
@@ -1782,7 +1791,7 @@ export component MainWindow inherits Window {
                         Text { text: root.rename-track-original-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
                         Rectangle { height: 1px; background: #27313d; }
                         Text { text: "New display name"; color: #aebccc; font-size: 12px; }
-                        LineEdit {
+                        IdeLineEdit {
                             text <=> root.rename-track-name;
                             enabled: root.app-mode == AppMode.running;
                             accessible-label: "New audio track name";
@@ -2012,8 +2021,8 @@ export component MainWindow inherits Window {
                             spacing: 8px;
                             VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "TRACK"; color: #65758a; font-size: 8px; } ComboBox { model: root.native-filter-track-names; current-index <=> root.native-filter-add-track-index; } }
                             VerticalLayout { min-width: 130px; max-width: 130px; spacing: 2px; Text { text: "MODE"; color: #65758a; font-size: 8px; } ComboBox { model: ["Low-pass", "High-pass"]; current-index <=> root.native-filter-add-mode-index; } }
-                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "CUTOFF · mHz"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-filter-add-cutoff; } }
-                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "RESONANCE · millionths"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-filter-add-resonance; } }
+                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "CUTOFF · mHz"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-filter-add-cutoff; } }
+                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "RESONANCE · millionths"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-filter-add-resonance; } }
                             Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.native-filter-add-visible = false; } }
                             Button {
                                 text: root.app-mode == AppMode.editing-native-filter ? "Adding…" : "Add";
@@ -2025,11 +2034,11 @@ export component MainWindow inherits Window {
                         if root.native-compressor-add-visible : HorizontalLayout {
                             height: 48px; spacing: 8px;
                             VerticalLayout { min-width: 120px; max-width: 120px; spacing: 2px; Text { text: "TRACK"; color: #65758a; font-size: 8px; } ComboBox { model: root.native-filter-track-names; current-index <=> root.native-filter-add-track-index; } }
-                            VerticalLayout { min-width: 100px; max-width: 100px; spacing: 2px; Text { text: "THRESHOLD · mdB"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-add-threshold; } }
-                            VerticalLayout { min-width: 100px; max-width: 100px; spacing: 2px; Text { text: "RATIO · millionths"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-add-ratio; } }
-                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "ATTACK · μs"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-add-attack; } }
-                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "RELEASE · μs"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-add-release; } }
-                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "MAKEUP · mdB"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-add-makeup; } }
+                            VerticalLayout { min-width: 100px; max-width: 100px; spacing: 2px; Text { text: "THRESHOLD · mdB"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-compressor-add-threshold; } }
+                            VerticalLayout { min-width: 100px; max-width: 100px; spacing: 2px; Text { text: "RATIO · millionths"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-compressor-add-ratio; } }
+                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "ATTACK · μs"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-compressor-add-attack; } }
+                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "RELEASE · μs"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-compressor-add-release; } }
+                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "MAKEUP · mdB"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-compressor-add-makeup; } }
                             Button { text: "Cancel"; clicked => { root.native-compressor-add-visible = false; } }
                             Button { text: "Add"; enabled: root.app-mode == AppMode.running; clicked => { IdeActions.add-native-compressor(root.native-filter-add-track-index, root.native-compressor-add-threshold, root.native-compressor-add-ratio, root.native-compressor-add-attack, root.native-compressor-add-release, root.native-compressor-add-makeup); } }
                         }
@@ -2038,8 +2047,8 @@ export component MainWindow inherits Window {
                             height: 48px;
                             spacing: 8px;
                             VerticalLayout { min-width: 130px; max-width: 130px; spacing: 2px; Text { text: "MODE"; color: #65758a; font-size: 8px; } ComboBox { model: ["Low-pass", "High-pass"]; current-index <=> root.native-filter-edit-mode-index; } }
-                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "CUTOFF · mHz"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-filter-edit-cutoff; } }
-                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "RESONANCE · millionths"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-filter-edit-resonance; } }
+                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "CUTOFF · mHz"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-filter-edit-cutoff; } }
+                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "RESONANCE · millionths"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-filter-edit-resonance; } }
                             Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.native-filter-edit-visible = false; root.native-filter-edit-index = -1; } }
                             Button {
                                 text: root.app-mode == AppMode.editing-native-filter ? "Saving…" : "Save";
@@ -2050,11 +2059,11 @@ export component MainWindow inherits Window {
 
                         if root.native-compressor-edit-visible : HorizontalLayout {
                             height: 48px; spacing: 8px;
-                            VerticalLayout { min-width: 100px; max-width: 100px; spacing: 2px; Text { text: "THRESHOLD · mdB"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-edit-threshold; } }
-                            VerticalLayout { min-width: 100px; max-width: 100px; spacing: 2px; Text { text: "RATIO · millionths"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-edit-ratio; } }
-                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "ATTACK · μs"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-edit-attack; } }
-                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "RELEASE · μs"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-edit-release; } }
-                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "MAKEUP · mdB"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-edit-makeup; } }
+                            VerticalLayout { min-width: 100px; max-width: 100px; spacing: 2px; Text { text: "THRESHOLD · mdB"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-compressor-edit-threshold; } }
+                            VerticalLayout { min-width: 100px; max-width: 100px; spacing: 2px; Text { text: "RATIO · millionths"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-compressor-edit-ratio; } }
+                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "ATTACK · μs"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-compressor-edit-attack; } }
+                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "RELEASE · μs"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-compressor-edit-release; } }
+                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "MAKEUP · mdB"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-compressor-edit-makeup; } }
                             Button { text: "Cancel"; clicked => { root.native-compressor-edit-visible = false; root.native-compressor-edit-index = -1; } }
                             Button { text: "Save"; enabled: root.app-mode == AppMode.running && root.native-compressor-edit-index >= 0; clicked => { IdeActions.update-native-compressor(root.native-compressor-edit-index, root.native-compressor-edit-enabled, root.native-compressor-edit-threshold, root.native-compressor-edit-ratio, root.native-compressor-edit-attack, root.native-compressor-edit-release, root.native-compressor-edit-makeup); } }
                         }
@@ -2249,7 +2258,7 @@ export component MainWindow inherits Window {
                             if root.control-target-continuous[root.control-create-target-index] : VerticalLayout {
                                 width: 140px;
                                 Text { text: "Output min"; color: #8fa0b4; font-size: 9px; }
-                                LineEdit {
+                                IdeLineEdit {
                                     text <=> root.control-create-output-min;
                                     input-type: number;
                                     enabled: root.app-mode == AppMode.running;
@@ -2258,7 +2267,7 @@ export component MainWindow inherits Window {
                             if root.control-target-continuous[root.control-create-target-index] : VerticalLayout {
                                 width: 140px;
                                 Text { text: "Output max"; color: #8fa0b4; font-size: 9px; }
-                                LineEdit {
+                                IdeLineEdit {
                                     text <=> root.control-create-output-max;
                                     input-type: number;
                                     enabled: root.app-mode == AppMode.running;
@@ -2438,7 +2447,7 @@ export component MainWindow inherits Window {
                             VerticalLayout {
                                 horizontal-stretch: 1;
                                 Text { text: "Name"; color: #8fa0b4; font-size: 9px; }
-                                LineEdit {
+                                IdeLineEdit {
                                     placeholder-text: "Take name";
                                     text <=> root.automation-create-name;
                                     enabled: root.app-mode == AppMode.running;
@@ -2475,7 +2484,7 @@ export component MainWindow inherits Window {
                             VerticalLayout {
                                 width: 120px;
                                 Text { text: "Start tick"; color: #8fa0b4; font-size: 9px; }
-                                LineEdit {
+                                IdeLineEdit {
                                     text <=> root.automation-create-start;
                                     input-type: number;
                                     enabled: root.app-mode == AppMode.running;
@@ -2484,7 +2493,7 @@ export component MainWindow inherits Window {
                             VerticalLayout {
                                 width: 120px;
                                 Text { text: "End tick"; color: #8fa0b4; font-size: 9px; }
-                                LineEdit {
+                                IdeLineEdit {
                                     text <=> root.automation-create-end;
                                     input-type: number;
                                     enabled: root.app-mode == AppMode.running;
@@ -2497,7 +2506,7 @@ export component MainWindow inherits Window {
                                     color: #8fa0b4;
                                     font-size: 9px;
                                 }
-                                LineEdit {
+                                IdeLineEdit {
                                     placeholder-text: "tick=value, tick=value";
                                     text <=> root.automation-create-points;
                                     enabled: root.app-mode == AppMode.running;
@@ -2723,7 +2732,7 @@ export component MainWindow inherits Window {
                                     wrap: word-wrap;
                                 }
                                 Text { text: "CLIP NAME"; color: #65758a; font-size: 9px; }
-                                LineEdit {
+                                IdeLineEdit {
                                     text <=> root.take-clip-name;
                                     accessible-label: "Reusable audio clip name";
                                 }
@@ -2896,7 +2905,7 @@ export component MainWindow inherits Window {
                             GridLayout {
                                 spacing: 8px;
                                 Text { row: 0; col: 0; text: "Project tick"; color: #8fa0b4; vertical-alignment: center; }
-                                LineEdit {
+                                IdeLineEdit {
                                     row: 0; col: 1;
                                     text <=> root.add-arrangement-scene-launch-tick;
                                     input-type: number;
@@ -2950,7 +2959,7 @@ export component MainWindow inherits Window {
                             GridLayout {
                                 spacing: 8px;
                                 Text { row: 0; col: 0; text: "Project tick"; color: #8fa0b4; vertical-alignment: center; }
-                                LineEdit {
+                                IdeLineEdit {
                                     row: 0; col: 1;
                                     text <=> root.move-arrangement-scene-launch-tick;
                                     input-type: number;
@@ -3297,7 +3306,7 @@ export component MainWindow inherits Window {
                                                     color: #6f8197;
                                                     font-size: 8px;
                                                 }
-                                                start-tick-input := LineEdit {
+                                                start-tick-input := IdeLineEdit {
                                                     width: 82px;
                                                     horizontal-stretch: 0;
                                                     text: placement.start-tick;
@@ -3338,7 +3347,7 @@ export component MainWindow inherits Window {
                                                     color: #6f8197;
                                                     font-size: 8px;
                                                 }
-                                                duration-tick-input := LineEdit {
+                                                duration-tick-input := IdeLineEdit {
                                                     width: 82px;
                                                     horizontal-stretch: 0;
                                                     text: placement.duration-ticks;
@@ -3700,7 +3709,7 @@ export component MainWindow inherits Window {
                             font-size: 11px;
                             wrap: word-wrap;
                         }
-                        LineEdit {
+                        IdeLineEdit {
                             text <=> root.clip-rename-name;
                             placeholder-text: "Audio clip name";
                             accessible-label: "New audio clip name";
@@ -3742,7 +3751,7 @@ export component MainWindow inherits Window {
                             font-size: 11px;
                             wrap: word-wrap;
                         }
-                        LineEdit {
+                        IdeLineEdit {
                             text <=> root.clip-duplicate-name;
                             placeholder-text: "New audio clip name";
                             accessible-label: "Duplicated audio clip name";
@@ -3823,7 +3832,7 @@ export component MainWindow inherits Window {
                             font-size: 11px;
                             wrap: word-wrap;
                         }
-                        LineEdit {
+                        IdeLineEdit {
                             text <=> root.add-arrangement-placement-start-tick;
                             placeholder-text: "0";
                             accessible-label: "Arrangement placement start tick";
@@ -3869,7 +3878,7 @@ export component MainWindow inherits Window {
                             font-size: 11px;
                             wrap: word-wrap;
                         }
-                        LineEdit {
+                        IdeLineEdit {
                             text <=> root.clip-gain-value;
                             placeholder-text: "0";
                             accessible-label: "Audio clip gain in decibels";
@@ -3915,9 +3924,9 @@ export component MainWindow inherits Window {
                         GridLayout {
                             spacing: 8px;
                             Text { text: "Fade in"; color: #8fa0b4; vertical-alignment: center; }
-                            LineEdit { text <=> root.clip-fades-in; placeholder-text: "0"; accessible-label: "Audio clip fade-in ticks"; }
+                            IdeLineEdit { text <=> root.clip-fades-in; placeholder-text: "0"; accessible-label: "Audio clip fade-in ticks"; }
                             Text { text: "Fade out"; color: #8fa0b4; vertical-alignment: center; }
-                            LineEdit { text <=> root.clip-fades-out; placeholder-text: "0"; accessible-label: "Audio clip fade-out ticks"; }
+                            IdeLineEdit { text <=> root.clip-fades-out; placeholder-text: "0"; accessible-label: "Audio clip fade-out ticks"; }
                         }
                         Text {
                             text: "The fixed curve is linear amplitude. This edits the reusable clip everywhere it is referenced; it is not an arrangement crossfade and does not change source audio.";
@@ -3967,9 +3976,9 @@ export component MainWindow inherits Window {
                         GridLayout {
                             spacing: 8px;
                             Text { text: "Loop start"; color: #8fa0b4; vertical-alignment: center; }
-                            LineEdit { text <=> root.clip-loop-start; placeholder-text: "0"; accessible-label: "Audio clip loop start tick"; }
+                            IdeLineEdit { text <=> root.clip-loop-start; placeholder-text: "0"; accessible-label: "Audio clip loop start tick"; }
                             Text { text: "Loop end"; color: #8fa0b4; vertical-alignment: center; }
-                            LineEdit { text <=> root.clip-loop-end; placeholder-text: root.clip-loop-duration; accessible-label: "Audio clip loop end tick"; }
+                            IdeLineEdit { text <=> root.clip-loop-end; placeholder-text: root.clip-loop-duration; accessible-label: "Audio clip loop end tick"; }
                         }
                         Text {
                             text: "This edits the reusable clip everywhere it is referenced. It is not the transport loop, does not repeat arrangement placements, and does not change source audio.";
@@ -4025,7 +4034,7 @@ export component MainWindow inherits Window {
                         GridLayout {
                             spacing: 8px;
                             Text { text: "Source start frame"; color: #8fa0b4; vertical-alignment: center; }
-                            LineEdit { text <=> root.clip-source-slip-start; placeholder-text: "0"; accessible-label: "Audio clip source start frame"; }
+                            IdeLineEdit { text <=> root.clip-source-slip-start; placeholder-text: "0"; accessible-label: "Audio clip source start frame"; }
                         }
                         Text {
                             text: "This is a nondestructive global slip of the reusable clip. Duration, warp, loop, fades, arrangement timing, scene references, and media bytes remain unchanged.";
@@ -4068,9 +4077,9 @@ export component MainWindow inherits Window {
                         GridLayout {
                             spacing: 8px;
                             Text { text: "Source start frame"; color: #8fa0b4; vertical-alignment: center; }
-                            LineEdit { text <=> root.clip-source-trim-start; placeholder-text: "0"; accessible-label: "Trimmed audio clip source start frame"; }
+                            IdeLineEdit { text <=> root.clip-source-trim-start; placeholder-text: "0"; accessible-label: "Trimmed audio clip source start frame"; }
                             Text { text: "Source frame count"; color: #8fa0b4; vertical-alignment: center; }
-                            LineEdit { text <=> root.clip-source-trim-frame-count; placeholder-text: "1"; accessible-label: "Trimmed audio clip source frame count"; }
+                            IdeLineEdit { text <=> root.clip-source-trim-frame-count; placeholder-text: "1"; accessible-label: "Trimmed audio clip source frame count"; }
                         }
                         Text {
                             text: "The trim preserves exact source rate and changes every reference only after save and reopen. It refuses nonlinear warp, lossy timing, and loop or fade state that no longer fits; source audio bytes and arrangement timing stay unchanged.";
