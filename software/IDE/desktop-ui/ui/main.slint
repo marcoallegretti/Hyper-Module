@@ -677,6 +677,12 @@ export component MainWindow inherits Window {
                 }
                 return accept;
             }
+            if event.modifiers.control && !event.modifiers.shift && !event.repeat && (event.text == "t" || event.text == "T") {
+                if root.app-mode == AppMode.running && root.track-count < 8 && !root.new-project-visible && !root.new-track-visible {
+                    root.new-track-visible = true;
+                }
+                return accept;
+            }
             reject
         }
 

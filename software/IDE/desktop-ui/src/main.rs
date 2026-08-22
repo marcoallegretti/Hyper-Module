@@ -9804,6 +9804,50 @@ mod tests {
         ui.set_new_track_visible(false);
     }
 
+    fn assert_audio_track_creation_shortcut_contract(ui: &MainWindow) {
+        ui.set_app_mode(AppMode::Running);
+        ui.set_track_count(1);
+        ui.set_new_project_visible(false);
+        ui.set_new_track_visible(false);
+        dispatch_ide_shortcut(ui, "t", false, false);
+        assert!(
+            ui.get_new_track_visible(),
+            "the primary add-track shortcut opens the same bounded running-state form as the button"
+        );
+
+        ui.set_new_track_visible(false);
+        dispatch_ide_shortcut(ui, "t", false, true);
+        dispatch_ide_shortcut(ui, "T", true, false);
+        assert!(
+            !ui.get_new_track_visible(),
+            "repeated and shifted add-track chords remain reserved rather than reopening a form"
+        );
+
+        ui.set_track_count(8);
+        dispatch_ide_shortcut(ui, "t", false, false);
+        assert!(
+            !ui.get_new_track_visible(),
+            "the bounded project track limit revokes the add-track shortcut"
+        );
+
+        ui.set_track_count(1);
+        ui.set_app_mode(AppMode::Closed);
+        dispatch_ide_shortcut(ui, "t", false, false);
+        assert!(
+            !ui.get_new_track_visible(),
+            "a closed project cannot open an audio-track form"
+        );
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_new_project_visible(true);
+        dispatch_ide_shortcut(ui, "t", false, false);
+        assert!(
+            !ui.get_new_track_visible(),
+            "the audio-track form never interrupts an already-open project form"
+        );
+        ui.set_new_project_visible(false);
+    }
+
     fn assert_restore_shortcut_commands(
         submitted: &Rc<RefCell<Vec<IdeWorkerCommand>>>,
         message: &str,
@@ -12652,6 +12696,7 @@ mod tests {
         assert_undo_redo_shortcut_contract(&ui);
         assert_project_save_shortcut_contract(&ui);
         assert_project_creation_shortcut_contract(&ui);
+        assert_audio_track_creation_shortcut_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);
         ui.set_status_text("Choose a Runtime destination".into());
         ui.set_error_text("retained message".into());
