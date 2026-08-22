@@ -665,6 +665,12 @@ export component MainWindow inherits Window {
                 }
                 return accept;
             }
+            if event.modifiers.control && !event.modifiers.shift && !event.repeat && (event.text == "s" || event.text == "S") {
+                if root.app-mode == AppMode.running && root.mixer-main-state-available {
+                    IdeActions.save-project();
+                }
+                return accept;
+            }
             reject
         }
 

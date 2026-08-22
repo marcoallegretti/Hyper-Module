@@ -1169,19 +1169,7 @@ fn bind_playback_callbacks(
     bind_loudness_callbacks(ui, worker);
     bind_scene_callbacks(ui, worker, project_state);
 
-    let weak = ui.as_weak();
-    let worker_for_save = Rc::clone(worker);
-    let state_for_save = Rc::clone(project_state);
-    actions.on_save_project(move || {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        if ui.get_app_mode() != AppMode::Running || !ui.get_mixer_main_state_available() {
-            ui.set_error_text("Committed mixer state is not available to save".into());
-            return;
-        }
-        submit_to_ui(&ui, &worker_for_save, project_save_command(&state_for_save));
-    });
+    bind_project_save_callback(ui, worker, project_state);
 
     bind_audio_track_callback(ui, worker);
 
@@ -1193,6 +1181,38 @@ fn bind_playback_callbacks(
 
     bind_mixer_callbacks(ui, worker);
     bind_native_filter_callbacks(ui, worker, project_state);
+}
+
+fn bind_project_save_callback(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_state: &ProjectUiStateCell,
+) {
+    let worker = Rc::clone(worker);
+    bind_project_save_callback_with(
+        ui,
+        project_state,
+        Rc::new(move |ui, command| submit_to_ui(ui, &worker, command)),
+    );
+}
+
+fn bind_project_save_callback_with(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    submitter: UiCommandSubmitter,
+) {
+    let weak = ui.as_weak();
+    let project_state = Rc::clone(project_state);
+    ui.global::<IdeActions>().on_save_project(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_mixer_main_state_available() {
+            ui.set_error_text("Committed mixer state is not available to save".into());
+            return;
+        }
+        submitter(&ui, project_save_command(&project_state));
+    });
 }
 
 fn bind_native_filter_callbacks(
@@ -9718,6 +9738,37 @@ mod tests {
         );
     }
 
+    fn assert_project_save_shortcut_contract(ui: &MainWindow) {
+        let project_state: ProjectUiStateCell = Rc::new(ProjectUiState::default());
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_project_save_callback_with(
+            ui,
+            &project_state,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_main_state_available(true);
+        dispatch_ide_shortcut(ui, "s", false, false);
+        dispatch_ide_shortcut(ui, "s", false, true);
+        dispatch_ide_shortcut(ui, "S", true, false);
+        assert!(
+            matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::SaveProject]),
+            "only a non-repeating primary save shortcut submits the existing project save command"
+        );
+
+        ui.set_app_mode(AppMode::Saving);
+        dispatch_ide_shortcut(ui, "s", false, false);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_main_state_available(false);
+        dispatch_ide_shortcut(ui, "s", false, false);
+        assert!(
+            matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::SaveProject]),
+            "pending or unavailable committed mixer state cannot queue another save"
+        );
+    }
+
     fn assert_restore_shortcut_commands(
         submitted: &Rc<RefCell<Vec<IdeWorkerCommand>>>,
         message: &str,
@@ -12564,6 +12615,7 @@ mod tests {
         );
         assert_window_contracts(&ui);
         assert_undo_redo_shortcut_contract(&ui);
+        assert_project_save_shortcut_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);
         ui.set_status_text("Choose a Runtime destination".into());
         ui.set_error_text("retained message".into());
