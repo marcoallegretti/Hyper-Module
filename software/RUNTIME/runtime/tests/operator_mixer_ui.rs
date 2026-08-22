@@ -77,6 +77,22 @@ fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
     );
     assert_eq!(*toggles.borrow(), 1);
 
+    let scene_stops = Rc::new(RefCell::new(0_usize));
+    let scene_stop_requested = Rc::clone(&scene_stops);
+    ui.on_stop_interactive_scenes_requested(move || {
+        *scene_stop_requested.borrow_mut() += 1;
+    });
+    ui.set_stop_interactive_scenes_enabled(true);
+    dispatch_shift_space(&ui, false);
+    dispatch_shift_space(&ui, true);
+    assert_eq!(*toggles.borrow(), 1, "Shift+Space must not toggle transport");
+    assert_eq!(*scene_stops.borrow(), 1);
+
+    ui.set_stop_interactive_scenes_enabled(false);
+    dispatch_shift_space(&ui, false);
+    assert_eq!(*toggles.borrow(), 1);
+    assert_eq!(*scene_stops.borrow(), 1, "revoked scene authority must refuse Shift+Space");
+
     ui.set_transport_start_enabled(false);
     ui.set_transport_stop_enabled(true);
     assert_eq!(start.accessible_enabled(), Some(false));
@@ -669,6 +685,39 @@ fn click_enabled(ui: &OperatorWindow, accessible_label: &str) {
 
 fn dispatch_key(ui: &OperatorWindow, event: WindowEvent) {
     ui.window().dispatch_event(event);
+}
+
+fn dispatch_shift_space(ui: &OperatorWindow, repeated: bool) {
+    dispatch_key(
+        ui,
+        WindowEvent::KeyPressed {
+            text: Key::Shift.into(),
+        },
+    );
+    dispatch_key(
+        ui,
+        if repeated {
+            WindowEvent::KeyPressRepeated {
+                text: Key::Space.into(),
+            }
+        } else {
+            WindowEvent::KeyPressed {
+                text: Key::Space.into(),
+            }
+        },
+    );
+    dispatch_key(
+        ui,
+        WindowEvent::KeyReleased {
+            text: Key::Space.into(),
+        },
+    );
+    dispatch_key(
+        ui,
+        WindowEvent::KeyReleased {
+            text: Key::Shift.into(),
+        },
+    );
 }
 
 fn drag_to_right_edge(element: &ElementHandle) {

@@ -516,7 +516,11 @@ export component OperatorWindow inherits Window {
 
         key-pressed(event) => {
             if event.text == Key.Space {
-                if !event.repeat && (root.transport-start-enabled || root.transport-stop-enabled) {
+                if event.modifiers.shift {
+                    if !event.repeat && root.stop-interactive-scenes-enabled {
+                        root.stop-interactive-scenes-requested();
+                    }
+                } else if !event.repeat && (root.transport-start-enabled || root.transport-stop-enabled) {
                     root.toggle-transport-requested();
                 }
                 return accept;
