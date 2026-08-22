@@ -16,8 +16,13 @@ use hyper_desktop_ide::{
     IdeInputSelection, IdeLoudnessCommand, IdeLoudnessDisplayUnit, IdeLoudnessMeasurementState,
     IdeLoudnessPresentationConfig, IdeLoudnessScale, IdeLoudnessScaleRegion,
     IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelKind, IdeMixerCommand,
-    IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeFilter,
+    IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice,
     IdeNativeFilterEdit, NativeFilterMode, IdeOutputSelection,
+    MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
+    MIN_COMPRESSOR_RATIO_MILLIONTHS, MAX_COMPRESSOR_RATIO_MILLIONTHS,
+    MIN_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_ATTACK_MICROSECONDS,
+    MIN_COMPRESSOR_RELEASE_MICROSECONDS, MAX_COMPRESSOR_RELEASE_MICROSECONDS,
+    MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS, MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS,
     ControlScope, ControlSource, ControlTarget, ControlTransform, Edge,
     IdeControlBindingRequest, IdeControlChannelParameter, IdeControlMainParameter,
     IdeControlMappingEdit, IdeLoopRangeFrames, IdeResourceRestoreError, MeterEvent, SceneAction,
@@ -1264,7 +1269,7 @@ fn bind_native_filter_callbacks_with(
         };
         let edit = native_filter_update(
             ui.get_app_mode(),
-            &ui.get_native_filters(),
+            &ui.get_native_devices(),
             index,
             enabled,
             mode_index,
@@ -1278,12 +1283,33 @@ fn bind_native_filter_callbacks_with(
     });
 
     let weak = ui.as_weak();
+    let submit_add = Rc::clone(&submitter);
+    let state_for_add = Rc::clone(project_state);
+    actions.on_add_native_compressor(move |track_index, threshold, ratio, attack, release, makeup| {
+        let Some(ui) = weak.upgrade() else { return; };
+        match native_compressor_addition(ui.get_app_mode(), &state_for_add.native_filter_tracks.borrow(), track_index, threshold.as_str(), ratio.as_str(), attack.as_str(), release.as_str(), makeup.as_str()) {
+            Ok(edit) => submit_add(&ui, IdeWorkerCommand::EditNativeFilter { edit }),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+
+    let weak = ui.as_weak();
+    let submit_update = Rc::clone(&submitter);
+    actions.on_update_native_compressor(move |index, enabled, threshold, ratio, attack, release, makeup| {
+        let Some(ui) = weak.upgrade() else { return; };
+        match native_compressor_update(ui.get_app_mode(), &ui.get_native_devices(), index, enabled, threshold.as_str(), ratio.as_str(), attack.as_str(), release.as_str(), makeup.as_str()) {
+            Ok(edit) => submit_update(&ui, IdeWorkerCommand::EditNativeFilter { edit }),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+
+    let weak = ui.as_weak();
     let submit_remove = submitter;
     actions.on_remove_native_filter(move |index| {
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        match native_filter_removal(ui.get_app_mode(), &ui.get_native_filters(), index) {
+        match native_filter_removal(ui.get_app_mode(), &ui.get_native_devices(), index) {
             Ok(edit) => submit_remove(&ui, IdeWorkerCommand::EditNativeFilter { edit }),
             Err(message) => ui.set_error_text(message.into()),
         }
@@ -1299,7 +1325,7 @@ fn native_filter_addition(
     resonance: &str,
 ) -> Result<IdeNativeFilterEdit, &'static str> {
     if mode != AppMode::Running {
-        return Err("Native Filter editing is unavailable in the current state");
+        return Err("Native Device editing is unavailable in the current state");
     }
     let track_id = usize::try_from(track_index)
         .ok()
@@ -1316,9 +1342,23 @@ fn native_filter_addition(
     })
 }
 
+fn native_compressor_addition(mode: AppMode, track_ids: &[String], track_index: i32, threshold: &str, ratio: &str, attack: &str, release: &str, makeup: &str) -> Result<IdeNativeFilterEdit, &'static str> {
+    if mode != AppMode::Running { return Err("Native Device editing is unavailable in the current state"); }
+    let track_id = usize::try_from(track_index).ok().and_then(|index| track_ids.get(index)).filter(|id| !id.is_empty()).ok_or("The selected audio track is no longer available")?;
+    let (threshold_millidecibels, ratio_millionths, attack_microseconds, release_microseconds, makeup_millidecibels) = parse_native_compressor_state(threshold, ratio, attack, release, makeup)?;
+    Ok(IdeNativeFilterEdit::AddCompressor { track_id: track_id.clone(), threshold_millidecibels, ratio_millionths, attack_microseconds, release_microseconds, makeup_millidecibels })
+}
+
+fn native_compressor_update(mode: AppMode, devices: &ModelRc<NativeDeviceRow>, index: i32, enabled: bool, threshold: &str, ratio: &str, attack: &str, release: &str, makeup: &str) -> Result<IdeNativeFilterEdit, &'static str> {
+    let row = native_filter_row(mode, devices, index)?;
+    if row.kind_index != 1 { return Err("The selected Native Device is not a compressor"); }
+    let (threshold_millidecibels, ratio_millionths, attack_microseconds, release_microseconds, makeup_millidecibels) = parse_native_compressor_state(threshold, ratio, attack, release, makeup)?;
+    Ok(IdeNativeFilterEdit::UpdateCompressor { chain_id: row.chain_id.to_string(), device_instance_id: row.device_instance_id.to_string(), enabled, threshold_millidecibels, ratio_millionths, attack_microseconds, release_microseconds, makeup_millidecibels })
+}
+
 fn native_filter_update(
     mode: AppMode,
-    filters: &ModelRc<NativeFilterRow>,
+    filters: &ModelRc<NativeDeviceRow>,
     index: i32,
     enabled: bool,
     mode_index: i32,
@@ -1326,6 +1366,9 @@ fn native_filter_update(
     resonance: &str,
 ) -> Result<IdeNativeFilterEdit, &'static str> {
     let row = native_filter_row(mode, filters, index)?;
+    if row.kind_index != 0 {
+        return Err("The selected Native Device is not a filter");
+    }
     let (mode, cutoff_millihertz, resonance_millionths) =
         parse_native_filter_state(mode_index, cutoff, resonance)?;
     Ok(IdeNativeFilterEdit::Update {
@@ -1340,7 +1383,7 @@ fn native_filter_update(
 
 fn native_filter_removal(
     mode: AppMode,
-    filters: &ModelRc<NativeFilterRow>,
+    filters: &ModelRc<NativeDeviceRow>,
     index: i32,
 ) -> Result<IdeNativeFilterEdit, &'static str> {
     let row = native_filter_row(mode, filters, index)?;
@@ -1352,18 +1395,18 @@ fn native_filter_removal(
 
 fn native_filter_row(
     mode: AppMode,
-    filters: &ModelRc<NativeFilterRow>,
+    filters: &ModelRc<NativeDeviceRow>,
     index: i32,
-) -> Result<NativeFilterRow, &'static str> {
+) -> Result<NativeDeviceRow, &'static str> {
     if mode != AppMode::Running {
-        return Err("Native Filter editing is unavailable in the current state");
+        return Err("Native Device editing is unavailable in the current state");
     }
     let row = usize::try_from(index)
         .ok()
         .and_then(|index| filters.row_data(index))
         .filter(|row| row.index == index)
         .filter(|row| !row.chain_id.is_empty() && !row.device_instance_id.is_empty())
-        .ok_or("The selected Native Filter is no longer available")?;
+        .ok_or("The selected native device is no longer available")?;
     Ok(row)
 }
 
@@ -1375,7 +1418,7 @@ fn parse_native_filter_state(
     let mode = match mode_index {
         0 => NativeFilterMode::LowPass,
         1 => NativeFilterMode::HighPass,
-        _ => return Err("Native Filter mode is invalid"),
+        _ => return Err("Native filter mode is invalid"),
     };
     let cutoff_millihertz = parse_bounded_u32(
         cutoff,
@@ -1408,6 +1451,21 @@ fn parse_bounded_u32(
     } else {
         Err(message)
     }
+}
+
+fn parse_native_compressor_state(threshold: &str, ratio: &str, attack: &str, release: &str, makeup: &str) -> Result<(i32, u32, u32, u32, i32), &'static str> {
+    Ok((
+        parse_bounded_i32(threshold, MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS, "Threshold must be whole millidecibels from -80000 through 0")?,
+        parse_bounded_u32(ratio, MIN_COMPRESSOR_RATIO_MILLIONTHS, MAX_COMPRESSOR_RATIO_MILLIONTHS, "Ratio must be whole millionths from 1000000 through 100000000")?,
+        parse_bounded_u32(attack, MIN_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_ATTACK_MICROSECONDS, "Attack must be whole microseconds from 100 through 500000")?,
+        parse_bounded_u32(release, MIN_COMPRESSOR_RELEASE_MICROSECONDS, MAX_COMPRESSOR_RELEASE_MICROSECONDS, "Release must be whole microseconds from 100 through 2000000")?,
+        parse_bounded_i32(makeup, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS, MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS, "Makeup must be whole millidecibels from -24000 through 24000")?,
+    ))
+}
+
+fn parse_bounded_i32(value: &str, minimum: i32, maximum: i32, message: &'static str) -> Result<i32, &'static str> {
+    let value = value.parse::<i32>().map_err(|_| message)?;
+    if (minimum..=maximum).contains(&value) { Ok(value) } else { Err(message) }
 }
 
 fn bind_scene_creation_callbacks(
@@ -3828,7 +3886,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
             "Preserving mixer state, editing control mappings, and reopening project..."
         }
         IdeWorkerCommandKind::EditNativeFilter => {
-            "Preserving mixer state, editing the Native Filter chain, and reopening project..."
+            "Preserving mixer state, editing the native device chain, and reopening project..."
         }
         IdeWorkerCommandKind::ExportProject => {
             "Rendering the project through the playback runtime..."
@@ -6495,13 +6553,16 @@ fn apply_mixer_observation(ui: &MainWindow, observation: &IdeRunningObservation)
 }
 
 fn reset_native_filter_ui(ui: &MainWindow, project_state: &ProjectUiStateCell) {
-    ui.set_native_filters(ModelRc::default());
+    ui.set_native_devices(ModelRc::default());
     ui.set_native_filter_track_names(ModelRc::default());
     ui.set_mixer_native_filter_visible(false);
     ui.set_native_filter_add_visible(false);
     ui.set_native_filter_edit_visible(false);
     ui.set_native_filter_edit_index(-1);
     ui.set_native_filter_remove_confirming_index(-1);
+    ui.set_native_compressor_add_visible(false);
+    ui.set_native_compressor_edit_visible(false);
+    ui.set_native_compressor_edit_index(-1);
     project_state.native_filter_tracks.borrow_mut().clear();
 }
 
@@ -6516,12 +6577,12 @@ fn set_native_filter_observation(
         .filter(|channel| channel.kind() == IdeMixerChannelKind::Audio)
         .map(|channel| channel.id().to_owned())
         .collect();
-    set_native_filters(ui, observation.native_filters(), observation.mixer_channels());
+    set_native_devices(ui, observation.native_devices(), observation.mixer_channels());
 }
 
-fn set_native_filters(
+fn set_native_devices(
     ui: &MainWindow,
-    filters: &[IdeNativeFilter],
+    devices: &[IdeNativeDevice],
     channels: &[IdeMixerChannel],
 ) {
     let track_names = channels
@@ -6530,47 +6591,50 @@ fn set_native_filters(
         .map(|channel| SharedString::from(channel.name()))
         .collect::<Vec<_>>();
     ui.set_native_filter_track_names(ModelRc::from(Rc::new(VecModel::from(track_names))));
-    ui.set_native_filters(ModelRc::from(Rc::new(VecModel::from(native_filter_rows(
-        filters, channels,
+    ui.set_native_devices(ModelRc::from(Rc::new(VecModel::from(native_device_rows(
+        devices, channels,
     )))));
 }
 
-fn native_filter_rows(
-    filters: &[IdeNativeFilter],
+fn native_device_rows(
+    devices: &[IdeNativeDevice],
     channels: &[IdeMixerChannel],
-) -> Vec<NativeFilterRow> {
-    filters
+) -> Vec<NativeDeviceRow> {
+    devices
         .iter()
         .enumerate()
-        .map(|(index, filter)| {
+        .map(|(index, device)| {
+            let (chain_id, device_instance_id, track_id, enabled, kind_index, kind_name, detail, mode_index, mode_name, cutoff_millihertz, cutoff_label, resonance_millionths, resonance_label, threshold_millidecibels, ratio_millionths, attack_microseconds, release_microseconds, makeup_millidecibels) = match device {
+                IdeNativeDevice::Filter(filter) => (
+                    filter.chain_id(), filter.device_instance_id(), filter.track_id(), filter.enabled(), 0, "FILTER", format!("{} · {}", format_millihertz(filter.cutoff_millihertz()), format!("Q {:.3}", f64::from(filter.resonance_millionths()) / 1_000_000.0)), match filter.mode() { NativeFilterMode::LowPass => 0, NativeFilterMode::HighPass => 1 }, match filter.mode() { NativeFilterMode::LowPass => "LOW-PASS", NativeFilterMode::HighPass => "HIGH-PASS" }, filter.cutoff_millihertz().to_string(), format_millihertz(filter.cutoff_millihertz()), filter.resonance_millionths().to_string(), format!("Q {:.3}", f64::from(filter.resonance_millionths()) / 1_000_000.0), String::new(), String::new(), String::new(), String::new(), String::new()),
+                IdeNativeDevice::Compressor(compressor) => (
+                    compressor.chain_id(), compressor.device_instance_id(), compressor.track_id(), compressor.enabled(), 1, "COMPRESSOR", format!("{} dB · {:.3}:1 · {} / {} ms · {} dB", f64::from(compressor.threshold_millidecibels()) / 1_000.0, f64::from(compressor.ratio_millionths()) / 1_000_000.0, f64::from(compressor.attack_microseconds()) / 1_000.0, f64::from(compressor.release_microseconds()) / 1_000.0, f64::from(compressor.makeup_millidecibels()) / 1_000.0), 0, "", String::new(), String::new(), String::new(), String::new(), compressor.threshold_millidecibels().to_string(), compressor.ratio_millionths().to_string(), compressor.attack_microseconds().to_string(), compressor.release_microseconds().to_string(), compressor.makeup_millidecibels().to_string()),
+            };
             let track_name = channels
                 .iter()
-                .find(|channel| channel.id() == filter.track_id())
-                .map_or(filter.track_id(), IdeMixerChannel::name);
-            NativeFilterRow {
+                .find(|channel| channel.id() == track_id)
+                .map_or(track_id, IdeMixerChannel::name);
+            NativeDeviceRow {
                 index: i32::try_from(index).unwrap_or(-1),
-                chain_id: filter.chain_id().into(),
-                device_instance_id: filter.device_instance_id().into(),
-                track_id: filter.track_id().into(),
+                chain_id: chain_id.into(),
+                device_instance_id: device_instance_id.into(),
+                track_id: track_id.into(),
                 track_name: track_name.into(),
-                enabled: filter.enabled(),
-                mode_index: match filter.mode() {
-                    NativeFilterMode::LowPass => 0,
-                    NativeFilterMode::HighPass => 1,
-                },
-                mode_name: match filter.mode() {
-                    NativeFilterMode::LowPass => "LOW-PASS",
-                    NativeFilterMode::HighPass => "HIGH-PASS",
-                }
-                .into(),
-                cutoff_millihertz: filter.cutoff_millihertz().to_string().into(),
-                cutoff_label: format_millihertz(filter.cutoff_millihertz()).into(),
-                resonance_millionths: filter.resonance_millionths().to_string().into(),
-                resonance_label: format!(
-                    "Q {:.3}",
-                    f64::from(filter.resonance_millionths()) / 1_000_000.0
-                )
-                .into(),
+                enabled,
+                kind_index,
+                kind_name: kind_name.into(),
+                detail: detail.into(),
+                mode_index,
+                mode_name: mode_name.into(),
+                cutoff_millihertz: cutoff_millihertz.into(),
+                cutoff_label: cutoff_label.into(),
+                resonance_millionths: resonance_millionths.into(),
+                resonance_label: resonance_label.into(),
+                threshold_millidecibels: threshold_millidecibels.into(),
+                ratio_millionths: ratio_millionths.into(),
+                attack_microseconds: attack_microseconds.into(),
+                release_microseconds: release_microseconds.into(),
+                makeup_millidecibels: makeup_millidecibels.into(),
             }
         })
         .collect()
@@ -6588,7 +6652,7 @@ fn apply_native_filter_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::NativeFilterEditing { .. } => {
             ui.set_app_mode(AppMode::EditingNativeFilter);
-            ui.set_status_text("Saving the Native Filter chain...".into());
+            ui.set_status_text("Saving the native device chain...".into());
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::NativeFilterEdited {
@@ -6598,12 +6662,15 @@ fn apply_native_filter_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_native_filter_add_visible(false);
             ui.set_native_filter_edit_visible(false);
             ui.set_native_filter_edit_index(-1);
+            ui.set_native_compressor_add_visible(false);
+            ui.set_native_compressor_edit_visible(false);
+            ui.set_native_compressor_edit_index(-1);
             ui.set_native_filter_remove_confirming_index(-1);
             ui.set_status_text(
                 if *changed {
-                    format!("Native Filter chain saved in project revision {revision}")
+                    format!("Native device chain saved in project revision {revision}")
                 } else {
-                    format!("Native Filter chain already matched project revision {revision}")
+                    format!("Native device chain already matched project revision {revision}")
                 }
                 .into(),
             );
@@ -6614,11 +6681,14 @@ fn apply_native_filter_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_native_filter_add_visible(false);
             ui.set_native_filter_edit_visible(false);
             ui.set_native_filter_edit_index(-1);
+            ui.set_native_compressor_add_visible(false);
+            ui.set_native_compressor_edit_visible(false);
+            ui.set_native_compressor_edit_index(-1);
             ui.set_native_filter_remove_confirming_index(-1);
-            ui.set_status_text("Native Filter change committed".into());
+            ui.set_status_text("Native device change committed".into());
             ui.set_error_text(
                 format!(
-                    "The Native Filter change was saved but the project may need attention: {warning}"
+                    "The native device change was saved but the project may need attention: {warning}"
                 )
                 .into(),
             );
@@ -9958,20 +10028,33 @@ mod tests {
             .native_filter_tracks
             .borrow_mut()
             .push("track-a".to_owned());
-        ui.set_native_filters(ModelRc::from(Rc::new(VecModel::from(vec![
-            NativeFilterRow {
+        ui.set_native_devices(ModelRc::from(Rc::new(VecModel::from(vec![
+            NativeDeviceRow {
                 index: 0,
                 chain_id: "chain-a".into(),
                 device_instance_id: "device-a".into(),
                 track_id: "track-a".into(),
                 track_name: "Audio".into(),
                 enabled: true,
+                kind_index: 0,
+                kind_name: "FILTER".into(),
+                detail: "1250 Hz · Q 0.707".into(),
                 mode_index: 0,
                 mode_name: "LOW-PASS".into(),
                 cutoff_millihertz: "1250000".into(),
                 cutoff_label: "1250 Hz".into(),
                 resonance_millionths: "707000".into(),
                 resonance_label: "Q 0.707".into(),
+                threshold_millidecibels: "".into(),
+                ratio_millionths: "".into(),
+                attack_microseconds: "".into(),
+                release_microseconds: "".into(),
+                makeup_millidecibels: "".into(),
+            },
+            NativeDeviceRow {
+                index: 1, chain_id: "chain-a".into(), device_instance_id: "device-b".into(), track_id: "track-a".into(), track_name: "Audio".into(), enabled: true,
+                kind_index: 1, kind_name: "COMPRESSOR".into(), detail: "-18 dB · 4:1".into(), mode_index: 0, mode_name: "".into(), cutoff_millihertz: "".into(), cutoff_label: "".into(), resonance_millionths: "".into(), resonance_label: "".into(),
+                threshold_millidecibels: "-18000".into(), ratio_millionths: "4000000".into(), attack_microseconds: "10000".into(), release_microseconds: "100000".into(), makeup_millidecibels: "0".into(),
             },
         ]))));
         let submitted = Rc::new(RefCell::new(Vec::new()));
@@ -9987,12 +10070,14 @@ mod tests {
         actions.invoke_add_native_filter(0, 1, "80000".into(), "2000000".into());
         actions.invoke_update_native_filter(0, false, 1, "90000".into(), "1500000".into());
         actions.invoke_remove_native_filter(0);
+        actions.invoke_add_native_compressor(0, "-24000".into(), "2000000".into(), "5000".into(), "80000".into(), "3000".into());
+        actions.invoke_update_native_compressor(1, false, "-12000".into(), "6000000".into(), "2000".into(), "60000".into(), "1000".into());
         actions.invoke_add_native_filter(0, 0, "19999".into(), "707000".into());
         assert!(ui.get_error_text().contains("Cutoff"));
         actions.invoke_remove_native_filter(-1);
 
         let commands = submitted.borrow();
-        assert_eq!(commands.len(), 3);
+        assert_eq!(commands.len(), 5);
         assert!(matches!(
             &commands[0],
             IdeWorkerCommand::EditNativeFilter {
@@ -10025,6 +10110,14 @@ mod tests {
                     device_instance_id,
                 },
             } if chain_id == "chain-a" && device_instance_id == "device-a"
+        ));
+        assert!(matches!(
+            &commands[3],
+            IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::AddCompressor { track_id, threshold_millidecibels: -24_000, ratio_millionths: 2_000_000, attack_microseconds: 5_000, release_microseconds: 80_000, makeup_millidecibels: 3_000 } } if track_id == "track-a"
+        ));
+        assert!(matches!(
+            &commands[4],
+            IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::UpdateCompressor { chain_id, device_instance_id, enabled: false, threshold_millidecibels: -12_000, ratio_millionths: 6_000_000, attack_microseconds: 2_000, release_microseconds: 60_000, makeup_millidecibels: 1_000 } } if chain_id == "chain-a" && device_instance_id == "device-b"
         ));
         drop(commands);
         assert!(ui.get_error_text().contains("no longer available"));

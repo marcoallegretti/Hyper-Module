@@ -110,19 +110,27 @@ export struct MixerSendRow {
     enabled: bool,
 }
 
-export struct NativeFilterRow {
+export struct NativeDeviceRow {
     index: int,
     chain-id: string,
     device-instance-id: string,
     track-id: string,
     track-name: string,
     enabled: bool,
+    kind-index: int,
+    kind-name: string,
+    detail: string,
     mode-index: int,
     mode-name: string,
     cutoff-millihertz: string,
     cutoff-label: string,
     resonance-millionths: string,
     resonance-label: string,
+    threshold-millidecibels: string,
+    ratio-millionths: string,
+    attack-microseconds: string,
+    release-microseconds: string,
+    makeup-millidecibels: string,
 }
 
 export struct TakeRow {
@@ -271,6 +279,8 @@ export global IdeActions {
     callback mixer-send-enabled(int);
     callback add-native-filter(int, int, string, string);
     callback update-native-filter(int, bool, int, string, string);
+    callback add-native-compressor(int, string, string, string, string, string);
+    callback update-native-compressor(int, bool, string, string, string, string, string);
     callback remove-native-filter(int);
     callback add-automation-take(string, int, int, string, string, string);
     callback set-automation-take-active(string, bool);
@@ -542,7 +552,7 @@ export component MainWindow inherits Window {
     in property <string> loudness-lra-status: "Waiting for final-output meter evidence";
     in property <[MixerChannelRow]> mixer-channels: [];
     in property <[MixerSendRow]> mixer-sends: [];
-    in property <[NativeFilterRow]> native-filters: [];
+    in property <[NativeDeviceRow]> native-devices: [];
     in property <[string]> native-filter-track-names: [];
     in-out property <bool> mixer-native-filter-visible: false;
     in-out property <bool> native-filter-add-visible: false;
@@ -557,6 +567,20 @@ export component MainWindow inherits Window {
     in-out property <string> native-filter-edit-cutoff: "";
     in-out property <string> native-filter-edit-resonance: "";
     in-out property <int> native-filter-remove-confirming-index: -1;
+    in-out property <bool> native-compressor-add-visible: false;
+    in-out property <string> native-compressor-add-threshold: "-18000";
+    in-out property <string> native-compressor-add-ratio: "4000000";
+    in-out property <string> native-compressor-add-attack: "10000";
+    in-out property <string> native-compressor-add-release: "100000";
+    in-out property <string> native-compressor-add-makeup: "0";
+    in-out property <bool> native-compressor-edit-visible: false;
+    in-out property <int> native-compressor-edit-index: -1;
+    in-out property <bool> native-compressor-edit-enabled: true;
+    in-out property <string> native-compressor-edit-threshold: "";
+    in-out property <string> native-compressor-edit-ratio: "";
+    in-out property <string> native-compressor-edit-attack: "";
+    in-out property <string> native-compressor-edit-release: "";
+    in-out property <string> native-compressor-edit-makeup: "";
     in property <[AutomationTakeRow]> automation-takes: [];
     in-out property <string> automation-take-remove-confirming-id: "";
     in property <[ControlBindingRow]> control-bindings: [];
@@ -1794,7 +1818,7 @@ export component MainWindow inherits Window {
                         Button { text: "Performance"; clicked => { root.mixer-visible = false; } }
                         Button { text: "Sends"; enabled: root.mixer-sends.length > 0; clicked => { root.mixer-sends-visible = true; } }
                         Button {
-                            text: "Devices (" + root.native-filters.length + ")";
+                            text: "Devices (" + root.native-devices.length + ")";
                             enabled: root.native-filter-track-names.length > 0;
                             clicked => {
                                 root.native-filter-add-visible = false;
@@ -1941,7 +1965,7 @@ export component MainWindow inherits Window {
                             spacing: 8px;
                             VerticalLayout {
                                 Text { text: "NATIVE DEVICES"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-                                Text { text: "Portable pre-fader filters · identical project state in IDE and Runtime"; color: #aebccc; font-size: 12px; }
+                                Text { text: "Portable pre-fader filters and compressors · identical project state in IDE and Runtime"; color: #aebccc; font-size: 12px; }
                             }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Button {
@@ -1949,14 +1973,21 @@ export component MainWindow inherits Window {
                                 clicked => {
                                     root.native-filter-add-visible = false;
                                     root.native-filter-edit-visible = false;
+                                    root.native-compressor-add-visible = false;
+                                    root.native-compressor-edit-visible = false;
                                     root.native-filter-remove-confirming-index = -1;
                                     root.mixer-native-filter-visible = false;
                                 }
                             }
                             Button {
                                 text: "Add filter";
-                                enabled: root.app-mode == AppMode.running && root.native-filter-track-names.length > 0 && !root.native-filter-edit-visible;
-                                clicked => { root.native-filter-remove-confirming-index = -1; root.native-filter-add-visible = true; }
+                                enabled: root.app-mode == AppMode.running && root.native-filter-track-names.length > 0 && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
+                                clicked => { root.native-filter-remove-confirming-index = -1; root.native-compressor-add-visible = false; root.native-compressor-edit-visible = false; root.native-filter-add-visible = true; }
+                            }
+                            Button {
+                                text: "Add compressor";
+                                enabled: root.app-mode == AppMode.running && root.native-filter-track-names.length > 0 && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-edit-visible;
+                                clicked => { root.native-filter-remove-confirming-index = -1; root.native-filter-add-visible = false; root.native-filter-edit-visible = false; root.native-compressor-add-visible = true; }
                             }
                         }
 
@@ -1977,6 +2008,18 @@ export component MainWindow inherits Window {
                             }
                         }
 
+                        if root.native-compressor-add-visible : HorizontalLayout {
+                            height: 48px; spacing: 8px;
+                            VerticalLayout { min-width: 120px; max-width: 120px; spacing: 2px; Text { text: "TRACK"; color: #65758a; font-size: 8px; } ComboBox { model: root.native-filter-track-names; current-index <=> root.native-filter-add-track-index; } }
+                            VerticalLayout { min-width: 100px; max-width: 100px; spacing: 2px; Text { text: "THRESHOLD · mdB"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-add-threshold; } }
+                            VerticalLayout { min-width: 100px; max-width: 100px; spacing: 2px; Text { text: "RATIO · millionths"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-add-ratio; } }
+                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "ATTACK · μs"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-add-attack; } }
+                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "RELEASE · μs"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-add-release; } }
+                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "MAKEUP · mdB"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-add-makeup; } }
+                            Button { text: "Cancel"; clicked => { root.native-compressor-add-visible = false; } }
+                            Button { text: "Add"; enabled: root.app-mode == AppMode.running; clicked => { IdeActions.add-native-compressor(root.native-filter-add-track-index, root.native-compressor-add-threshold, root.native-compressor-add-ratio, root.native-compressor-add-attack, root.native-compressor-add-release, root.native-compressor-add-makeup); } }
+                        }
+
                         if root.native-filter-edit-visible : HorizontalLayout {
                             height: 48px;
                             spacing: 8px;
@@ -1991,9 +2034,20 @@ export component MainWindow inherits Window {
                             }
                         }
 
+                        if root.native-compressor-edit-visible : HorizontalLayout {
+                            height: 48px; spacing: 8px;
+                            VerticalLayout { min-width: 100px; max-width: 100px; spacing: 2px; Text { text: "THRESHOLD · mdB"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-edit-threshold; } }
+                            VerticalLayout { min-width: 100px; max-width: 100px; spacing: 2px; Text { text: "RATIO · millionths"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-edit-ratio; } }
+                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "ATTACK · μs"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-edit-attack; } }
+                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "RELEASE · μs"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-edit-release; } }
+                            VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "MAKEUP · mdB"; color: #65758a; font-size: 8px; } LineEdit { text <=> root.native-compressor-edit-makeup; } }
+                            Button { text: "Cancel"; clicked => { root.native-compressor-edit-visible = false; root.native-compressor-edit-index = -1; } }
+                            Button { text: "Save"; enabled: root.app-mode == AppMode.running && root.native-compressor-edit-index >= 0; clicked => { IdeActions.update-native-compressor(root.native-compressor-edit-index, root.native-compressor-edit-enabled, root.native-compressor-edit-threshold, root.native-compressor-edit-ratio, root.native-compressor-edit-attack, root.native-compressor-edit-release, root.native-compressor-edit-makeup); } }
+                        }
+
                         ListView {
                             vertical-stretch: 1;
-                            for filter in root.native-filters : Rectangle {
+                            for filter in root.native-devices : Rectangle {
                                 height: 56px;
                                 background: filter.enabled ? #0e1c20 : #0e141b;
                                 border-color: filter.enabled ? #315a58 : #27313d;
@@ -2004,30 +2058,48 @@ export component MainWindow inherits Window {
                                     spacing: 10px;
                                     VerticalLayout {
                                         horizontal-stretch: 1;
-                                        Text { text: filter.track-name + " · " + filter.mode-name; color: filter.enabled ? #dce5ef : #8290a2; font-size: 12px; font-weight: 600; overflow: elide; }
-                                        Text { text: filter.cutoff-label + " · " + filter.resonance-label + (filter.enabled ? "" : " · BYPASSED"); color: #8290a2; font-size: 10px; overflow: elide; }
+                                        Text { text: filter.track-name + " · " + filter.kind-name; color: filter.enabled ? #dce5ef : #8290a2; font-size: 12px; font-weight: 600; overflow: elide; }
+                                        Text { text: filter.detail + (filter.enabled ? "" : " · BYPASSED"); color: #8290a2; font-size: 10px; overflow: elide; }
                                     }
                                     Button {
                                         text: filter.enabled ? "Bypass" : "Enable";
-                                        enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible;
-                                        clicked => { IdeActions.update-native-filter(filter.index, !filter.enabled, filter.mode-index, filter.cutoff-millihertz, filter.resonance-millionths); }
+                                        enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
+                                        clicked => {
+                                            if filter.kind-index == 0 { IdeActions.update-native-filter(filter.index, !filter.enabled, filter.mode-index, filter.cutoff-millihertz, filter.resonance-millionths); }
+                                            else { IdeActions.update-native-compressor(filter.index, !filter.enabled, filter.threshold-millidecibels, filter.ratio-millionths, filter.attack-microseconds, filter.release-microseconds, filter.makeup-millidecibels); }
+                                        }
                                     }
                                     Button {
                                         text: "Edit";
-                                        enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible;
+                                        enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
                                         clicked => {
-                                            root.native-filter-edit-index = filter.index;
-                                            root.native-filter-edit-enabled = filter.enabled;
-                                            root.native-filter-edit-mode-index = filter.mode-index;
-                                            root.native-filter-edit-cutoff = filter.cutoff-millihertz;
-                                            root.native-filter-edit-resonance = filter.resonance-millionths;
+                                            if filter.kind-index == 0 {
+                                                root.native-compressor-add-visible = false;
+                                                root.native-compressor-edit-visible = false;
+                                                root.native-filter-edit-index = filter.index;
+                                                root.native-filter-edit-enabled = filter.enabled;
+                                                root.native-filter-edit-mode-index = filter.mode-index;
+                                                root.native-filter-edit-cutoff = filter.cutoff-millihertz;
+                                                root.native-filter-edit-resonance = filter.resonance-millionths;
+                                                root.native-filter-edit-visible = true;
+                                            } else {
+                                                root.native-filter-add-visible = false;
+                                                root.native-filter-edit-visible = false;
+                                                root.native-compressor-edit-index = filter.index;
+                                                root.native-compressor-edit-enabled = filter.enabled;
+                                                root.native-compressor-edit-threshold = filter.threshold-millidecibels;
+                                                root.native-compressor-edit-ratio = filter.ratio-millionths;
+                                                root.native-compressor-edit-attack = filter.attack-microseconds;
+                                                root.native-compressor-edit-release = filter.release-microseconds;
+                                                root.native-compressor-edit-makeup = filter.makeup-millidecibels;
+                                                root.native-compressor-edit-visible = true;
+                                            }
                                             root.native-filter-remove-confirming-index = -1;
-                                            root.native-filter-edit-visible = true;
                                         }
                                     }
                                     Button {
                                         text: root.native-filter-remove-confirming-index == filter.index ? "Confirm" : "Remove";
-                                        enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible;
+                                        enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
                                         clicked => {
                                             if root.native-filter-remove-confirming-index == filter.index {
                                                 IdeActions.remove-native-filter(filter.index);
@@ -2040,10 +2112,10 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        if root.native-filters.length == 0 : Rectangle {
+                        if root.native-devices.length == 0 : Rectangle {
                             vertical-stretch: 1;
                             background: transparent;
-                            Text { text: "No Native Filters on audio tracks"; color: #65758a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "No Native Devices on audio tracks"; color: #65758a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
                         }
                     }
                 }

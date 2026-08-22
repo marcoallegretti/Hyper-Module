@@ -130,10 +130,18 @@ pub use hyper_project_history::{
 use hyper_project_loader::{PreparedProjectPlayback, ProjectPlaybackError, ProjectPlaybackLimits};
 use hyper_project_model::ResourceRole;
 pub use hyper_native_device::{
+    MAX_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+    MAX_COMPRESSOR_RATIO_MILLIONTHS, MAX_COMPRESSOR_RELEASE_MICROSECONDS,
+    MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
     MAX_FILTER_CUTOFF_MILLIHERTZ, MAX_FILTER_RESONANCE_MILLIONTHS,
+    MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
+    MIN_COMPRESSOR_RATIO_MILLIONTHS, MIN_COMPRESSOR_RELEASE_MICROSECONDS,
+    MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
     MIN_FILTER_CUTOFF_MILLIHERTZ, MIN_FILTER_RESONANCE_MILLIONTHS, NativeFilterMode,
 };
-use hyper_native_device::{DeviceChain, DeviceChainError, NativeDeviceInstance, NativeFilterState};
+use hyper_native_device::{
+    DeviceChain, DeviceChainError, NativeCompressorState, NativeDeviceInstance, NativeFilterState,
+};
 use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
     AudioClipRemovalOutcome, AudioClipRemovalRequest,
@@ -162,7 +170,7 @@ pub use recording::{
 pub use worker::{
     DesktopIdeWorker, DesktopIdeWorkerPendingShutdown, IdeAudioClip,
     IdeAudioClipEditCommittedWarning, IdeAudioPreviewObservation, IdeClosedSnapshot,
-    IdeMixerChannel, IdeMixerSend, IdeNativeFilter, IdeProjectCreationError, IdeRecordingCaptureKind,
+    IdeMixerChannel, IdeMixerSend, IdeNativeCompressor, IdeNativeDevice, IdeNativeFilter, IdeProjectCreationError, IdeRecordingCaptureKind,
     IdeRecordingState, IdeRecordingTake, IdeRunningObservation, IdeRuntimePreparationError,
     IdeScene, IdeSceneTrackAction, IdeSceneTrackSlot, IdeWorkerCommand, IdeWorkerCommandFailure,
     IdeWorkerCommandKind, IdeWorkerEvent, IdeWorkerEventReceiveError, IdeWorkerJoinError,
@@ -3730,7 +3738,7 @@ pub struct IdeAutomationTakeRequest {
     pub points: Vec<AutomationPoint>,
 }
 
-/// One complete Native Filter mutation submitted through the project's
+/// One complete native-device mutation submitted through the project's
 /// close-publish-reopen lifecycle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IdeNativeFilterEdit {
@@ -3747,6 +3755,24 @@ pub enum IdeNativeFilterEdit {
         mode: NativeFilterMode,
         cutoff_millihertz: u32,
         resonance_millionths: u32,
+    },
+    AddCompressor {
+        track_id: String,
+        threshold_millidecibels: i32,
+        ratio_millionths: u32,
+        attack_microseconds: u32,
+        release_microseconds: u32,
+        makeup_millidecibels: i32,
+    },
+    UpdateCompressor {
+        chain_id: String,
+        device_instance_id: String,
+        enabled: bool,
+        threshold_millidecibels: i32,
+        ratio_millionths: u32,
+        attack_microseconds: u32,
+        release_microseconds: u32,
+        makeup_millidecibels: i32,
     },
     Remove {
         chain_id: String,
@@ -3813,23 +3839,23 @@ impl IdeNativeFilterEditError {
 impl fmt::Display for IdeNativeFilterEditError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidIdentity => formatter.write_str("native filter identity is invalid"),
-            Self::TrackUnavailable => formatter.write_str("native filter track is unavailable"),
-            Self::ChainUnavailable => formatter.write_str("native filter chain is unavailable"),
+            Self::InvalidIdentity => formatter.write_str("native device identity is invalid"),
+            Self::TrackUnavailable => formatter.write_str("native device track is unavailable"),
+            Self::ChainUnavailable => formatter.write_str("native device chain is unavailable"),
             Self::MixerSave(source) => write!(formatter, "live mixer state could not be preserved: {source}"),
             Self::Device(source) | Self::Serialization(source) => source.fmt(formatter),
             Self::MixerPublication(source) => write!(formatter, "live mixer state could not be published: {source}"),
             Self::Publication { mixer, source } if mixer.changed() => write!(
                 formatter,
-                "live mixer was preserved in project revision {} but native filter publication failed: {source}",
+                "live mixer was preserved in project revision {} but native device publication failed: {source}",
                 mixer.project_revision()
             ),
             Self::Publication { source, .. } => source.fmt(formatter),
-            Self::NativeClose(source) => write!(formatter, "native playback did not close cleanly before editing native filters: {source:?}"),
-            Self::NativeCloseAndReopen { close, reopen } => write!(formatter, "native playback did not close cleanly before editing native filters ({close:?}) and authoritative playback could not be reopened: {reopen}"),
-            Self::ReopenAfterPreparation { preparation, reopen } => write!(formatter, "native filter edit was refused ({preparation}) and authoritative playback could not be reopened: {reopen}"),
-            Self::ReopenAfterPublication { outcome, source } => write!(formatter, "native filter edit committed as project revision {}, but playback could not be reopened: {source}", outcome.project_revision()),
-            Self::PublicationAndReopen { publication, reopen } => write!(formatter, "native filter publication failed ({publication}) and authoritative playback could not be reopened: {reopen}"),
+            Self::NativeClose(source) => write!(formatter, "native playback did not close cleanly before editing native devices: {source:?}"),
+            Self::NativeCloseAndReopen { close, reopen } => write!(formatter, "native playback did not close cleanly before editing native devices ({close:?}) and authoritative playback could not be reopened: {reopen}"),
+            Self::ReopenAfterPreparation { preparation, reopen } => write!(formatter, "native device edit was refused ({preparation}) and authoritative playback could not be reopened: {reopen}"),
+            Self::ReopenAfterPublication { outcome, source } => write!(formatter, "native device edit committed as project revision {}, but playback could not be reopened: {source}", outcome.project_revision()),
+            Self::PublicationAndReopen { publication, reopen } => write!(formatter, "native device publication failed ({publication}) and authoritative playback could not be reopened: {reopen}"),
         }
     }
 }
@@ -6644,6 +6670,23 @@ fn native_filter_state(
 ) -> Result<NativeFilterState, IdeNativeFilterEditError> {
     NativeFilterState::try_new(mode, cutoff_millihertz, resonance_millionths)
         .map_err(IdeNativeFilterEditError::Device)
+}
+
+fn native_compressor_state(
+    threshold_millidecibels: i32,
+    ratio_millionths: u32,
+    attack_microseconds: u32,
+    release_microseconds: u32,
+    makeup_millidecibels: i32,
+) -> Result<NativeCompressorState, IdeNativeFilterEditError> {
+    NativeCompressorState::try_new(
+        threshold_millidecibels,
+        ratio_millionths,
+        attack_microseconds,
+        release_microseconds,
+        makeup_millidecibels,
+    )
+    .map_err(IdeNativeFilterEditError::Device)
 }
 
 fn serialize_native_filter_chain(
@@ -9830,6 +9873,79 @@ impl RunningDesktopIdeApplication {
                     )
                 }
             }
+            IdeNativeFilterEdit::AddCompressor {
+                track_id,
+                threshold_millidecibels,
+                ratio_millionths,
+                attack_microseconds,
+                release_microseconds,
+                makeup_millidecibels,
+            } => {
+                if track_id.is_empty() {
+                    return Err(IdeNativeFilterEditError::InvalidIdentity);
+                }
+                let (_, compiled_mixer, _, _) = prepared.session().parts();
+                if !compiled_mixer
+                    .slots()
+                    .iter()
+                    .any(|slot| slot.track_id() == track_id)
+                {
+                    return Err(IdeNativeFilterEditError::TrackUnavailable);
+                }
+                let compressor_state = native_compressor_state(
+                    *threshold_millidecibels,
+                    *ratio_millionths,
+                    *attack_microseconds,
+                    *release_microseconds,
+                    *makeup_millidecibels,
+                )?;
+                let device_id = uuid::Uuid::new_v4().to_string();
+                if let Some(chain) = prepared
+                    .device_chains()
+                    .iter()
+                    .find(|chain| chain.track_id() == track_id)
+                {
+                    let changed = chain
+                        .try_with_appended_compressor(device_id, true, compressor_state)
+                        .map_err(IdeNativeFilterEditError::Device)?;
+                    let previous = serialize_native_filter_chain(chain)?;
+                    (
+                        chain.id().to_owned(),
+                        IdeNativeFilterPublication::Replacement(
+                            serialize_native_filter_chain(&changed)?,
+                        ),
+                        IdeHistoryOperation::ResourceReplacement {
+                            resource_id: chain.id().to_owned(),
+                            bytes: previous,
+                        },
+                    )
+                } else {
+                    let chain_id = uuid::Uuid::new_v4().to_string();
+                    let chain = DeviceChain::try_new(
+                        chain_id.clone(),
+                        prepared.package().manifest().project_id().to_owned(),
+                        track_id.clone(),
+                        vec![
+                            NativeDeviceInstance::try_new_compressor(
+                                device_id,
+                                true,
+                                compressor_state,
+                            )
+                            .map_err(IdeNativeFilterEditError::Device)?,
+                        ],
+                    )
+                    .map_err(IdeNativeFilterEditError::Device)?;
+                    let bytes = serialize_native_filter_chain(&chain)?;
+                    (
+                        chain_id,
+                        IdeNativeFilterPublication::Addition(bytes.clone()),
+                        IdeHistoryOperation::DeviceChainRemoval {
+                            chain_id: chain.id().to_owned(),
+                            expected_bytes: bytes,
+                        },
+                    )
+                }
+            }
             IdeNativeFilterEdit::Update {
                 chain_id,
                 device_instance_id,
@@ -9844,6 +9960,41 @@ impl RunningDesktopIdeApplication {
                         device_instance_id,
                         *enabled,
                         native_filter_state(*mode, *cutoff_millihertz, *resonance_millionths)?,
+                    )
+                    .map_err(IdeNativeFilterEditError::Device)?;
+                (
+                    chain_id.clone(),
+                    IdeNativeFilterPublication::Replacement(
+                        serialize_native_filter_chain(&changed)?,
+                    ),
+                    IdeHistoryOperation::ResourceReplacement {
+                        resource_id: chain.id().to_owned(),
+                        bytes: serialize_native_filter_chain(chain)?,
+                    },
+                )
+            }
+            IdeNativeFilterEdit::UpdateCompressor {
+                chain_id,
+                device_instance_id,
+                enabled,
+                threshold_millidecibels,
+                ratio_millionths,
+                attack_microseconds,
+                release_microseconds,
+                makeup_millidecibels,
+            } => {
+                let chain = find_native_filter_chain(prepared, chain_id, device_instance_id)?;
+                let changed = chain
+                    .try_with_compressor_state(
+                        device_instance_id,
+                        *enabled,
+                        native_compressor_state(
+                            *threshold_millidecibels,
+                            *ratio_millionths,
+                            *attack_microseconds,
+                            *release_microseconds,
+                            *makeup_millidecibels,
+                        )?,
                     )
                     .map_err(IdeNativeFilterEditError::Device)?;
                 (
@@ -14283,8 +14434,17 @@ mod tests {
         let chain_id = chain.id().to_owned();
         let device_id = chain.devices()[0].id().to_owned();
         assert!(chain.devices()[0].enabled());
-        assert_eq!(chain.devices()[0].state().mode(), NativeFilterMode::LowPass);
-        assert_eq!(chain.devices()[0].state().cutoff_millihertz(), 1_250_000);
+        assert_eq!(
+            chain.devices()[0].filter_state().unwrap().mode(),
+            NativeFilterMode::LowPass
+        );
+        assert_eq!(
+            chain.devices()[0]
+                .filter_state()
+                .unwrap()
+                .cutoff_millihertz(),
+            1_250_000
+        );
 
         let update = RunningDesktopIdeApplication::prepare_native_filter_edit_from_project(
             fixture_mixer_save_plan(&prepared),
@@ -14307,9 +14467,10 @@ mod tests {
         let device = &prepared.device_chains()[0].devices()[0];
         assert_eq!(device.id(), device_id);
         assert!(!device.enabled());
-        assert_eq!(device.state().mode(), NativeFilterMode::HighPass);
-        assert_eq!(device.state().cutoff_millihertz(), 80_000);
-        assert_eq!(device.state().resonance_millionths(), 2_000_000);
+        let state = device.filter_state().unwrap();
+        assert_eq!(state.mode(), NativeFilterMode::HighPass);
+        assert_eq!(state.cutoff_millihertz(), 80_000);
+        assert_eq!(state.resonance_millionths(), 2_000_000);
 
         let removal = RunningDesktopIdeApplication::prepare_native_filter_edit_from_project(
             fixture_mixer_save_plan(&prepared),

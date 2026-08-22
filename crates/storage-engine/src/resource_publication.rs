@@ -6,6 +6,7 @@ use std::path::Path;
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::fs::{Dir, OpenOptions};
+use hyper_native_device::DeviceChain;
 use hyper_project_model::{ProjectManifest, ResourceDescriptor, ResourceRole, is_valid_entity_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1144,7 +1145,11 @@ fn publish_project_resource_observed(
         ));
     }
     match mode {
-        ProjectResourcePublicationMode::Replacement => {}
+        ProjectResourcePublicationMode::Replacement => {
+            if request.expected_role == ResourceRole::DeviceChain {
+                validate_device_chain_document(&verified, request)?;
+            }
+        }
         ProjectResourcePublicationMode::ArrangementAddition => {
             validate_arrangement_addition_request(&verified, request)?;
         }
@@ -2132,21 +2137,94 @@ fn validate_device_chain_addition_request(
             "device-chain identity conflicts with the active project",
         ));
     }
-    let chain: Value = serde_json::from_slice(request.resource_bytes).map_err(|error| {
+    validate_device_chain_document(verified, request)
+}
+
+fn validate_device_chain_document(
+    verified: &StructurallyVerifiedProject,
+    request: ProjectResourcePublicationRequest<'_>,
+) -> Result<(), ProjectResourcePublicationError> {
+    let chain = DeviceChain::parse(request.resource_bytes).map_err(|error| {
         caused(
             ProjectResourcePublicationErrorKind::InvalidResource,
             "parse new device-chain resource",
             error,
         )
     })?;
-    if chain["format"].as_str() != Some("hyper-device-chain")
-        || chain["format_version"].as_u64() != Some(1)
-        || chain["id"].as_str() != Some(request.resource_id)
-        || chain["project_id"].as_str() != Some(verified.manifest().project_id())
-    {
+    if chain.id() != request.resource_id || chain.project_id() != verified.manifest().project_id() {
         return Err(failure(
             ProjectResourcePublicationErrorKind::InvalidResource,
             "device-chain resource does not match the active project",
+        ));
+    }
+    unique_resource(verified, chain.track_id(), ResourceRole::Track).map_err(|error| {
+        if error.kind() == ProjectResourcePublicationErrorKind::ResourceConflict {
+            failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "device-chain track ownership does not match the active project",
+            )
+        } else {
+            error
+        }
+    })?;
+    validate_device_chain_inventory(verified, request.resource_id, &chain)?;
+    Ok(())
+}
+
+fn validate_device_chain_inventory(
+    verified: &StructurallyVerifiedProject,
+    replacing_resource_id: &str,
+    candidate: &DeviceChain,
+) -> Result<(), ProjectResourcePublicationError> {
+    let manifest_ids = verified
+        .manifest()
+        .resources()
+        .iter()
+        .map(|resource| resource.id().to_owned())
+        .chain(
+            verified
+                .manifest()
+                .assets()
+                .iter()
+                .map(|asset| asset.id().to_owned()),
+        )
+        .collect::<BTreeSet<_>>();
+    let mut device_ids = BTreeSet::new();
+    for descriptor in verified
+        .manifest()
+        .resources()
+        .iter()
+        .filter(|descriptor| descriptor.role() == ResourceRole::DeviceChain)
+        .filter(|descriptor| descriptor.id() != replacing_resource_id)
+    {
+        let bytes = verified.read_resource(descriptor.id()).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "read active device-chain resource",
+                error,
+            )
+        })?;
+        let chain = DeviceChain::parse(&bytes).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "parse active device-chain resource",
+                error,
+            )
+        })?;
+        if chain.track_id() == candidate.track_id() {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "device-chain track already has an active chain",
+            ));
+        }
+        device_ids.extend(chain.devices().iter().map(|device| device.id().to_owned()));
+    }
+    if candidate.devices().iter().any(|device| {
+        manifest_ids.contains(device.id()) || !device_ids.insert(device.id().to_owned())
+    }) {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "device-chain identity collides with active project content",
         ));
     }
     Ok(())
@@ -5565,6 +5643,159 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn version_two_compressor_chain(fixture: &DeviceChainFixture) -> Vec<u8> {
+        let source: Value = serde_json::from_slice(&fixture.chain).unwrap();
+        serde_json_canonicalizer::to_vec(&json!({
+            "format": "hyper-device-chain",
+            "format_version": 2,
+            "id": DEVICE_CHAIN_ID,
+            "project_id": source["project_id"],
+            "track_id": source["track_id"],
+            "devices": [{
+                "id": DEVICE_INSTANCE_ID,
+                "device_id": "org.hyper-module.native-compressor",
+                "state_version": 1,
+                "dsp_version": 1,
+                "enabled": true,
+                "state": {
+                    "kind": "compressor",
+                    "parameters": {
+                        "threshold_millidecibels": -18_000,
+                        "ratio_millionths": 4_000_000,
+                        "attack_microseconds": 10_000,
+                        "release_microseconds": 100_000,
+                        "makeup_millidecibels": 0
+                    }
+                },
+                "extensions": {}
+            }],
+            "extensions": {}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn publishes_a_version_two_compressor_device_chain_manifest_last() {
+        let fixture = DeviceChainFixture::new();
+        let chain = version_two_compressor_chain(&fixture);
+        let request = DeviceChainPublicationRequest {
+            expected_project_sha256: *verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest_sha256(),
+            chain_id: DEVICE_CHAIN_ID,
+            chain_bytes: &chain,
+        };
+
+        let published = publish_device_chain(&fixture.root, request).unwrap();
+
+        assert!(published.changed());
+        assert_eq!(published.project_revision(), 2);
+        assert_eq!(
+            fs::read(fixture.root.join(published.resource_path())).unwrap(),
+            chain
+        );
+        assert_eq!(
+            verify_project_package(&fixture.root)
+                .unwrap()
+                .manifest()
+                .resources()
+                .iter()
+                .filter(|resource| resource.role() == ResourceRole::DeviceChain)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn device_chain_publication_validates_v2_state_and_replacements_before_commit() {
+        let fixture = DeviceChainFixture::new();
+        let initial_manifest = fs::read(fixture.root.join(MANIFEST_NAME)).unwrap();
+        let valid = version_two_compressor_chain(&fixture);
+        let source: Value = serde_json::from_slice(&valid).unwrap();
+        let mut out_of_range = source.clone();
+        out_of_range["devices"][0]["state"]["parameters"]["threshold_millidecibels"] =
+            json!(-80_001);
+        let mut cross_kind = source.clone();
+        cross_kind["devices"][0]["device_id"] = json!("org.hyper-module.native-filter");
+        let mut unknown_track = source;
+        unknown_track["track_id"] = json!("018f47a2-6b2d-7c11-8a44-001122334499");
+
+        for malformed in [out_of_range, cross_kind, unknown_track] {
+            let bytes = serde_json_canonicalizer::to_vec(&malformed).unwrap();
+            let error = publish_device_chain(
+                &fixture.root,
+                DeviceChainPublicationRequest {
+                    expected_project_sha256: *verify_project_package(&fixture.root)
+                        .unwrap()
+                        .manifest_sha256(),
+                    chain_id: DEVICE_CHAIN_ID,
+                    chain_bytes: &bytes,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::InvalidResource);
+            assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), initial_manifest);
+            assert!(!fixture.root.join("devices").exists());
+        }
+
+        publish_device_chain(
+            &fixture.root,
+            DeviceChainPublicationRequest {
+                expected_project_sha256: *verify_project_package(&fixture.root)
+                    .unwrap()
+                    .manifest_sha256(),
+                chain_id: DEVICE_CHAIN_ID,
+                chain_bytes: &valid,
+            },
+        )
+        .unwrap();
+        let manifest_after_addition = fs::read(fixture.root.join(MANIFEST_NAME)).unwrap();
+        let mut duplicate_track: Value = serde_json::from_slice(&valid).unwrap();
+        duplicate_track["id"] = json!("018f47a2-6b2d-7c11-8a44-001122334498");
+        duplicate_track["devices"][0]["id"] = json!("018f47a2-6b2d-7c11-8a44-001122334497");
+        let duplicate_track = serde_json_canonicalizer::to_vec(&duplicate_track).unwrap();
+        let error = publish_device_chain(
+            &fixture.root,
+            DeviceChainPublicationRequest {
+                expected_project_sha256: *verify_project_package(&fixture.root)
+                    .unwrap()
+                    .manifest_sha256(),
+                chain_id: "018f47a2-6b2d-7c11-8a44-001122334498",
+                chain_bytes: &duplicate_track,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::InvalidResource);
+        assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), manifest_after_addition);
+        let mut replacement: Value = serde_json::from_slice(&valid).unwrap();
+        replacement["devices"][0]["state"]["parameters"]["threshold_millidecibels"] =
+            json!(-17_000);
+        let replacement = serde_json_canonicalizer::to_vec(&replacement).unwrap();
+        let outcome = publish_project_resource(
+            &fixture.root,
+            ProjectResourcePublicationRequest {
+                expected_project_sha256: *verify_project_package(&fixture.root)
+                    .unwrap()
+                    .manifest_sha256(),
+                resource_id: DEVICE_CHAIN_ID,
+                expected_role: ResourceRole::DeviceChain,
+                resource_bytes: &replacement,
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.project_revision(), 3);
+        assert_eq!(
+            DeviceChain::parse(&fs::read(fixture.root.join(outcome.resource_path())).unwrap())
+                .unwrap()
+                .devices()[0]
+                .compressor_state()
+                .unwrap()
+                .threshold_millidecibels(),
+            -17_000
+        );
+        verify_project_package(&fixture.root).unwrap();
     }
 
     #[test]

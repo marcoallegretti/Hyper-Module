@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use hyper_audio_source::DecodeLimits;
 use hyper_fs_authority::open_syncable_directory_ambient;
 use hyper_media_cache::CacheLimits;
-use hyper_native_device::{DeviceChain, NativeDeviceInstance, NativeFilterMode, NativeFilterState};
+use hyper_native_device::{
+    DeviceChain, NativeCompressorState, NativeDeviceInstance, NativeFilterMode, NativeFilterState,
+};
 use hyper_playback_json::LoaderLimits;
 use hyper_playback_session::PlaybackSessionAssemblyLimits;
 use hyper_project_loader::ProjectPlaybackLimits;
@@ -29,14 +31,22 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        Self::new_with_native_filter(false)
+        Self::new_with_native_device(None)
     }
 
     fn with_native_filter() -> Self {
-        Self::new_with_native_filter(true)
+        Self::new_with_native_device(Some(publish_native_filter))
     }
 
-    fn new_with_native_filter(include_native_filter: bool) -> Self {
+    fn with_native_compressor() -> Self {
+        Self::new_with_native_device(Some(publish_native_compressor))
+    }
+
+    fn with_native_filter_and_compressor() -> Self {
+        Self::new_with_native_device(Some(publish_native_filter_and_compressor))
+    }
+
+    fn new_with_native_device(publish: Option<fn(&Path)>) -> Self {
         let parent = std::env::temp_dir().join(format!(
             "hyper-runtime-bundle-{}-{}",
             std::process::id(),
@@ -53,8 +63,8 @@ impl Fixture {
         .unwrap();
         let source_root = creation.project().root().to_owned();
         drop(creation);
-        if include_native_filter {
-            publish_native_filter(&source_root);
+        if let Some(publish) = publish {
+            publish(&source_root);
         }
         let project = verify_project_package(&source_root).unwrap();
         let project_bytes = fs::read(source_root.join("project.json")).unwrap();
@@ -168,6 +178,88 @@ fn publish_native_filter(source_root: &Path) {
     .unwrap();
 }
 
+fn publish_native_compressor(source_root: &Path) {
+    let project = verify_project_package(source_root).unwrap();
+    let project_id = project.manifest().project_id().to_owned();
+    let track = project
+        .manifest()
+        .resources()
+        .iter()
+        .find(|resource| resource.role() == ResourceRole::Track)
+        .unwrap();
+    let track_document: Value =
+        serde_json::from_slice(&project.read_resource(track.id()).unwrap()).unwrap();
+    let track_id = track_document["id"].as_str().unwrap().to_owned();
+    let expected_project_sha256 = *project.manifest_sha256();
+    drop(project);
+    let chain = DeviceChain::try_new(
+        "018f47a2-6b2d-7c11-8a44-0011223375a2".to_owned(),
+        project_id,
+        track_id,
+        vec![NativeDeviceInstance::try_new_compressor(
+            "018f47a2-6b2d-7c11-8a44-0011223375a3".to_owned(),
+            true,
+            NativeCompressorState::try_new(-18_000, 4_000_000, 10_000, 100_000, 0).unwrap(),
+        )
+        .unwrap()],
+    )
+    .unwrap();
+    let chain_bytes = chain.to_canonical_vec().unwrap();
+    publish_device_chain(
+        source_root,
+        DeviceChainPublicationRequest {
+            expected_project_sha256,
+            chain_id: chain.id(),
+            chain_bytes: &chain_bytes,
+        },
+    )
+    .unwrap();
+}
+
+fn publish_native_filter_and_compressor(source_root: &Path) {
+    let project = verify_project_package(source_root).unwrap();
+    let project_id = project.manifest().project_id().to_owned();
+    let track = project
+        .manifest()
+        .resources()
+        .iter()
+        .find(|resource| resource.role() == ResourceRole::Track)
+        .unwrap();
+    let track_document: Value =
+        serde_json::from_slice(&project.read_resource(track.id()).unwrap()).unwrap();
+    let track_id = track_document["id"].as_str().unwrap().to_owned();
+    let expected_project_sha256 = *project.manifest_sha256();
+    drop(project);
+    let chain = DeviceChain::try_new(
+        "018f47a2-6b2d-7c11-8a44-0011223375a4".to_owned(),
+        project_id,
+        track_id,
+        vec![NativeDeviceInstance::try_new_filter(
+            "018f47a2-6b2d-7c11-8a44-0011223375a5".to_owned(),
+            true,
+            NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_000).unwrap(),
+        )
+        .unwrap()],
+    )
+    .unwrap()
+    .try_with_appended_compressor(
+        "018f47a2-6b2d-7c11-8a44-0011223375a6".to_owned(),
+        true,
+        NativeCompressorState::try_new(-18_000, 4_000_000, 10_000, 100_000, 1_000).unwrap(),
+    )
+    .unwrap();
+    let chain_bytes = chain.to_canonical_vec().unwrap();
+    publish_device_chain(
+        source_root,
+        DeviceChainPublicationRequest {
+            expected_project_sha256,
+            chain_id: chain.id(),
+            chain_bytes: &chain_bytes,
+        },
+    )
+    .unwrap();
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(self.root.parent().unwrap());
@@ -203,7 +295,48 @@ fn prepared_bundle_retains_a_native_filter_for_runtime_loading() {
     let chain = &bundle.project().device_chains()[0];
     assert_eq!(chain.devices().len(), 1);
     assert!(chain.devices()[0].enabled());
-    assert_eq!(chain.devices()[0].state().mode(), NativeFilterMode::LowPass);
+    assert_eq!(
+        chain.devices()[0].filter_state().unwrap().mode(),
+        NativeFilterMode::LowPass
+    );
+    bundle.project().package().confirm_unchanged().unwrap();
+}
+
+#[test]
+fn prepared_bundle_retains_a_versioned_native_compressor_for_runtime_loading() {
+    let fixture = Fixture::with_native_compressor();
+    let bundle = prepare_runtime_bundle(&fixture.root, "0.1.0", 1 << 30, limits()).unwrap();
+
+    assert_eq!(bundle.project().device_chains().len(), 1);
+    let chain = &bundle.project().device_chains()[0];
+    assert_eq!(chain.format_version(), 2);
+    assert_eq!(chain.devices().len(), 1);
+    let compressor = chain.devices()[0].compressor_state().unwrap();
+    assert!(chain.devices()[0].enabled());
+    assert_eq!(compressor.threshold_millidecibels(), -18_000);
+    assert_eq!(compressor.ratio_millionths(), 4_000_000);
+    assert_eq!(compressor.attack_microseconds(), 10_000);
+    assert_eq!(compressor.release_microseconds(), 100_000);
+    assert_eq!(compressor.makeup_millidecibels(), 0);
+    bundle.project().package().confirm_unchanged().unwrap();
+}
+
+#[test]
+fn prepared_bundle_preserves_mixed_native_device_order_for_runtime_loading() {
+    let fixture = Fixture::with_native_filter_and_compressor();
+    let bundle = prepare_runtime_bundle(&fixture.root, "0.1.0", 1 << 30, limits()).unwrap();
+
+    let chain = &bundle.project().device_chains()[0];
+    assert_eq!(chain.format_version(), 2);
+    assert_eq!(chain.devices().len(), 2);
+    assert!(chain.devices()[0].filter_state().is_some());
+    assert_eq!(
+        chain.devices()[1]
+            .compressor_state()
+            .unwrap()
+            .makeup_millidecibels(),
+        1_000
+    );
     bundle.project().package().confirm_unchanged().unwrap();
 }
 

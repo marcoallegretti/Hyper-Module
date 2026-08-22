@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const FORMAT: &str = "hyper-device-chain";
-const FORMAT_VERSION: u8 = 1;
+const LEGACY_FORMAT_VERSION: u8 = 1;
+const CURRENT_FORMAT_VERSION: u8 = 2;
 const MAX_DOCUMENT_BYTES: usize = 1_048_576;
 pub const MAX_DEVICES_PER_CHAIN: usize = 8;
 pub const PROJECT_SAMPLE_RATE_HZ: u32 = 48_000;
@@ -28,6 +29,28 @@ pub const MIN_FILTER_CUTOFF_MILLIHERTZ: u32 = 20_000;
 pub const MAX_FILTER_CUTOFF_MILLIHERTZ: u32 = 20_000_000;
 pub const MIN_FILTER_RESONANCE_MILLIONTHS: u32 = 100_000;
 pub const MAX_FILTER_RESONANCE_MILLIONTHS: u32 = 20_000_000;
+pub const NATIVE_COMPRESSOR_DEVICE_ID: &str = "org.hyper-module.native-compressor";
+pub const NATIVE_COMPRESSOR_STATE_VERSION: u16 = 1;
+pub const NATIVE_COMPRESSOR_DSP_VERSION: u16 = 1;
+pub const NATIVE_COMPRESSOR_THRESHOLD_PARAMETER: &str =
+    "org.hyper-module.native-compressor/threshold";
+pub const NATIVE_COMPRESSOR_RATIO_PARAMETER: &str = "org.hyper-module.native-compressor/ratio";
+pub const NATIVE_COMPRESSOR_ATTACK_PARAMETER: &str = "org.hyper-module.native-compressor/attack";
+pub const NATIVE_COMPRESSOR_RELEASE_PARAMETER: &str =
+    "org.hyper-module.native-compressor/release";
+pub const NATIVE_COMPRESSOR_MAKEUP_PARAMETER: &str = "org.hyper-module.native-compressor/makeup";
+pub const NATIVE_COMPRESSOR_ENABLED_PARAMETER: &str =
+    "org.hyper-module.native-compressor/enabled";
+pub const MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS: i32 = -80_000;
+pub const MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS: i32 = 0;
+pub const MIN_COMPRESSOR_RATIO_MILLIONTHS: u32 = 1_000_000;
+pub const MAX_COMPRESSOR_RATIO_MILLIONTHS: u32 = 100_000_000;
+pub const MIN_COMPRESSOR_ATTACK_MICROSECONDS: u32 = 100;
+pub const MAX_COMPRESSOR_ATTACK_MICROSECONDS: u32 = 500_000;
+pub const MIN_COMPRESSOR_RELEASE_MICROSECONDS: u32 = 100;
+pub const MAX_COMPRESSOR_RELEASE_MICROSECONDS: u32 = 2_000_000;
+pub const MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS: i32 = -24_000;
+pub const MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS: i32 = 24_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceChainErrorKind {
@@ -118,15 +141,83 @@ impl NativeFilterState {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Persisted state for the fixed, zero-latency linked stereo compressor.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct NativeCompressorState {
+    threshold_millidecibels: i32,
+    ratio_millionths: u32,
+    attack_microseconds: u32,
+    release_microseconds: u32,
+    makeup_millidecibels: i32,
+}
+
+impl NativeCompressorState {
+    /// Creates one persisted compressor state in the version-1 parameter domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when a control is outside the declared device range.
+    pub fn try_new(
+        threshold_millidecibels: i32,
+        ratio_millionths: u32,
+        attack_microseconds: u32,
+        release_microseconds: u32,
+        makeup_millidecibels: i32,
+    ) -> Result<Self, DeviceChainError> {
+        let state = Self {
+            threshold_millidecibels,
+            ratio_millionths,
+            attack_microseconds,
+            release_microseconds,
+            makeup_millidecibels,
+        };
+        validate_compressor_state(state)?;
+        Ok(state)
+    }
+
+    #[must_use]
+    pub const fn threshold_millidecibels(self) -> i32 {
+        self.threshold_millidecibels
+    }
+
+    #[must_use]
+    pub const fn ratio_millionths(self) -> u32 {
+        self.ratio_millionths
+    }
+
+    #[must_use]
+    pub const fn attack_microseconds(self) -> u32 {
+        self.attack_microseconds
+    }
+
+    #[must_use]
+    pub const fn release_microseconds(self) -> u32 {
+        self.release_microseconds
+    }
+
+    #[must_use]
+    pub const fn makeup_millidecibels(self) -> i32 {
+        self.makeup_millidecibels
+    }
+}
+
+/// The state discriminant stored by a version-2 device-chain document.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "parameters", rename_all = "kebab-case")]
+pub enum NativeDeviceState {
+    Filter(NativeFilterState),
+    Compressor(NativeCompressorState),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeDeviceInstance {
     id: String,
     device_id: String,
     state_version: u16,
     dsp_version: u16,
     enabled: bool,
-    state: NativeFilterState,
+    state: NativeDeviceState,
     extensions: BTreeMap<String, Value>,
 }
 
@@ -147,7 +238,30 @@ impl NativeDeviceInstance {
             state_version: NATIVE_FILTER_STATE_VERSION,
             dsp_version: NATIVE_FILTER_DSP_VERSION,
             enabled,
-            state,
+            state: NativeDeviceState::Filter(state),
+            extensions: BTreeMap::new(),
+        };
+        validate_device(&instance)?;
+        Ok(instance)
+    }
+
+    /// Creates one supported Native Compressor instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error for an invalid identity or state.
+    pub fn try_new_compressor(
+        id: String,
+        enabled: bool,
+        state: NativeCompressorState,
+    ) -> Result<Self, DeviceChainError> {
+        let instance = Self {
+            id,
+            device_id: NATIVE_COMPRESSOR_DEVICE_ID.to_owned(),
+            state_version: NATIVE_COMPRESSOR_STATE_VERSION,
+            dsp_version: NATIVE_COMPRESSOR_DSP_VERSION,
+            enabled,
+            state: NativeDeviceState::Compressor(state),
             extensions: BTreeMap::new(),
         };
         validate_device(&instance)?;
@@ -180,8 +294,24 @@ impl NativeDeviceInstance {
     }
 
     #[must_use]
-    pub const fn state(&self) -> NativeFilterState {
-        self.state
+    pub const fn state(&self) -> &NativeDeviceState {
+        &self.state
+    }
+
+    #[must_use]
+    pub const fn filter_state(&self) -> Option<NativeFilterState> {
+        match self.state {
+            NativeDeviceState::Filter(state) => Some(state),
+            NativeDeviceState::Compressor(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn compressor_state(&self) -> Option<NativeCompressorState> {
+        match self.state {
+            NativeDeviceState::Filter(_) => None,
+            NativeDeviceState::Compressor(state) => Some(state),
+        }
     }
 
     #[must_use]
@@ -190,8 +320,7 @@ impl NativeDeviceInstance {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceChain {
     format: String,
     format_version: u8,
@@ -202,14 +331,119 @@ pub struct DeviceChain {
     extensions: BTreeMap<String, Value>,
 }
 
+#[derive(Deserialize)]
+struct DeviceChainHeader {
+    format: String,
+    format_version: u8,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceChainV1 {
+    format: String,
+    format_version: u8,
+    id: String,
+    project_id: String,
+    track_id: String,
+    devices: Vec<NativeDeviceInstanceV1>,
+    extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeDeviceInstanceV1 {
+    id: String,
+    device_id: String,
+    state_version: u16,
+    dsp_version: u16,
+    enabled: bool,
+    state: NativeFilterState,
+    extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceChainV2 {
+    format: String,
+    format_version: u8,
+    id: String,
+    project_id: String,
+    track_id: String,
+    devices: Vec<NativeDeviceInstanceV2>,
+    extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeDeviceInstanceV2 {
+    id: String,
+    device_id: String,
+    state_version: u16,
+    dsp_version: u16,
+    enabled: bool,
+    state: NativeDeviceState,
+    extensions: BTreeMap<String, Value>,
+}
+
 impl DeviceChain {
-    /// Parses and validates one complete version-1 device chain.
+    /// Parses and validates one complete device-chain document.
     ///
     /// # Errors
     ///
     /// Returns a classified strict-JSON or device-domain rejection.
     pub fn parse(bytes: &[u8]) -> Result<Self, DeviceChainError> {
-        let chain: Self = hyper_strict_json::parse(bytes, MAX_DOCUMENT_BYTES)?;
+        let header: DeviceChainHeader = hyper_strict_json::parse(bytes, MAX_DOCUMENT_BYTES)?;
+        let chain = match (header.format.as_str(), header.format_version) {
+            (FORMAT, LEGACY_FORMAT_VERSION) => {
+                let legacy: DeviceChainV1 = hyper_strict_json::parse(bytes, MAX_DOCUMENT_BYTES)?;
+                Self {
+                    format: legacy.format,
+                    format_version: legacy.format_version,
+                    id: legacy.id,
+                    project_id: legacy.project_id,
+                    track_id: legacy.track_id,
+                    devices: legacy
+                        .devices
+                        .into_iter()
+                        .map(|device| NativeDeviceInstance {
+                            id: device.id,
+                            device_id: device.device_id,
+                            state_version: device.state_version,
+                            dsp_version: device.dsp_version,
+                            enabled: device.enabled,
+                            state: NativeDeviceState::Filter(device.state),
+                            extensions: device.extensions,
+                        })
+                        .collect(),
+                    extensions: legacy.extensions,
+                }
+            }
+            (FORMAT, CURRENT_FORMAT_VERSION) => {
+                let current: DeviceChainV2 = hyper_strict_json::parse(bytes, MAX_DOCUMENT_BYTES)?;
+                Self {
+                    format: current.format,
+                    format_version: current.format_version,
+                    id: current.id,
+                    project_id: current.project_id,
+                    track_id: current.track_id,
+                    devices: current
+                        .devices
+                        .into_iter()
+                        .map(|device| NativeDeviceInstance {
+                            id: device.id,
+                            device_id: device.device_id,
+                            state_version: device.state_version,
+                            dsp_version: device.dsp_version,
+                            enabled: device.enabled,
+                            state: device.state,
+                            extensions: device.extensions,
+                        })
+                        .collect(),
+                    extensions: current.extensions,
+                }
+            }
+            _ => return Err(invalid_domain("device chain format is unsupported")),
+        };
         validate_chain(&chain)?;
         Ok(chain)
     }
@@ -226,9 +460,17 @@ impl DeviceChain {
         track_id: String,
         devices: Vec<NativeDeviceInstance>,
     ) -> Result<Self, DeviceChainError> {
+        let format_version = if devices
+            .iter()
+            .all(|device| matches!(device.state(), NativeDeviceState::Filter(_)))
+        {
+            LEGACY_FORMAT_VERSION
+        } else {
+            CURRENT_FORMAT_VERSION
+        };
         let chain = Self {
             format: FORMAT.to_owned(),
-            format_version: FORMAT_VERSION,
+            format_version,
             id,
             project_id,
             track_id,
@@ -245,7 +487,60 @@ impl DeviceChain {
     ///
     /// Returns a capacity error if serialization cannot allocate its output.
     pub fn to_canonical_vec(&self) -> Result<Vec<u8>, DeviceChainError> {
-        serde_json_canonicalizer::to_vec(self).map_err(|_| DeviceChainError {
+        let result = match self.format_version {
+            LEGACY_FORMAT_VERSION => {
+                let devices = self
+                    .devices
+                    .iter()
+                    .map(|device| {
+                        let state = device.filter_state().ok_or_else(|| {
+                            invalid_domain("version-one device chains may contain only filters")
+                        })?;
+                        Ok(NativeDeviceInstanceV1 {
+                            id: device.id.clone(),
+                            device_id: device.device_id.clone(),
+                            state_version: device.state_version,
+                            dsp_version: device.dsp_version,
+                            enabled: device.enabled,
+                            state,
+                            extensions: device.extensions.clone(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, DeviceChainError>>()?;
+                serde_json_canonicalizer::to_vec(&DeviceChainV1 {
+                    format: self.format.clone(),
+                    format_version: self.format_version,
+                    id: self.id.clone(),
+                    project_id: self.project_id.clone(),
+                    track_id: self.track_id.clone(),
+                    devices,
+                    extensions: self.extensions.clone(),
+                })
+            }
+            CURRENT_FORMAT_VERSION => serde_json_canonicalizer::to_vec(&DeviceChainV2 {
+                format: self.format.clone(),
+                format_version: self.format_version,
+                id: self.id.clone(),
+                project_id: self.project_id.clone(),
+                track_id: self.track_id.clone(),
+                devices: self
+                    .devices
+                    .iter()
+                    .map(|device| NativeDeviceInstanceV2 {
+                        id: device.id.clone(),
+                        device_id: device.device_id.clone(),
+                        state_version: device.state_version,
+                        dsp_version: device.dsp_version,
+                        enabled: device.enabled,
+                        state: device.state.clone(),
+                        extensions: device.extensions.clone(),
+                    })
+                    .collect(),
+                extensions: self.extensions.clone(),
+            }),
+            _ => return Err(invalid_domain("device chain format is unsupported")),
+        };
+        result.map_err(|_| DeviceChainError {
             kind: DeviceChainErrorKind::CapacityUnavailable,
             message: "device chain serialization capacity is unavailable".to_owned(),
         })
@@ -271,6 +566,11 @@ impl DeviceChain {
         &self.devices
     }
 
+    #[must_use]
+    pub const fn format_version(&self) -> u8 {
+        self.format_version
+    }
+
     /// Returns a copy with one validated Native Filter appended in processing
     /// order.
     ///
@@ -286,12 +586,26 @@ impl DeviceChain {
     ) -> Result<Self, DeviceChainError> {
         let mut devices = self.devices.clone();
         devices.push(NativeDeviceInstance::try_new_filter(id, enabled, state)?);
-        Self::try_new(
-            self.id.clone(),
-            self.project_id.clone(),
-            self.track_id.clone(),
-            devices,
-        )
+        self.try_with_devices(devices)
+    }
+
+    /// Returns a copy with one validated Native Compressor appended in processing
+    /// order. A legacy filter-only chain upgrades to the explicit version-2
+    /// discriminated representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when the instance identity is duplicated or the
+    /// device-count bound would be exceeded.
+    pub fn try_with_appended_compressor(
+        &self,
+        id: String,
+        enabled: bool,
+        state: NativeCompressorState,
+    ) -> Result<Self, DeviceChainError> {
+        let mut devices = self.devices.clone();
+        devices.push(NativeDeviceInstance::try_new_compressor(id, enabled, state)?);
+        self.try_with_devices(devices)
     }
 
     /// Returns a copy with one existing Native Filter state replaced without
@@ -299,8 +613,8 @@ impl DeviceChain {
     ///
     /// # Errors
     ///
-    /// Returns a domain error when the device identity is absent or the state
-    /// is outside the version-1 filter domain.
+    /// Returns a domain error when the device identity is absent, belongs to a
+    /// different native-device kind, or the state is outside the filter domain.
     pub fn try_with_filter_state(
         &self,
         device_instance_id: &str,
@@ -312,22 +626,52 @@ impl DeviceChain {
             .iter_mut()
             .find(|device| device.id() == device_instance_id)
         else {
-            return Err(DeviceChainError {
-                kind: DeviceChainErrorKind::InvalidDomain,
-                message: "native device instance does not exist in this chain".to_owned(),
-            });
+            return Err(invalid_domain(
+                "native device instance does not exist in this chain",
+            ));
         };
+        if device.filter_state().is_none() {
+            return Err(invalid_domain("native device kind does not match the requested edit"));
+        }
         *device = NativeDeviceInstance::try_new_filter(
             device_instance_id.to_owned(),
             enabled,
             state,
         )?;
-        Self::try_new(
-            self.id.clone(),
-            self.project_id.clone(),
-            self.track_id.clone(),
-            devices,
-        )
+        self.try_with_devices(devices)
+    }
+
+    /// Returns a copy with one existing Native Compressor state replaced without
+    /// changing chain order or device identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when the instance identity is absent, belongs to a
+    /// different native-device kind, or contains an invalid state.
+    pub fn try_with_compressor_state(
+        &self,
+        device_instance_id: &str,
+        enabled: bool,
+        state: NativeCompressorState,
+    ) -> Result<Self, DeviceChainError> {
+        let mut devices = self.devices.clone();
+        let Some(device) = devices
+            .iter_mut()
+            .find(|device| device.id() == device_instance_id)
+        else {
+            return Err(invalid_domain(
+                "native device instance does not exist in this chain",
+            ));
+        };
+        if device.compressor_state().is_none() {
+            return Err(invalid_domain("native device kind does not match the requested edit"));
+        }
+        *device = NativeDeviceInstance::try_new_compressor(
+            device_instance_id.to_owned(),
+            enabled,
+            state,
+        )?;
+        self.try_with_devices(devices)
     }
 
     /// Returns a copy without one device, or `None` when removing it empties
@@ -355,23 +699,49 @@ impl DeviceChain {
         }
         let mut devices = self.devices.clone();
         devices.remove(index);
-        Ok(Some(Self::try_new(
-            self.id.clone(),
-            self.project_id.clone(),
-            self.track_id.clone(),
-            devices,
-        )?))
+        Ok(Some(self.try_with_devices(devices)?))
     }
 
     #[must_use]
     pub const fn extensions(&self) -> &BTreeMap<String, Value> {
         &self.extensions
     }
+
+    fn try_with_devices(
+        &self,
+        devices: Vec<NativeDeviceInstance>,
+    ) -> Result<Self, DeviceChainError> {
+        let format_version = match self.format_version {
+            LEGACY_FORMAT_VERSION
+                if devices
+                    .iter()
+                    .all(|device| matches!(device.state(), NativeDeviceState::Filter(_))) =>
+            {
+                LEGACY_FORMAT_VERSION
+            }
+            _ => CURRENT_FORMAT_VERSION,
+        };
+        let chain = Self {
+            format: self.format.clone(),
+            format_version,
+            id: self.id.clone(),
+            project_id: self.project_id.clone(),
+            track_id: self.track_id.clone(),
+            devices,
+            extensions: self.extensions.clone(),
+        };
+        validate_chain(&chain)?;
+        Ok(chain)
+    }
 }
 
 fn validate_chain(chain: &DeviceChain) -> Result<(), DeviceChainError> {
     require(
-        chain.format == FORMAT && chain.format_version == FORMAT_VERSION,
+        chain.format == FORMAT
+            && matches!(
+                chain.format_version,
+                LEGACY_FORMAT_VERSION | CURRENT_FORMAT_VERSION
+            ),
         "device chain format is unsupported",
     )?;
     require(
@@ -382,7 +752,7 @@ fn validate_chain(chain: &DeviceChain) -> Result<(), DeviceChainError> {
     )?;
     require(
         (1..=MAX_DEVICES_PER_CHAIN).contains(&chain.devices.len()),
-        "device chain count is outside the version-1 bound",
+        "device chain count is outside the declared bound",
     )?;
     require(
         chain
@@ -394,6 +764,12 @@ fn validate_chain(chain: &DeviceChain) -> Result<(), DeviceChainError> {
     let mut identities = BTreeSet::new();
     for device in &chain.devices {
         validate_device(device)?;
+        if chain.format_version == LEGACY_FORMAT_VERSION {
+            require(
+                matches!(device.state(), NativeDeviceState::Filter(_)),
+                "version-1 device chains may contain only native filters",
+            )?;
+        }
         require(
             identities.insert(device.id()),
             "device chain contains a duplicate device identity",
@@ -407,12 +783,26 @@ fn validate_device(device: &NativeDeviceInstance) -> Result<(), DeviceChainError
         is_valid_entity_id(&device.id),
         "native device identity is invalid",
     )?;
-    require(
-        device.device_id == NATIVE_FILTER_DEVICE_ID
-            && device.state_version == NATIVE_FILTER_STATE_VERSION
-            && device.dsp_version == NATIVE_FILTER_DSP_VERSION,
-        "native device kind or version is unsupported",
-    )?;
+    match device.state() {
+        NativeDeviceState::Filter(state) => {
+            require(
+                device.device_id == NATIVE_FILTER_DEVICE_ID
+                    && device.state_version == NATIVE_FILTER_STATE_VERSION
+                    && device.dsp_version == NATIVE_FILTER_DSP_VERSION,
+                "native filter kind or version is unsupported",
+            )?;
+            validate_filter_state(*state)?;
+        }
+        NativeDeviceState::Compressor(state) => {
+            require(
+                device.device_id == NATIVE_COMPRESSOR_DEVICE_ID
+                    && device.state_version == NATIVE_COMPRESSOR_STATE_VERSION
+                    && device.dsp_version == NATIVE_COMPRESSOR_DSP_VERSION,
+                "native compressor kind or version is unsupported",
+            )?;
+            validate_compressor_state(*state)?;
+        }
+    }
     require(
         device
             .extensions
@@ -420,7 +810,7 @@ fn validate_device(device: &NativeDeviceInstance) -> Result<(), DeviceChainError
             .all(|key| is_valid_extension_key(key)),
         "native device contains an invalid extension key",
     )?;
-    validate_filter_state(device.state)
+    Ok(())
 }
 
 fn validate_filter_state(state: NativeFilterState) -> Result<(), DeviceChainError> {
@@ -436,6 +826,34 @@ fn validate_filter_state(state: NativeFilterState) -> Result<(), DeviceChainErro
     )
 }
 
+fn validate_compressor_state(state: NativeCompressorState) -> Result<(), DeviceChainError> {
+    require(
+        (MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS..=MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS)
+            .contains(&state.threshold_millidecibels),
+        "native compressor threshold is outside -80..=0 dB",
+    )?;
+    require(
+        (MIN_COMPRESSOR_RATIO_MILLIONTHS..=MAX_COMPRESSOR_RATIO_MILLIONTHS)
+            .contains(&state.ratio_millionths),
+        "native compressor ratio is outside 1..=100",
+    )?;
+    require(
+        (MIN_COMPRESSOR_ATTACK_MICROSECONDS..=MAX_COMPRESSOR_ATTACK_MICROSECONDS)
+            .contains(&state.attack_microseconds),
+        "native compressor attack is outside 0.1..=500 ms",
+    )?;
+    require(
+        (MIN_COMPRESSOR_RELEASE_MICROSECONDS..=MAX_COMPRESSOR_RELEASE_MICROSECONDS)
+            .contains(&state.release_microseconds),
+        "native compressor release is outside 0.1..=2000 ms",
+    )?;
+    require(
+        (MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS..=MAX_COMPRESSOR_MAKEUP_MILLIDECIBELS)
+            .contains(&state.makeup_millidecibels),
+        "native compressor makeup is outside -24..=24 dB",
+    )
+}
+
 fn require(condition: bool, message: &'static str) -> Result<(), DeviceChainError> {
     if condition {
         Ok(())
@@ -444,6 +862,13 @@ fn require(condition: bool, message: &'static str) -> Result<(), DeviceChainErro
             kind: DeviceChainErrorKind::InvalidDomain,
             message: message.to_owned(),
         })
+    }
+}
+
+fn invalid_domain(message: &'static str) -> DeviceChainError {
+    DeviceChainError {
+        kind: DeviceChainErrorKind::InvalidDomain,
+        message: message.to_owned(),
     }
 }
 
@@ -641,9 +1066,148 @@ fn coefficients(state: NativeFilterState, sample_rate_hz: u32) -> BiquadCoeffici
     }
 }
 
+/// Zero-latency stereo-linked peak compressor runtime state.
+#[derive(Debug)]
+pub struct NativeCompressorProcessor {
+    enabled: bool,
+    threshold_decibels: f64,
+    ratio: f64,
+    attack_coefficient: f64,
+    release_coefficient: f64,
+    makeup_gain: f64,
+    gain_reduction_decibels: f64,
+}
+
+impl NativeCompressorProcessor {
+    /// Compiles one compressor into fixed callback state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the configured sample rate is the project rate.
+    pub fn try_new(
+        state: NativeCompressorState,
+        enabled: bool,
+        sample_rate_hz: u32,
+    ) -> Result<Self, NativeDeviceCreationError> {
+        if sample_rate_hz != PROJECT_SAMPLE_RATE_HZ {
+            return Err(NativeDeviceCreationError::UnsupportedSampleRate {
+                actual: sample_rate_hz,
+                required: PROJECT_SAMPLE_RATE_HZ,
+            });
+        }
+        let rate = f64::from(sample_rate_hz);
+        let attack_seconds = f64::from(state.attack_microseconds) / 1_000_000.0;
+        let release_seconds = f64::from(state.release_microseconds) / 1_000_000.0;
+        let makeup_decibels = f64::from(state.makeup_millidecibels) / 1_000.0;
+        Ok(Self {
+            enabled,
+            threshold_decibels: f64::from(state.threshold_millidecibels) / 1_000.0,
+            ratio: f64::from(state.ratio_millionths) / 1_000_000.0,
+            attack_coefficient: (-1.0 / (attack_seconds * rate)).exp(),
+            release_coefficient: (-1.0 / (release_seconds * rate)).exp(),
+            makeup_gain: 10.0_f64.powf(makeup_decibels / 20.0),
+            gain_reduction_decibels: 0.0,
+        })
+    }
+
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn reset(&mut self) {
+        self.gain_reduction_decibels = 0.0;
+    }
+
+    /// Processes one planar stereo block in place without allocation.
+    ///
+    /// The detector is peak-linked across both channels; each sample pair gets
+    /// exactly one shared gain, so the compressor cannot move the stereo image.
+    ///
+    /// # Errors
+    ///
+    /// Returns before processing for an invalid shape or non-finite input. A
+    /// non-finite calculated output resets detector history before returning.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the finite f64 processor result is range-checked after conversion to the f32 audio domain"
+    )]
+    pub fn process_in_place(
+        &mut self,
+        left: &mut [f32],
+        right: &mut [f32],
+    ) -> Result<(), NativeDeviceProcessError> {
+        validate_block(left, right)?;
+        if !self.enabled {
+            return Ok(());
+        }
+        let mut gain_reduction_decibels = self.gain_reduction_decibels;
+        for (left, right) in left.iter_mut().zip(right) {
+            let peak = f64::from(left.abs().max(right.abs()));
+            let level_decibels = 20.0 * peak.max(f64::MIN_POSITIVE).log10();
+            let target_gain_reduction = if level_decibels > self.threshold_decibels {
+                (level_decibels - self.threshold_decibels) * (1.0 - 1.0 / self.ratio)
+            } else {
+                0.0
+            };
+            let coefficient = if target_gain_reduction > gain_reduction_decibels {
+                self.attack_coefficient
+            } else {
+                self.release_coefficient
+            };
+            gain_reduction_decibels = coefficient.mul_add(
+                gain_reduction_decibels,
+                (1.0 - coefficient) * target_gain_reduction,
+            );
+            let gain = 10.0_f64.powf(-gain_reduction_decibels / 20.0) * self.makeup_gain;
+            let next_left = f64::from(*left) * gain;
+            let next_right = f64::from(*right) * gain;
+            let next_left = next_left as f32;
+            let next_right = next_right as f32;
+            if !next_left.is_finite()
+                || !next_right.is_finite()
+                || !gain_reduction_decibels.is_finite()
+            {
+                self.reset();
+                return Err(NativeDeviceProcessError::NonFiniteOutput);
+            }
+            *left = next_left;
+            *right = next_right;
+        }
+        self.gain_reduction_decibels = gain_reduction_decibels;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum NativeDeviceProcessor {
+    Filter(NativeFilterProcessor),
+    Compressor(NativeCompressorProcessor),
+}
+
+impl NativeDeviceProcessor {
+    fn reset(&mut self) {
+        match self {
+            Self::Filter(processor) => processor.reset(),
+            Self::Compressor(processor) => processor.reset(),
+        }
+    }
+
+    fn process_in_place(
+        &mut self,
+        left: &mut [f32],
+        right: &mut [f32],
+    ) -> Result<(), NativeDeviceProcessError> {
+        match self {
+            Self::Filter(processor) => processor.process_in_place(left, right),
+            Self::Compressor(processor) => processor.process_in_place(left, right),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct NativeDeviceChainProcessor {
-    filters: Vec<NativeFilterProcessor>,
+    devices: Vec<NativeDeviceProcessor>,
 }
 
 impl NativeDeviceChainProcessor {
@@ -656,28 +1220,39 @@ impl NativeDeviceChainProcessor {
         chain: &DeviceChain,
         sample_rate_hz: u32,
     ) -> Result<Self, NativeDeviceCreationError> {
-        let mut filters = Vec::new();
-        filters
+        let mut devices = Vec::new();
+        devices
             .try_reserve_exact(chain.devices.len())
             .map_err(|_| NativeDeviceCreationError::CapacityUnavailable)?;
         for device in &chain.devices {
-            filters.push(NativeFilterProcessor::try_new(
-                device.state,
-                device.enabled,
-                sample_rate_hz,
-            )?);
+            devices.push(match device.state() {
+                NativeDeviceState::Filter(state) => {
+                    NativeDeviceProcessor::Filter(NativeFilterProcessor::try_new(
+                        *state,
+                        device.enabled,
+                        sample_rate_hz,
+                    )?)
+                }
+                NativeDeviceState::Compressor(state) => {
+                    NativeDeviceProcessor::Compressor(NativeCompressorProcessor::try_new(
+                        *state,
+                        device.enabled,
+                        sample_rate_hz,
+                    )?)
+                }
+            });
         }
-        Ok(Self { filters })
+        Ok(Self { devices })
     }
 
     #[must_use]
     pub fn device_count(&self) -> usize {
-        self.filters.len()
+        self.devices.len()
     }
 
     pub fn reset(&mut self) {
-        for filter in &mut self.filters {
-            filter.reset();
+        for device in &mut self.devices {
+            device.reset();
         }
     }
 
@@ -691,8 +1266,8 @@ impl NativeDeviceChainProcessor {
         left: &mut [f32],
         right: &mut [f32],
     ) -> Result<(), NativeDeviceProcessError> {
-        for filter in &mut self.filters {
-            if let Err(error) = filter.process_in_place(left, right) {
+        for device in &mut self.devices {
+            if let Err(error) = device.process_in_place(left, right) {
                 self.reset();
                 return Err(error);
             }
@@ -714,6 +1289,10 @@ mod tests {
         NativeFilterState::try_new(mode, 1_000_000, 707_107).unwrap()
     }
 
+    fn compressor_state() -> NativeCompressorState {
+        NativeCompressorState::try_new(-18_000, 4_000_000, 10_000, 100_000, 0).unwrap()
+    }
+
     fn chain(enabled: bool) -> DeviceChain {
         DeviceChain::try_new(
             CHAIN_ID.to_owned(),
@@ -731,11 +1310,31 @@ mod tests {
         .unwrap()
     }
 
+    fn compressor_chain(enabled: bool) -> DeviceChain {
+        DeviceChain::try_new(
+            CHAIN_ID.to_owned(),
+            PROJECT_ID.to_owned(),
+            TRACK_ID.to_owned(),
+            vec![
+                NativeDeviceInstance::try_new_compressor(
+                    DEVICE_ID.to_owned(),
+                    enabled,
+                    compressor_state(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn canonical_chain_round_trips_with_stable_device_identity() {
         let chain = chain(true);
         let bytes = chain.to_canonical_vec().unwrap();
         assert_eq!(DeviceChain::parse(&bytes).unwrap(), chain);
+        assert_eq!(chain.format_version(), LEGACY_FORMAT_VERSION);
+        let wire: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(wire["devices"][0]["state"].get("kind").is_none());
         assert_eq!(chain.devices()[0].device_id(), NATIVE_FILTER_DEVICE_ID);
         assert_eq!(chain.devices()[0].state_version(), 1);
         assert_eq!(chain.devices()[0].dsp_version(), 1);
@@ -753,6 +1352,31 @@ mod tests {
                 "org.hyper-module.native-filter/enabled",
             ]
         );
+    }
+
+    #[test]
+    fn compressor_chain_uses_explicit_v2_state_and_preserves_v1_filters_on_upgrade() {
+        let compressor = compressor_chain(true);
+        let bytes = compressor.to_canonical_vec().unwrap();
+        let wire: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(compressor.format_version(), CURRENT_FORMAT_VERSION);
+        assert_eq!(wire["format_version"], CURRENT_FORMAT_VERSION);
+        assert_eq!(wire["devices"][0]["state"]["kind"], "compressor");
+        assert_eq!(DeviceChain::parse(&bytes).unwrap(), compressor);
+
+        let upgraded = chain(true)
+            .try_with_appended_compressor(
+                "018f47a2-6b2d-7c11-8a44-001122338005".to_owned(),
+                false,
+                compressor_state(),
+            )
+            .unwrap();
+        assert_eq!(upgraded.format_version(), CURRENT_FORMAT_VERSION);
+        assert_eq!(upgraded.devices()[0].filter_state(), Some(state(NativeFilterMode::LowPass)));
+        assert_eq!(upgraded.devices()[1].compressor_state(), Some(compressor_state()));
+        let upgraded_wire: Value = serde_json::from_slice(&upgraded.to_canonical_vec().unwrap()).unwrap();
+        assert_eq!(upgraded_wire["devices"][0]["state"]["kind"], "filter");
+        assert_eq!(upgraded_wire["devices"][1]["state"]["kind"], "compressor");
     }
 
     #[test]
@@ -775,7 +1399,7 @@ mod tests {
             .unwrap();
         assert!(changed.devices()[1].enabled());
         assert_eq!(
-            changed.devices()[1].state().mode(),
+            changed.devices()[1].filter_state().unwrap().mode(),
             NativeFilterMode::LowPass
         );
         let reduced = changed.try_without_device(DEVICE_ID).unwrap().unwrap();
@@ -785,12 +1409,37 @@ mod tests {
     }
 
     #[test]
+    fn chain_edits_reject_cross_kind_replacements_without_changing_canonical_state() {
+        let filter = chain(true);
+        let compressor = compressor_chain(true);
+        let filter_bytes = filter.to_canonical_vec().unwrap();
+        let compressor_bytes = compressor.to_canonical_vec().unwrap();
+
+        assert_eq!(
+            filter
+                .try_with_compressor_state(DEVICE_ID, true, compressor_state())
+                .unwrap_err()
+                .kind(),
+            DeviceChainErrorKind::InvalidDomain
+        );
+        assert_eq!(filter.to_canonical_vec().unwrap(), filter_bytes);
+        assert_eq!(
+            compressor
+                .try_with_filter_state(DEVICE_ID, true, state(NativeFilterMode::LowPass))
+                .unwrap_err()
+                .kind(),
+            DeviceChainErrorKind::InvalidDomain
+        );
+        assert_eq!(compressor.to_canonical_vec().unwrap(), compressor_bytes);
+    }
+
+    #[test]
     fn parser_rejects_unknown_device_versions_domains_and_duplicate_instances() {
         let canonical = chain(true).to_canonical_vec().unwrap();
         let base: Value = serde_json::from_slice(&canonical).unwrap();
         let mut cases = Vec::new();
         for (pointer, value) in [
-            ("/format_version", serde_json::json!(2)),
+            ("/format_version", serde_json::json!(3)),
             ("/devices/0/device_id", serde_json::json!("unknown.device")),
             ("/devices/0/state_version", serde_json::json!(2)),
             ("/devices/0/dsp_version", serde_json::json!(2)),
@@ -819,6 +1468,74 @@ mod tests {
                 DeviceChainErrorKind::InvalidDomain
             );
         }
+    }
+
+    #[test]
+    fn v2_parser_rejects_cross_kind_versions_and_compressor_domains() {
+        let canonical = compressor_chain(true).to_canonical_vec().unwrap();
+        let base: Value = serde_json::from_slice(&canonical).unwrap();
+        let mut cases = Vec::new();
+        for (pointer, value) in [
+            (
+                "/devices/0/device_id",
+                serde_json::json!(NATIVE_FILTER_DEVICE_ID),
+            ),
+            ("/devices/0/state_version", serde_json::json!(2)),
+            (
+                "/devices/0/state/parameters/threshold_millidecibels",
+                serde_json::json!(-80_001),
+            ),
+            (
+                "/devices/0/state/parameters/ratio_millionths",
+                serde_json::json!(100_000_001),
+            ),
+            (
+                "/devices/0/state/parameters/attack_microseconds",
+                serde_json::json!(99),
+            ),
+            (
+                "/devices/0/state/parameters/release_microseconds",
+                serde_json::json!(2_000_001),
+            ),
+            (
+                "/devices/0/state/parameters/makeup_millidecibels",
+                serde_json::json!(24_001),
+            ),
+        ] {
+            let mut changed = base.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            cases.push(changed);
+        }
+        for value in cases {
+            let bytes = serde_json_canonicalizer::to_vec(&value).unwrap();
+            assert_eq!(
+                DeviceChain::parse(&bytes).unwrap_err().kind(),
+                DeviceChainErrorKind::InvalidDomain
+            );
+        }
+
+        let mut cross_kind = base.clone();
+        cross_kind["devices"][0]["state"] = serde_json::json!({
+            "kind": "filter",
+            "parameters": {
+                "mode": "low-pass",
+                "cutoff_millihertz": 1_000_000,
+                "resonance_millionths": 707_107
+            }
+        });
+        let cross_kind_bytes = serde_json_canonicalizer::to_vec(&cross_kind).unwrap();
+        assert_eq!(
+            DeviceChain::parse(&cross_kind_bytes).unwrap_err().kind(),
+            DeviceChainErrorKind::InvalidDomain
+        );
+
+        let mut legacy = serde_json::from_slice::<Value>(&chain(true).to_canonical_vec().unwrap()).unwrap();
+        legacy["devices"][0]["state"] = base["devices"][0]["state"].clone();
+        let legacy_bytes = serde_json_canonicalizer::to_vec(&legacy).unwrap();
+        assert!(matches!(
+            DeviceChain::parse(&legacy_bytes).unwrap_err().kind(),
+            DeviceChainErrorKind::Json(StrictJsonErrorKind::TypedDocumentMismatch)
+        ));
     }
 
     #[test]
@@ -954,5 +1671,200 @@ mod tests {
                 second_right.map(f32::to_bits)
             );
         }
+    }
+
+    #[test]
+    fn compressor_is_block_split_equivalent_stereo_linked_and_resettable() {
+        let state = NativeCompressorState::try_new(-24_000, 4_000_000, 5_000, 80_000, 0).unwrap();
+        let mut whole =
+            NativeCompressorProcessor::try_new(state, true, PROJECT_SAMPLE_RATE_HZ).unwrap();
+        let mut split =
+            NativeCompressorProcessor::try_new(state, true, PROJECT_SAMPLE_RATE_HZ).unwrap();
+        let mut whole_left = [1.0_f32; 256];
+        let mut whole_right = [0.25_f32; 256];
+        let mut split_left = whole_left;
+        let mut split_right = whole_right;
+        whole
+            .process_in_place(&mut whole_left, &mut whole_right)
+            .unwrap();
+        split
+            .process_in_place(&mut split_left[..71], &mut split_right[..71])
+            .unwrap();
+        split
+            .process_in_place(&mut split_left[71..], &mut split_right[71..])
+            .unwrap();
+        assert_eq!(whole_left.map(f32::to_bits), split_left.map(f32::to_bits));
+        assert_eq!(whole_right.map(f32::to_bits), split_right.map(f32::to_bits));
+        assert!(whole_left[255] < 1.0);
+        assert!((f64::from(whole_left[255]) / f64::from(whole_right[255]) - 4.0).abs() < 0.000_001);
+
+        whole.reset();
+        let mut replay_left = [1.0_f32; 256];
+        let mut replay_right = [0.25_f32; 256];
+        whole
+            .process_in_place(&mut replay_left, &mut replay_right)
+            .unwrap();
+        assert_eq!(whole_left.map(f32::to_bits), replay_left.map(f32::to_bits));
+        assert_eq!(whole_right.map(f32::to_bits), replay_right.map(f32::to_bits));
+    }
+
+    #[test]
+    fn compressor_bypass_and_unity_ratio_are_bit_exact() {
+        let state = compressor_state();
+        let mut bypass =
+            NativeCompressorProcessor::try_new(state, false, PROJECT_SAMPLE_RATE_HZ).unwrap();
+        let mut unity = NativeCompressorProcessor::try_new(
+            NativeCompressorState::try_new(-80_000, 1_000_000, 100, 100, 0).unwrap(),
+            true,
+            PROJECT_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+        let expected_left = [0.25_f32, -0.5, 1.0];
+        let expected_right = [-0.125_f32, 0.375, -0.75];
+        let mut bypass_left = expected_left;
+        let mut bypass_right = expected_right;
+        let mut unity_left = expected_left;
+        let mut unity_right = expected_right;
+        bypass
+            .process_in_place(&mut bypass_left, &mut bypass_right)
+            .unwrap();
+        unity
+            .process_in_place(&mut unity_left, &mut unity_right)
+            .unwrap();
+        assert_eq!(bypass_left.map(f32::to_bits), expected_left.map(f32::to_bits));
+        assert_eq!(bypass_right.map(f32::to_bits), expected_right.map(f32::to_bits));
+        assert_eq!(unity_left.map(f32::to_bits), expected_left.map(f32::to_bits));
+        assert_eq!(unity_right.map(f32::to_bits), expected_right.map(f32::to_bits));
+    }
+
+    fn compressor_threshold_and_ratio_are_directional() {
+        let mut lower_threshold = NativeCompressorProcessor::try_new(
+            NativeCompressorState::try_new(-36_000, 4_000_000, 100, 100_000, 0).unwrap(),
+            true,
+            PROJECT_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+        let mut higher_threshold = NativeCompressorProcessor::try_new(
+            NativeCompressorState::try_new(-6_000, 4_000_000, 100, 100_000, 0).unwrap(),
+            true,
+            PROJECT_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+        let mut higher_ratio = NativeCompressorProcessor::try_new(
+            NativeCompressorState::try_new(-18_000, 16_000_000, 100, 100_000, 0).unwrap(),
+            true,
+            PROJECT_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+        let mut lower_ratio = NativeCompressorProcessor::try_new(
+            NativeCompressorState::try_new(-18_000, 2_000_000, 100, 100_000, 0).unwrap(),
+            true,
+            PROJECT_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+        let mut source = [1.0_f32; 512];
+        let mut right = source;
+        lower_threshold
+            .process_in_place(&mut source, &mut right)
+            .unwrap();
+        let mut source = [1.0_f32; 512];
+        let mut right = source;
+        higher_threshold
+            .process_in_place(&mut source, &mut right)
+            .unwrap();
+        assert!(lower_threshold.gain_reduction_decibels > higher_threshold.gain_reduction_decibels);
+        let mut source = [1.0_f32; 512];
+        let mut right = source;
+        higher_ratio.process_in_place(&mut source, &mut right).unwrap();
+        let mut source = [1.0_f32; 512];
+        let mut right = source;
+        lower_ratio.process_in_place(&mut source, &mut right).unwrap();
+        assert!(higher_ratio.gain_reduction_decibels > lower_ratio.gain_reduction_decibels);
+    }
+
+    fn compressor_attack_and_release_are_directional() {
+        let mut fast_attack = NativeCompressorProcessor::try_new(
+            NativeCompressorState::try_new(-24_000, 8_000_000, 100, 100_000, 0).unwrap(),
+            true,
+            PROJECT_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+        let mut slow_attack = NativeCompressorProcessor::try_new(
+            NativeCompressorState::try_new(-24_000, 8_000_000, 500_000, 100_000, 0).unwrap(),
+            true,
+            PROJECT_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+        let mut fast_attack_left = [1.0_f32];
+        let mut fast_attack_right = fast_attack_left;
+        fast_attack
+            .process_in_place(&mut fast_attack_left, &mut fast_attack_right)
+            .unwrap();
+        let mut slow_attack_left = [1.0_f32];
+        let mut slow_attack_right = slow_attack_left;
+        slow_attack
+            .process_in_place(&mut slow_attack_left, &mut slow_attack_right)
+            .unwrap();
+        assert!(fast_attack_left[0] < slow_attack_left[0]);
+
+        let release_state = |release_microseconds| {
+            NativeCompressorProcessor::try_new(
+                NativeCompressorState::try_new(-24_000, 8_000_000, 100, release_microseconds, 0)
+                    .unwrap(),
+                true,
+                PROJECT_SAMPLE_RATE_HZ,
+            )
+            .unwrap()
+        };
+        let mut fast_release = release_state(100);
+        let mut slow_release = release_state(2_000_000);
+        let mut high_left = [1.0_f32; 512];
+        let mut high_right = high_left;
+        fast_release.process_in_place(&mut high_left, &mut high_right).unwrap();
+        let mut high_left = [1.0_f32; 512];
+        let mut high_right = high_left;
+        slow_release.process_in_place(&mut high_left, &mut high_right).unwrap();
+        let mut fast_release_left = [0.01_f32; 32];
+        let mut fast_release_right = fast_release_left;
+        fast_release
+            .process_in_place(&mut fast_release_left, &mut fast_release_right)
+            .unwrap();
+        let mut slow_release_left = [0.01_f32; 32];
+        let mut slow_release_right = slow_release_left;
+        slow_release
+            .process_in_place(&mut slow_release_left, &mut slow_release_right)
+            .unwrap();
+        assert!(fast_release_left[31] > slow_release_left[31]);
+    }
+
+    fn compressor_makeup_changes_unity_gain() {
+        let mut no_makeup = NativeCompressorProcessor::try_new(
+            NativeCompressorState::try_new(-80_000, 1_000_000, 100, 100, 0).unwrap(),
+            true,
+            PROJECT_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+        let mut makeup = NativeCompressorProcessor::try_new(
+            NativeCompressorState::try_new(-80_000, 1_000_000, 100, 100, 6_000).unwrap(),
+            true,
+            PROJECT_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+        let mut no_makeup_left = [0.25_f32];
+        let mut no_makeup_right = no_makeup_left;
+        no_makeup
+            .process_in_place(&mut no_makeup_left, &mut no_makeup_right)
+            .unwrap();
+        let mut makeup_left = [0.25_f32];
+        let mut makeup_right = makeup_left;
+        makeup.process_in_place(&mut makeup_left, &mut makeup_right).unwrap();
+        assert!(makeup_left[0] > no_makeup_left[0]);
+    }
+
+    #[test]
+    fn compressor_controls_have_independent_directional_effects() {
+        compressor_threshold_and_ratio_are_directional();
+        compressor_attack_and_release_are_directional();
+        compressor_makeup_changes_unity_gain();
     }
 }

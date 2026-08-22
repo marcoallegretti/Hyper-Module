@@ -21,7 +21,9 @@ use hyper_mixer_runtime::{
     TransportOutputProcessor, TransportState, loudness_command_channel, output_meter_channel,
     playback_recovery_channel,
 };
-use hyper_native_device::{DeviceChain, NativeDeviceInstance, NativeFilterMode, NativeFilterState};
+use hyper_native_device::{
+    DeviceChain, NativeCompressorState, NativeDeviceInstance, NativeFilterMode, NativeFilterState,
+};
 
 use common::{PlaybackFixture, fixture, graph_fixture, playback_fixture};
 
@@ -68,6 +70,66 @@ fn native_filter_chain_for_track(
             NativeDeviceInstance::try_new_filter(
                 device_id.to_owned(),
                 enabled,
+                NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_107)
+                    .unwrap(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
+}
+
+fn native_compressor_chain(enabled: bool) -> DeviceChain {
+    native_compressor_chain_with_makeup(enabled, 0)
+}
+
+fn native_compressor_chain_with_makeup(enabled: bool, makeup_millidecibels: i32) -> DeviceChain {
+    DeviceChain::try_new(
+        "018f47a2-6b2d-7c11-8a44-001122336474".to_owned(),
+        PROJECT_ID.to_owned(),
+        ARRANGEMENT_TRACK_ID.to_owned(),
+        vec![NativeDeviceInstance::try_new_compressor(
+            "018f47a2-6b2d-7c11-8a44-001122336475".to_owned(),
+            enabled,
+            NativeCompressorState::try_new(
+                -80_000,
+                4_000_000,
+                100,
+                100_000,
+                makeup_millidecibels,
+            )
+            .unwrap(),
+        )
+        .unwrap()],
+    )
+    .unwrap()
+}
+
+fn native_filter_then_compressor_chain() -> DeviceChain {
+    native_filter_chain(true)
+        .try_with_appended_compressor(
+            "018f47a2-6b2d-7c11-8a44-001122336476".to_owned(),
+            true,
+            NativeCompressorState::try_new(-36_000, 8_000_000, 100, 100_000, 6_000).unwrap(),
+        )
+        .unwrap()
+}
+
+fn native_compressor_then_filter_chain() -> DeviceChain {
+    DeviceChain::try_new(
+        "018f47a2-6b2d-7c11-8a44-001122336477".to_owned(),
+        PROJECT_ID.to_owned(),
+        ARRANGEMENT_TRACK_ID.to_owned(),
+        vec![
+            NativeDeviceInstance::try_new_compressor(
+                "018f47a2-6b2d-7c11-8a44-001122336478".to_owned(),
+                true,
+                NativeCompressorState::try_new(-36_000, 8_000_000, 100, 100_000, 6_000).unwrap(),
+            )
+            .unwrap(),
+            NativeDeviceInstance::try_new_filter(
+                "018f47a2-6b2d-7c11-8a44-001122336479".to_owned(),
+                true,
                 NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_107)
                     .unwrap(),
             )
@@ -175,6 +237,53 @@ fn prepared_playback_runs_native_filter_before_the_mixer() {
             .any(|(baseline, filtered)| baseline.to_bits() != filtered.to_bits())
     );
     assert_eq!(baseline.1.map(f32::to_bits), filtered.1.map(f32::to_bits));
+}
+
+#[test]
+fn prepared_playback_runs_native_compressor_before_the_mixer() {
+    let baseline = render_with_device_chain(None);
+    let bypassed_chain = native_compressor_chain(false);
+    let bypassed = render_with_device_chain(Some(&bypassed_chain));
+    assert_eq!(baseline.0.map(f32::to_bits), bypassed.0.map(f32::to_bits));
+    assert_eq!(baseline.1.map(f32::to_bits), bypassed.1.map(f32::to_bits));
+
+    let compressed_chain = native_compressor_chain(true);
+    let compressed = render_with_device_chain(Some(&compressed_chain));
+    assert!(
+        baseline
+            .0
+            .iter()
+            .zip(compressed.0)
+            .any(|(baseline, compressed)| baseline.to_bits() != compressed.to_bits())
+    );
+    assert_eq!(baseline.1.map(f32::to_bits), compressed.1.map(f32::to_bits));
+
+    let makeup = render_with_device_chain(Some(&native_compressor_chain_with_makeup(true, 6_000)));
+    assert!(
+        compressed
+            .0
+            .iter()
+            .zip(makeup.0)
+            .any(|(compressed, makeup)| compressed.to_bits() != makeup.to_bits())
+    );
+}
+
+#[test]
+fn prepared_playback_preserves_native_filter_compressor_processing_order() {
+    let filter_then_compressor = native_filter_then_compressor_chain();
+    let compressor_then_filter = native_compressor_then_filter_chain();
+    assert!(filter_then_compressor.devices()[0].filter_state().is_some());
+    assert!(filter_then_compressor.devices()[1].compressor_state().is_some());
+
+    let first = render_with_device_chain(Some(&filter_then_compressor));
+    let second = render_with_device_chain(Some(&compressor_then_filter));
+    assert!(
+        first
+            .0
+            .iter()
+            .zip(second.0)
+            .any(|(first, second)| first.to_bits() != second.to_bits())
+    );
 }
 
 #[test]

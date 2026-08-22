@@ -695,7 +695,9 @@ pub struct IdeRunningObservation {
     control_bindings: Vec<IdeControlBinding>,
     audio_clips: Vec<IdeAudioClip>,
     recording_takes: Vec<IdeRecordingTake>,
+    native_devices: Vec<IdeNativeDevice>,
     native_filters: Vec<IdeNativeFilter>,
+    native_compressors: Vec<IdeNativeCompressor>,
     unused_sample_cleanup: IdeUnusedSampleCleanupSummary,
     preview: IdeAudioPreviewObservation,
     scenes: Vec<IdeScene>,
@@ -718,6 +720,46 @@ pub struct IdeNativeFilter {
     mode: NativeFilterMode,
     cutoff_millihertz: u32,
     resonance_millionths: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdeNativeCompressor {
+    chain_id: String,
+    device_instance_id: String,
+    track_id: String,
+    enabled: bool,
+    threshold_millidecibels: i32,
+    ratio_millionths: u32,
+    attack_microseconds: u32,
+    release_microseconds: u32,
+    makeup_millidecibels: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdeNativeDevice {
+    Filter(IdeNativeFilter),
+    Compressor(IdeNativeCompressor),
+}
+
+impl IdeNativeCompressor {
+    #[must_use]
+    pub fn chain_id(&self) -> &str { &self.chain_id }
+    #[must_use]
+    pub fn device_instance_id(&self) -> &str { &self.device_instance_id }
+    #[must_use]
+    pub fn track_id(&self) -> &str { &self.track_id }
+    #[must_use]
+    pub const fn enabled(&self) -> bool { self.enabled }
+    #[must_use]
+    pub const fn threshold_millidecibels(&self) -> i32 { self.threshold_millidecibels }
+    #[must_use]
+    pub const fn ratio_millionths(&self) -> u32 { self.ratio_millionths }
+    #[must_use]
+    pub const fn attack_microseconds(&self) -> u32 { self.attack_microseconds }
+    #[must_use]
+    pub const fn release_microseconds(&self) -> u32 { self.release_microseconds }
+    #[must_use]
+    pub const fn makeup_millidecibels(&self) -> i32 { self.makeup_millidecibels }
 }
 
 impl IdeNativeFilter {
@@ -1336,6 +1378,16 @@ impl IdeRunningObservation {
     #[must_use]
     pub fn native_filters(&self) -> &[IdeNativeFilter] {
         &self.native_filters
+    }
+
+    #[must_use]
+    pub fn native_devices(&self) -> &[IdeNativeDevice] {
+        &self.native_devices
+    }
+
+    #[must_use]
+    pub fn native_compressors(&self) -> &[IdeNativeCompressor] {
+        &self.native_compressors
     }
 
     #[must_use]
@@ -3170,7 +3222,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SetSceneActive => "scene activation",
         IdeWorkerCommandKind::SetAutomationTakeActive => "automation activation",
         IdeWorkerCommandKind::RemoveAutomationTake => "automation take removal",
-        IdeWorkerCommandKind::EditNativeFilter => "native filter",
+        IdeWorkerCommandKind::EditNativeFilter => "native device",
         IdeWorkerCommandKind::AddArrangementPlacement => "placement",
         IdeWorkerCommandKind::AddArrangementSceneLaunch => "scene marker",
         IdeWorkerCommandKind::DuplicateArrangementPlacement => "placement duplication",
@@ -11498,18 +11550,44 @@ fn running_observation(
     native_filters
         .try_reserve_exact(native_filter_count)
         .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
+    let mut native_compressors = Vec::new();
+    native_compressors
+        .try_reserve_exact(native_filter_count)
+        .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
+    let mut native_devices = Vec::new();
+    native_devices
+        .try_reserve_exact(native_filter_count)
+        .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
     for chain in snapshot.device_chains {
         for device in chain.devices() {
-            let state = device.state();
-            native_filters.push(IdeNativeFilter {
-                chain_id: try_project_owned(chain.id())?,
-                device_instance_id: try_project_owned(device.id())?,
-                track_id: try_project_owned(chain.track_id())?,
-                enabled: device.enabled(),
-                mode: state.mode(),
-                cutoff_millihertz: state.cutoff_millihertz(),
-                resonance_millionths: state.resonance_millionths(),
-            });
+            if let Some(state) = device.filter_state() {
+                let filter = IdeNativeFilter {
+                    chain_id: try_project_owned(chain.id())?,
+                    device_instance_id: try_project_owned(device.id())?,
+                    track_id: try_project_owned(chain.track_id())?,
+                    enabled: device.enabled(),
+                    mode: state.mode(),
+                    cutoff_millihertz: state.cutoff_millihertz(),
+                    resonance_millionths: state.resonance_millionths(),
+                };
+                native_devices.push(IdeNativeDevice::Filter(filter.clone()));
+                native_filters.push(filter);
+            }
+            if let Some(state) = device.compressor_state() {
+                let compressor = IdeNativeCompressor {
+                    chain_id: try_project_owned(chain.id())?,
+                    device_instance_id: try_project_owned(device.id())?,
+                    track_id: try_project_owned(chain.track_id())?,
+                    enabled: device.enabled(),
+                    threshold_millidecibels: state.threshold_millidecibels(),
+                    ratio_millionths: state.ratio_millionths(),
+                    attack_microseconds: state.attack_microseconds(),
+                    release_microseconds: state.release_microseconds(),
+                    makeup_millidecibels: state.makeup_millidecibels(),
+                };
+                native_devices.push(IdeNativeDevice::Compressor(compressor.clone()));
+                native_compressors.push(compressor);
+            }
         }
     }
     let mut scenes = Vec::new();
@@ -11601,7 +11679,9 @@ fn running_observation(
         control_bindings,
         audio_clips,
         recording_takes,
+        native_devices,
         native_filters,
+        native_compressors,
         unused_sample_cleanup: snapshot.unused_sample_cleanup,
         preview: IdeAudioPreviewObservation {
             snapshot: snapshot.preview,
@@ -12551,6 +12631,121 @@ mod tests {
     }
 
     #[test]
+    fn native_compressor_edits_reopen_and_undo_through_the_real_worker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-native-compressor-history-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+        let worker = DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker.try_send(IdeWorkerCommand::OpenProject(project.clone())).unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else { panic!("the project must open"); };
+        let track_id = opened.mixer_channels().iter().find(|channel| channel.kind() == IdeMixerChannelKind::Audio).unwrap().id().to_owned();
+        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::AddCompressor {
+            track_id, threshold_millidecibels: -18_000, ratio_millionths: 4_000_000,
+            attack_microseconds: 10_000, release_microseconds: 100_000, makeup_millidecibels: 0,
+        }}).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        let history_event = recv(&worker);
+        assert!(matches!(history_event, IdeWorkerEvent::UndoStateChanged { undo_label: Some("native device"), .. }), "unexpected compressor history event: {history_event:?}");
+        let IdeWorkerEvent::Running(added) = recv(&worker) else { panic!("the compressor must reopen"); };
+        assert_eq!(added.native_compressors().len(), 1);
+        let compressor = &added.native_compressors()[0];
+        let chain_id = compressor.chain_id().to_owned();
+        let device_id = compressor.device_instance_id().to_owned();
+        assert_eq!(compressor.threshold_millidecibels(), -18_000);
+        assert_eq!(compressor.ratio_millionths(), 4_000_000);
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 2, .. }));
+
+        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::UpdateCompressor {
+            chain_id: chain_id.clone(), device_instance_id: device_id.clone(), enabled: false,
+            threshold_millidecibels: -12_000, ratio_millionths: 6_000_000,
+            attack_microseconds: 2_000, release_microseconds: 60_000, makeup_millidecibels: 1_000,
+        }}).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        let IdeWorkerEvent::Running(updated) = recv(&worker) else { panic!("the compressor update must reopen"); };
+        let compressor = &updated.native_compressors()[0];
+        assert!(!compressor.enabled());
+        assert_eq!(compressor.threshold_millidecibels(), -12_000);
+        assert_eq!(compressor.makeup_millidecibels(), 1_000);
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 3, .. }));
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        let IdeWorkerEvent::Running(restored) = recv(&worker) else { panic!("the restored compressor must reopen"); };
+        let compressor = &restored.native_compressors()[0];
+        assert!(compressor.enabled());
+        assert_eq!(compressor.threshold_millidecibels(), -18_000);
+        assert_eq!(compressor.device_instance_id(), device_id);
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 4, redo: false, .. }));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn native_device_observation_preserves_filter_compressor_order_through_the_real_worker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-native-device-order-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+        let worker = DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker.try_send(IdeWorkerCommand::OpenProject(project)).unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else { panic!("the project must open"); };
+        let track_id = opened.mixer_channels().iter().find(|channel| channel.kind() == IdeMixerChannelKind::Audio).unwrap().id().to_owned();
+
+        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Add {
+            track_id: track_id.clone(), mode: NativeFilterMode::LowPass,
+            cutoff_millihertz: 1_000_000, resonance_millionths: 707_000,
+        }}).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 2, .. }));
+
+        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::AddCompressor {
+            track_id, threshold_millidecibels: -18_000, ratio_millionths: 4_000_000,
+            attack_microseconds: 10_000, release_microseconds: 100_000, makeup_millidecibels: 1_000,
+        }}).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        let IdeWorkerEvent::Running(running) = recv(&worker) else { panic!("the mixed chain must reopen"); };
+        assert!(matches!(
+            running.native_devices(),
+            [IdeNativeDevice::Filter(_), IdeNativeDevice::Compressor(_)]
+        ));
+        assert_eq!(running.native_devices().len(), 2);
+        assert_eq!(running.native_compressors()[0].makeup_millidecibels(), 1_000);
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 3, .. }));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "one real-worker scenario proves replacement and structural device-chain undo/redo without hiding event ordering behind a helper"
@@ -12607,7 +12802,7 @@ mod tests {
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::UndoStateChanged {
-                undo_label: Some("native filter"),
+                undo_label: Some("native device"),
                 redo_label: None,
             }
         ));
@@ -12631,14 +12826,14 @@ mod tests {
             recv(&worker),
             IdeWorkerEvent::EditRestoring {
                 redo: false,
-                label: "native filter",
+                label: "native device",
             }
         ));
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::UndoStateChanged {
                 undo_label: None,
-                redo_label: Some("native filter"),
+                redo_label: Some("native device"),
             }
         ));
         let IdeWorkerEvent::Running(undone) = recv(&worker) else {
@@ -12650,7 +12845,7 @@ mod tests {
             IdeWorkerEvent::EditRestored {
                 revision: 3,
                 redo: false,
-                label: "native filter",
+                label: "native device",
             }
         ));
         assert!(!project.join("devices").exists());
@@ -12660,13 +12855,13 @@ mod tests {
             recv(&worker),
             IdeWorkerEvent::EditRestoring {
                 redo: true,
-                label: "native filter",
+                label: "native device",
             }
         ));
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::UndoStateChanged {
-                undo_label: Some("native filter"),
+                undo_label: Some("native device"),
                 redo_label: None,
             }
         ));
@@ -12681,7 +12876,7 @@ mod tests {
             IdeWorkerEvent::EditRestored {
                 revision: 4,
                 redo: true,
-                label: "native filter",
+                label: "native device",
             }
         ));
 
@@ -16002,11 +16197,11 @@ mod tests {
 
         assert_eq!(history.undo.len(), 1);
         assert_eq!(history.undo[0].operation(), inverse);
-        assert_eq!(history.undo[0].label, "native filter");
+        assert_eq!(history.undo[0].label, "native device");
         assert!(matches!(
             receiver.try_recv(),
             Ok(IdeWorkerEvent::UndoStateChanged {
-                undo_label: Some("native filter"),
+                undo_label: Some("native device"),
                 redo_label: None,
             })
         ));
