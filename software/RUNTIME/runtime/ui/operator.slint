@@ -5,6 +5,7 @@ export struct OperatorSceneRow {
     status: string,
     available: bool,
     controls-enabled: bool,
+    selected: bool,
     queued: bool,
     last-launched: bool,
 }
@@ -100,13 +101,15 @@ component SceneLaunchTile inherits Rectangle {
     in property <string> status;
     in property <bool> available;
     in property <bool> controls-enabled;
+    in property <bool> selected;
     in property <bool> queued;
     in property <bool> last-launched;
     callback launch-requested();
+    callback selected-requested();
     width: 94px;
     min-height: 62px;
     background: root.queued ? #44306f : root.last-launched ? #174c42 : root.available ? #202836 : #141923;
-    border-color: root.queued ? #a88cff : root.last-launched ? #3ddc97 : #2c3445;
+    border-color: root.queued ? #a88cff : root.last-launched ? #3ddc97 : root.selected ? #7dcfff : #2c3445;
     border-width: 1px;
     border-radius: 5px;
     opacity: root.available && root.controls-enabled ? 1 : 0.72;
@@ -117,9 +120,13 @@ component SceneLaunchTile inherits Rectangle {
         Text { text: root.name; color: #edf2f8; font-size: 11px; font-weight: 700; overflow: elide; }
         Text { text: root.status; color: #8d99ad; font-size: 9px; overflow: elide; }
     }
+    accessible-role: button;
+    accessible-enabled: root.available && root.controls-enabled;
+    accessible-label: "Launch scene " + root.name;
+
     TouchArea {
         enabled: root.available && root.controls-enabled;
-        clicked => { root.launch-requested(); }
+        clicked => { root.selected-requested(); root.launch-requested(); }
     }
 }
 
@@ -446,6 +453,7 @@ export component OperatorWindow inherits Window {
     in-out property <bool> loudness-reset-confirming: false;
     in property <[OperatorSceneRow]> scenes;
     in property <string> scene-feedback;
+    in property <bool> scene-selection-enabled: false;
     in property <bool> stop-interactive-scenes-enabled: false;
     in property <[OperatorMixerRow]> mixer-channels;
     in property <[OperatorMixerSendRow]> mixer-sends;
@@ -481,6 +489,9 @@ export component OperatorWindow inherits Window {
     callback set-main-gain-requested(float);
     callback toggle-main-mute-requested();
     callback launch-scene-requested(int);
+    callback select-scene-requested(int);
+    callback move-scene-selection-requested(int);
+    callback launch-selected-scene-requested();
     callback stop-interactive-scenes-requested();
     callback quit-requested();
 
@@ -513,6 +524,24 @@ export component OperatorWindow inherits Window {
             if event.text == Key.Home {
                 if !event.repeat && root.transport-return-to-start-enabled {
                     root.return-to-start-requested();
+                }
+                return accept;
+            }
+            if event.text == Key.UpArrow {
+                if root.scene-selection-enabled {
+                    root.move-scene-selection-requested(-1);
+                }
+                return accept;
+            }
+            if event.text == Key.DownArrow {
+                if root.scene-selection-enabled {
+                    root.move-scene-selection-requested(1);
+                }
+                return accept;
+            }
+            if event.text == Key.Return {
+                if !event.repeat && root.scene-selection-enabled {
+                    root.launch-selected-scene-requested();
                 }
                 return accept;
             }
@@ -790,8 +819,10 @@ export component OperatorWindow inherits Window {
                         status: scene.status;
                         available: scene.available;
                         controls-enabled: scene.controls-enabled;
+                        selected: scene.selected;
                         queued: scene.queued;
                         last-launched: scene.last-launched;
+                        selected-requested => { root.select-scene-requested(index); }
                         launch-requested => { root.launch-scene-requested(index); }
                     }
                 }

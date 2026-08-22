@@ -194,6 +194,7 @@ fn generated_scene_stop_button_respects_recovery_authority() {
         status: "Ready".into(),
         available: true,
         controls_enabled: true,
+        selected: false,
         queued: false,
         last_launched: false,
     }]));
@@ -216,6 +217,101 @@ fn generated_scene_stop_button_respects_recovery_authority() {
     assert_eq!(stop.accessible_enabled(), Some(false));
     stop.mock_single_click(PointerEventButton::Left);
     assert_eq!(*intents.borrow(), 1);
+}
+
+#[test]
+fn generated_scene_selection_uses_keyboard_and_accessible_tiles() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = OperatorWindow::new().unwrap();
+    ui.set_scenes(ModelRc::from(Rc::new(VecModel::from(vec![
+        OperatorSceneRow {
+            name: "Intro".into(),
+            status: "Ready".into(),
+            available: true,
+            controls_enabled: true,
+            selected: true,
+            queued: false,
+            last_launched: false,
+        },
+        OperatorSceneRow {
+            name: "Unavailable".into(),
+            status: "Audio unavailable".into(),
+            available: false,
+            controls_enabled: false,
+            selected: false,
+            queued: false,
+            last_launched: false,
+        },
+    ]))));
+    ui.set_scene_selection_enabled(true);
+    let moved = Rc::new(RefCell::new(Vec::new()));
+    let moved_callback = Rc::clone(&moved);
+    ui.on_move_scene_selection_requested(move |delta| moved_callback.borrow_mut().push(delta));
+    let launched = Rc::new(RefCell::new(0_usize));
+    let launch_callback = Rc::clone(&launched);
+    ui.on_launch_selected_scene_requested(move || *launch_callback.borrow_mut() += 1);
+    let selected = Rc::new(RefCell::new(Vec::new()));
+    let selected_callback = Rc::clone(&selected);
+    ui.on_select_scene_requested(move |row| selected_callback.borrow_mut().push(row));
+    let direct_launches = Rc::new(RefCell::new(Vec::new()));
+    let direct_callback = Rc::clone(&direct_launches);
+    ui.on_launch_scene_requested(move |row| direct_callback.borrow_mut().push(row));
+    ui.show().unwrap();
+    scroll_down(&ui);
+
+    let ready = find_control(&ui, "Launch scene 1 · Intro");
+    let unavailable = find_control(&ui, "Launch scene 2 · Unavailable");
+    assert_eq!(ready.accessible_enabled(), Some(true));
+    assert_eq!(unavailable.accessible_enabled(), Some(false));
+    ready.mock_single_click(PointerEventButton::Left);
+    assert_eq!(*selected.borrow(), [0]);
+    assert_eq!(*direct_launches.borrow(), [0]);
+    unavailable.mock_single_click(PointerEventButton::Left);
+    assert_eq!(*selected.borrow(), [0]);
+    assert_eq!(*direct_launches.borrow(), [0]);
+
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::UpArrow.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressRepeated {
+            text: Key::DownArrow.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::Return.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressRepeated {
+            text: Key::Return.into(),
+        },
+    );
+    assert_eq!(*moved.borrow(), [-1, 1]);
+    assert_eq!(*launched.borrow(), 1);
+
+    ui.set_scene_selection_enabled(false);
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::DownArrow.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::Return.into(),
+        },
+    );
+    assert_eq!(*moved.borrow(), [-1, 1]);
+    assert_eq!(*launched.borrow(), 1);
 }
 
 #[test]

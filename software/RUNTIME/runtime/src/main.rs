@@ -1189,6 +1189,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let loop_authority = Rc::new(Cell::new(None));
     let seek_authority = Rc::new(Cell::new(None));
     let scene_launch_authority = Rc::new(Cell::new(false));
+    let scene_selection = Rc::new(Cell::new(None));
     let scene_stop_authority = Rc::new(Cell::new(false));
     let loudness_authority = Rc::new(Cell::new(None));
     let mixer_authority = Rc::new(RefCell::new(None));
@@ -1209,6 +1210,8 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &diagnostic,
         &scenes,
         &scene_launch_authority,
+        &scene_model,
+        &scene_selection,
     );
     wire_operator_scene_stop(&ui, &commands_tx, &diagnostic, &scene_stop_authority);
     wire_operator_loop_toggle(&ui, &commands_tx, &diagnostic, &loop_authority);
@@ -1223,6 +1226,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &seek_authority,
         &scene_model,
         &scene_launch_authority,
+        &scene_selection,
         &scene_stop_authority,
         false,
     );
@@ -1248,6 +1252,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer_meter_observer = Rc::clone(&meter_observer);
     let timer_scene_model = Rc::clone(&scene_model);
     let timer_scene_launch_authority = Rc::clone(&scene_launch_authority);
+    let timer_scene_selection = Rc::clone(&scene_selection);
     let timer_scene_stop_authority = Rc::clone(&scene_stop_authority);
     let timer_transport_authority = Rc::clone(&transport_authority);
     let timer_loop_authority = Rc::clone(&loop_authority);
@@ -1273,6 +1278,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &timer_seek_authority,
                 &timer_scene_model,
                 &timer_scene_launch_authority,
+                &timer_scene_selection,
                 &timer_scene_stop_authority,
                 completion_observed,
             );
@@ -1450,7 +1456,7 @@ fn apply_operator_worker_completion(
         }
     };
     revoke_operator_transport_authority(ui, transport_authority);
-    revoke_operator_scene_launch_authority(scene_model, scene_launch_authority);
+    revoke_operator_scene_launch_authority(ui, scene_model, scene_launch_authority);
     revoke_operator_scene_stop_authority(ui, scene_stop_authority);
     let close_result = close_operator_surface();
     let message = close_result
@@ -1687,46 +1693,148 @@ fn wire_operator_loudness_controls(
     });
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the one scene owner binds direct launch, local selection, navigation, and selected launch to the same bounded authority"
+)]
 fn wire_operator_scene_launch(
     ui: &OperatorWindow,
     sender: &SyncSender<OperatorCommand>,
     diagnostic: &Arc<Mutex<String>>,
     scenes: &[OperatorScene],
     authority: &Rc<Cell<bool>>,
+    scene_model: &Rc<VecModel<OperatorSceneRow>>,
+    selection: &Rc<Cell<Option<usize>>>,
 ) {
-    let sender = sender.clone();
-    let diagnostic = Arc::clone(diagnostic);
-    let scenes = scenes.to_vec();
-    let authority = Rc::clone(authority);
+    let direct_sender = sender.clone();
+    let direct_diagnostic = Arc::clone(diagnostic);
+    let direct_scenes = scenes.to_vec();
+    let direct_authority = Rc::clone(authority);
+    let direct_model = Rc::clone(scene_model);
+    let direct_selection = Rc::clone(selection);
     ui.on_launch_scene_requested(move |row| {
-        if !authority.get() {
+        if !direct_authority.get() {
             set_diagnostic(
-                &diagnostic,
+                &direct_diagnostic,
                 "scene launch refused: accepted scene state is unavailable".to_owned(),
             );
             return;
         }
         let Ok(row) = usize::try_from(row) else {
-            set_diagnostic(&diagnostic, "scene launch refused: invalid row".to_owned());
+            set_diagnostic(
+                &direct_diagnostic,
+                "scene launch refused: invalid row".to_owned(),
+            );
             return;
         };
-        let Some(scene) = scenes.get(row) else {
-            set_diagnostic(&diagnostic, "scene launch refused: stale row".to_owned());
+        let Some(scene) = direct_scenes.get(row) else {
+            set_diagnostic(
+                &direct_diagnostic,
+                "scene launch refused: stale row".to_owned(),
+            );
             return;
         };
         if scene.availability != DesktopSceneAvailability::Ready {
             set_diagnostic(
-                &diagnostic,
+                &direct_diagnostic,
+                format!("scene {} is not launchable", scene.index + 1),
+            );
+            return;
+        }
+        set_operator_scene_selection(&direct_model, &direct_selection, row);
+        send_operator_command(
+            &direct_sender,
+            OperatorCommand::LaunchScene {
+                scene_index: scene.index,
+            },
+            &direct_diagnostic,
+        );
+    });
+
+    let selection_model = Rc::clone(scene_model);
+    let selection_state = Rc::clone(selection);
+    let selection_authority = Rc::clone(authority);
+    let selection_diagnostic = Arc::clone(diagnostic);
+    ui.on_select_scene_requested(move |row| {
+        if !selection_authority.get() {
+            set_diagnostic(
+                &selection_diagnostic,
+                "scene selection refused: accepted scene state is unavailable".to_owned(),
+            );
+            return;
+        }
+        let Ok(row) = usize::try_from(row) else {
+            set_diagnostic(
+                &selection_diagnostic,
+                "scene selection refused: invalid row".to_owned(),
+            );
+            return;
+        };
+        if !operator_scene_row_is_launchable(&selection_model, row) {
+            set_diagnostic(
+                &selection_diagnostic,
+                "scene selection refused: scene is not launchable".to_owned(),
+            );
+            return;
+        }
+        set_operator_scene_selection(&selection_model, &selection_state, row);
+    });
+
+    let navigation_model = Rc::clone(scene_model);
+    let navigation_state = Rc::clone(selection);
+    let navigation_authority = Rc::clone(authority);
+    ui.on_move_scene_selection_requested(move |delta| {
+        if !navigation_authority.get() {
+            return;
+        }
+        let Some(next) =
+            operator_scene_selection_target(&navigation_model, navigation_state.get(), delta)
+        else {
+            return;
+        };
+        set_operator_scene_selection(&navigation_model, &navigation_state, next);
+    });
+
+    let launch_sender = sender.clone();
+    let launch_diagnostic = Arc::clone(diagnostic);
+    let launch_scenes = scenes.to_vec();
+    let launch_authority = Rc::clone(authority);
+    let launch_selection = Rc::clone(selection);
+    ui.on_launch_selected_scene_requested(move || {
+        if !launch_authority.get() {
+            set_diagnostic(
+                &launch_diagnostic,
+                "scene launch refused: accepted scene state is unavailable".to_owned(),
+            );
+            return;
+        }
+        let Some(row) = launch_selection.get() else {
+            set_diagnostic(
+                &launch_diagnostic,
+                "scene launch refused: no Ready scene is selected".to_owned(),
+            );
+            return;
+        };
+        let Some(scene) = launch_scenes.get(row) else {
+            set_diagnostic(
+                &launch_diagnostic,
+                "scene launch refused: stale row".to_owned(),
+            );
+            return;
+        };
+        if scene.availability != DesktopSceneAvailability::Ready {
+            set_diagnostic(
+                &launch_diagnostic,
                 format!("scene {} is not launchable", scene.index + 1),
             );
             return;
         }
         send_operator_command(
-            &sender,
+            &launch_sender,
             OperatorCommand::LaunchScene {
                 scene_index: scene.index,
             },
-            &diagnostic,
+            &launch_diagnostic,
         );
     });
 }
@@ -2252,10 +2360,60 @@ fn operator_scene_rows(scenes: &[OperatorScene]) -> Vec<OperatorSceneRow> {
             status: operator_scene_availability_text(scene.availability).into(),
             available: scene.availability == DesktopSceneAvailability::Ready,
             controls_enabled: false,
+            selected: false,
             queued: false,
             last_launched: false,
         })
         .collect()
+}
+
+fn operator_scene_row_is_launchable(scenes: &VecModel<OperatorSceneRow>, row: usize) -> bool {
+    scenes
+        .row_data(row)
+        .is_some_and(|scene| scene.available && scene.controls_enabled)
+}
+
+fn operator_scene_selection_target(
+    scenes: &VecModel<OperatorSceneRow>,
+    selected: Option<usize>,
+    delta: i32,
+) -> Option<usize> {
+    if delta == 0 {
+        return selected.filter(|&row| operator_scene_row_is_launchable(scenes, row));
+    }
+    let launchable: Vec<_> = (0..scenes.row_count())
+        .filter(|&row| operator_scene_row_is_launchable(scenes, row))
+        .collect();
+    let first = *launchable.first()?;
+    let last = *launchable.last()?;
+    let Some(selected) = selected else {
+        return Some(if delta.is_negative() { last } else { first });
+    };
+    let position = launchable.iter().position(|&row| row == selected);
+    let Some(position) = position else {
+        return Some(if delta.is_negative() { last } else { first });
+    };
+    if delta.is_negative() {
+        position
+            .checked_sub(1)
+            .map_or(Some(first), |previous| launchable.get(previous).copied())
+    } else {
+        launchable.get(position + 1).copied().or(Some(last))
+    }
+}
+
+fn set_operator_scene_selection(
+    scenes: &VecModel<OperatorSceneRow>,
+    selection: &Cell<Option<usize>>,
+    selected: usize,
+) {
+    for row in 0..scenes.row_count() {
+        if let Some(mut scene) = scenes.row_data(row) {
+            scene.selected = row == selected;
+            scenes.set_row_data(row, scene);
+        }
+    }
+    selection.set(Some(selected));
 }
 
 fn operator_mixer_rows(channels: &[OperatorMixerChannel]) -> Vec<OperatorMixerRow> {
@@ -2588,12 +2746,13 @@ fn apply_operator_cycle_observation(
     seek_authority: &Cell<Option<usize>>,
     scene_model: &VecModel<OperatorSceneRow>,
     scene_launch_authority: &Cell<bool>,
+    scene_selection: &Cell<Option<usize>>,
     scene_stop_authority: &Cell<bool>,
     terminal_latched: bool,
 ) {
     if terminal_latched {
         revoke_operator_transport_authority(ui, transport_authority);
-        revoke_operator_scene_launch_authority(scene_model, scene_launch_authority);
+        revoke_operator_scene_launch_authority(ui, scene_model, scene_launch_authority);
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
         return;
     }
@@ -2602,7 +2761,7 @@ fn apply_operator_cycle_observation(
         revoke_operator_transport_authority(ui, transport_authority);
         revoke_operator_loop_authority(ui, loop_authority);
         revoke_operator_seek_authority(ui, seek_authority);
-        revoke_operator_scene_launch_authority(scene_model, scene_launch_authority);
+        revoke_operator_scene_launch_authority(ui, scene_model, scene_launch_authority);
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
         return;
     }
@@ -2620,30 +2779,42 @@ fn apply_operator_cycle_observation(
         observers.facts.playback_extent,
     );
     apply_operator_scene_observation(ui, scene_model, observation);
-    set_operator_scene_launch_authority(scene_model, scene_launch_authority);
+    set_operator_scene_launch_authority(ui, scene_model, scene_launch_authority, scene_selection);
     let available = scene_model.row_count() > 0;
     scene_stop_authority.set(available);
     ui.set_stop_interactive_scenes_enabled(available);
 }
 
 fn set_operator_scene_launch_authority(
+    ui: &OperatorWindow,
     scenes: &VecModel<OperatorSceneRow>,
     authority: &Cell<bool>,
+    selection: &Cell<Option<usize>>,
 ) {
     authority.set(true);
+    ui.set_scene_selection_enabled(true);
     for row in 0..scenes.row_count() {
         if let Some(mut scene) = scenes.row_data(row) {
             scene.controls_enabled = scene.available;
             scenes.set_row_data(row, scene);
         }
     }
+    let selected = selection
+        .get()
+        .filter(|&row| operator_scene_row_is_launchable(scenes, row))
+        .or_else(|| operator_scene_selection_target(scenes, None, 1));
+    if let Some(row) = selected {
+        set_operator_scene_selection(scenes, selection, row);
+    }
 }
 
 fn revoke_operator_scene_launch_authority(
+    ui: &OperatorWindow,
     scenes: &VecModel<OperatorSceneRow>,
     authority: &Cell<bool>,
 ) {
     authority.set(false);
+    ui.set_scene_selection_enabled(false);
     for row in 0..scenes.row_count() {
         if let Some(mut scene) = scenes.row_data(row) {
             scene.controls_enabled = false;
@@ -3427,6 +3598,58 @@ mod tests {
     }
 
     #[test]
+    fn scene_keyboard_selection_skips_unavailable_rows_and_clamps() {
+        let scenes = VecModel::from(vec![
+            OperatorSceneRow {
+                name: "Intro".into(),
+                status: "Ready".into(),
+                available: true,
+                controls_enabled: true,
+                selected: false,
+                queued: false,
+                last_launched: false,
+            },
+            OperatorSceneRow {
+                name: "Missing".into(),
+                status: "Audio unavailable".into(),
+                available: false,
+                controls_enabled: false,
+                selected: false,
+                queued: false,
+                last_launched: false,
+            },
+            OperatorSceneRow {
+                name: "Finale".into(),
+                status: "Ready".into(),
+                available: true,
+                controls_enabled: true,
+                selected: false,
+                queued: false,
+                last_launched: false,
+            },
+        ]);
+
+        assert_eq!(operator_scene_selection_target(&scenes, None, 1), Some(0));
+        assert_eq!(operator_scene_selection_target(&scenes, None, -1), Some(2));
+        assert_eq!(
+            operator_scene_selection_target(&scenes, Some(0), 1),
+            Some(2)
+        );
+        assert_eq!(
+            operator_scene_selection_target(&scenes, Some(2), 1),
+            Some(2)
+        );
+        assert_eq!(
+            operator_scene_selection_target(&scenes, Some(0), -1),
+            Some(0)
+        );
+        assert_eq!(
+            operator_scene_selection_target(&scenes, Some(1), 1),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn startup_diagnostics_retain_the_bundle_rejection_cause() {
         let output_opened = Cell::new(false);
         let missing = std::env::temp_dir().join(format!(
@@ -4040,12 +4263,15 @@ mod tests {
             std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
         let scene_diagnostic = Arc::new(Mutex::new(String::new()));
         let scene_launch_authority = Rc::new(Cell::new(false));
+        let scene_selection = Rc::new(Cell::new(None));
         wire_operator_scene_launch(
             ui,
             &scene_commands,
             &scene_diagnostic,
             &operator_scenes,
             &scene_launch_authority,
+            &scene_model,
+            &scene_selection,
         );
         let scene_stop_authority = Rc::new(Cell::new(false));
         wire_operator_scene_stop(
@@ -4129,8 +4355,25 @@ mod tests {
         ui.set_stop_interactive_scenes_enabled(false);
         let generated_scenes = ui.get_scenes();
         assert_eq!(generated_scenes.row_count(), 4);
-        set_operator_scene_launch_authority(&scene_model, &scene_launch_authority);
+        set_operator_scene_launch_authority(
+            ui,
+            &scene_model,
+            &scene_launch_authority,
+            &scene_selection,
+        );
         assert!(scene_launch_authority.get());
+        assert_eq!(scene_selection.get(), Some(0));
+        set_operator_scene_launch_authority(
+            ui,
+            &scene_model,
+            &scene_launch_authority,
+            &scene_selection,
+        );
+        assert_eq!(
+            scene_selection.get(),
+            Some(0),
+            "a later accepted observation retains local scene selection"
+        );
         for (row, expected) in [
             (0, (true, "Ready")),
             (1, (false, "Disabled")),
@@ -4142,6 +4385,11 @@ mod tests {
             assert_eq!(scene.controls_enabled, scene.available);
         }
         ui.invoke_launch_scene_requested(0);
+        assert_eq!(
+            scene_command_receiver.try_recv(),
+            Ok(OperatorCommand::LaunchScene { scene_index: 0 })
+        );
+        ui.invoke_launch_selected_scene_requested();
         assert_eq!(
             scene_command_receiver.try_recv(),
             Ok(OperatorCommand::LaunchScene { scene_index: 0 })
@@ -6501,6 +6749,7 @@ mod tests {
             &terminal_operator_scenes,
         )));
         let terminal_scene_launch_authority = Rc::new(Cell::new(false));
+        let terminal_scene_selection = Rc::new(Cell::new(None));
         let terminal_scene_stop_authority = Rc::new(Cell::new(false));
         wire_operator_loop_toggle(&ui, &sender, &diagnostic, &loop_authority);
         wire_operator_scene_launch(
@@ -6509,6 +6758,8 @@ mod tests {
             &diagnostic,
             &terminal_operator_scenes,
             &terminal_scene_launch_authority,
+            &terminal_scenes,
+            &terminal_scene_selection,
         );
         wire_operator_scene_stop(&ui, &sender, &diagnostic, &terminal_scene_stop_authority);
         apply_operator_cycle_observation(
@@ -6520,6 +6771,7 @@ mod tests {
             &seek_authority,
             &terminal_scenes,
             &terminal_scene_launch_authority,
+            &terminal_scene_selection,
             &terminal_scene_stop_authority,
             false,
         );
@@ -6556,6 +6808,7 @@ mod tests {
             &seek_authority,
             &terminal_scenes,
             &terminal_scene_launch_authority,
+            &terminal_scene_selection,
             &terminal_scene_stop_authority,
             true,
         );
@@ -6675,7 +6928,12 @@ mod tests {
             PlaybackRecoveryTransportState::Stopped,
         );
         assert!(ui.get_transport_start_enabled());
-        set_operator_scene_launch_authority(&terminal_scenes, &terminal_scene_launch_authority);
+        set_operator_scene_launch_authority(
+            &ui,
+            &terminal_scenes,
+            &terminal_scene_launch_authority,
+            &terminal_scene_selection,
+        );
         assert!(terminal_scene_launch_authority.get());
         completion_sender
             .send(Err("native audio ownership ended unexpectedly".to_owned()))
@@ -6717,7 +6975,12 @@ mod tests {
         let (lost_sender, lost_receiver) = std::sync::mpsc::sync_channel(1);
         drop(lost_sender);
         surface_closed.set(false);
-        set_operator_scene_launch_authority(&terminal_scenes, &terminal_scene_launch_authority);
+        set_operator_scene_launch_authority(
+            &ui,
+            &terminal_scenes,
+            &terminal_scene_launch_authority,
+            &terminal_scene_selection,
+        );
         terminal_scene_stop_authority.set(true);
         ui.set_stop_interactive_scenes_enabled(true);
         let retained_scene_feedback = ui.get_scene_feedback();
