@@ -193,6 +193,7 @@ fn generated_scene_stop_button_respects_recovery_authority() {
         name: "Interactive layer".into(),
         status: "Ready".into(),
         available: true,
+        controls_enabled: true,
         queued: false,
         last_launched: false,
     }]));

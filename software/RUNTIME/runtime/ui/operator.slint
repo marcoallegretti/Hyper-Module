@@ -4,6 +4,7 @@ export struct OperatorSceneRow {
     name: string,
     status: string,
     available: bool,
+    controls-enabled: bool,
     queued: bool,
     last-launched: bool,
 }
@@ -98,6 +99,7 @@ component SceneLaunchTile inherits Rectangle {
     in property <string> name;
     in property <string> status;
     in property <bool> available;
+    in property <bool> controls-enabled;
     in property <bool> queued;
     in property <bool> last-launched;
     callback launch-requested();
@@ -107,7 +109,7 @@ component SceneLaunchTile inherits Rectangle {
     border-color: root.queued ? #a88cff : root.last-launched ? #3ddc97 : #2c3445;
     border-width: 1px;
     border-radius: 5px;
-    opacity: root.available ? 1 : 0.72;
+    opacity: root.available && root.controls-enabled ? 1 : 0.72;
 
     VerticalLayout {
         padding: 7px;
@@ -116,7 +118,7 @@ component SceneLaunchTile inherits Rectangle {
         Text { text: root.status; color: #8d99ad; font-size: 9px; overflow: elide; }
     }
     TouchArea {
-        enabled: root.available;
+        enabled: root.available && root.controls-enabled;
         clicked => { root.launch-requested(); }
     }
 }
@@ -787,6 +789,7 @@ export component OperatorWindow inherits Window {
                         name: (index + 1) + " · " + scene.name;
                         status: scene.status;
                         available: scene.available;
+                        controls-enabled: scene.controls-enabled;
                         queued: scene.queued;
                         last-launched: scene.last-launched;
                         launch-requested => { root.launch-scene-requested(index); }

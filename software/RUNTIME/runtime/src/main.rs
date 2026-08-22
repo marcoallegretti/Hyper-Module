@@ -1188,6 +1188,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let transport_authority = Rc::new(Cell::new(None));
     let loop_authority = Rc::new(Cell::new(None));
     let seek_authority = Rc::new(Cell::new(None));
+    let scene_launch_authority = Rc::new(Cell::new(false));
     let scene_stop_authority = Rc::new(Cell::new(false));
     let loudness_authority = Rc::new(Cell::new(None));
     let mixer_authority = Rc::new(RefCell::new(None));
@@ -1202,7 +1203,13 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_peak_reset(&ui, &meter_observer, &loudness_authority);
     wire_operator_loudness_controls(&ui, &commands_tx, &diagnostic, &loudness_authority);
     wire_operator_mixer_controls(&ui, &commands_tx, &diagnostic, &mixer_authority);
-    wire_operator_scene_launch(&ui, &commands_tx, &diagnostic, &scenes);
+    wire_operator_scene_launch(
+        &ui,
+        &commands_tx,
+        &diagnostic,
+        &scenes,
+        &scene_launch_authority,
+    );
     wire_operator_scene_stop(&ui, &commands_tx, &diagnostic, &scene_stop_authority);
     wire_operator_loop_toggle(&ui, &commands_tx, &diagnostic, &loop_authority);
     wire_operator_loop_range(&ui, &commands_tx, &diagnostic, &loop_authority);
@@ -1215,6 +1222,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &loop_authority,
         &seek_authority,
         &scene_model,
+        &scene_launch_authority,
         &scene_stop_authority,
         false,
     );
@@ -1239,6 +1247,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer_observers = observers.clone();
     let timer_meter_observer = Rc::clone(&meter_observer);
     let timer_scene_model = Rc::clone(&scene_model);
+    let timer_scene_launch_authority = Rc::clone(&scene_launch_authority);
     let timer_scene_stop_authority = Rc::clone(&scene_stop_authority);
     let timer_transport_authority = Rc::clone(&transport_authority);
     let timer_loop_authority = Rc::clone(&loop_authority);
@@ -1263,6 +1272,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &timer_loop_authority,
                 &timer_seek_authority,
                 &timer_scene_model,
+                &timer_scene_launch_authority,
                 &timer_scene_stop_authority,
                 completion_observed,
             );
@@ -1290,6 +1300,8 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                     &worker.completion,
                     &timer_diagnostic,
                     &timer_transport_authority,
+                    &timer_scene_model,
+                    &timer_scene_launch_authority,
                     &timer_scene_stop_authority,
                     || {
                         close_operator_surface(
@@ -1415,11 +1427,17 @@ fn close_operator_surface(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the terminal coordinator must revoke the independently owned transport and scene authorities before it closes the sole operator surface"
+)]
 fn apply_operator_worker_completion(
     ui: &OperatorWindow,
     completion: &Receiver<Result<(), String>>,
     diagnostic: &Mutex<String>,
     transport_authority: &Cell<Option<PlaybackRecoveryTransportState>>,
+    scene_model: &VecModel<OperatorSceneRow>,
+    scene_launch_authority: &Cell<bool>,
     scene_stop_authority: &Cell<bool>,
     close_operator_surface: impl FnOnce() -> Result<(), String>,
 ) -> Option<Result<(), String>> {
@@ -1432,6 +1450,7 @@ fn apply_operator_worker_completion(
         }
     };
     revoke_operator_transport_authority(ui, transport_authority);
+    revoke_operator_scene_launch_authority(scene_model, scene_launch_authority);
     revoke_operator_scene_stop_authority(ui, scene_stop_authority);
     let close_result = close_operator_surface();
     let message = close_result
@@ -1673,11 +1692,20 @@ fn wire_operator_scene_launch(
     sender: &SyncSender<OperatorCommand>,
     diagnostic: &Arc<Mutex<String>>,
     scenes: &[OperatorScene],
+    authority: &Rc<Cell<bool>>,
 ) {
     let sender = sender.clone();
     let diagnostic = Arc::clone(diagnostic);
     let scenes = scenes.to_vec();
+    let authority = Rc::clone(authority);
     ui.on_launch_scene_requested(move |row| {
+        if !authority.get() {
+            set_diagnostic(
+                &diagnostic,
+                "scene launch refused: accepted scene state is unavailable".to_owned(),
+            );
+            return;
+        }
         let Ok(row) = usize::try_from(row) else {
             set_diagnostic(&diagnostic, "scene launch refused: invalid row".to_owned());
             return;
@@ -2223,6 +2251,7 @@ fn operator_scene_rows(scenes: &[OperatorScene]) -> Vec<OperatorSceneRow> {
             name: scene.name.clone().into(),
             status: operator_scene_availability_text(scene.availability).into(),
             available: scene.availability == DesktopSceneAvailability::Ready,
+            controls_enabled: false,
             queued: false,
             last_launched: false,
         })
@@ -2558,11 +2587,13 @@ fn apply_operator_cycle_observation(
     loop_authority: &Cell<Option<OperatorLoopAuthority>>,
     seek_authority: &Cell<Option<usize>>,
     scene_model: &VecModel<OperatorSceneRow>,
+    scene_launch_authority: &Cell<bool>,
     scene_stop_authority: &Cell<bool>,
     terminal_latched: bool,
 ) {
     if terminal_latched {
         revoke_operator_transport_authority(ui, transport_authority);
+        revoke_operator_scene_launch_authority(scene_model, scene_launch_authority);
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
         return;
     }
@@ -2571,6 +2602,7 @@ fn apply_operator_cycle_observation(
         revoke_operator_transport_authority(ui, transport_authority);
         revoke_operator_loop_authority(ui, loop_authority);
         revoke_operator_seek_authority(ui, seek_authority);
+        revoke_operator_scene_launch_authority(scene_model, scene_launch_authority);
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
         return;
     }
@@ -2588,9 +2620,36 @@ fn apply_operator_cycle_observation(
         observers.facts.playback_extent,
     );
     apply_operator_scene_observation(ui, scene_model, observation);
+    set_operator_scene_launch_authority(scene_model, scene_launch_authority);
     let available = scene_model.row_count() > 0;
     scene_stop_authority.set(available);
     ui.set_stop_interactive_scenes_enabled(available);
+}
+
+fn set_operator_scene_launch_authority(
+    scenes: &VecModel<OperatorSceneRow>,
+    authority: &Cell<bool>,
+) {
+    authority.set(true);
+    for row in 0..scenes.row_count() {
+        if let Some(mut scene) = scenes.row_data(row) {
+            scene.controls_enabled = scene.available;
+            scenes.set_row_data(row, scene);
+        }
+    }
+}
+
+fn revoke_operator_scene_launch_authority(
+    scenes: &VecModel<OperatorSceneRow>,
+    authority: &Cell<bool>,
+) {
+    authority.set(false);
+    for row in 0..scenes.row_count() {
+        if let Some(mut scene) = scenes.row_data(row) {
+            scene.controls_enabled = false;
+            scenes.set_row_data(row, scene);
+        }
+    }
 }
 
 fn revoke_operator_scene_stop_authority(ui: &OperatorWindow, authority: &Cell<bool>) {
@@ -3980,7 +4039,14 @@ mod tests {
         let (scene_commands, scene_command_receiver) =
             std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
         let scene_diagnostic = Arc::new(Mutex::new(String::new()));
-        wire_operator_scene_launch(ui, &scene_commands, &scene_diagnostic, &operator_scenes);
+        let scene_launch_authority = Rc::new(Cell::new(false));
+        wire_operator_scene_launch(
+            ui,
+            &scene_commands,
+            &scene_diagnostic,
+            &operator_scenes,
+            &scene_launch_authority,
+        );
         let scene_stop_authority = Rc::new(Cell::new(false));
         wire_operator_scene_stop(
             ui,
@@ -4063,6 +4129,8 @@ mod tests {
         ui.set_stop_interactive_scenes_enabled(false);
         let generated_scenes = ui.get_scenes();
         assert_eq!(generated_scenes.row_count(), 4);
+        set_operator_scene_launch_authority(&scene_model, &scene_launch_authority);
+        assert!(scene_launch_authority.get());
         for (row, expected) in [
             (0, (true, "Ready")),
             (1, (false, "Disabled")),
@@ -4071,6 +4139,7 @@ mod tests {
         ] {
             let scene = generated_scenes.row_data(row).unwrap();
             assert_eq!((scene.available, scene.status.as_str()), expected);
+            assert_eq!(scene.controls_enabled, scene.available);
         }
         ui.invoke_launch_scene_requested(0);
         assert_eq!(
@@ -6423,13 +6492,24 @@ mod tests {
             recovery: terminal_recovery,
             panel_connected: Arc::new(AtomicBool::new(false)),
         };
-        let terminal_scenes = Rc::new(VecModel::from(operator_scene_rows(&[OperatorScene {
+        let terminal_operator_scenes = [OperatorScene {
             index: 0,
             name: "Terminal scene authority".to_owned(),
             availability: DesktopSceneAvailability::Ready,
-        }])));
+        }];
+        let terminal_scenes = Rc::new(VecModel::from(operator_scene_rows(
+            &terminal_operator_scenes,
+        )));
+        let terminal_scene_launch_authority = Rc::new(Cell::new(false));
         let terminal_scene_stop_authority = Rc::new(Cell::new(false));
         wire_operator_loop_toggle(&ui, &sender, &diagnostic, &loop_authority);
+        wire_operator_scene_launch(
+            &ui,
+            &sender,
+            &diagnostic,
+            &terminal_operator_scenes,
+            &terminal_scene_launch_authority,
+        );
         wire_operator_scene_stop(&ui, &sender, &diagnostic, &terminal_scene_stop_authority);
         apply_operator_cycle_observation(
             &ui,
@@ -6439,6 +6519,7 @@ mod tests {
             &loop_authority,
             &seek_authority,
             &terminal_scenes,
+            &terminal_scene_launch_authority,
             &terminal_scene_stop_authority,
             false,
         );
@@ -6450,6 +6531,13 @@ mod tests {
                 position_frame: 0,
                 extent: facts.playback_extent,
             })
+        );
+        assert!(terminal_scene_launch_authority.get());
+        assert!(terminal_scenes.row_data(0).unwrap().controls_enabled);
+        ui.invoke_launch_scene_requested(0);
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::LaunchScene { scene_index: 0 })
         );
         assert!(terminal_scene_stop_authority.get());
         assert!(ui.get_stop_interactive_scenes_enabled());
@@ -6467,6 +6555,7 @@ mod tests {
             &loop_authority,
             &seek_authority,
             &terminal_scenes,
+            &terminal_scene_launch_authority,
             &terminal_scene_stop_authority,
             true,
         );
@@ -6475,8 +6564,16 @@ mod tests {
         assert!(!ui.get_transport_start_enabled());
         assert!(!ui.get_transport_stop_enabled());
         assert!(!ui.get_transport_return_to_start_enabled());
+        assert!(!terminal_scene_launch_authority.get());
+        assert!(!terminal_scenes.row_data(0).unwrap().controls_enabled);
         assert!(!terminal_scene_stop_authority.get());
         assert!(!ui.get_stop_interactive_scenes_enabled());
+        ui.invoke_launch_scene_requested(0);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "scene launch refused: accepted scene state is unavailable"
+        );
         ui.invoke_stop_interactive_scenes_requested();
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(
@@ -6561,6 +6658,8 @@ mod tests {
                 &completion_receiver,
                 &diagnostic,
                 &transport_authority,
+                &terminal_scenes,
+                &terminal_scene_launch_authority,
                 &terminal_scene_stop_authority,
                 || {
                     surface_closed.set(true);
@@ -6576,6 +6675,8 @@ mod tests {
             PlaybackRecoveryTransportState::Stopped,
         );
         assert!(ui.get_transport_start_enabled());
+        set_operator_scene_launch_authority(&terminal_scenes, &terminal_scene_launch_authority);
+        assert!(terminal_scene_launch_authority.get());
         completion_sender
             .send(Err("native audio ownership ended unexpectedly".to_owned()))
             .unwrap();
@@ -6585,6 +6686,8 @@ mod tests {
                 &completion_receiver,
                 &diagnostic,
                 &transport_authority,
+                &terminal_scenes,
+                &terminal_scene_launch_authority,
                 &terminal_scene_stop_authority,
                 || {
                     surface_closed.set(true);
@@ -6598,6 +6701,8 @@ mod tests {
         assert!(!ui.get_transport_start_enabled());
         assert!(!ui.get_transport_stop_enabled());
         assert!(!ui.get_transport_return_to_start_enabled());
+        assert!(!terminal_scene_launch_authority.get());
+        assert!(!terminal_scenes.row_data(0).unwrap().controls_enabled);
         assert_eq!(
             ui.get_diagnostic().as_str(),
             "Runtime worker stopped: native audio ownership ended unexpectedly"
@@ -6612,6 +6717,7 @@ mod tests {
         let (lost_sender, lost_receiver) = std::sync::mpsc::sync_channel(1);
         drop(lost_sender);
         surface_closed.set(false);
+        set_operator_scene_launch_authority(&terminal_scenes, &terminal_scene_launch_authority);
         terminal_scene_stop_authority.set(true);
         ui.set_stop_interactive_scenes_enabled(true);
         let retained_scene_feedback = ui.get_scene_feedback();
@@ -6621,6 +6727,8 @@ mod tests {
                 &lost_receiver,
                 &diagnostic,
                 &transport_authority,
+                &terminal_scenes,
+                &terminal_scene_launch_authority,
                 &terminal_scene_stop_authority,
                 || {
                     surface_closed.set(true);
@@ -6630,6 +6738,8 @@ mod tests {
             Some(Err("adapter refused to hide".to_owned()))
         );
         assert!(surface_closed.get());
+        assert!(!terminal_scene_launch_authority.get());
+        assert!(!terminal_scenes.row_data(0).unwrap().controls_enabled);
         assert!(!terminal_scene_stop_authority.get());
         assert!(!ui.get_stop_interactive_scenes_enabled());
         ui.invoke_stop_interactive_scenes_requested();
