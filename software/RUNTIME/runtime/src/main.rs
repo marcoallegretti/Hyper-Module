@@ -274,6 +274,9 @@ enum OperatorCommand {
     SetLoopEnabled {
         enabled: bool,
     },
+    SetLoopRange {
+        range: Option<TransportLoopRange>,
+    },
     SetLoudnessState {
         state: LoudnessMeasurementState,
     },
@@ -319,6 +322,8 @@ enum OperatorCommand {
 struct OperatorLoopAuthority {
     range: Option<TransportLoopRange>,
     enabled: bool,
+    position_frame: usize,
+    extent: PlaybackExtent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -658,6 +663,9 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
                     Err(error) => diagnostic(format!("project loop toggle refused: {error}")),
                 }
             }
+            OperatorCommand::SetLoopRange { range } => {
+                queue_operator_loop_range(host, range, diagnostic);
+            }
             OperatorCommand::SetLoudnessState { state } => {
                 match host.queue_loudness(LoudnessMeasurementCommand::SetState(state)) {
                     Ok(()) => diagnostic(match state {
@@ -696,6 +704,26 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
             }
             OperatorCommand::Quit => stop.store(true, Ordering::Release),
         }
+    }
+}
+
+fn queue_operator_loop_range<H: RuntimeOperatorControl>(
+    host: &mut H,
+    range: Option<TransportLoopRange>,
+    diagnostic: &dyn Fn(String),
+) {
+    match host.queue_transport(TransportCommand::SetLoopRange(range)) {
+        Ok(()) => diagnostic(range.map_or_else(
+            || "session loop range clear queued".to_owned(),
+            |range| {
+                format!(
+                    "session loop range {}–{} queued",
+                    range.start_frame(),
+                    range.end_frame()
+                )
+            },
+        )),
+        Err(error) => diagnostic(format!("session loop range refused: {error}")),
     }
 }
 
@@ -1109,6 +1137,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_mixer_controls(&ui, &commands_tx, &diagnostic, &mixer_authority);
     wire_operator_scene_launch(&ui, &commands_tx, &diagnostic, &scenes);
     wire_operator_loop_toggle(&ui, &commands_tx, &diagnostic, &loop_authority);
+    wire_operator_loop_range(&ui, &commands_tx, &diagnostic, &loop_authority);
 
     apply_operator_cycle_observation(
         &ui,
@@ -1909,6 +1938,110 @@ fn wire_operator_loop_toggle(
     });
 }
 
+#[derive(Clone, Copy)]
+enum OperatorLoopMark {
+    In,
+    Out,
+}
+
+fn operator_loop_range_at_playhead(
+    current: OperatorLoopAuthority,
+    mark: OperatorLoopMark,
+) -> Option<TransportLoopRange> {
+    match mark {
+        OperatorLoopMark::In => {
+            let end_frame = current
+                .range
+                .filter(|range| range.end_frame() > current.position_frame)
+                .map(TransportLoopRange::end_frame)
+                .or(match current.extent {
+                    PlaybackExtent::Bounded { end_frame } if end_frame > current.position_frame => {
+                        Some(end_frame)
+                    }
+                    PlaybackExtent::Bounded { .. } | PlaybackExtent::Unbounded => None,
+                })?;
+            operator_runtime_loop_range(current.position_frame, end_frame)
+        }
+        OperatorLoopMark::Out => {
+            let start_frame = current
+                .range
+                .filter(|range| range.start_frame() < current.position_frame)
+                .map_or(0, TransportLoopRange::start_frame);
+            operator_runtime_loop_range(start_frame, current.position_frame)
+        }
+    }
+}
+
+fn operator_runtime_loop_range(start_frame: usize, end_frame: usize) -> Option<TransportLoopRange> {
+    let range = TransportLoopRange::new(start_frame, end_frame).ok()?;
+    (end_frame - start_frame >= MAXIMUM_BLOCK_FRAMES).then_some(range)
+}
+
+fn wire_operator_loop_range(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    authority: &Rc<Cell<Option<OperatorLoopAuthority>>>,
+) {
+    for (mark, register) in [
+        (
+            OperatorLoopMark::In,
+            OperatorWindow::on_set_loop_in_requested as fn(&OperatorWindow, Box<dyn FnMut()>),
+        ),
+        (
+            OperatorLoopMark::Out,
+            OperatorWindow::on_set_loop_out_requested as fn(&OperatorWindow, Box<dyn FnMut()>),
+        ),
+    ] {
+        let sender = sender.clone();
+        let diagnostic = Arc::clone(diagnostic);
+        let authority = Rc::clone(authority);
+        register(
+            ui,
+            Box::new(move || {
+                let Some(current) = authority.get() else {
+                    set_diagnostic(
+                        &diagnostic,
+                        "session loop mark refused: accepted state is unavailable".to_owned(),
+                    );
+                    return;
+                };
+                let Some(range) = operator_loop_range_at_playhead(current, mark) else {
+                    set_diagnostic(
+                        &diagnostic,
+                        "session loop mark refused: playhead cannot form a positive range"
+                            .to_owned(),
+                    );
+                    return;
+                };
+                send_operator_command(
+                    &sender,
+                    OperatorCommand::SetLoopRange { range: Some(range) },
+                    &diagnostic,
+                );
+            }),
+        );
+    }
+
+    let sender = sender.clone();
+    let diagnostic = Arc::clone(diagnostic);
+    let authority = Rc::clone(authority);
+    ui.on_clear_loop_range_requested(move || {
+        if authority.get().and_then(|current| current.range).is_none() {
+            set_diagnostic(
+                &diagnostic,
+                "session loop clear refused: no committed range".to_owned(),
+            );
+            return;
+        }
+        send_operator_command(
+            &sender,
+            OperatorCommand::SetLoopRange { range: None },
+            &diagnostic,
+        );
+    });
+}
+
 fn request_operator_shutdown(
     stop: &AtomicBool,
     sender: &SyncSender<OperatorCommand>,
@@ -2164,12 +2297,22 @@ fn apply_operator_loop_observation(
     ui: &OperatorWindow,
     authority: &Cell<Option<OperatorLoopAuthority>>,
     observation: PlaybackCycleObservation,
+    extent: PlaybackExtent,
 ) {
     let current = OperatorLoopAuthority {
         range: observation.loop_range(),
         enabled: observation.loop_enabled(),
+        position_frame: observation.position_frame(),
+        extent,
     };
     authority.set(Some(current));
+    ui.set_loop_in_enabled(
+        operator_loop_range_at_playhead(current, OperatorLoopMark::In).is_some(),
+    );
+    ui.set_loop_out_enabled(
+        operator_loop_range_at_playhead(current, OperatorLoopMark::Out).is_some(),
+    );
+    ui.set_loop_clear_enabled(current.range.is_some());
     if let Some(range) = current.range {
         ui.set_loop_state(if current.enabled {
             "Looping".into()
@@ -2185,7 +2328,7 @@ fn apply_operator_loop_observation(
         ui.set_loop_toggle_enabled(true);
     } else {
         ui.set_loop_state("No project loop".into());
-        ui.set_loop_range("No saved range".into());
+        ui.set_loop_range("No committed session range".into());
         ui.set_loop_toggle_label("Loop unavailable".into());
         ui.set_loop_toggle_enabled(false);
     }
@@ -2272,7 +2415,12 @@ fn apply_operator_cycle_observation(
         observers.facts.playback_extent,
         observation.position_frame(),
     );
-    apply_operator_loop_observation(ui, loop_authority, observation);
+    apply_operator_loop_observation(
+        ui,
+        loop_authority,
+        observation,
+        observers.facts.playback_extent,
+    );
     apply_operator_scene_observation(ui, scene_model, observation);
 }
 
@@ -2289,6 +2437,9 @@ fn revoke_operator_loop_authority(
     authority.set(None);
     ui.set_loop_toggle_label("Runtime stopped".into());
     ui.set_loop_toggle_enabled(false);
+    ui.set_loop_in_enabled(false);
+    ui.set_loop_out_enabled(false);
+    ui.set_loop_clear_enabled(false);
 }
 
 fn revoke_operator_loudness_authority(
@@ -3236,6 +3387,98 @@ mod tests {
     }
 
     #[test]
+    fn operator_loop_marks_derive_exact_positive_session_ranges() {
+        let bounded = PlaybackExtent::Bounded { end_frame: 1_500 };
+        let authority = |range, position_frame, extent| OperatorLoopAuthority {
+            range,
+            enabled: false,
+            position_frame,
+            extent,
+        };
+        assert_eq!(
+            operator_loop_range_at_playhead(authority(None, 375, bounded), OperatorLoopMark::In),
+            Some(TransportLoopRange::new(375, 1_500).unwrap())
+        );
+        assert_eq!(
+            operator_loop_range_at_playhead(authority(None, 1_200, bounded), OperatorLoopMark::Out),
+            Some(TransportLoopRange::new(0, 1_200).unwrap())
+        );
+        let wide_bounded = PlaybackExtent::Bounded { end_frame: 5_000 };
+        let existing = Some(TransportLoopRange::new(500, 4_000).unwrap());
+        assert_eq!(
+            operator_loop_range_at_playhead(
+                authority(existing, 2_000, wide_bounded),
+                OperatorLoopMark::In
+            ),
+            Some(TransportLoopRange::new(2_000, 4_000).unwrap())
+        );
+        assert_eq!(
+            operator_loop_range_at_playhead(
+                authority(existing, 2_000, wide_bounded),
+                OperatorLoopMark::Out
+            ),
+            Some(TransportLoopRange::new(500, 2_000).unwrap())
+        );
+        assert_eq!(
+            operator_loop_range_at_playhead(
+                authority(None, 10, PlaybackExtent::Unbounded),
+                OperatorLoopMark::In
+            ),
+            None
+        );
+        assert_eq!(
+            operator_loop_range_at_playhead(
+                authority(None, 1_024, PlaybackExtent::Unbounded),
+                OperatorLoopMark::Out
+            ),
+            Some(TransportLoopRange::new(0, 1_024).unwrap())
+        );
+        assert_eq!(
+            operator_loop_range_at_playhead(authority(None, 0, bounded), OperatorLoopMark::Out),
+            None
+        );
+        assert_eq!(
+            operator_loop_range_at_playhead(authority(None, 1_500, bounded), OperatorLoopMark::In),
+            None
+        );
+        assert_eq!(operator_runtime_loop_range(0, 1_023), None);
+        assert_eq!(
+            operator_runtime_loop_range(0, 1_024),
+            Some(TransportLoopRange::new(0, 1_024).unwrap())
+        );
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        sender
+            .send(OperatorCommand::SetLoopRange {
+                range: Some(TransportLoopRange::new(375, 900).unwrap()),
+            })
+            .unwrap();
+        sender
+            .send(OperatorCommand::SetLoopRange { range: None })
+            .unwrap();
+        let stop = AtomicBool::new(false);
+        let mut owner = OperatorControl::default();
+        let diagnostics = RefCell::new(Vec::new());
+        drain_operator_commands(&mut owner, &receiver, &stop, &|message| {
+            diagnostics.borrow_mut().push(message);
+        });
+        assert_eq!(
+            owner.commands,
+            [
+                TransportCommand::SetLoopRange(Some(TransportLoopRange::new(375, 900).unwrap())),
+                TransportCommand::SetLoopRange(None),
+            ]
+        );
+        assert_eq!(
+            diagnostics.into_inner(),
+            [
+                "session loop range 375–900 queued",
+                "session loop range clear queued",
+            ]
+        );
+    }
+
+    #[test]
     fn a_refused_operator_command_is_visible_and_a_lost_ui_stops_the_worker() {
         let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
         sender.send(OperatorCommand::Start).unwrap();
@@ -3791,8 +4034,14 @@ mod tests {
             std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
         let loop_diagnostic = Arc::new(Mutex::new(String::new()));
         wire_operator_loop_toggle(ui, &loop_commands, &loop_diagnostic, &loop_authority);
+        wire_operator_loop_range(ui, &loop_commands, &loop_diagnostic, &loop_authority);
         let initial_observation = recovery.observe_cycle();
-        apply_operator_loop_observation(ui, &loop_authority, initial_observation);
+        apply_operator_loop_observation(
+            ui,
+            &loop_authority,
+            initial_observation,
+            PlaybackExtent::Bounded { end_frame: 1_500 },
+        );
         apply_operator_scene_observation(ui, &scene_model, initial_observation);
         apply_operator_mixer_observation(
             ui,
@@ -3805,7 +4054,7 @@ mod tests {
             false,
         );
         assert_eq!(ui.get_loop_state().as_str(), "No project loop");
-        assert_eq!(ui.get_loop_range().as_str(), "No saved range");
+        assert_eq!(ui.get_loop_range().as_str(), "No committed session range");
         assert_eq!(ui.get_loop_toggle_label().as_str(), "Loop unavailable");
         assert!(!ui.get_loop_toggle_enabled());
         assert_eq!(ui.get_mixer_state().as_str(), "Committed cycle 0");
@@ -4120,13 +4369,27 @@ mod tests {
             loop_diagnostic.lock().unwrap().as_str(),
             "project loop toggle refused: no project loop is armed"
         );
+        assert!(ui.get_loop_in_enabled());
+        assert!(!ui.get_loop_out_enabled());
+        assert!(!ui.get_loop_clear_enabled());
+        ui.invoke_set_loop_out_requested();
+        ui.invoke_clear_loop_range_requested();
+        assert_eq!(loop_command_receiver.try_recv(), Err(TryRecvError::Empty));
+        ui.invoke_set_loop_in_requested();
+        let requested_range = TransportLoopRange::new(0, 1_500).unwrap();
+        assert_eq!(
+            loop_command_receiver.try_recv(),
+            Ok(OperatorCommand::SetLoopRange {
+                range: Some(requested_range)
+            })
+        );
+        assert_eq!(ui.get_loop_state().as_str(), "No project loop");
+        assert_eq!(ui.get_loop_range().as_str(), "No committed session range");
         transport_sender
             .try_send(TransportCommand::LaunchScene { scene_index: 0 })
             .unwrap();
         transport_sender
-            .try_send(TransportCommand::SetLoopRange(Some(
-                TransportLoopRange::new(0, 1_500).unwrap(),
-            )))
+            .try_send(TransportCommand::SetLoopRange(Some(requested_range)))
             .unwrap();
         let mut stopped_left = [0.0_f32; 480];
         let mut stopped_right = [0.0_f32; 480];
@@ -4142,7 +4405,12 @@ mod tests {
         let committed_mixer = transport.mixer_parameter_state();
         recovery_publisher.publish_cycle(queued, Some(&committed_mixer));
         let queued_observation = recovery.observe_cycle();
-        apply_operator_loop_observation(ui, &loop_authority, queued_observation);
+        apply_operator_loop_observation(
+            ui,
+            &loop_authority,
+            queued_observation,
+            PlaybackExtent::Bounded { end_frame: 1_500 },
+        );
         apply_operator_scene_observation(ui, &scene_model, queued_observation);
         apply_operator_mixer_observation(
             ui,
@@ -4434,6 +4702,9 @@ mod tests {
         assert_eq!(ui.get_loop_range().as_str(), "frames 0–1500");
         assert_eq!(ui.get_loop_toggle_label().as_str(), "Enable loop");
         assert!(ui.get_loop_toggle_enabled());
+        assert!(ui.get_loop_in_enabled());
+        assert!(!ui.get_loop_out_enabled());
+        assert!(ui.get_loop_clear_enabled());
         ui.invoke_toggle_loop_requested();
         assert_eq!(
             loop_command_receiver.try_recv(),
@@ -4529,7 +4800,12 @@ mod tests {
             .unwrap();
         recovery_publisher.publish_cycle(launched.snapshot().cycle(), None);
         let launched_observation = recovery.observe_cycle();
-        apply_operator_loop_observation(ui, &loop_authority, launched_observation);
+        apply_operator_loop_observation(
+            ui,
+            &loop_authority,
+            launched_observation,
+            PlaybackExtent::Bounded { end_frame: 1_500 },
+        );
         apply_operator_scene_observation(ui, &scene_model, launched_observation);
         assert_eq!(ui.get_loop_state().as_str(), "Looping");
         assert_eq!(ui.get_loop_range().as_str(), "frames 0–1500");
@@ -4578,6 +4854,9 @@ mod tests {
         );
         assert_eq!(ui.get_loop_toggle_label().as_str(), "Runtime stopped");
         assert!(!ui.get_loop_toggle_enabled());
+        assert!(!ui.get_loop_in_enabled());
+        assert!(!ui.get_loop_out_enabled());
+        assert!(!ui.get_loop_clear_enabled());
         let launched_row = ui.get_scenes().row_data(0).unwrap();
         assert!(!launched_row.queued);
         assert!(launched_row.last_launched);
@@ -5375,6 +5654,7 @@ mod tests {
         let loop_authority = Rc::new(Cell::new(None));
         let seek_authority = Rc::new(Cell::new(None));
         wire_operator_loop_toggle(&ui, &sender, &diagnostic, &loop_authority);
+        wire_operator_loop_range(&ui, &sender, &diagnostic, &loop_authority);
         wire_operator_seek(&ui, &sender, &diagnostic, &seek_authority);
 
         let facts = RuntimeFacts {
@@ -5395,7 +5675,7 @@ mod tests {
         };
         apply_static_facts(&ui, &facts);
         let observation = apply_observations(&ui, &observers, &diagnostic);
-        apply_operator_loop_observation(&ui, &loop_authority, observation);
+        apply_operator_loop_observation(&ui, &loop_authority, observation, facts.playback_extent);
         apply_operator_seek_observation(
             &ui,
             &seek_authority,
@@ -5403,9 +5683,45 @@ mod tests {
             observation.position_frame(),
         );
         assert_eq!(ui.get_loop_state().as_str(), "No project loop");
-        assert_eq!(ui.get_loop_range().as_str(), "No saved range");
+        assert_eq!(ui.get_loop_range().as_str(), "No committed session range");
         assert_eq!(ui.get_loop_toggle_label().as_str(), "Loop unavailable");
         assert!(!ui.get_loop_toggle_enabled());
+        assert!(ui.get_loop_in_enabled());
+        assert!(!ui.get_loop_out_enabled());
+        assert!(!ui.get_loop_clear_enabled());
+        let editable_range = TransportLoopRange::new(0, 1_500).unwrap();
+        loop_authority.set(Some(OperatorLoopAuthority {
+            range: Some(editable_range),
+            enabled: false,
+            position_frame: 375,
+            extent: facts.playback_extent,
+        }));
+        ui.invoke_set_loop_in_requested();
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::SetLoopRange {
+                range: Some(TransportLoopRange::new(375, 1_500).unwrap())
+            })
+        );
+        loop_authority.set(Some(OperatorLoopAuthority {
+            range: Some(editable_range),
+            enabled: false,
+            position_frame: 1_200,
+            extent: facts.playback_extent,
+        }));
+        ui.invoke_set_loop_out_requested();
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::SetLoopRange {
+                range: Some(TransportLoopRange::new(0, 1_200).unwrap())
+            })
+        );
+        ui.invoke_clear_loop_range_requested();
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::SetLoopRange { range: None })
+        );
+        apply_operator_loop_observation(&ui, &loop_authority, observation, facts.playback_extent);
         assert!(ui.get_transport_seek_enabled());
         assert_operator_float(ui.get_transport_position_percent(), 0.0);
         ui.invoke_locate_percent_requested(50.0);
@@ -5516,6 +5832,8 @@ mod tests {
             Some(OperatorLoopAuthority {
                 range: Some(terminal_range),
                 enabled: true,
+                position_frame: 0,
+                extent: facts.playback_extent,
             })
         );
         revoke_operator_loop_authority(&ui, &loop_authority);
@@ -5539,6 +5857,9 @@ mod tests {
         assert_operator_float(ui.get_transport_position_percent(), 25.0);
         ui.invoke_locate_percent_requested(50.0);
         ui.invoke_toggle_loop_requested();
+        ui.invoke_set_loop_in_requested();
+        ui.invoke_set_loop_out_requested();
+        ui.invoke_clear_loop_range_requested();
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
 
         ui.invoke_start_requested();

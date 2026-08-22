@@ -408,6 +408,9 @@ export component OperatorWindow inherits Window {
     in property <string> loop-range;
     in property <string> loop-toggle-label;
     in property <bool> loop-toggle-enabled;
+    in property <bool> loop-in-enabled;
+    in property <bool> loop-out-enabled;
+    in property <bool> loop-clear-enabled;
     in property <string> stream-state;
     in property <string> callback-count;
     in property <string> stream-failures;
@@ -449,6 +452,9 @@ export component OperatorWindow inherits Window {
     callback return-to-start-requested();
     callback locate-percent-requested(float);
     callback toggle-loop-requested();
+    callback set-loop-in-requested();
+    callback set-loop-out-requested();
+    callback clear-loop-range-requested();
     callback reset-output-peak-requested();
     callback loudness-run-requested();
     callback loudness-standby-requested();
@@ -503,7 +509,7 @@ export component OperatorWindow inherits Window {
                 value: root.transport-state + "  ·  " + root.transport-time;
                 detail: "frame " + root.transport-frame;
             }
-            FactCard { label: "PROJECT LOOP"; value: root.loop-state; detail: root.loop-range; }
+            FactCard { label: "SESSION LOOP"; value: root.loop-state; detail: root.loop-range; }
             FactCard { label: "AUDIO OWNER"; value: root.stream-state; }
             FactCard { label: "PANEL LINK"; value: root.panel-state; }
         }
@@ -526,6 +532,23 @@ export component OperatorWindow inherits Window {
                 control-label: "Committed transport position percent";
                 released(value) => { root.locate-percent-requested(value); }
             }
+        }
+
+        HorizontalLayout {
+            spacing: 10px;
+            Button { text: "Start"; clicked => { root.start-requested(); } }
+            Button { text: "Stop"; clicked => { root.stop-requested(); } }
+            Button { text: "Return to start"; clicked => { root.return-to-start-requested(); } }
+            Button {
+                text: root.loop-toggle-label;
+                enabled: root.loop-toggle-enabled;
+                clicked => { root.toggle-loop-requested(); }
+            }
+            Button { text: "Loop In"; enabled: root.loop-in-enabled; clicked => { root.set-loop-in-requested(); } }
+            Button { text: "Loop Out"; enabled: root.loop-out-enabled; clicked => { root.set-loop-out-requested(); } }
+            Button { text: "Clear loop"; enabled: root.loop-clear-enabled; clicked => { root.clear-loop-range-requested(); } }
+            Rectangle { horizontal-stretch: 1; }
+            Button { text: "Shut down Runtime"; clicked => { root.quit-requested(); } }
         }
 
         HorizontalLayout {
@@ -755,19 +778,6 @@ export component OperatorWindow inherits Window {
             }
         }
 
-            HorizontalLayout {
-                spacing: 10px;
-                Button { text: "Start"; clicked => { root.start-requested(); } }
-                Button { text: "Stop"; clicked => { root.stop-requested(); } }
-                Button { text: "Return to start"; clicked => { root.return-to-start-requested(); } }
-                Button {
-                    text: root.loop-toggle-label;
-                    enabled: root.loop-toggle-enabled;
-                    clicked => { root.toggle-loop-requested(); }
-                }
-                Rectangle { horizontal-stretch: 1; }
-                Button { text: "Shut down Runtime"; clicked => { root.quit-requested(); } }
-            }
         }
     }
 }

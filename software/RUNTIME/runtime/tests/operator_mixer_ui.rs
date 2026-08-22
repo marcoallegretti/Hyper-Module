@@ -20,7 +20,18 @@ enum MixerIntent {
     MainMute,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoopIntent {
+    In,
+    Out,
+    Clear,
+}
+
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one generated-window contract keeps actual control mapping and capability evidence together"
+)]
 fn generated_mixer_controls_forward_exact_rows_values_and_capability() {
     i_slint_backend_testing::init_no_event_loop();
     let ui = OperatorWindow::new().unwrap();
@@ -69,6 +80,7 @@ fn generated_mixer_controls_forward_exact_rows_values_and_capability() {
     ui.set_main_gain_percent(40.0);
     ui.set_main_mute_enabled(true);
     let seek_intents = configure_transport_seek(&ui);
+    let loop_intents = configure_loop_marks(&ui);
 
     let intents = Rc::new(RefCell::new(Vec::new()));
     let mute_intents = Rc::clone(&intents);
@@ -122,8 +134,41 @@ fn generated_mixer_controls_forward_exact_rows_values_and_capability() {
     ui.show().unwrap();
 
     verify_committed_transport_seek(&ui, &seek_intents);
+    verify_loop_mark_buttons(&ui, &loop_intents);
     verify_enabled_controls(&ui, &intents);
     verify_recovery_and_disabled_controls(&ui, &rows, &sends, &intents);
+}
+
+fn configure_loop_marks(ui: &OperatorWindow) -> Rc<RefCell<Vec<LoopIntent>>> {
+    ui.set_loop_in_enabled(true);
+    ui.set_loop_out_enabled(true);
+    ui.set_loop_clear_enabled(true);
+    let intents = Rc::new(RefCell::new(Vec::new()));
+    let loop_in = Rc::clone(&intents);
+    ui.on_set_loop_in_requested(move || loop_in.borrow_mut().push(LoopIntent::In));
+    let loop_out = Rc::clone(&intents);
+    ui.on_set_loop_out_requested(move || loop_out.borrow_mut().push(LoopIntent::Out));
+    let clear = Rc::clone(&intents);
+    ui.on_clear_loop_range_requested(move || clear.borrow_mut().push(LoopIntent::Clear));
+    intents
+}
+
+fn verify_loop_mark_buttons(ui: &OperatorWindow, intents: &RefCell<Vec<LoopIntent>>) {
+    click_enabled(ui, "Loop In");
+    click_enabled(ui, "Loop Out");
+    click_enabled(ui, "Clear loop");
+    assert_eq!(
+        intents.borrow().as_slice(),
+        [LoopIntent::In, LoopIntent::Out, LoopIntent::Clear]
+    );
+
+    ui.set_loop_in_enabled(false);
+    ui.set_loop_out_enabled(false);
+    ui.set_loop_clear_enabled(false);
+    find_control(ui, "Loop In").mock_single_click(PointerEventButton::Left);
+    find_control(ui, "Loop Out").mock_single_click(PointerEventButton::Left);
+    find_control(ui, "Clear loop").mock_single_click(PointerEventButton::Left);
+    assert_eq!(intents.borrow().len(), 3);
 }
 
 fn configure_transport_seek(ui: &OperatorWindow) -> Rc<RefCell<Vec<u32>>> {
