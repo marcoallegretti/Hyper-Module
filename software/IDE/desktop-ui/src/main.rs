@@ -9819,6 +9819,41 @@ mod tests {
         ui.set_new_track_visible(false);
     }
 
+    fn assert_project_open_shortcut_contract(ui: &MainWindow) {
+        let opened = Rc::new(Cell::new(0_usize));
+        let opened_by_callback = Rc::clone(&opened);
+        ui.global::<IdeActions>().on_choose_project(move || {
+            opened_by_callback.set(opened_by_callback.get() + 1);
+        });
+
+        ui.set_app_mode(AppMode::Closed);
+        ui.set_new_project_visible(false);
+        ui.set_new_track_visible(false);
+        dispatch_ide_shortcut(ui, "o", false, false);
+        assert_eq!(opened.get(), 1, "the shortcut reaches the existing open action");
+
+        dispatch_ide_shortcut(ui, "o", false, true);
+        dispatch_ide_shortcut(ui, "O", true, false);
+        assert_eq!(opened.get(), 1, "repeat and Shift must not reopen the picker");
+
+        ui.set_app_mode(AppMode::Running);
+        dispatch_ide_shortcut(ui, "o", false, false);
+        assert_eq!(opened.get(), 1, "a running project cannot be replaced by a shortcut");
+
+        ui.set_app_mode(AppMode::Closed);
+        ui.set_new_project_visible(true);
+        dispatch_ide_shortcut(ui, "o", false, false);
+        ui.set_new_project_visible(false);
+        ui.set_new_track_visible(true);
+        dispatch_ide_shortcut(ui, "o", false, false);
+        assert_eq!(
+            opened.get(),
+            1,
+            "a local project form keeps the picker entry point unavailable"
+        );
+        ui.set_new_track_visible(false);
+    }
+
     fn assert_audio_track_creation_shortcut_contract(ui: &MainWindow) {
         ui.set_app_mode(AppMode::Running);
         ui.set_track_count(1);
@@ -12754,6 +12789,7 @@ mod tests {
         assert_undo_redo_shortcut_contract(&ui);
         assert_project_save_shortcut_contract(&ui);
         assert_project_creation_shortcut_contract(&ui);
+        assert_project_open_shortcut_contract(&ui);
         assert_audio_track_creation_shortcut_contract(&ui);
         assert_form_cancellation_shortcut_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);
