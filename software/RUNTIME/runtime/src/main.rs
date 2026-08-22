@@ -34,6 +34,7 @@ use hyper_mixer_runtime::{
     TransportLoopRange,
 };
 use hyper_panel_protocol::{LinkConfig, Message, PanelDescriptor};
+use hyper_playback_compiler::{FrameTimeline, MeterEvent, TempoEvent, musical_position};
 use hyper_playback_json::LoaderLimits;
 use hyper_playback_session::{PlaybackExtent, PlaybackSessionAssemblyLimits};
 use hyper_project_loader::ProjectPlaybackLimits;
@@ -146,6 +147,46 @@ struct RuntimeFacts {
     project_id: String,
     project_revision: u64,
     playback_extent: PlaybackExtent,
+    musical_timeline: RuntimeMusicalTimeline,
+}
+
+/// Immutable conversion authority for the Runtime's display-only musical
+/// transport position. It is built from a verified project before native
+/// output starts, then shared with the UI observer without touching the audio
+/// owner.
+#[derive(Clone, Debug)]
+struct RuntimeMusicalTimeline {
+    frames: Arc<FrameTimeline>,
+    meter_events: Arc<[MeterEvent]>,
+}
+
+impl RuntimeMusicalTimeline {
+    fn try_new(
+        sample_rate_hz: u32,
+        tempo_events: &[TempoEvent],
+        meter_events: &[MeterEvent],
+    ) -> Result<Self, String> {
+        let frames = FrameTimeline::try_new(sample_rate_hz, tempo_events)
+            .map_err(|error| format!("frame-to-tick conversion is invalid: {error}"))?;
+        let meter_events: Arc<[MeterEvent]> = meter_events.into();
+        musical_position(meter_events.as_ref(), 0)
+            .map_err(|error| format!("meter-map conversion is invalid: {error}"))?;
+        Ok(Self {
+            frames: Arc::new(frames),
+            meter_events,
+        })
+    }
+
+    fn format_position(&self, frame: usize) -> Option<String> {
+        let tick = self.frames.position_at_frame(frame).ok()?.whole_tick();
+        let position = musical_position(self.meter_events.as_ref(), tick).ok()?;
+        Some(format!(
+            "{}|{}|{:03}",
+            position.bar(),
+            position.beat(),
+            position.tick()
+        ))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -409,6 +450,7 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
                 )
             })?;
             let manifest = deployment.bundle().project().package().manifest();
+            let (project, ..) = deployment.bundle().project().session().parts();
             let facts = RuntimeFacts {
                 bundle_identity: hex_digest(deployment.bundle().bundle_sha256()),
                 deployment_generation: deployment.generation(),
@@ -417,6 +459,14 @@ fn start_runtime(arguments: &RuntimeArguments) -> Result<StartedRuntime, String>
                 project_id: manifest.project_id().to_owned(),
                 project_revision: manifest.revision(),
                 playback_extent: deployment.bundle().project().session().extent(),
+                musical_timeline: RuntimeMusicalTimeline::try_new(
+                    project.sample_rate_hz(),
+                    project.tempo_events(),
+                    project.meter_events(),
+                )
+                .map_err(|error| {
+                    format!("verified project musical timing could not be prepared: {error}")
+                })?,
             };
             Ok((facts, deployment.into_bundle().into_project()))
         },
@@ -2536,6 +2586,7 @@ struct OperatorObservationPresentation {
     transport_state: &'static str,
     transport_time: String,
     transport_frame: String,
+    transport_musical_position: String,
     stream_state: String,
     callback_count: String,
     stream_failures: String,
@@ -2757,6 +2808,7 @@ fn operator_peak_hold_presentation(measurement_available: bool, dbfs: f32) -> (S
 fn operator_observation_presentation(
     transport_state: PlaybackRecoveryTransportState,
     transport_frame: usize,
+    musical_timeline: &RuntimeMusicalTimeline,
     stream_state: OutputStreamState,
     counters: OutputStreamSnapshot,
     panel_connected: bool,
@@ -2769,6 +2821,9 @@ fn operator_observation_presentation(
         },
         transport_time: format_transport_time(transport_frame as u64),
         transport_frame: transport_frame.to_string(),
+        transport_musical_position: musical_timeline
+            .format_position(transport_frame)
+            .unwrap_or_else(|| "unavailable".to_owned()),
         stream_state: format!("{stream_state:?}"),
         callback_count: counters.callback_count.to_string(),
         stream_failures: counters.stream_error_count.to_string(),
@@ -2820,6 +2875,7 @@ fn apply_observations(
     let presentation = operator_observation_presentation(
         cycle.state(),
         cycle.position_frame(),
+        &observers.facts.musical_timeline,
         stream_state,
         counters,
         observers.panel_connected.load(Ordering::Acquire),
@@ -2828,6 +2884,7 @@ fn apply_observations(
     ui.set_transport_state(presentation.transport_state.into());
     ui.set_transport_time(presentation.transport_time.into());
     ui.set_transport_frame(presentation.transport_frame.into());
+    ui.set_transport_musical_position(presentation.transport_musical_position.into());
     ui.set_stream_state(presentation.stream_state.into());
     ui.set_callback_count(presentation.callback_count.into());
     ui.set_stream_failures(presentation.stream_failures.into());
@@ -2980,7 +3037,7 @@ mod tests {
     use hyper_audio_engine::{InterleavedStereoCallback, StereoOutput};
     use hyper_audio_source::DecodedAudio;
     use hyper_mixer_runtime::{PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime};
-    use hyper_playback_compiler::{graph::GraphLimits, scene::SceneLimits};
+    use hyper_playback_compiler::{MeterEvent, TempoEvent, graph::GraphLimits, scene::SceneLimits};
     use hyper_playback_session::{
         DecodedPlaybackAsset, PlaybackDocumentBytes, PlaybackSessionAssemblyInput,
         assemble_playback_session,
@@ -2992,6 +3049,86 @@ mod tests {
         assert!(
             (actual - expected).abs() <= f32::EPSILON,
             "{actual} != {expected}"
+        );
+    }
+
+    fn test_musical_timeline() -> RuntimeMusicalTimeline {
+        RuntimeMusicalTimeline::try_new(
+            SAMPLE_RATE_HZ,
+            &[TempoEvent {
+                tick: 0,
+                microseconds_per_quarter: 500_000,
+            }],
+            &[MeterEvent {
+                tick: 0,
+                numerator: 4,
+                denominator: 4,
+            }],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn runtime_musical_position_uses_the_verified_tempo_and_meter_maps() {
+        let timeline = RuntimeMusicalTimeline::try_new(
+            SAMPLE_RATE_HZ,
+            &[
+                TempoEvent {
+                    tick: 0,
+                    microseconds_per_quarter: 500_000,
+                },
+                TempoEvent {
+                    tick: 7_680,
+                    microseconds_per_quarter: 250_000,
+                },
+            ],
+            &[
+                MeterEvent {
+                    tick: 0,
+                    numerator: 4,
+                    denominator: 4,
+                },
+                MeterEvent {
+                    tick: 15_360,
+                    numerator: 3,
+                    denominator: 4,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(timeline.format_position(0).as_deref(), Some("1|1|000"));
+        assert_eq!(timeline.format_position(96_000).as_deref(), Some("2|1|000"));
+        assert_eq!(
+            timeline.format_position(144_000).as_deref(),
+            Some("3|1|000")
+        );
+        assert!(timeline.format_position(usize::MAX).is_some());
+        assert!(
+            RuntimeMusicalTimeline::try_new(
+                0,
+                &[TempoEvent {
+                    tick: 0,
+                    microseconds_per_quarter: 500_000,
+                }],
+                &[MeterEvent {
+                    tick: 0,
+                    numerator: 4,
+                    denominator: 4,
+                }],
+            )
+            .is_err()
+        );
+        assert!(
+            RuntimeMusicalTimeline::try_new(
+                SAMPLE_RATE_HZ,
+                &[TempoEvent {
+                    tick: 0,
+                    microseconds_per_quarter: 500_000,
+                }],
+                &[],
+            )
+            .is_err()
         );
     }
 
@@ -3683,6 +3820,12 @@ mod tests {
         })
         .unwrap();
         let (project, mixer, _, media) = session.parts();
+        let runtime_musical_timeline = RuntimeMusicalTimeline::try_new(
+            project.sample_rate_hz(),
+            project.tempo_events(),
+            project.meter_events(),
+        )
+        .unwrap();
         let facts: Vec<_> = media.media_asset_facts().collect();
         let graph = project
             .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
@@ -5882,6 +6025,7 @@ mod tests {
                 project_id: PROJECT_ID.to_owned(),
                 project_revision: 1,
                 playback_extent: PlaybackExtent::Bounded { end_frame: 1_500 },
+                musical_timeline: runtime_musical_timeline.clone(),
             },
             output_status: OutputStreamStatus::default(),
             output_counters: OutputStreamCounters::default(),
@@ -5890,6 +6034,7 @@ mod tests {
         };
         let _ = apply_observations(ui, &seek_observers, &seek_diagnostic);
         assert_eq!(ui.get_transport_frame().as_str(), "855");
+        assert_eq!(ui.get_transport_musical_position().as_str(), "1|1|034");
         let committed_frame = ui.get_transport_frame();
         revoke_operator_seek_authority(ui, &seek_authority);
         assert_eq!(seek_authority.get(), None);
@@ -5952,6 +6097,7 @@ mod tests {
             project_id: "project-night-drive".to_owned(),
             project_revision: u64::MAX - 1,
             playback_extent: PlaybackExtent::Bounded { end_frame: 1_500 },
+            musical_timeline: test_musical_timeline(),
         };
         let observers = RuntimeObservers {
             facts: facts.clone(),
@@ -5962,6 +6108,7 @@ mod tests {
         };
         apply_static_facts(&ui, &facts);
         let observation = apply_observations(&ui, &observers, &diagnostic);
+        assert_eq!(ui.get_transport_musical_position().as_str(), "1|1|000");
         apply_operator_loop_observation(&ui, &loop_authority, observation, facts.playback_extent);
         apply_operator_seek_observation(
             &ui,
@@ -6428,6 +6575,7 @@ mod tests {
         let presentation = operator_observation_presentation(
             PlaybackRecoveryTransportState::Rolling,
             usize::MAX,
+            &test_musical_timeline(),
             OutputStreamState::Failed,
             OutputStreamSnapshot {
                 callback_count: u64::MAX,
@@ -6448,6 +6596,7 @@ mod tests {
             format_transport_time(usize::MAX as u64)
         );
         assert_eq!(presentation.transport_frame, usize::MAX.to_string());
+        assert!(presentation.transport_musical_position.contains('|'));
         assert_eq!(presentation.stream_state, "Failed");
         assert_eq!(presentation.callback_count, u64::MAX.to_string());
         assert_eq!(presentation.stream_failures, (u64::MAX - 1).to_string());

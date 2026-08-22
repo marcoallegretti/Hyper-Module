@@ -401,6 +401,7 @@ export component OperatorWindow inherits Window {
     in property <string> transport-state;
     in property <string> transport-time;
     in property <string> transport-frame;
+    in property <string> transport-musical-position;
     in property <float> transport-position-percent: 0;
     in property <string> transport-seek-state: "Seek unavailable";
     in property <bool> transport-seek-enabled: false;
@@ -509,7 +510,7 @@ export component OperatorWindow inherits Window {
             FactCard {
                 label: "TRANSPORT";
                 value: root.transport-state + "  ·  " + root.transport-time;
-                detail: "frame " + root.transport-frame;
+                detail: "BBT " + root.transport-musical-position + "  ·  frame " + root.transport-frame;
             }
             FactCard { label: "SESSION LOOP"; value: root.loop-state; detail: root.loop-range; }
             FactCard { label: "AUDIO OWNER"; value: root.stream-state; }

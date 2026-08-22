@@ -20,6 +20,7 @@ hyper-control-runtime = { path = "../control-runtime" }
 hyper-desktop-audio = { path = "../../IDE/audio-backend" }
 hyper-media-cache = { path = "../../../crates/media-cache" }
 hyper-panel-protocol = { path = "../../../crates/panel-protocol" }
+hyper-playback-compiler = { path = "../../../crates/playback-compiler" }
 hyper-playback-json = { path = "../../../crates/playback-json" }
 hyper-playback-session = { path = "../../../crates/playback-session" }
 hyper-project-loader = { path = "../../../crates/project-loader" }
