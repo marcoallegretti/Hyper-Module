@@ -9769,6 +9769,41 @@ mod tests {
         );
     }
 
+    fn assert_project_creation_shortcut_contract(ui: &MainWindow) {
+        ui.set_app_mode(AppMode::Closed);
+        ui.set_new_project_visible(false);
+        ui.set_new_track_visible(false);
+        dispatch_ide_shortcut(ui, "n", false, false);
+        assert!(
+            ui.get_new_project_visible(),
+            "the primary new-project shortcut opens the same closed-state form as the button"
+        );
+
+        ui.set_new_project_visible(false);
+        dispatch_ide_shortcut(ui, "n", false, true);
+        dispatch_ide_shortcut(ui, "N", true, false);
+        assert!(
+            !ui.get_new_project_visible(),
+            "repeated and shifted new-project chords remain reserved rather than reopening a form"
+        );
+
+        ui.set_app_mode(AppMode::Running);
+        dispatch_ide_shortcut(ui, "n", false, false);
+        assert!(
+            !ui.get_new_project_visible(),
+            "a running project cannot be replaced by a keyboard form request"
+        );
+
+        ui.set_app_mode(AppMode::Closed);
+        ui.set_new_track_visible(true);
+        dispatch_ide_shortcut(ui, "n", false, false);
+        assert!(
+            !ui.get_new_project_visible(),
+            "the project form never interrupts an already-open track form"
+        );
+        ui.set_new_track_visible(false);
+    }
+
     fn assert_restore_shortcut_commands(
         submitted: &Rc<RefCell<Vec<IdeWorkerCommand>>>,
         message: &str,
@@ -12616,6 +12651,7 @@ mod tests {
         assert_window_contracts(&ui);
         assert_undo_redo_shortcut_contract(&ui);
         assert_project_save_shortcut_contract(&ui);
+        assert_project_creation_shortcut_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);
         ui.set_status_text("Choose a Runtime destination".into());
         ui.set_error_text("retained message".into());
