@@ -10244,6 +10244,64 @@ mod tests {
         ui.set_new_track_visible(false);
     }
 
+    fn assert_audio_import_shortcut_contract(ui: &MainWindow) {
+        let selected = Rc::new(RefCell::new(Vec::new()));
+        let selected_by_callback = Rc::clone(&selected);
+        ui.global::<IdeActions>()
+            .on_choose_audio_import(move |index| selected_by_callback.borrow_mut().push(index));
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_clips_visible(true);
+        ui.set_clip_rename_visible(false);
+        ui.set_clip_duplicate_visible(false);
+        ui.set_clip_remove_visible(false);
+        ui.set_clip_gain_visible(false);
+        ui.set_clip_fades_visible(false);
+        ui.set_clip_loop_visible(false);
+        ui.set_clip_source_slip_visible(false);
+        ui.set_clip_source_trim_visible(false);
+        ui.set_add_arrangement_placement_visible(false);
+        ui.set_audio_import_track_names(ModelRc::from(Rc::new(VecModel::from(vec![
+            SharedString::from("Audio A"),
+            SharedString::from("Audio B"),
+        ]))));
+        ui.set_selected_audio_import_track_index(1);
+
+        dispatch_ide_shortcut(ui, "i", false, false);
+        dispatch_ide_shortcut(ui, "i", false, true);
+        dispatch_ide_shortcut(ui, "I", true, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "i", false, true, false, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "i", false, false, true, false);
+        assert_eq!(
+            selected.borrow().as_slice(),
+            &[1],
+            "only the exact primary import chord reaches the existing destination-aware action"
+        );
+
+        ui.set_selected_audio_import_track_index(-1);
+        dispatch_ide_shortcut(ui, "i", false, false);
+        ui.set_selected_audio_import_track_index(0);
+        ui.set_clip_rename_visible(true);
+        dispatch_ide_shortcut(ui, "i", false, false);
+        ui.set_clip_rename_visible(false);
+        ui.set_app_mode(AppMode::ImportingAudio);
+        dispatch_ide_shortcut(ui, "i", false, false);
+        assert_eq!(
+            selected.borrow().as_slice(),
+            &[1],
+            "invalid destinations, local clip forms, and pending imports keep the shortcut unavailable"
+        );
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_clips_visible(false);
+        dispatch_ide_shortcut(ui, "i", false, false);
+        assert_eq!(
+            selected.borrow().as_slice(),
+            &[1],
+            "the shortcut stays contextual to the visible Audio Clips workspace"
+        );
+    }
+
     #[test]
     fn focused_line_edits_consume_the_project_close_chord() {
         i_slint_backend_testing::init_no_event_loop();
@@ -13259,6 +13317,7 @@ mod tests {
         assert_project_open_shortcut_contract(&ui);
         assert_audio_track_creation_shortcut_contract(&ui);
         assert_project_close_shortcut_contract(&ui);
+        assert_audio_import_shortcut_contract(&ui);
         assert_form_cancellation_shortcut_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);
         ui.set_status_text("Choose a Runtime destination".into());
