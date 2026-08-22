@@ -219,6 +219,21 @@ fn prepared_playback_runs_native_filter_before_the_mixer() {
             .any(|(baseline, filtered)| baseline.to_bits() != filtered.to_bits())
     );
     assert_eq!(baseline.1.map(f32::to_bits), filtered.1.map(f32::to_bits));
+
+    let duplicated_chain = filtered_chain
+        .try_with_duplicated_device(
+            filtered_chain.devices()[0].id(),
+            "018f47a2-6b2d-7c11-8a44-00112233647a".to_owned(),
+        )
+        .unwrap();
+    let duplicated = render_with_device_chain(Some(&duplicated_chain));
+    assert!(
+        filtered
+            .0
+            .iter()
+            .zip(duplicated.0)
+            .any(|(filtered, duplicated)| filtered.to_bits() != duplicated.to_bits())
+    );
 }
 
 #[test]

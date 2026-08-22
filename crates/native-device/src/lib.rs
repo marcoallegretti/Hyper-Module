@@ -268,6 +268,21 @@ impl NativeDeviceInstance {
         Ok(instance)
     }
 
+    /// Returns this supported device with a new stable instance identity.
+    ///
+    /// This preserves the device kind, version, enabled state, parameter
+    /// state, and extension data for durable processor duplication.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when the replacement identity is invalid.
+    pub fn try_with_id(&self, id: String) -> Result<Self, DeviceChainError> {
+        let mut device = self.clone();
+        device.id = id;
+        validate_device(&device)?;
+        Ok(device)
+    }
+
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
@@ -710,6 +725,36 @@ impl DeviceChain {
         let mut devices = self.devices.clone();
         let device = devices.remove(source_index);
         devices.insert(destination_index, device);
+        self.try_with_devices(devices)
+    }
+
+    /// Returns a copy with one existing device duplicated immediately after
+    /// the source device.
+    ///
+    /// The new instance receives the supplied identity while preserving the
+    /// source kind, version, state, enabled flag, and extension data.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when the source is absent, the new identity is
+    /// invalid or already present, or the resulting chain exceeds its bound.
+    pub fn try_with_duplicated_device(
+        &self,
+        source_device_instance_id: &str,
+        duplicate_device_instance_id: String,
+    ) -> Result<Self, DeviceChainError> {
+        let Some(source_index) = self
+            .devices
+            .iter()
+            .position(|device| device.id() == source_device_instance_id)
+        else {
+            return Err(invalid_domain(
+                "native device instance does not exist in this chain",
+            ));
+        };
+        let duplicate = self.devices[source_index].try_with_id(duplicate_device_instance_id)?;
+        let mut devices = self.devices.clone();
+        devices.insert(source_index + 1, duplicate);
         self.try_with_devices(devices)
     }
 
@@ -1468,6 +1513,83 @@ mod tests {
         assert!(chain.try_with_moved_device(second_id, 1).is_err());
         assert!(chain.try_with_moved_device("missing", 0).is_err());
         assert!(chain.try_with_moved_device(second_id, 2).is_err());
+    }
+
+    #[test]
+    fn duplicating_a_device_preserves_state_and_requires_a_new_identity() {
+        let source_id = "018f47a2-6b2d-7c11-8a44-001122338004";
+        let duplicate_id = "018f47a2-6b2d-7c11-8a44-001122338005";
+        let source_chain = chain(true)
+            .try_with_appended_compressor(source_id.to_owned(), false, compressor_state())
+            .unwrap();
+        let mut source_wire: Value = serde_json::from_slice(&source_chain.to_canonical_vec().unwrap()).unwrap();
+        source_wire["devices"][1]["extensions"] = serde_json::json!({
+            "org.example.fixture": { "retained": true }
+        });
+        let source_chain = DeviceChain::parse(&serde_json::to_vec(&source_wire).unwrap()).unwrap();
+        let source_bytes = source_chain.to_canonical_vec().unwrap();
+
+        let duplicated = source_chain
+            .try_with_duplicated_device(source_id, duplicate_id.to_owned())
+            .unwrap();
+        assert_eq!(
+            duplicated
+                .devices()
+                .iter()
+                .map(NativeDeviceInstance::id)
+                .collect::<Vec<_>>(),
+            [DEVICE_ID, source_id, duplicate_id]
+        );
+        assert_eq!(duplicated.devices()[1].device_id(), duplicated.devices()[2].device_id());
+        assert_eq!(duplicated.devices()[1].state(), duplicated.devices()[2].state());
+        assert_eq!(duplicated.devices()[1].enabled(), duplicated.devices()[2].enabled());
+        assert_eq!(duplicated.devices()[1].extensions(), duplicated.devices()[2].extensions());
+        assert_eq!(
+            duplicated.devices()[2].extensions()["org.example.fixture"],
+            serde_json::json!({ "retained": true })
+        );
+        assert_eq!(duplicated.format_version(), CURRENT_FORMAT_VERSION);
+        assert_eq!(
+            DeviceChain::parse(&duplicated.to_canonical_vec().unwrap()).unwrap(),
+            duplicated
+        );
+        assert!(source_chain
+            .try_with_duplicated_device(source_id, source_id.to_owned())
+            .is_err());
+        assert_eq!(source_chain.to_canonical_vec().unwrap(), source_bytes);
+        assert_eq!(
+            source_chain
+                .try_with_duplicated_device(source_id, "not a device identity".to_owned())
+                .unwrap_err()
+                .kind(),
+            DeviceChainErrorKind::InvalidDomain
+        );
+        assert_eq!(source_chain.to_canonical_vec().unwrap(), source_bytes);
+        assert!(source_chain
+            .try_with_duplicated_device("missing", duplicate_id.to_owned())
+            .is_err());
+
+        let mut full = chain(true);
+        for id in [
+            "018f47a2-6b2d-7c11-8a44-001122338006",
+            "018f47a2-6b2d-7c11-8a44-001122338007",
+            "018f47a2-6b2d-7c11-8a44-001122338008",
+            "018f47a2-6b2d-7c11-8a44-001122338009",
+            "018f47a2-6b2d-7c11-8a44-001122338010",
+            "018f47a2-6b2d-7c11-8a44-001122338011",
+            "018f47a2-6b2d-7c11-8a44-001122338012",
+        ] {
+            full = full
+                .try_with_appended_filter(id.to_owned(), true, state(NativeFilterMode::LowPass))
+                .unwrap();
+        }
+        assert_eq!(full.devices().len(), MAX_DEVICES_PER_CHAIN);
+        assert!(full
+            .try_with_duplicated_device(
+                DEVICE_ID,
+                "018f47a2-6b2d-7c11-8a44-001122338013".to_owned(),
+            )
+            .is_err());
     }
 
     #[test]

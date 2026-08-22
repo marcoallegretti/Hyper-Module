@@ -1316,6 +1316,18 @@ fn bind_native_filter_callbacks_with(
     });
 
     let weak = ui.as_weak();
+    let submit_duplicate = Rc::clone(&submitter);
+    actions.on_duplicate_native_device(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        match native_device_duplication(ui.get_app_mode(), &ui.get_native_devices(), index) {
+            Ok(edit) => submit_duplicate(&ui, IdeWorkerCommand::EditNativeFilter { edit }),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+
+    let weak = ui.as_weak();
     let submit_remove = submitter;
     actions.on_remove_native_filter(move |index| {
         let Some(ui) = weak.upgrade() else {
@@ -1439,6 +1451,21 @@ fn native_device_move(
         chain_id: row.chain_id.to_string(),
         device_instance_id: row.device_instance_id.to_string(),
         destination_index,
+    })
+}
+
+fn native_device_duplication(
+    mode: AppMode,
+    devices: &ModelRc<NativeDeviceRow>,
+    index: i32,
+) -> Result<IdeNativeFilterEdit, &'static str> {
+    let row = native_filter_row(mode, devices, index)?;
+    if !row.can_duplicate {
+        return Err("The selected native device chain cannot contain another device");
+    }
+    Ok(IdeNativeFilterEdit::Duplicate {
+        chain_id: row.chain_id.to_string(),
+        device_instance_id: row.device_instance_id.to_string(),
     })
 }
 
@@ -6663,9 +6690,9 @@ fn native_device_rows(
                 .iter()
                 .find(|channel| channel.id() == track_id)
                 .map_or(track_id, IdeMixerChannel::name);
-            let (can_move_earlier, can_move_later) = match device {
-                IdeNativeDevice::Filter(filter) => (filter.can_move_earlier(), filter.can_move_later()),
-                IdeNativeDevice::Compressor(compressor) => (compressor.can_move_earlier(), compressor.can_move_later()),
+            let (can_move_earlier, can_move_later, can_duplicate) = match device {
+                IdeNativeDevice::Filter(filter) => (filter.can_move_earlier(), filter.can_move_later(), filter.can_duplicate()),
+                IdeNativeDevice::Compressor(compressor) => (compressor.can_move_earlier(), compressor.can_move_later(), compressor.can_duplicate()),
             };
             NativeDeviceRow {
                 index: i32::try_from(index).unwrap_or(-1),
@@ -6676,6 +6703,7 @@ fn native_device_rows(
                 enabled,
                 can_move_earlier,
                 can_move_later,
+                can_duplicate,
                 kind_index,
                 kind_name: kind_name.into(),
                 detail: detail.into(),
@@ -10093,6 +10121,7 @@ mod tests {
                 enabled: true,
                 can_move_earlier: false,
                 can_move_later: true,
+                can_duplicate: true,
                 kind_index: 0,
                 kind_name: "FILTER".into(),
                 detail: "1250 Hz · Q 0.707".into(),
@@ -10109,7 +10138,7 @@ mod tests {
                 makeup_millidecibels: "".into(),
             },
             NativeDeviceRow {
-                index: 1, chain_id: "chain-a".into(), device_instance_id: "device-b".into(), track_id: "track-a".into(), track_name: "Audio".into(), enabled: true, can_move_earlier: true, can_move_later: false,
+                index: 1, chain_id: "chain-a".into(), device_instance_id: "device-b".into(), track_id: "track-a".into(), track_name: "Audio".into(), enabled: true, can_move_earlier: true, can_move_later: false, can_duplicate: true,
                 kind_index: 1, kind_name: "COMPRESSOR".into(), detail: "-18 dB · 4:1".into(), mode_index: 0, mode_name: "".into(), cutoff_millihertz: "".into(), cutoff_label: "".into(), resonance_millionths: "".into(), resonance_label: "".into(),
                 threshold_millidecibels: "-18000".into(), ratio_millionths: "4000000".into(), attack_microseconds: "10000".into(), release_microseconds: "100000".into(), makeup_millidecibels: "0".into(),
             },
@@ -10130,13 +10159,14 @@ mod tests {
         actions.invoke_add_native_compressor(0, "-24000".into(), "2000000".into(), "5000".into(), "80000".into(), "3000".into());
         actions.invoke_update_native_compressor(1, false, "-12000".into(), "6000000".into(), "2000".into(), "60000".into(), "1000".into());
         actions.invoke_move_native_device(0, 1);
+        actions.invoke_duplicate_native_device(1);
         actions.invoke_move_native_device(0, -1);
         actions.invoke_add_native_filter(0, 0, "19999".into(), "707000".into());
         assert!(ui.get_error_text().contains("Cutoff"));
         actions.invoke_remove_native_filter(-1);
 
         let commands = submitted.borrow();
-        assert_eq!(commands.len(), 6);
+        assert_eq!(commands.len(), 7);
         assert!(matches!(
             &commands[0],
             IdeWorkerCommand::EditNativeFilter {
@@ -10182,8 +10212,44 @@ mod tests {
             &commands[5],
             IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Move { chain_id, device_instance_id, destination_index: 1 } } if chain_id == "chain-a" && device_instance_id == "device-a"
         ));
+        assert!(matches!(
+            &commands[6],
+            IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Duplicate { chain_id, device_instance_id } } if chain_id == "chain-a" && device_instance_id == "device-b"
+        ));
         drop(commands);
         assert!(ui.get_error_text().contains("no longer available"));
+
+        ui.set_native_devices(ModelRc::from(Rc::new(VecModel::from(vec![NativeDeviceRow {
+            index: 0,
+            chain_id: "chain-a".into(),
+            device_instance_id: "device-a".into(),
+            track_id: "track-a".into(),
+            track_name: "Audio".into(),
+            enabled: true,
+            can_move_earlier: false,
+            can_move_later: false,
+            can_duplicate: false,
+            kind_index: 0,
+            kind_name: "FILTER".into(),
+            detail: "1250 Hz · Q 0.707".into(),
+            mode_index: 0,
+            mode_name: "LOW-PASS".into(),
+            cutoff_millihertz: "1250000".into(),
+            cutoff_label: "1250 Hz".into(),
+            resonance_millionths: "707000".into(),
+            resonance_label: "Q 0.707".into(),
+            threshold_millidecibels: "".into(),
+            ratio_millionths: "".into(),
+            attack_microseconds: "".into(),
+            release_microseconds: "".into(),
+            makeup_millidecibels: "".into(),
+        }]))));
+        actions.invoke_duplicate_native_device(0);
+        assert_eq!(submitted.borrow().len(), 7);
+        assert_eq!(
+            ui.get_error_text(),
+            "The selected native device chain cannot contain another device"
+        );
         assert_native_filter_pending_modes();
 
         apply_native_filter_event(

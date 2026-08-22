@@ -119,6 +119,7 @@ export struct NativeDeviceRow {
     enabled: bool,
     can-move-earlier: bool,
     can-move-later: bool,
+    can-duplicate: bool,
     kind-index: int,
     kind-name: string,
     detail: string,
@@ -284,6 +285,7 @@ export global IdeActions {
     callback add-native-compressor(int, string, string, string, string, string);
     callback update-native-compressor(int, bool, string, string, string, string, string);
     callback move-native-device(int, int);
+    callback duplicate-native-device(int);
     callback remove-native-filter(int);
     callback add-automation-take(string, int, int, string, string, string);
     callback set-automation-take-active(string, bool);
@@ -2083,6 +2085,12 @@ export component MainWindow inherits Window {
                                         accessible-label: "Move native device later in its chain";
                                         enabled: root.app-mode == AppMode.running && filter.can-move-later && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
                                         clicked => { IdeActions.move-native-device(filter.index, 1); }
+                                    }
+                                    Button {
+                                        text: "Duplicate";
+                                        accessible-label: "Duplicate native device in its chain";
+                                        enabled: root.app-mode == AppMode.running && filter.can-duplicate && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
+                                        clicked => { IdeActions.duplicate-native-device(filter.index); }
                                     }
                                     Button {
                                         text: "Edit";

@@ -137,7 +137,8 @@ pub use hyper_native_device::{
     MIN_COMPRESSOR_ATTACK_MICROSECONDS, MIN_COMPRESSOR_MAKEUP_MILLIDECIBELS,
     MIN_COMPRESSOR_RATIO_MILLIONTHS, MIN_COMPRESSOR_RELEASE_MICROSECONDS,
     MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
-    MIN_FILTER_CUTOFF_MILLIHERTZ, MIN_FILTER_RESONANCE_MILLIONTHS, NativeFilterMode,
+    MIN_FILTER_CUTOFF_MILLIHERTZ, MIN_FILTER_RESONANCE_MILLIONTHS,
+    MAX_DEVICES_PER_CHAIN, NativeFilterMode,
 };
 use hyper_native_device::{
     DeviceChain, DeviceChainError, NativeCompressorState, NativeDeviceInstance, NativeFilterState,
@@ -3778,6 +3779,10 @@ pub enum IdeNativeFilterEdit {
         chain_id: String,
         device_instance_id: String,
         destination_index: usize,
+    },
+    Duplicate {
+        chain_id: String,
+        device_instance_id: String,
     },
     Remove {
         chain_id: String,
@@ -10021,6 +10026,28 @@ impl RunningDesktopIdeApplication {
                 let chain = find_native_filter_chain(prepared, chain_id, device_instance_id)?;
                 let changed = chain
                     .try_with_moved_device(device_instance_id, *destination_index)
+                    .map_err(IdeNativeFilterEditError::Device)?;
+                (
+                    chain_id.clone(),
+                    IdeNativeFilterPublication::Replacement(
+                        serialize_native_filter_chain(&changed)?,
+                    ),
+                    IdeHistoryOperation::ResourceReplacement {
+                        resource_id: chain.id().to_owned(),
+                        bytes: serialize_native_filter_chain(chain)?,
+                    },
+                )
+            }
+            IdeNativeFilterEdit::Duplicate {
+                chain_id,
+                device_instance_id,
+            } => {
+                let chain = find_native_filter_chain(prepared, chain_id, device_instance_id)?;
+                let changed = chain
+                    .try_with_duplicated_device(
+                        device_instance_id,
+                        uuid::Uuid::new_v4().to_string(),
+                    )
                     .map_err(IdeNativeFilterEditError::Device)?;
                 (
                     chain_id.clone(),

@@ -55,6 +55,7 @@ use super::{
     IdeSceneSlotEditError, IdeTempoEditError, IdeTransportSeekError, IdeUnusedSampleCleanupError,
     IdeUnusedSampleCleanupSummary, InputInventoryError,
     LocateState, OutputInventoryError, OutputStreamSnapshot, OutputStreamState,
+    MAX_DEVICES_PER_CHAIN,
     OutputTestingDesktopIdeApplication, RunningDesktopIdeApplication, RunningIdeSnapshot,
 };
 
@@ -712,13 +713,19 @@ pub struct IdeRunningObservation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct IdeNativeDeviceEditing {
+    can_move_earlier: bool,
+    can_move_later: bool,
+    can_duplicate: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdeNativeFilter {
     chain_id: String,
     device_instance_id: String,
     track_id: String,
     enabled: bool,
-    can_move_earlier: bool,
-    can_move_later: bool,
+    editing: IdeNativeDeviceEditing,
     mode: NativeFilterMode,
     cutoff_millihertz: u32,
     resonance_millionths: u32,
@@ -730,8 +737,7 @@ pub struct IdeNativeCompressor {
     device_instance_id: String,
     track_id: String,
     enabled: bool,
-    can_move_earlier: bool,
-    can_move_later: bool,
+    editing: IdeNativeDeviceEditing,
     threshold_millidecibels: i32,
     ratio_millionths: u32,
     attack_microseconds: u32,
@@ -755,9 +761,11 @@ impl IdeNativeCompressor {
     #[must_use]
     pub const fn enabled(&self) -> bool { self.enabled }
     #[must_use]
-    pub const fn can_move_earlier(&self) -> bool { self.can_move_earlier }
+    pub const fn can_move_earlier(&self) -> bool { self.editing.can_move_earlier }
     #[must_use]
-    pub const fn can_move_later(&self) -> bool { self.can_move_later }
+    pub const fn can_move_later(&self) -> bool { self.editing.can_move_later }
+    #[must_use]
+    pub const fn can_duplicate(&self) -> bool { self.editing.can_duplicate }
     #[must_use]
     pub const fn threshold_millidecibels(&self) -> i32 { self.threshold_millidecibels }
     #[must_use]
@@ -793,12 +801,17 @@ impl IdeNativeFilter {
 
     #[must_use]
     pub const fn can_move_earlier(&self) -> bool {
-        self.can_move_earlier
+        self.editing.can_move_earlier
     }
 
     #[must_use]
     pub const fn can_move_later(&self) -> bool {
-        self.can_move_later
+        self.editing.can_move_later
+    }
+
+    #[must_use]
+    pub const fn can_duplicate(&self) -> bool {
+        self.editing.can_duplicate
     }
 
     #[must_use]
@@ -11585,8 +11598,11 @@ fn running_observation(
                     device_instance_id: try_project_owned(device.id())?,
                     track_id: try_project_owned(chain.track_id())?,
                     enabled: device.enabled(),
-                    can_move_earlier: device_index > 0,
-                    can_move_later: device_index + 1 < chain_length,
+                    editing: IdeNativeDeviceEditing {
+                        can_move_earlier: device_index > 0,
+                        can_move_later: device_index + 1 < chain_length,
+                        can_duplicate: chain_length < MAX_DEVICES_PER_CHAIN,
+                    },
                     mode: state.mode(),
                     cutoff_millihertz: state.cutoff_millihertz(),
                     resonance_millionths: state.resonance_millionths(),
@@ -11600,8 +11616,11 @@ fn running_observation(
                     device_instance_id: try_project_owned(device.id())?,
                     track_id: try_project_owned(chain.track_id())?,
                     enabled: device.enabled(),
-                    can_move_earlier: device_index > 0,
-                    can_move_later: device_index + 1 < chain_length,
+                    editing: IdeNativeDeviceEditing {
+                        can_move_earlier: device_index > 0,
+                        can_move_later: device_index + 1 < chain_length,
+                        can_duplicate: chain_length < MAX_DEVICES_PER_CHAIN,
+                    },
                     threshold_millidecibels: state.threshold_millidecibels(),
                     ratio_millionths: state.ratio_millionths(),
                     attack_microseconds: state.attack_microseconds(),
@@ -12852,6 +12871,119 @@ mod tests {
                     && compressor.device_instance_id() == compressor_id
         ));
         assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 7, redo: false, label: "native device" }));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker scenario retains the generated duplicate identity across publication, undo, and redo"
+    )]
+    fn native_device_duplication_is_durable_and_undoable_through_the_real_worker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-native-device-duplicate-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+        let worker = DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker.try_send(IdeWorkerCommand::OpenProject(project)).unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else { panic!("the project must open"); };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .unwrap()
+            .id()
+            .to_owned();
+
+        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::AddCompressor {
+            track_id,
+            threshold_millidecibels: -21_000,
+            ratio_millionths: 3_000_000,
+            attack_microseconds: 6_000,
+            release_microseconds: 90_000,
+            makeup_millidecibels: 1_500,
+        }}).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        let IdeWorkerEvent::Running(added) = recv(&worker) else { panic!("the source device must reopen"); };
+        let IdeNativeDevice::Compressor(source) = &added.native_devices()[0] else { panic!("the source must be a compressor"); };
+        let chain_id = source.chain_id().to_owned();
+        let source_id = source.device_instance_id().to_owned();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 2, .. }));
+
+        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Duplicate {
+            chain_id: chain_id.clone(),
+            device_instance_id: source_id.clone(),
+        }}).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { undo_label: Some("native device"), .. }));
+        let IdeWorkerEvent::Running(duplicated) = recv(&worker) else { panic!("the duplicated chain must reopen"); };
+        let [IdeNativeDevice::Compressor(source), IdeNativeDevice::Compressor(duplicate)] = duplicated.native_devices() else {
+            panic!("duplication must preserve the source and append one same-kind device");
+        };
+        assert_eq!(source.device_instance_id(), source_id);
+        assert_ne!(source.device_instance_id(), duplicate.device_instance_id());
+        assert_eq!(source.chain_id(), chain_id);
+        assert_eq!(duplicate.chain_id(), chain_id);
+        assert_eq!(source.threshold_millidecibels(), duplicate.threshold_millidecibels());
+        assert_eq!(source.ratio_millionths(), duplicate.ratio_millionths());
+        assert_eq!(source.attack_microseconds(), duplicate.attack_microseconds());
+        assert_eq!(source.release_microseconds(), duplicate.release_microseconds());
+        assert_eq!(source.makeup_millidecibels(), duplicate.makeup_millidecibels());
+        let duplicate_id = duplicate.device_instance_id().to_owned();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 3, .. }));
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, label: "native device" }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { redo_label: Some("native device"), .. }));
+        let IdeWorkerEvent::Running(undone) = recv(&worker) else { panic!("undo must restore the one-device chain"); };
+        assert!(matches!(undone.native_devices(), [IdeNativeDevice::Compressor(source)] if source.device_instance_id() == source_id));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 4, redo: false, label: "native device" }));
+
+        worker.try_send(IdeWorkerCommand::Redo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: true, label: "native device" }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { undo_label: Some("native device"), redo_label: None }));
+        let IdeWorkerEvent::Running(redone) = recv(&worker) else { panic!("redo must restore the duplicated chain"); };
+        assert!(matches!(
+            redone.native_devices(),
+            [IdeNativeDevice::Compressor(source), IdeNativeDevice::Compressor(duplicate)]
+                if source.device_instance_id() == source_id
+                    && duplicate.device_instance_id() == duplicate_id
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 5, redo: true, label: "native device" }));
+
+        for expected_device_count in 3..=MAX_DEVICES_PER_CHAIN {
+            worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Duplicate {
+                chain_id: chain_id.clone(),
+                device_instance_id: source_id.clone(),
+            }}).unwrap();
+            assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+            assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+            let IdeWorkerEvent::Running(full_chain) = recv(&worker) else {
+                panic!("each duplicate must reopen the authoritative chain");
+            };
+            assert_eq!(full_chain.native_devices().len(), expected_device_count);
+            if expected_device_count == MAX_DEVICES_PER_CHAIN {
+                assert!(full_chain.native_devices().iter().all(|device| match device {
+                    IdeNativeDevice::Filter(filter) => !filter.can_duplicate(),
+                    IdeNativeDevice::Compressor(compressor) => !compressor.can_duplicate(),
+                }));
+            }
+            assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { .. }));
+        }
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
