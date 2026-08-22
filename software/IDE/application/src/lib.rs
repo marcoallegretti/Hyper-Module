@@ -3774,6 +3774,11 @@ pub enum IdeNativeFilterEdit {
         release_microseconds: u32,
         makeup_millidecibels: i32,
     },
+    Move {
+        chain_id: String,
+        device_instance_id: String,
+        destination_index: usize,
+    },
     Remove {
         chain_id: String,
         device_instance_id: String,
@@ -9996,6 +10001,26 @@ impl RunningDesktopIdeApplication {
                             *makeup_millidecibels,
                         )?,
                     )
+                    .map_err(IdeNativeFilterEditError::Device)?;
+                (
+                    chain_id.clone(),
+                    IdeNativeFilterPublication::Replacement(
+                        serialize_native_filter_chain(&changed)?,
+                    ),
+                    IdeHistoryOperation::ResourceReplacement {
+                        resource_id: chain.id().to_owned(),
+                        bytes: serialize_native_filter_chain(chain)?,
+                    },
+                )
+            }
+            IdeNativeFilterEdit::Move {
+                chain_id,
+                device_instance_id,
+                destination_index,
+            } => {
+                let chain = find_native_filter_chain(prepared, chain_id, device_instance_id)?;
+                let changed = chain
+                    .try_with_moved_device(device_instance_id, *destination_index)
                     .map_err(IdeNativeFilterEditError::Device)?;
                 (
                     chain_id.clone(),

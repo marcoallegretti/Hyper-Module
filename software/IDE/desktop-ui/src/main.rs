@@ -1304,6 +1304,18 @@ fn bind_native_filter_callbacks_with(
     });
 
     let weak = ui.as_weak();
+    let submit_move = Rc::clone(&submitter);
+    actions.on_move_native_device(move |index, offset| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        match native_device_move(ui.get_app_mode(), &ui.get_native_devices(), index, offset) {
+            Ok(edit) => submit_move(&ui, IdeWorkerCommand::EditNativeFilter { edit }),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+
+    let weak = ui.as_weak();
     let submit_remove = submitter;
     actions.on_remove_native_filter(move |index| {
         let Some(ui) = weak.upgrade() else {
@@ -1390,6 +1402,43 @@ fn native_filter_removal(
     Ok(IdeNativeFilterEdit::Remove {
         chain_id: row.chain_id.to_string(),
         device_instance_id: row.device_instance_id.to_string(),
+    })
+}
+
+fn native_device_move(
+    mode: AppMode,
+    devices: &ModelRc<NativeDeviceRow>,
+    index: i32,
+    offset: i32,
+) -> Result<IdeNativeFilterEdit, &'static str> {
+    let row = native_filter_row(mode, devices, index)?;
+    let next_index = index
+        .checked_add(offset)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or("The selected native device cannot move beyond its chain")?;
+    let target = devices
+        .row_data(next_index)
+        .filter(|target| target.chain_id == row.chain_id)
+        .ok_or("The selected native device cannot move beyond its chain")?;
+    let permitted = match offset {
+        -1 => row.can_move_earlier,
+        1 => row.can_move_later,
+        _ => false,
+    };
+    if !permitted {
+        return Err("The selected native device cannot move beyond its chain");
+    }
+    let destination_index = (0..next_index)
+        .filter_map(|candidate| devices.row_data(candidate))
+        .filter(|candidate| candidate.chain_id == row.chain_id)
+        .count();
+    if target.device_instance_id.is_empty() {
+        return Err("The selected native device is no longer available");
+    }
+    Ok(IdeNativeFilterEdit::Move {
+        chain_id: row.chain_id.to_string(),
+        device_instance_id: row.device_instance_id.to_string(),
+        destination_index,
     })
 }
 
@@ -6614,6 +6663,10 @@ fn native_device_rows(
                 .iter()
                 .find(|channel| channel.id() == track_id)
                 .map_or(track_id, IdeMixerChannel::name);
+            let (can_move_earlier, can_move_later) = match device {
+                IdeNativeDevice::Filter(filter) => (filter.can_move_earlier(), filter.can_move_later()),
+                IdeNativeDevice::Compressor(compressor) => (compressor.can_move_earlier(), compressor.can_move_later()),
+            };
             NativeDeviceRow {
                 index: i32::try_from(index).unwrap_or(-1),
                 chain_id: chain_id.into(),
@@ -6621,6 +6674,8 @@ fn native_device_rows(
                 track_id: track_id.into(),
                 track_name: track_name.into(),
                 enabled,
+                can_move_earlier,
+                can_move_later,
                 kind_index,
                 kind_name: kind_name.into(),
                 detail: detail.into(),
@@ -10036,6 +10091,8 @@ mod tests {
                 track_id: "track-a".into(),
                 track_name: "Audio".into(),
                 enabled: true,
+                can_move_earlier: false,
+                can_move_later: true,
                 kind_index: 0,
                 kind_name: "FILTER".into(),
                 detail: "1250 Hz · Q 0.707".into(),
@@ -10052,7 +10109,7 @@ mod tests {
                 makeup_millidecibels: "".into(),
             },
             NativeDeviceRow {
-                index: 1, chain_id: "chain-a".into(), device_instance_id: "device-b".into(), track_id: "track-a".into(), track_name: "Audio".into(), enabled: true,
+                index: 1, chain_id: "chain-a".into(), device_instance_id: "device-b".into(), track_id: "track-a".into(), track_name: "Audio".into(), enabled: true, can_move_earlier: true, can_move_later: false,
                 kind_index: 1, kind_name: "COMPRESSOR".into(), detail: "-18 dB · 4:1".into(), mode_index: 0, mode_name: "".into(), cutoff_millihertz: "".into(), cutoff_label: "".into(), resonance_millionths: "".into(), resonance_label: "".into(),
                 threshold_millidecibels: "-18000".into(), ratio_millionths: "4000000".into(), attack_microseconds: "10000".into(), release_microseconds: "100000".into(), makeup_millidecibels: "0".into(),
             },
@@ -10072,12 +10129,14 @@ mod tests {
         actions.invoke_remove_native_filter(0);
         actions.invoke_add_native_compressor(0, "-24000".into(), "2000000".into(), "5000".into(), "80000".into(), "3000".into());
         actions.invoke_update_native_compressor(1, false, "-12000".into(), "6000000".into(), "2000".into(), "60000".into(), "1000".into());
+        actions.invoke_move_native_device(0, 1);
+        actions.invoke_move_native_device(0, -1);
         actions.invoke_add_native_filter(0, 0, "19999".into(), "707000".into());
         assert!(ui.get_error_text().contains("Cutoff"));
         actions.invoke_remove_native_filter(-1);
 
         let commands = submitted.borrow();
-        assert_eq!(commands.len(), 5);
+        assert_eq!(commands.len(), 6);
         assert!(matches!(
             &commands[0],
             IdeWorkerCommand::EditNativeFilter {
@@ -10118,6 +10177,10 @@ mod tests {
         assert!(matches!(
             &commands[4],
             IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::UpdateCompressor { chain_id, device_instance_id, enabled: false, threshold_millidecibels: -12_000, ratio_millionths: 6_000_000, attack_microseconds: 2_000, release_microseconds: 60_000, makeup_millidecibels: 1_000 } } if chain_id == "chain-a" && device_instance_id == "device-b"
+        ));
+        assert!(matches!(
+            &commands[5],
+            IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Move { chain_id, device_instance_id, destination_index: 1 } } if chain_id == "chain-a" && device_instance_id == "device-a"
         ));
         drop(commands);
         assert!(ui.get_error_text().contains("no longer available"));

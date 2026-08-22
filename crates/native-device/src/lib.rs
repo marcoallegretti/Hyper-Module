@@ -674,6 +674,45 @@ impl DeviceChain {
         self.try_with_devices(devices)
     }
 
+    /// Returns a copy with one existing device moved to a new processing index.
+    ///
+    /// The device instance and every other device remain unchanged; only the
+    /// explicit processing order changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when the device identity is absent, the target
+    /// index is outside this chain, or the requested position is unchanged.
+    pub fn try_with_moved_device(
+        &self,
+        device_instance_id: &str,
+        destination_index: usize,
+    ) -> Result<Self, DeviceChainError> {
+        let Some(source_index) = self
+            .devices
+            .iter()
+            .position(|device| device.id() == device_instance_id)
+        else {
+            return Err(invalid_domain(
+                "native device instance does not exist in this chain",
+            ));
+        };
+        if destination_index >= self.devices.len() {
+            return Err(invalid_domain(
+                "native device destination is outside this chain",
+            ));
+        }
+        if source_index == destination_index {
+            return Err(invalid_domain(
+                "native device is already at the requested processing position",
+            ));
+        }
+        let mut devices = self.devices.clone();
+        let device = devices.remove(source_index);
+        devices.insert(destination_index, device);
+        self.try_with_devices(devices)
+    }
+
     /// Returns a copy without one device, or `None` when removing it empties
     /// the chain and therefore requires deleting the chain resource.
     ///
@@ -1406,6 +1445,29 @@ mod tests {
         assert_eq!(reduced.devices()[0].id(), second_id);
         assert!(reduced.try_without_device(second_id).unwrap().is_none());
         assert!(reduced.try_without_device(DEVICE_ID).is_err());
+    }
+
+    #[test]
+    fn moving_a_device_changes_only_processing_order() {
+        let second_id = "018f47a2-6b2d-7c11-8a44-001122338004";
+        let chain = chain(true)
+            .try_with_appended_compressor(second_id.to_owned(), false, compressor_state())
+            .unwrap();
+        let moved = chain.try_with_moved_device(DEVICE_ID, 1).unwrap();
+        assert_eq!(
+            moved.devices().iter().map(NativeDeviceInstance::id).collect::<Vec<_>>(),
+            [second_id, DEVICE_ID]
+        );
+        assert_eq!(moved.devices()[0].compressor_state(), Some(compressor_state()));
+        assert!(!moved.devices()[0].enabled());
+        assert_eq!(moved.devices()[1].filter_state(), Some(state(NativeFilterMode::LowPass)));
+        assert!(moved.devices()[1].enabled());
+        assert_eq!(moved.to_canonical_vec().unwrap(), DeviceChain::parse(&moved.to_canonical_vec().unwrap()).unwrap().to_canonical_vec().unwrap());
+        let restored = moved.try_with_moved_device(DEVICE_ID, 0).unwrap();
+        assert_eq!(restored.to_canonical_vec().unwrap(), chain.to_canonical_vec().unwrap());
+        assert!(chain.try_with_moved_device(second_id, 1).is_err());
+        assert!(chain.try_with_moved_device("missing", 0).is_err());
+        assert!(chain.try_with_moved_device(second_id, 2).is_err());
     }
 
     #[test]

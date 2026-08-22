@@ -717,6 +717,8 @@ pub struct IdeNativeFilter {
     device_instance_id: String,
     track_id: String,
     enabled: bool,
+    can_move_earlier: bool,
+    can_move_later: bool,
     mode: NativeFilterMode,
     cutoff_millihertz: u32,
     resonance_millionths: u32,
@@ -728,6 +730,8 @@ pub struct IdeNativeCompressor {
     device_instance_id: String,
     track_id: String,
     enabled: bool,
+    can_move_earlier: bool,
+    can_move_later: bool,
     threshold_millidecibels: i32,
     ratio_millionths: u32,
     attack_microseconds: u32,
@@ -750,6 +754,10 @@ impl IdeNativeCompressor {
     pub fn track_id(&self) -> &str { &self.track_id }
     #[must_use]
     pub const fn enabled(&self) -> bool { self.enabled }
+    #[must_use]
+    pub const fn can_move_earlier(&self) -> bool { self.can_move_earlier }
+    #[must_use]
+    pub const fn can_move_later(&self) -> bool { self.can_move_later }
     #[must_use]
     pub const fn threshold_millidecibels(&self) -> i32 { self.threshold_millidecibels }
     #[must_use]
@@ -781,6 +789,16 @@ impl IdeNativeFilter {
     #[must_use]
     pub const fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    #[must_use]
+    pub const fn can_move_earlier(&self) -> bool {
+        self.can_move_earlier
+    }
+
+    #[must_use]
+    pub const fn can_move_later(&self) -> bool {
+        self.can_move_later
     }
 
     #[must_use]
@@ -11559,13 +11577,16 @@ fn running_observation(
         .try_reserve_exact(native_filter_count)
         .map_err(|_| IdeWorkerCommandFailure::ProjectPublicationCapacityUnavailable)?;
     for chain in snapshot.device_chains {
-        for device in chain.devices() {
+        let chain_length = chain.devices().len();
+        for (device_index, device) in chain.devices().iter().enumerate() {
             if let Some(state) = device.filter_state() {
                 let filter = IdeNativeFilter {
                     chain_id: try_project_owned(chain.id())?,
                     device_instance_id: try_project_owned(device.id())?,
                     track_id: try_project_owned(chain.track_id())?,
                     enabled: device.enabled(),
+                    can_move_earlier: device_index > 0,
+                    can_move_later: device_index + 1 < chain_length,
                     mode: state.mode(),
                     cutoff_millihertz: state.cutoff_millihertz(),
                     resonance_millionths: state.resonance_millionths(),
@@ -11579,6 +11600,8 @@ fn running_observation(
                     device_instance_id: try_project_owned(device.id())?,
                     track_id: try_project_owned(chain.track_id())?,
                     enabled: device.enabled(),
+                    can_move_earlier: device_index > 0,
+                    can_move_later: device_index + 1 < chain_length,
                     threshold_millidecibels: state.threshold_millidecibels(),
                     ratio_millionths: state.ratio_millionths(),
                     attack_microseconds: state.attack_microseconds(),
@@ -12696,6 +12719,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker scenario keeps later move, refused move, undo, redo, and exact lifecycle ordering together"
+    )]
     fn native_device_observation_preserves_filter_compressor_order_through_the_real_worker() {
         let fixture = std::env::temp_dir().join(format!(
             "hyper-desktop-ide-native-device-order-{}",
@@ -12741,6 +12768,90 @@ mod tests {
         assert_eq!(running.native_devices().len(), 2);
         assert_eq!(running.native_compressors()[0].makeup_millidecibels(), 1_000);
         assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 3, .. }));
+
+        let (chain_id, filter_id, compressor_id) = match running.native_devices() {
+            [IdeNativeDevice::Filter(filter), IdeNativeDevice::Compressor(compressor)] => (
+                filter.chain_id().to_owned(),
+                filter.device_instance_id().to_owned(),
+                compressor.device_instance_id().to_owned(),
+            ),
+            _ => panic!("the reopened native device order must remain authoritative"),
+        };
+        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Move {
+            chain_id: chain_id.clone(), device_instance_id: filter_id.clone(), destination_index: 1,
+        }}).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { undo_label: Some("native device"), .. }));
+        let IdeWorkerEvent::Running(moved) = recv(&worker) else { panic!("the reordered chain must reopen"); };
+        assert!(matches!(
+            moved.native_devices(),
+            [IdeNativeDevice::Compressor(compressor), IdeNativeDevice::Filter(filter)]
+                if compressor.device_instance_id() == compressor_id
+                    && filter.device_instance_id() == filter_id
+        ));
+        let [IdeNativeDevice::Compressor(compressor), IdeNativeDevice::Filter(filter)] = moved.native_devices() else {
+            panic!("the reordered device observation must retain both movement boundaries");
+        };
+        assert!(!compressor.can_move_earlier());
+        assert!(compressor.can_move_later());
+        assert!(filter.can_move_earlier());
+        assert!(!filter.can_move_later());
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 4, .. }));
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, label: "native device" }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { redo_label: Some("native device"), .. }));
+        let IdeWorkerEvent::Running(restored) = recv(&worker) else { panic!("undo must restore the prior device order"); };
+        assert!(matches!(
+            restored.native_devices(),
+            [IdeNativeDevice::Filter(filter), IdeNativeDevice::Compressor(compressor)]
+                if filter.device_instance_id() == filter_id
+                    && compressor.device_instance_id() == compressor_id
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 5, redo: false, label: "native device" }));
+
+        worker.try_send(IdeWorkerCommand::Redo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: true, label: "native device" }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { undo_label: Some("native device"), redo_label: None }));
+        let IdeWorkerEvent::Running(redone) = recv(&worker) else { panic!("redo must restore the later processing order"); };
+        assert!(matches!(
+            redone.native_devices(),
+            [IdeNativeDevice::Compressor(compressor), IdeNativeDevice::Filter(filter)]
+                if compressor.device_instance_id() == compressor_id
+                    && filter.device_instance_id() == filter_id
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 6, redo: true, label: "native device" }));
+
+        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Move {
+            chain_id: chain_id.clone(), device_instance_id: compressor_id.clone(), destination_index: 0,
+        }}).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        let IdeWorkerEvent::Running(refused) = recv(&worker) else { panic!("a refused move must reopen the unchanged project"); };
+        assert!(matches!(
+            refused.native_devices(),
+            [IdeNativeDevice::Compressor(compressor), IdeNativeDevice::Filter(filter)]
+                if compressor.device_instance_id() == compressor_id
+                    && filter.device_instance_id() == filter_id
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::EditNativeFilter,
+                reason: IdeWorkerCommandFailure::NativeFilterEdit(_),
+            }
+        ));
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, label: "native device" }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { redo_label: Some("native device"), .. }));
+        let IdeWorkerEvent::Running(after_refusal_undo) = recv(&worker) else { panic!("the retained reorder inverse must remain undoable"); };
+        assert!(matches!(
+            after_refusal_undo.native_devices(),
+            [IdeNativeDevice::Filter(filter), IdeNativeDevice::Compressor(compressor)]
+                if filter.device_instance_id() == filter_id
+                    && compressor.device_instance_id() == compressor_id
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 7, redo: false, label: "native device" }));
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }

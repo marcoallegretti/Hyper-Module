@@ -116,27 +116,9 @@ fn native_filter_then_compressor_chain() -> DeviceChain {
 }
 
 fn native_compressor_then_filter_chain() -> DeviceChain {
-    DeviceChain::try_new(
-        "018f47a2-6b2d-7c11-8a44-001122336477".to_owned(),
-        PROJECT_ID.to_owned(),
-        ARRANGEMENT_TRACK_ID.to_owned(),
-        vec![
-            NativeDeviceInstance::try_new_compressor(
-                "018f47a2-6b2d-7c11-8a44-001122336478".to_owned(),
-                true,
-                NativeCompressorState::try_new(-36_000, 8_000_000, 100, 100_000, 6_000).unwrap(),
-            )
-            .unwrap(),
-            NativeDeviceInstance::try_new_filter(
-                "018f47a2-6b2d-7c11-8a44-001122336479".to_owned(),
-                true,
-                NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 707_107)
-                    .unwrap(),
-            )
-            .unwrap(),
-        ],
-    )
-    .unwrap()
+    let chain = native_filter_then_compressor_chain();
+    let compressor_id = chain.devices()[1].id().to_owned();
+    chain.try_with_moved_device(&compressor_id, 0).unwrap()
 }
 
 fn assert_constant(samples: &[f32], expected: f32) {
@@ -274,6 +256,8 @@ fn prepared_playback_preserves_native_filter_compressor_processing_order() {
     let compressor_then_filter = native_compressor_then_filter_chain();
     assert!(filter_then_compressor.devices()[0].filter_state().is_some());
     assert!(filter_then_compressor.devices()[1].compressor_state().is_some());
+    assert!(compressor_then_filter.devices()[0].compressor_state().is_some());
+    assert!(compressor_then_filter.devices()[1].filter_state().is_some());
 
     let first = render_with_device_chain(Some(&filter_then_compressor));
     let second = render_with_device_chain(Some(&compressor_then_filter));
