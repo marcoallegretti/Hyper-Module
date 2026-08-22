@@ -595,6 +595,7 @@ impl RuntimeControlSink for DesktopControlSink {
                         ..
                     }
                     | TransportCommand::LaunchScene { .. }
+                    | TransportCommand::StopInteractiveScenes
                     | TransportCommand::SetLoopRange(_)
                     | TransportCommand::SetLoopEnabled(_) => DirectControlStateUpdate::Unchanged,
                 })

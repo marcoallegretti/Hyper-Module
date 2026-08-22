@@ -10,20 +10,18 @@ use hyper_mixer_runtime::{
     EbuLoudnessPresentationConfig, EbuLoudnessScale, FlatMainRuntime, GraphMainRuntime,
     GraphTransportRuntime, LocateState, LoudnessCommandSendError, LoudnessCommandSender,
     LoudnessDisplayUnit, MAX_QUEUED_LOUDNESS_COMMANDS, MAX_QUEUED_MIXER_PARAMETER_COMMANDS,
-    MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, MixerParameterCommand,
-    MixerChannelHandle, MixerParameterCommandSendError, MixerParameterCommandSender,
+    MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, MixerChannelHandle,
+    MixerParameterCommand, MixerParameterCommandSendError, MixerParameterCommandSender,
     MixerParameterResolveError, MixerParameterStateRestoreError, MixerParameterTargetError,
     OutputMeterPublication, OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot,
     PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime, RuntimeCreationError,
     RuntimeProcessError, RuntimeProjectComponent, SamplePeakBallisticsConfig, SceneLaunchState,
     StereoSamplePeakBallistics, TransportCommand, TransportCommandSendError, TransportCycle,
     TransportLoopRange, TransportLoopRangeError, TransportOutputCreationError,
-    TransportOutputProcessor, TransportState,
-    loudness_command_channel, output_meter_channel, playback_recovery_channel,
+    TransportOutputProcessor, TransportState, loudness_command_channel, output_meter_channel,
+    playback_recovery_channel,
 };
-use hyper_native_device::{
-    DeviceChain, NativeDeviceInstance, NativeFilterMode, NativeFilterState,
-};
+use hyper_native_device::{DeviceChain, NativeDeviceInstance, NativeFilterMode, NativeFilterState};
 
 use common::{PlaybackFixture, fixture, graph_fixture, playback_fixture};
 
@@ -1220,14 +1218,19 @@ fn assert_scene_observation(
 }
 
 #[test]
-fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() {
+#[allow(
+    clippy::too_many_lines,
+    reason = "one real transport fixture keeps command-boundary, recovery, and rollback evidence together"
+)]
+fn stop_interactive_scenes_cancels_pending_launches_without_stopping_transport() {
     let fixture = playback_fixture();
     let graph = fixture.compile_playback();
     let prepared = fixture.cache.prepare_playback(&graph).unwrap();
     let runtime =
         PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 50)
             .unwrap();
-    let (mut sender, mut transport) = PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+    let (mut sender, mut mixer_sender, mut transport) =
+        PreparedPlaybackTransportRuntime::with_command_queues(runtime);
     let (mut recovery_publisher, recovery) = playback_recovery_channel(None, None);
     assert_eq!(sender.scene_count(), 2);
     assert_eq!(
@@ -1245,8 +1248,20 @@ fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() 
             state: LocateState::Stopped,
         })
         .unwrap();
+    let loop_range = TransportLoopRange::new(100, 1_000).unwrap();
+    sender
+        .try_send(TransportCommand::SetLoopRange(Some(loop_range)))
+        .unwrap();
+    sender
+        .try_send(TransportCommand::SetLoopEnabled(true))
+        .unwrap();
     sender
         .try_send(TransportCommand::LaunchScene { scene_index: 0 })
+        .unwrap();
+    mixer_sender
+        .try_send(MixerParameterCommand::MainGain {
+            gain: LinearGain::from_millionths(750_000).unwrap(),
+        })
         .unwrap();
 
     let mut arrangement_left = [9.0_f32; 50];
@@ -1268,14 +1283,20 @@ fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() 
             },
         )
         .unwrap();
-    assert_eq!(queued.applied_command_count(), 2);
+    assert_eq!(queued.applied_command_count(), 4);
+    assert_eq!(queued.applied_mixer_parameter_command_count(), 1);
     assert_eq!(queued.scene_launch_state().queued_scene_index(), Some(0));
     assert_eq!(queued.scene_launch_state().queued_launch_frame(), Some(100));
     assert_eq!(
         queued.scene_launch_state().last_launched_scene_index(),
         None
     );
-    recovery_publisher.publish_cycle(queued, None);
+    let committed_mixer = transport.mixer_parameter_state();
+    assert_eq!(
+        committed_mixer.main_gain(),
+        LinearGain::from_millionths(750_000).unwrap()
+    );
+    recovery_publisher.publish_cycle(queued, Some(&committed_mixer));
     assert_scene_observation(recovery.observe_cycle(), Some(0), Some(100), None);
     assert_samples(&output_left, &[0.0; 50]);
     assert_samples(&output_right, &[0.0; 50]);
@@ -1299,10 +1320,17 @@ fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() 
     recovery_publisher.publish_cycle(launched, None);
     assert_scene_observation(recovery.observe_cycle(), None, None, Some(0));
     assert_samples(&output_left, &[0.0; 50]);
-    assert_samples(&output_right, &fixture.scene_samples[..50]);
+    let expected_launched_scene: Vec<f32> = fixture.scene_samples[..50]
+        .iter()
+        .map(|sample| sample * 0.75)
+        .collect();
+    assert_samples(&output_right, &expected_launched_scene);
 
     sender
-        .try_send(TransportCommand::LaunchScene { scene_index: 1 })
+        .try_send(TransportCommand::LaunchScene { scene_index: 0 })
+        .unwrap();
+    sender
+        .try_send(TransportCommand::StopInteractiveScenes)
         .unwrap();
     let stopped = transport
         .process_cycle(
@@ -1313,16 +1341,33 @@ fn queued_interactive_scene_launch_reaches_the_mixer_and_stop_takes_ownership() 
             },
         )
         .unwrap();
+    assert_eq!(stopped.applied_command_count(), 2);
+    assert_eq!(stopped.state(), TransportState::Rolling);
+    assert_eq!(stopped.start_frame(), 150);
+    assert_eq!(stopped.position_frame(), 200);
+    assert_eq!(stopped.loop_range(), Some(loop_range));
+    assert!(stopped.loop_enabled());
+    assert_eq!(transport.mixer_parameter_state(), committed_mixer);
     assert_eq!(stopped.scene_launch_state().queued_scene_index(), None);
     assert_eq!(
         stopped.scene_launch_state().last_launched_scene_index(),
-        Some(1)
+        Some(0)
     );
+    recovery_publisher.publish_cycle(stopped, None);
+    assert_scene_observation(recovery.observe_cycle(), None, None, Some(0));
+    let recovered = recovery.snapshot();
+    assert_eq!(recovered.loop_range(), Some(loop_range));
+    assert!(recovered.loop_enabled());
+    assert_eq!(recovered.mixer_parameter_state(), Some(committed_mixer));
     assert_samples(&output_left, &[0.0; 50]);
     assert_samples(&output_right, &[0.0; 50]);
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one real transport fixture keeps pending rollback and recovery evidence together"
+)]
 fn failed_cycle_restores_the_prior_interactive_scene_state() {
     let fixture = playback_fixture();
     let graph = fixture.compile_playback();
@@ -1331,6 +1376,7 @@ fn failed_cycle_restores_the_prior_interactive_scene_state() {
         PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 25)
             .unwrap();
     let (mut sender, mut transport) = PreparedPlaybackTransportRuntime::with_command_queue(runtime);
+    let (mut recovery_publisher, recovery) = playback_recovery_channel(None, None);
     sender
         .try_send(TransportCommand::Locate {
             frame: 100,
@@ -1351,7 +1397,7 @@ fn failed_cycle_restores_the_prior_interactive_scene_state() {
     ];
     let mut output_left = [0.0_f32; 25];
     let mut output_right = [0.0_f32; 25];
-    let recovered = transport
+    let launched = transport
         .process_cycle(
             &mut scratch,
             StereoOutput {
@@ -1360,9 +1406,43 @@ fn failed_cycle_restores_the_prior_interactive_scene_state() {
             },
         )
         .unwrap();
+    assert_eq!(launched.state(), TransportState::Rolling);
+    assert_eq!(launched.position_frame(), 125);
+    assert_eq!(launched.scene_launch_state().queued_scene_index(), None);
+    assert_eq!(
+        launched.scene_launch_state().last_launched_scene_index(),
+        Some(0)
+    );
+    assert_samples(&output_right, &fixture.scene_samples[..25]);
 
+    sender.try_send(TransportCommand::Stop).unwrap();
     sender
-        .try_send(TransportCommand::LaunchScene { scene_index: 1 })
+        .try_send(TransportCommand::LaunchScene { scene_index: 0 })
+        .unwrap();
+    let pending = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut output_left,
+                right: &mut output_right,
+            },
+        )
+        .unwrap();
+    assert_eq!(pending.state(), TransportState::Stopped);
+    assert_eq!(pending.position_frame(), 125);
+    assert_eq!(pending.scene_launch_state().queued_scene_index(), Some(0));
+    assert_eq!(
+        pending.scene_launch_state().queued_launch_frame(),
+        Some(125)
+    );
+    assert_eq!(
+        pending.scene_launch_state().last_launched_scene_index(),
+        Some(0)
+    );
+
+    sender.try_send(TransportCommand::Start).unwrap();
+    sender
+        .try_send(TransportCommand::StopInteractiveScenes)
         .unwrap();
     let mut incomplete_left = [0.0_f32; 25];
     let mut incomplete_right = [0.0_f32; 25];
@@ -1381,9 +1461,10 @@ fn failed_cycle_restores_the_prior_interactive_scene_state() {
             )
             .is_err()
     );
+    assert_eq!(transport.state(), TransportState::Stopped);
     assert_eq!(transport.position_frame(), 125);
 
-    transport
+    let retry = transport
         .process_cycle(
             &mut scratch,
             StereoOutput {
@@ -1392,12 +1473,39 @@ fn failed_cycle_restores_the_prior_interactive_scene_state() {
             },
         )
         .unwrap();
-    assert_eq!(recovered.scene_launch_state().queued_scene_index(), None);
+    assert_eq!(retry.state(), TransportState::Stopped);
+    assert_eq!(retry.position_frame(), 125);
+    assert_eq!(retry.scene_launch_state().queued_scene_index(), Some(0));
     assert_eq!(
-        recovered.scene_launch_state().last_launched_scene_index(),
+        retry.scene_launch_state().queued_launch_frame(),
+        Some(125)
+    );
+    assert_eq!(
+        retry.scene_launch_state().last_launched_scene_index(),
         Some(0)
     );
-    assert_samples(&output_right, &fixture.scene_samples[25..50]);
+    recovery_publisher.publish_cycle(retry, None);
+    assert_scene_observation(recovery.observe_cycle(), Some(0), Some(125), Some(0));
+
+    sender.try_send(TransportCommand::Start).unwrap();
+    let resumed = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut output_left,
+                right: &mut output_right,
+            },
+        )
+        .unwrap();
+    assert_eq!(resumed.state(), TransportState::Rolling);
+    assert_eq!(resumed.start_frame(), 125);
+    assert_eq!(resumed.position_frame(), 150);
+    assert_eq!(resumed.scene_launch_state().queued_scene_index(), None);
+    assert_eq!(
+        resumed.scene_launch_state().last_launched_scene_index(),
+        Some(0)
+    );
+    assert_samples(&output_right, &fixture.scene_samples[..25]);
 }
 
 #[test]

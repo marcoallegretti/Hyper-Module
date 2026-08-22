@@ -3802,6 +3802,9 @@ fn apply_event(
                     TransportCommand::LaunchScene { .. } => {
                         "Scene launch queued for the audio runtime"
                     }
+                    TransportCommand::StopInteractiveScenes => {
+                        "Interactive scenes stop queued for the audio runtime"
+                    }
                     TransportCommand::SetLoopRange(Some(_)) => {
                         "Loop range queued for the audio runtime"
                     }

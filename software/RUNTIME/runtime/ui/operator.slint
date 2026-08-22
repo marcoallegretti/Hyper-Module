@@ -439,6 +439,7 @@ export component OperatorWindow inherits Window {
     in-out property <bool> loudness-reset-confirming: false;
     in property <[OperatorSceneRow]> scenes;
     in property <string> scene-feedback;
+    in property <bool> stop-interactive-scenes-enabled: false;
     in property <[OperatorMixerRow]> mixer-channels;
     in property <[OperatorMixerSendRow]> mixer-sends;
     in property <float> main-gain-percent: 0;
@@ -472,6 +473,7 @@ export component OperatorWindow inherits Window {
     callback set-main-gain-requested(float);
     callback toggle-main-mute-requested();
     callback launch-scene-requested(int);
+    callback stop-interactive-scenes-requested();
     callback quit-requested();
 
     begin-loudness-reset => {
@@ -735,6 +737,11 @@ export component OperatorWindow inherits Window {
                     Text { text: "SCENES"; color: #8d99ad; font-size: 11px; font-weight: 700; }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
                     Text { text: root.scene-feedback; color: #8d99ad; font-size: 10px; overflow: elide; }
+                    Button {
+                        text: "Stop interactive scenes";
+                        enabled: root.stop-interactive-scenes-enabled;
+                        clicked => { root.stop-interactive-scenes-requested(); }
+                    }
                 }
                 HorizontalLayout {
                     spacing: 7px;

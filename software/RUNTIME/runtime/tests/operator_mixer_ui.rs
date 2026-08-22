@@ -28,6 +28,38 @@ enum LoopIntent {
 }
 
 #[test]
+fn generated_scene_stop_button_respects_recovery_authority() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = OperatorWindow::new().unwrap();
+    let scenes = Rc::new(VecModel::from(vec![OperatorSceneRow {
+        name: "Interactive layer".into(),
+        status: "Ready".into(),
+        available: true,
+        queued: false,
+        last_launched: false,
+    }]));
+    ui.set_scenes(ModelRc::from(scenes));
+    let intents = Rc::new(RefCell::new(0_usize));
+    let requested = Rc::clone(&intents);
+    ui.on_stop_interactive_scenes_requested(move || {
+        *requested.borrow_mut() += 1;
+    });
+    ui.set_stop_interactive_scenes_enabled(true);
+    ui.show().unwrap();
+    scroll_down(&ui);
+
+    let stop = find_control(&ui, "Stop interactive scenes");
+    assert_eq!(stop.accessible_enabled(), Some(true));
+    stop.mock_single_click(PointerEventButton::Left);
+    assert_eq!(*intents.borrow(), 1);
+
+    ui.set_stop_interactive_scenes_enabled(false);
+    assert_eq!(stop.accessible_enabled(), Some(false));
+    stop.mock_single_click(PointerEventButton::Left);
+    assert_eq!(*intents.borrow(), 1);
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "one generated-window contract keeps actual control mapping and capability evidence together"

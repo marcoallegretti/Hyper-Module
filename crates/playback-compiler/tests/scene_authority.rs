@@ -577,3 +577,131 @@ fn interactive_launch_is_quantized_transactional_and_cleared_by_seek() {
     assert_eq!(runtime.track_states(), [None]);
     assert_eq!(runtime.launch_state().last_launched_scene_index(), Some(1));
 }
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one recorded and interactive authority fixture keeps the stop boundary auditable"
+)]
+fn stopping_interactive_scenes_preserves_recorded_authority_and_cancels_pending_launches() {
+    let tracks = [
+        SceneTrackResource {
+            id: "recorded-track",
+            active: true,
+        },
+        SceneTrackResource {
+            id: "interactive-track",
+            active: true,
+        },
+    ];
+    let clips = [
+        SceneClipResource {
+            id: "recorded-loop",
+            track_id: "recorded-track",
+            enabled: true,
+            duration_ticks: 16,
+            loop_enabled: true,
+        },
+        SceneClipResource {
+            id: "interactive-loop",
+            track_id: "interactive-track",
+            enabled: true,
+            duration_ticks: 16,
+            loop_enabled: true,
+        },
+    ];
+    let recorded_slots = [SceneSlotResource {
+        track_id: "recorded-track",
+        action: SceneSlotAction::Play {
+            clip_id: "recorded-loop",
+        },
+    }];
+    let interactive_slots = [SceneSlotResource {
+        track_id: "interactive-track",
+        action: SceneSlotAction::Play {
+            clip_id: "interactive-loop",
+        },
+    }];
+    let recorded_stop_slots = [SceneSlotResource {
+        track_id: "recorded-track",
+        action: SceneSlotAction::Stop,
+    }];
+    let scenes = [
+        SceneResource {
+            id: "recorded",
+            enabled: true,
+            order: 0,
+            launch_quantization: LaunchQuantization::Immediate,
+            slots: &recorded_slots,
+        },
+        SceneResource {
+            id: "interactive",
+            enabled: true,
+            order: 1,
+            launch_quantization: LaunchQuantization::Grid { quantum_ticks: 4 },
+            slots: &interactive_slots,
+        },
+        SceneResource {
+            id: "recorded-stop",
+            enabled: true,
+            order: 2,
+            launch_quantization: LaunchQuantization::Immediate,
+            slots: &recorded_stop_slots,
+        },
+    ];
+    let launches = [
+        hyper_playback_compiler::scene::SceneLaunchResource {
+            id: "recorded-launch",
+            tick: 0,
+            scene_id: "recorded",
+        },
+        hyper_playback_compiler::scene::SceneLaunchResource {
+            id: "recorded-stop-launch",
+            tick: 8,
+            scene_id: "recorded-stop",
+        },
+    ];
+    let compiled = compile_scene_performance(
+        timeline(),
+        ScenePerformanceInput {
+            enabled: true,
+            tracks: &tracks,
+            clips: &clips,
+            scenes: &scenes,
+            launches: &launches,
+        },
+        SceneLimits::VERSION_1,
+    )
+    .unwrap();
+    let mut runtime = compiled.runtime_at(1).unwrap();
+
+    runtime.queue_scene_launch(1).unwrap();
+    runtime.process_window(1, 50, |_| {}).unwrap();
+    assert_eq!(
+        runtime.track_states()[0].map(PlayingSceneClip::clip_id),
+        Some("recorded-loop")
+    );
+    assert_eq!(
+        runtime.track_states()[1].map(PlayingSceneClip::clip_id),
+        Some("interactive-loop")
+    );
+    assert_eq!(runtime.launch_state().last_launched_scene_index(), Some(1));
+
+    runtime.queue_scene_launch(1).unwrap();
+    assert_eq!(runtime.launch_state().queued_scene_index(), Some(1));
+    runtime.stop_interactive_scenes();
+
+    assert_eq!(runtime.launch_state().queued_scene_index(), None);
+    assert_eq!(runtime.launch_state().last_launched_scene_index(), Some(1));
+    assert_eq!(
+        runtime.track_states()[0].map(PlayingSceneClip::clip_id),
+        Some("recorded-loop")
+    );
+    assert_eq!(runtime.track_states()[1], None);
+    assert_eq!(runtime.track_controlled(), [true, true]);
+
+    runtime.process_window(51, 50, |_| {}).unwrap();
+    assert_eq!(runtime.track_states(), [None, None]);
+    assert_eq!(runtime.track_controlled(), [true, true]);
+    assert_eq!(runtime.launch_state().last_launched_scene_index(), Some(1));
+}

@@ -1185,6 +1185,24 @@ impl<'plan, 'resource> SceneRuntime<'plan, 'resource> {
         Ok(())
     }
 
+    /// Cancels a queued interactive launch and ends only currently interactive
+    /// clips at the next transport command boundary.
+    ///
+    /// Recorded scene authority and its later actions remain intact. A stopped
+    /// interactive track stays scene-controlled, matching an authored `Stop`
+    /// slot rather than revealing an unrelated source beneath it.
+    pub fn stop_interactive_scenes(&mut self) {
+        self.pending = None;
+        for (state, controlled) in self.states.iter_mut().zip(&mut self.controlled) {
+            if state.is_some_and(|playing| {
+                matches!(playing.source(), ScenePlaybackSource::Interactive { .. })
+            }) {
+                *state = None;
+                *controlled = true;
+            }
+        }
+    }
+
     /// Reconstructs per-track state at an arbitrary sample frame.
     pub fn seek(&mut self, frame: usize) {
         self.position = frame;

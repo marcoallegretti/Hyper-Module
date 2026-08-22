@@ -993,6 +993,12 @@ impl<'authority, 'resource, 'prepared, 'cache, 'binding>
         self.runtime.queue_scene_launch(scene_index)
     }
 
+    /// Cancels the pending interactive launch and ends active interactive
+    /// scene material while preserving recorded scene authority.
+    pub fn stop_interactive_scenes(&mut self) {
+        self.runtime.stop_interactive_scenes();
+    }
+
     #[must_use]
     pub fn checkpoint(&self) -> SceneRuntimeCheckpoint<'resource> {
         self.runtime.checkpoint()
@@ -1445,6 +1451,12 @@ impl<'prepared, 'authority, 'cache, 'schedule, 'resource>
     /// arithmetic outside the supported frame domain.
     pub fn queue_scene_launch(&mut self, scene_index: usize) -> Result<(), SceneRuntimeError> {
         self.scene.queue_scene_launch(scene_index)
+    }
+
+    /// Cancels the pending interactive launch and ends active interactive
+    /// scene material while preserving recorded scene authority.
+    pub fn stop_interactive_scenes(&mut self) {
+        self.scene.stop_interactive_scenes();
     }
 
     #[must_use]

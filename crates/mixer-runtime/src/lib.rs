@@ -231,6 +231,7 @@ pub enum TransportCommand {
     Stop,
     Locate { frame: usize, state: LocateState },
     LaunchScene { scene_index: usize },
+    StopInteractiveScenes,
     SetLoopRange(Option<TransportLoopRange>),
     SetLoopEnabled(bool),
 }
@@ -2136,6 +2137,8 @@ pub trait TrackWindowRenderer: sealed::TrackWindowRenderer {
     fn scene_launch_state(&self) -> SceneLaunchState;
 
     fn queue_scene_launch(&mut self, scene_index: usize) -> Result<(), SceneRuntimeError>;
+
+    fn stop_interactive_scenes(&mut self);
 }
 
 impl sealed::TrackWindowRenderer for ArrangementRenderer<'_, '_, '_> {}
@@ -2174,6 +2177,8 @@ impl TrackWindowRenderer for ArrangementRenderer<'_, '_, '_> {
     fn queue_scene_launch(&mut self, scene_index: usize) -> Result<(), SceneRuntimeError> {
         Err(SceneRuntimeError::MissingScene { scene_index })
     }
+
+    fn stop_interactive_scenes(&mut self) {}
 }
 
 impl sealed::TrackWindowRenderer for PlaybackRenderer<'_, '_, '_, '_, '_> {}
@@ -2217,6 +2222,10 @@ impl<'resource> TrackWindowRenderer for PlaybackRenderer<'_, '_, '_, '_, 'resour
 
     fn queue_scene_launch(&mut self, scene_index: usize) -> Result<(), SceneRuntimeError> {
         PlaybackRenderer::queue_scene_launch(self, scene_index)
+    }
+
+    fn stop_interactive_scenes(&mut self) {
+        PlaybackRenderer::stop_interactive_scenes(self);
     }
 }
 
@@ -2695,6 +2704,10 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
 
     fn queue_scene_launch(&mut self, scene_index: usize) -> Result<(), SceneRuntimeError> {
         self.renderer.queue_scene_launch(scene_index)
+    }
+
+    fn stop_interactive_scenes(&mut self) {
+        self.renderer.stop_interactive_scenes();
     }
 
     fn take_parameter_layout(&mut self) -> MixerParameterLayout {
@@ -3378,6 +3391,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             TransportCommand::LaunchScene { scene_index } => {
                 self.runtime.queue_scene_launch(scene_index)?;
             }
+            TransportCommand::StopInteractiveScenes => self.runtime.stop_interactive_scenes(),
             TransportCommand::SetLoopRange(range) => self.loop_range = range,
             TransportCommand::SetLoopEnabled(enabled) => self.loop_enabled = enabled,
         }
