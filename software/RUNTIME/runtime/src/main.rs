@@ -656,11 +656,11 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
             OperatorCommand::SetLoopEnabled { enabled } => {
                 match host.queue_transport(TransportCommand::SetLoopEnabled(enabled)) {
                     Ok(()) => diagnostic(if enabled {
-                        "project loop enable queued".to_owned()
+                        "session loop enable queued".to_owned()
                     } else {
-                        "project loop disable queued".to_owned()
+                        "session loop disable queued".to_owned()
                     }),
-                    Err(error) => diagnostic(format!("project loop toggle refused: {error}")),
+                    Err(error) => diagnostic(format!("session loop toggle refused: {error}")),
                 }
             }
             OperatorCommand::SetLoopRange { range } => {
@@ -1917,14 +1917,14 @@ fn wire_operator_loop_toggle(
         let Some(current) = authority.get() else {
             set_diagnostic(
                 &diagnostic,
-                "project loop toggle refused: accepted state is unavailable".to_owned(),
+                "session loop toggle refused: accepted state is unavailable".to_owned(),
             );
             return;
         };
         if current.range.is_none() {
             set_diagnostic(
                 &diagnostic,
-                "project loop toggle refused: no project loop is armed".to_owned(),
+                "session loop toggle refused: no session loop is armed".to_owned(),
             );
             return;
         }
@@ -2027,7 +2027,14 @@ fn wire_operator_loop_range(
     let diagnostic = Arc::clone(diagnostic);
     let authority = Rc::clone(authority);
     ui.on_clear_loop_range_requested(move || {
-        if authority.get().and_then(|current| current.range).is_none() {
+        let Some(current) = authority.get() else {
+            set_diagnostic(
+                &diagnostic,
+                "session loop clear refused: accepted state is unavailable".to_owned(),
+            );
+            return;
+        };
+        if current.range.is_none() {
             set_diagnostic(
                 &diagnostic,
                 "session loop clear refused: no committed range".to_owned(),
@@ -2327,7 +2334,7 @@ fn apply_operator_loop_observation(
         });
         ui.set_loop_toggle_enabled(true);
     } else {
-        ui.set_loop_state("No project loop".into());
+        ui.set_loop_state("No session loop".into());
         ui.set_loop_range("No committed session range".into());
         ui.set_loop_toggle_label("Loop unavailable".into());
         ui.set_loop_toggle_enabled(false);
@@ -3337,8 +3344,8 @@ mod tests {
                 "transport stop queued",
                 "transport return to start queued",
                 "scene 4 launch queued",
-                "project loop enable queued",
-                "project loop disable queued",
+                "session loop enable queued",
+                "session loop disable queued",
                 "programme loudness standby queued",
                 "programme loudness reset queued",
             ]
@@ -4053,7 +4060,7 @@ mod tests {
             &recovery.snapshot(),
             false,
         );
-        assert_eq!(ui.get_loop_state().as_str(), "No project loop");
+        assert_eq!(ui.get_loop_state().as_str(), "No session loop");
         assert_eq!(ui.get_loop_range().as_str(), "No committed session range");
         assert_eq!(ui.get_loop_toggle_label().as_str(), "Loop unavailable");
         assert!(!ui.get_loop_toggle_enabled());
@@ -4367,7 +4374,7 @@ mod tests {
         assert_eq!(loop_command_receiver.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(
             loop_diagnostic.lock().unwrap().as_str(),
-            "project loop toggle refused: no project loop is armed"
+            "session loop toggle refused: no session loop is armed"
         );
         assert!(ui.get_loop_in_enabled());
         assert!(!ui.get_loop_out_enabled());
@@ -4383,7 +4390,7 @@ mod tests {
                 range: Some(requested_range)
             })
         );
-        assert_eq!(ui.get_loop_state().as_str(), "No project loop");
+        assert_eq!(ui.get_loop_state().as_str(), "No session loop");
         assert_eq!(ui.get_loop_range().as_str(), "No committed session range");
         transport_sender
             .try_send(TransportCommand::LaunchScene { scene_index: 0 })
@@ -4817,6 +4824,15 @@ mod tests {
             Ok(OperatorCommand::SetLoopEnabled { enabled: false })
         );
 
+        loop_authority.set(Some(OperatorLoopAuthority {
+            range: Some(TransportLoopRange::new(0, 1_500).unwrap()),
+            enabled: true,
+            position_frame: 300,
+            extent: PlaybackExtent::Bounded { end_frame: 1_500 },
+        }));
+        ui.set_loop_in_enabled(true);
+        ui.set_loop_out_enabled(false);
+
         let accepted_authority = loop_authority.get();
         let accepted_state = ui.get_loop_state();
         let accepted_range = ui.get_loop_range();
@@ -4830,7 +4846,15 @@ mod tests {
             &saturated_diagnostic,
             &loop_authority,
         );
+        wire_operator_loop_range(
+            ui,
+            &saturated_sender,
+            &saturated_diagnostic,
+            &loop_authority,
+        );
         ui.invoke_toggle_loop_requested();
+        ui.invoke_set_loop_in_requested();
+        ui.invoke_clear_loop_range_requested();
         assert_eq!(saturated_receiver.try_recv(), Ok(OperatorCommand::Start));
         assert_eq!(saturated_receiver.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(loop_authority.get(), accepted_authority);
@@ -4838,6 +4862,9 @@ mod tests {
         assert_eq!(ui.get_loop_range(), accepted_range);
         assert_eq!(ui.get_loop_toggle_label(), accepted_label);
         assert!(ui.get_loop_toggle_enabled());
+        assert!(ui.get_loop_in_enabled());
+        assert!(!ui.get_loop_out_enabled());
+        assert!(ui.get_loop_clear_enabled());
         assert!(
             saturated_diagnostic
                 .lock()
@@ -4845,18 +4872,81 @@ mod tests {
                 .contains("operator command refused")
         );
 
+        loop_authority.set(Some(OperatorLoopAuthority {
+            range: Some(TransportLoopRange::new(0, 1_500).unwrap()),
+            enabled: true,
+            position_frame: 1_200,
+            extent: PlaybackExtent::Bounded { end_frame: 1_500 },
+        }));
+        ui.set_loop_in_enabled(false);
+        ui.set_loop_out_enabled(true);
+        let disconnected_authority = loop_authority.get();
+        let disconnected_state = ui.get_loop_state();
+        let disconnected_range = ui.get_loop_range();
+        let disconnected_enabled = (
+            ui.get_loop_toggle_enabled(),
+            ui.get_loop_in_enabled(),
+            ui.get_loop_out_enabled(),
+            ui.get_loop_clear_enabled(),
+        );
+        let (disconnected_sender, disconnected_receiver) = std::sync::mpsc::sync_channel(1);
+        drop(disconnected_receiver);
+        let disconnected_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_loop_range(
+            ui,
+            &disconnected_sender,
+            &disconnected_diagnostic,
+            &loop_authority,
+        );
+        ui.invoke_set_loop_out_requested();
+        ui.invoke_clear_loop_range_requested();
+        assert!(
+            disconnected_diagnostic
+                .lock()
+                .unwrap()
+                .contains("operator command refused")
+        );
+        assert_eq!(loop_authority.get(), disconnected_authority);
+        assert_eq!(ui.get_loop_state(), disconnected_state);
+        assert_eq!(ui.get_loop_range(), disconnected_range);
+        assert_eq!(
+            (
+                ui.get_loop_toggle_enabled(),
+                ui.get_loop_in_enabled(),
+                ui.get_loop_out_enabled(),
+                ui.get_loop_clear_enabled(),
+            ),
+            disconnected_enabled
+        );
+
+        let terminal_state = ui.get_loop_state();
+        let terminal_range = ui.get_loop_range();
+        let (terminal_sender, terminal_receiver) =
+            std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
+        let terminal_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_loop_range(ui, &terminal_sender, &terminal_diagnostic, &loop_authority);
         revoke_operator_loop_authority(ui, &loop_authority);
         ui.invoke_toggle_loop_requested();
+        ui.invoke_set_loop_in_requested();
+        ui.invoke_set_loop_out_requested();
+        ui.invoke_clear_loop_range_requested();
+        assert_eq!(terminal_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            terminal_diagnostic.lock().unwrap().as_str(),
+            "session loop clear refused: accepted state is unavailable"
+        );
         assert_eq!(saturated_receiver.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(
             saturated_diagnostic.lock().unwrap().as_str(),
-            "project loop toggle refused: accepted state is unavailable"
+            "session loop toggle refused: accepted state is unavailable"
         );
         assert_eq!(ui.get_loop_toggle_label().as_str(), "Runtime stopped");
         assert!(!ui.get_loop_toggle_enabled());
         assert!(!ui.get_loop_in_enabled());
         assert!(!ui.get_loop_out_enabled());
         assert!(!ui.get_loop_clear_enabled());
+        assert_eq!(ui.get_loop_state(), terminal_state);
+        assert_eq!(ui.get_loop_range(), terminal_range);
         let launched_row = ui.get_scenes().row_data(0).unwrap();
         assert!(!launched_row.queued);
         assert!(launched_row.last_launched);
@@ -5500,6 +5590,72 @@ mod tests {
             Err(TryRecvError::Empty)
         );
 
+        transport_sender.try_send(TransportCommand::Stop).unwrap();
+        let stopped_with_range = transport
+            .process_cycle(
+                &mut scratch,
+                StereoOutput {
+                    left: &mut mixer_left,
+                    right: &mut mixer_right,
+                },
+            )
+            .unwrap();
+        recovery_publisher.publish_cycle(stopped_with_range, None);
+        let before_clear = recovery.observe_cycle();
+        assert_eq!(
+            before_clear.state(),
+            PlaybackRecoveryTransportState::Stopped
+        );
+        assert_eq!(
+            before_clear.loop_range(),
+            Some(TransportLoopRange::new(0, 1_500).unwrap())
+        );
+        assert!(before_clear.loop_enabled());
+        apply_operator_loop_observation(
+            ui,
+            &loop_authority,
+            before_clear,
+            PlaybackExtent::Bounded { end_frame: 1_500 },
+        );
+        wire_operator_loop_range(ui, &loop_commands, &loop_diagnostic, &loop_authority);
+        let before_clear_state = ui.get_loop_state();
+        let before_clear_range = ui.get_loop_range();
+        ui.invoke_clear_loop_range_requested();
+        assert_eq!(
+            loop_command_receiver.try_recv(),
+            Ok(OperatorCommand::SetLoopRange { range: None })
+        );
+        assert_eq!(ui.get_loop_state(), before_clear_state);
+        assert_eq!(ui.get_loop_range(), before_clear_range);
+        transport_sender
+            .try_send(TransportCommand::SetLoopRange(None))
+            .unwrap();
+        let cleared_cycle = transport
+            .process_cycle(
+                &mut scratch,
+                StereoOutput {
+                    left: &mut mixer_left,
+                    right: &mut mixer_right,
+                },
+            )
+            .unwrap();
+        recovery_publisher.publish_cycle(cleared_cycle, None);
+        let cleared = recovery.observe_cycle();
+        assert_eq!(cleared.position_frame(), before_clear.position_frame());
+        assert_eq!(cleared.state(), before_clear.state());
+        assert_eq!(cleared.loop_range(), None);
+        assert!(cleared.loop_enabled());
+        apply_operator_loop_observation(
+            ui,
+            &loop_authority,
+            cleared,
+            PlaybackExtent::Bounded { end_frame: 1_500 },
+        );
+        assert_eq!(ui.get_loop_state().as_str(), "No session loop");
+        assert_eq!(ui.get_loop_range().as_str(), "No committed session range");
+        assert!(!ui.get_loop_toggle_enabled());
+        assert!(!ui.get_loop_clear_enabled());
+
         let seek_authority = Rc::new(Cell::new(None));
         let (seek_commands, seek_receiver) =
             std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
@@ -5682,7 +5838,7 @@ mod tests {
             facts.playback_extent,
             observation.position_frame(),
         );
-        assert_eq!(ui.get_loop_state().as_str(), "No project loop");
+        assert_eq!(ui.get_loop_state().as_str(), "No session loop");
         assert_eq!(ui.get_loop_range().as_str(), "No committed session range");
         assert_eq!(ui.get_loop_toggle_label().as_str(), "Loop unavailable");
         assert!(!ui.get_loop_toggle_enabled());
