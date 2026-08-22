@@ -10167,6 +10167,49 @@ mod tests {
         ui.set_new_project_visible(false);
     }
 
+    fn assert_project_close_shortcut_contract(ui: &MainWindow) {
+        let closed = Rc::new(Cell::new(0_usize));
+        let closed_by_callback = Rc::clone(&closed);
+        ui.global::<IdeActions>().on_close_project(move || {
+            closed_by_callback.set(closed_by_callback.get() + 1);
+        });
+
+        ui.set_new_project_visible(false);
+        ui.set_new_track_visible(false);
+        ui.set_app_mode(AppMode::Running);
+        dispatch_ide_shortcut(ui, "w", false, false);
+        dispatch_ide_shortcut(ui, "w", false, true);
+        dispatch_ide_shortcut(ui, "W", true, false);
+        assert_eq!(
+            closed.get(),
+            1,
+            "only a non-repeating primary close shortcut reaches the existing close action"
+        );
+
+        ui.set_app_mode(AppMode::Previewing);
+        dispatch_ide_shortcut(ui, "w", false, false);
+        assert_eq!(
+            closed.get(),
+            2,
+            "the previewing state shares the visible Close action authority"
+        );
+
+        ui.set_app_mode(AppMode::Closing);
+        dispatch_ide_shortcut(ui, "w", false, false);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_new_project_visible(true);
+        dispatch_ide_shortcut(ui, "w", false, false);
+        ui.set_new_project_visible(false);
+        ui.set_new_track_visible(true);
+        dispatch_ide_shortcut(ui, "w", false, false);
+        assert_eq!(
+            closed.get(),
+            2,
+            "pending work and local forms keep the close shortcut unavailable"
+        );
+        ui.set_new_track_visible(false);
+    }
+
     fn assert_form_cancellation_shortcut_contract(ui: &MainWindow) {
         ui.set_app_mode(AppMode::Closed);
         ui.set_new_project_visible(true);
@@ -13152,6 +13195,7 @@ mod tests {
         assert_project_creation_shortcut_contract(&ui);
         assert_project_open_shortcut_contract(&ui);
         assert_audio_track_creation_shortcut_contract(&ui);
+        assert_project_close_shortcut_contract(&ui);
         assert_form_cancellation_shortcut_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);
         ui.set_status_text("Choose a Runtime destination".into());
