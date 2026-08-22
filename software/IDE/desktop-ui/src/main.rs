@@ -115,6 +115,14 @@ struct ProjectUiState {
     control_targets: RefCell<Vec<ControlTargetChoice>>,
     unused_sample_cleanup: Cell<Option<IdeUnusedSampleCleanupSummary>>,
     native_filter_tracks: RefCell<Vec<String>>,
+    native_device_observation_generation: Cell<Option<u64>>,
+    native_device_clipboard: RefCell<Option<NativeDeviceClipboard>>,
+}
+
+#[derive(Clone)]
+struct NativeDeviceClipboard {
+    source_chain_id: String,
+    source_device_instance_id: String,
 }
 
 /// The two marks a user sets independently. They only become a transport range
@@ -1328,6 +1336,45 @@ fn bind_native_filter_callbacks_with(
     });
 
     let weak = ui.as_weak();
+    let state_for_copy = Rc::clone(project_state);
+    actions.on_copy_native_device(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        match native_device_copy_selection(ui.get_app_mode(), &ui.get_native_devices(), index) {
+            Ok(selection) => {
+                *state_for_copy.native_device_clipboard.borrow_mut() = Some(selection);
+                ui.set_native_device_copy_available(true);
+                ui.set_status_text(
+                    "Native device selected. Choose a target in another chain and paste after it."
+                        .into(),
+                );
+                ui.set_error_text(SharedString::default());
+            }
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+
+    let weak = ui.as_weak();
+    let submit_paste = Rc::clone(&submitter);
+    let state_for_paste = Rc::clone(project_state);
+    actions.on_paste_native_device(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let selection = state_for_paste.native_device_clipboard.borrow().clone();
+        match native_device_copy_to(
+            ui.get_app_mode(),
+            &ui.get_native_devices(),
+            selection.as_ref(),
+            index,
+        ) {
+            Ok(edit) => submit_paste(&ui, IdeWorkerCommand::EditNativeFilter { edit }),
+            Err(message) => ui.set_error_text(message.into()),
+        }
+    });
+
+    let weak = ui.as_weak();
     let submit_remove = submitter;
     actions.on_remove_native_filter(move |index| {
         let Some(ui) = weak.upgrade() else {
@@ -1466,6 +1513,49 @@ fn native_device_duplication(
     Ok(IdeNativeFilterEdit::Duplicate {
         chain_id: row.chain_id.to_string(),
         device_instance_id: row.device_instance_id.to_string(),
+    })
+}
+
+fn native_device_copy_selection(
+    mode: AppMode,
+    devices: &ModelRc<NativeDeviceRow>,
+    index: i32,
+) -> Result<NativeDeviceClipboard, &'static str> {
+    let row = native_filter_row(mode, devices, index)?;
+    Ok(NativeDeviceClipboard {
+        source_chain_id: row.chain_id.to_string(),
+        source_device_instance_id: row.device_instance_id.to_string(),
+    })
+}
+
+fn native_device_copy_to(
+    mode: AppMode,
+    devices: &ModelRc<NativeDeviceRow>,
+    selection: Option<&NativeDeviceClipboard>,
+    index: i32,
+) -> Result<IdeNativeFilterEdit, &'static str> {
+    let source = selection.ok_or("Copy a native device before choosing a paste target")?;
+    let source_is_current = (0..devices.row_count())
+        .filter_map(|candidate| devices.row_data(candidate))
+        .any(|candidate| {
+            candidate.chain_id == source.source_chain_id
+                && candidate.device_instance_id == source.source_device_instance_id
+        });
+    if !source_is_current {
+        return Err("The copied native device is no longer available");
+    }
+    let target = native_filter_row(mode, devices, index)?;
+    if !target.can_duplicate {
+        return Err("The selected native device chain cannot contain another device");
+    }
+    if target.chain_id == source.source_chain_id {
+        return Err("Choose a paste target in another native device chain");
+    }
+    Ok(IdeNativeFilterEdit::CopyTo {
+        source_chain_id: source.source_chain_id.clone(),
+        source_device_instance_id: source.source_device_instance_id.clone(),
+        target_chain_id: target.chain_id.to_string(),
+        target_device_instance_id: target.device_instance_id.to_string(),
     })
 }
 
@@ -6640,6 +6730,27 @@ fn reset_native_filter_ui(ui: &MainWindow, project_state: &ProjectUiStateCell) {
     ui.set_native_compressor_edit_visible(false);
     ui.set_native_compressor_edit_index(-1);
     project_state.native_filter_tracks.borrow_mut().clear();
+    project_state.native_device_observation_generation.set(None);
+    clear_native_device_copy_selection(ui, project_state);
+}
+
+fn clear_native_device_copy_selection(ui: &MainWindow, project_state: &ProjectUiStateCell) {
+    ui.set_native_device_copy_available(false);
+    *project_state.native_device_clipboard.borrow_mut() = None;
+}
+
+fn observe_native_device_copy_authority(
+    ui: &MainWindow,
+    project_state: &ProjectUiStateCell,
+    playback_session_generation: u64,
+) {
+    if project_state
+        .native_device_observation_generation
+        .replace(Some(playback_session_generation))
+        != Some(playback_session_generation)
+    {
+        clear_native_device_copy_selection(ui, project_state);
+    }
 }
 
 fn set_native_filter_observation(
@@ -6647,6 +6758,11 @@ fn set_native_filter_observation(
     project_state: &ProjectUiStateCell,
     observation: &IdeRunningObservation,
 ) {
+    observe_native_device_copy_authority(
+        ui,
+        project_state,
+        observation.playback_session_generation(),
+    );
     *project_state.native_filter_tracks.borrow_mut() = observation
         .mixer_channels()
         .iter()
@@ -10142,6 +10258,11 @@ mod tests {
                 kind_index: 1, kind_name: "COMPRESSOR".into(), detail: "-18 dB · 4:1".into(), mode_index: 0, mode_name: "".into(), cutoff_millihertz: "".into(), cutoff_label: "".into(), resonance_millionths: "".into(), resonance_label: "".into(),
                 threshold_millidecibels: "-18000".into(), ratio_millionths: "4000000".into(), attack_microseconds: "10000".into(), release_microseconds: "100000".into(), makeup_millidecibels: "0".into(),
             },
+            NativeDeviceRow {
+                index: 2, chain_id: "chain-b".into(), device_instance_id: "device-c".into(), track_id: "track-b".into(), track_name: "Bass".into(), enabled: true, can_move_earlier: false, can_move_later: false, can_duplicate: true,
+                kind_index: 0, kind_name: "FILTER".into(), detail: "800 Hz · Q 1.0".into(), mode_index: 1, mode_name: "HIGH-PASS".into(), cutoff_millihertz: "800000".into(), cutoff_label: "800 Hz".into(), resonance_millionths: "1000000".into(), resonance_label: "Q 1.0".into(),
+                threshold_millidecibels: "".into(), ratio_millionths: "".into(), attack_microseconds: "".into(), release_microseconds: "".into(), makeup_millidecibels: "".into(),
+            },
         ]))));
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_callback = Rc::clone(&submitted);
@@ -10153,6 +10274,12 @@ mod tests {
         ui.set_app_mode(AppMode::Running);
 
         let actions = ui.global::<IdeActions>();
+        observe_native_device_copy_authority(ui, &project_state, 7);
+        actions.invoke_paste_native_device(0);
+        assert_eq!(
+            ui.get_error_text(),
+            "Copy a native device before choosing a paste target"
+        );
         actions.invoke_add_native_filter(0, 1, "80000".into(), "2000000".into());
         actions.invoke_update_native_filter(0, false, 1, "90000".into(), "1500000".into());
         actions.invoke_remove_native_filter(0);
@@ -10160,13 +10287,28 @@ mod tests {
         actions.invoke_update_native_compressor(1, false, "-12000".into(), "6000000".into(), "2000".into(), "60000".into(), "1000".into());
         actions.invoke_move_native_device(0, 1);
         actions.invoke_duplicate_native_device(1);
+        actions.invoke_copy_native_device(1);
+        assert!(ui.get_native_device_copy_available());
+        assert_eq!(
+            ui.get_status_text(),
+            "Native device selected. Choose a target in another chain and paste after it."
+        );
+        observe_native_device_copy_authority(ui, &project_state, 7);
+        assert!(ui.get_native_device_copy_available());
+        actions.invoke_paste_native_device(0);
+        assert_eq!(submitted.borrow().len(), 7);
+        assert_eq!(
+            ui.get_error_text(),
+            "Choose a paste target in another native device chain"
+        );
+        actions.invoke_paste_native_device(2);
         actions.invoke_move_native_device(0, -1);
         actions.invoke_add_native_filter(0, 0, "19999".into(), "707000".into());
         assert!(ui.get_error_text().contains("Cutoff"));
         actions.invoke_remove_native_filter(-1);
 
         let commands = submitted.borrow();
-        assert_eq!(commands.len(), 7);
+        assert_eq!(commands.len(), 8);
         assert!(matches!(
             &commands[0],
             IdeWorkerCommand::EditNativeFilter {
@@ -10216,39 +10358,36 @@ mod tests {
             &commands[6],
             IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Duplicate { chain_id, device_instance_id } } if chain_id == "chain-a" && device_instance_id == "device-b"
         ));
+        assert!(matches!(
+            &commands[7],
+            IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::CopyTo { source_chain_id, source_device_instance_id, target_chain_id, target_device_instance_id } }
+                if source_chain_id == "chain-a"
+                    && source_device_instance_id == "device-b"
+                    && target_chain_id == "chain-b"
+                    && target_device_instance_id == "device-c"
+        ));
         drop(commands);
         assert!(ui.get_error_text().contains("no longer available"));
 
-        ui.set_native_devices(ModelRc::from(Rc::new(VecModel::from(vec![NativeDeviceRow {
-            index: 0,
-            chain_id: "chain-a".into(),
-            device_instance_id: "device-a".into(),
-            track_id: "track-a".into(),
-            track_name: "Audio".into(),
-            enabled: true,
-            can_move_earlier: false,
-            can_move_later: false,
-            can_duplicate: false,
-            kind_index: 0,
-            kind_name: "FILTER".into(),
-            detail: "1250 Hz · Q 0.707".into(),
-            mode_index: 0,
-            mode_name: "LOW-PASS".into(),
-            cutoff_millihertz: "1250000".into(),
-            cutoff_label: "1250 Hz".into(),
-            resonance_millionths: "707000".into(),
-            resonance_label: "Q 0.707".into(),
-            threshold_millidecibels: "".into(),
-            ratio_millionths: "".into(),
-            attack_microseconds: "".into(),
-            release_microseconds: "".into(),
-            makeup_millidecibels: "".into(),
-        }]))));
-        actions.invoke_duplicate_native_device(0);
-        assert_eq!(submitted.borrow().len(), 7);
+        let mut constrained_rows = (0..ui.get_native_devices().row_count())
+            .filter_map(|index| ui.get_native_devices().row_data(index))
+            .collect::<Vec<_>>();
+        constrained_rows[2].can_duplicate = false;
+        ui.set_native_devices(ModelRc::from(Rc::new(VecModel::from(constrained_rows))));
+        actions.invoke_duplicate_native_device(2);
+        actions.invoke_paste_native_device(2);
+        assert_eq!(submitted.borrow().len(), 8);
         assert_eq!(
             ui.get_error_text(),
             "The selected native device chain cannot contain another device"
+        );
+        observe_native_device_copy_authority(ui, &project_state, 8);
+        assert!(!ui.get_native_device_copy_available());
+        actions.invoke_paste_native_device(2);
+        assert_eq!(submitted.borrow().len(), 8);
+        assert_eq!(
+            ui.get_error_text(),
+            "Copy a native device before choosing a paste target"
         );
         assert_native_filter_pending_modes();
 

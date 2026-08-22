@@ -286,6 +286,8 @@ export global IdeActions {
     callback update-native-compressor(int, bool, string, string, string, string, string);
     callback move-native-device(int, int);
     callback duplicate-native-device(int);
+    callback copy-native-device(int);
+    callback paste-native-device(int);
     callback remove-native-filter(int);
     callback add-automation-take(string, int, int, string, string, string);
     callback set-automation-take-active(string, bool);
@@ -559,6 +561,7 @@ export component MainWindow inherits Window {
     in property <[MixerSendRow]> mixer-sends: [];
     in property <[NativeDeviceRow]> native-devices: [];
     in property <[string]> native-filter-track-names: [];
+    in-out property <bool> native-device-copy-available: false;
     in-out property <bool> mixer-native-filter-visible: false;
     in-out property <bool> native-filter-add-visible: false;
     in-out property <int> native-filter-add-track-index: 0;
@@ -2053,7 +2056,7 @@ export component MainWindow inherits Window {
                         ListView {
                             vertical-stretch: 1;
                             for filter in root.native-devices : Rectangle {
-                                height: 56px;
+                                height: 88px;
                                 background: filter.enabled ? #0e1c20 : #0e141b;
                                 border-color: filter.enabled ? #315a58 : #27313d;
                                 border-width: 1px;
@@ -2066,68 +2069,90 @@ export component MainWindow inherits Window {
                                         Text { text: filter.track-name + " · " + filter.kind-name; color: filter.enabled ? #dce5ef : #8290a2; font-size: 12px; font-weight: 600; overflow: elide; }
                                         Text { text: filter.detail + (filter.enabled ? "" : " · BYPASSED"); color: #8290a2; font-size: 10px; overflow: elide; }
                                     }
-                                    Button {
-                                        text: filter.enabled ? "Bypass" : "Enable";
-                                        enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
-                                        clicked => {
-                                            if filter.kind-index == 0 { IdeActions.update-native-filter(filter.index, !filter.enabled, filter.mode-index, filter.cutoff-millihertz, filter.resonance-millionths); }
-                                            else { IdeActions.update-native-compressor(filter.index, !filter.enabled, filter.threshold-millidecibels, filter.ratio-millionths, filter.attack-microseconds, filter.release-microseconds, filter.makeup-millidecibels); }
-                                        }
-                                    }
-                                    Button {
-                                        text: "←";
-                                        accessible-label: "Move native device earlier in its chain";
-                                        enabled: root.app-mode == AppMode.running && filter.can-move-earlier && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
-                                        clicked => { IdeActions.move-native-device(filter.index, -1); }
-                                    }
-                                    Button {
-                                        text: "→";
-                                        accessible-label: "Move native device later in its chain";
-                                        enabled: root.app-mode == AppMode.running && filter.can-move-later && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
-                                        clicked => { IdeActions.move-native-device(filter.index, 1); }
-                                    }
-                                    Button {
-                                        text: "Duplicate";
-                                        accessible-label: "Duplicate native device in its chain";
-                                        enabled: root.app-mode == AppMode.running && filter.can-duplicate && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
-                                        clicked => { IdeActions.duplicate-native-device(filter.index); }
-                                    }
-                                    Button {
-                                        text: "Edit";
-                                        enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
-                                        clicked => {
-                                            if filter.kind-index == 0 {
-                                                root.native-compressor-add-visible = false;
-                                                root.native-compressor-edit-visible = false;
-                                                root.native-filter-edit-index = filter.index;
-                                                root.native-filter-edit-enabled = filter.enabled;
-                                                root.native-filter-edit-mode-index = filter.mode-index;
-                                                root.native-filter-edit-cutoff = filter.cutoff-millihertz;
-                                                root.native-filter-edit-resonance = filter.resonance-millionths;
-                                                root.native-filter-edit-visible = true;
-                                            } else {
-                                                root.native-filter-add-visible = false;
-                                                root.native-filter-edit-visible = false;
-                                                root.native-compressor-edit-index = filter.index;
-                                                root.native-compressor-edit-enabled = filter.enabled;
-                                                root.native-compressor-edit-threshold = filter.threshold-millidecibels;
-                                                root.native-compressor-edit-ratio = filter.ratio-millionths;
-                                                root.native-compressor-edit-attack = filter.attack-microseconds;
-                                                root.native-compressor-edit-release = filter.release-microseconds;
-                                                root.native-compressor-edit-makeup = filter.makeup-millidecibels;
-                                                root.native-compressor-edit-visible = true;
+                                    VerticalLayout {
+                                        min-width: 310px;
+                                        spacing: 4px;
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Button {
+                                                text: filter.enabled ? "Bypass" : "Enable";
+                                                enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
+                                                clicked => {
+                                                    if filter.kind-index == 0 { IdeActions.update-native-filter(filter.index, !filter.enabled, filter.mode-index, filter.cutoff-millihertz, filter.resonance-millionths); }
+                                                    else { IdeActions.update-native-compressor(filter.index, !filter.enabled, filter.threshold-millidecibels, filter.ratio-millionths, filter.attack-microseconds, filter.release-microseconds, filter.makeup-millidecibels); }
+                                                }
                                             }
-                                            root.native-filter-remove-confirming-index = -1;
+                                            Button {
+                                                text: "Copy";
+                                                accessible-label: "Copy native device for a later paste";
+                                                enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
+                                                clicked => { IdeActions.copy-native-device(filter.index); }
+                                            }
+                                            Button {
+                                                text: "Paste";
+                                                accessible-label: "Paste copied native device after this device";
+                                                enabled: root.app-mode == AppMode.running && root.native-device-copy-available && filter.can-duplicate && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
+                                                clicked => { IdeActions.paste-native-device(filter.index); }
+                                            }
                                         }
-                                    }
-                                    Button {
-                                        text: root.native-filter-remove-confirming-index == filter.index ? "Confirm" : "Remove";
-                                        enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
-                                        clicked => {
-                                            if root.native-filter-remove-confirming-index == filter.index {
-                                                IdeActions.remove-native-filter(filter.index);
-                                            } else {
-                                                root.native-filter-remove-confirming-index = filter.index;
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Button {
+                                                text: "←";
+                                                accessible-label: "Move native device earlier in its chain";
+                                                enabled: root.app-mode == AppMode.running && filter.can-move-earlier && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
+                                                clicked => { IdeActions.move-native-device(filter.index, -1); }
+                                            }
+                                            Button {
+                                                text: "→";
+                                                accessible-label: "Move native device later in its chain";
+                                                enabled: root.app-mode == AppMode.running && filter.can-move-later && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
+                                                clicked => { IdeActions.move-native-device(filter.index, 1); }
+                                            }
+                                            Button {
+                                                text: "Duplicate";
+                                                accessible-label: "Duplicate native device in its chain";
+                                                enabled: root.app-mode == AppMode.running && filter.can-duplicate && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
+                                                clicked => { IdeActions.duplicate-native-device(filter.index); }
+                                            }
+                                            Button {
+                                                text: "Edit";
+                                                enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
+                                                clicked => {
+                                                    if filter.kind-index == 0 {
+                                                        root.native-compressor-add-visible = false;
+                                                        root.native-compressor-edit-visible = false;
+                                                        root.native-filter-edit-index = filter.index;
+                                                        root.native-filter-edit-enabled = filter.enabled;
+                                                        root.native-filter-edit-mode-index = filter.mode-index;
+                                                        root.native-filter-edit-cutoff = filter.cutoff-millihertz;
+                                                        root.native-filter-edit-resonance = filter.resonance-millionths;
+                                                        root.native-filter-edit-visible = true;
+                                                    } else {
+                                                        root.native-filter-add-visible = false;
+                                                        root.native-filter-edit-visible = false;
+                                                        root.native-compressor-edit-index = filter.index;
+                                                        root.native-compressor-edit-enabled = filter.enabled;
+                                                        root.native-compressor-edit-threshold = filter.threshold-millidecibels;
+                                                        root.native-compressor-edit-ratio = filter.ratio-millionths;
+                                                        root.native-compressor-edit-attack = filter.attack-microseconds;
+                                                        root.native-compressor-edit-release = filter.release-microseconds;
+                                                        root.native-compressor-edit-makeup = filter.makeup-millidecibels;
+                                                        root.native-compressor-edit-visible = true;
+                                                    }
+                                                    root.native-filter-remove-confirming-index = -1;
+                                                }
+                                            }
+                                            Button {
+                                                text: root.native-filter-remove-confirming-index == filter.index ? "Confirm" : "Remove";
+                                                enabled: root.app-mode == AppMode.running && !root.native-filter-add-visible && !root.native-filter-edit-visible && !root.native-compressor-add-visible && !root.native-compressor-edit-visible;
+                                                clicked => {
+                                                    if root.native-filter-remove-confirming-index == filter.index {
+                                                        IdeActions.remove-native-filter(filter.index);
+                                                    } else {
+                                                        root.native-filter-remove-confirming-index = filter.index;
+                                                    }
+                                                }
                                             }
                                         }
                                     }

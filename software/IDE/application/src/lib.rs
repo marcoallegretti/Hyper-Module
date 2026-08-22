@@ -3784,6 +3784,12 @@ pub enum IdeNativeFilterEdit {
         chain_id: String,
         device_instance_id: String,
     },
+    CopyTo {
+        source_chain_id: String,
+        source_device_instance_id: String,
+        target_chain_id: String,
+        target_device_instance_id: String,
+    },
     Remove {
         chain_id: String,
         device_instance_id: String,
@@ -3793,6 +3799,7 @@ pub enum IdeNativeFilterEdit {
 #[derive(Debug)]
 pub enum IdeNativeFilterEditError {
     InvalidIdentity,
+    CopyRequiresDistinctChains,
     TrackUnavailable,
     ChainUnavailable,
     MixerSave(Box<IdeProjectSaveError>),
@@ -3834,6 +3841,7 @@ impl IdeNativeFilterEditError {
                 ..
             } => publication.publication_committed(),
             Self::InvalidIdentity
+            | Self::CopyRequiresDistinctChains
             | Self::TrackUnavailable
             | Self::ChainUnavailable
             | Self::MixerSave(_)
@@ -3850,6 +3858,9 @@ impl fmt::Display for IdeNativeFilterEditError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidIdentity => formatter.write_str("native device identity is invalid"),
+            Self::CopyRequiresDistinctChains => {
+                formatter.write_str("a native device copy target must be in another chain")
+            }
             Self::TrackUnavailable => formatter.write_str("native device track is unavailable"),
             Self::ChainUnavailable => formatter.write_str("native device chain is unavailable"),
             Self::MixerSave(source) => write!(formatter, "live mixer state could not be preserved: {source}"),
@@ -3883,6 +3894,7 @@ impl Error for IdeNativeFilterEditError {
             } => Some(preparation),
             Self::ReopenAfterPublication { source, .. } => Some(source),
             Self::InvalidIdentity
+            | Self::CopyRequiresDistinctChains
             | Self::TrackUnavailable
             | Self::ChainUnavailable
             | Self::NativeClose(_)
@@ -10057,6 +10069,48 @@ impl RunningDesktopIdeApplication {
                     IdeHistoryOperation::ResourceReplacement {
                         resource_id: chain.id().to_owned(),
                         bytes: serialize_native_filter_chain(chain)?,
+                    },
+                )
+            }
+            IdeNativeFilterEdit::CopyTo {
+                source_chain_id,
+                source_device_instance_id,
+                target_chain_id,
+                target_device_instance_id,
+            } => {
+                if source_chain_id == target_chain_id {
+                    return Err(IdeNativeFilterEditError::CopyRequiresDistinctChains);
+                }
+                let source_chain = find_native_filter_chain(
+                    prepared,
+                    source_chain_id,
+                    source_device_instance_id,
+                )?;
+                let source = source_chain
+                    .devices()
+                    .iter()
+                    .find(|device| device.id() == source_device_instance_id)
+                    .ok_or(IdeNativeFilterEditError::InvalidIdentity)?;
+                let target_chain = find_native_filter_chain(
+                    prepared,
+                    target_chain_id,
+                    target_device_instance_id,
+                )?;
+                let changed = target_chain
+                    .try_with_copied_device_after(
+                        source,
+                        target_device_instance_id,
+                        uuid::Uuid::new_v4().to_string(),
+                    )
+                    .map_err(IdeNativeFilterEditError::Device)?;
+                (
+                    target_chain_id.clone(),
+                    IdeNativeFilterPublication::Replacement(
+                        serialize_native_filter_chain(&changed)?,
+                    ),
+                    IdeHistoryOperation::ResourceReplacement {
+                        resource_id: target_chain.id().to_owned(),
+                        bytes: serialize_native_filter_chain(target_chain)?,
                     },
                 )
             }

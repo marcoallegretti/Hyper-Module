@@ -12991,6 +12991,192 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "one real-worker scenario proves cross-chain copy changes only the target through publication, undo, and redo"
+    )]
+    fn native_device_copy_is_durable_and_targeted_through_the_real_worker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-native-device-copy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+        let worker = DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker.try_send(IdeWorkerCommand::OpenProject(project)).unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else { panic!("the project must open"); };
+        let source_track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .unwrap()
+            .id()
+            .to_owned();
+
+        worker.try_send(IdeWorkerCommand::AddAudioTrack { name: "Target".to_owned() }).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::AudioTrackAdding));
+        let IdeWorkerEvent::Running(with_target_track) = recv(&worker) else { panic!("the added target track must reopen"); };
+        let target_track_id = with_target_track
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio && channel.id() != source_track_id)
+            .unwrap()
+            .id()
+            .to_owned();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::AudioTrackAdded { revision: 2 }));
+
+        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::AddCompressor {
+            track_id: source_track_id.clone(),
+            threshold_millidecibels: -21_000,
+            ratio_millionths: 3_000_000,
+            attack_microseconds: 6_000,
+            release_microseconds: 90_000,
+            makeup_millidecibels: 1_500,
+        }}).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        let IdeWorkerEvent::Running(with_source) = recv(&worker) else { panic!("the source device must reopen"); };
+        let IdeNativeDevice::Compressor(source) = &with_source.native_devices()[0] else { panic!("the source must be a compressor"); };
+        let source_chain_id = source.chain_id().to_owned();
+        let source_device_id = source.device_instance_id().to_owned();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 3, .. }));
+
+        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::Add {
+            track_id: target_track_id.clone(),
+            mode: NativeFilterMode::HighPass,
+            cutoff_millihertz: 800_000,
+            resonance_millionths: 1_000_000,
+        }}).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { .. }));
+        let IdeWorkerEvent::Running(with_target) = recv(&worker) else { panic!("the target device must reopen"); };
+        let IdeNativeDevice::Filter(target) = &with_target.native_devices()[1] else { panic!("the target must be a filter"); };
+        let target_chain_id = target.chain_id().to_owned();
+        let target_device_id = target.device_instance_id().to_owned();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 4, .. }));
+
+        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::CopyTo {
+            source_chain_id: source_chain_id.clone(),
+            source_device_instance_id: source_device_id.clone(),
+            target_chain_id: target_chain_id.clone(),
+            target_device_instance_id: target_device_id.clone(),
+        }}).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { undo_label: Some("native device"), .. }));
+        let IdeWorkerEvent::Running(copied) = recv(&worker) else { panic!("the copied target chain must reopen"); };
+        let [IdeNativeDevice::Compressor(source), IdeNativeDevice::Filter(target), IdeNativeDevice::Compressor(copied)] = copied.native_devices() else {
+            panic!("copy must retain the source chain and insert the copied state only after the target");
+        };
+        assert_eq!(source.device_instance_id(), source_device_id);
+        assert_eq!(target.device_instance_id(), target_device_id);
+        assert_eq!(copied.chain_id(), target_chain_id);
+        assert_ne!(copied.device_instance_id(), source_device_id);
+        assert_eq!(copied.threshold_millidecibels(), source.threshold_millidecibels());
+        assert_eq!(copied.ratio_millionths(), source.ratio_millionths());
+        assert_eq!(copied.attack_microseconds(), source.attack_microseconds());
+        assert_eq!(copied.release_microseconds(), source.release_microseconds());
+        assert_eq!(copied.makeup_millidecibels(), source.makeup_millidecibels());
+        let copied_device_id = copied.device_instance_id().to_owned();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEdited { revision: 5, .. }));
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, label: "native device" }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { redo_label: Some("native device"), .. }));
+        let IdeWorkerEvent::Running(undone) = recv(&worker) else { panic!("undo must restore the target chain only"); };
+        assert!(matches!(
+            undone.native_devices(),
+            [IdeNativeDevice::Compressor(source), IdeNativeDevice::Filter(target)]
+                if source.device_instance_id() == source_device_id
+                    && target.device_instance_id() == target_device_id
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 6, redo: false, label: "native device" }));
+
+        worker.try_send(IdeWorkerCommand::Redo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: true, label: "native device" }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { undo_label: Some("native device"), redo_label: None }));
+        let IdeWorkerEvent::Running(redone) = recv(&worker) else { panic!("redo must restore the copied target chain"); };
+        assert!(matches!(
+            redone.native_devices(),
+            [IdeNativeDevice::Compressor(source), IdeNativeDevice::Filter(target), IdeNativeDevice::Compressor(copied)]
+                if source.device_instance_id() == source_device_id
+                    && target.device_instance_id() == target_device_id
+                    && copied.device_instance_id() == copied_device_id
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 7, redo: true, label: "native device" }));
+
+        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::CopyTo {
+            source_chain_id: source_chain_id.clone(),
+            source_device_instance_id: source_device_id.clone(),
+            target_chain_id: source_chain_id.clone(),
+            target_device_instance_id: source_device_id.clone(),
+        }}).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        let IdeWorkerEvent::Running(same_chain_refused) = recv(&worker) else { panic!("a same-chain copy must reopen the unchanged project"); };
+        assert!(matches!(
+            same_chain_refused.native_devices(),
+            [IdeNativeDevice::Compressor(source), IdeNativeDevice::Filter(target), IdeNativeDevice::Compressor(copied)]
+                if source.device_instance_id() == source_device_id
+                    && target.device_instance_id() == target_device_id
+                    && copied.device_instance_id() == copied_device_id
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::EditNativeFilter,
+                reason: IdeWorkerCommandFailure::NativeFilterEdit(error),
+            } if matches!(
+                error.as_ref(),
+                IdeNativeFilterEditError::CopyRequiresDistinctChains
+            )
+        ));
+
+        worker.try_send(IdeWorkerCommand::EditNativeFilter { edit: IdeNativeFilterEdit::CopyTo {
+            source_chain_id: source_chain_id.clone(),
+            source_device_instance_id: "018f47a2-6b2d-7c11-8a44-001122338099".to_owned(),
+            target_chain_id: target_chain_id.clone(),
+            target_device_instance_id: target_device_id.clone(),
+        }}).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(stale_source_refused) if matches!(
+            stale_source_refused.native_devices(),
+            [IdeNativeDevice::Compressor(source), IdeNativeDevice::Filter(target), IdeNativeDevice::Compressor(copied)]
+                if source.device_instance_id() == source_device_id
+                    && target.device_instance_id() == target_device_id
+                    && copied.device_instance_id() == copied_device_id
+        )));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::EditNativeFilter,
+                reason: IdeWorkerCommandFailure::NativeFilterEdit(error),
+            } if matches!(error.as_ref(), IdeNativeFilterEditError::InvalidIdentity)
+        ));
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestoring { redo: false, label: "native device" }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::UndoStateChanged { redo_label: Some("native device"), .. }));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(after_refusal_undo) if matches!(
+            after_refusal_undo.native_devices(),
+            [IdeNativeDevice::Compressor(source), IdeNativeDevice::Filter(target)]
+                if source.device_instance_id() == source_device_id
+                    && target.device_instance_id() == target_device_id
+        )));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::EditRestored { revision: 8, redo: false, label: "native device" }));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "one real-worker scenario proves replacement and structural device-chain undo/redo without hiding event ordering behind a helper"
     )]
     fn native_filter_edits_are_undoable_and_redoable_through_the_real_worker() {

@@ -758,6 +758,38 @@ impl DeviceChain {
         self.try_with_devices(devices)
     }
 
+    /// Returns a copy with a validated device from another chain inserted
+    /// immediately after one existing device in this chain.
+    ///
+    /// The inserted device receives the supplied identity while preserving the
+    /// copied device's supported kind, version, state, enabled flag, and
+    /// extension data.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when the target is absent, the new identity is
+    /// invalid or already present, or the resulting chain exceeds its bound.
+    pub fn try_with_copied_device_after(
+        &self,
+        source: &NativeDeviceInstance,
+        target_device_instance_id: &str,
+        copied_device_instance_id: String,
+    ) -> Result<Self, DeviceChainError> {
+        let Some(target_index) = self
+            .devices
+            .iter()
+            .position(|device| device.id() == target_device_instance_id)
+        else {
+            return Err(invalid_domain(
+                "native device insertion target does not exist in this chain",
+            ));
+        };
+        let copied = source.try_with_id(copied_device_instance_id)?;
+        let mut devices = self.devices.clone();
+        devices.insert(target_index + 1, copied);
+        self.try_with_devices(devices)
+    }
+
     /// Returns a copy without one device, or `None` when removing it empties
     /// the chain and therefore requires deleting the chain resource.
     ///
@@ -1590,6 +1622,84 @@ mod tests {
                 "018f47a2-6b2d-7c11-8a44-001122338013".to_owned(),
             )
             .is_err());
+    }
+
+    #[test]
+    fn copying_a_device_after_an_existing_target_preserves_the_source_state() {
+        let source_id = "018f47a2-6b2d-7c11-8a44-001122338014";
+        let copied_id = "018f47a2-6b2d-7c11-8a44-001122338015";
+        let source_chain = chain(true)
+            .try_with_appended_compressor(source_id.to_owned(), false, compressor_state())
+            .unwrap();
+        let mut source_wire: Value = serde_json::from_slice(&source_chain.to_canonical_vec().unwrap()).unwrap();
+        source_wire["devices"][1]["extensions"] = serde_json::json!({
+            "org.example.fixture": { "copied": true }
+        });
+        let source_chain = DeviceChain::parse(&serde_json::to_vec(&source_wire).unwrap()).unwrap();
+        let source = &source_chain.devices()[1];
+
+        let target = DeviceChain::try_new(
+            "018f47a2-6b2d-7c11-8a44-001122338016".to_owned(),
+            PROJECT_ID.to_owned(),
+            "018f47a2-6b2d-7c11-8a44-001122338017".to_owned(),
+            vec![
+                NativeDeviceInstance::try_new_filter(
+                    "018f47a2-6b2d-7c11-8a44-001122338018".to_owned(),
+                    true,
+                    state(NativeFilterMode::HighPass),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let target_bytes = target.to_canonical_vec().unwrap();
+        let copied = target
+            .try_with_copied_device_after(source, target.devices()[0].id(), copied_id.to_owned())
+            .unwrap();
+        assert_eq!(
+            copied.devices().iter().map(NativeDeviceInstance::id).collect::<Vec<_>>(),
+            [target.devices()[0].id(), copied_id]
+        );
+        assert_eq!(copied.devices()[1].device_id(), source.device_id());
+        assert_eq!(copied.devices()[1].state(), source.state());
+        assert_eq!(copied.devices()[1].enabled(), source.enabled());
+        assert_eq!(copied.devices()[1].extensions(), source.extensions());
+        assert_eq!(
+            DeviceChain::parse(&copied.to_canonical_vec().unwrap()).unwrap(),
+            copied
+        );
+        assert_eq!(
+            target
+                .try_with_copied_device_after(source, "missing", copied_id.to_owned())
+                .unwrap_err()
+                .kind(),
+            DeviceChainErrorKind::InvalidDomain
+        );
+        assert_eq!(target.to_canonical_vec().unwrap(), target_bytes);
+
+        let full_target = (0..7).fold(target, |chain, ordinal| {
+            chain
+                .try_with_appended_filter(
+                    format!("018f47a2-6b2d-7c11-8a44-{ordinal:012x}"),
+                    true,
+                    state(NativeFilterMode::LowPass),
+                )
+                .unwrap()
+        });
+        let full_target_bytes = full_target.to_canonical_vec().unwrap();
+        assert_eq!(full_target.devices().len(), MAX_DEVICES_PER_CHAIN);
+        assert_eq!(
+            full_target
+                .try_with_copied_device_after(
+                    source,
+                    full_target.devices()[0].id(),
+                    "018f47a2-6b2d-7c11-8a44-001122338030".to_owned(),
+                )
+                .unwrap_err()
+                .kind(),
+            DeviceChainErrorKind::InvalidDomain
+        );
+        assert_eq!(full_target.to_canonical_vec().unwrap(), full_target_bytes);
     }
 
     #[test]
