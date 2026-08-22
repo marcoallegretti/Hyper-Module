@@ -6276,6 +6276,22 @@ struct IdeAudioClipEditPlan {
     clip_bytes: Vec<u8>,
 }
 
+/// A source-view trim retains the prior canonical clip document before its
+/// publication begins. A committed storage warning therefore still has the
+/// exact inverse needed to keep undo truthful.
+#[derive(Debug)]
+struct IdeAudioClipSourceTrimPlan {
+    edit: IdeAudioClipEditPlan,
+    inverse: IdeHistoryOperation,
+}
+
+#[derive(Debug)]
+struct IdeAudioClipSourceTrimResource {
+    clip_id: String,
+    clip_bytes: Vec<u8>,
+    prior_clip_bytes: Vec<u8>,
+}
+
 #[derive(Debug)]
 struct IdeSceneEditPlan {
     mixer: IdeMixerSavePlan,
@@ -6946,7 +6962,7 @@ fn prepare_audio_clip_source_trim_resource(
     source_start_frame: u64,
     source_frame_count: u64,
     limits: LoaderLimits,
-) -> Result<(String, Vec<u8>), IdeAudioClipSourceTrimEditError> {
+) -> Result<IdeAudioClipSourceTrimResource, IdeAudioClipSourceTrimEditError> {
     let package = prepared.package();
     let descriptor = package
         .manifest()
@@ -6995,7 +7011,11 @@ fn prepare_audio_clip_source_trim_resource(
         .try_reserve_exact(clip_id.len())
         .map_err(|_| IdeAudioClipSourceTrimEditError::CapacityUnavailable)?;
     owned_clip_id.push_str(clip_id);
-    Ok((owned_clip_id, clip_bytes))
+    Ok(IdeAudioClipSourceTrimResource {
+        clip_id: owned_clip_id,
+        clip_bytes,
+        prior_clip_bytes: source,
+    })
 }
 
 fn prepare_audio_clip_gain_resource(
@@ -7131,6 +7151,18 @@ impl IdeAudioClipEditPlan {
             mixer: Box::new(mixer),
             source: Box::new(source),
         })
+    }
+}
+
+impl IdeAudioClipSourceTrimPlan {
+    fn inverse(&self) -> IdeHistoryOperation {
+        self.inverse.clone()
+    }
+
+    fn publish(
+        &self,
+    ) -> Result<ProjectResourcePublicationOutcome, IdeAudioClipEditPublicationError> {
+        self.edit.publish()
     }
 }
 
@@ -10443,7 +10475,7 @@ impl RunningDesktopIdeApplication {
         clip_id: &str,
         source_start_frame: u64,
         source_frame_count: u64,
-    ) -> Result<IdeAudioClipEditPlan, IdeAudioClipSourceTrimEditError> {
+    ) -> Result<IdeAudioClipSourceTrimPlan, IdeAudioClipSourceTrimEditError> {
         let mixer = Self::prepare_mixer_save(application, recovery)
             .map_err(|source| IdeAudioClipSourceTrimEditError::MixerSave(Box::new(source)))?;
         let prepared = recovery.prepared_project().ok_or_else(|| {
@@ -10451,17 +10483,24 @@ impl RunningDesktopIdeApplication {
                 IdeProjectSaveError::ProjectSnapshotUnavailable,
             ))
         })?;
-        let (clip_id, clip_bytes) = prepare_audio_clip_source_trim_resource(
+        let resource = prepare_audio_clip_source_trim_resource(
             prepared,
             clip_id,
             source_start_frame,
             source_frame_count,
             application.config.project_limits.session.documents,
         )?;
-        Ok(IdeAudioClipEditPlan {
-            mixer,
-            clip_id,
-            clip_bytes,
+        let inverse = IdeHistoryOperation::ResourceReplacement {
+            resource_id: resource.clip_id.clone(),
+            bytes: resource.prior_clip_bytes,
+        };
+        Ok(IdeAudioClipSourceTrimPlan {
+            edit: IdeAudioClipEditPlan {
+                mixer,
+                clip_id: resource.clip_id,
+                clip_bytes: resource.clip_bytes,
+            },
+            inverse,
         })
     }
 
@@ -16281,7 +16320,7 @@ mod tests {
         let mixer_bytes = package.read_resource(mixer.id()).unwrap();
         let source_audio = std::fs::read(project_path.join("assets/samples/sample.wav")).unwrap();
         let expected_project_sha256 = *package.manifest_sha256();
-        let (clip_id, clip_bytes) = prepare_audio_clip_source_trim_resource(
+        let resource = prepare_audio_clip_source_trim_resource(
             &prepared,
             clip.id(),
             25,
@@ -16296,9 +16335,10 @@ mod tests {
                 resource_id: mixer_id.clone(),
                 resource_bytes: mixer_bytes.clone(),
             },
-            clip_id,
-            clip_bytes: clip_bytes.clone(),
+            clip_id: resource.clip_id,
+            clip_bytes: resource.clip_bytes.clone(),
         };
+        let clip_bytes = resource.clip_bytes;
         drop(prepared);
 
         let outcome = plan.publish().unwrap();

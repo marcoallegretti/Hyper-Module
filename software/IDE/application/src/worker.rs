@@ -5894,6 +5894,10 @@ fn complete_committed_restore(history: &mut UndoHistory, attempt: &ProjectMutati
     true
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive committed-outcome table keeps each mutation's undo authority explicit"
+)]
 fn observe_history(
     history: &mut UndoHistory,
     attempt: &ProjectMutationAttempt,
@@ -5960,6 +5964,17 @@ fn observe_history(
                 true
             }
             ProjectMutationAttempt::EditNativeFilter {
+                inverse: Some(inverse),
+                result: Err(reason),
+                ..
+            } if reason.publication_committed() => {
+                history.record_edit(UndoEntry::from_operation(
+                    inverse.clone(),
+                    undo_label(command),
+                ));
+                true
+            }
+            ProjectMutationAttempt::TrimAudioClipSource {
                 inverse: Some(inverse),
                 result: Err(reason),
                 ..
@@ -7494,6 +7509,7 @@ enum ProjectMutationAttempt {
     TrimAudioClipSource {
         source_start_frame: u64,
         source_frame_count: u64,
+        inverse: Option<IdeHistoryOperation>,
         result: Result<
             hyper_storage_engine::ProjectResourcePublicationOutcome,
             IdeAudioClipSourceTrimEditError,
@@ -8451,6 +8467,7 @@ fn complete_project_mutation(
                     source_start_frame,
                     source_frame_count,
                     result: Ok(outcome),
+                    ..
                 } => send_event(
                     events,
                     IdeWorkerEvent::AudioClipSourceTrimmed {
@@ -9187,18 +9204,22 @@ fn attempt_project_mutation(
             clip_id,
             source_start_frame,
             source_frame_count,
-        } => ProjectMutationAttempt::TrimAudioClipSource {
-            source_start_frame,
-            source_frame_count,
-            result: attempt_audio_clip_source_trim(
+        } => {
+            let (inverse, result) = attempt_audio_clip_source_trim(
                 application,
                 recovery,
                 &clip_id,
                 source_start_frame,
                 source_frame_count,
                 native_failure,
-            ),
-        },
+            );
+            ProjectMutationAttempt::TrimAudioClipSource {
+                source_start_frame,
+                source_frame_count,
+                inverse,
+                result,
+            }
+        }
         ProjectMutation::EditControlMapping { edit } => {
             ProjectMutationAttempt::EditControlMapping {
                 edit: edit.clone(),
@@ -9901,22 +9922,33 @@ fn attempt_audio_clip_source_trim(
     source_start_frame: u64,
     source_frame_count: u64,
     native_failure: Option<IdeNativeCloseFailure>,
-) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAudioClipSourceTrimEditError>
-{
+) -> (
+    Option<IdeHistoryOperation>,
+    Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAudioClipSourceTrimEditError>,
+) {
     if let Some(failure) = native_failure {
-        return Err(IdeAudioClipSourceTrimEditError::NativeClose(failure));
+        return (
+            None,
+            Err(IdeAudioClipSourceTrimEditError::NativeClose(failure)),
+        );
     }
-    RunningDesktopIdeApplication::prepare_audio_clip_source_trim(
+    match RunningDesktopIdeApplication::prepare_audio_clip_source_trim(
         application,
         recovery,
         clip_id,
         source_start_frame,
         source_frame_count,
-    )
-    .and_then(|plan| {
-        plan.publish()
-            .map_err(|source| IdeAudioClipSourceTrimEditError::Publication(Box::new(source)))
-    })
+    ) {
+        Ok(plan) => {
+            let inverse = plan.inverse();
+            (
+                Some(inverse),
+                plan.publish()
+                    .map_err(|source| IdeAudioClipSourceTrimEditError::Publication(Box::new(source))),
+            )
+        }
+        Err(reason) => (None, Err(reason)),
+    }
 }
 
 #[allow(
@@ -15859,6 +15891,52 @@ mod tests {
     }
 
     #[test]
+    fn committed_source_trim_warning_records_the_prior_clip_before_reopen() {
+        let publication = captured_mixer_edit("committed-source-trim-history");
+        let inverse = IdeHistoryOperation::ResourceReplacement {
+            resource_id: "018f47a2-6b2d-7c11-8a44-001122334460".to_owned(),
+            bytes: br#"{\"format\":\"hyper-audio-clip\",\"duration_ticks\":4}"#.to_vec(),
+        };
+        let attempt = ProjectMutationAttempt::TrimAudioClipSource {
+            source_start_frame: 25,
+            source_frame_count: 50,
+            inverse: Some(inverse.clone()),
+            result: Err(IdeAudioClipSourceTrimEditError::ReopenAfterPublication {
+                outcome: Box::new(publication.outcome.clone()),
+                source: Box::new(IdeProjectOpenError::PlaybackSessionGenerationExhausted),
+            }),
+        };
+        let (events, receiver) = std::sync::mpsc::sync_channel(4);
+        let mut history = UndoHistory::default();
+
+        observe_history(
+            &mut history,
+            &attempt,
+            IdeWorkerCommandKind::TrimAudioClipSource,
+            &events,
+        );
+
+        assert_eq!(history.undo.len(), 1);
+        assert_eq!(history.undo[0].operation(), inverse);
+        assert_eq!(history.undo[0].label, "clip source trim");
+        assert!(history.redo.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("clip source trim"),
+                redo_label: None,
+            })
+        ));
+        let failure = project_mutation_reopen_failure(
+            attempt,
+            IdeProjectOpenError::PlaybackSessionGenerationExhausted,
+        );
+        assert!(matches!(failure, IdeWorkerCommandFailure::AudioClipSourceTrim(_)));
+        assert_eq!(history.undo.len(), 1, "terminal mapping cannot rewrite history");
+        assert_eq!(history.undo[0].operation(), inverse);
+    }
+
+    #[test]
     fn history_captures_nothing_from_an_unchanged_republication() {
         let edit = captured_mixer_edit("unchanged");
         let (events, receiver) = std::sync::mpsc::sync_channel(8);
@@ -17786,6 +17864,187 @@ mod tests {
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real worker sequence keeps trim publication, history ordering, reopen, and restore evidence together"
+    )]
+    fn source_trim_reopens_then_records_and_restores_its_exact_clip_history() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-source-trim-history-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+        let source = fixture.join("Source.wav");
+        std::fs::write(&source, pcm16_wav(1, 48_000, &[0; 100])).unwrap();
+
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(audio_import_application()), 2, 8)
+                .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv_native_mutation(&worker) else {
+            panic!("the verified project must open before source trim");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .unwrap()
+            .id()
+            .to_owned();
+
+        worker
+            .try_send(IdeWorkerCommand::ImportAudio {
+                paths: vec![source],
+                track_id,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioImporting { files: 1 }
+        ));
+        let IdeWorkerEvent::Running(imported) = recv_native_mutation(&worker) else {
+            panic!("the imported clip must reopen before completion");
+        };
+        let clip = imported.audio_clips().first().unwrap();
+        let clip_id = clip.id().to_owned();
+        assert_eq!(clip.source_start_frame(), 0);
+        assert_eq!(clip.source_frame_count(), 100);
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioImported(outcome) if outcome.imported() == 1
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SetAudioClipLoop {
+                clip_id: clip_id.clone(),
+                enabled: false,
+                start_tick: 0,
+                end_tick: 2,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioClipLoopChanging {
+                enabled: false,
+                start_tick: 0,
+                end_tick: 2,
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("clip loop"),
+                redo_label: None,
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::Running(_)
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioClipLoopChanged {
+                changed: true,
+                enabled: false,
+                start_tick: 0,
+                end_tick: 2,
+                ..
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::TrimAudioClipSource {
+                clip_id: clip_id.clone(),
+                source_start_frame: 25,
+                source_frame_count: 50,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioClipSourceTrimming {
+                source_start_frame: 25,
+                source_frame_count: 50,
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("clip source trim"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(trimmed) = recv_native_mutation(&worker) else {
+            panic!("the source-trim history must be recorded before verified reopen");
+        };
+        let trimmed_clip = trimmed
+            .audio_clips()
+            .iter()
+            .find(|clip| clip.id() == clip_id)
+            .unwrap();
+        assert_eq!(trimmed_clip.source_start_frame(), 25);
+        assert_eq!(trimmed_clip.source_frame_count(), 50);
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioClipSourceTrimmed {
+                changed: true,
+                source_start_frame: 25,
+                source_frame_count: 50,
+                ..
+            }
+        ));
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "clip source trim",
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("clip loop"),
+                redo_label: Some("clip source trim"),
+            }
+        ));
+        let IdeWorkerEvent::Running(restored) = recv_native_mutation(&worker) else {
+            panic!("the restored source view must reopen before completion");
+        };
+        let restored_clip = restored
+            .audio_clips()
+            .iter()
+            .find(|clip| clip.id() == clip_id)
+            .unwrap();
+        assert_eq!(restored_clip.source_start_frame(), 0);
+        assert_eq!(restored_clip.source_frame_count(), 100);
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::EditRestored {
+                redo: false,
+                label: "clip source trim",
+                ..
+            }
+        ));
+
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]

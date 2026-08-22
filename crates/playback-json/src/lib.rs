@@ -12423,6 +12423,89 @@ mod tests {
     }
 
     #[test]
+    fn source_trim_preserves_or_refuses_retained_graph_references() {
+        let mut source: Value = serde_json::from_slice(CLIP).unwrap();
+        source["loop"]["end_tick"] = 2.into();
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let source_before = source.clone();
+        let mut compatible_arrangement: Value = serde_json::from_slice(ARRANGEMENT).unwrap();
+        compatible_arrangement["placements"][0]["duration_ticks"] = 2.into();
+        let compatible_arrangement =
+            serde_json_canonicalizer::to_vec(&compatible_arrangement).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [&source];
+        let scenes: [&[u8]; 1] = [SCENE];
+        let assets = asset_facts();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334460";
+        let compatible = load(
+            input_with_scenes(
+                TIMELINE,
+                &tracks,
+                &clips,
+                &scenes,
+                Some(&compatible_arrangement),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let edited = serialize_audio_clip_source_view(
+            &compatible,
+            &assets,
+            &source,
+            clip_id,
+            25,
+            50,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let edited_clips: [&[u8]; 1] = [&edited];
+        let reopened = load(
+            input_with_scenes(
+                TIMELINE,
+                &tracks,
+                &edited_clips,
+                &scenes,
+                Some(&compatible_arrangement),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.clip_duration_ticks_at(0), Some(2));
+        assert_eq!(reopened.placement_count(), 1);
+        assert_eq!(reopened.scene_count(), 1);
+        assert!(matches!(
+            reopened.scene_track_action(
+                "018f47a2-6b2d-7c11-8a44-001122334461",
+                "018f47a2-6b2d-7c11-8a44-001122334456",
+            ),
+            Some(SceneTrackAction::Play { clip_id }) if clip_id == "018f47a2-6b2d-7c11-8a44-001122334460"
+        ));
+
+        let incompatible = load(
+            input_with_scenes(TIMELINE, &tracks, &clips, &scenes, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_audio_clip_source_view(
+                &incompatible,
+                &assets,
+                &source,
+                clip_id,
+                25,
+                50,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipSourceViewSerializationError::ProjectCompilation(_))
+        ));
+        assert_eq!(
+            source, source_before,
+            "refusal never changes the source document"
+        );
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "one rejection table keeps every retained source-view invariant together"

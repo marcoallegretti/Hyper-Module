@@ -2889,10 +2889,35 @@ fn bind_audio_clip_source_trim_callback(
     worker: &WorkerCell,
     project_state: &ProjectUiStateCell,
 ) {
-    let actions = ui.global::<IdeActions>();
-    let weak = ui.as_weak();
     let worker = Rc::clone(worker);
     let project_state = Rc::clone(project_state);
+    bind_audio_clip_source_trim_callback_with(
+        ui,
+        move |clip_id| {
+            project_state
+                .audio_clips
+                .borrow()
+                .iter()
+                .find(|clip| clip.id() == clip_id)
+                .map(|clip| {
+                    (
+                        clip.id().to_owned(),
+                        clip.source_start_frame(),
+                        clip.source_frame_count(),
+                    )
+                })
+        },
+        move |ui, command| submit_to_ui(ui, &worker, command),
+    );
+}
+
+fn bind_audio_clip_source_trim_callback_with(
+    ui: &MainWindow,
+    resolve_clip: impl Fn(&str) -> Option<(String, usize, usize)> + 'static,
+    submit: impl Fn(&MainWindow, IdeWorkerCommand) + 'static,
+) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
     actions.on_trim_audio_clip_source(move |clip_id, start, frame_count| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -2917,30 +2942,28 @@ fn bind_audio_clip_source_trim_callback(
                 return;
             }
         };
-        let clips = project_state.audio_clips.borrow();
-        let Some(clip) = clips.iter().find(|clip| clip.id() == clip_id.as_str()) else {
+        let Some((owned_clip_id, committed_start, committed_frame_count)) =
+            resolve_clip(clip_id.as_str())
+        else {
             ui.set_error_text("The selected audio clip is no longer available".into());
             return;
         };
-        if source_frame_count > u64::try_from(clip.source_frame_count()).unwrap_or(u64::MAX) {
+        if source_frame_count > u64::try_from(committed_frame_count).unwrap_or(u64::MAX) {
             ui.set_error_text(
                 "Source trim may not extend the committed reusable source view".into(),
             );
             return;
         }
-        if usize::try_from(source_start_frame).ok() == Some(clip.source_start_frame())
-            && usize::try_from(source_frame_count).ok() == Some(clip.source_frame_count())
+        if usize::try_from(source_start_frame).ok() == Some(committed_start)
+            && usize::try_from(source_frame_count).ok() == Some(committed_frame_count)
         {
             reset_audio_clip_source_trim_form(&ui);
             ui.set_status_text("Audio-clip source view already matches the committed value".into());
             ui.set_error_text(SharedString::default());
             return;
         }
-        let owned_clip_id = clip.id().to_owned();
-        drop(clips);
-        submit_to_ui(
+        submit(
             &ui,
-            &worker,
             IdeWorkerCommand::TrimAudioClipSource {
                 clip_id: owned_clip_id,
                 source_start_frame,
@@ -12555,6 +12578,7 @@ mod tests {
         assert_recent_project_window_contract(ui);
         assert_audio_import_window_contract(ui);
         assert_audio_clip_removal_window_contract(ui);
+        assert_audio_clip_source_trim_window_contract(ui);
         assert_unused_sample_cleanup_window_contract(ui);
         assert_native_filter_window_contract(ui);
         assert_automation_take_removal_window_contract(ui);
@@ -12723,6 +12747,76 @@ mod tests {
         assert!(ui.get_clip_remove_id().is_empty());
         assert!(ui.get_status_text().contains("source media was retained"));
         assert!(ui.get_error_text().is_empty());
+    }
+
+    fn assert_audio_clip_source_trim_window_contract(ui: &MainWindow) {
+        let available = Rc::new(Cell::new(true));
+        let available_for_callback = Rc::clone(&available);
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_audio_clip_source_trim_callback_with(
+            ui,
+            move |clip_id| {
+                (available_for_callback.get() && clip_id == "clip-a")
+                    .then(|| ("clip-a".to_owned(), 0, 100))
+            },
+            move |_, command| submitted_by_callback.borrow_mut().push(command),
+        );
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_clip_source_trim_visible(true);
+        ui.set_clip_source_trim_id("clip-a".into());
+        ui.set_clip_source_trim_name("Clip A".into());
+        ui.set_clip_source_trim_original_start("0".into());
+        ui.set_clip_source_trim_original_frame_count("100".into());
+        ui.set_clip_source_trim_start("25".into());
+        ui.set_clip_source_trim_frame_count("50".into());
+        ui.set_error_text(SharedString::default());
+
+        ui.global::<IdeActions>().invoke_trim_audio_clip_source(
+            "stale-clip".into(),
+            "25".into(),
+            "50".into(),
+        );
+        assert!(submitted.borrow().is_empty());
+        assert!(ui.get_error_text().contains("no longer available"));
+        assert!(ui.get_clip_source_trim_visible());
+        assert_eq!(ui.get_clip_source_trim_start(), "25");
+        assert_eq!(ui.get_clip_source_trim_frame_count(), "50");
+
+        available.set(false);
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>().invoke_trim_audio_clip_source(
+            "clip-a".into(),
+            "25".into(),
+            "50".into(),
+        );
+        assert!(submitted.borrow().is_empty());
+        assert!(ui.get_error_text().contains("no longer available"));
+        assert!(ui.get_clip_source_trim_visible());
+        assert_eq!(ui.get_clip_source_trim_start(), "25");
+        assert_eq!(ui.get_clip_source_trim_frame_count(), "50");
+
+        available.set(true);
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>().invoke_trim_audio_clip_source(
+            "clip-a".into(),
+            "25".into(),
+            "50".into(),
+        );
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::TrimAudioClipSource {
+                clip_id,
+                source_start_frame: 25,
+                source_frame_count: 50,
+            }] if clip_id == "clip-a"
+        ));
+        assert!(ui.get_error_text().is_empty());
+        assert!(ui.get_clip_source_trim_visible());
+        assert_eq!(ui.get_clip_source_trim_id(), "clip-a");
+        assert_eq!(ui.get_clip_source_trim_start(), "25");
+        assert_eq!(ui.get_clip_source_trim_frame_count(), "50");
     }
 
     fn assert_unused_sample_cleanup_window_contract(ui: &MainWindow) {
