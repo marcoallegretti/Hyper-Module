@@ -6074,6 +6074,8 @@ fn apply_running_event(
     );
     let position_frame = observation.recovery().position_frame();
     set_playhead(ui, project_state, position_frame);
+    let transport_state = observation.recovery().state();
+    apply_transport_recovery_availability(ui, transport_state);
     ui.set_transport_clock(
         format_transport_clock(
             u64::try_from(position_frame).unwrap_or(u64::MAX),
@@ -6085,7 +6087,7 @@ fn apply_running_event(
         if observation.preview().state().is_active() {
             "Auditioning take · transport stopped"
         } else {
-            match observation.recovery().state() {
+            match transport_state {
                 PlaybackRecoveryTransportState::Stopped => "Stopped",
                 PlaybackRecoveryTransportState::Rolling => "Rolling",
             }
@@ -7091,6 +7093,8 @@ fn reset_project(
     ui.set_transport_progress_percent(0.0);
     ui.set_transport_end_clock("—".into());
     ui.set_transport_state("Stopped".into());
+    ui.set_transport_start_available(false);
+    ui.set_transport_stop_available(false);
     ui.set_stream_state("No stream".into());
     ui.set_frame_position("0".into());
     ui.set_transport_clock("00:00:00.000".into());
@@ -7102,6 +7106,14 @@ fn reset_project(
     ui.set_left_reading("—".into());
     ui.set_right_reading("—".into());
     reset_loudness_observation(ui);
+}
+
+fn apply_transport_recovery_availability(
+    ui: &MainWindow,
+    state: PlaybackRecoveryTransportState,
+) {
+    ui.set_transport_start_available(state == PlaybackRecoveryTransportState::Stopped);
+    ui.set_transport_stop_available(state == PlaybackRecoveryTransportState::Rolling);
 }
 
 fn reset_arrangement_ui(ui: &MainWindow) {
@@ -9992,6 +10004,68 @@ mod tests {
         });
     }
 
+    fn dispatch_ide_space(
+        ui: &MainWindow,
+        control: bool,
+        shift: bool,
+        alt: bool,
+        meta: bool,
+        repeated: bool,
+    ) {
+        if control {
+            ui.window().dispatch_event(WindowEvent::KeyPressed {
+                text: Key::Control.into(),
+            });
+        }
+        if shift {
+            ui.window().dispatch_event(WindowEvent::KeyPressed {
+                text: Key::Shift.into(),
+            });
+        }
+        if alt {
+            ui.window().dispatch_event(WindowEvent::KeyPressed {
+                text: Key::Alt.into(),
+            });
+        }
+        if meta {
+            ui.window().dispatch_event(WindowEvent::KeyPressed {
+                text: Key::Meta.into(),
+            });
+        }
+        ui.window().dispatch_event(if repeated {
+            WindowEvent::KeyPressRepeated {
+                text: Key::Space.into(),
+            }
+        } else {
+            WindowEvent::KeyPressed {
+                text: Key::Space.into(),
+            }
+        });
+        ui.window().dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Space.into(),
+        });
+        if meta {
+            ui.window().dispatch_event(WindowEvent::KeyReleased {
+                text: Key::Meta.into(),
+            });
+        }
+        if alt {
+            ui.window().dispatch_event(WindowEvent::KeyReleased {
+                text: Key::Alt.into(),
+            });
+        }
+        if shift {
+            ui.window().dispatch_event(WindowEvent::KeyReleased {
+                text: Key::Shift.into(),
+            });
+        }
+        if control {
+            ui.window().dispatch_event(WindowEvent::KeyReleased {
+                text: Key::Control.into(),
+            });
+        }
+    }
+
     fn dispatch_ide_escape(ui: &MainWindow, repeated: bool) {
         ui.window().dispatch_event(if repeated {
             WindowEvent::KeyPressRepeated {
@@ -10242,6 +10316,72 @@ mod tests {
             "pending work and local forms keep the close shortcut unavailable"
         );
         ui.set_new_track_visible(false);
+    }
+
+    fn assert_transport_space_shortcut_contract(ui: &MainWindow) {
+        let starts = Rc::new(Cell::new(0_usize));
+        let starts_by_callback = Rc::clone(&starts);
+        ui.global::<IdeActions>().on_transport_start(move || {
+            starts_by_callback.set(starts_by_callback.get() + 1);
+        });
+        let stops = Rc::new(Cell::new(0_usize));
+        let stops_by_callback = Rc::clone(&stops);
+        ui.global::<IdeActions>().on_transport_stop(move || {
+            stops_by_callback.set(stops_by_callback.get() + 1);
+        });
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_visible(false);
+        ui.set_takes_visible(false);
+        ui.set_arrangement_visible(false);
+        ui.set_clips_visible(false);
+        ui.set_loudness_visible(false);
+        ui.set_scene_create_visible(false);
+        ui.set_scene_rename_visible(false);
+        ui.set_scene_duplicate_visible(false);
+        ui.set_scene_slots_visible(false);
+        apply_transport_recovery_availability(ui, PlaybackRecoveryTransportState::Stopped);
+        assert!(ui.get_transport_start_available());
+        assert!(!ui.get_transport_stop_available());
+        dispatch_ide_space(ui, false, false, false, false, false);
+        dispatch_ide_space(ui, false, false, false, false, true);
+        assert_eq!(
+            starts.get(),
+            1,
+            "Space reuses Start only from the current stopped recovery authority"
+        );
+
+        apply_transport_recovery_availability(ui, PlaybackRecoveryTransportState::Rolling);
+        assert!(!ui.get_transport_start_available());
+        assert!(ui.get_transport_stop_available());
+        dispatch_ide_space(ui, false, false, false, false, false);
+        assert_eq!(
+            stops.get(),
+            1,
+            "Space reuses Stop only from the current rolling recovery authority"
+        );
+
+        dispatch_ide_space(ui, true, false, false, false, false);
+        dispatch_ide_space(ui, false, true, false, false, false);
+        dispatch_ide_space(ui, false, false, true, false, false);
+        dispatch_ide_space(ui, false, false, false, true, false);
+        ui.set_transport_stop_available(false);
+        dispatch_ide_space(ui, false, false, false, false, false);
+        ui.set_transport_start_available(true);
+        ui.set_clips_visible(true);
+        dispatch_ide_space(ui, false, false, false, false, false);
+        ui.set_clips_visible(false);
+        ui.set_app_mode(AppMode::Previewing);
+        dispatch_ide_space(ui, false, false, false, false, false);
+        assert_eq!(starts.get(), 1);
+        assert_eq!(
+            stops.get(),
+            1,
+            "modifiers, revoked authority, hidden performance controls, and non-running modes remain inert"
+        );
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_transport_start_available(false);
     }
 
     fn assert_audio_import_shortcut_contract(ui: &MainWindow) {
@@ -13317,6 +13457,7 @@ mod tests {
         assert_project_open_shortcut_contract(&ui);
         assert_audio_track_creation_shortcut_contract(&ui);
         assert_project_close_shortcut_contract(&ui);
+        assert_transport_space_shortcut_contract(&ui);
         assert_audio_import_shortcut_contract(&ui);
         assert_form_cancellation_shortcut_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);

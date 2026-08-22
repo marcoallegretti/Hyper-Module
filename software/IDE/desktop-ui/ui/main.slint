@@ -673,6 +673,8 @@ export component MainWindow inherits Window {
     in property <string> preview-state: "Idle";
     in property <string> preview-progress: "—";
     in property <string> transport-state: "Stopped";
+    in property <bool> transport-start-available: false;
+    in property <bool> transport-stop-available: false;
     in property <string> stream-state: "No stream";
     in property <string> frame-position: "0";
     in property <string> musical-position: "";
@@ -698,6 +700,16 @@ export component MainWindow inherits Window {
     in property <string> right-reading: "—";
     in property <string> status-text: "Discovering desktop audio outputs…";
     in property <string> error-text: "";
+    private property <bool> performance-visible:
+        !root.mixer-visible
+        && !root.takes-visible
+        && !root.arrangement-visible
+        && !root.clips-visible
+        && !root.loudness-visible
+        && !root.scene-create-visible
+        && !root.scene-rename-visible
+        && !root.scene-duplicate-visible
+        && !root.scene-slots-visible;
 
     keyboard := FocusScope {
         width: parent.width;
@@ -718,6 +730,22 @@ export component MainWindow inherits Window {
         }
 
         key-pressed(event) => {
+            if event.text == Key.Space {
+                if !event.repeat
+                    && !event.modifiers.control
+                    && !event.modifiers.shift
+                    && !event.modifiers.alt
+                    && !event.modifiers.meta
+                    && root.app-mode == AppMode.running
+                    && root.performance-visible {
+                    if root.transport-start-available {
+                        IdeActions.transport-start();
+                    } else if root.transport-stop-available {
+                        IdeActions.transport-stop();
+                    }
+                }
+                return accept;
+            }
             if event.modifiers.control && !event.repeat && (event.text == "z" || event.text == "Z") {
                 if event.modifiers.shift {
                     if root.redo-available {
@@ -1221,7 +1249,7 @@ export component MainWindow inherits Window {
                 vertical-stretch: 1;
                 background: transparent;
 
-                if !root.mixer-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.scene-create-visible && !root.scene-rename-visible && !root.scene-duplicate-visible && !root.scene-slots-visible : Panel {
+                if root.performance-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1277,12 +1305,12 @@ export component MainWindow inherits Window {
                                 spacing: 10px;
                                 Button {
                                     text: "▶  Start";
-                                    enabled: root.app-mode == AppMode.running;
+                                    enabled: root.app-mode == AppMode.running && root.transport-start-available;
                                     clicked => { IdeActions.transport-start(); }
                                 }
                                 Button {
                                     text: "■  Stop";
-                                    enabled: root.app-mode == AppMode.running;
+                                    enabled: root.app-mode == AppMode.running && root.transport-stop-available;
                                     clicked => { IdeActions.transport-stop(); }
                                 }
                                 Button {
