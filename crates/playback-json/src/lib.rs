@@ -908,6 +908,23 @@ pub enum AudioClipSourceStartSerializationError {
     ProjectCompilation(AdapterCompileError),
 }
 
+/// Rejects a source-view trim that would change the reusable clip's exact
+/// tick-to-frame relation or leave retained clip-local state outside its new
+/// duration.
+#[derive(Debug)]
+pub enum AudioClipSourceViewSerializationError {
+    SourceFrameCountZero,
+    SourceFrameCountExceedsCurrentView,
+    SourceFrameCountOutOfRange,
+    DurationArithmeticOverflow,
+    DurationIsNotExact,
+    NonLinearWarp,
+    RetainedLoopOutOfRange,
+    RetainedFadesExceedDuration,
+    Document(AudioClipDocumentSerializationError),
+    ProjectCompilation(AdapterCompileError),
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AudioTrackRemovalBlockers {
     pub clip_references: usize,
@@ -1384,6 +1401,56 @@ impl Error for AudioClipSourceStartSerializationError {
         match self {
             Self::Document(source) => Some(source),
             Self::ProjectCompilation(source) => Some(source),
+        }
+    }
+}
+
+impl fmt::Display for AudioClipSourceViewSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceFrameCountZero => {
+                formatter.write_str("an audio-clip source view cannot be empty")
+            }
+            Self::SourceFrameCountExceedsCurrentView => formatter.write_str(
+                "an audio-clip source-view trim cannot extend the committed source view",
+            ),
+            Self::SourceFrameCountOutOfRange => {
+                formatter.write_str("audio-clip source frame count exceeds the platform range")
+            }
+            Self::DurationArithmeticOverflow => {
+                formatter.write_str("audio-clip source-view duration arithmetic overflowed")
+            }
+            Self::DurationIsNotExact => formatter.write_str(
+                "the requested source-view length cannot retain the clip's exact tick-to-frame rate",
+            ),
+            Self::NonLinearWarp => formatter.write_str(
+                "a nonlinear audio-clip warp requires consolidation before source-view trim",
+            ),
+            Self::RetainedLoopOutOfRange => formatter.write_str(
+                "the retained audio-clip loop does not fit the trimmed source-view duration",
+            ),
+            Self::RetainedFadesExceedDuration => formatter.write_str(
+                "the retained audio-clip fades do not fit the trimmed source-view duration",
+            ),
+            Self::Document(source) => source.fmt(formatter),
+            Self::ProjectCompilation(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioClipSourceViewSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Document(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
+            Self::SourceFrameCountZero
+            | Self::SourceFrameCountExceedsCurrentView
+            | Self::SourceFrameCountOutOfRange
+            | Self::DurationArithmeticOverflow
+            | Self::DurationIsNotExact
+            | Self::NonLinearWarp
+            | Self::RetainedLoopOutOfRange
+            | Self::RetainedFadesExceedDuration => None,
         }
     }
 }
@@ -4517,6 +4584,143 @@ pub fn serialize_audio_clip_source_start(
         .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
         .map_err(AudioClipSourceStartSerializationError::ProjectCompilation)?;
     Ok(output)
+}
+
+/// Atomically trims one reusable audio clip's immutable-media view while
+/// preserving its existing exact linear tick-to-frame rate.
+///
+/// Unlike source slip, this changes the view's frame count and therefore also
+/// its clip-local duration and warp endpoints. The edit deliberately refuses a
+/// nonlinear warp, an inexact scaled duration, or retained loop/fade state that
+/// would fall outside the shorter view rather than silently changing any of
+/// those semantics.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the requested range is empty, extends
+/// the current view, cannot retain the exact rate, has nonlinear warp state,
+/// invalidates retained loop/fade state, falls outside verified media, or makes
+/// the complete project unexecutable.
+pub fn serialize_audio_clip_source_view(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_clip: &[u8],
+    clip_id: &str,
+    source_start_frame: u64,
+    source_frame_count: u64,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AudioClipSourceViewSerializationError> {
+    let clip_index = project
+        .clips
+        .iter()
+        .position(|clip| clip.id == clip_id)
+        .ok_or(AudioClipSourceViewSerializationError::Document(
+            AudioClipDocumentSerializationError::ClipMissing,
+        ))?;
+    let committed = &project.clips[clip_index];
+    let requested_frame_count = usize::try_from(source_frame_count)
+        .map_err(|_| AudioClipSourceViewSerializationError::SourceFrameCountOutOfRange)?;
+
+    if requested_frame_count == 0 {
+        return Err(AudioClipSourceViewSerializationError::SourceFrameCountZero);
+    }
+    if requested_frame_count > committed.source_frame_count {
+        return Err(AudioClipSourceViewSerializationError::SourceFrameCountExceedsCurrentView);
+    }
+
+    if requested_frame_count == committed.source_frame_count
+        && usize::try_from(source_start_frame).ok() == Some(committed.source_start_frame)
+    {
+        let output =
+            serialize_audio_clip_document_edit(project, source_clip, clip_id, limits, |_| Ok(()))
+                .map_err(AudioClipSourceViewSerializationError::Document)?;
+        project
+            .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+            .map_err(AudioClipSourceViewSerializationError::ProjectCompilation)?;
+        return Ok(output);
+    }
+
+    if !audio_clip_warp_is_exactly_linear(committed) {
+        return Err(AudioClipSourceViewSerializationError::NonLinearWarp);
+    }
+
+    let duration_numerator = u128::from(committed.duration_ticks)
+        .checked_mul(
+            u128::try_from(requested_frame_count)
+                .map_err(|_| AudioClipSourceViewSerializationError::DurationArithmeticOverflow)?,
+        )
+        .ok_or(AudioClipSourceViewSerializationError::DurationArithmeticOverflow)?;
+    let committed_frame_count = u128::try_from(committed.source_frame_count)
+        .map_err(|_| AudioClipSourceViewSerializationError::DurationArithmeticOverflow)?;
+    if duration_numerator % committed_frame_count != 0 {
+        return Err(AudioClipSourceViewSerializationError::DurationIsNotExact);
+    }
+    let duration_ticks = u64::try_from(duration_numerator / committed_frame_count)
+        .map_err(|_| AudioClipSourceViewSerializationError::DurationArithmeticOverflow)?;
+    if duration_ticks == 0 {
+        return Err(AudioClipSourceViewSerializationError::DurationIsNotExact);
+    }
+    if committed.loop_range.end > duration_ticks {
+        return Err(AudioClipSourceViewSerializationError::RetainedLoopOutOfRange);
+    }
+    if committed.fade_in_ticks > duration_ticks
+        || committed.fade_out_ticks > duration_ticks - committed.fade_in_ticks
+    {
+        return Err(AudioClipSourceViewSerializationError::RetainedFadesExceedDuration);
+    }
+
+    let output =
+        serialize_audio_clip_document_edit(project, source_clip, clip_id, limits, |document| {
+            document.insert("duration_ticks".to_owned(), duration_ticks.into());
+            let source = document
+                .get_mut("source")
+                .and_then(Value::as_object_mut)
+                .ok_or(AudioClipDocumentSerializationError::InvalidDocumentShape)?;
+            source.insert("start_frame".to_owned(), source_start_frame.into());
+            source.insert("frame_count".to_owned(), source_frame_count.into());
+            document.insert(
+                "warp_markers".to_owned(),
+                json!([
+                    {"tick": 0, "source_frame_offset": 0},
+                    {"tick": duration_ticks, "source_frame_offset": source_frame_count}
+                ]),
+            );
+            Ok(())
+        })
+        .map_err(AudioClipSourceViewSerializationError::Document)?;
+
+    let edited = load_clip(
+        &output,
+        clip_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_warp_markers,
+    )
+    .map_err(AudioClipDocumentSerializationError::Source)
+    .map_err(AudioClipSourceViewSerializationError::Document)?;
+    let mut edited_project = project.clone();
+    edited_project.clips[clip_index] = edited;
+    edited_project
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(AudioClipSourceViewSerializationError::ProjectCompilation)?;
+    Ok(output)
+}
+
+fn audio_clip_warp_is_exactly_linear(clip: &LoadedClip) -> bool {
+    let duration = u128::from(clip.duration_ticks);
+    let Ok(frame_count) = u128::try_from(clip.source_frame_count) else {
+        return false;
+    };
+    clip.warp_markers.iter().all(|marker| {
+        u128::from(marker.tick)
+            .checked_mul(frame_count)
+            .zip(
+                u128::try_from(marker.source_frame_offset)
+                    .ok()
+                    .and_then(|offset| offset.checked_mul(duration)),
+            )
+            .is_some_and(|(left, right)| left == right)
+    })
 }
 
 /// Replaces only the global activation state in one validated canonical audio
@@ -12147,6 +12351,221 @@ mod tests {
             Err(AudioClipSourceStartSerializationError::Document(
                 AudioClipDocumentSerializationError::NonCanonicalSource
             ))
+        ));
+    }
+
+    #[test]
+    fn audio_clip_source_view_trim_preserves_exact_rate_and_canonical_endpoints() {
+        let mut source: Value = serde_json::from_slice(CLIP).unwrap();
+        source["extensions"]["org.example.clip"] = json!({"opaque": [1, 2, 3]});
+        source["loop"]["end_tick"] = 2.into();
+        let source = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [&source];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334460";
+        let assets = [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
+            sample_rate_hz: 48_000,
+            frame_count: 150,
+        }];
+
+        let edited = serialize_audio_clip_source_view(
+            &loaded,
+            &assets,
+            &source,
+            clip_id,
+            25,
+            50,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mut expected: Value = serde_json::from_slice(&source).unwrap();
+        expected["duration_ticks"] = 2.into();
+        expected["source"]["start_frame"] = 25.into();
+        expected["source"]["frame_count"] = 50.into();
+        expected["warp_markers"] = json!([
+            {"tick": 0, "source_frame_offset": 0},
+            {"tick": 2, "source_frame_offset": 50}
+        ]);
+        assert_eq!(edited, serde_json_canonicalizer::to_vec(&expected).unwrap());
+        assert_eq!(
+            expected["extensions"]["org.example.clip"],
+            json!({"opaque": [1, 2, 3]})
+        );
+
+        let edited_clips: [&[u8]; 1] = [&edited];
+        let reopened = load(
+            input(TIMELINE, &tracks, &edited_clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(reopened.clip_source_start_frame_at(0), Some(25));
+        assert_eq!(reopened.clip_source_frame_count_at(0), Some(50));
+        assert_eq!(reopened.clip_duration_ticks_at(0), Some(2));
+        assert_eq!(
+            serialize_audio_clip_source_view(
+                &loaded,
+                &assets,
+                &source,
+                clip_id,
+                0,
+                100,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one rejection table keeps every retained source-view invariant together"
+    )]
+    fn audio_clip_source_view_trim_refuses_lossy_or_incompatible_state() {
+        let mut source: Value = serde_json::from_slice(CLIP).unwrap();
+        source["loop"]["end_tick"] = 2.into();
+        let canonical = serde_json_canonicalizer::to_vec(&source).unwrap();
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [&canonical];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let clip_id = "018f47a2-6b2d-7c11-8a44-001122334460";
+        let assets = [MediaAssetFact {
+            id: "018f47a2-6b2d-7c11-8a44-001122334457",
+            sample_rate_hz: 48_000,
+            frame_count: 150,
+        }];
+
+        assert!(matches!(
+            serialize_audio_clip_source_view(
+                &loaded,
+                &assets,
+                &canonical,
+                clip_id,
+                0,
+                0,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipSourceViewSerializationError::SourceFrameCountZero)
+        ));
+        assert!(matches!(
+            serialize_audio_clip_source_view(
+                &loaded,
+                &assets,
+                &canonical,
+                clip_id,
+                0,
+                101,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipSourceViewSerializationError::SourceFrameCountExceedsCurrentView)
+        ));
+        assert!(matches!(
+            serialize_audio_clip_source_view(
+                &loaded,
+                &assets,
+                &canonical,
+                clip_id,
+                0,
+                30,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipSourceViewSerializationError::DurationIsNotExact)
+        ));
+        assert!(matches!(
+            serialize_audio_clip_source_view(
+                &loaded,
+                &assets,
+                &canonical,
+                clip_id,
+                101,
+                50,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipSourceViewSerializationError::ProjectCompilation(
+                AdapterCompileError::Graph(GraphError::SourceOutsideAsset { clip_index: 0 })
+            ))
+        ));
+
+        let mut loop_source = source.clone();
+        loop_source["loop"]["enabled"] = true.into();
+        loop_source["loop"]["end_tick"] = 4.into();
+        let loop_source = serde_json_canonicalizer::to_vec(&loop_source).unwrap();
+        let loop_clips: [&[u8]; 1] = [&loop_source];
+        let loop_project = load(
+            input(TIMELINE, &tracks, &loop_clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_audio_clip_source_view(
+                &loop_project,
+                &assets,
+                &loop_source,
+                clip_id,
+                0,
+                50,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipSourceViewSerializationError::RetainedLoopOutOfRange)
+        ));
+
+        let mut fade_source = source.clone();
+        fade_source["fades"]["in_ticks"] = 1.into();
+        fade_source["fades"]["out_ticks"] = 2.into();
+        let fade_source = serde_json_canonicalizer::to_vec(&fade_source).unwrap();
+        let fade_clips: [&[u8]; 1] = [&fade_source];
+        let fade_project = load(
+            input(TIMELINE, &tracks, &fade_clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_audio_clip_source_view(
+                &fade_project,
+                &assets,
+                &fade_source,
+                clip_id,
+                0,
+                50,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipSourceViewSerializationError::RetainedFadesExceedDuration)
+        ));
+
+        let mut nonlinear_source = source;
+        nonlinear_source["warp_markers"] = json!([
+            {"tick": 0, "source_frame_offset": 0},
+            {"tick": 1, "source_frame_offset": 10},
+            {"tick": 4, "source_frame_offset": 100}
+        ]);
+        let nonlinear_source = serde_json_canonicalizer::to_vec(&nonlinear_source).unwrap();
+        let nonlinear_clips: [&[u8]; 1] = [&nonlinear_source];
+        let nonlinear_project = load(
+            input(TIMELINE, &tracks, &nonlinear_clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_audio_clip_source_view(
+                &nonlinear_project,
+                &assets,
+                &nonlinear_source,
+                clip_id,
+                0,
+                50,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioClipSourceViewSerializationError::NonLinearWarp)
         ));
     }
 

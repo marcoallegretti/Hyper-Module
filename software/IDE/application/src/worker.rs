@@ -33,7 +33,8 @@ use super::{
     IdeAudioClipDuplicationError, IdeAudioClipFadeEditError, IdeAudioClipGainEditError,
     IdeAudioClipRemovalError,
     IdeAudioClipLoopEditError, IdeAudioClipRenameEditError, IdeAudioClipReverseEditError,
-    IdeAudioClipSourceSlipEditError, IdeAudioImportBatchFailure, IdeAudioImportBatchOutcome,
+    IdeAudioClipSourceSlipEditError, IdeAudioClipSourceTrimEditError, IdeAudioImportBatchFailure,
+    IdeAudioImportBatchOutcome,
     IdeAudioImportError, IdeAudioInputInventory, IdeAudioOutputInventory,
     IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioTrackAdditionError,
     IdeAudioTrackEditError, IdeAudioTrackRemovalError, IdeAutomationTakeCreationError,
@@ -174,6 +175,7 @@ pub enum IdeWorkerCommandKind {
     SetAudioClipLoop,
     SetAudioClipReverse,
     SetAudioClipSourceStart,
+    TrimAudioClipSource,
     AddScene,
     DuplicateScene,
     SetSceneSlot,
@@ -358,6 +360,11 @@ pub enum IdeWorkerCommand {
         clip_id: String,
         source_start_frame: u64,
     },
+    TrimAudioClipSource {
+        clip_id: String,
+        source_start_frame: u64,
+        source_frame_count: u64,
+    },
     AddScene {
         name: String,
         quantization: IdeSceneLaunchQuantization,
@@ -492,6 +499,7 @@ impl IdeWorkerCommand {
             Self::SetAudioClipLoop { .. } => IdeWorkerCommandKind::SetAudioClipLoop,
             Self::SetAudioClipReverse { .. } => IdeWorkerCommandKind::SetAudioClipReverse,
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
+            Self::TrimAudioClipSource { .. } => IdeWorkerCommandKind::TrimAudioClipSource,
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
@@ -1580,6 +1588,7 @@ pub enum IdeWorkerCommandFailure {
     AudioClipLoop(Box<IdeAudioClipLoopEditError>),
     AudioClipReverse(Box<IdeAudioClipReverseEditError>),
     AudioClipSourceSlip(Box<IdeAudioClipSourceSlipEditError>),
+    AudioClipSourceTrim(Box<IdeAudioClipSourceTrimEditError>),
     SceneCreation(Box<IdeSceneCreationError>),
     AutomationTakeCreation(Box<IdeAutomationTakeCreationError>),
     AutomationTakeActivation(Box<IdeAutomationTakeEditError>),
@@ -1668,6 +1677,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::AudioClipLoop(source) => source.fmt(formatter),
             Self::AudioClipReverse(source) => source.fmt(formatter),
             Self::AudioClipSourceSlip(source) => source.fmt(formatter),
+            Self::AudioClipSourceTrim(source) => source.fmt(formatter),
             Self::SceneCreation(source) => source.fmt(formatter),
             Self::AutomationTakeCreation(source) => source.fmt(formatter),
             Self::AutomationTakeActivation(source) | Self::AutomationTakeRemoval(source) => {
@@ -1747,6 +1757,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::AudioClipLoop(source) => Some(source),
             Self::AudioClipReverse(source) => Some(source),
             Self::AudioClipSourceSlip(source) => Some(source),
+            Self::AudioClipSourceTrim(source) => Some(source),
             Self::SceneCreation(source) => Some(source),
             Self::AutomationTakeCreation(source) => Some(source),
             Self::AutomationTakeActivation(source) | Self::AutomationTakeRemoval(source) => {
@@ -1781,6 +1792,7 @@ pub enum IdeAudioClipEditCommittedWarning {
     Loop(Box<IdeAudioClipLoopEditError>),
     Reverse(Box<IdeAudioClipReverseEditError>),
     SourceSlip(Box<IdeAudioClipSourceSlipEditError>),
+    SourceTrim(Box<IdeAudioClipSourceTrimEditError>),
 }
 
 impl fmt::Display for IdeAudioClipEditCommittedWarning {
@@ -1793,6 +1805,7 @@ impl fmt::Display for IdeAudioClipEditCommittedWarning {
             Self::Loop(source) => source.fmt(formatter),
             Self::Reverse(source) => source.fmt(formatter),
             Self::SourceSlip(source) => source.fmt(formatter),
+            Self::SourceTrim(source) => source.fmt(formatter),
         }
     }
 }
@@ -1807,6 +1820,7 @@ impl Error for IdeAudioClipEditCommittedWarning {
             Self::Loop(source) => Some(source),
             Self::Reverse(source) => Some(source),
             Self::SourceSlip(source) => Some(source),
+            Self::SourceTrim(source) => Some(source),
         }
     }
 }
@@ -1991,6 +2005,12 @@ pub enum IdeWorkerEvent {
         revision: u64,
         changed: bool,
         source_start_frame: u64,
+    },
+    AudioClipSourceTrimmed {
+        revision: u64,
+        changed: bool,
+        source_start_frame: u64,
+        source_frame_count: u64,
     },
     SceneAdded {
         revision: u64,
@@ -2199,6 +2219,10 @@ pub enum IdeWorkerEvent {
     },
     AudioClipSourceStartChanging {
         source_start_frame: u64,
+    },
+    AudioClipSourceTrimming {
+        source_start_frame: u64,
+        source_frame_count: u64,
     },
     SceneAdding,
     AutomationTakeAdding,
@@ -2697,6 +2721,11 @@ enum ProjectMutation {
         clip_id: String,
         source_start_frame: u64,
     },
+    TrimAudioClipSource {
+        clip_id: String,
+        source_start_frame: u64,
+        source_frame_count: u64,
+    },
     AddScene {
         name: String,
         quantization: IdeSceneLaunchQuantization,
@@ -2796,6 +2825,7 @@ impl ProjectMutation {
             Self::SetAudioClipLoop { .. } => IdeWorkerCommandKind::SetAudioClipLoop,
             Self::SetAudioClipReverse { .. } => IdeWorkerCommandKind::SetAudioClipReverse,
             Self::SetAudioClipSourceStart { .. } => IdeWorkerCommandKind::SetAudioClipSourceStart,
+            Self::TrimAudioClipSource { .. } => IdeWorkerCommandKind::TrimAudioClipSource,
             Self::AddScene { .. } => IdeWorkerCommandKind::AddScene,
             Self::AddAutomationTake { .. } => IdeWorkerCommandKind::AddAutomationTake,
             Self::SetAutomationTakeActive { .. } => IdeWorkerCommandKind::SetAutomationTakeActive,
@@ -2918,6 +2948,14 @@ impl ProjectMutation {
                 source_start_frame, ..
             } => IdeWorkerEvent::AudioClipSourceStartChanging {
                 source_start_frame: *source_start_frame,
+            },
+            Self::TrimAudioClipSource {
+                source_start_frame,
+                source_frame_count,
+                ..
+            } => IdeWorkerEvent::AudioClipSourceTrimming {
+                source_start_frame: *source_start_frame,
+                source_frame_count: *source_frame_count,
             },
             Self::AddScene { .. } => IdeWorkerEvent::SceneAdding,
             Self::AddAutomationTake { .. } => IdeWorkerEvent::AutomationTakeAdding,
@@ -3126,6 +3164,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SetAudioClipLoop => "clip loop",
         IdeWorkerCommandKind::SetAudioClipReverse => "clip direction",
         IdeWorkerCommandKind::SetAudioClipSourceStart => "clip source slip",
+        IdeWorkerCommandKind::TrimAudioClipSource => "clip source trim",
         IdeWorkerCommandKind::RenameScene => "scene rename",
         IdeWorkerCommandKind::SetSceneSlot => "scene slot edit",
         IdeWorkerCommandKind::SetSceneActive => "scene activation",
@@ -3484,6 +3523,7 @@ fn process_command(
         | IdeWorkerCommand::SetAudioClipLoop { .. }
         | IdeWorkerCommand::SetAudioClipReverse { .. }
         | IdeWorkerCommand::SetAudioClipSourceStart { .. }
+        | IdeWorkerCommand::TrimAudioClipSource { .. }
         | IdeWorkerCommand::AddScene { .. }
         | IdeWorkerCommand::AddAutomationTake { .. }
         | IdeWorkerCommand::SetAutomationTakeActive { .. }
@@ -3656,6 +3696,17 @@ fn process_project_mutation_command(
             clip_id,
             source_start_frame,
         } => set_audio_clip_source_start(state, events, &clip_id, source_start_frame),
+        IdeWorkerCommand::TrimAudioClipSource {
+            clip_id,
+            source_start_frame,
+            source_frame_count,
+        } => trim_audio_clip_source(
+            state,
+            events,
+            &clip_id,
+            source_start_frame,
+            source_frame_count,
+        ),
         IdeWorkerCommand::AddScene { name, quantization } => {
             add_scene(state, events, &name, quantization)
         }
@@ -6052,6 +6103,10 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             result: Ok(outcome),
             ..
         }
+        | ProjectMutationAttempt::TrimAudioClipSource {
+            result: Ok(outcome),
+            ..
+        }
         | ProjectMutationAttempt::AddScene {
             result: Ok(outcome),
             ..
@@ -6155,6 +6210,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::SetAudioClipLoop { result: Err(_), .. }
         | ProjectMutationAttempt::SetAudioClipReverse { result: Err(_), .. }
         | ProjectMutationAttempt::SetAudioClipSourceStart { result: Err(_), .. }
+        | ProjectMutationAttempt::TrimAudioClipSource { result: Err(_), .. }
         | ProjectMutationAttempt::AddScene { result: Err(_), .. }
         | ProjectMutationAttempt::AddAutomationTake { result: Err(_), .. }
         | ProjectMutationAttempt::SetAutomationTakeActive { result: Err(_), .. }
@@ -6688,6 +6744,44 @@ fn set_audio_clip_source_start(
     )
 }
 
+fn trim_audio_clip_source(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    clip_id: &str,
+    source_start_frame: u64,
+    source_frame_count: u64,
+) -> bool {
+    if clip_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::TrimAudioClipSource,
+            IdeWorkerCommandFailure::AudioClipSourceTrim(Box::new(
+                IdeAudioClipSourceTrimEditError::InvalidClipIdentity,
+            )),
+        );
+    }
+    let mut owned_clip_id = String::new();
+    if owned_clip_id.try_reserve_exact(clip_id.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::TrimAudioClipSource,
+            IdeWorkerCommandFailure::AudioClipSourceTrim(Box::new(
+                IdeAudioClipSourceTrimEditError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_clip_id.push_str(clip_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::TrimAudioClipSource {
+            clip_id: owned_clip_id,
+            source_start_frame,
+            source_frame_count,
+        },
+    )
+}
+
 fn begin_project_mutation_request(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -6893,6 +6987,11 @@ fn project_mutation_save_failure(
         ProjectMutation::SetAudioClipSourceStart { .. } => {
             IdeWorkerCommandFailure::AudioClipSourceSlip(Box::new(
                 IdeAudioClipSourceSlipEditError::MixerSave(Box::new(reason)),
+            ))
+        }
+        ProjectMutation::TrimAudioClipSource { .. } => {
+            IdeWorkerCommandFailure::AudioClipSourceTrim(Box::new(
+                IdeAudioClipSourceTrimEditError::MixerSave(Box::new(reason)),
             ))
         }
         ProjectMutation::AddScene { .. } => IdeWorkerCommandFailure::SceneCreation(Box::new(
@@ -7152,6 +7251,11 @@ fn project_mutation_native_close_failure(
                 IdeAudioClipSourceSlipEditError::NativeClose(failure),
             ))
         }
+        ProjectMutation::TrimAudioClipSource { .. } => {
+            IdeWorkerCommandFailure::AudioClipSourceTrim(Box::new(
+                IdeAudioClipSourceTrimEditError::NativeClose(failure),
+            ))
+        }
         ProjectMutation::AddScene { .. } => IdeWorkerCommandFailure::SceneCreation(Box::new(
             IdeSceneCreationError::NativeClose(failure),
         )),
@@ -7387,6 +7491,14 @@ enum ProjectMutationAttempt {
             IdeAudioClipSourceSlipEditError,
         >,
     },
+    TrimAudioClipSource {
+        source_start_frame: u64,
+        source_frame_count: u64,
+        result: Result<
+            hyper_storage_engine::ProjectResourcePublicationOutcome,
+            IdeAudioClipSourceTrimEditError,
+        >,
+    },
     AddScene {
         name: String,
         result:
@@ -7595,6 +7707,18 @@ pub(super) fn audio_clip_source_slip_edit_failure_event(
         IdeAudioClipSourceSlipEditError::publication_committed,
         IdeAudioClipEditCommittedWarning::SourceSlip,
         IdeWorkerCommandFailure::AudioClipSourceSlip,
+    )
+}
+
+pub(super) fn audio_clip_source_trim_edit_failure_event(
+    reason: IdeAudioClipSourceTrimEditError,
+) -> IdeWorkerEvent {
+    audio_clip_edit_failure_event(
+        IdeWorkerCommandKind::TrimAudioClipSource,
+        reason,
+        IdeAudioClipSourceTrimEditError::publication_committed,
+        IdeAudioClipEditCommittedWarning::SourceTrim,
+        IdeWorkerCommandFailure::AudioClipSourceTrim,
     )
 }
 
@@ -8323,6 +8447,23 @@ fn complete_project_mutation(
                     result: Err(reason),
                     ..
                 } => send_event(events, audio_clip_source_slip_edit_failure_event(reason)),
+                ProjectMutationAttempt::TrimAudioClipSource {
+                    source_start_frame,
+                    source_frame_count,
+                    result: Ok(outcome),
+                } => send_event(
+                    events,
+                    IdeWorkerEvent::AudioClipSourceTrimmed {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                        source_start_frame,
+                        source_frame_count,
+                    },
+                ),
+                ProjectMutationAttempt::TrimAudioClipSource {
+                    result: Err(reason),
+                    ..
+                } => send_event(events, audio_clip_source_trim_edit_failure_event(reason)),
                 ProjectMutationAttempt::AddScene {
                     name,
                     result: Ok(outcome),
@@ -9042,6 +9183,22 @@ fn attempt_project_mutation(
                 native_failure,
             ),
         },
+        ProjectMutation::TrimAudioClipSource {
+            clip_id,
+            source_start_frame,
+            source_frame_count,
+        } => ProjectMutationAttempt::TrimAudioClipSource {
+            source_start_frame,
+            source_frame_count,
+            result: attempt_audio_clip_source_trim(
+                application,
+                recovery,
+                &clip_id,
+                source_start_frame,
+                source_frame_count,
+                native_failure,
+            ),
+        },
         ProjectMutation::EditControlMapping { edit } => {
             ProjectMutationAttempt::EditControlMapping {
                 edit: edit.clone(),
@@ -9737,6 +9894,31 @@ fn attempt_audio_clip_source_slip(
     })
 }
 
+fn attempt_audio_clip_source_trim(
+    application: &DesktopIdeApplication,
+    recovery: &DesktopPlaybackRecovery,
+    clip_id: &str,
+    source_start_frame: u64,
+    source_frame_count: u64,
+    native_failure: Option<IdeNativeCloseFailure>,
+) -> Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAudioClipSourceTrimEditError>
+{
+    if let Some(failure) = native_failure {
+        return Err(IdeAudioClipSourceTrimEditError::NativeClose(failure));
+    }
+    RunningDesktopIdeApplication::prepare_audio_clip_source_trim(
+        application,
+        recovery,
+        clip_id,
+        source_start_frame,
+        source_frame_count,
+    )
+    .and_then(|plan| {
+        plan.publish()
+            .map_err(|source| IdeAudioClipSourceTrimEditError::Publication(Box::new(source)))
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "every mutation outcome retains its command-specific recovery evidence"
@@ -10058,6 +10240,9 @@ fn project_mutation_reopen_failure(
         }
         ProjectMutationAttempt::SetAudioClipSourceStart { result, .. } => {
             audio_clip_source_slip_edit_reopen_failure(result, reopen)
+        }
+        ProjectMutationAttempt::TrimAudioClipSource { result, .. } => {
+            audio_clip_source_trim_edit_reopen_failure(result, reopen)
         }
         ProjectMutationAttempt::AddScene { result, .. } => {
             scene_creation_reopen_failure(result, reopen)
@@ -10734,6 +10919,38 @@ fn audio_clip_source_slip_edit_reopen_failure(
         },
     };
     IdeWorkerCommandFailure::AudioClipSourceSlip(Box::new(reason))
+}
+
+fn audio_clip_source_trim_edit_reopen_failure(
+    result: Result<
+        hyper_storage_engine::ProjectResourcePublicationOutcome,
+        IdeAudioClipSourceTrimEditError,
+    >,
+    reopen: IdeProjectOpenError,
+) -> IdeWorkerCommandFailure {
+    let reason = match result {
+        Ok(outcome) => IdeAudioClipSourceTrimEditError::ReopenAfterPublication {
+            outcome: Box::new(outcome),
+            source: Box::new(reopen),
+        },
+        Err(IdeAudioClipSourceTrimEditError::Publication(publication)) => {
+            IdeAudioClipSourceTrimEditError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(IdeAudioClipSourceTrimEditError::NativeClose(close)) => {
+            IdeAudioClipSourceTrimEditError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            }
+        }
+        Err(preparation) => IdeAudioClipSourceTrimEditError::ReopenAfterPreparation {
+            preparation: Box::new(preparation),
+            reopen: Box::new(reopen),
+        },
+    };
+    IdeWorkerCommandFailure::AudioClipSourceTrim(Box::new(reason))
 }
 
 fn arrangement_placement_edit_reopen_failure(
@@ -16489,6 +16706,10 @@ mod tests {
                 IdeWorkerCommandKind::SetAudioClipSourceStart,
                 "clip source slip",
             ),
+            (
+                IdeWorkerCommandKind::TrimAudioClipSource,
+                "clip source trim",
+            ),
             (IdeWorkerCommandKind::AddScene, "scene"),
             (IdeWorkerCommandKind::DuplicateScene, "scene duplication"),
             (IdeWorkerCommandKind::RenameScene, "scene rename"),
@@ -17502,6 +17723,66 @@ mod tests {
                 command: IdeWorkerCommandKind::SetAudioClipSourceStart,
                 reason: IdeWorkerCommandFailure::AudioClipSourceSlip(reason),
             } if matches!(reason.as_ref(), IdeAudioClipSourceSlipEditError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn audio_clip_source_trim_validates_identity_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::TrimAudioClipSource {
+                clip_id: String::new(),
+                source_start_frame: 25,
+                source_frame_count: 50,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::TrimAudioClipSource,
+                reason: IdeWorkerCommandFailure::AudioClipSourceTrim(reason),
+            } if matches!(reason.as_ref(), IdeAudioClipSourceTrimEditError::InvalidClipIdentity)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::TrimAudioClipSource {
+                clip_id: "018f47a2-6b2d-7c11-8a44-001122334460".to_owned(),
+                source_start_frame: 25,
+                source_frame_count: 50,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioClipSourceTrimming {
+                source_start_frame: 25,
+                source_frame_count: 50,
+            }
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::TrimAudioClipSource,
+                reason: IdeWorkerCommandFailure::AudioClipSourceTrim(reason),
+            } if matches!(reason.as_ref(), IdeAudioClipSourceTrimEditError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);

@@ -35,6 +35,7 @@ export enum AppMode {
     changing-clip-loop,
     changing-clip-reverse,
     changing-clip-source,
+    trimming-clip-source,
     adding-automation-take,
     editing-control-mapping,
     editing-native-filter,
@@ -246,6 +247,7 @@ export global IdeActions {
     callback set-audio-clip-loop(string, bool, string, string);
     callback set-audio-clip-reverse(string, bool);
     callback set-audio-clip-source-start(string, string);
+    callback trim-audio-clip-source(string, string, string);
     callback loudness-run();
     callback loudness-standby();
     callback loudness-reset();
@@ -505,6 +507,13 @@ export component MainWindow inherits Window {
     in-out property <string> clip-source-slip-frame-count: "";
     in-out property <string> clip-source-slip-original: "";
     in-out property <string> clip-source-slip-start: "";
+    in-out property <bool> clip-source-trim-visible: false;
+    in-out property <string> clip-source-trim-id: "";
+    in-out property <string> clip-source-trim-name: "";
+    in-out property <string> clip-source-trim-original-start: "";
+    in-out property <string> clip-source-trim-original-frame-count: "";
+    in-out property <string> clip-source-trim-start: "";
+    in-out property <string> clip-source-trim-frame-count: "";
     in-out property <bool> add-arrangement-placement-visible: false;
     in-out property <string> add-arrangement-placement-clip-id: "";
     in-out property <string> add-arrangement-placement-clip-name: "";
@@ -705,6 +714,7 @@ export component MainWindow inherits Window {
                         : root.app-mode == AppMode.changing-clip-loop ? "◌  UPDATING LOOP"
                         : root.app-mode == AppMode.changing-clip-reverse ? "◌  UPDATING DIRECTION"
                         : root.app-mode == AppMode.changing-clip-source ? "◌  SLIPPING SOURCE"
+                        : root.app-mode == AppMode.trimming-clip-source ? "◌  TRIMMING SOURCE"
                         : root.app-mode == AppMode.creating-clip ? "◌  CREATING CLIP"
                         : root.app-mode == AppMode.importing-audio ? "◌  IMPORTING AUDIO"
                         : root.app-mode == AppMode.selecting ? "◌  SELECTING"
@@ -3202,7 +3212,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-remove-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.clip-loop-visible && !root.clip-source-slip-visible && !root.add-arrangement-placement-visible : Panel {
+                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-remove-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.clip-loop-visible && !root.clip-source-slip-visible && !root.clip-source-trim-visible && !root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -3218,12 +3228,12 @@ export component MainWindow inherits Window {
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
                                 Button {
                                     text: "Performance";
-                                    clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.clip-source-slip-visible = false; root.add-arrangement-placement-visible = false; }
+                                    clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.clip-source-slip-visible = false; root.clip-source-trim-visible = false; root.add-arrangement-placement-visible = false; }
                                 }
                                 Button {
                                     text: "Mixer";
                                     enabled: root.app-mode == AppMode.running;
-                                    clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.clip-source-slip-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
+                                    clicked => { root.clips-visible = false; root.clip-rename-visible = false; root.clip-duplicate-visible = false; root.clip-gain-visible = false; root.clip-fades-visible = false; root.clip-loop-visible = false; root.clip-source-slip-visible = false; root.clip-source-trim-visible = false; root.add-arrangement-placement-visible = false; root.mixer-visible = true; }
                                 }
                             }
                             HorizontalLayout {
@@ -3457,6 +3467,21 @@ export component MainWindow inherits Window {
                                                     root.clip-source-slip-visible = true;
                                                 }
                                             }
+                                            Button {
+                                                width: 92px;
+                                                text: "Trim source";
+                                                accessible-label: "Trim the reusable source view for " + clip.name + " everywhere";
+                                                enabled: root.app-mode == AppMode.running;
+                                                clicked => {
+                                                    root.clip-source-trim-id = clip.id;
+                                                    root.clip-source-trim-name = clip.name;
+                                                    root.clip-source-trim-original-start = clip.source-start-edit;
+                                                    root.clip-source-trim-original-frame-count = clip.source-frame-count;
+                                                    root.clip-source-trim-start = clip.source-start-edit;
+                                                    root.clip-source-trim-frame-count = clip.source-frame-count;
+                                                    root.clip-source-trim-visible = true;
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -3464,7 +3489,7 @@ export component MainWindow inherits Window {
                         }
 
                         Text {
-                            text: "Import copies WAV or FLAC into project-owned 48 kHz media and creates one full-file reusable clip per file; it creates no arrangement placement. Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Remove unused deletes only an unreferenced reusable clip and keeps its source media. Clean unused media permanently deletes only project-owned sample copies referenced by no clip; recording takes and external originals are never included. Place creates one full-length non-ripple reference. Activation, direction, source slip, gain, loop, and fades affect every existing reference.";
+                            text: "Import copies WAV or FLAC into project-owned 48 kHz media and creates one full-file reusable clip per file; it creates no arrangement placement. Rename changes metadata only. Duplicate shares immutable source audio but creates no placement. Remove unused deletes only an unreferenced reusable clip and keeps its source media. Clean unused media permanently deletes only project-owned sample copies referenced by no clip; recording takes and external originals are never included. Place creates one full-length non-ripple reference. Activation, direction, source slip, source trim, gain, loop, and fades affect every existing reference.";
                             color: #65758a;
                             font-size: 9px;
                             wrap: word-wrap;
@@ -3794,7 +3819,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.clip-loop-visible && root.clip-source-slip-visible && !root.add-arrangement-placement-visible : Panel {
+                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.clip-loop-visible && root.clip-source-slip-visible && !root.clip-source-trim-visible && !root.add-arrangement-placement-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -3832,6 +3857,59 @@ export component MainWindow inherits Window {
                                     && root.clip-source-slip-start != ""
                                     && root.clip-source-slip-start != root.clip-source-slip-original;
                                 clicked => { IdeActions.set-audio-clip-source-start(root.clip-source-slip-id, root.clip-source-slip-start); }
+                            }
+                        }
+                    }
+                }
+
+                if root.clips-visible && !root.clip-rename-visible && !root.clip-duplicate-visible && !root.clip-gain-visible && !root.clip-fades-visible && !root.clip-loop-visible && !root.clip-source-slip-visible && root.clip-source-trim-visible && !root.add-arrangement-placement-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 16px;
+                        Text { text: "TRIM REUSABLE CLIP SOURCE VIEW"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.clip-source-trim-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                        Text {
+                            text: "Set a shorter exact source view. This cannot extend the committed " + root.clip-source-trim-original-frame-count + "-frame view.";
+                            color: #aebccc;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        GridLayout {
+                            spacing: 8px;
+                            Text { text: "Source start frame"; color: #8fa0b4; vertical-alignment: center; }
+                            LineEdit { text <=> root.clip-source-trim-start; placeholder-text: "0"; accessible-label: "Trimmed audio clip source start frame"; }
+                            Text { text: "Source frame count"; color: #8fa0b4; vertical-alignment: center; }
+                            LineEdit { text <=> root.clip-source-trim-frame-count; placeholder-text: "1"; accessible-label: "Trimmed audio clip source frame count"; }
+                        }
+                        Text {
+                            text: "The trim preserves exact source rate and changes every reference only after save and reopen. It refuses nonlinear warp, lossy timing, and loop or fade state that no longer fits; source audio bytes and arrangement timing stay unchanged.";
+                            color: #65758a;
+                            font-size: 9px;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Cancel"; clicked => { root.clip-source-trim-visible = false; } }
+                            Button {
+                                text: "Restore view";
+                                clicked => {
+                                    root.clip-source-trim-start = root.clip-source-trim-original-start;
+                                    root.clip-source-trim-frame-count = root.clip-source-trim-original-frame-count;
+                                }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: "Apply source trim";
+                                enabled: root.app-mode == AppMode.running
+                                    && root.clip-source-trim-id != ""
+                                    && root.clip-source-trim-start != ""
+                                    && root.clip-source-trim-frame-count != ""
+                                    && (root.clip-source-trim-start != root.clip-source-trim-original-start
+                                        || root.clip-source-trim-frame-count != root.clip-source-trim-original-frame-count);
+                                clicked => { IdeActions.trim-audio-clip-source(root.clip-source-trim-id, root.clip-source-trim-start, root.clip-source-trim-frame-count); }
                             }
                         }
                     }

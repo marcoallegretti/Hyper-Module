@@ -695,6 +695,50 @@ impl PreparedPlaybackSession {
         .map_err(AudioClipSourceSlipValidationError::NativeGain)
     }
 
+    /// Validates a candidate trimmed source view against the exact decoded
+    /// media and the clip's persisted native gain.
+    ///
+    /// The serializer owns duration, warp, loop, and fade semantics. This
+    /// boundary only verifies the candidate immutable-media range that the
+    /// serializer cannot prove from manifest metadata alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified rejection when the clip/media binding is missing,
+    /// the requested range overflows or exceeds decoded media, or applying the
+    /// persisted gain to the candidate samples would overflow.
+    pub fn validate_audio_clip_source_view(
+        &self,
+        clip_id: &str,
+        source_start_frame: usize,
+        source_frame_count: usize,
+    ) -> Result<(), AudioClipSourceSlipValidationError> {
+        let view = self
+            .project
+            .audio_clip_gain_validation_view(clip_id)
+            .ok_or(AudioClipSourceSlipValidationError::ClipMissing)?;
+        let source_end = source_start_frame
+            .checked_add(source_frame_count)
+            .ok_or(AudioClipSourceSlipValidationError::SourceRangeOverflow)?;
+        let source = self
+            .media
+            .decoded_audio(view.asset_id())
+            .ok_or(AudioClipSourceSlipValidationError::MediaMissing)?;
+        if source_end > source.frame_count() {
+            return Err(AudioClipSourceSlipValidationError::SourceOutsideMedia);
+        }
+        validate_native_clip_gain(
+            source,
+            FrameRange {
+                start: source_start_frame,
+                end: source_end,
+            },
+            view.gain_decibels(),
+        )
+        .map(|_| ())
+        .map_err(AudioClipSourceSlipValidationError::NativeGain)
+    }
+
     #[must_use]
     pub fn parts(
         &self,
@@ -1410,6 +1454,24 @@ mod tests {
         ));
         assert_eq!(
             session.validate_audio_clip_source_start("018f47a2-6b2d-7c11-8a44-001122337503", 101,),
+            Err(AudioClipSourceSlipValidationError::SourceOutsideMedia)
+        );
+        assert!(matches!(
+            session.validate_audio_clip_source_view(
+                "018f47a2-6b2d-7c11-8a44-001122337503",
+                100,
+                50,
+            ),
+            Err(AudioClipSourceSlipValidationError::NativeGain(
+                ClipPlanError::SampleGainOverflow
+            ))
+        ));
+        assert_eq!(
+            session.validate_audio_clip_source_view(
+                "018f47a2-6b2d-7c11-8a44-001122337503",
+                151,
+                50,
+            ),
             Err(AudioClipSourceSlipValidationError::SourceOutsideMedia)
         );
     }
