@@ -9691,6 +9691,21 @@ mod tests {
         });
     }
 
+    fn dispatch_ide_escape(ui: &MainWindow, repeated: bool) {
+        ui.window().dispatch_event(if repeated {
+            WindowEvent::KeyPressRepeated {
+                text: Key::Escape.into(),
+            }
+        } else {
+            WindowEvent::KeyPressed {
+                text: Key::Escape.into(),
+            }
+        });
+        ui.window().dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Escape.into(),
+        });
+    }
+
     fn assert_undo_redo_shortcut_contract(ui: &MainWindow) {
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_callback = Rc::clone(&submitted);
@@ -9846,6 +9861,49 @@ mod tests {
             "the audio-track form never interrupts an already-open project form"
         );
         ui.set_new_project_visible(false);
+    }
+
+    fn assert_form_cancellation_shortcut_contract(ui: &MainWindow) {
+        ui.set_app_mode(AppMode::Closed);
+        ui.set_new_project_visible(true);
+        ui.set_new_track_visible(false);
+        dispatch_ide_escape(ui, false);
+        assert!(
+            !ui.get_new_project_visible(),
+            "Escape cancels the local closed-project form before a native picker is started"
+        );
+
+        ui.set_new_project_visible(true);
+        ui.set_app_mode(AppMode::Selecting);
+        dispatch_ide_escape(ui, false);
+        assert!(
+            ui.get_new_project_visible(),
+            "Escape cannot dismiss a project form while native folder selection owns the workflow"
+        );
+        ui.set_new_project_visible(false);
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_new_track_visible(true);
+        dispatch_ide_escape(ui, false);
+        assert!(
+            !ui.get_new_track_visible(),
+            "Escape cancels the local running-project audio-track form"
+        );
+
+        ui.set_new_track_visible(true);
+        dispatch_ide_escape(ui, true);
+        assert!(
+            ui.get_new_track_visible(),
+            "repeated Escape does not reopen or repeatedly mutate an audio-track form"
+        );
+
+        ui.set_app_mode(AppMode::AddingTrack);
+        dispatch_ide_escape(ui, false);
+        assert!(
+            ui.get_new_track_visible(),
+            "Escape cannot dismiss an audio-track form while durable creation is in flight"
+        );
+        ui.set_new_track_visible(false);
     }
 
     fn assert_restore_shortcut_commands(
@@ -12697,6 +12755,7 @@ mod tests {
         assert_project_save_shortcut_contract(&ui);
         assert_project_creation_shortcut_contract(&ui);
         assert_audio_track_creation_shortcut_contract(&ui);
+        assert_form_cancellation_shortcut_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);
         ui.set_status_text("Choose a Runtime destination".into());
         ui.set_error_text("retained message".into());

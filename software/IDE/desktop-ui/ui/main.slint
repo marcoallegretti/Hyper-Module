@@ -648,6 +648,20 @@ export component MainWindow inherits Window {
         width: parent.width;
         height: parent.height;
 
+        capture-key-pressed(event) => {
+            if !event.repeat && event.text == Key.Escape {
+                if root.new-project-visible && root.app-mode == AppMode.closed {
+                    root.new-project-visible = false;
+                    return accept;
+                }
+                if root.new-track-visible && root.app-mode == AppMode.running {
+                    root.new-track-visible = false;
+                    return accept;
+                }
+            }
+            reject
+        }
+
         key-pressed(event) => {
             if event.modifiers.control && !event.repeat && (event.text == "z" || event.text == "Z") {
                 if event.modifiers.shift {
