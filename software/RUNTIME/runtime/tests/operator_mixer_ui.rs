@@ -77,6 +77,34 @@ fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
     );
     assert_eq!(*toggles.borrow(), 1);
 
+    ui.set_transport_start_enabled(false);
+    ui.set_transport_stop_enabled(true);
+    assert_eq!(start.accessible_enabled(), Some(false));
+    assert_eq!(stop.accessible_enabled(), Some(true));
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::Space.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressRepeated {
+            text: Key::Space.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyReleased {
+            text: Key::Space.into(),
+        },
+    );
+    assert_eq!(
+        *toggles.borrow(),
+        2,
+        "Space remains available while rolling"
+    );
+
     dispatch_key(
         &ui,
         WindowEvent::KeyPressed {
@@ -125,6 +153,7 @@ fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
     ui.set_transport_start_enabled(false);
     ui.set_transport_stop_enabled(false);
     ui.set_transport_return_to_start_enabled(false);
+    ui.set_transport_seek_enabled(false);
     assert_eq!(start.accessible_enabled(), Some(false));
     assert_eq!(stop.accessible_enabled(), Some(false));
     assert_eq!(return_to_start.accessible_enabled(), Some(false));
@@ -140,7 +169,19 @@ fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
             text: Key::Home.into(),
         },
     );
-    assert_eq!(*toggles.borrow(), 1);
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressRepeated {
+            text: Key::Home.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyReleased {
+            text: Key::Home.into(),
+        },
+    );
+    assert_eq!(*toggles.borrow(), 2);
     assert_eq!(*returns.borrow(), 1);
 }
 
