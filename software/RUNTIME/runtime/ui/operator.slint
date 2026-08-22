@@ -391,6 +391,7 @@ export component OperatorWindow inherits Window {
     width: 880px;
     height: 948px;
     background: #0d1016;
+    forward-focus: keyboard;
 
     in property <string> project-name;
     in property <string> project-identity;
@@ -405,6 +406,9 @@ export component OperatorWindow inherits Window {
     in property <float> transport-position-percent: 0;
     in property <string> transport-seek-state: "Seek unavailable";
     in property <bool> transport-seek-enabled: false;
+    in property <bool> transport-start-enabled: false;
+    in property <bool> transport-stop-enabled: false;
+    in property <bool> transport-return-to-start-enabled: false;
     in property <string> loop-state;
     in property <string> loop-range;
     in property <string> loop-toggle-label;
@@ -451,6 +455,7 @@ export component OperatorWindow inherits Window {
 
     callback start-requested();
     callback stop-requested();
+    callback toggle-transport-requested();
     callback return-to-start-requested();
     callback locate-percent-requested(float);
     callback toggle-loop-requested();
@@ -492,9 +497,29 @@ export component OperatorWindow inherits Window {
         }
     }
 
-    ScrollView {
-        horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
-        VerticalLayout {
+    keyboard := FocusScope {
+        width: parent.width;
+        height: parent.height;
+
+        key-pressed(event) => {
+            if event.text == Key.Space {
+                if !event.repeat && (root.transport-start-enabled || root.transport-stop-enabled) {
+                    root.toggle-transport-requested();
+                }
+                return accept;
+            }
+            if event.text == Key.Home {
+                if !event.repeat && root.transport-return-to-start-enabled {
+                    root.return-to-start-requested();
+                }
+                return accept;
+            }
+            reject
+        }
+
+        ScrollView {
+            horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+            VerticalLayout {
             padding: 24px;
             spacing: 18px;
 
@@ -539,9 +564,21 @@ export component OperatorWindow inherits Window {
 
         HorizontalLayout {
             spacing: 10px;
-            Button { text: "Start"; clicked => { root.start-requested(); } }
-            Button { text: "Stop"; clicked => { root.stop-requested(); } }
-            Button { text: "Return to start"; clicked => { root.return-to-start-requested(); } }
+            Button {
+                text: "Start";
+                enabled: root.transport-start-enabled;
+                clicked => { root.start-requested(); }
+            }
+            Button {
+                text: "Stop";
+                enabled: root.transport-stop-enabled;
+                clicked => { root.stop-requested(); }
+            }
+            Button {
+                text: "Return to start";
+                enabled: root.transport-return-to-start-enabled;
+                clicked => { root.return-to-start-requested(); }
+            }
             Button {
                 text: root.loop-toggle-label;
                 enabled: root.loop-toggle-enabled;
@@ -786,6 +823,7 @@ export component OperatorWindow inherits Window {
             }
         }
 
+        }
         }
     }
 }

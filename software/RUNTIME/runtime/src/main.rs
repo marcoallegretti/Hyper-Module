@@ -361,6 +361,14 @@ enum OperatorCommand {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperatorTransportAction {
+    Start,
+    Stop,
+    Toggle,
+    ReturnToStart,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OperatorLoopAuthority {
     range: Option<TransportLoopRange>,
     enabled: bool,
@@ -1177,6 +1185,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let scene_model = Rc::new(VecModel::from(operator_scene_rows(&scenes)));
     let mixer_model = Rc::new(VecModel::from(operator_mixer_rows(&mixer_channels)));
     let mixer_send_model = Rc::new(VecModel::from(operator_mixer_send_rows(&mixer_sends)));
+    let transport_authority = Rc::new(Cell::new(None));
     let loop_authority = Rc::new(Cell::new(None));
     let seek_authority = Rc::new(Cell::new(None));
     let scene_stop_authority = Rc::new(Cell::new(false));
@@ -1187,9 +1196,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     ui.set_mixer_sends(ModelRc::from(Rc::clone(&mixer_send_model)));
 
     apply_static_facts(&ui, &observers.facts);
-    wire_operator_action(&ui, &commands_tx, &diagnostic, OperatorCommand::Start);
-    wire_operator_stop(&ui, &commands_tx, &diagnostic);
-    wire_operator_return_to_start(&ui, &commands_tx, &diagnostic);
+    wire_operator_transport_controls(&ui, &commands_tx, &diagnostic, &transport_authority);
     wire_operator_seek(&ui, &commands_tx, &diagnostic, &seek_authority);
     wire_operator_quit(&ui, &commands_tx, &stop, &diagnostic);
     wire_operator_peak_reset(&ui, &meter_observer, &loudness_authority);
@@ -1204,6 +1211,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &ui,
         &observers,
         &diagnostic,
+        &transport_authority,
         &loop_authority,
         &seek_authority,
         &scene_model,
@@ -1232,6 +1240,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer_meter_observer = Rc::clone(&meter_observer);
     let timer_scene_model = Rc::clone(&scene_model);
     let timer_scene_stop_authority = Rc::clone(&scene_stop_authority);
+    let timer_transport_authority = Rc::clone(&transport_authority);
     let timer_loop_authority = Rc::clone(&loop_authority);
     let timer_seek_authority = Rc::clone(&seek_authority);
     let timer_loudness_authority = Rc::clone(&loudness_authority);
@@ -1250,6 +1259,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &ui,
                 &timer_observers,
                 &timer_diagnostic,
+                &timer_transport_authority,
                 &timer_loop_authority,
                 &timer_seek_authority,
                 &timer_scene_model,
@@ -1279,6 +1289,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                     &ui,
                     &worker.completion,
                     &timer_diagnostic,
+                    &timer_transport_authority,
                     &timer_scene_stop_authority,
                     || {
                         close_operator_surface(
@@ -1408,6 +1419,7 @@ fn apply_operator_worker_completion(
     ui: &OperatorWindow,
     completion: &Receiver<Result<(), String>>,
     diagnostic: &Mutex<String>,
+    transport_authority: &Cell<Option<PlaybackRecoveryTransportState>>,
     scene_stop_authority: &Cell<bool>,
     close_operator_surface: impl FnOnce() -> Result<(), String>,
 ) -> Option<Result<(), String>> {
@@ -1419,6 +1431,7 @@ fn apply_operator_worker_completion(
             "Runtime worker ended without publishing its result".to_owned()
         }
     };
+    revoke_operator_transport_authority(ui, transport_authority);
     revoke_operator_scene_stop_authority(ui, scene_stop_authority);
     let close_result = close_operator_surface();
     let message = close_result
@@ -1430,39 +1443,86 @@ fn apply_operator_worker_completion(
     Some(close_result)
 }
 
-fn wire_operator_action(
+fn wire_operator_transport_controls(
     ui: &OperatorWindow,
     sender: &SyncSender<OperatorCommand>,
     diagnostic: &Arc<Mutex<String>>,
-    command: OperatorCommand,
+    authority: &Rc<Cell<Option<PlaybackRecoveryTransportState>>>,
 ) {
-    let sender = sender.clone();
-    let diagnostic = Arc::clone(diagnostic);
-    ui.on_start_requested(move || send_operator_command(&sender, command, &diagnostic));
+    let register = |action, register: fn(&OperatorWindow, Box<dyn FnMut()>)| {
+        let sender = sender.clone();
+        let diagnostic = Arc::clone(diagnostic);
+        let authority = Rc::clone(authority);
+        register(
+            ui,
+            Box::new(move || {
+                queue_operator_transport_action(&sender, &diagnostic, authority.get(), action);
+            }),
+        );
+    };
+    register(
+        OperatorTransportAction::Start,
+        OperatorWindow::on_start_requested as fn(&OperatorWindow, Box<dyn FnMut()>),
+    );
+    register(
+        OperatorTransportAction::Stop,
+        OperatorWindow::on_stop_requested as fn(&OperatorWindow, Box<dyn FnMut()>),
+    );
+    register(
+        OperatorTransportAction::Toggle,
+        OperatorWindow::on_toggle_transport_requested as fn(&OperatorWindow, Box<dyn FnMut()>),
+    );
+    register(
+        OperatorTransportAction::ReturnToStart,
+        OperatorWindow::on_return_to_start_requested as fn(&OperatorWindow, Box<dyn FnMut()>),
+    );
 }
 
-fn wire_operator_stop(
-    ui: &OperatorWindow,
+fn queue_operator_transport_action(
     sender: &SyncSender<OperatorCommand>,
     diagnostic: &Arc<Mutex<String>>,
+    state: Option<PlaybackRecoveryTransportState>,
+    action: OperatorTransportAction,
 ) {
-    let sender = sender.clone();
-    let diagnostic = Arc::clone(diagnostic);
-    ui.on_stop_requested(move || {
-        send_operator_command(&sender, OperatorCommand::Stop, &diagnostic);
-    });
+    match operator_transport_command(state, action) {
+        Ok(command) => send_operator_command(sender, command, diagnostic),
+        Err(message) => set_diagnostic(diagnostic, message.to_owned()),
+    }
 }
 
-fn wire_operator_return_to_start(
-    ui: &OperatorWindow,
-    sender: &SyncSender<OperatorCommand>,
-    diagnostic: &Arc<Mutex<String>>,
-) {
-    let sender = sender.clone();
-    let diagnostic = Arc::clone(diagnostic);
-    ui.on_return_to_start_requested(move || {
-        send_operator_command(&sender, OperatorCommand::ReturnToStart, &diagnostic);
-    });
+fn operator_transport_command(
+    state: Option<PlaybackRecoveryTransportState>,
+    action: OperatorTransportAction,
+) -> Result<OperatorCommand, &'static str> {
+    match (action, state) {
+        (
+            OperatorTransportAction::Start | OperatorTransportAction::Toggle,
+            Some(PlaybackRecoveryTransportState::Stopped),
+        ) => Ok(OperatorCommand::Start),
+        (
+            OperatorTransportAction::Stop | OperatorTransportAction::Toggle,
+            Some(PlaybackRecoveryTransportState::Rolling),
+        ) => Ok(OperatorCommand::Stop),
+        (OperatorTransportAction::ReturnToStart, Some(_)) => Ok(OperatorCommand::ReturnToStart),
+        (OperatorTransportAction::Start, Some(PlaybackRecoveryTransportState::Rolling)) => {
+            Err("transport start refused: recovered transport is already rolling")
+        }
+        (OperatorTransportAction::Stop, Some(PlaybackRecoveryTransportState::Stopped)) => {
+            Err("transport stop refused: recovered transport is already stopped")
+        }
+        (OperatorTransportAction::Toggle, None) => {
+            Err("transport toggle refused: coherent transport state is unavailable")
+        }
+        (OperatorTransportAction::ReturnToStart, None) => {
+            Err("transport return to start refused: coherent transport state is unavailable")
+        }
+        (OperatorTransportAction::Start, None) => {
+            Err("transport start refused: coherent transport state is unavailable")
+        }
+        (OperatorTransportAction::Stop, None) => {
+            Err("transport stop refused: coherent transport state is unavailable")
+        }
+    }
 }
 
 fn wire_operator_seek(
@@ -2494,6 +2554,7 @@ fn apply_operator_cycle_observation(
     ui: &OperatorWindow,
     observers: &RuntimeObservers,
     diagnostic: &Mutex<String>,
+    transport_authority: &Cell<Option<PlaybackRecoveryTransportState>>,
     loop_authority: &Cell<Option<OperatorLoopAuthority>>,
     seek_authority: &Cell<Option<usize>>,
     scene_model: &VecModel<OperatorSceneRow>,
@@ -2501,16 +2562,19 @@ fn apply_operator_cycle_observation(
     terminal_latched: bool,
 ) {
     if terminal_latched {
+        revoke_operator_transport_authority(ui, transport_authority);
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
         return;
     }
     let observation = apply_observations(ui, observers, diagnostic);
     if observers.output_status.state() == OutputStreamState::Failed {
+        revoke_operator_transport_authority(ui, transport_authority);
         revoke_operator_loop_authority(ui, loop_authority);
         revoke_operator_seek_authority(ui, seek_authority);
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
         return;
     }
+    apply_operator_transport_observation(ui, transport_authority, observation.state());
     apply_operator_seek_observation(
         ui,
         seek_authority,
@@ -2532,6 +2596,27 @@ fn apply_operator_cycle_observation(
 fn revoke_operator_scene_stop_authority(ui: &OperatorWindow, authority: &Cell<bool>) {
     authority.set(false);
     ui.set_stop_interactive_scenes_enabled(false);
+}
+
+fn apply_operator_transport_observation(
+    ui: &OperatorWindow,
+    authority: &Cell<Option<PlaybackRecoveryTransportState>>,
+    state: PlaybackRecoveryTransportState,
+) {
+    authority.set(Some(state));
+    ui.set_transport_start_enabled(state == PlaybackRecoveryTransportState::Stopped);
+    ui.set_transport_stop_enabled(state == PlaybackRecoveryTransportState::Rolling);
+    ui.set_transport_return_to_start_enabled(true);
+}
+
+fn revoke_operator_transport_authority(
+    ui: &OperatorWindow,
+    authority: &Cell<Option<PlaybackRecoveryTransportState>>,
+) {
+    authority.set(None);
+    ui.set_transport_start_enabled(false);
+    ui.set_transport_stop_enabled(false);
+    ui.set_transport_return_to_start_enabled(false);
 }
 
 fn revoke_operator_seek_authority(ui: &OperatorWindow, authority: &Cell<Option<usize>>) {
@@ -6079,9 +6164,8 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::sync_channel(OPERATOR_COMMAND_CAPACITY);
         let diagnostic = Arc::new(Mutex::new("authoritative diagnostic".to_owned()));
         let stop = Arc::new(AtomicBool::new(false));
-        wire_operator_action(&ui, &sender, &diagnostic, OperatorCommand::Start);
-        wire_operator_stop(&ui, &sender, &diagnostic);
-        wire_operator_return_to_start(&ui, &sender, &diagnostic);
+        let transport_authority = Rc::new(Cell::new(None));
+        wire_operator_transport_controls(&ui, &sender, &diagnostic, &transport_authority);
         wire_operator_quit(&ui, &sender, &stop, &diagnostic);
         let loop_authority = Rc::new(Cell::new(None));
         let seek_authority = Rc::new(Cell::new(None));
@@ -6108,7 +6192,96 @@ mod tests {
         };
         apply_static_facts(&ui, &facts);
         let observation = apply_observations(&ui, &observers, &diagnostic);
+        apply_operator_transport_observation(&ui, &transport_authority, observation.state());
         assert_eq!(ui.get_transport_musical_position().as_str(), "1|1|000");
+        assert_eq!(
+            transport_authority.get(),
+            Some(PlaybackRecoveryTransportState::Stopped)
+        );
+        assert!(ui.get_transport_start_enabled());
+        assert!(!ui.get_transport_stop_enabled());
+        assert!(ui.get_transport_return_to_start_enabled());
+        let committed_transport_controls = (
+            ui.get_transport_start_enabled(),
+            ui.get_transport_stop_enabled(),
+            ui.get_transport_return_to_start_enabled(),
+        );
+        let (saturated_transport_sender, saturated_transport_receiver) =
+            std::sync::mpsc::sync_channel(1);
+        saturated_transport_sender
+            .send(OperatorCommand::Quit)
+            .unwrap();
+        let saturated_transport_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_transport_controls(
+            &ui,
+            &saturated_transport_sender,
+            &saturated_transport_diagnostic,
+            &transport_authority,
+        );
+        ui.invoke_start_requested();
+        assert_eq!(
+            saturated_transport_receiver.try_recv(),
+            Ok(OperatorCommand::Quit)
+        );
+        assert_eq!(
+            saturated_transport_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        );
+        assert!(
+            saturated_transport_diagnostic
+                .lock()
+                .unwrap()
+                .contains("operator command refused")
+        );
+        assert_eq!(
+            (
+                ui.get_transport_start_enabled(),
+                ui.get_transport_stop_enabled(),
+                ui.get_transport_return_to_start_enabled(),
+            ),
+            committed_transport_controls
+        );
+
+        apply_operator_transport_observation(
+            &ui,
+            &transport_authority,
+            PlaybackRecoveryTransportState::Rolling,
+        );
+        let committed_transport_controls = (
+            ui.get_transport_start_enabled(),
+            ui.get_transport_stop_enabled(),
+            ui.get_transport_return_to_start_enabled(),
+        );
+        let (lost_transport_sender, lost_transport_receiver) = std::sync::mpsc::sync_channel(1);
+        drop(lost_transport_receiver);
+        let lost_transport_diagnostic = Arc::new(Mutex::new(String::new()));
+        wire_operator_transport_controls(
+            &ui,
+            &lost_transport_sender,
+            &lost_transport_diagnostic,
+            &transport_authority,
+        );
+        ui.invoke_stop_requested();
+        assert!(
+            lost_transport_diagnostic
+                .lock()
+                .unwrap()
+                .contains("operator command refused")
+        );
+        assert_eq!(
+            (
+                ui.get_transport_start_enabled(),
+                ui.get_transport_stop_enabled(),
+                ui.get_transport_return_to_start_enabled(),
+            ),
+            committed_transport_controls
+        );
+        apply_operator_transport_observation(
+            &ui,
+            &transport_authority,
+            PlaybackRecoveryTransportState::Stopped,
+        );
+        wire_operator_transport_controls(&ui, &sender, &diagnostic, &transport_authority);
         apply_operator_loop_observation(&ui, &loop_authority, observation, facts.playback_extent);
         apply_operator_seek_observation(
             &ui,
@@ -6262,6 +6435,7 @@ mod tests {
             &ui,
             &terminal_observers,
             &diagnostic,
+            &transport_authority,
             &loop_authority,
             &seek_authority,
             &terminal_scenes,
@@ -6289,6 +6463,7 @@ mod tests {
             &ui,
             &terminal_observers,
             &diagnostic,
+            &transport_authority,
             &loop_authority,
             &seek_authority,
             &terminal_scenes,
@@ -6296,6 +6471,10 @@ mod tests {
             true,
         );
         assert_eq!(loop_authority.get(), None);
+        assert_eq!(transport_authority.get(), None);
+        assert!(!ui.get_transport_start_enabled());
+        assert!(!ui.get_transport_stop_enabled());
+        assert!(!ui.get_transport_return_to_start_enabled());
         assert!(!terminal_scene_stop_authority.get());
         assert!(!ui.get_stop_interactive_scenes_enabled());
         ui.invoke_stop_interactive_scenes_requested();
@@ -6321,12 +6500,34 @@ mod tests {
 
         ui.invoke_start_requested();
         ui.invoke_stop_requested();
+        ui.invoke_toggle_transport_requested();
         ui.invoke_return_to_start_requested();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "transport return to start refused: coherent transport state is unavailable"
+        );
+
+        apply_operator_transport_observation(
+            &ui,
+            &transport_authority,
+            PlaybackRecoveryTransportState::Stopped,
+        );
+        ui.invoke_start_requested();
+        ui.invoke_toggle_transport_requested();
+        ui.invoke_return_to_start_requested();
+        apply_operator_transport_observation(
+            &ui,
+            &transport_authority,
+            PlaybackRecoveryTransportState::Rolling,
+        );
+        ui.invoke_stop_requested();
         ui.invoke_quit_requested();
 
         assert_eq!(receiver.try_recv(), Ok(OperatorCommand::Start));
-        assert_eq!(receiver.try_recv(), Ok(OperatorCommand::Stop));
+        assert_eq!(receiver.try_recv(), Ok(OperatorCommand::Start));
         assert_eq!(receiver.try_recv(), Ok(OperatorCommand::ReturnToStart));
+        assert_eq!(receiver.try_recv(), Ok(OperatorCommand::Stop));
         assert_eq!(receiver.try_recv(), Ok(OperatorCommand::Quit));
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
         assert!(stop.load(Ordering::Acquire));
@@ -6359,6 +6560,7 @@ mod tests {
                 &ui,
                 &completion_receiver,
                 &diagnostic,
+                &transport_authority,
                 &terminal_scene_stop_authority,
                 || {
                     surface_closed.set(true);
@@ -6368,6 +6570,12 @@ mod tests {
             None
         );
         assert!(!surface_closed.get());
+        apply_operator_transport_observation(
+            &ui,
+            &transport_authority,
+            PlaybackRecoveryTransportState::Stopped,
+        );
+        assert!(ui.get_transport_start_enabled());
         completion_sender
             .send(Err("native audio ownership ended unexpectedly".to_owned()))
             .unwrap();
@@ -6376,6 +6584,7 @@ mod tests {
                 &ui,
                 &completion_receiver,
                 &diagnostic,
+                &transport_authority,
                 &terminal_scene_stop_authority,
                 || {
                     surface_closed.set(true);
@@ -6385,9 +6594,19 @@ mod tests {
             Some(Ok(()))
         );
         assert!(surface_closed.get());
+        assert_eq!(transport_authority.get(), None);
+        assert!(!ui.get_transport_start_enabled());
+        assert!(!ui.get_transport_stop_enabled());
+        assert!(!ui.get_transport_return_to_start_enabled());
         assert_eq!(
             ui.get_diagnostic().as_str(),
             "Runtime worker stopped: native audio ownership ended unexpectedly"
+        );
+        ui.invoke_toggle_transport_requested();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            diagnostic.lock().unwrap().as_str(),
+            "transport toggle refused: coherent transport state is unavailable"
         );
 
         let (lost_sender, lost_receiver) = std::sync::mpsc::sync_channel(1);
@@ -6401,6 +6620,7 @@ mod tests {
                 &ui,
                 &lost_receiver,
                 &diagnostic,
+                &transport_authority,
                 &terminal_scene_stop_authority,
                 || {
                     surface_closed.set(true);

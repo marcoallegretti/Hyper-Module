@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use i_slint_backend_testing::ElementHandle;
-use slint::platform::{PointerEventButton, WindowEvent};
+use slint::platform::{Key, PointerEventButton, WindowEvent};
 use slint::{ComponentHandle, LogicalPosition, Model, ModelRc, VecModel};
 
 slint::include_modules!();
@@ -25,6 +25,123 @@ enum LoopIntent {
     In,
     Out,
     Clear,
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one generated-window contract keeps shortcut routing and recovery-enabled controls together"
+)]
+fn generated_transport_shortcuts_are_focus_aware_and_repeat_free() {
+    i_slint_backend_testing::init_no_event_loop();
+    let ui = OperatorWindow::new().unwrap();
+    ui.set_transport_start_enabled(true);
+    ui.set_transport_stop_enabled(false);
+    ui.set_transport_return_to_start_enabled(true);
+    let toggles = Rc::new(RefCell::new(0_usize));
+    let toggle_requested = Rc::clone(&toggles);
+    ui.on_toggle_transport_requested(move || {
+        *toggle_requested.borrow_mut() += 1;
+    });
+    let returns = Rc::new(RefCell::new(0_usize));
+    let return_requested = Rc::clone(&returns);
+    ui.on_return_to_start_requested(move || {
+        *return_requested.borrow_mut() += 1;
+    });
+    let seek_intents = configure_transport_seek(&ui);
+    ui.show().unwrap();
+    let start = find_control(&ui, "Start");
+    let stop = find_control(&ui, "Stop");
+    let return_to_start = find_control(&ui, "Return to start");
+    assert_eq!(start.accessible_enabled(), Some(true));
+    assert_eq!(stop.accessible_enabled(), Some(false));
+    assert_eq!(return_to_start.accessible_enabled(), Some(true));
+
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::Space.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressRepeated {
+            text: Key::Space.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyReleased {
+            text: Key::Space.into(),
+        },
+    );
+    assert_eq!(*toggles.borrow(), 1);
+
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::Home.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressRepeated {
+            text: Key::Home.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyReleased {
+            text: Key::Home.into(),
+        },
+    );
+    assert_eq!(*returns.borrow(), 1);
+
+    let seek = find_control(&ui, "Committed transport position percent");
+    click_committed_marker(&ui, &seek, 0.2);
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::Home.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressRepeated {
+            text: Key::Home.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyReleased {
+            text: Key::Home.into(),
+        },
+    );
+    assert_eq!(*returns.borrow(), 1, "the focused slider owns Home");
+    assert_eq!(seek_intents.borrow().len(), 2);
+    assert!((f32::from_bits(seek_intents.borrow()[0]) - 20.0).abs() <= 0.001);
+    assert_eq!(seek_intents.borrow()[1], 0.0_f32.to_bits());
+
+    ui.set_transport_start_enabled(false);
+    ui.set_transport_stop_enabled(false);
+    ui.set_transport_return_to_start_enabled(false);
+    assert_eq!(start.accessible_enabled(), Some(false));
+    assert_eq!(stop.accessible_enabled(), Some(false));
+    assert_eq!(return_to_start.accessible_enabled(), Some(false));
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::Space.into(),
+        },
+    );
+    dispatch_key(
+        &ui,
+        WindowEvent::KeyPressed {
+            text: Key::Home.into(),
+        },
+    );
+    assert_eq!(*toggles.borrow(), 1);
+    assert_eq!(*returns.borrow(), 1);
 }
 
 #[test]
@@ -410,6 +527,10 @@ fn click_enabled(ui: &OperatorWindow, accessible_label: &str) {
     let element = find_control(ui, accessible_label);
     assert_eq!(element.accessible_enabled(), Some(true));
     element.mock_single_click(PointerEventButton::Left);
+}
+
+fn dispatch_key(ui: &OperatorWindow, event: WindowEvent) {
+    ui.window().dispatch_event(event);
 }
 
 fn drag_to_right_edge(element: &ElementHandle) {
