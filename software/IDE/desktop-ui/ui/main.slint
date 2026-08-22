@@ -370,6 +370,7 @@ export component MainWindow inherits Window {
     width: 1180px;
     height: 800px;
     background: #0b0f14;
+    forward-focus: keyboard;
 
     in property <AppMode> app-mode: AppMode.discovering;
     in property <[string]> output-names: [];
@@ -642,6 +643,30 @@ export component MainWindow inherits Window {
     in property <string> right-reading: "—";
     in property <string> status-text: "Discovering desktop audio outputs…";
     in property <string> error-text: "";
+
+    keyboard := FocusScope {
+        width: parent.width;
+        height: parent.height;
+
+        key-pressed(event) => {
+            if event.modifiers.control && !event.repeat && (event.text == "z" || event.text == "Z") {
+                if event.modifiers.shift {
+                    if root.redo-available {
+                        IdeActions.redo-edit();
+                    }
+                } else if root.undo-available {
+                    IdeActions.undo-edit();
+                }
+                return accept;
+            }
+            if event.modifiers.control && !event.repeat && (event.text == "y" || event.text == "Y") {
+                if root.redo-available {
+                    IdeActions.redo-edit();
+                }
+                return accept;
+            }
+            reject
+        }
 
     VerticalLayout {
         padding-left: 22px;
@@ -4054,5 +4079,6 @@ export component MainWindow inherits Window {
                 }
             }
         }
+    }
     }
 }

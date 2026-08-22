@@ -9239,9 +9239,17 @@ fn bind_loop_callbacks(ui: &MainWindow, worker: &WorkerCell, state: &ProjectUiSt
 }
 
 fn bind_undo_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let worker = Rc::clone(worker);
+    bind_undo_callbacks_with(
+        ui,
+        Rc::new(move |ui, command| submit_to_ui(ui, &worker, command)),
+    );
+}
+
+fn bind_undo_callbacks_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
     let restore = |redo: bool| {
         let weak = ui.as_weak();
-        let worker = Rc::clone(worker);
+        let submitter = Rc::clone(&submitter);
         move || {
             let Some(ui) = weak.upgrade() else {
                 return;
@@ -9254,9 +9262,8 @@ fn bind_undo_callbacks(ui: &MainWindow, worker: &WorkerCell) {
             if !restore_available(ui.get_app_mode(), Some(label.as_str())) {
                 return;
             }
-            submit_to_ui(
+            submitter(
                 &ui,
-                &worker,
                 if redo {
                     IdeWorkerCommand::Redo
                 } else {
@@ -9637,6 +9644,90 @@ impl Error for DesktopUiExitError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slint::platform::{Key, WindowEvent};
+
+    fn dispatch_ide_shortcut(ui: &MainWindow, text: &str, shift: bool, repeated: bool) {
+        ui.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Control.into(),
+        });
+        if shift {
+            ui.window().dispatch_event(WindowEvent::KeyPressed {
+                text: Key::Shift.into(),
+            });
+        }
+        ui.window().dispatch_event(if repeated {
+            WindowEvent::KeyPressRepeated { text: text.into() }
+        } else {
+            WindowEvent::KeyPressed { text: text.into() }
+        });
+        ui.window().dispatch_event(WindowEvent::KeyReleased { text: text.into() });
+        if shift {
+            ui.window().dispatch_event(WindowEvent::KeyReleased {
+                text: Key::Shift.into(),
+            });
+        }
+        ui.window().dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Control.into(),
+        });
+    }
+
+    fn assert_undo_redo_shortcut_contract(ui: &MainWindow) {
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_undo_callbacks_with(
+            ui,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_undo_label("clip gain".into());
+        ui.set_redo_label("scene rename".into());
+        refresh_restore_availability(ui);
+        assert!(ui.get_undo_available());
+        assert!(ui.get_redo_available());
+
+        dispatch_ide_shortcut(ui, "z", false, false);
+        dispatch_ide_shortcut(ui, "Z", true, false);
+        dispatch_ide_shortcut(ui, "y", false, false);
+        dispatch_ide_shortcut(ui, "z", false, true);
+        assert_restore_shortcut_commands(
+            &submitted,
+            "the root maps only one non-repeating primary shortcut to each existing action",
+        );
+
+        ui.set_app_mode(AppMode::RestoringEdit);
+        refresh_restore_availability(ui);
+        dispatch_ide_shortcut(ui, "z", false, false);
+        dispatch_ide_shortcut(ui, "Z", true, false);
+        dispatch_ide_shortcut(ui, "y", false, false);
+        assert_restore_shortcut_commands(
+            &submitted,
+            "pending durable work revokes all history shortcuts instead of queuing a second restore",
+        );
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_undo_label(SharedString::default());
+        ui.set_redo_label(SharedString::default());
+        refresh_restore_availability(ui);
+        dispatch_ide_shortcut(ui, "z", false, false);
+        dispatch_ide_shortcut(ui, "Z", true, false);
+        dispatch_ide_shortcut(ui, "y", false, false);
+        assert_restore_shortcut_commands(
+            &submitted,
+            "empty durable-history stacks remain inert even when the project is otherwise idle",
+        );
+    }
+
+    fn assert_restore_shortcut_commands(
+        submitted: &Rc<RefCell<Vec<IdeWorkerCommand>>>,
+        message: &str,
+    ) {
+        let commands = submitted.borrow();
+        assert_eq!(commands.len(), 3, "{message}");
+        assert!(matches!(commands[0], IdeWorkerCommand::Undo), "{message}");
+        assert!(matches!(commands[1], IdeWorkerCommand::Redo), "{message}");
+        assert!(matches!(commands[2], IdeWorkerCommand::Redo), "{message}");
+    }
 
     fn assert_native_filter_window_contract(ui: &MainWindow) {
         let project_state = Rc::new(ProjectUiState::default());
@@ -12472,6 +12563,7 @@ mod tests {
             MAX_IDE_SCENES
         );
         assert_window_contracts(&ui);
+        assert_undo_redo_shortcut_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);
         ui.set_status_text("Choose a Runtime destination".into());
         ui.set_error_text("retained message".into());
