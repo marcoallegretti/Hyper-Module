@@ -10389,6 +10389,7 @@ mod tests {
         );
 
         ui.set_app_mode(AppMode::Running);
+        ui.set_clip_source_trim_visible(false);
         ui.set_mixer_main_state_available(true);
         dispatch_ide_shortcut(ui, "s", false, false);
         dispatch_ide_shortcut(ui, "s", false, true);
@@ -11037,6 +11038,7 @@ mod tests {
         configure_ui_contracts(&ui);
         ui.set_app_mode(AppMode::Running);
         ui.set_export_available(true);
+        ui.set_mixer_main_state_available(true);
         ui.set_scene_rename_visible(true);
         ui.show().unwrap();
 
@@ -11059,6 +11061,7 @@ mod tests {
         });
         dispatch_ide_shortcut(&ui, "w", false, false);
         dispatch_ide_shortcut(&ui, "e", false, false);
+        dispatch_ide_shortcut(&ui, "s", true, false);
         assert_eq!(
             closed.get(),
             0,
@@ -11068,6 +11071,105 @@ mod tests {
             exports.get(),
             0,
             "a focused LineEdit owns the primary export chord instead of opening an unrelated native picker"
+        );
+        assert!(
+            !ui.get_save_project_as_visible(),
+            "a focused local editor keeps Save As unavailable instead of opening a second project form"
+        );
+
+        ui.set_scene_rename_visible(false);
+        let mut save_as_entries =
+            ElementHandle::find_by_element_id(&ui, "MainWindow::save-project-as-entry");
+        let save_as_entry = save_as_entries
+            .next()
+            .expect("dismissing the editor restores the generated Save As entry button");
+        assert!(
+            save_as_entries.next().is_none(),
+            "the restored Save As entry button id remains unique"
+        );
+        save_as_entry.mock_single_click(PointerEventButton::Left);
+        assert!(
+            ui.get_save_project_as_visible(),
+            "Save As becomes available again after the local editor is dismissed"
+        );
+    }
+
+    #[test]
+    fn save_as_buttons_use_the_generated_callback_route() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_main_state_available(true);
+        ui.set_project_name("Source".into());
+        ui.show().unwrap();
+
+        let mut entries =
+            ElementHandle::find_by_element_id(&ui, "MainWindow::save-project-as-entry");
+        let entry = entries
+            .next()
+            .expect("the generated Save As entry button must be present");
+        assert!(entries.next().is_none(), "the Save As entry button id is unique");
+        entry.mock_single_click(PointerEventButton::Left);
+        assert!(ui.get_save_project_as_visible());
+        assert_eq!(ui.get_save_project_as_name(), "Source copy");
+
+        let mut cancels =
+            ElementHandle::find_by_element_id(&ui, "MainWindow::save-project-as-cancel");
+        let cancel = cancels
+            .next()
+            .expect("the generated Save As cancel button must be present");
+        assert!(cancels.next().is_none(), "the Save As cancel button id is unique");
+        cancel.mock_single_click(PointerEventButton::Left);
+        assert!(
+            !ui.get_save_project_as_visible(),
+            "the generated cancel button closes only the local Save As form"
+        );
+
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_choice = Rc::clone(&submitted);
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        bind_project_copy_callback_with(&ui, &worker, move |weak, _, project_name| {
+            let ui = weak.upgrade().unwrap();
+            complete_project_copy_choice_with(
+                &ui,
+                project_name,
+                ProjectCopyChoice::Selected(PathBuf::from("parent")),
+                |command| submitted_by_choice.borrow_mut().push(command),
+            );
+        });
+        let mut restored_entries =
+            ElementHandle::find_by_element_id(&ui, "MainWindow::save-project-as-entry");
+        let restored_entry = restored_entries
+            .next()
+            .expect("the generated Save As entry button returns after cancellation");
+        assert!(
+            restored_entries.next().is_none(),
+            "the restored Save As entry button id is unique"
+        );
+        restored_entry.mock_single_click(PointerEventButton::Left);
+        let mut submits =
+            ElementHandle::find_by_element_id(&ui, "MainWindow::save-project-as-submit");
+        let submit = submits
+            .next()
+            .expect("the generated Save As submission button must be present");
+        assert!(submits.next().is_none(), "the Save As submission button id is unique");
+        submit.mock_single_click(PointerEventButton::Left);
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::SaveProjectAs {
+                parent,
+                directory_name,
+                project_name,
+            }] if parent == &PathBuf::from("parent")
+                && directory_name == "Source copy"
+                && project_name == "Source copy"
+        ));
+        submit.mock_single_click(PointerEventButton::Left);
+        assert_eq!(
+            submitted.borrow().len(),
+            1,
+            "the generated submission button stays inert while Save As is pending"
         );
     }
 

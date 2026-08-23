@@ -12846,6 +12846,58 @@ mod tests {
         ));
     }
 
+    fn add_compressor_history(worker: &DesktopIdeWorker, track_id: String) {
+        worker
+            .try_send(IdeWorkerCommand::EditNativeFilter {
+                edit: IdeNativeFilterEdit::AddCompressor {
+                    track_id,
+                    threshold_millidecibels: -18_000,
+                    ratio_millionths: 4_000_000,
+                    attack_microseconds: 10_000,
+                    release_microseconds: 100_000,
+                    makeup_millidecibels: 0,
+                },
+            })
+            .unwrap();
+        assert!(matches!(recv_native_mutation(worker), IdeWorkerEvent::NativeFilterEditing { .. }));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("native device"),
+                redo_label: None,
+            }
+        ));
+        assert!(matches!(recv_native_mutation(worker), IdeWorkerEvent::Running(_)));
+        assert!(matches!(recv_native_mutation(worker), IdeWorkerEvent::NativeFilterEdited { .. }));
+    }
+
+    fn undo_native_device_history(worker: &DesktopIdeWorker) {
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "native device",
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: Some("native device"),
+            }
+        ));
+        assert!(matches!(recv_native_mutation(worker), IdeWorkerEvent::Running(_)));
+        assert!(matches!(
+            recv_native_mutation(worker),
+            IdeWorkerEvent::EditRestored {
+                redo: false,
+                label: "native device",
+                ..
+            }
+        ));
+    }
+
     fn refuse_audio_import(
         worker: &DesktopIdeWorker,
         unsupported: &Path,
@@ -13175,6 +13227,14 @@ mod tests {
             panic!("the source project must open");
         };
         let source_id = source_running.project_id().to_owned();
+        let track_id = source_running
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the source project exposes an audio-channel device chain")
+            .id()
+            .to_owned();
+        add_compressor_history(&worker, track_id);
 
         worker
             .try_send(IdeWorkerCommand::SaveProjectAs {
@@ -13191,6 +13251,13 @@ mod tests {
             IdeWorkerEvent::RecentProjectsChanged { ref projects }
                 if projects.len() == 2 && projects[0].name() == "Independent"
         ), "unexpected Save As history event: {recent:?}");
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: None,
+            }
+        ));
         let IdeWorkerEvent::Running(copied) = recv_native_mutation(&worker) else {
             panic!("the verified copied project must open");
         };
@@ -13205,6 +13272,92 @@ mod tests {
             std::fs::canonicalize(&destination).unwrap()
         );
         assert!(source.is_dir());
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn save_as_refusal_reopens_the_source_and_retains_its_history() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-save-as-refusal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = fixture.join("config");
+        let projects = fixture.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let source = create_project_package(
+            &projects,
+            ProjectCreationRequest {
+                directory_name: "Source",
+                project_name: "Source",
+            },
+        )
+        .unwrap()
+        .project()
+        .root()
+        .to_path_buf();
+        let occupied = projects.join("Occupied");
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("marker"), b"pre-existing destination").unwrap();
+        let history = ProjectHistory::at(&config);
+        let worker = DesktopIdeWorker::start_state_with_history(
+            WorkerState::Closed(closed_application()),
+            Some(history.clone()),
+            2,
+            8,
+        )
+        .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RecentProjectsChanged { projects } if projects.is_empty()
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(source.clone()))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RecentProjectsChanged { projects }
+                if projects.len() == 1 && projects[0].path() == source
+        ));
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the source project must open before the refused copy");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the source project exposes an audio-channel device chain")
+            .id()
+            .to_owned();
+        add_compressor_history(&worker, track_id);
+
+        worker
+            .try_send(IdeWorkerCommand::SaveProjectAs {
+                parent: projects,
+                directory_name: "Occupied".to_owned(),
+                project_name: "Occupied".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(recv_native_mutation(&worker), IdeWorkerEvent::Saving));
+        let IdeWorkerEvent::Running(reopened) = recv_native_mutation(&worker) else {
+            panic!("an unpublished Save As refusal must reopen the source project");
+        };
+        assert_eq!(reopened.project_id(), opened.project_id());
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::SaveProjectAs,
+                reason: IdeWorkerCommandFailure::ProjectCopy(_),
+            }
+        ));
+        assert_eq!(
+            history.load().unwrap()[0].path(),
+            std::fs::canonicalize(&source).unwrap(),
+            "a refused Save As must retain the source as the current recent project"
+        );
+
+        undo_native_device_history(&worker);
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
