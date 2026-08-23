@@ -2356,6 +2356,7 @@ dependencies = [
  "hyper-audio-engine",
  "hyper-audio-source",
  "hyper-clip-engine",
+ "hyper-native-device",
  "hyper-playback-compiler",
  "hyper-project-model",
  "hyper-strict-json",

@@ -2115,6 +2115,24 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
     });
 
     let weak = ui.as_weak();
+    let worker_for_duplication = Rc::clone(worker);
+    actions.on_duplicate_audio_track(move |index, name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        match audio_track_duplication_command(
+            ui.get_app_mode(),
+            index,
+            name.as_str(),
+            ui.get_track_count(),
+            &ui.get_mixer_channels(),
+        ) {
+            Ok(command) => submit_to_ui(&ui, &worker_for_duplication, command),
+            Err(reason) => ui.set_error_text(reason.message().into()),
+        }
+    });
+
+    let weak = ui.as_weak();
     let worker_for_rename = Rc::clone(worker);
     actions.on_rename_audio_track(move |index, name| {
         let Some(ui) = weak.upgrade() else {
@@ -4080,6 +4098,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         | IdeWorkerCommandKind::SetTempo
         | IdeWorkerCommandKind::SetMeter => AppMode::Saving,
         IdeWorkerCommandKind::AddAudioTrack => AppMode::AddingTrack,
+        IdeWorkerCommandKind::DuplicateAudioTrack => AppMode::DuplicatingTrack,
         IdeWorkerCommandKind::RemoveAudioTrack => AppMode::RemovingTrack,
         IdeWorkerCommandKind::RenameAudioTrack => AppMode::RenamingTrack,
         IdeWorkerCommandKind::SetAudioTrackActive => AppMode::ChangingTrackActivation,
@@ -4200,6 +4219,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::AddAudioTrack => {
             "Saving mixer state, adding the audio track, and reopening project…"
+        }
+        IdeWorkerCommandKind::DuplicateAudioTrack => {
+            "Preserving mixer state, duplicating the audio track, and reopening project…"
         }
         IdeWorkerCommandKind::RemoveAudioTrack => {
             "Preserving mixer state, removing the empty audio track, and reopening project…"
@@ -4475,6 +4497,10 @@ fn apply_event(
         }
         event @ (IdeWorkerEvent::AudioTrackRemoved { .. } | IdeWorkerEvent::AudioTrackRemoving) => {
             apply_audio_track_removal_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioTrackDuplicated { .. }
+        | IdeWorkerEvent::AudioTrackDuplicating) => {
+            apply_audio_track_duplication_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioTracksReordered { .. }
         | IdeWorkerEvent::AudioTracksReordering) => {
@@ -4895,6 +4921,30 @@ fn apply_audio_track_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_status_text("Waiting for native output before removing the audio track…".into());
         }
         _ => unreachable!("audio-track removal event dispatcher received another event"),
+    }
+}
+
+fn reset_audio_track_duplication_form(ui: &MainWindow) {
+    ui.set_duplicate_track_visible(false);
+    ui.set_duplicate_track_index(-1);
+    ui.set_duplicate_track_source_name(SharedString::default());
+    ui.set_duplicate_track_name(SharedString::default());
+}
+
+fn apply_audio_track_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioTrackDuplicated { revision, .. } => {
+            reset_audio_track_duplication_form(ui);
+            ui.set_status_text(
+                format!("Audio track duplicated in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioTrackDuplicating => {
+            ui.set_app_mode(AppMode::DuplicatingTrack);
+            ui.set_status_text("Waiting for native output before duplicating the audio track…".into());
+        }
+        _ => unreachable!("audio-track duplication event dispatcher received another event"),
     }
 }
 
@@ -7349,6 +7399,7 @@ fn reset_project(
     reset_scene_creation_form(ui);
     ui.set_new_track_visible(false);
     ui.set_new_track_name("Audio 2".into());
+    reset_audio_track_duplication_form(ui);
     ui.set_rename_track_visible(false);
     ui.set_remove_track_visible(false);
     ui.set_remove_track_id(SharedString::default());
@@ -7533,6 +7584,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::AddAudioTrack if current == AppMode::AddingTrack => AppMode::Running,
+        IdeWorkerCommandKind::DuplicateAudioTrack if current == AppMode::DuplicatingTrack => {
+            AppMode::Running
+        }
         IdeWorkerCommandKind::RemoveAudioTrack if current == AppMode::RemovingTrack => {
             AppMode::Running
         }
@@ -8225,6 +8279,30 @@ fn audio_track_reorder_command(
     Ok(IdeWorkerCommand::ReorderAudioTracks {
         track_id: row.track_id.to_string(),
         destination_index,
+    })
+}
+
+fn audio_track_duplication_command(
+    mode: AppMode,
+    index: i32,
+    name: &str,
+    track_count: i32,
+    channels: &ModelRc<MixerChannelRow>,
+) -> Result<IdeWorkerCommand, MixerControlFailure> {
+    if track_count >= 8 {
+        return Err(MixerControlFailure::StateUnavailable);
+    }
+    let (_, row) = validate_mixer_channel(mode, index, channels)?;
+    if !row.renameable {
+        return Err(MixerControlFailure::StateUnavailable);
+    }
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err(MixerControlFailure::InvalidValue);
+    }
+    Ok(IdeWorkerCommand::DuplicateAudioTrack {
+        track_id: row.track_id.to_string(),
+        name: name.to_owned(),
     })
 }
 
@@ -11250,6 +11328,66 @@ mod tests {
     }
 
     #[test]
+    fn generated_audio_track_duplication_form_uses_the_current_audio_row() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_visible(true);
+        ui.set_track_count(1);
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![
+            MixerChannelRow {
+                index: 0,
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456".into(),
+                name: "Audio 1".into(),
+                display_name: "Audio 1".into(),
+                kind: "AUDIO".into(),
+                state_available: true,
+                gain_percent: 100.0,
+                pan_percent: 0.0,
+                muted: false,
+                solo: false,
+                solo_available: true,
+                renameable: true,
+                removable: true,
+                can_move_earlier: false,
+                can_move_later: false,
+                active: true,
+                activation_toggleable: true,
+            },
+        ]))));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        ui.global::<IdeActions>()
+            .on_duplicate_audio_track(move |index, name| {
+                submitted_by_callback.borrow_mut().push((index, name.to_string()));
+            });
+        ui.show().unwrap();
+
+        let duplicate = ElementHandle::find_by_accessible_label(&ui, "Duplicate Audio 1")
+            .next()
+            .expect("the current audio row exposes duplication");
+        assert_eq!(duplicate.accessible_enabled(), Some(true));
+        duplicate.mock_single_click(PointerEventButton::Left);
+        assert!(ui.get_duplicate_track_visible());
+        assert_eq!(ui.get_duplicate_track_index(), 0);
+        assert_eq!(ui.get_duplicate_track_source_name(), "Audio 1");
+
+        ui.set_duplicate_track_name("Audio 1 copy".into());
+        let confirm =
+            ElementHandle::find_by_accessible_label(&ui, "Confirm duplicate audio track")
+                .next()
+                .expect("the visible form exposes one confirmation action");
+        assert_eq!(confirm.accessible_enabled(), Some(true));
+        confirm.mock_single_click(PointerEventButton::Left);
+        assert_eq!(
+            submitted.borrow().as_slice(),
+            &[(0, "Audio 1 copy".to_owned())],
+            "the generated row and form must forward the source row and chosen name exactly"
+        );
+    }
+
+    #[test]
     fn focused_line_edits_consume_project_global_chords() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().unwrap();
@@ -12807,6 +12945,39 @@ mod tests {
         );
         assert_eq!(
             mode_after_failure(AppMode::Saving, IdeWorkerCommandKind::ReorderAudioTracks),
+            AppMode::Running
+        );
+        assert!(matches!(
+            audio_track_duplication_command(
+                AppMode::Running,
+                1,
+                " Target copy ",
+                2,
+                &reordered,
+            ),
+            Ok(IdeWorkerCommand::DuplicateAudioTrack { track_id, name })
+                if track_id == track_a && name == "Target copy"
+        ));
+        assert!(matches!(
+            audio_track_duplication_command(AppMode::Running, 1, "Copy", 8, &reordered),
+            Err(MixerControlFailure::StateUnavailable)
+        ));
+        assert!(matches!(
+            audio_track_duplication_command(AppMode::Running, 1, "   ", 2, &reordered),
+            Err(MixerControlFailure::InvalidValue)
+        ));
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::DuplicateAudioTrack,
+            ),
+            AppMode::DuplicatingTrack
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::DuplicatingTrack,
+                IdeWorkerCommandKind::DuplicateAudioTrack,
+            ),
             AppMode::Running
         );
         assert_eq!(

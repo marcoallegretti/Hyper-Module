@@ -586,6 +586,64 @@ impl DeviceChain {
         self.format_version
     }
 
+    /// Returns an independently addressable copy for another track.
+    ///
+    /// The caller supplies a fresh chain identity, destination track identity,
+    /// and exactly one fresh identity for every device instance. Device order,
+    /// format version, and validated state are retained. Unknown extension
+    /// payloads refuse the copy because their identity semantics are not known
+    /// at this boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when the supplied identities are invalid, the
+    /// source declares extensions with unknown copy semantics, the
+    /// device-identity count differs from this chain, or the copied chain is
+    /// not valid.
+    pub fn try_clone_for_track(
+        &self,
+        chain_id: String,
+        track_id: String,
+        device_instance_ids: &[String],
+    ) -> Result<Self, DeviceChainError> {
+        if !self.extensions.is_empty()
+            || self
+                .devices
+                .iter()
+                .any(|device| !device.extensions.is_empty())
+        {
+            return Err(invalid_domain(
+                "native device clone refuses unknown extension identity semantics",
+            ));
+        }
+        if device_instance_ids.len() != self.devices.len() {
+            return Err(invalid_domain(
+                "native device clone identities do not match the source chain",
+            ));
+        }
+        let mut devices = Vec::new();
+        devices
+            .try_reserve_exact(self.devices.len())
+            .map_err(|_| DeviceChainError {
+                kind: DeviceChainErrorKind::CapacityUnavailable,
+                message: "native device clone capacity is unavailable".to_owned(),
+            })?;
+        for (source, id) in self.devices.iter().zip(device_instance_ids) {
+            devices.push(source.try_with_id(id.clone())?);
+        }
+        let copied = Self {
+            format: self.format.clone(),
+            format_version: self.format_version,
+            id: chain_id,
+            project_id: self.project_id.clone(),
+            track_id,
+            devices,
+            extensions: BTreeMap::new(),
+        };
+        validate_chain(&copied)?;
+        Ok(copied)
+    }
+
     /// Returns a copy with one validated Native Filter appended in processing
     /// order.
     ///
@@ -1622,6 +1680,93 @@ mod tests {
                 "018f47a2-6b2d-7c11-8a44-001122338013".to_owned(),
             )
             .is_err());
+    }
+
+    #[test]
+    fn cloning_a_chain_for_another_track_preserves_processing_state() {
+        let source = chain(true)
+            .try_with_appended_compressor(
+                "018f47a2-6b2d-7c11-8a44-001122338040".to_owned(),
+                false,
+                compressor_state(),
+            )
+            .unwrap();
+        let source_bytes = source.to_canonical_vec().unwrap();
+        let cloned = source
+            .try_clone_for_track(
+                "018f47a2-6b2d-7c11-8a44-001122338041".to_owned(),
+                "018f47a2-6b2d-7c11-8a44-001122338042".to_owned(),
+                &[
+                    "018f47a2-6b2d-7c11-8a44-001122338043".to_owned(),
+                    "018f47a2-6b2d-7c11-8a44-001122338044".to_owned(),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(cloned.id(), "018f47a2-6b2d-7c11-8a44-001122338041");
+        assert_eq!(cloned.track_id(), "018f47a2-6b2d-7c11-8a44-001122338042");
+        assert_eq!(
+            cloned.devices().iter().map(NativeDeviceInstance::id).collect::<Vec<_>>(),
+            [
+                "018f47a2-6b2d-7c11-8a44-001122338043",
+                "018f47a2-6b2d-7c11-8a44-001122338044",
+            ]
+        );
+        assert_eq!(cloned.format_version(), source.format_version());
+        assert_eq!(cloned.devices()[1].state(), source.devices()[1].state());
+        assert_eq!(DeviceChain::parse(&cloned.to_canonical_vec().unwrap()).unwrap(), cloned);
+        assert_eq!(source.to_canonical_vec().unwrap(), source_bytes);
+        assert_eq!(
+            source
+                .try_clone_for_track(
+                    "018f47a2-6b2d-7c11-8a44-001122338041".to_owned(),
+                    "018f47a2-6b2d-7c11-8a44-001122338042".to_owned(),
+                    &["018f47a2-6b2d-7c11-8a44-001122338043".to_owned()],
+                )
+                .unwrap_err()
+                .kind(),
+            DeviceChainErrorKind::InvalidDomain
+        );
+
+        let mut extended_wire: Value = serde_json::from_slice(&source_bytes).unwrap();
+        extended_wire["extensions"] = serde_json::json!({"org.example.chain": {"retained": true}});
+        let extended =
+            DeviceChain::parse(&serde_json_canonicalizer::to_vec(&extended_wire).unwrap()).unwrap();
+        assert_eq!(
+            extended
+                .try_clone_for_track(
+                    "018f47a2-6b2d-7c11-8a44-001122338041".to_owned(),
+                    "018f47a2-6b2d-7c11-8a44-001122338042".to_owned(),
+                    &[
+                        "018f47a2-6b2d-7c11-8a44-001122338043".to_owned(),
+                        "018f47a2-6b2d-7c11-8a44-001122338044".to_owned(),
+                    ],
+                )
+                .unwrap_err()
+                .kind(),
+            DeviceChainErrorKind::InvalidDomain
+        );
+
+        let mut extended_device_wire: Value = serde_json::from_slice(&source_bytes).unwrap();
+        extended_device_wire["devices"][0]["extensions"] =
+            serde_json::json!({"org.example.device": {"retained": true}});
+        let extended_device =
+            DeviceChain::parse(&serde_json_canonicalizer::to_vec(&extended_device_wire).unwrap())
+                .unwrap();
+        assert_eq!(
+            extended_device
+                .try_clone_for_track(
+                    "018f47a2-6b2d-7c11-8a44-001122338041".to_owned(),
+                    "018f47a2-6b2d-7c11-8a44-001122338042".to_owned(),
+                    &[
+                        "018f47a2-6b2d-7c11-8a44-001122338043".to_owned(),
+                        "018f47a2-6b2d-7c11-8a44-001122338044".to_owned(),
+                    ],
+                )
+                .unwrap_err()
+                .kind(),
+            DeviceChainErrorKind::InvalidDomain
+        );
     }
 
     #[test]

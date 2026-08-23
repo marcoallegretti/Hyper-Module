@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 hyper-audio-engine = { path = "../audio-engine" }
 hyper-clip-engine = { path = "../clip-engine" }
+hyper-native-device = { path = "../native-device" }
 hyper-playback-compiler = { path = "../playback-compiler" }
 hyper-project-model = { path = "../project-model" }
 hyper-strict-json = { path = "../strict-json" }

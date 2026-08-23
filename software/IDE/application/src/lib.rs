@@ -83,6 +83,7 @@ use hyper_playback_json::{
     AudioTrackAdditionSerializationError,
     AudioTrackDocumentSerializationError, AudioTrackRemovalBlockers,
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
+    AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
     AudioTrackReorderSerializationError,
     AutomationTakeAddition, AutomationTakeAdditionSerializationError,
     AutomationTakeEditSerializationError, AutomationTargetSelection, CompiledMixerGraph,
@@ -103,7 +104,7 @@ use hyper_playback_json::{
     serialize_audio_clip_source_view,
     serialize_audio_track_activation, serialize_audio_track_addition,
     serialize_audio_track_removal, serialize_audio_track_rename,
-    serialize_audio_track_reorder,
+    serialize_audio_track_duplication, serialize_audio_track_reorder,
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_mixer_base_state, serialize_recording_audio_clip_addition,
     serialize_scene_activation, serialize_scene_addition, serialize_scene_duplication,
@@ -148,6 +149,7 @@ use hyper_native_device::{
 use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
     AudioClipRemovalOutcome, AudioClipRemovalRequest,
+    AudioTrackDuplicationPublicationOutcome, AudioTrackDuplicationPublicationRequest,
     AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
     AudioTrackRemovalRequest, AutomationTakePublicationRequest, AutomationTakeRemovalRequest,
     ControlMappingPublicationRequest,
@@ -156,7 +158,7 @@ use hyper_storage_engine::{
     ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest,
     RequiredControlCapabilities, SampleCleanupOutcome, SampleCleanupRequest,
     ScenePublicationRequest, StorageError, clean_unused_samples, publish_arrangement,
-    publish_audio_clip, publish_audio_track, publish_automation_take, publish_control_mapping,
+    publish_audio_clip, publish_audio_track, publish_audio_track_duplication, publish_automation_take, publish_control_mapping,
     publish_device_chain, publish_imported_audio_clip, publish_project_resource, publish_scene,
     remove_audio_clip, remove_audio_track, remove_automation_take, remove_device_chain,
     TrackOrderPublicationOutcome, TrackOrderPublicationRequest, publish_track_order,
@@ -2183,6 +2185,122 @@ impl Error for IdeAudioTrackReorderError {
             Self::TrackResourceMissing
             | Self::TrackResourceRoleMismatch
             | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+/// A complete independent audio-track duplication. The operation owns every
+/// mutable document edge that the duplicated track can reach, so publication
+/// is intentionally one manifest-last batch rather than a sequence of edits.
+#[derive(Debug)]
+pub enum IdeAudioTrackDuplicationError {
+    MixerSave(Box<IdeProjectSaveError>),
+    Storage(StorageError),
+    Device(DeviceChainError),
+    TrackResourceMissing,
+    TrackResourceRoleMismatch,
+    DeviceChainAmbiguous,
+    CapacityUnavailable,
+    InvalidName,
+    Serialization(AudioTrackDuplicationSerializationError),
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeAudioTrackDuplicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: AudioTrackDuplicationPublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<ProjectResourcePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeAudioTrackDuplicationError {
+    /// Whether the complete duplication reached its manifest commit.
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        matches!(self, Self::Publication(source) if source.published())
+            || matches!(self, Self::ReopenAfterPublication { .. })
+            || matches!(self, Self::ReopenAfterPreparation { preparation, .. }
+                if preparation.publication_committed())
+    }
+}
+
+impl fmt::Display for IdeAudioTrackDuplicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MixerSave(source) => {
+                write!(formatter, "live mixer state could not be preserved: {source}")
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Device(source) => source.fmt(formatter),
+            Self::TrackResourceMissing => {
+                formatter.write_str("the source audio track is unavailable")
+            }
+            Self::TrackResourceRoleMismatch => formatter.write_str(
+                "the selected track cannot be duplicated as independent audio-track state",
+            ),
+            Self::DeviceChainAmbiguous => formatter.write_str(
+                "the source track has more than one native device chain",
+            ),
+            Self::CapacityUnavailable => {
+                formatter.write_str("audio-track duplication capacity is unavailable")
+            }
+            Self::InvalidName => formatter.write_str("the duplicated track name is invalid"),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before duplicating the audio track: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before duplicating the audio track ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation { preparation, reopen } => write!(
+                formatter,
+                "audio-track duplication preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "audio track {} was duplicated in project revision {} but the project could not be reopened: {source}",
+                outcome.track_id(),
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen { publication, reopen } => write!(
+                formatter,
+                "audio-track duplication failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAudioTrackDuplicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Device(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::TrackResourceMissing
+            | Self::TrackResourceRoleMismatch
+            | Self::DeviceChainAmbiguous
+            | Self::CapacityUnavailable
+            | Self::InvalidName
             | Self::NativeClose(_) => None,
         }
     }
@@ -6446,6 +6564,12 @@ struct IdeAudioTrackReorderPlan {
 }
 
 #[derive(Debug)]
+struct IdeAudioTrackDuplicationPlan {
+    mixer: IdeMixerSavePlan,
+    documents: hyper_playback_json::AudioTrackDuplicationDocuments,
+}
+
+#[derive(Debug)]
 struct IdeArrangementPlacementEditPlan {
     mixer: IdeMixerSavePlan,
     arrangement_id: String,
@@ -7536,6 +7660,21 @@ impl IdeAudioTrackReorderPlan {
 
 }
 
+impl IdeAudioTrackDuplicationPlan {
+    fn publish(
+        &self,
+    ) -> Result<AudioTrackDuplicationPublicationOutcome, ProjectResourcePublicationError> {
+        publish_audio_track_duplication(
+            &self.mixer.project_path,
+            AudioTrackDuplicationPublicationRequest {
+                expected_project_sha256: self.mixer.expected_project_sha256,
+                mixer_id: &self.mixer.resource_id,
+                documents: &self.documents,
+            },
+        )
+    }
+}
+
 impl IdeAudioTrackAdditionPlan {
     fn publish(&self) -> Result<AudioTrackPublicationOutcome, ProjectResourcePublicationError> {
         publish_audio_track(
@@ -8123,6 +8262,154 @@ impl RunningDesktopIdeApplication {
             mixer,
             documents,
         })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the complete manifest resource inventory is retained explicitly so duplication never infers a partial mutable graph"
+    )]
+    fn prepare_audio_track_duplication(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        track_id: &str,
+        track_name: &str,
+    ) -> Result<IdeAudioTrackDuplicationPlan, IdeAudioTrackDuplicationError> {
+        let name_length = track_name.chars().count();
+        if track_name.trim() != track_name || !(1..=120).contains(&name_length) {
+            return Err(IdeAudioTrackDuplicationError::InvalidName);
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAudioTrackDuplicationError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAudioTrackDuplicationError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let source_descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == track_id)
+            .ok_or(IdeAudioTrackDuplicationError::TrackResourceMissing)?;
+        if source_descriptor.role() != ResourceRole::Track {
+            return Err(IdeAudioTrackDuplicationError::TrackResourceRoleMismatch);
+        }
+        let source_track = package
+            .read_resource(track_id)
+            .map_err(IdeAudioTrackDuplicationError::Storage)?;
+        let (project, _, _, media) = prepared.session().parts();
+        if project.structural_track_index(track_id).is_none() {
+            return Err(IdeAudioTrackDuplicationError::TrackResourceMissing);
+        }
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeAudioTrackDuplicationError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+
+        let resources = package.manifest().resources();
+        let mut clips = Vec::new();
+        let mut scenes = Vec::new();
+        let mut automation_ids = Vec::new();
+        let mut automation_takes = Vec::new();
+        clips
+            .try_reserve_exact(resources.len())
+            .map_err(|_| IdeAudioTrackDuplicationError::CapacityUnavailable)?;
+        scenes
+            .try_reserve_exact(resources.len())
+            .map_err(|_| IdeAudioTrackDuplicationError::CapacityUnavailable)?;
+        automation_ids
+            .try_reserve_exact(resources.len())
+            .map_err(|_| IdeAudioTrackDuplicationError::CapacityUnavailable)?;
+        automation_takes
+            .try_reserve_exact(resources.len())
+            .map_err(|_| IdeAudioTrackDuplicationError::CapacityUnavailable)?;
+        let mut arrangement = None;
+        let mut device_chain_id = None;
+        let mut device_chain = None;
+        for descriptor in resources {
+            match descriptor.role() {
+                ResourceRole::Clip => {
+                    let bytes = package
+                        .read_resource(descriptor.id())
+                        .map_err(IdeAudioTrackDuplicationError::Storage)?;
+                    clips.push((descriptor.id().to_owned(), bytes));
+                }
+                ResourceRole::Scene => {
+                    let bytes = package
+                        .read_resource(descriptor.id())
+                        .map_err(IdeAudioTrackDuplicationError::Storage)?;
+                    scenes.push((descriptor.id().to_owned(), bytes));
+                }
+                ResourceRole::Arrangement => {
+                    if arrangement.is_some() {
+                        return Err(IdeAudioTrackDuplicationError::TrackResourceRoleMismatch);
+                    }
+                    arrangement = Some(
+                        package
+                            .read_resource(descriptor.id())
+                            .map_err(IdeAudioTrackDuplicationError::Storage)?,
+                    );
+                }
+                ResourceRole::AutomationTake => {
+                    let bytes = package
+                        .read_resource(descriptor.id())
+                        .map_err(IdeAudioTrackDuplicationError::Storage)?;
+                    automation_ids.push(descriptor.id().to_owned());
+                    automation_takes.push((descriptor.id().to_owned(), bytes));
+                }
+                ResourceRole::DeviceChain => {
+                    let bytes = package
+                        .read_resource(descriptor.id())
+                        .map_err(IdeAudioTrackDuplicationError::Storage)?;
+                    let chain = DeviceChain::parse(&bytes)
+                        .map_err(IdeAudioTrackDuplicationError::Device)?;
+                    if chain.track_id() == track_id {
+                        if device_chain.is_some() {
+                            return Err(IdeAudioTrackDuplicationError::DeviceChainAmbiguous);
+                        }
+                        device_chain_id = Some(descriptor.id().to_owned());
+                        device_chain = Some(bytes);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let clip_sources = clips
+            .iter()
+            .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let scene_sources = scenes
+            .iter()
+            .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let automation_take_ids = automation_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let automation_sources = automation_takes
+            .iter()
+            .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let documents = serialize_audio_track_duplication(
+            project,
+            &assets,
+            AudioTrackDuplicationSource {
+                track: &source_track,
+                clips: &clip_sources,
+                scenes: &scene_sources,
+                arrangement: arrangement.as_deref(),
+                mixer: &mixer.resource_bytes,
+                automation_take_ids: &automation_take_ids,
+                automation_takes: &automation_sources,
+                device_chain_id: device_chain_id.as_deref(),
+                device_chain: device_chain.as_deref(),
+            },
+            track_id,
+            track_name,
+            application.config.project_limits.session.documents,
+            || uuid::Uuid::new_v4().to_string(),
+        )
+        .map_err(IdeAudioTrackDuplicationError::Serialization)?;
+        Ok(IdeAudioTrackDuplicationPlan { mixer, documents })
     }
 
     fn prepare_audio_track_activation(

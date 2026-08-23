@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 mod audio_clip_publication;
+mod audio_track_duplication;
 mod sample_cleanup;
 
 pub use audio_clip_publication::{
@@ -22,6 +23,11 @@ pub use audio_clip_publication::{
     AudioClipPublicationRecoveryDisposition, AudioClipPublicationRequest, AudioClipRemovalOutcome,
     AudioClipRemovalRequest, ImportedAudioClipPublicationRequest, publish_audio_clip,
     publish_imported_audio_clip, recover_audio_clip_publications, remove_audio_clip,
+};
+pub use audio_track_duplication::{
+    AudioTrackDuplicationPublicationOutcome, AudioTrackDuplicationPublicationRecovery,
+    AudioTrackDuplicationPublicationRecoveryDisposition, AudioTrackDuplicationPublicationRequest,
+    publish_audio_track_duplication, recover_audio_track_duplications,
 };
 pub use sample_cleanup::{
     SampleCleanupOutcome, SampleCleanupRecovery, SampleCleanupRecoveryDisposition,

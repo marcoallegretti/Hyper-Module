@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod automation;
+mod duplication;
 
 pub use automation::{
     AutomationChannelParameter, AutomationCompileError, AutomationEvaluationError,
@@ -10,6 +11,11 @@ pub use automation::{
     AutomationTakeAdditionSerializationError, AutomationTakeEditSerializationError,
     AutomationTarget, AutomationTargetSelection, AutomationValue, CompiledAutomation,
     LoadedAutomationSet, serialize_automation_take_activation, serialize_automation_take_addition,
+};
+pub use duplication::{
+    AudioTrackDuplicationDocument, AudioTrackDuplicationDocuments,
+    AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
+    serialize_audio_track_duplication,
 };
 
 use core::error::Error;

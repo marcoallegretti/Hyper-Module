@@ -3,11 +3,11 @@ use core::fmt;
 use std::path::Path;
 
 use super::{
-    AudioClipPublicationRecovery, AudioTrackPublicationRecovery, ControlMappingPublicationError,
+    AudioClipPublicationRecovery, AudioTrackDuplicationPublicationRecovery, AudioTrackPublicationRecovery, ControlMappingPublicationError,
     ControlMappingPublicationRecovery, ProjectResourcePublicationError,
     ProjectResourcePublicationRecovery, RecordingImportError, RecordingImportRecovery,
     ProjectRenameError, ProjectRenameRecovery, SampleCleanupRecovery,
-    recover_audio_clip_publications, recover_audio_track_publications,
+    recover_audio_clip_publications, recover_audio_track_duplications, recover_audio_track_publications,
     recover_control_mapping_publications, recover_project_resource_publications,
     recover_project_renames, recover_recording_imports,
     recover_sample_cleanups, TrackOrderPublicationRecovery, recover_track_order_publications,
@@ -25,6 +25,7 @@ struct ProjectTransactionRecoveryFamilies {
     sample_cleanups: Vec<SampleCleanupRecovery>,
     resources: Vec<ProjectResourcePublicationRecovery>,
     audio_tracks: Vec<AudioTrackPublicationRecovery>,
+    audio_track_duplications: Vec<AudioTrackDuplicationPublicationRecovery>,
     track_orders: Vec<TrackOrderPublicationRecovery>,
     audio_clips: Vec<AudioClipPublicationRecovery>,
     control_mappings: Vec<ControlMappingPublicationRecovery>,
@@ -52,6 +53,7 @@ impl ProjectTransactionRecoveryReport {
                 sample_cleanups,
                 resources,
                 audio_tracks,
+                audio_track_duplications: Vec::new(),
                 track_orders,
                 audio_clips,
                 control_mappings,
@@ -59,6 +61,14 @@ impl ProjectTransactionRecoveryReport {
                 renames,
             }),
         }
+    }
+
+    fn with_audio_track_duplications(
+        mut self,
+        audio_track_duplications: Vec<AudioTrackDuplicationPublicationRecovery>,
+    ) -> Self {
+        self.families.audio_track_duplications = audio_track_duplications;
+        self
     }
 
     #[must_use]
@@ -74,6 +84,11 @@ impl ProjectTransactionRecoveryReport {
     #[must_use]
     pub fn audio_tracks(&self) -> &[AudioTrackPublicationRecovery] {
         &self.families.audio_tracks
+    }
+
+    #[must_use]
+    pub fn audio_track_duplications(&self) -> &[AudioTrackDuplicationPublicationRecovery] {
+        &self.families.audio_track_duplications
     }
 
     #[must_use]
@@ -106,6 +121,7 @@ impl ProjectTransactionRecoveryReport {
         self.families.sample_cleanups.is_empty()
             && self.families.resources.is_empty()
             && self.families.audio_tracks.is_empty()
+            && self.families.audio_track_duplications.is_empty()
             && self.families.track_orders.is_empty()
             && self.families.audio_clips.is_empty()
             && self.families.control_mappings.is_empty()
@@ -119,6 +135,7 @@ pub enum ProjectTransactionRecoveryErrorSource {
     Resource(ProjectResourcePublicationError),
     SampleCleanup(ProjectResourcePublicationError),
     AudioTrack(ProjectResourcePublicationError),
+    AudioTrackDuplication(ProjectResourcePublicationError),
     TrackOrder(ProjectResourcePublicationError),
     AudioClip(ProjectResourcePublicationError),
     ControlMapping(ControlMappingPublicationError),
@@ -132,6 +149,9 @@ impl fmt::Display for ProjectTransactionRecoveryErrorSource {
             Self::Resource(source) => write!(formatter, "resource recovery failed: {source}"),
             Self::SampleCleanup(source) => write!(formatter, "sample cleanup recovery failed: {source}"),
             Self::AudioTrack(source) => write!(formatter, "audio-track recovery failed: {source}"),
+            Self::AudioTrackDuplication(source) => {
+                write!(formatter, "audio-track duplication recovery failed: {source}")
+            }
             Self::TrackOrder(source) => write!(formatter, "track-order recovery failed: {source}"),
             Self::AudioClip(source) => write!(formatter, "audio-clip recovery failed: {source}"),
             Self::ControlMapping(source) => {
@@ -149,6 +169,7 @@ impl Error for ProjectTransactionRecoveryErrorSource {
             Self::Resource(source)
             | Self::SampleCleanup(source)
             | Self::AudioTrack(source)
+            | Self::AudioTrackDuplication(source)
             | Self::TrackOrder(source)
             | Self::AudioClip(source) => {
                 Some(source)
@@ -206,9 +227,9 @@ impl Error for ProjectTransactionRecoveryError {
 /// order before normal project verification.
 ///
 /// Sample cleanup is recovered first because it may restore asset files needed
-/// by later package verification. Existing-resource, audio-track, audio-clip,
-/// mapping, recording, and manifest-name transactions then follow in that
-/// order through the same shared lock.
+/// by later package verification. Existing-resource, audio-track, track-order,
+/// audio-clip, mapping, audio-track-duplication, recording, and manifest-name
+/// transactions then follow in that order through the same shared lock.
 ///
 /// Recovery is fail-closed when another project storage transaction owns that
 /// lock. Callers may retry after the competing transaction has completed; this
@@ -324,6 +345,26 @@ pub fn recover_project_transactions(
             });
         }
     };
+    let audio_track_duplications = match recover_audio_track_duplications(project_path) {
+        Ok(audio_track_duplications) => audio_track_duplications,
+        Err(source) => {
+            return Err(ProjectTransactionRecoveryError {
+                completed: ProjectTransactionRecoveryReport::from_parts(
+                    sample_cleanups,
+                    resources,
+                    audio_tracks,
+                    track_orders,
+                    audio_clips,
+                    control_mappings,
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                source: Box::new(ProjectTransactionRecoveryErrorSource::AudioTrackDuplication(
+                    source,
+                )),
+            });
+        }
+    };
     let recordings = match recover_recording_imports(project_path) {
         Ok(recordings) => recordings,
         Err(source) => {
@@ -337,7 +378,8 @@ pub fn recover_project_transactions(
                     control_mappings,
                     Vec::new(),
                     Vec::new(),
-                ),
+                )
+                .with_audio_track_duplications(audio_track_duplications),
                 source: Box::new(ProjectTransactionRecoveryErrorSource::Recording(source)),
             });
         }
@@ -355,7 +397,8 @@ pub fn recover_project_transactions(
                     control_mappings,
                     recordings,
                     Vec::new(),
-                ),
+                )
+                .with_audio_track_duplications(audio_track_duplications),
                 source: Box::new(ProjectTransactionRecoveryErrorSource::Rename(source)),
             });
         }
@@ -369,7 +412,8 @@ pub fn recover_project_transactions(
         control_mappings,
         recordings,
         renames,
-    ))
+    )
+    .with_audio_track_duplications(audio_track_duplications))
 }
 
 #[cfg(test)]
