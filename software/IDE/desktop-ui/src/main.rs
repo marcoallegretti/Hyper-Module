@@ -10302,9 +10302,11 @@ mod tests {
         ui.set_new_project_visible(false);
         dispatch_ide_shortcut(ui, "n", false, true);
         dispatch_ide_shortcut(ui, "N", true, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "n", false, true, false, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "n", false, false, true, false);
         assert!(
             !ui.get_new_project_visible(),
-            "repeated and shifted new-project chords remain reserved rather than reopening a form"
+            "repeated and modified new-project chords remain reserved rather than reopening a form"
         );
 
         ui.set_app_mode(AppMode::Running);
