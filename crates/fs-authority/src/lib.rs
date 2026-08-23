@@ -8,6 +8,15 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, DirBuilder, File, Metadata, OpenOptions};
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "linux")]
+use std::fs::File as StdFile;
+
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+
+#[cfg(target_os = "linux")]
+use rustix::fs::{AtFlags, Mode, OFlags};
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows_rename {
@@ -21,7 +30,8 @@ mod windows_rename {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
     use cap_std::fs::{Dir, File, OpenOptions, OpenOptionsExt};
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+        FILE_DISPOSITION_INFORMATION, FILE_RENAME_INFORMATION, FileDispositionInformation,
+        FileRenameInformation, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -108,6 +118,28 @@ mod windows_rename {
         ))
     }
 
+    fn remove_open_source(source_handle: &File) -> io::Result<()> {
+        let mut disposition = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
+        let mut io_status = IO_STATUS_BLOCK::default();
+        let status = unsafe {
+            NtSetInformationFile(
+                source_handle.as_raw_handle(),
+                &raw mut io_status,
+                (&raw mut disposition).cast(),
+                u32::try_from(size_of::<FILE_DISPOSITION_INFORMATION>())
+                    .map_err(|_| invalid_argument("file disposition information is too large"))?,
+                FileDispositionInformation,
+            )
+        };
+        if status >= 0 {
+            return Ok(());
+        }
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        Err(io::Error::from_raw_os_error(
+            i32::try_from(error).unwrap_or(i32::MAX),
+        ))
+    }
+
     pub(super) fn rename(
         source_directory: &Dir,
         source: &str,
@@ -118,6 +150,15 @@ mod windows_rename {
     ) -> io::Result<()> {
         let source_handle = open_verified_source(source_directory, source, expected_identity)?;
         rename_open_source(&source_handle, destination_directory, destination, replace)
+    }
+
+    pub(super) fn remove(
+        directory: &Dir,
+        name: &str,
+        expected_identity: (u64, u64),
+    ) -> io::Result<()> {
+        let source_handle = open_verified_source(directory, name, expected_identity)?;
+        remove_open_source(&source_handle)
     }
 
     #[cfg(test)]
@@ -1096,6 +1137,73 @@ pub fn rename_replace(
     )
 }
 
+#[cfg(windows)]
+/// Removes a regular entry only through an opened handle whose identity matches
+/// the caller's retained authority.
+///
+/// # Errors
+///
+/// Returns an I/O or identity error when the entry changed or handle-bound
+/// deletion fails. A replacement at the original pathname is never removed.
+pub fn remove_file_if_identity(
+    directory: &Dir,
+    name: &str,
+    expected_identity: (u64, u64),
+) -> io::Result<()> {
+    windows_rename::remove(directory, name, expected_identity)
+}
+
+#[cfg(target_os = "linux")]
+/// Atomically publishes already-verified bytes to a destination which is
+/// currently absent, without ever naming the temporary inode.
+///
+/// Linux cannot bind a source file descriptor to an overwrite rename. This
+/// operation therefore fails with `AlreadyExists` instead of weakening the
+/// verified-publication guarantee for an existing destination. It links the
+/// unnamed inode through its `/proc/self/fd` capability path, which works for
+/// ordinary users without the capability required by `AT_EMPTY_PATH`.
+///
+/// # Errors
+///
+/// Returns an I/O or validation error when the destination name is not one
+/// normal component, the filesystem does not support unnamed temporary files,
+/// writing or syncing fails, or the destination already exists.
+pub fn publish_bytes_no_replace(
+    directory: &Dir,
+    destination: &str,
+    bytes: &[u8],
+) -> io::Result<()> {
+    validate_entry_name(destination)?;
+    let descriptor = rustix::fs::openat(
+        directory,
+        ".",
+        OFlags::RDWR | OFlags::CLOEXEC | OFlags::TMPFILE,
+        Mode::from_bits_truncate(0o600),
+    )?;
+    let mut temporary = StdFile::from(descriptor);
+    temporary.write_all(bytes)?;
+    temporary.sync_all()?;
+    let source = format!("/proc/self/fd/{}", temporary.as_raw_fd());
+    Ok(rustix::fs::linkat(
+        rustix::fs::CWD,
+        source,
+        directory,
+        destination,
+        AtFlags::SYMLINK_FOLLOW,
+    )?)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_entry_name(name: &str) -> io::Result<()> {
+    let mut components = Path::new(name).components();
+    if matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none() {
+        return Ok(());
+    }
+    Err(invalid_argument(
+        "filesystem entry name must be one normal component",
+    ))
+}
+
 fn rename_verified_directory_no_replace(
     arguments: &mut impl Iterator<Item = String>,
 ) -> Result<(), Box<dyn Error>> {
@@ -1260,6 +1368,8 @@ mod stable_file_tests {
         confirm_stable_absolute_file, open_syncable_directory_ambient, path_is_proven_absent,
         read_stable_absolute_file, read_stable_file, read_stable_file_observed, sync_directory,
     };
+    #[cfg(target_os = "linux")]
+    use super::publish_bytes_no_replace;
 
     struct TemporaryDirectory(PathBuf);
 
@@ -1307,6 +1417,19 @@ mod stable_file_tests {
         let directory = open_syncable_directory_ambient(temporary.path()).unwrap();
 
         sync_directory(&directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unnamed_verified_publication_never_replaces_an_existing_destination() {
+        let temporary = TemporaryDirectory::new();
+        let directory = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+
+        publish_bytes_no_replace(&directory, "mix.flac", b"verified").unwrap();
+        assert_eq!(fs::read(temporary.path().join("mix.flac")).unwrap(), b"verified");
+
+        assert!(publish_bytes_no_replace(&directory, "mix.flac", b"replacement").is_err());
+        assert_eq!(fs::read(temporary.path().join("mix.flac")).unwrap(), b"verified");
     }
 
     #[test]
