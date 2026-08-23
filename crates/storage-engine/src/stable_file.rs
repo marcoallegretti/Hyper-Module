@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use same_file::Handle;
 use sha2::{Digest, Sha256};
@@ -38,6 +38,75 @@ pub(crate) fn verify_open_stable(
         Some((expected_bytes, expected_sha256)),
         capture,
     )
+}
+
+/// Streams a retained regular file into `destination` while proving that both
+/// complete reads and the final opened-file metadata still match `expected`.
+///
+/// The caller owns destination publication.  This helper intentionally never
+/// captures the source payload in memory, which keeps verified project assets
+/// copyable at their declared size bounds.
+pub(crate) fn copy_open_stable(
+    file: fs::File,
+    label: &str,
+    expected_bytes: u64,
+    expected_sha256: [u8; 32],
+    destination: &mut impl Write,
+) -> Result<(), StorageError> {
+    let mut handle = Handle::from_file(file).map_err(|error| io_error(label, "open file", error))?;
+    let before = handle
+        .as_file()
+        .metadata()
+        .map_err(|error| io_error(label, "inspect open file", error))?;
+    require_regular_non_link(&before, label)?;
+    if before.len() != expected_bytes {
+        return Err(rejection(
+            StorageErrorKind::ByteLengthMismatch,
+            label,
+            "declared byte length does not match the file",
+        ));
+    }
+    let before_stamp = metadata_stamp(&before);
+    let mut buffer = vec![0_u8; READ_BUFFER_BYTES].into_boxed_slice();
+    let (first_sha256, first_total) = copy_pass(
+        handle.as_file_mut(),
+        label,
+        expected_bytes,
+        &mut buffer,
+        destination,
+    )?;
+    handle
+        .as_file_mut()
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| io_error(label, "rewind file", error))?;
+    let (confirmed_sha256, confirmed_total) = read_pass(
+        handle.as_file_mut(),
+        label,
+        expected_bytes,
+        &mut buffer,
+        None,
+    )?;
+    let after = handle
+        .as_file()
+        .metadata()
+        .map_err(|error| io_error(label, "reinspect open file", error))?;
+    if first_sha256 != confirmed_sha256
+        || first_total != confirmed_total
+        || first_total != expected_bytes
+        || !after.is_file()
+        || after.len() != expected_bytes
+        || before_stamp != metadata_stamp(&after)
+    {
+        return Err(changed(label));
+    }
+    if first_sha256 != expected_sha256 {
+        return Err(rejection(
+            StorageErrorKind::Sha256Mismatch,
+            label,
+            "declared SHA-256 does not match the file",
+        ));
+    }
+    Ok(())
 }
 
 fn read_open_file_observed<F>(
@@ -213,6 +282,44 @@ fn read_pass(
     Ok((hasher.finalize().into(), total))
 }
 
+fn copy_pass(
+    file: &mut fs::File,
+    label: &str,
+    maximum_bytes: u64,
+    buffer: &mut [u8],
+    destination: &mut impl Write,
+) -> Result<([u8; 32], u64), StorageError> {
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    loop {
+        let count = file
+            .read(buffer)
+            .map_err(|error| io_error(label, "read file", error))?;
+        if count == 0 {
+            break;
+        }
+        total = total.checked_add(count as u64).ok_or_else(|| {
+            rejection(
+                StorageErrorKind::LimitExceeded,
+                label,
+                "file byte count overflowed",
+            )
+        })?;
+        if total > maximum_bytes {
+            return Err(rejection(
+                StorageErrorKind::ByteLengthMismatch,
+                label,
+                "file grew beyond its byte limit while reading",
+            ));
+        }
+        destination
+            .write_all(&buffer[..count])
+            .map_err(|error| io_error(label, "write copied file", error))?;
+        hasher.update(&buffer[..count]);
+    }
+    Ok((hasher.finalize().into(), total))
+}
+
 fn require_regular_non_link(metadata: &fs::Metadata, label: &str) -> Result<(), StorageError> {
     if is_link_like(metadata) {
         return Err(rejection(
@@ -311,6 +418,30 @@ mod tests {
             result.unwrap_err().kind(),
             StorageErrorKind::ChangedDuringVerification
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn streams_verified_bytes_without_capturing_the_source_payload() {
+        let root = std::env::temp_dir().join(format!(
+            "hyper-stable-file-copy-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("payload");
+        let expected = b"stable project asset";
+        fs::write(&path, expected).unwrap();
+        let mut copied = Vec::new();
+        copy_open_stable(
+            fs::File::open(&path).unwrap(),
+            "payload",
+            expected.len() as u64,
+            Sha256::digest(expected).into(),
+            &mut copied,
+        )
+        .unwrap();
+        assert_eq!(copied, expected);
         fs::remove_dir_all(root).unwrap();
     }
 }

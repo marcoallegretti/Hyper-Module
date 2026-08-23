@@ -21,6 +21,7 @@ use crate::project_lock::{
     ProjectLock, RECORDING_IMPORT_TRANSACTION_PREFIX as TRANSACTION_PREFIX,
     find_unhandled_project_transaction,
 };
+use crate::stable_file::copy_open_stable;
 
 const MAX_RECORDING_BYTES: u64 = u32::MAX as u64;
 const MAX_MANIFEST_BYTES: usize = 1_048_576;
@@ -790,7 +791,7 @@ fn copy_verified_recording(
     if !path_metadata.is_file() || super::stable_file::is_link_like(&path_metadata) {
         return Err(failure("recording source must be a real regular file"));
     }
-    let mut source = File::open(request.recording_path)
+    let source = File::open(request.recording_path)
         .map_err(|error| caused("open recording source", error))?;
     let source_handle = Handle::from_file(
         source
@@ -803,33 +804,17 @@ fn copy_verified_recording(
     let mut destination_file = destination_dir
         .open_with(destination, &options)
         .map_err(|error| caused("create staged recording", error))?;
-    let mut hasher = Sha256::new();
-    let mut length = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    loop {
-        let read = source
-            .read(&mut buffer)
-            .map_err(|error| caused("read recording source", error))?;
-        if read == 0 {
-            break;
-        }
-        length = length
-            .checked_add(read as u64)
-            .filter(|length| *length <= MAX_RECORDING_BYTES)
-            .ok_or_else(|| failure("recording source exceeds the WAV container limit"))?;
-        hasher.update(&buffer[..read]);
-        destination_file
-            .write_all(&buffer[..read])
-            .map_err(|error| caused("write staged recording", error))?;
-    }
+    copy_open_stable(
+        source,
+        "recording source",
+        request.recording_byte_length,
+        request.recording_sha256,
+        &mut destination_file,
+    )
+    .map_err(|error| caused("copy verified recording source", error))?;
     destination_file
         .sync_all()
         .map_err(|error| caused("sync staged recording", error))?;
-    if length != request.recording_byte_length
-        || <[u8; 32]>::from(hasher.finalize()) != request.recording_sha256
-    {
-        return Err(failure("recording publication descriptor mismatch"));
-    }
     let current = Handle::from_path(request.recording_path)
         .map_err(|error| caused("reopen recording source", error))?;
     if current != source_handle {
