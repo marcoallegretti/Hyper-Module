@@ -11824,7 +11824,7 @@ mod tests {
         ChannelParameter, ControlSource, ControlTransform, SendParameter,
     };
     use hyper_media_cache::CacheLimits;
-    use hyper_playback_json::LoaderLimits;
+    use hyper_playback_json::{LoaderLimits, PlaybackJsonInput, load};
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
@@ -12760,6 +12760,114 @@ mod tests {
             mixer.main_muted(),
         );
         assert_eq!(live_mixer_state_is_dirty(mixer, &malformed), None);
+
+        let send_mixer = compiled_mixer_with_one_send();
+        let send_channels: Vec<_> = send_mixer
+            .slots()
+            .iter()
+            .map(|slot| {
+                let sends: Vec<_> = slot
+                    .sends()
+                    .iter()
+                    .map(|send| {
+                        hyper_mixer_runtime::MixerSendParameterState::for_test(
+                            send.parameters(),
+                            send.enabled(),
+                        )
+                    })
+                    .collect();
+                hyper_mixer_runtime::MixerChannelParameterState::for_test(
+                    slot.parameters(),
+                    slot.muted(),
+                    slot.solo(),
+                    &sends,
+                )
+            })
+            .collect();
+        let send = send_channels[0].send(0).unwrap();
+        for changed_send in [
+            hyper_mixer_runtime::MixerSendParameterState::for_test(
+                hyper_audio_engine::ChannelParameters::new(
+                    LinearGain::from_millionths(750_000).unwrap(),
+                    send.parameters().pan,
+                    send.parameters().audible,
+                ),
+                send.enabled(),
+            ),
+            hyper_mixer_runtime::MixerSendParameterState::for_test(
+                hyper_audio_engine::ChannelParameters::new(
+                    send.parameters().gain,
+                    Pan::from_millionths(250_000).unwrap(),
+                    send.parameters().audible,
+                ),
+                send.enabled(),
+            ),
+            hyper_mixer_runtime::MixerSendParameterState::for_test(
+                send.parameters(),
+                !send.enabled(),
+            ),
+        ] {
+            let mut changed = send_channels.clone();
+            changed[0] = hyper_mixer_runtime::MixerChannelParameterState::for_test(
+                changed[0].parameters(),
+                changed[0].muted(),
+                changed[0].solo(),
+                &[changed_send],
+            );
+            let snapshot = hyper_mixer_runtime::MixerParameterStateSnapshot::for_test(
+                &changed,
+                send_mixer.main_gain(),
+                send_mixer.main_muted(),
+            );
+            assert_eq!(live_mixer_state_is_dirty(&send_mixer, &snapshot), Some(true));
+        }
+        let malformed_send = hyper_mixer_runtime::MixerParameterStateSnapshot::for_test(
+            &[
+                hyper_mixer_runtime::MixerChannelParameterState::for_test(
+                    send_channels[0].parameters(),
+                    send_channels[0].muted(),
+                    send_channels[0].solo(),
+                    &[],
+                ),
+                send_channels[1],
+            ],
+            send_mixer.main_gain(),
+            send_mixer.main_muted(),
+        );
+        assert_eq!(live_mixer_state_is_dirty(&send_mixer, &malformed_send), Some(true));
+    }
+
+    fn compiled_mixer_with_one_send() -> CompiledMixerGraph {
+        let project_id = "018f47a2-6b2d-7c11-8a44-00112233a000";
+        let timeline = serde_json_canonicalizer::to_vec(&json!({
+            "format":"hyper-timeline", "format_version":1, "id":"018f47a2-6b2d-7c11-8a44-00112233a001",
+            "project_id":project_id, "ticks_per_quarter":1920,
+            "tempo_events":[{"tick":0,"microseconds_per_quarter":1_000_000}],
+            "meter_events":[{"tick":0,"numerator":4,"denominator":4}], "extensions":{}
+        })).unwrap();
+        let audio = serde_json_canonicalizer::to_vec(&json!({
+            "format":"hyper-track", "format_version":1, "id":"018f47a2-6b2d-7c11-8a44-00112233a002",
+            "project_id":project_id, "name":"Source", "kind":"audio", "order":0,
+            "active":true, "clip_ids":[], "extensions":{}
+        })).unwrap();
+        let return_bus = serde_json_canonicalizer::to_vec(&json!({
+            "format":"hyper-track", "format_version":1, "id":"018f47a2-6b2d-7c11-8a44-00112233a003",
+            "project_id":project_id, "name":"Return", "kind":"return", "order":1,
+            "active":true, "clip_ids":[], "extensions":{}
+        })).unwrap();
+        let project = load(PlaybackJsonInput {
+            project_id, sample_rate_hz:48_000, timeline:&timeline, tracks:&[&audio, &return_bus],
+            clips:&[], scenes:&[], arrangement:None,
+        }, LoaderLimits::VERSION_1).unwrap();
+        let mixer = serde_json_canonicalizer::to_vec(&json!({
+            "format":"hyper-mixer", "format_version":1, "id":"018f47a2-6b2d-7c11-8a44-00112233a004", "project_id":project_id,
+            "channels":[
+                {"track_id":"018f47a2-6b2d-7c11-8a44-00112233a002", "gain_millionths":1_000_000, "pan_millionths":0, "mute":false, "solo":false, "destination":{"kind":"main"}, "sends":[{"id":"018f47a2-6b2d-7c11-8a44-00112233a005", "bus":"a", "tap":"post-fader", "gain_millionths":1_000_000, "pan_millionths":0, "enabled":true}]},
+                {"track_id":"018f47a2-6b2d-7c11-8a44-00112233a003", "gain_millionths":1_000_000, "pan_millionths":0, "mute":false, "solo":false, "destination":{"kind":"main"}, "sends":[]}
+            ], "return_buses":[{"bus":"a", "track_id":"018f47a2-6b2d-7c11-8a44-00112233a003"}],
+            "main":{"gain_millionths":1_000_000,"mute":false}, "cue":{"source":"main","gain_millionths":1_000_000,"mute":false}, "extensions":{}
+        })).unwrap();
+        project.load_mixer(&mixer, &[], LoaderLimits::VERSION_1).unwrap().compile_main_graph().unwrap()
     }
 
     #[test]
