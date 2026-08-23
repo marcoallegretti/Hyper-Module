@@ -1212,12 +1212,7 @@ fn bind_project_close_callback_with(ui: &MainWindow, submitter: UiCommandSubmitt
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        if matches!(ui.get_app_mode(), AppMode::Running | AppMode::Previewing)
-            && ui.get_mixer_unsaved_changes()
-        {
-            ui.set_close_unsaved_mixer_confirming(true);
-            ui.set_status_text("Live mixer changes need a save or explicit discard before closing".into());
-            ui.set_error_text(SharedString::default());
+        if ui.get_close_unsaved_mixer_confirming() {
             return;
         }
         close_submitter(&ui, IdeWorkerCommand::CloseProject);
@@ -1233,7 +1228,7 @@ fn bind_project_close_callback_with(ui: &MainWindow, submitter: UiCommandSubmitt
             return;
         }
         ui.set_close_unsaved_mixer_confirming(false);
-        submitter(&ui, IdeWorkerCommand::CloseProject);
+        submitter(&ui, IdeWorkerCommand::DiscardCloseProject);
     });
 }
 
@@ -1248,9 +1243,7 @@ fn bind_window_close_callback(ui: &MainWindow) {
 }
 
 fn window_close_response(ui: &MainWindow) -> CloseRequestResponse {
-    if matches!(ui.get_app_mode(), AppMode::Running | AppMode::Previewing)
-        && ui.get_mixer_unsaved_changes()
-    {
+    if matches!(ui.get_app_mode(), AppMode::Running | AppMode::Previewing) {
         ui.global::<IdeActions>().invoke_close_project();
         CloseRequestResponse::KeepWindowShown
     } else {
@@ -4247,6 +4240,9 @@ fn apply_event(
             ui.set_status_text("Mixer base command queued for the audio runtime".into());
             ui.set_error_text(SharedString::default());
         }
+        IdeWorkerEvent::CloseDiscardRequired => {
+            apply_close_discard_required(ui);
+        }
         IdeWorkerEvent::MonitoringApplied(_) => {
             ui.set_status_text("Input cue control applied".into());
             ui.set_error_text(SharedString::default());
@@ -4563,6 +4559,12 @@ fn apply_event(
             ui.set_error_text(format!("{}: {reason}", command_status(command)).into());
         }
     }
+}
+
+fn apply_close_discard_required(ui: &MainWindow) {
+    ui.set_close_unsaved_mixer_confirming(true);
+    ui.set_status_text("Live mixer changes need a save or explicit discard before closing".into());
+    ui.set_error_text(SharedString::default());
 }
 
 fn apply_recent_projects(
@@ -10448,19 +10450,26 @@ mod tests {
         ui.window()
             .try_dispatch_event(slint::platform::WindowEvent::CloseRequested)
             .expect("a rejected native close request must remain dispatchable");
-        assert!(submitted.borrow().is_empty());
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::CloseProject]
+        ));
+        apply_close_discard_required(ui);
         assert!(
             ui.get_close_unsaved_mixer_confirming(),
             "a native close request with a committed live-mixer difference must require an explicit close decision"
         );
         ui.global::<IdeActions>().invoke_close_project();
         assert!(
-            submitted.borrow().is_empty(),
+            matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::CloseProject]),
             "repeating the ordinary close action cannot silently confirm discard"
         );
         ui.global::<IdeActions>().invoke_confirm_close_project();
         assert!(
-            matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::CloseProject]),
+            matches!(
+                submitted.borrow().as_slice(),
+                [IdeWorkerCommand::CloseProject, IdeWorkerCommand::DiscardCloseProject]
+            ),
             "only the explicit discard confirmation may send close"
         );
 
@@ -10468,14 +10477,21 @@ mod tests {
         ui.set_app_mode(AppMode::Previewing);
         ui.set_close_unsaved_mixer_confirming(false);
         ui.global::<IdeActions>().invoke_close_project();
-        assert!(submitted.borrow().is_empty());
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::CloseProject]
+        ));
+        apply_close_discard_required(ui);
         assert!(
             ui.get_close_unsaved_mixer_confirming(),
             "take audition cannot bypass a pending live-mixer discard decision"
         );
         ui.global::<IdeActions>().invoke_confirm_close_project();
         assert!(
-            matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::CloseProject]),
+            matches!(
+                submitted.borrow().as_slice(),
+                [IdeWorkerCommand::CloseProject, IdeWorkerCommand::DiscardCloseProject]
+            ),
             "the explicit discard path remains available while auditioning"
         );
 
@@ -10494,8 +10510,8 @@ mod tests {
         );
         assert_eq!(
             window_close_response(ui),
-            CloseRequestResponse::HideWindow,
-            "a clean project does not block ordinary application exit"
+            CloseRequestResponse::KeepWindowShown,
+            "a clean native close waits for the worker's fenced close decision"
         );
     }
 

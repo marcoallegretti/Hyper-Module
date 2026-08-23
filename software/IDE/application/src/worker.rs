@@ -421,6 +421,7 @@ pub enum IdeWorkerCommand {
     AudioPreviewControl(IdeAudioPreviewControlCommand),
     Observe,
     CloseProject,
+    DiscardCloseProject,
     Shutdown,
 }
 
@@ -522,6 +523,7 @@ impl IdeWorkerCommand {
             Self::AudioPreviewControl(_) => IdeWorkerCommandKind::AudioPreviewControl,
             Self::Observe => IdeWorkerCommandKind::Observe,
             Self::CloseProject => IdeWorkerCommandKind::CloseProject,
+            Self::DiscardCloseProject => IdeWorkerCommandKind::CloseProject,
             Self::Shutdown => IdeWorkerCommandKind::Shutdown,
         }
     }
@@ -1979,6 +1981,7 @@ pub enum IdeWorkerEvent {
     TransportQueued(TransportCommand),
     LoudnessQueued(IdeLoudnessCommand),
     MixerQueued(IdeMixerCommand),
+    CloseDiscardRequired,
     MonitoringApplied(IdeMonitoringCommand),
     ProjectSaved {
         revision: u64,
@@ -2712,6 +2715,11 @@ enum WorkerState {
     AudioPreviewFence {
         application: RunningDesktopIdeApplication,
         asset_id: String,
+        sequence: u64,
+        deadline: Instant,
+    },
+    CloseFence {
+        application: RunningDesktopIdeApplication,
         sequence: u64,
         deadline: Instant,
     },
@@ -3538,8 +3546,7 @@ fn process_command(
     let kind = command.kind();
     if matches!(
         command,
-        IdeWorkerCommand::CloseProject
-            | IdeWorkerCommand::OpenProject(_)
+        IdeWorkerCommand::OpenProject(_)
             | IdeWorkerCommand::OpenRecentProject(_)
             | IdeWorkerCommand::CreateProject { .. }
     ) && history.clear()
@@ -3685,11 +3692,16 @@ fn process_command(
             block_frames,
         } => export_project(state, events, &wav_path, block_frames),
         IdeWorkerCommand::Observe => publish_state(state, events, unpublished_native_failure),
-        IdeWorkerCommand::CloseProject => close_project(
+        IdeWorkerCommand::CloseProject => request_project_close(
+            state,
+            events,
+        ),
+        IdeWorkerCommand::DiscardCloseProject => close_project(
             state,
             events,
             unpublished_native_failure,
             IdeWorkerCommandKind::CloseProject,
+            history,
         ),
         IdeWorkerCommand::Shutdown => unreachable!("shutdown is handled by the worker loop"),
     }
@@ -4987,9 +4999,13 @@ fn close_project(
     events: &SyncSender<IdeWorkerEvent>,
     unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
     command: IdeWorkerCommandKind,
+    history: &mut UndoHistory,
 ) -> bool {
     if !matches!(state, WorkerState::Running(_)) {
         return publish_failure(events, command, IdeWorkerCommandFailure::InvalidState);
+    }
+    if history.clear() && !send_event(events, history.state_event()) {
+        return false;
     }
     let WorkerState::Running(application) = std::mem::replace(state, WorkerState::Empty) else {
         unreachable!("running state was checked before ownership transfer");
@@ -5008,6 +5024,42 @@ fn close_project(
             send_event(events, IdeWorkerEvent::Closing)
         }
     }
+}
+
+fn request_project_close(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) -> bool {
+    let WorkerState::Running(application) = state else {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CloseProject,
+            IdeWorkerCommandFailure::InvalidState,
+        );
+    };
+    let sequence = match application.try_send_mixer_fence() {
+        Ok(Some(sequence)) => sequence,
+        Ok(None) => {
+            return publish_failure(
+                events,
+                IdeWorkerCommandKind::CloseProject,
+                IdeWorkerCommandFailure::InvalidState,
+            );
+        }
+        Err(reason) => {
+            return publish_failure(
+                events,
+                IdeWorkerCommandKind::CloseProject,
+                IdeWorkerCommandFailure::Mixer(IdeMixerCommandError::Send(reason)),
+            );
+        }
+    };
+    let WorkerState::Running(application) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("running state was checked before close-fence ownership transfer");
+    };
+    *state = WorkerState::CloseFence {
+        application,
+        sequence,
+        deadline: Instant::now() + MIXER_SAVE_COMMIT_TIMEOUT,
+    };
+    true
 }
 
 fn save_project(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) -> bool {
@@ -11328,6 +11380,54 @@ fn poll_pending_state(
             sequence,
             deadline,
         } => poll_audio_preview_fence(state, application, asset_id, sequence, deadline, events),
+        WorkerState::CloseFence {
+            application,
+            sequence,
+            deadline,
+        } => {
+            if application.committed_mixer_fence() >= sequence {
+                match application.mixer_close_requires_discard() {
+                    Some(true) => {
+                        *state = WorkerState::Running(application);
+                        let mut no_native_failure = None;
+                        publish_state(state, events, &mut no_native_failure)
+                            && send_event(events, IdeWorkerEvent::CloseDiscardRequired)
+                    }
+                    Some(false) => {
+                        *state = WorkerState::Running(application);
+                        close_project(
+                            state,
+                            events,
+                            unpublished_native_failure,
+                            IdeWorkerCommandKind::CloseProject,
+                            history,
+                        )
+                    }
+                    None => {
+                        *state = WorkerState::Running(application);
+                        publish_failure(
+                            events,
+                            IdeWorkerCommandKind::CloseProject,
+                            IdeWorkerCommandFailure::InvalidState,
+                        )
+                    }
+                }
+            } else if Instant::now() >= deadline {
+                *state = WorkerState::Running(application);
+                publish_failure(
+                    events,
+                    IdeWorkerCommandKind::CloseProject,
+                    IdeWorkerCommandFailure::InvalidState,
+                )
+            } else {
+                *state = WorkerState::CloseFence {
+                    application,
+                    sequence,
+                    deadline,
+                };
+                true
+            }
+        }
         WorkerState::OutputTestStopping { pending, command } => {
             poll_output_test_shutdown(state, pending, command, events, unpublished_native_failure)
         }
@@ -11440,7 +11540,7 @@ fn publish_state(
                 return publish_failure(events, IdeWorkerCommandKind::Observe, reason);
             }
         },
-        WorkerState::Closing(_) => IdeWorkerEvent::Closing,
+        WorkerState::Closing(_) | WorkerState::CloseFence { .. } => IdeWorkerEvent::Closing,
         WorkerState::SaveFence { operation, .. } | WorkerState::Saving { operation, .. } => {
             operation.pending_event()
         }
@@ -11879,6 +11979,10 @@ fn shutdown_state(
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
             },
             WorkerState::SaveFence { application, .. } => match application.close() {
+                IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
+                IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
+            },
+            WorkerState::CloseFence { application, .. } => match application.close() {
                 IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
             },
@@ -14898,7 +15002,10 @@ mod tests {
     fn running_worker_queues_runtime_commands_and_closes_before_shutdown() {
         let running = RunningDesktopIdeApplication {
             application: closed_application(),
-            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
         };
         let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 4, 4).unwrap();
         assert!(matches!(
@@ -14942,7 +15049,11 @@ mod tests {
             IdeWorkerEvent::TransportQueued(TransportCommand::Stop)
         ));
         worker.try_send(IdeWorkerCommand::CloseProject).unwrap();
-        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        let close_started = recv(&worker);
+        assert!(
+            matches!(close_started, IdeWorkerEvent::Closed { .. }),
+            "a committed close fence must authorize the normal close, got {close_started:?}"
+        );
         assert_eq!(shutdown_report(worker).native_failure(), None);
     }
 
@@ -16724,7 +16835,10 @@ mod tests {
     fn closing_a_project_drops_its_history_through_the_dispatcher() {
         let running = RunningDesktopIdeApplication {
             application: closed_application(),
-            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
         };
         let (events, receiver) = std::sync::mpsc::sync_channel(16);
         let mut state = WorkerState::Running(running);
@@ -16741,6 +16855,12 @@ mod tests {
             &mut history,
             None,
         ));
+        assert!(poll_pending_state(
+            &mut state,
+            &events,
+            &mut native,
+            &mut history,
+        ));
         assert!(
             history.undo.is_empty() && history.redo.is_empty(),
             "entries from the closed project cannot target the next one"
@@ -16755,6 +16875,52 @@ mod tests {
             ),
             "and the controls are told before anything else happens"
         );
+    }
+
+    #[test]
+    fn fenced_close_requires_explicit_discard_without_clearing_history() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                commit_mixer_fences: true,
+                close_requires_discard: Some(true),
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let (events, receiver) = std::sync::mpsc::sync_channel(16);
+        let mut state = WorkerState::Running(running);
+        let mut history = UndoHistory::default();
+        let mut native = None;
+        history.record_edit(labelled("scene", "scene rename"));
+        while receiver.try_recv().is_ok() {}
+
+        assert!(process_command(
+            &mut state,
+            IdeWorkerCommand::CloseProject,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+        assert!(poll_pending_state(
+            &mut state,
+            &events,
+            &mut native,
+            &mut history,
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::CloseDiscardRequired)
+        ));
+        assert_eq!(history.undo.len(), 1);
+        assert!(matches!(state, WorkerState::Running(_)));
     }
 
     /// The rule the previous hand-maintained list broke: adding, duplicating,

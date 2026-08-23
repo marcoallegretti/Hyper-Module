@@ -7548,6 +7548,7 @@ struct TestPlaybackSession {
     commit_mixer_fences: bool,
     committed_mixer_fence: u64,
     next_mixer_fence: u64,
+    close_requires_discard: Option<bool>,
     extent: IdePlaybackExtent,
     arrangement_project_id: String,
     arrangement_placements: Vec<(String, usize)>,
@@ -7567,6 +7568,7 @@ impl Default for TestPlaybackSession {
             commit_mixer_fences: false,
             committed_mixer_fence: 0,
             next_mixer_fence: 1,
+            close_requires_discard: Some(false),
             extent: IdePlaybackExtent::Bounded { end_frame: 0 },
             arrangement_project_id: String::new(),
             arrangement_placements: Vec::new(),
@@ -7576,6 +7578,22 @@ impl Default for TestPlaybackSession {
 }
 
 impl RunningDesktopIdeApplication {
+    /// Returns whether a fenced live mixer checkpoint requires explicit discard
+    /// before closing. `None` is an indeterminate checkpoint and must fail closed.
+    pub(crate) fn mixer_close_requires_discard(&self) -> Option<bool> {
+        let session = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session,
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(session) => return session.close_requires_discard,
+        };
+        let project = session.prepared_project()?;
+        let (_, mixer, _, _) = project.session().parts();
+        match session.recovery_checkpoint().snapshot().mixer_parameter_state() {
+            Some(state) => live_mixer_state_is_dirty(mixer, &state),
+            None => Some(false),
+        }
+    }
+
     pub(crate) fn audio_preview_is_active(&self) -> bool {
         match &self.session {
             IdePlaybackSessionOwner::Native(session) => {
@@ -12690,12 +12708,58 @@ mod tests {
         );
         assert_eq!(live_mixer_state_is_dirty(mixer, &changed_channel), Some(true));
 
+        for (parameters, muted, solo) in [
+            (
+                hyper_audio_engine::ChannelParameters::new(
+                    original.parameters().gain,
+                    Pan::from_millionths(250_000).unwrap(),
+                    original.parameters().audible,
+                ),
+                original.muted(),
+                original.solo(),
+            ),
+            (
+                hyper_audio_engine::ChannelParameters::new(
+                    original.parameters().gain,
+                    original.parameters().pan,
+                    !original.parameters().audible,
+                ),
+                original.muted(),
+                original.solo(),
+            ),
+            (original.parameters(), !original.muted(), original.solo()),
+            (original.parameters(), original.muted(), !original.solo()),
+        ] {
+            let mut changed = channels.clone();
+            changed[0] = hyper_mixer_runtime::MixerChannelParameterState::for_test(
+                parameters, muted, solo, &sends,
+            );
+            let snapshot = hyper_mixer_runtime::MixerParameterStateSnapshot::for_test(
+                &changed,
+                mixer.main_gain(),
+                mixer.main_muted(),
+            );
+            assert_eq!(live_mixer_state_is_dirty(mixer, &snapshot), Some(true));
+        }
+
         let changed_main = hyper_mixer_runtime::MixerParameterStateSnapshot::for_test(
             &channels,
             LinearGain::from_millionths(750_000).unwrap(),
             mixer.main_muted(),
         );
         assert_eq!(live_mixer_state_is_dirty(mixer, &changed_main), Some(true));
+        let changed_main_mute = hyper_mixer_runtime::MixerParameterStateSnapshot::for_test(
+            &channels,
+            mixer.main_gain(),
+            !mixer.main_muted(),
+        );
+        assert_eq!(live_mixer_state_is_dirty(mixer, &changed_main_mute), Some(true));
+        let malformed = hyper_mixer_runtime::MixerParameterStateSnapshot::for_test(
+            &[],
+            mixer.main_gain(),
+            mixer.main_muted(),
+        );
+        assert_eq!(live_mixer_state_is_dirty(mixer, &malformed), None);
     }
 
     #[test]
