@@ -1143,6 +1143,782 @@ fn duplicate_automation_lanes(
     Ok(output)
 }
 
+/// One canonical replacement or removed resource in a complete track-content
+/// deletion transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioTrackContentRemovalDocument {
+    id: String,
+    bytes: Vec<u8>,
+}
+
+impl AudioTrackContentRemovalDocument {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Complete verified source authority for a destructive audio-track removal.
+///
+/// Automation resources are supplied explicitly because they are stored
+/// outside the playback-document graph. The source therefore cannot silently
+/// leave a lane addressing a removed channel or send behind.
+#[derive(Clone, Copy, Debug)]
+pub struct AudioTrackContentRemovalSource<'a> {
+    pub track: &'a [u8],
+    pub clips: &'a [(&'a str, &'a [u8])],
+    pub scenes: &'a [(&'a str, &'a [u8])],
+    pub arrangement: Option<&'a [u8]>,
+    pub mixer: &'a [u8],
+    pub automation_take_ids: &'a [&'a str],
+    pub automation_takes: &'a [(&'a str, &'a [u8])],
+    pub device_chain_id: Option<&'a str>,
+    pub device_chain: Option<&'a [u8]>,
+}
+
+/// Complete resource delta for removing one flat audio track and all of its
+/// mutable musical state. Immutable project media is intentionally absent: it
+/// remains available to the separate unused-media cleanup authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioTrackContentRemovalDocuments {
+    track: AudioTrackContentRemovalDocument,
+    clips: Vec<AudioTrackContentRemovalDocument>,
+    mixer: AudioTrackContentRemovalDocument,
+    arrangement: Option<AudioTrackContentRemovalDocument>,
+    scenes: Vec<AudioTrackContentRemovalDocument>,
+    automation_takes: Vec<AudioTrackContentRemovalDocument>,
+    device_chain: Option<AudioTrackContentRemovalDocument>,
+}
+
+impl AudioTrackContentRemovalDocuments {
+    #[must_use]
+    pub const fn track(&self) -> &AudioTrackContentRemovalDocument {
+        &self.track
+    }
+
+    #[must_use]
+    pub fn clips(&self) -> &[AudioTrackContentRemovalDocument] {
+        &self.clips
+    }
+
+    #[must_use]
+    pub const fn mixer(&self) -> &AudioTrackContentRemovalDocument {
+        &self.mixer
+    }
+
+    #[must_use]
+    pub const fn arrangement(&self) -> Option<&AudioTrackContentRemovalDocument> {
+        self.arrangement.as_ref()
+    }
+
+    #[must_use]
+    pub fn scenes(&self) -> &[AudioTrackContentRemovalDocument] {
+        &self.scenes
+    }
+
+    #[must_use]
+    pub fn automation_takes(&self) -> &[AudioTrackContentRemovalDocument] {
+        &self.automation_takes
+    }
+
+    #[must_use]
+    pub const fn device_chain(&self) -> Option<&AudioTrackContentRemovalDocument> {
+        self.device_chain.as_ref()
+    }
+}
+
+/// Rejection returned before a partially reduced track graph can be published.
+#[derive(Debug)]
+pub enum AudioTrackContentRemovalSerializationError {
+    TrackMissing,
+    TrackNotAudio,
+    ParentTrackUnsupported,
+    SourceTrackMismatch,
+    SourceClipCoverage,
+    SourceSceneCoverage,
+    SourceArrangementMismatch,
+    SourceMixerMismatch,
+    SourceAutomationCoverage,
+    SourceDeviceChainMismatch,
+    InvalidDocumentShape,
+    UnknownExtensionSemantics,
+    Source(LoadError),
+    Device(DeviceChainError),
+    Serialization(serde_json::Error),
+    ProjectCompilation(AdapterCompileError),
+    MixerCompilation(MixerCompileError),
+    AutomationCompilation(AutomationCompileError),
+}
+
+impl fmt::Display for AudioTrackContentRemovalSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TrackMissing => formatter.write_str("the selected track is not present"),
+            Self::TrackNotAudio => formatter.write_str("track removal supports audio tracks only"),
+            Self::ParentTrackUnsupported => {
+                formatter.write_str("track removal does not infer hierarchy deletion semantics")
+            }
+            Self::SourceTrackMismatch => {
+                formatter.write_str("source track bytes do not match the loaded project")
+            }
+            Self::SourceClipCoverage => {
+                formatter.write_str("source clip documents do not exactly cover the selected track")
+            }
+            Self::SourceSceneCoverage => {
+                formatter.write_str("source scene documents do not exactly cover the project")
+            }
+            Self::SourceArrangementMismatch => {
+                formatter.write_str("source arrangement bytes do not match the loaded project")
+            }
+            Self::SourceMixerMismatch => {
+                formatter.write_str("source mixer bytes do not match the loaded project")
+            }
+            Self::SourceAutomationCoverage => {
+                formatter.write_str("source automation documents have duplicate or misaddressed identities")
+            }
+            Self::SourceDeviceChainMismatch => {
+                formatter.write_str("source native device chain does not belong to the selected track")
+            }
+            Self::InvalidDocumentShape => {
+                formatter.write_str("a source document shape changed after typed validation")
+            }
+            Self::UnknownExtensionSemantics => formatter.write_str(
+                "track removal refuses a transformed document with unknown extension semantics",
+            ),
+            Self::Source(source) => source.fmt(formatter),
+            Self::Device(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::ProjectCompilation(source) => source.fmt(formatter),
+            Self::MixerCompilation(source) => source.fmt(formatter),
+            Self::AutomationCompilation(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioTrackContentRemovalSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Device(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
+            Self::MixerCompilation(source) => Some(source),
+            Self::AutomationCompilation(source) => Some(source),
+            Self::TrackMissing
+            | Self::TrackNotAudio
+            | Self::ParentTrackUnsupported
+            | Self::SourceTrackMismatch
+            | Self::SourceClipCoverage
+            | Self::SourceSceneCoverage
+            | Self::SourceArrangementMismatch
+            | Self::SourceMixerMismatch
+            | Self::SourceAutomationCoverage
+            | Self::SourceDeviceChainMismatch
+            | Self::InvalidDocumentShape
+            | Self::UnknownExtensionSemantics => None,
+        }
+    }
+}
+
+/// Builds the complete mutable document delta for one confirmed audio-track
+/// deletion. The result deliberately carries both prior bytes for every
+/// removed resource and canonical replacements for every dependent resource;
+/// storage must publish it as one manifest-last transaction.
+///
+/// # Errors
+///
+/// Returns a classified refusal when the supplied authority is incomplete,
+/// stale, noncanonical, unsupported, or cannot compile after removal.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the deletion boundary validates every mutable edge before returning one all-or-nothing resource delta"
+)]
+pub fn serialize_audio_track_content_removal(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source: AudioTrackContentRemovalSource<'_>,
+    source_track_id: &str,
+    limits: LoaderLimits,
+) -> Result<AudioTrackContentRemovalDocuments, AudioTrackContentRemovalSerializationError> {
+    let source_track_index = project
+        .track_index(source_track_id)
+        .ok_or(AudioTrackContentRemovalSerializationError::TrackMissing)?;
+    let loaded_source_track = load_track(
+        source.track,
+        source_track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(AudioTrackContentRemovalSerializationError::Source)?;
+    let expected_source_track = &project.tracks[source_track_index];
+    if !same_track(&loaded_source_track, expected_source_track) {
+        return Err(AudioTrackContentRemovalSerializationError::SourceTrackMismatch);
+    }
+    if loaded_source_track.kind != super::TrackKind::Audio {
+        return Err(AudioTrackContentRemovalSerializationError::TrackNotAudio);
+    }
+    if loaded_source_track.parent_track_id.is_some()
+        || project
+            .tracks
+            .iter()
+            .any(|track| track.parent_track_id.as_deref() == Some(source_track_id))
+    {
+        return Err(AudioTrackContentRemovalSerializationError::ParentTrackUnsupported);
+    }
+    let (track_value, canonical_track) = removal_canonical_value(source.track)?;
+    if canonical_track != source.track || !removal_extensions_empty(&track_value)? {
+        return Err(AudioTrackContentRemovalSerializationError::UnknownExtensionSemantics);
+    }
+
+    let source_clips = removal_source_clip_map(project, &loaded_source_track, source.clips, limits)?;
+    let source_scenes = removal_source_scene_map(project, source.scenes, limits)?;
+    let source_arrangement = removal_source_arrangement(project, source.arrangement, limits)?;
+
+    let (mixer_value, canonical_mixer) = removal_canonical_value(source.mixer)?;
+    if canonical_mixer != source.mixer {
+        return Err(AudioTrackContentRemovalSerializationError::SourceMixerMismatch);
+    }
+    if !removal_extensions_empty(&mixer_value)? {
+        return Err(AudioTrackContentRemovalSerializationError::UnknownExtensionSemantics);
+    }
+    let loaded_mixer = project
+        .load_mixer(source.mixer, assets, limits)
+        .map_err(AudioTrackContentRemovalSerializationError::Source)?;
+    let source_channel = loaded_mixer
+        .channels
+        .iter()
+        .find(|channel| channel.track_id == source_track_id)
+        .ok_or(AudioTrackContentRemovalSerializationError::SourceMixerMismatch)?;
+    let source_send_ids: BTreeSet<&str> = source_channel
+        .sends
+        .iter()
+        .map(|send| send.id.as_str())
+        .collect();
+
+    let source_automation = removal_source_automation(
+        project,
+        &loaded_mixer,
+        assets,
+        source.automation_take_ids,
+        source.automation_takes,
+        limits,
+    )?;
+    let device_chain = removal_source_device_chain(project, source, source_track_id)?;
+
+    let mut candidate = project.clone();
+    candidate.tracks.remove(source_track_index);
+    candidate
+        .clips
+        .retain(|clip| clip.track_id != source_track_id);
+    validate_track_hierarchy(&candidate.tracks)
+        .map_err(AudioTrackContentRemovalSerializationError::Source)?;
+
+    let arrangement = removal_arrangement(
+        &mut candidate,
+        project,
+        source_arrangement,
+        source_track_id,
+        limits,
+    )?;
+    let scenes = removal_scene_actions(
+        &mut candidate,
+        project,
+        &source_scenes,
+        source_track_id,
+        limits,
+    )?;
+    validate_loaded_identities(&candidate).map_err(AudioTrackContentRemovalSerializationError::Source)?;
+
+    let mixer = removal_mixer(
+        &candidate,
+        source.mixer,
+        &loaded_mixer,
+        source_track_id,
+        assets,
+        limits,
+    )?;
+    let candidate_mixer = candidate
+        .load_mixer(mixer.bytes(), assets, limits)
+        .map_err(AudioTrackContentRemovalSerializationError::Source)?;
+    let automation_takes = removal_automation_lanes(
+        project,
+        assets,
+        source.automation_takes,
+        &source_automation,
+        source_track_id,
+        &source_send_ids,
+        &candidate_mixer,
+        limits,
+    )?;
+    candidate
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(AudioTrackContentRemovalSerializationError::ProjectCompilation)?;
+
+    let clips = loaded_source_track
+        .clip_ids
+        .iter()
+        .map(|id| {
+            source_clips
+                .get(id.as_str())
+                .copied()
+                .map(|bytes| AudioTrackContentRemovalDocument {
+                    id: id.clone(),
+                    bytes: bytes.to_vec(),
+                })
+                .ok_or(AudioTrackContentRemovalSerializationError::SourceClipCoverage)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AudioTrackContentRemovalDocuments {
+        track: AudioTrackContentRemovalDocument {
+            id: loaded_source_track.id,
+            bytes: source.track.to_vec(),
+        },
+        clips,
+        mixer,
+        arrangement,
+        scenes,
+        automation_takes,
+        device_chain,
+    })
+}
+
+fn removal_canonical_value(
+    bytes: &[u8],
+) -> Result<(Value, Vec<u8>), AudioTrackContentRemovalSerializationError> {
+    let value = serde_json::from_slice(bytes)
+        .map_err(AudioTrackContentRemovalSerializationError::Serialization)?;
+    let canonical = serde_json_canonicalizer::to_vec(&value)
+        .map_err(AudioTrackContentRemovalSerializationError::Serialization)?;
+    Ok((value, canonical))
+}
+
+fn removal_extensions_empty(
+    value: &Value,
+) -> Result<bool, AudioTrackContentRemovalSerializationError> {
+    value
+        .get("extensions")
+        .and_then(Value::as_object)
+        .map(|extensions| extensions.is_empty())
+        .ok_or(AudioTrackContentRemovalSerializationError::InvalidDocumentShape)
+}
+
+fn removal_source_clip_map<'a>(
+    project: &LoadedPlaybackProject,
+    source_track: &super::LoadedTrack,
+    source: &'a [(&'a str, &'a [u8])],
+    limits: LoaderLimits,
+) -> Result<HashMap<&'a str, &'a [u8]>, AudioTrackContentRemovalSerializationError> {
+    if source.len() != source_track.clip_ids.len() {
+        return Err(AudioTrackContentRemovalSerializationError::SourceClipCoverage);
+    }
+    let mut output = HashMap::new();
+    output
+        .try_reserve(source.len())
+        .map_err(|_| AudioTrackContentRemovalSerializationError::Source(capacity_error()))?;
+    for (clip_id, bytes) in source {
+        let clip_index = project
+            .clips
+            .iter()
+            .position(|clip| clip.id == *clip_id)
+            .ok_or(AudioTrackContentRemovalSerializationError::SourceClipCoverage)?;
+        if output.insert(*clip_id, *bytes).is_some()
+            || !source_track.clip_ids.iter().any(|id| id == clip_id)
+        {
+            return Err(AudioTrackContentRemovalSerializationError::SourceClipCoverage);
+        }
+        let (value, canonical) = removal_canonical_value(bytes)?;
+        if canonical != *bytes || !removal_extensions_empty(&value)? {
+            return Err(AudioTrackContentRemovalSerializationError::UnknownExtensionSemantics);
+        }
+        let loaded = load_clip(
+            bytes,
+            clip_index,
+            project.project_id(),
+            limits.max_document_bytes,
+            limits.max_warp_markers,
+        )
+        .map_err(AudioTrackContentRemovalSerializationError::Source)?;
+        if loaded.id != *clip_id
+            || loaded.track_id != source_track.id
+            || loaded != project.clips[clip_index]
+        {
+            return Err(AudioTrackContentRemovalSerializationError::SourceClipCoverage);
+        }
+    }
+    if output.len() != source_track.clip_ids.len() {
+        return Err(AudioTrackContentRemovalSerializationError::SourceClipCoverage);
+    }
+    Ok(output)
+}
+
+fn removal_source_scene_map<'a>(
+    project: &LoadedPlaybackProject,
+    source: &'a [(&'a str, &'a [u8])],
+    limits: LoaderLimits,
+) -> Result<HashMap<&'a str, &'a [u8]>, AudioTrackContentRemovalSerializationError> {
+    if source.len() != project.scenes.len() {
+        return Err(AudioTrackContentRemovalSerializationError::SourceSceneCoverage);
+    }
+    let mut output = HashMap::new();
+    output
+        .try_reserve(source.len())
+        .map_err(|_| AudioTrackContentRemovalSerializationError::Source(capacity_error()))?;
+    for (id, bytes) in source {
+        let scene_index = project
+            .scenes
+            .iter()
+            .position(|scene| scene.id == *id)
+            .ok_or(AudioTrackContentRemovalSerializationError::SourceSceneCoverage)?;
+        if output.insert(*id, *bytes).is_some() {
+            return Err(AudioTrackContentRemovalSerializationError::SourceSceneCoverage);
+        }
+        let (_, canonical) = removal_canonical_value(bytes)?;
+        if canonical != *bytes {
+            return Err(AudioTrackContentRemovalSerializationError::SourceSceneCoverage);
+        }
+        let loaded = load_scene(
+            bytes,
+            scene_index,
+            project.project_id(),
+            limits.max_document_bytes,
+            limits.max_scene_slots,
+        )
+        .map_err(AudioTrackContentRemovalSerializationError::Source)?;
+        if loaded.id != *id || loaded != project.scenes[scene_index] {
+            return Err(AudioTrackContentRemovalSerializationError::SourceSceneCoverage);
+        }
+    }
+    Ok(output)
+}
+
+fn removal_source_arrangement<'a>(
+    project: &LoadedPlaybackProject,
+    source: Option<&'a [u8]>,
+    limits: LoaderLimits,
+) -> Result<Option<&'a [u8]>, AudioTrackContentRemovalSerializationError> {
+    match (project.arrangement.as_ref(), source) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            Err(AudioTrackContentRemovalSerializationError::SourceArrangementMismatch)
+        }
+        (Some(expected), Some(bytes)) => {
+            let (_, canonical) = removal_canonical_value(bytes)?;
+            if canonical != bytes {
+                return Err(AudioTrackContentRemovalSerializationError::SourceArrangementMismatch);
+            }
+            let loaded = load_arrangement(
+                bytes,
+                project.project_id(),
+                limits.max_document_bytes,
+                limits.max_placements,
+                limits.max_scene_launches,
+            )
+            .map_err(AudioTrackContentRemovalSerializationError::Source)?;
+            if loaded != *expected {
+                return Err(AudioTrackContentRemovalSerializationError::SourceArrangementMismatch);
+            }
+            Ok(Some(bytes))
+        }
+    }
+}
+
+fn removal_source_automation(
+    project: &LoadedPlaybackProject,
+    mixer: &super::LoadedMixer,
+    assets: &[MediaAssetFact<'_>],
+    expected_ids: &[&str],
+    source: &[(&str, &[u8])],
+    limits: LoaderLimits,
+) -> Result<super::LoadedAutomationSet, AudioTrackContentRemovalSerializationError> {
+    if expected_ids.len() != source.len() {
+        return Err(AudioTrackContentRemovalSerializationError::SourceAutomationCoverage);
+    }
+    let mut expected = BTreeSet::new();
+    for id in expected_ids {
+        if !is_valid_entity_id(id) || !expected.insert(*id) {
+            return Err(AudioTrackContentRemovalSerializationError::SourceAutomationCoverage);
+        }
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(source.len())
+        .map_err(|_| AudioTrackContentRemovalSerializationError::Source(capacity_error()))?;
+    let mut actual = BTreeSet::new();
+    for (id, document) in source {
+        if !actual.insert(*id) || !expected.contains(*id) {
+            return Err(AudioTrackContentRemovalSerializationError::SourceAutomationCoverage);
+        }
+        let (_, canonical) = removal_canonical_value(document)?;
+        if canonical != *document {
+            return Err(AudioTrackContentRemovalSerializationError::SourceAutomationCoverage);
+        }
+        bytes.push(*document);
+    }
+    let automation = project
+        .load_automation_takes(mixer, assets, &bytes, limits)
+        .map_err(AudioTrackContentRemovalSerializationError::Source)?;
+    if automation.takes().len() != source.len()
+        || automation
+            .takes()
+            .iter()
+            .zip(source)
+            .any(|(take, (id, _))| take.id() != *id)
+    {
+        return Err(AudioTrackContentRemovalSerializationError::SourceAutomationCoverage);
+    }
+    Ok(automation)
+}
+
+fn removal_source_device_chain(
+    project: &LoadedPlaybackProject,
+    source: AudioTrackContentRemovalSource<'_>,
+    source_track_id: &str,
+) -> Result<Option<AudioTrackContentRemovalDocument>, AudioTrackContentRemovalSerializationError> {
+    match (source.device_chain_id, source.device_chain) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            Err(AudioTrackContentRemovalSerializationError::SourceDeviceChainMismatch)
+        }
+        (Some(id), Some(bytes)) => {
+            let chain = DeviceChain::parse(bytes)
+                .map_err(AudioTrackContentRemovalSerializationError::Device)?;
+            if chain.id() != id
+                || chain.project_id() != project.project_id()
+                || chain.track_id() != source_track_id
+            {
+                return Err(AudioTrackContentRemovalSerializationError::SourceDeviceChainMismatch);
+            }
+            Ok(Some(AudioTrackContentRemovalDocument {
+                id: id.to_owned(),
+                bytes: bytes.to_vec(),
+            }))
+        }
+    }
+}
+
+fn removal_arrangement(
+    candidate: &mut LoadedPlaybackProject,
+    project: &LoadedPlaybackProject,
+    source: Option<&[u8]>,
+    source_track_id: &str,
+    limits: LoaderLimits,
+) -> Result<Option<AudioTrackContentRemovalDocument>, AudioTrackContentRemovalSerializationError> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let Some(original) = &project.arrangement else {
+        return Err(AudioTrackContentRemovalSerializationError::SourceArrangementMismatch);
+    };
+    if !original
+        .placements
+        .iter()
+        .any(|placement| placement.track_id == source_track_id)
+    {
+        return Ok(None);
+    }
+    let (mut value, _) = removal_canonical_value(source)?;
+    if !removal_extensions_empty(&value)? {
+        return Err(AudioTrackContentRemovalSerializationError::UnknownExtensionSemantics);
+    }
+    let placements = value
+        .get_mut("placements")
+        .and_then(Value::as_array_mut)
+        .ok_or(AudioTrackContentRemovalSerializationError::InvalidDocumentShape)?;
+    let previous = placements.len();
+    placements.retain(|placement| {
+        placement.get("track_id").and_then(Value::as_str) != Some(source_track_id)
+    });
+    if placements.len() >= previous {
+        return Err(AudioTrackContentRemovalSerializationError::SourceArrangementMismatch);
+    }
+    let bytes = serde_json_canonicalizer::to_vec(&value)
+        .map_err(AudioTrackContentRemovalSerializationError::Serialization)?;
+    let loaded = load_arrangement(
+        &bytes,
+        candidate.project_id(),
+        limits.max_document_bytes,
+        limits.max_placements,
+        limits.max_scene_launches,
+    )
+    .map_err(AudioTrackContentRemovalSerializationError::Source)?;
+    candidate.arrangement = Some(loaded);
+    Ok(Some(AudioTrackContentRemovalDocument {
+        id: original.id.clone(),
+        bytes,
+    }))
+}
+
+fn removal_scene_actions(
+    candidate: &mut LoadedPlaybackProject,
+    project: &LoadedPlaybackProject,
+    source_scenes: &HashMap<&str, &[u8]>,
+    source_track_id: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<AudioTrackContentRemovalDocument>, AudioTrackContentRemovalSerializationError> {
+    let mut output = Vec::new();
+    for (index, scene) in project.scenes.iter().enumerate() {
+        if !scene.slots.iter().any(|slot| slot.track_id == source_track_id) {
+            continue;
+        }
+        let source = source_scenes
+            .get(scene.id.as_str())
+            .copied()
+            .ok_or(AudioTrackContentRemovalSerializationError::SourceSceneCoverage)?;
+        let (mut value, _) = removal_canonical_value(source)?;
+        if !removal_extensions_empty(&value)? {
+            return Err(AudioTrackContentRemovalSerializationError::UnknownExtensionSemantics);
+        }
+        let slots = value
+            .get_mut("slots")
+            .and_then(Value::as_array_mut)
+            .ok_or(AudioTrackContentRemovalSerializationError::InvalidDocumentShape)?;
+        let previous = slots.len();
+        slots.retain(|slot| slot.get("track_id").and_then(Value::as_str) != Some(source_track_id));
+        if slots.len() >= previous {
+            return Err(AudioTrackContentRemovalSerializationError::SourceSceneCoverage);
+        }
+        let bytes = serde_json_canonicalizer::to_vec(&value)
+            .map_err(AudioTrackContentRemovalSerializationError::Serialization)?;
+        candidate.scenes[index] = load_scene(
+            &bytes,
+            index,
+            candidate.project_id(),
+            limits.max_document_bytes,
+            limits.max_scene_slots,
+        )
+        .map_err(AudioTrackContentRemovalSerializationError::Source)?;
+        output.push(AudioTrackContentRemovalDocument {
+            id: scene.id.clone(),
+            bytes,
+        });
+    }
+    Ok(output)
+}
+
+fn removal_mixer(
+    candidate: &LoadedPlaybackProject,
+    source: &[u8],
+    loaded_source: &super::LoadedMixer,
+    source_track_id: &str,
+    assets: &[MediaAssetFact<'_>],
+    limits: LoaderLimits,
+) -> Result<AudioTrackContentRemovalDocument, AudioTrackContentRemovalSerializationError> {
+    let (mut value, _) = removal_canonical_value(source)?;
+    let channels = value
+        .get_mut("channels")
+        .and_then(Value::as_array_mut)
+        .ok_or(AudioTrackContentRemovalSerializationError::InvalidDocumentShape)?;
+    let source_index = channels
+        .iter()
+        .position(|channel| channel.get("track_id").and_then(Value::as_str) == Some(source_track_id))
+        .ok_or(AudioTrackContentRemovalSerializationError::SourceMixerMismatch)?;
+    if source_index >= loaded_source.channels.len()
+        || loaded_source.channels[source_index].track_id != source_track_id
+    {
+        return Err(AudioTrackContentRemovalSerializationError::SourceMixerMismatch);
+    }
+    channels.remove(source_index);
+    let bytes = serde_json_canonicalizer::to_vec(&value)
+        .map_err(AudioTrackContentRemovalSerializationError::Serialization)?;
+    candidate
+        .load_mixer(&bytes, assets, limits)
+        .map_err(AudioTrackContentRemovalSerializationError::Source)?;
+    Ok(AudioTrackContentRemovalDocument {
+        id: loaded_source.id.clone(),
+        bytes,
+    })
+}
+
+#[allow(clippy::too_many_arguments, reason = "the helper keeps complete automation coverage and the removed target domain together")]
+fn removal_automation_lanes(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source: &[(&str, &[u8])],
+    loaded_source: &super::LoadedAutomationSet,
+    source_track_id: &str,
+    source_send_ids: &BTreeSet<&str>,
+    mixer: &super::LoadedMixer,
+    limits: LoaderLimits,
+) -> Result<Vec<AudioTrackContentRemovalDocument>, AudioTrackContentRemovalSerializationError> {
+    let mut output = Vec::new();
+    let mut candidate_documents: Vec<Vec<u8>> = Vec::new();
+    candidate_documents
+        .try_reserve_exact(source.len())
+        .map_err(|_| AudioTrackContentRemovalSerializationError::Source(capacity_error()))?;
+    for ((take_id, source_bytes), loaded_take) in source.iter().zip(loaded_source.takes()) {
+        if loaded_take.id() != *take_id {
+            return Err(AudioTrackContentRemovalSerializationError::SourceAutomationCoverage);
+        }
+        let (mut value, _) = removal_canonical_value(source_bytes)?;
+        let extensions_empty = removal_extensions_empty(&value)?;
+        let lanes = value
+            .get_mut("lanes")
+            .and_then(Value::as_array_mut)
+            .ok_or(AudioTrackContentRemovalSerializationError::InvalidDocumentShape)?;
+        let mut removed = false;
+        let mut retained = Vec::new();
+        retained
+            .try_reserve_exact(lanes.len())
+            .map_err(|_| AudioTrackContentRemovalSerializationError::Source(capacity_error()))?;
+        for lane in lanes.iter() {
+            let target = lane
+                .get("target")
+                .and_then(Value::as_object)
+                .ok_or(AudioTrackContentRemovalSerializationError::InvalidDocumentShape)?;
+            let remove = match target.get("kind").and_then(Value::as_str) {
+                Some("mixer-channel") => {
+                    target.get("track_id").and_then(Value::as_str) == Some(source_track_id)
+                }
+                Some("mixer-send") => target
+                    .get("send_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| source_send_ids.contains(id)),
+                Some("mixer-main") | Some("mixer-cue") => false,
+                Some(_) | None => {
+                    return Err(AudioTrackContentRemovalSerializationError::InvalidDocumentShape);
+                }
+            };
+            removed |= remove;
+            if !remove {
+                retained.push(lane.clone());
+            }
+        }
+        if !removed {
+            candidate_documents.push((*source_bytes).to_vec());
+            continue;
+        }
+        if !extensions_empty {
+            return Err(AudioTrackContentRemovalSerializationError::UnknownExtensionSemantics);
+        }
+        *lanes = retained;
+        let bytes = serde_json_canonicalizer::to_vec(&value)
+            .map_err(AudioTrackContentRemovalSerializationError::Serialization)?;
+        candidate_documents.push(bytes.clone());
+        output.push(AudioTrackContentRemovalDocument {
+            id: (*take_id).to_owned(),
+            bytes,
+        });
+    }
+    let candidate_refs: Vec<&[u8]> = candidate_documents.iter().map(Vec::as_slice).collect();
+    let automation = project
+        .load_automation_takes(mixer, assets, &candidate_refs, limits)
+        .map_err(AudioTrackContentRemovalSerializationError::Source)?;
+    let graph = mixer
+        .compile_main_graph()
+        .map_err(AudioTrackContentRemovalSerializationError::MixerCompilation)?;
+    project
+        .compile_main_automation(&graph, &automation)
+        .map_err(AudioTrackContentRemovalSerializationError::AutomationCompilation)?;
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1469,6 +2245,197 @@ mod tests {
         .unwrap();
         let copied: Value = serde_json::from_slice(documents.track().bytes()).unwrap();
         assert_eq!(copied["order"], 1);
+    }
+
+    #[test]
+    fn removes_the_complete_audio_track_identity_graph_and_keeps_immutable_media() {
+        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) = fixture();
+        let tracks = [track.as_slice(), return_track.as_slice()];
+        let clips = [clip.as_slice()];
+        let scenes = [scene.as_slice()];
+        let project = crate::load(
+            crate::PlaybackJsonInput {
+                project_id: PROJECT_ID,
+                sample_rate_hz: 48_000,
+                timeline: &timeline,
+                tracks: &tracks,
+                clips: &clips,
+                scenes: &scenes,
+                arrangement: Some(&arrangement),
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let assets = [MediaAssetFact {
+            id: ASSET_ID,
+            sample_rate_hz: 48_000,
+            frame_count: 24_000,
+        }];
+        let documents = serialize_audio_track_content_removal(
+            &project,
+            &assets,
+            AudioTrackContentRemovalSource {
+                track: &track,
+                clips: &[(CLIP_ID, clip.as_slice())],
+                scenes: &[(SCENE_ID, scene.as_slice())],
+                arrangement: Some(&arrangement),
+                mixer: &mixer,
+                automation_take_ids: &[TAKE_ID],
+                automation_takes: &[(TAKE_ID, take.as_slice())],
+                device_chain_id: Some("018f47a2-6b2d-7c11-8a44-001122335017"),
+                device_chain: Some(&device_chain),
+            },
+            TRACK_ID,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        assert_eq!(documents.track().id(), TRACK_ID);
+        assert_eq!(documents.track().bytes(), track);
+        assert_eq!(documents.clips().len(), 1);
+        assert_eq!(documents.clips()[0].id(), CLIP_ID);
+        assert_eq!(documents.clips()[0].bytes(), clip);
+        assert_eq!(documents.device_chain().unwrap().bytes(), device_chain);
+        assert_eq!(documents.scenes().len(), 1);
+        assert_eq!(documents.automation_takes().len(), 1);
+
+        let remaining_tracks = [return_track.as_slice()];
+        let remaining_scenes = [documents.scenes()[0].bytes()];
+        let reduced = crate::load(
+            crate::PlaybackJsonInput {
+                project_id: PROJECT_ID,
+                sample_rate_hz: 48_000,
+                timeline: &timeline,
+                tracks: &remaining_tracks,
+                clips: &[],
+                scenes: &remaining_scenes,
+                arrangement: documents.arrangement().map(AudioTrackContentRemovalDocument::bytes),
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let reduced_mixer = reduced
+            .load_mixer(documents.mixer().bytes(), &assets, LoaderLimits::VERSION_1)
+            .unwrap();
+        let automation = reduced
+            .load_automation_takes(
+                &reduced_mixer,
+                &assets,
+                &[documents.automation_takes()[0].bytes()],
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap();
+        reduced
+            .compile_main_automation(&reduced_mixer.compile_main_graph().unwrap(), &automation)
+            .unwrap();
+        assert_eq!(reduced.track_count(), 1);
+        assert_eq!(reduced.clip_count(), 0);
+        let scene_value: Value = serde_json::from_slice(documents.scenes()[0].bytes()).unwrap();
+        assert_eq!(scene_value["slots"], serde_json::json!([]));
+        let arrangement_value: Value =
+            serde_json::from_slice(documents.arrangement().unwrap().bytes()).unwrap();
+        assert_eq!(arrangement_value["placements"], serde_json::json!([]));
+        let automation_value: Value =
+            serde_json::from_slice(documents.automation_takes()[0].bytes()).unwrap();
+        assert_eq!(automation_value["lanes"].as_array().unwrap().len(), 1);
+        assert_eq!(automation_value["lanes"][0]["id"], MAIN_LANE_ID);
+        assert_eq!(assets[0].id, ASSET_ID);
+    }
+
+    #[test]
+    fn track_content_removal_refuses_incomplete_owned_document_authority() {
+        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) = fixture();
+        let tracks = [track.as_slice(), return_track.as_slice()];
+        let clips = [clip.as_slice()];
+        let scenes = [scene.as_slice()];
+        let project = crate::load(
+            crate::PlaybackJsonInput {
+                project_id: PROJECT_ID,
+                sample_rate_hz: 48_000,
+                timeline: &timeline,
+                tracks: &tracks,
+                clips: &clips,
+                scenes: &scenes,
+                arrangement: Some(&arrangement),
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let assets = [MediaAssetFact {
+            id: ASSET_ID,
+            sample_rate_hz: 48_000,
+            frame_count: 24_000,
+        }];
+        let source = AudioTrackContentRemovalSource {
+            track: &track,
+            clips: &[],
+            scenes: &[(SCENE_ID, scene.as_slice())],
+            arrangement: Some(&arrangement),
+            mixer: &mixer,
+            automation_take_ids: &[TAKE_ID],
+            automation_takes: &[(TAKE_ID, take.as_slice())],
+            device_chain_id: Some("018f47a2-6b2d-7c11-8a44-001122335017"),
+            device_chain: Some(&device_chain),
+        };
+        assert!(matches!(
+            serialize_audio_track_content_removal(
+                &project,
+                &assets,
+                source,
+                TRACK_ID,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioTrackContentRemovalSerializationError::SourceClipCoverage)
+        ));
+    }
+
+    #[test]
+    fn track_content_removal_refuses_unknown_owned_track_extensions() {
+        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) = fixture();
+        let mut extended_track: Value = serde_json::from_slice(&track).unwrap();
+        extended_track["extensions"] = serde_json::json!({"org.example.owned-state": {"opaque": true}});
+        let extended_track = canonical(extended_track);
+        let tracks = [extended_track.as_slice(), return_track.as_slice()];
+        let clips = [clip.as_slice()];
+        let scenes = [scene.as_slice()];
+        let project = crate::load(
+            crate::PlaybackJsonInput {
+                project_id: PROJECT_ID,
+                sample_rate_hz: 48_000,
+                timeline: &timeline,
+                tracks: &tracks,
+                clips: &clips,
+                scenes: &scenes,
+                arrangement: Some(&arrangement),
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let assets = [MediaAssetFact {
+            id: ASSET_ID,
+            sample_rate_hz: 48_000,
+            frame_count: 24_000,
+        }];
+        assert!(matches!(
+            serialize_audio_track_content_removal(
+                &project,
+                &assets,
+                AudioTrackContentRemovalSource {
+                    track: &extended_track,
+                    clips: &[(CLIP_ID, clip.as_slice())],
+                    scenes: &[(SCENE_ID, scene.as_slice())],
+                    arrangement: Some(&arrangement),
+                    mixer: &mixer,
+                    automation_take_ids: &[TAKE_ID],
+                    automation_takes: &[(TAKE_ID, take.as_slice())],
+                    device_chain_id: Some("018f47a2-6b2d-7c11-8a44-001122335017"),
+                    device_chain: Some(&device_chain),
+                },
+                TRACK_ID,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioTrackContentRemovalSerializationError::UnknownExtensionSemantics)
+        ));
     }
 
     #[test]

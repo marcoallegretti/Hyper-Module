@@ -13,9 +13,11 @@ pub use automation::{
     LoadedAutomationSet, serialize_automation_take_activation, serialize_automation_take_addition,
 };
 pub use duplication::{
+    AudioTrackContentRemovalDocument, AudioTrackContentRemovalDocuments,
+    AudioTrackContentRemovalSerializationError, AudioTrackContentRemovalSource,
     AudioTrackDuplicationDocument, AudioTrackDuplicationDocuments,
     AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
-    serialize_audio_track_duplication,
+    serialize_audio_track_content_removal, serialize_audio_track_duplication,
 };
 
 use core::error::Error;
