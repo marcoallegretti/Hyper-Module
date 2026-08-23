@@ -90,7 +90,7 @@ impl AudioTrackContentRemovalPublicationRecovery {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PublicationPhase { Transaction, ResourceMoved(usize), Resource(usize), Manifest }
+enum PublicationPhase { Transaction, ResourceMoved(usize), Resource(usize), Directory(usize), Manifest }
 
 #[derive(Debug)]
 struct Entry<'a> {
@@ -384,7 +384,7 @@ fn run_publication(
         }
         observer(PublicationPhase::Resource(index), verified.root())?;
     }
-    for directory in &tx.removed_directories {
+    for (index, directory) in tx.removed_directories.iter().enumerate() {
         verified.root_dir.remove_dir(directory).map_err(|error| {
             caused(
                 ProjectResourcePublicationErrorKind::ProjectChanged,
@@ -393,6 +393,7 @@ fn run_publication(
             )
         })?;
         sync_dir(&verified.root_dir)?;
+        observer(PublicationPhase::Directory(index), verified.root())?;
     }
     let candidate = verify_project_candidate(verified.root(), &verified.root_dir, candidate_project).map_err(|error| caused(ProjectResourcePublicationErrorKind::Integrity, "track-content removal candidate does not verify", error))?;
     if candidate.revision() != next_revision { return Err(failure(ProjectResourcePublicationErrorKind::Integrity, "track-content removal candidate revision changed")); }
@@ -1175,6 +1176,86 @@ mod tests {
         assert_eq!(package.read_resource(DEVICE_CHAIN_ID).unwrap(), fs::read(fixture.root.join("devices/lead.json")).unwrap());
         assert_eq!(package.read_resource(MIXER_ID).unwrap(), previous_mixer);
         assert_eq!(fs::read(fixture.root.join("assets/recordings/retained.wav")).unwrap(), vec![0x3C; 64]);
+    }
+
+    #[test]
+    fn complete_track_graph_recovery_covers_every_resource_move_and_directory_removal() {
+        let probe = Fixture::new();
+        let (_, documents) = probe.complete_documents();
+        let resource_count = 2
+            + documents.clips().len()
+            + documents.scenes().len()
+            + documents.automation_takes().len()
+            + usize::from(documents.arrangement().is_some())
+            + usize::from(documents.device_chain().is_some());
+        let mut phases = vec![PublicationPhase::Transaction];
+        for index in 0..resource_count {
+            phases.push(PublicationPhase::ResourceMoved(index));
+            phases.push(PublicationPhase::Resource(index));
+        }
+        for index in 0..3 {
+            phases.push(PublicationPhase::Directory(index));
+        }
+        phases.push(PublicationPhase::Manifest);
+
+        for phase in phases {
+            let fixture = Fixture::new();
+            let (identity, documents) = fixture.complete_documents();
+            let before_track = fs::read(fixture.root.join("tracks/lead.json")).unwrap();
+            let before_clip = fs::read(fixture.root.join("clips/lead.json")).unwrap();
+            let before_device = fs::read(fixture.root.join("devices/lead.json")).unwrap();
+            let before_mixer = fs::read(fixture.root.join("mixer/main.json")).unwrap();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = publish_observed(
+                    &fixture.root,
+                    AudioTrackContentRemovalPublicationRequest {
+                        expected_project_sha256: identity,
+                        documents: &documents,
+                    },
+                    |current, _| {
+                        assert_ne!(current, phase, "simulate process termination");
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+
+            let report = recover_project_transactions(&fixture.root).unwrap();
+            let expected = if phase == PublicationPhase::Manifest {
+                AudioTrackContentRemovalPublicationRecoveryDisposition::Committed
+            } else {
+                AudioTrackContentRemovalPublicationRecoveryDisposition::RolledBack
+            };
+            assert_eq!(
+                report.audio_track_content_removals()[0].disposition(),
+                expected,
+            );
+            let package = verify_project_package(&fixture.root).unwrap();
+            if expected == AudioTrackContentRemovalPublicationRecoveryDisposition::Committed {
+                for id in [TRACK_ID, CLIP_ID, DEVICE_CHAIN_ID] {
+                    assert!(package.manifest().resources().iter().all(|resource| resource.id() != id));
+                }
+                for path in ["tracks", "clips", "devices"] {
+                    assert!(!fixture.root.join(path).exists());
+                }
+            } else {
+                assert_eq!(*package.manifest_sha256(), identity);
+                assert_eq!(fs::read(fixture.root.join("tracks/lead.json")).unwrap(), before_track);
+                assert_eq!(fs::read(fixture.root.join("clips/lead.json")).unwrap(), before_clip);
+                assert_eq!(fs::read(fixture.root.join("devices/lead.json")).unwrap(), before_device);
+                assert_eq!(fs::read(fixture.root.join("mixer/main.json")).unwrap(), before_mixer);
+            }
+            assert_eq!(
+                fs::read(fixture.root.join("assets/recordings/retained.wav")).unwrap(),
+                vec![0x3C; 64],
+            );
+            assert!(fs::read_dir(fixture.root.join("backups"))
+                .map_or(true, |entries| entries.flatten().all(|entry| {
+                    !entry.file_name().to_string_lossy().starts_with(
+                        AUDIO_TRACK_CONTENT_REMOVAL_TRANSACTION_PREFIX,
+                    )
+                })));
+        }
     }
 
     #[test]
