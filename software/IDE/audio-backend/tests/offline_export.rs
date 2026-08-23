@@ -3,7 +3,7 @@ use hyper_audio_engine::StereoOutput;
 use hyper_audio_source::DecodedAudio;
 use hyper_desktop_audio::{
     OfflineExportError, OfflineExportSpec, export_project_wav, render_project_offline,
-    render_project_offline_with_mixer,
+    render_project_offline_with_mixer, render_project_track_stems_with_mixer,
 };
 use hyper_media_cache::CacheLimits;
 use hyper_mixer_runtime::{RoutedMainRuntime, RoutedTransportRuntime, TransportCommand};
@@ -185,6 +185,24 @@ fn offline_export_matches_the_playback_runtime_sample_for_sample() {
         left.iter().zip(right.iter()).any(|(l, r)| (l - r).abs() > f32::EPSILON),
         "the panned fixture distinguishes the two channels"
     );
+}
+
+#[test]
+fn track_stems_are_aligned_direct_channel_renders() {
+    let session = session(Some(ARRANGEMENT), vec![AUTOMATION.to_vec()]);
+    let main = render_project_offline(&session, OfflineExportSpec { block_frames: 32 }).unwrap();
+    let stems =
+        render_project_track_stems_with_mixer(&session, OfflineExportSpec { block_frames: 32 }, None)
+            .unwrap();
+
+    assert_eq!(stems.len(), 1);
+    let stem = &stems[0];
+    assert_eq!(stem.track_id, "018f47a2-6b2d-7c11-8a44-001122337502");
+    assert_eq!(stem.track_name, "Audio");
+    assert_eq!(stem.audio.sample_rate_hz(), main.sample_rate_hz());
+    assert_eq!(stem.audio.frame_count(), main.frame_count());
+    assert_eq!(stem.audio.plane(0), main.plane(0));
+    assert_eq!(stem.audio.plane(1), main.plane(1));
 }
 
 #[test]

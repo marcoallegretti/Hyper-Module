@@ -152,6 +152,13 @@ impl Error for RuntimeCreationError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeProcessError {
     OutputLengthMismatch { left: usize, right: usize },
+    ChannelTapOutputLengthMismatch {
+        output_frames: usize,
+        left: usize,
+        right: usize,
+    },
+    ChannelTapUnavailable { channel_index: usize, channel_count: usize },
+    DuplicateChannelTap { channel_index: usize },
     BlockLimit { actual: usize, maximum: usize },
     FrameRangeOverflow,
     Scene(SceneRuntimeError),
@@ -172,6 +179,24 @@ impl fmt::Display for RuntimeProcessError {
                     formatter,
                     "runtime output lengths differ: left={left}, right={right}"
                 )
+            }
+            Self::ChannelTapOutputLengthMismatch {
+                output_frames,
+                left,
+                right,
+            } => write!(
+                formatter,
+                "runtime channel tap lengths differ from output: output={output_frames}, left={left}, right={right}"
+            ),
+            Self::ChannelTapUnavailable {
+                channel_index,
+                channel_count,
+            } => write!(
+                formatter,
+                "runtime channel tap {channel_index} is outside {channel_count} compiled channels"
+            ),
+            Self::DuplicateChannelTap { channel_index } => {
+                write!(formatter, "runtime channel tap {channel_index} was requested more than once")
             }
             Self::BlockLimit { actual, maximum } => write!(
                 formatter,
@@ -205,6 +230,9 @@ impl Error for RuntimeProcessError {
             Self::Parameter(source) => Some(source),
             Self::Scene(source) => Some(source),
             Self::OutputLengthMismatch { .. }
+            | Self::ChannelTapOutputLengthMismatch { .. }
+            | Self::ChannelTapUnavailable { .. }
+            | Self::DuplicateChannelTap { .. }
             | Self::BlockLimit { .. }
             | Self::FrameRangeOverflow
             | Self::AutomationValueMismatch => None,
@@ -2857,6 +2885,80 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
         scratch: &mut [RenderScratchSlot<'_>],
         output: StereoOutput<'_>,
     ) -> Result<RenderedWindow, RuntimeProcessError> {
+        self.process_window_with_channel_tap_sink(
+            arrangement_start_frame,
+            scratch,
+            output,
+            &[],
+            |_, _, _| {},
+        )
+    }
+
+    /// Renders the normal main output while copying one compiled audio channel
+    /// after its device and channel controls but before it reaches sends,
+    /// groups, returns, or the main processor.
+    ///
+    /// The tapped channel follows its own automation, mute, fader, and pan.
+    /// The copied planes intentionally exclude the master gain/mute and every
+    /// contribution that is not the selected channel's direct output.
+    ///
+    /// # Errors
+    ///
+    /// Returns the usual processing error, or a classified refusal before any
+    /// rendering when the requested channel or output shape is invalid.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the caller transfers its temporary mutable output borrows to the callback-bound render window"
+    )]
+    pub fn process_window_with_channel_tap(
+        &mut self,
+        arrangement_start_frame: usize,
+        scratch: &mut [RenderScratchSlot<'_>],
+        output: StereoOutput<'_>,
+        channel_index: usize,
+        channel_output: StereoOutput<'_>,
+    ) -> Result<RenderedWindow, RuntimeProcessError> {
+        if output.left.len() == output.right.len()
+            && (channel_output.left.len() != output.left.len()
+                || channel_output.right.len() != output.left.len())
+        {
+            return Err(RuntimeProcessError::ChannelTapOutputLengthMismatch {
+                output_frames: output.left.len(),
+                left: channel_output.left.len(),
+                right: channel_output.right.len(),
+            });
+        }
+        self.process_window_with_channel_tap_sink(
+            arrangement_start_frame,
+            scratch,
+            output,
+            &[channel_index],
+            |_, left, right| {
+                channel_output.left[..left.len()].copy_from_slice(left);
+                channel_output.right[..right.len()].copy_from_slice(right);
+            },
+        )
+    }
+
+    /// Renders the normal main output while copying a distinct set of compiled
+    /// audio channels into caller-owned buffers at the direct-channel tap.
+    ///
+    /// Each selected channel follows its own automation, device, mute, fader,
+    /// and pan. Taps are taken before sends, groups, returns, and master
+    /// processing. The set must name each compiled channel at most once.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified refusal before rendering when a channel index or
+    /// duplicate selection is invalid.
+    pub fn process_window_with_channel_tap_sink(
+        &mut self,
+        arrangement_start_frame: usize,
+        scratch: &mut [RenderScratchSlot<'_>],
+        output: StereoOutput<'_>,
+        channel_indices: &[usize],
+        mut channel_tap: impl FnMut(usize, &[f32], &[f32]),
+    ) -> Result<RenderedWindow, RuntimeProcessError> {
         let frame_count = output.left.len();
         if frame_count != output.right.len() {
             return Err(RuntimeProcessError::OutputLengthMismatch {
@@ -2869,6 +2971,19 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                 actual: frame_count,
                 maximum: self.max_block_frames,
             });
+        }
+        for (tap_index, &channel_index) in channel_indices.iter().enumerate() {
+            if channel_index >= self.slots.len() {
+                return Err(RuntimeProcessError::ChannelTapUnavailable {
+                    channel_index,
+                    channel_count: self.slots.len(),
+                });
+            }
+            if channel_indices[..tap_index].contains(&channel_index) {
+                return Err(RuntimeProcessError::DuplicateChannelTap {
+                    channel_index,
+                });
+            }
         }
         let rendered =
             self.renderer
@@ -2891,6 +3006,13 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
                 self.process_devices(slot_index, frame_count, scratch)?;
                 self.process_sends(slot_index, CompiledMixerTap::PreFader, frame_count, scratch)?;
                 self.process_channel(slot_index, frame_count, scratch)?;
+                if channel_indices.contains(&slot_index) {
+                    channel_tap(
+                        slot_index,
+                        &self.channel_output.left[..frame_count],
+                        &self.channel_output.right[..frame_count],
+                    );
+                }
                 self.route_channel_output(slot_index, frame_count);
                 self.process_sends(
                     slot_index,

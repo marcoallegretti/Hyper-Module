@@ -202,6 +202,155 @@ fn render_with_device_chain(chain: Option<&DeviceChain>) -> ([f32; 64], [f32; 64
 }
 
 #[test]
+fn prepared_playback_channel_tap_captures_post_fader_audio_before_main_processing() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let mut runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 64)
+            .unwrap();
+    let mut arrangement_left = [9.0_f32; 64];
+    let mut arrangement_right = [9.0_f32; 64];
+    let mut scene_left = [9.0_f32; 64];
+    let mut scene_right = [9.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut main_left = [9.0_f32; 64];
+    let mut main_right = [9.0_f32; 64];
+    let mut tap_left = [9.0_f32; 64];
+    let mut tap_right = [9.0_f32; 64];
+    let mut scene_tap_left = [9.0_f32; 64];
+    let mut scene_tap_right = [9.0_f32; 64];
+
+    runtime
+        .process_window_with_channel_tap_sink(
+            0,
+            &mut scratch,
+            StereoOutput {
+                left: &mut main_left,
+                right: &mut main_right,
+            },
+            &[0, 1],
+            |channel_index, left, right| match channel_index {
+                0 => {
+                    tap_left.copy_from_slice(left);
+                    tap_right.copy_from_slice(right);
+                }
+                1 => {
+                    scene_tap_left.copy_from_slice(left);
+                    scene_tap_right.copy_from_slice(right);
+                }
+                _ => unreachable!("the runtime prevalidated the requested taps"),
+            },
+        )
+        .unwrap();
+
+    assert_samples(&tap_left, &fixture.arrangement_samples[..64]);
+    assert_constant(&tap_right, 0.0);
+    assert_constant(&scene_tap_left, 0.0);
+    assert!(scene_tap_right.iter().any(|sample| sample.abs() > f32::EPSILON));
+    assert!(main_right.iter().any(|sample| sample.abs() > f32::EPSILON));
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one refusal test proves every channel-tap preflight leaves the render boundary untouched"
+)]
+fn channel_tap_refusals_leave_renderer_and_output_untouched() {
+    let fixture = playback_fixture();
+    let graph = fixture.compile_playback();
+    let prepared = fixture.cache.prepare_playback(&graph).unwrap();
+    let mut runtime =
+        PreparedPlaybackMainRuntime::try_new_prepared_playback(&prepared, &fixture.mixer, 64)
+            .unwrap();
+    let mut arrangement_left = [7.0_f32; 64];
+    let mut arrangement_right = [7.0_f32; 64];
+    let mut scene_left = [7.0_f32; 64];
+    let mut scene_right = [7.0_f32; 64];
+    let mut scratch = [
+        RenderScratchSlot::new(&mut arrangement_left, &mut arrangement_right),
+        RenderScratchSlot::new(&mut scene_left, &mut scene_right),
+    ];
+    let mut main_left = [8.0_f32; 64];
+    let mut main_right = [8.0_f32; 64];
+    let mut tap_left = [9.0_f32; 64];
+    let mut tap_right = [9.0_f32; 63];
+
+    assert_eq!(
+        runtime.process_window_with_channel_tap(
+            0,
+            &mut scratch,
+            StereoOutput {
+                left: &mut main_left,
+                right: &mut main_right,
+            },
+            2,
+            StereoOutput {
+                left: &mut tap_left,
+                right: &mut tap_right,
+            },
+        ),
+        Err(RuntimeProcessError::ChannelTapOutputLengthMismatch {
+            output_frames: 64,
+            left: 64,
+            right: 63,
+        })
+    );
+    assert_eq!(scratch[0].left(), &[7.0; 64]);
+    assert_eq!(scratch[1].right(), &[7.0; 64]);
+    assert_constant(&main_left, 8.0);
+    assert_constant(&main_right, 8.0);
+    assert_constant(&tap_left, 9.0);
+    assert_constant(&tap_right, 9.0);
+
+    let mut valid_tap_right = [9.0_f32; 64];
+    assert_eq!(
+        runtime.process_window_with_channel_tap(
+            0,
+            &mut scratch,
+            StereoOutput {
+                left: &mut main_left,
+                right: &mut main_right,
+            },
+            2,
+            StereoOutput {
+                left: &mut tap_left,
+                right: &mut valid_tap_right,
+            },
+        ),
+        Err(RuntimeProcessError::ChannelTapUnavailable {
+            channel_index: 2,
+            channel_count: 2,
+        })
+    );
+    assert_eq!(scratch[0].left(), &[7.0; 64]);
+    assert_eq!(scratch[1].right(), &[7.0; 64]);
+    assert_constant(&main_left, 8.0);
+    assert_constant(&main_right, 8.0);
+    assert_constant(&tap_left, 9.0);
+    assert_constant(&valid_tap_right, 9.0);
+
+    assert_eq!(
+        runtime.process_window_with_channel_tap_sink(
+            0,
+            &mut scratch,
+            StereoOutput {
+                left: &mut main_left,
+                right: &mut main_right,
+            },
+            &[0, 0],
+            |_, _, _| unreachable!("duplicate taps must be refused before rendering"),
+        ),
+        Err(RuntimeProcessError::DuplicateChannelTap { channel_index: 0 })
+    );
+    assert_constant(&tap_left, 9.0);
+    assert_constant(&valid_tap_right, 9.0);
+}
+
+#[test]
 fn prepared_playback_runs_native_filter_before_the_mixer() {
     let baseline = render_with_device_chain(None);
     let bypassed_chain = native_filter_chain(false);

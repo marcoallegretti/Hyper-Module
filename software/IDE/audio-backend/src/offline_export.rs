@@ -24,7 +24,7 @@ use hyper_mixer_runtime::{
 use hyper_native_device::DeviceChain;
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
-use hyper_playback_json::{AdapterCompileError, CompiledMixerGraph};
+use hyper_playback_json::{AdapterCompileError, CompiledMixerGraph, CompiledMixerTrackKind};
 use hyper_playback_session::{PlaybackExtent, PreparedPlaybackSession};
 use hyper_project_loader::PreparedProjectPlayback;
 use hyper_recording_journal::{JournalConfig, JournalError, JournalWriter};
@@ -47,6 +47,18 @@ pub struct OfflineExportSpec {
     pub block_frames: usize,
 }
 
+/// One aligned direct audio-track render from a verified project.
+///
+/// `audio` includes the track's device chain, automation, mute, fader, and
+/// pan. It deliberately excludes sends, groups, returns, and master
+/// processing, so every stem is independently usable while remaining aligned
+/// to the project extent.
+pub struct OfflineTrackStem {
+    pub track_id: String,
+    pub track_name: String,
+    pub audio: DecodedAudio,
+}
+
 #[derive(Debug)]
 pub enum OfflineExportError {
     UnboundedExtent,
@@ -62,6 +74,8 @@ pub enum OfflineExportError {
     TruePeak(StereoTruePeakError),
     Loudness(StereoLoudnessError),
     MixerLayoutMismatch,
+    StemTrackMetadataUnavailable { channel_index: usize },
+    NoAudioTrackStems,
     Destination(std::io::Error),
     FlacEncoding(String),
     FlacVerification,
@@ -92,6 +106,13 @@ impl fmt::Display for OfflineExportError {
             Self::MixerLayoutMismatch => {
                 formatter.write_str("the live mixer does not match the prepared mixer graph")
             }
+            Self::StemTrackMetadataUnavailable { channel_index } => write!(
+                formatter,
+                "compiled audio channel {channel_index} has no verified track metadata"
+            ),
+            Self::NoAudioTrackStems => {
+                formatter.write_str("this project has no audio tracks to export as stems")
+            }
             Self::Destination(source) => {
                 write!(formatter, "the export destination is unusable: {source}")
             }
@@ -121,6 +142,8 @@ impl Error for OfflineExportError {
             | Self::InvalidBlockFrames
             | Self::CapacityUnavailable
             | Self::MixerLayoutMismatch
+            | Self::StemTrackMetadataUnavailable { .. }
+            | Self::NoAudioTrackStems
             | Self::FlacEncoding(_)
             | Self::FlacVerification
             | Self::FlacMinimumFrames => None,
@@ -205,9 +228,7 @@ fn render_project_offline_with_devices(
 
     let (project, prepared_mixer, automation, media) = session.parts();
     let mixer = live_mixer.unwrap_or(prepared_mixer);
-    if mixer.slots().len() != prepared_mixer.slots().len()
-        || mixer.project_id() != prepared_mixer.project_id()
-    {
+    if !same_mixer_layout(prepared_mixer, mixer) {
         return Err(OfflineExportError::MixerLayoutMismatch);
     }
     let facts: Vec<_> = media.media_asset_facts().collect();
@@ -282,6 +303,212 @@ fn render_project_offline_with_devices(
 
     DecodedAudio::from_stereo(session.sample_rate_hz(), left, right)
         .map_err(OfflineExportError::Output)
+}
+
+/// Renders every compiled audio track as an aligned direct stem.
+///
+/// This uses one routed render pass per block and captures every selected
+/// channel after its device and channel controls. Consequently stateful native
+/// devices and automation advance exactly once, identically for all stems.
+///
+/// # Errors
+///
+/// Returns the usual offline-render refusal, including a layout mismatch when
+/// the supplied live mixer cannot describe the prepared project's channels.
+pub fn render_project_track_stems_with_mixer(
+    session: &PreparedPlaybackSession,
+    spec: OfflineExportSpec,
+    live_mixer: Option<&CompiledMixerGraph>,
+) -> Result<Vec<OfflineTrackStem>, OfflineExportError> {
+    render_project_track_stems_with_devices(session, &[], spec, live_mixer)
+}
+
+/// Renders every compiled audio track of a structurally verified project as an
+/// aligned direct stem, including its verified native device chains.
+///
+/// # Errors
+///
+/// Returns the same classified rejections as
+/// [`render_project_track_stems_with_mixer`].
+pub fn render_prepared_project_track_stems_with_mixer(
+    project: &PreparedProjectPlayback,
+    spec: OfflineExportSpec,
+    live_mixer: Option<&CompiledMixerGraph>,
+) -> Result<Vec<OfflineTrackStem>, OfflineExportError> {
+    render_project_track_stems_with_devices(
+        project.session(),
+        project.device_chains(),
+        spec,
+        live_mixer,
+    )
+}
+
+struct StemRenderBuffer {
+    channel_index: usize,
+    track_id: String,
+    track_name: String,
+    left: Vec<f32>,
+    right: Vec<f32>,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one pass retains the required shared renderer/device state for every aligned stem"
+)]
+fn render_project_track_stems_with_devices(
+    session: &PreparedPlaybackSession,
+    device_chains: &[DeviceChain],
+    spec: OfflineExportSpec,
+    live_mixer: Option<&CompiledMixerGraph>,
+) -> Result<Vec<OfflineTrackStem>, OfflineExportError> {
+    let PlaybackExtent::Bounded { end_frame } = session.extent() else {
+        return Err(OfflineExportError::UnboundedExtent);
+    };
+    if end_frame == 0 {
+        return Err(OfflineExportError::EmptyExtent);
+    }
+    if spec.block_frames == 0 || spec.block_frames > hyper_audio_engine::MAX_PROCESS_FRAMES {
+        return Err(OfflineExportError::InvalidBlockFrames);
+    }
+    let block_frames = spec.block_frames.min(end_frame);
+
+    let (project, prepared_mixer, automation, media) = session.parts();
+    let mixer = live_mixer.unwrap_or(prepared_mixer);
+    if !same_mixer_layout(prepared_mixer, mixer) {
+        return Err(OfflineExportError::MixerLayoutMismatch);
+    }
+    let mut stems = select_stem_buffers(session, mixer, end_frame)?;
+    let facts: Vec<_> = media.media_asset_facts().collect();
+    let graph = project
+        .compile_playback(&facts, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(OfflineExportError::Playback)?;
+    let prepared = media
+        .prepare_playback(&graph)
+        .map_err(OfflineExportError::Media)?;
+    let mut runtime = match automation {
+        Some(automation) => RoutedMainRuntime::try_new_prepared_playback_automated_with_devices(
+            &prepared,
+            mixer,
+            automation.clone(),
+            device_chains,
+            block_frames,
+        ),
+        None => RoutedMainRuntime::try_new_prepared_playback_with_devices(
+            &prepared,
+            mixer,
+            device_chains,
+            block_frames,
+        ),
+    }
+    .map_err(OfflineExportError::Runtime)?;
+
+    let slot_count = mixer.slots().len();
+    let mut scratch_left = allocate_planes(slot_count, block_frames)?;
+    let mut scratch_right = allocate_planes(slot_count, block_frames)?;
+    let mut scratch = Vec::new();
+    scratch
+        .try_reserve_exact(slot_count)
+        .map_err(|_| OfflineExportError::CapacityUnavailable)?;
+    scratch.extend(
+        scratch_left
+            .iter_mut()
+            .zip(&mut scratch_right)
+            .map(|(left, right)| RenderScratchSlot::new(left, right)),
+    );
+    let mut main_left = allocate_silence(block_frames)?;
+    let mut main_right = allocate_silence(block_frames)?;
+    let mut channel_indices = Vec::new();
+    channel_indices
+        .try_reserve_exact(stems.len())
+        .map_err(|_| OfflineExportError::CapacityUnavailable)?;
+    channel_indices.extend(stems.iter().map(|stem| stem.channel_index));
+
+    let mut rendered = 0_usize;
+    while rendered < end_frame {
+        let frames = block_frames.min(end_frame - rendered);
+        let block_end = rendered
+            .checked_add(frames)
+            .ok_or(OfflineExportError::CapacityUnavailable)?;
+        runtime
+            .process_window_with_channel_tap_sink(
+                rendered,
+                &mut scratch,
+                StereoOutput {
+                    left: &mut main_left[..frames],
+                    right: &mut main_right[..frames],
+                },
+                &channel_indices,
+                |channel_index, left, right| {
+                    let stem = stems
+                        .iter_mut()
+                        .find(|stem| stem.channel_index == channel_index)
+                        .expect("the runtime emits only the prevalidated selected channels");
+                    stem.left[rendered..block_end].copy_from_slice(left);
+                    stem.right[rendered..block_end].copy_from_slice(right);
+                },
+            )
+            .map_err(OfflineExportError::Process)?;
+        rendered = block_end;
+    }
+
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(stems.len())
+        .map_err(|_| OfflineExportError::CapacityUnavailable)?;
+    for stem in stems {
+        output.push(OfflineTrackStem {
+            track_id: stem.track_id,
+            track_name: stem.track_name,
+            audio: DecodedAudio::from_stereo(session.sample_rate_hz(), stem.left, stem.right)
+                .map_err(OfflineExportError::Output)?,
+        });
+    }
+    Ok(output)
+}
+
+fn same_mixer_layout(
+    prepared: &CompiledMixerGraph,
+    candidate: &CompiledMixerGraph,
+) -> bool {
+    prepared.project_id() == candidate.project_id()
+        && prepared.slots().len() == candidate.slots().len()
+        && prepared
+            .slots()
+            .iter()
+            .zip(candidate.slots())
+            .all(|(prepared, candidate)| {
+                prepared.track_id() == candidate.track_id() && prepared.kind() == candidate.kind()
+            })
+}
+
+fn select_stem_buffers(
+    session: &PreparedPlaybackSession,
+    mixer: &CompiledMixerGraph,
+    end_frame: usize,
+) -> Result<Vec<StemRenderBuffer>, OfflineExportError> {
+    let mut stems = Vec::new();
+    stems
+        .try_reserve_exact(mixer.slots().len())
+        .map_err(|_| OfflineExportError::CapacityUnavailable)?;
+    for (channel_index, slot) in mixer.slots().iter().enumerate() {
+        if slot.kind() != CompiledMixerTrackKind::Audio {
+            continue;
+        }
+        let track_name = session
+            .mixer_channel_name_at(channel_index)
+            .ok_or(OfflineExportError::StemTrackMetadataUnavailable { channel_index })?;
+        stems.push(StemRenderBuffer {
+            channel_index,
+            track_id: slot.track_id().to_owned(),
+            track_name: track_name.to_owned(),
+            left: allocate_silence(end_frame)?,
+            right: allocate_silence(end_frame)?,
+        });
+    }
+    if stems.is_empty() {
+        return Err(OfflineExportError::NoAudioTrackStems);
+    }
+    Ok(stems)
 }
 
 fn allocate_planes(
