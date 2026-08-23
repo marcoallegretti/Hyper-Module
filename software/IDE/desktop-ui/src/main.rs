@@ -2089,6 +2089,16 @@ fn bind_scene_callbacks(ui: &MainWindow, worker: &WorkerCell, project_state: &Pr
 }
 
 fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
+    bind_audio_track_add_callback(ui, worker);
+    bind_audio_track_duplication_callback(ui, worker);
+    bind_audio_track_rename_callback(ui, worker);
+    bind_audio_track_reorder_callback(ui, worker);
+    bind_audio_track_activation_callback(ui, worker);
+    bind_audio_track_removal_callback(ui, worker);
+    bind_audio_track_content_removal_callback(ui, worker);
+}
+
+fn bind_audio_track_add_callback(ui: &MainWindow, worker: &WorkerCell) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_track = Rc::clone(worker);
@@ -2113,7 +2123,10 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
             },
         );
     });
+}
 
+fn bind_audio_track_duplication_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_duplication = Rc::clone(worker);
     actions.on_duplicate_audio_track(move |index, name| {
@@ -2131,7 +2144,10 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
             Err(reason) => ui.set_error_text(reason.message().into()),
         }
     });
+}
 
+fn bind_audio_track_rename_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_rename = Rc::clone(worker);
     actions.on_rename_audio_track(move |index, name| {
@@ -2166,7 +2182,10 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
             },
         );
     });
+}
 
+fn bind_audio_track_reorder_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_reorder = Rc::clone(worker);
     actions.on_reorder_audio_track(move |index, earlier| {
@@ -2183,7 +2202,10 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
             Err(reason) => ui.set_error_text(reason.message().into()),
         }
     });
+}
 
+fn bind_audio_track_activation_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_activation = Rc::clone(worker);
     actions.on_set_audio_track_active(move |index, active| {
@@ -2209,9 +2231,6 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
             },
         );
     });
-
-    bind_audio_track_removal_callback(ui, worker);
-    bind_audio_track_content_removal_callback(ui, worker);
 }
 
 fn bind_audio_track_removal_callback(ui: &MainWindow, worker: &WorkerCell) {
@@ -7662,10 +7681,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::DuplicateAudioTrack if current == AppMode::DuplicatingTrack => {
             AppMode::Running
         }
-        IdeWorkerCommandKind::RemoveAudioTrack if current == AppMode::RemovingTrack => {
-            AppMode::Running
-        }
-        IdeWorkerCommandKind::RemoveAudioTrackContent if current == AppMode::RemovingTrack => {
+        IdeWorkerCommandKind::RemoveAudioTrack | IdeWorkerCommandKind::RemoveAudioTrackContent
+            if current == AppMode::RemovingTrack =>
+        {
             AppMode::Running
         }
         IdeWorkerCommandKind::RenameAudioTrack if current == AppMode::RenamingTrack => {
@@ -10512,6 +10530,28 @@ mod tests {
     use i_slint_backend_testing::ElementHandle;
     use slint::platform::{Key, PointerEventButton, WindowEvent};
 
+    fn audio_track_mixer_row(index: i32, track_id: &str) -> MixerChannelRow {
+        MixerChannelRow {
+            index,
+            track_id: track_id.into(),
+            name: "Audio channel".into(),
+            display_name: "Audio".into(),
+            kind: "AUDIO".into(),
+            state_available: true,
+            gain_percent: 100.0,
+            pan_percent: 0.0,
+            muted: false,
+            solo: false,
+            solo_available: true,
+            renameable: true,
+            removable: true,
+            can_move_earlier: index > 0,
+            can_move_later: true,
+            active: true,
+            activation_toggleable: true,
+        }
+    }
+
     fn dispatch_ide_shortcut(ui: &MainWindow, text: &str, shift: bool, repeated: bool) {
         dispatch_ide_shortcut_with_modifiers(ui, text, shift, false, false, repeated);
     }
@@ -12979,29 +13019,11 @@ mod tests {
     }
 
     #[test]
-    fn mixer_controls_require_current_observed_rows_and_bounded_values() {
-        let row = |index, track_id: &str| MixerChannelRow {
-            index,
-            track_id: track_id.into(),
-            name: "Audio channel".into(),
-            display_name: "Audio".into(),
-            kind: "AUDIO".into(),
-            state_available: true,
-            gain_percent: 100.0,
-            pan_percent: 0.0,
-            muted: false,
-            solo: false,
-            solo_available: true,
-            renameable: true,
-            removable: true,
-            can_move_earlier: index > 0,
-            can_move_later: true,
-            active: true,
-            activation_toggleable: true,
-        };
+    fn mixer_channel_validation_requires_current_observed_rows() {
         let track_a = "018f47a2-6b2d-7c11-8a44-001122334456";
-        let track_b = "018f47a2-6b2d-7c11-8a44-001122334457";
-        let channels = ModelRc::from(Rc::new(VecModel::from(vec![row(0, track_a)])));
+        let channels = ModelRc::from(Rc::new(VecModel::from(vec![audio_track_mixer_row(
+            0, track_a,
+        )])));
         assert!(validate_mixer_channel(AppMode::Running, 0, &channels).is_ok());
         assert_eq!(
             validate_mixer_channel(AppMode::Closed, 0, &channels).unwrap_err(),
@@ -13015,9 +13037,15 @@ mod tests {
             validate_mixer_channel(AppMode::Running, -1, &channels).unwrap_err(),
             MixerControlFailure::InvalidSelection
         );
+    }
+
+    #[test]
+    fn audio_track_commands_require_authoritative_rows() {
+        let track_a = "018f47a2-6b2d-7c11-8a44-001122334456";
+        let track_b = "018f47a2-6b2d-7c11-8a44-001122334457";
         let reordered = ModelRc::from(Rc::new(VecModel::from(vec![
-            row(0, track_b),
-            row(1, track_a),
+            audio_track_mixer_row(0, track_b),
+            audio_track_mixer_row(1, track_a),
         ])));
         assert!(matches!(
             audio_track_reorder_command(AppMode::Running, 1, true, &reordered),
@@ -13076,6 +13104,16 @@ mod tests {
             ),
             AppMode::Running
         );
+    }
+
+    #[test]
+    fn audio_track_removal_requires_authoritative_rows() {
+        let track_a = "018f47a2-6b2d-7c11-8a44-001122334456";
+        let track_b = "018f47a2-6b2d-7c11-8a44-001122334457";
+        let reordered = ModelRc::from(Rc::new(VecModel::from(vec![
+            audio_track_mixer_row(0, track_b),
+            audio_track_mixer_row(1, track_a),
+        ])));
         assert_eq!(
             validate_audio_track_removal(AppMode::Running, track_a, &reordered).unwrap(),
             track_a
@@ -13097,7 +13135,7 @@ mod tests {
             validate_audio_track_content_removal(AppMode::Closed, track_a, &reordered),
             Err(MixerControlFailure::StateUnavailable)
         );
-        let mut non_audio = row(0, track_a);
+        let mut non_audio = audio_track_mixer_row(0, track_a);
         non_audio.activation_toggleable = false;
         let non_audio = ModelRc::from(Rc::new(VecModel::from(vec![non_audio])));
         assert_eq!(
@@ -13118,6 +13156,10 @@ mod tests {
             ),
             AppMode::Running
         );
+    }
+
+    #[test]
+    fn mixer_value_domains_reject_invalid_values() {
         assert_eq!(gain_percent_to_millionths(0.0), Ok(0));
         assert_eq!(gain_percent_to_millionths(125.5), Ok(1_255_000));
         assert_eq!(gain_percent_to_millionths(200.0), Ok(2_000_000));
