@@ -2586,6 +2586,7 @@ dependencies = [
  "hound",
  "hyper-audio-source",
  "hyper-control-mappings",
+ "hyper-fs-authority",
  "hyper-native-device",
  "hyper-project-model",
  "hyper-recording-metadata",

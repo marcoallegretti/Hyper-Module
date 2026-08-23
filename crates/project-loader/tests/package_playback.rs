@@ -18,8 +18,9 @@ use hyper_project_loader::{
 };
 use hyper_project_model::ResourceRole;
 use hyper_storage_engine::{
-    AudioTrackPublicationRequest, ProjectCreationRequest, ProjectResourcePublicationRequest,
-    create_project, publish_audio_track, publish_project_resource, verify_project_package,
+    AudioTrackPublicationRequest, ProjectCopyRequest, ProjectCreationRequest,
+    ProjectResourcePublicationRequest, copy_project, create_project, publish_audio_track,
+    publish_project_resource, verify_project_package,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -422,6 +423,50 @@ fn newly_created_project_prepares_as_an_empty_recordable_session() {
 
     drop(prepared);
     drop(creation);
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn copied_project_prepares_as_an_independent_recordable_session() {
+    let parent = std::env::temp_dir().join(format!(
+        "hyper-project-copy-loader-{}-{}",
+        std::process::id(),
+        NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&parent).unwrap();
+    let creation = create_project(
+        &parent,
+        ProjectCreationRequest {
+            directory_name: "Source Session",
+            project_name: "Source Session",
+        },
+    )
+    .unwrap();
+    let source_path = creation.project().root().to_owned();
+    drop(creation);
+    let copied = copy_project(ProjectCopyRequest {
+        source: &source_path,
+        destination_parent: &parent,
+        directory_name: "Independent Session",
+        project_name: "Independent Session",
+    })
+    .unwrap();
+    let prepared = prepare_project_playback(copied.project().root(), limits()).unwrap();
+
+    assert_ne!(
+        copied.source_project_id(),
+        prepared.package().manifest().project_id()
+    );
+    assert_eq!(prepared.package().manifest().name(), "Independent Session");
+    assert_eq!(prepared.package().manifest().revision(), 1);
+    let (project, _, _, _) = prepared.session().parts();
+    assert_eq!(project.track_count(), 1);
+    assert_eq!(project.track_name_at(0), Some("Audio 1"));
+    assert_eq!(prepared.session().media_asset_count(), 0);
+    prepared.package().confirm_unchanged().unwrap();
+
+    drop(prepared);
+    drop(copied);
     fs::remove_dir_all(parent).unwrap();
 }
 

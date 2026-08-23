@@ -3,6 +3,7 @@
 
 mod mapping_publication;
 mod project_creation;
+mod project_copy;
 mod project_lock;
 mod project_recovery;
 mod recording_import;
@@ -19,6 +20,9 @@ pub use mapping_publication::{
 pub use project_creation::{
     ProjectCreationError, ProjectCreationErrorKind, ProjectCreationOutcome, ProjectCreationRequest,
     create_project,
+};
+pub use project_copy::{
+    ProjectCopyError, ProjectCopyErrorKind, ProjectCopyOutcome, ProjectCopyRequest, copy_project,
 };
 pub use project_recovery::{
     ProjectTransactionRecoveryError, ProjectTransactionRecoveryErrorSource,
