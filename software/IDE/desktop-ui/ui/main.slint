@@ -323,6 +323,7 @@ export global IdeActions {
     callback preview-mute();
     callback close-project();
     callback confirm-close-project();
+    callback cancel-close-project();
 }
 
 component Panel inherits Rectangle {
@@ -1189,7 +1190,7 @@ export component MainWindow inherits Window {
                             Button {
                                 text: "Keep editing";
                                 enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing;
-                                clicked => { root.close-unsaved-mixer-confirming = false; }
+                                clicked => { IdeActions.cancel-close-project(); }
                             }
                             Button {
                                 text: "Discard live mixer changes";

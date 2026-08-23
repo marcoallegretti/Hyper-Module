@@ -1218,6 +1218,7 @@ fn bind_project_close_callback_with(ui: &MainWindow, submitter: UiCommandSubmitt
         close_submitter(&ui, IdeWorkerCommand::CloseProject);
     });
     let weak = ui.as_weak();
+    let cancel_submitter = Rc::clone(&submitter);
     actions.on_confirm_close_project(move || {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -1227,8 +1228,19 @@ fn bind_project_close_callback_with(ui: &MainWindow, submitter: UiCommandSubmitt
         {
             return;
         }
-        ui.set_close_unsaved_mixer_confirming(false);
         submitter(&ui, IdeWorkerCommand::DiscardCloseProject);
+    });
+    let weak = ui.as_weak();
+    actions.on_cancel_close_project(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if !matches!(ui.get_app_mode(), AppMode::Running | AppMode::Previewing)
+            || !ui.get_close_unsaved_mixer_confirming()
+        {
+            return;
+        }
+        cancel_submitter(&ui, IdeWorkerCommand::CancelCloseProject);
     });
 }
 
@@ -4243,6 +4255,9 @@ fn apply_event(
         IdeWorkerEvent::CloseDiscardRequired => {
             apply_close_discard_required(ui);
         }
+        IdeWorkerEvent::CloseDiscardCancelled => {
+            apply_close_discard_cancelled(ui);
+        }
         IdeWorkerEvent::MonitoringApplied(_) => {
             ui.set_status_text("Input cue control applied".into());
             ui.set_error_text(SharedString::default());
@@ -4564,6 +4579,12 @@ fn apply_event(
 fn apply_close_discard_required(ui: &MainWindow) {
     ui.set_close_unsaved_mixer_confirming(true);
     ui.set_status_text("Live mixer changes need a save or explicit discard before closing".into());
+    ui.set_error_text(SharedString::default());
+}
+
+fn apply_close_discard_cancelled(ui: &MainWindow) {
+    ui.set_close_unsaved_mixer_confirming(false);
+    ui.set_status_text("Project close canceled; live mixer changes remain active".into());
     ui.set_error_text(SharedString::default());
 }
 
@@ -10464,11 +10485,31 @@ mod tests {
             matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::CloseProject]),
             "repeating the ordinary close action cannot silently confirm discard"
         );
+        ui.global::<IdeActions>().invoke_cancel_close_project();
+        assert!(
+            matches!(
+                submitted.borrow().as_slice(),
+                [IdeWorkerCommand::CloseProject, IdeWorkerCommand::CancelCloseProject]
+            ),
+            "keeping the project open must cancel the worker-owned discard authorization"
+        );
+        apply_close_discard_cancelled(ui);
+        assert!(
+            !ui.get_close_unsaved_mixer_confirming(),
+            "only the worker cancellation outcome may withdraw the discard confirmation"
+        );
+        ui.global::<IdeActions>().invoke_close_project();
+        apply_close_discard_required(ui);
         ui.global::<IdeActions>().invoke_confirm_close_project();
         assert!(
             matches!(
                 submitted.borrow().as_slice(),
-                [IdeWorkerCommand::CloseProject, IdeWorkerCommand::DiscardCloseProject]
+                [
+                    IdeWorkerCommand::CloseProject,
+                    IdeWorkerCommand::CancelCloseProject,
+                    IdeWorkerCommand::CloseProject,
+                    IdeWorkerCommand::DiscardCloseProject
+                ]
             ),
             "only the explicit discard confirmation may send close"
         );

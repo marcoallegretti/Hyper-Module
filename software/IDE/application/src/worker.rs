@@ -422,6 +422,7 @@ pub enum IdeWorkerCommand {
     Observe,
     CloseProject,
     DiscardCloseProject,
+    CancelCloseProject,
     Shutdown,
 }
 
@@ -524,6 +525,7 @@ impl IdeWorkerCommand {
             Self::Observe => IdeWorkerCommandKind::Observe,
             Self::CloseProject => IdeWorkerCommandKind::CloseProject,
             Self::DiscardCloseProject => IdeWorkerCommandKind::CloseProject,
+            Self::CancelCloseProject => IdeWorkerCommandKind::CloseProject,
             Self::Shutdown => IdeWorkerCommandKind::Shutdown,
         }
     }
@@ -1683,6 +1685,7 @@ pub enum IdeWorkerCommandFailure {
     Mixer(IdeMixerCommandError),
     Monitoring(IdeMonitoringCommandError),
     ProjectSave(IdeProjectSaveError),
+    ProjectClose(IdeProjectCloseError),
     RuntimePreparation(Box<IdeRuntimePreparationError>),
     AudioTrackAddition(Box<super::IdeAudioTrackAdditionError>),
     AudioTrackRemoval(Box<super::IdeAudioTrackRemovalError>),
@@ -1745,6 +1748,50 @@ pub enum IdeWorkerCommandFailure {
     ProjectSnapshotUnavailable,
 }
 
+/// A close request was refused before the project owner was released.
+#[derive(Debug)]
+pub enum IdeProjectCloseError {
+    MixerFenceSequenceUnavailable,
+    MixerCommit(super::DesktopDirectControlError),
+    MixerCommitTimeout,
+    MixerCheckpointUnavailable,
+    DiscardNotAuthorized,
+}
+
+impl fmt::Display for IdeProjectCloseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MixerFenceSequenceUnavailable => {
+                formatter.write_str("the audio runtime did not provide a mixer close fence")
+            }
+            Self::MixerCommit(source) => {
+                write!(formatter, "the audio runtime could not queue the mixer close fence: {source}")
+            }
+            Self::MixerCommitTimeout => {
+                formatter.write_str("the audio runtime did not commit the mixer close fence in time")
+            }
+            Self::MixerCheckpointUnavailable => {
+                formatter.write_str("the committed mixer checkpoint cannot authorize project close")
+            }
+            Self::DiscardNotAuthorized => {
+                formatter.write_str("explicit mixer discard was not authorized by a close decision")
+            }
+        }
+    }
+}
+
+impl Error for IdeProjectCloseError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerCommit(source) => Some(source),
+            Self::MixerFenceSequenceUnavailable
+            | Self::MixerCommitTimeout
+            | Self::MixerCheckpointUnavailable
+            | Self::DiscardNotAuthorized => None,
+        }
+    }
+}
+
 impl fmt::Display for IdeWorkerCommandFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1770,6 +1817,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::Mixer(source) => source.fmt(formatter),
             Self::Monitoring(source) => source.fmt(formatter),
             Self::ProjectSave(source) => source.fmt(formatter),
+            Self::ProjectClose(source) => source.fmt(formatter),
             Self::RuntimePreparation(source) => source.fmt(formatter),
             Self::AudioTrackAddition(source) => source.fmt(formatter),
             Self::AudioTrackRemoval(source) => source.fmt(formatter),
@@ -1860,6 +1908,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::Mixer(source) => Some(source),
             Self::Monitoring(source) => Some(source),
             Self::ProjectSave(source) => Some(source),
+            Self::ProjectClose(source) => Some(source),
             Self::RuntimePreparation(source) => Some(source.as_ref()),
             Self::AudioTrackAddition(source) => Some(source),
             Self::AudioTrackRemoval(source) => Some(source),
@@ -1982,6 +2031,7 @@ pub enum IdeWorkerEvent {
     LoudnessQueued(IdeLoudnessCommand),
     MixerQueued(IdeMixerCommand),
     CloseDiscardRequired,
+    CloseDiscardCancelled,
     MonitoringApplied(IdeMonitoringCommand),
     ProjectSaved {
         revision: u64,
@@ -2723,6 +2773,7 @@ enum WorkerState {
         sequence: u64,
         deadline: Instant,
     },
+    AwaitingCloseDiscard(RunningDesktopIdeApplication),
     RecordingClosing {
         pending: DesktopIdePendingSaveClose,
         target: IdeRecordingTarget,
@@ -3389,6 +3440,7 @@ fn run_worker(
             WorkerState::SaveFence { .. }
                 | WorkerState::RecordingFence { .. }
                 | WorkerState::AudioPreviewFence { .. }
+                | WorkerState::CloseFence { .. }
                 | WorkerState::RecordingClosing { .. }
                 | WorkerState::OutputTestStopping { .. }
                 | WorkerState::Closing(_)
@@ -3696,12 +3748,17 @@ fn process_command(
             state,
             events,
         ),
-        IdeWorkerCommand::DiscardCloseProject => close_project(
+        IdeWorkerCommand::DiscardCloseProject => discard_project_close(
             state,
             events,
             unpublished_native_failure,
             IdeWorkerCommandKind::CloseProject,
             history,
+        ),
+        IdeWorkerCommand::CancelCloseProject => cancel_project_close(
+            state,
+            events,
+            unpublished_native_failure,
         ),
         IdeWorkerCommand::Shutdown => unreachable!("shutdown is handled by the worker loop"),
     }
@@ -5026,6 +5083,47 @@ fn close_project(
     }
 }
 
+fn discard_project_close(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+    command: IdeWorkerCommandKind,
+    history: &mut UndoHistory,
+) -> bool {
+    if !matches!(state, WorkerState::AwaitingCloseDiscard(_)) {
+        return publish_failure(
+            events,
+            command,
+            IdeWorkerCommandFailure::ProjectClose(IdeProjectCloseError::DiscardNotAuthorized),
+        );
+    }
+    let WorkerState::AwaitingCloseDiscard(application) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("the close-discard state was checked before ownership transfer");
+    };
+    *state = WorkerState::Running(application);
+    close_project(state, events, unpublished_native_failure, command, history)
+}
+
+fn cancel_project_close(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
+) -> bool {
+    if !matches!(state, WorkerState::AwaitingCloseDiscard(_)) {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::CloseProject,
+            IdeWorkerCommandFailure::ProjectClose(IdeProjectCloseError::DiscardNotAuthorized),
+        );
+    }
+    let WorkerState::AwaitingCloseDiscard(application) = std::mem::replace(state, WorkerState::Empty) else {
+        unreachable!("the close-discard state was checked before ownership transfer");
+    };
+    *state = WorkerState::Running(application);
+    publish_state(state, events, unpublished_native_failure)
+        && send_event(events, IdeWorkerEvent::CloseDiscardCancelled)
+}
+
 fn request_project_close(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) -> bool {
     let WorkerState::Running(application) = state else {
         return publish_failure(
@@ -5040,14 +5138,16 @@ fn request_project_close(state: &mut WorkerState, events: &SyncSender<IdeWorkerE
             return publish_failure(
                 events,
                 IdeWorkerCommandKind::CloseProject,
-                IdeWorkerCommandFailure::InvalidState,
+                IdeWorkerCommandFailure::ProjectClose(
+                    IdeProjectCloseError::MixerFenceSequenceUnavailable,
+                ),
             );
         }
         Err(reason) => {
             return publish_failure(
                 events,
                 IdeWorkerCommandKind::CloseProject,
-                IdeWorkerCommandFailure::Mixer(IdeMixerCommandError::Send(reason)),
+                IdeWorkerCommandFailure::ProjectClose(IdeProjectCloseError::MixerCommit(reason)),
             );
         }
     };
@@ -11388,7 +11488,7 @@ fn poll_pending_state(
             if application.committed_mixer_fence() >= sequence {
                 match application.mixer_close_requires_discard() {
                     Some(true) => {
-                        *state = WorkerState::Running(application);
+                        *state = WorkerState::AwaitingCloseDiscard(application);
                         let mut no_native_failure = None;
                         publish_state(state, events, &mut no_native_failure)
                             && send_event(events, IdeWorkerEvent::CloseDiscardRequired)
@@ -11408,7 +11508,9 @@ fn poll_pending_state(
                         publish_failure(
                             events,
                             IdeWorkerCommandKind::CloseProject,
-                            IdeWorkerCommandFailure::InvalidState,
+                            IdeWorkerCommandFailure::ProjectClose(
+                                IdeProjectCloseError::MixerCheckpointUnavailable,
+                            ),
                         )
                     }
                 }
@@ -11417,7 +11519,7 @@ fn poll_pending_state(
                 publish_failure(
                     events,
                     IdeWorkerCommandKind::CloseProject,
-                    IdeWorkerCommandFailure::InvalidState,
+                    IdeWorkerCommandFailure::ProjectClose(IdeProjectCloseError::MixerCommitTimeout),
                 )
             } else {
                 *state = WorkerState::CloseFence {
@@ -11540,7 +11642,15 @@ fn publish_state(
                 return publish_failure(events, IdeWorkerCommandKind::Observe, reason);
             }
         },
-        WorkerState::Closing(_) | WorkerState::CloseFence { .. } => IdeWorkerEvent::Closing,
+        WorkerState::Closing(_) => IdeWorkerEvent::Closing,
+        WorkerState::CloseFence { application, .. }
+        | WorkerState::AwaitingCloseDiscard(application) => match running_observation(application) {
+            Ok(observation) => IdeWorkerEvent::Running(observation),
+            Err(reason) => {
+                let delivered = publish_failure(events, IdeWorkerCommandKind::Observe, reason);
+                return delivered && unpublished_native_failure.is_none();
+            }
+        },
         WorkerState::SaveFence { operation, .. } | WorkerState::Saving { operation, .. } => {
             operation.pending_event()
         }
@@ -11983,6 +12093,10 @@ fn shutdown_state(
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
             },
             WorkerState::CloseFence { application, .. } => match application.close() {
+                IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
+                IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
+            },
+            WorkerState::AwaitingCloseDiscard(application) => match application.close() {
                 IdeCloseOutcome::Closed { failure, .. } => return (failure, None),
                 IdeCloseOutcome::Pending(pending) => WorkerState::Closing(pending),
             },
@@ -16920,7 +17034,111 @@ mod tests {
             Ok(IdeWorkerEvent::CloseDiscardRequired)
         ));
         assert_eq!(history.undo.len(), 1);
+        assert!(matches!(state, WorkerState::AwaitingCloseDiscard(_)));
+    }
+
+    #[test]
+    fn discard_close_requires_a_fenced_worker_authorization() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        let (events, receiver) = std::sync::mpsc::sync_channel(4);
+        let mut state = WorkerState::Running(running);
+        let mut history = UndoHistory::default();
+        let mut native = None;
+        history.record_edit(labelled("scene", "scene rename"));
+        while receiver.try_recv().is_ok() {}
+
+        assert!(process_command(
+            &mut state,
+            IdeWorkerCommand::DiscardCloseProject,
+            &events,
+            &mut native,
+            &mut history,
+            None,
+        ));
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::CloseProject,
+                reason: IdeWorkerCommandFailure::ProjectClose(
+                    IdeProjectCloseError::DiscardNotAuthorized,
+                ),
+            })
+        ));
+        assert_eq!(history.undo.len(), 1);
         assert!(matches!(state, WorkerState::Running(_)));
+    }
+
+    #[test]
+    fn close_fence_timeout_returns_to_running_with_a_typed_failure() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        let (events, receiver) = std::sync::mpsc::sync_channel(4);
+        let mut state = WorkerState::CloseFence {
+            application: running,
+            sequence: 1,
+            deadline: Instant::now(),
+        };
+        let mut history = UndoHistory::default();
+        let mut native = None;
+
+        assert!(poll_pending_state(
+            &mut state,
+            &events,
+            &mut native,
+            &mut history,
+        ));
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::CloseProject,
+                reason: IdeWorkerCommandFailure::ProjectClose(
+                    IdeProjectCloseError::MixerCommitTimeout,
+                ),
+            })
+        ));
+        assert!(matches!(state, WorkerState::Running(_)));
+    }
+
+    #[test]
+    fn close_fence_times_out_without_a_ui_observation_wake_up() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 4).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker.try_send(IdeWorkerCommand::CloseProject).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::CloseProject,
+                reason: IdeWorkerCommandFailure::ProjectClose(
+                    IdeProjectCloseError::MixerCommitTimeout,
+                ),
+            }
+        ));
+        worker
+            .try_send(IdeWorkerCommand::Transport(TransportCommand::Stop))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::TransportQueued(TransportCommand::Stop)
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
     }
 
     /// The rule the previous hand-maintained list broke: adding, duplicating,
