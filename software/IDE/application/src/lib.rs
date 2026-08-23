@@ -24,7 +24,9 @@ pub use hyper_control_mappings::{
     MainParameter as IdeControlMainParameter, SceneAction,
     SendParameter as IdeControlSendParameter, TransportAction, TriggerBehavior,
 };
-pub use hyper_desktop_audio::OfflineExportReport;
+pub use hyper_desktop_audio::{
+    OfflineExportReport, OfflineTrackStemExportFormat, OfflineTrackStemExportReport,
+};
 use hyper_desktop_audio::{
     CaptureStreamSnapshot, DesktopAudioPreviewCommandError, DesktopAudioPreviewControlError,
     DesktopAudioPreviewSnapshot, DesktopDirectControlError, DesktopInputConfig,
@@ -38,6 +40,7 @@ use hyper_desktop_audio::{
     OutputStreamState, PendingNativeShutdown, PendingNativeShutdownWait, StreamState,
     discover_desktop_input_targets, discover_desktop_output_targets,
     export_prepared_project_flac_with_mixer, export_prepared_project_wav_with_mixer,
+    export_prepared_project_track_stems_with_mixer,
 };
 pub use hyper_desktop_audio::{
     DesktopAudioPreviewState, DesktopSceneAvailability as IdeSceneAvailability,
@@ -4875,6 +4878,21 @@ impl Error for IdeProjectExportError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Export(source) => Some(source.as_ref()),
+            Self::ProjectSnapshotUnavailable
+            | Self::DestinationUnavailable
+            | Self::LiveMixerUnavailable => None,
+        }
+    }
+}
+
+impl IdeProjectExportError {
+    /// Returns the complete stem-export outcome only when the destination was
+    /// activated but its final directory durability barrier reported a
+    /// warning.
+    #[must_use]
+    pub fn committed_track_stem_report(&self) -> Option<&OfflineTrackStemExportReport> {
+        match self {
+            Self::Export(source) => source.committed_track_stem_report(),
             Self::ProjectSnapshotUnavailable
             | Self::DestinationUnavailable
             | Self::LiveMixerUnavailable => None,
@@ -10136,6 +10154,45 @@ impl RunningDesktopIdeApplication {
         }
         .map_err(|source| IdeProjectExportError::Export(Box::new(source)))?;
         Ok(report)
+    }
+
+    /// Renders every audio track to one newly activated directory of aligned
+    /// WAV or FLAC stems.
+    ///
+    /// This shares the live mixer snapshot used by a full-mix export, but it
+    /// does not alter project state or take a project-mutation fence: the
+    /// verified renderer reads the prepared project and writes only to the
+    /// separately selected destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified rejection when no verified project is open, the
+    /// audible mixer cannot be compiled, or rendering/publication fails.
+    pub fn export_project_track_stems(
+        &self,
+        destination_directory: &Path,
+        format: IdeProjectExportFormat,
+        block_frames: usize,
+    ) -> Result<OfflineTrackStemExportReport, IdeProjectExportError> {
+        let prepared = match &self.session {
+            IdePlaybackSessionOwner::Native(session) => session.prepared_project(),
+            #[cfg(test)]
+            IdePlaybackSessionOwner::Test(_) => None,
+        }
+        .ok_or(IdeProjectExportError::ProjectSnapshotUnavailable)?;
+        let live_mixer = self.live_compiled_mixer(prepared)?;
+        let format = match format {
+            IdeProjectExportFormat::Wav => OfflineTrackStemExportFormat::Wav,
+            IdeProjectExportFormat::Flac => OfflineTrackStemExportFormat::Flac,
+        };
+        export_prepared_project_track_stems_with_mixer(
+            prepared,
+            OfflineExportSpec { block_frames },
+            live_mixer.as_ref(),
+            format,
+            destination_directory,
+        )
+        .map_err(|source| IdeProjectExportError::Export(Box::new(source)))
     }
 
     /// Compiles the graph the audio thread is actually rendering with.

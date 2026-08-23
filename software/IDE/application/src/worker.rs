@@ -199,6 +199,7 @@ pub enum IdeWorkerCommandKind {
     EditNativeFilter,
     EditControlMapping,
     ExportProject,
+    ExportTrackStems,
     Undo,
     Redo,
     StartRecording,
@@ -421,6 +422,11 @@ pub enum IdeWorkerCommand {
         format: IdeProjectExportFormat,
         block_frames: usize,
     },
+    ExportTrackStems {
+        destination_directory: std::path::PathBuf,
+        format: IdeProjectExportFormat,
+        block_frames: usize,
+    },
     Undo,
     Redo,
     DuplicateScene {
@@ -552,6 +558,7 @@ impl IdeWorkerCommand {
             Self::EditNativeFilter { .. } => IdeWorkerCommandKind::EditNativeFilter,
             Self::EditControlMapping { .. } => IdeWorkerCommandKind::EditControlMapping,
             Self::ExportProject { .. } => IdeWorkerCommandKind::ExportProject,
+            Self::ExportTrackStems { .. } => IdeWorkerCommandKind::ExportTrackStems,
             Self::Undo => IdeWorkerCommandKind::Undo,
             Self::Redo => IdeWorkerCommandKind::Redo,
             Self::DuplicateScene { .. } => IdeWorkerCommandKind::DuplicateScene,
@@ -2485,6 +2492,14 @@ pub enum IdeWorkerEvent {
     ProjectExported {
         report: hyper_desktop_audio::OfflineExportReport,
     },
+    ProjectStemExporting,
+    ProjectStemsExported {
+        report: hyper_desktop_audio::OfflineTrackStemExportReport,
+    },
+    ProjectStemsExportedWithWarning {
+        report: hyper_desktop_audio::OfflineTrackStemExportReport,
+        warning: Box<IdeProjectExportError>,
+    },
     UndoStateChanged {
         undo_label: Option<&'static str>,
         redo_label: Option<&'static str>,
@@ -3668,6 +3683,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::CleanUnusedSamples
         | IdeWorkerCommandKind::EditControlMapping
         | IdeWorkerCommandKind::ExportProject
+        | IdeWorkerCommandKind::ExportTrackStems
         | IdeWorkerCommandKind::Undo
         | IdeWorkerCommandKind::Redo
         | IdeWorkerCommandKind::StartRecording
@@ -4020,6 +4036,17 @@ fn process_command(
             format,
             block_frames,
         } => export_project(state, events, &destination_path, format, block_frames),
+        IdeWorkerCommand::ExportTrackStems {
+            destination_directory,
+            format,
+            block_frames,
+        } => export_track_stems(
+            state,
+            events,
+            &destination_directory,
+            format,
+            block_frames,
+        ),
         IdeWorkerCommand::Observe => publish_state(state, events, unpublished_native_failure),
         IdeWorkerCommand::CloseProject => request_project_close(
             state,
@@ -6560,6 +6587,47 @@ fn export_project(
             IdeWorkerCommandKind::ExportProject,
             IdeWorkerCommandFailure::ProjectExport(Box::new(reason)),
         ),
+    }
+}
+
+fn export_track_stems(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    destination_directory: &std::path::Path,
+    format: IdeProjectExportFormat,
+    block_frames: usize,
+) -> bool {
+    let WorkerState::Running(running) = state else {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::ExportTrackStems,
+            IdeWorkerCommandFailure::ProjectExport(Box::new(
+                IdeProjectExportError::ProjectSnapshotUnavailable,
+            )),
+        );
+    };
+    if !send_event(events, IdeWorkerEvent::ProjectStemExporting) {
+        return false;
+    }
+    match running.export_project_track_stems(destination_directory, format, block_frames) {
+        Ok(report) => send_event(events, IdeWorkerEvent::ProjectStemsExported { report }),
+        Err(reason) => {
+            if let Some(report) = reason.committed_track_stem_report().cloned() {
+                send_event(
+                    events,
+                    IdeWorkerEvent::ProjectStemsExportedWithWarning {
+                        report,
+                        warning: Box::new(reason),
+                    },
+                )
+            } else {
+                publish_failure(
+                    events,
+                    IdeWorkerCommandKind::ExportTrackStems,
+                    IdeWorkerCommandFailure::ProjectExport(Box::new(reason)),
+                )
+            }
+        }
     }
 }
 
@@ -16036,6 +16104,36 @@ mod tests {
             "unexpected FLAC export result: {flac_export:?}"
         );
 
+        let stem_directory = fixture.join("aligned-stems");
+        worker
+            .try_send(IdeWorkerCommand::ExportTrackStems {
+                destination_directory: stem_directory.clone(),
+                format: IdeProjectExportFormat::Wav,
+                block_frames: 64,
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectStemExporting));
+        let stem_export = recv(&worker);
+        let IdeWorkerEvent::ProjectStemsExported { report } = stem_export else {
+            panic!("unexpected stem export result: {stem_export:?}");
+        };
+        assert_eq!(report.frame_count, 500);
+        assert_eq!(report.files.len(), 1);
+        let stem_path = stem_directory.join(&report.files[0].file_name);
+        let stem = decode_bytes(
+            std::fs::read(stem_path).unwrap(),
+            AudioContainer::Wav,
+            48_000,
+            DecodeLimits::new(1_048_576, 1_024, 65_536).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stem.frame_count(), 500);
+        assert!(stem
+            .plane(0)
+            .unwrap()
+            .iter()
+            .any(|sample| sample.abs() > 0.0));
+
         let mismatched_path = fixture.join("must-remain.flac");
         std::fs::write(&mismatched_path, b"previous export").unwrap();
         worker
@@ -20195,6 +20293,21 @@ mod tests {
             recv(&worker),
             IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::ExportProject,
+                reason: IdeWorkerCommandFailure::ProjectExport(reason),
+            } if matches!(reason.as_ref(), IdeProjectExportError::ProjectSnapshotUnavailable)
+        ));
+        worker
+            .try_send(IdeWorkerCommand::ExportTrackStems {
+                destination_directory: std::path::PathBuf::from("stems"),
+                format: IdeProjectExportFormat::Wav,
+                block_frames: 1_024,
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectStemExporting));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ExportTrackStems,
                 reason: IdeWorkerCommandFailure::ProjectExport(reason),
             } if matches!(reason.as_ref(), IdeProjectExportError::ProjectSnapshotUnavailable)
         ));

@@ -6,12 +6,15 @@ use hyper_audio_engine::{
     StereoLoudnessError, StereoLoudnessMeter, StereoOutput, StereoTruePeakError,
     StereoTruePeakMeter,
 };
-use hyper_audio_source::{DecodeError, DecodedAudio};
+use hyper_audio_source::{
+    AudioContainer, DecodeError, DecodeLimits, DecodedAudio, decode_bytes, encode_float_wav,
+};
 use hyper_fs_authority::{
-    open_syncable_directory_ambient, sync_directory,
+    create_syncable_directory_at, open_syncable_directory_ambient, remove_directory_entry,
+    sync_directory,
 };
 #[cfg(target_os = "linux")]
-use hyper_fs_authority::publish_bytes_no_replace;
+use hyper_fs_authority::{publish_bytes_no_replace, rename_no_replace};
 #[cfg(windows)]
 use hyper_fs_authority::{identity, read_stable_file_snapshot, rename_no_replace};
 #[cfg(windows)]
@@ -59,6 +62,43 @@ pub struct OfflineTrackStem {
     pub audio: DecodedAudio,
 }
 
+/// One explicitly supported container for a complete aligned stem export.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OfflineTrackStemExportFormat {
+    Wav,
+    Flac,
+}
+
+impl OfflineTrackStemExportFormat {
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Wav => "wav",
+            Self::Flac => "flac",
+        }
+    }
+}
+
+/// One published file in an aligned stem export.
+///
+/// `file_name` is generated from the canonical track order plus a portable
+/// encoding of the verified track name. It is never derived as a raw path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineTrackStemExportFile {
+    pub ordinal: usize,
+    pub track_id: String,
+    pub track_name: String,
+    pub file_name: String,
+}
+
+/// The complete result of publishing an aligned stem set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineTrackStemExportReport {
+    pub frame_count: usize,
+    pub sample_rate_hz: u32,
+    pub format: OfflineTrackStemExportFormat,
+    pub files: Vec<OfflineTrackStemExportFile>,
+}
+
 #[derive(Debug)]
 pub enum OfflineExportError {
     UnboundedExtent,
@@ -77,6 +117,11 @@ pub enum OfflineExportError {
     StemTrackMetadataUnavailable { channel_index: usize },
     NoAudioTrackStems,
     Destination(std::io::Error),
+    StemDestination(std::io::Error),
+    StemPublicationCommittedWithWarning {
+        source: std::io::Error,
+        report: Box<OfflineTrackStemExportReport>,
+    },
     FlacEncoding(String),
     FlacVerification,
     FlacMinimumFrames,
@@ -116,6 +161,13 @@ impl fmt::Display for OfflineExportError {
             Self::Destination(source) => {
                 write!(formatter, "the export destination is unusable: {source}")
             }
+            Self::StemDestination(source) => {
+                write!(formatter, "the stem export destination is unusable: {source}")
+            }
+            Self::StemPublicationCommittedWithWarning { source, .. } => write!(
+                formatter,
+                "the complete stem export was published but its parent durability barrier failed: {source}"
+            ),
             Self::FlacEncoding(source) => write!(formatter, "FLAC encoding failed: {source}"),
             Self::FlacVerification => formatter.write_str("the staged FLAC did not decode to its exact PCM"),
             Self::FlacMinimumFrames => {
@@ -136,7 +188,9 @@ impl Error for OfflineExportError {
             Self::Journal(source) => Some(source),
             Self::TruePeak(source) => Some(source),
             Self::Loudness(source) => Some(source),
-            Self::Destination(source) => Some(source),
+            Self::Destination(source)
+            | Self::StemDestination(source)
+            | Self::StemPublicationCommittedWithWarning { source, .. } => Some(source),
             Self::UnboundedExtent
             | Self::EmptyExtent
             | Self::InvalidBlockFrames
@@ -147,6 +201,18 @@ impl Error for OfflineExportError {
             | Self::FlacEncoding(_)
             | Self::FlacVerification
             | Self::FlacMinimumFrames => None,
+        }
+    }
+}
+
+impl OfflineExportError {
+    /// Returns the activated stem-set report only when publication completed
+    /// but its final parent-directory durability barrier failed.
+    #[must_use]
+    pub fn committed_track_stem_report(&self) -> Option<&OfflineTrackStemExportReport> {
+        match self {
+            Self::StemPublicationCommittedWithWarning { report, .. } => Some(report),
+            _ => None,
         }
     }
 }
@@ -341,6 +407,295 @@ pub fn render_prepared_project_track_stems_with_mixer(
         spec,
         live_mixer,
     )
+}
+
+/// Renders every verified audio track and publishes the complete aligned set
+/// into one new destination directory.
+///
+/// The destination itself must be absent. Each file is encoded and verified
+/// inside a private stage, then the complete stage is synced and activated
+/// with one no-replace directory rename. Callers therefore observe either no
+/// destination or the whole ordered stem set, never a partially populated
+/// final directory.
+///
+/// # Errors
+///
+/// Returns the usual render and encoding rejections, a destination refusal
+/// when the final directory already exists or cannot be safely created, or a
+/// committed warning only after the complete directory was activated and its
+/// parent durability barrier failed.
+pub fn export_prepared_project_track_stems_with_mixer(
+    project: &PreparedProjectPlayback,
+    spec: OfflineExportSpec,
+    live_mixer: Option<&CompiledMixerGraph>,
+    format: OfflineTrackStemExportFormat,
+    destination_directory: &Path,
+) -> Result<OfflineTrackStemExportReport, OfflineExportError> {
+    let stems = render_prepared_project_track_stems_with_mixer(project, spec, live_mixer)?;
+    publish_rendered_track_stems(&stems, format, destination_directory)
+}
+
+fn publish_rendered_track_stems(
+    stems: &[OfflineTrackStem],
+    format: OfflineTrackStemExportFormat,
+    destination_directory: &Path,
+) -> Result<OfflineTrackStemExportReport, OfflineExportError> {
+    let files = describe_track_stem_files(stems, format)?;
+    let frame_count = stems
+        .first()
+        .ok_or(OfflineExportError::NoAudioTrackStems)?
+        .audio
+        .frame_count();
+    let sample_rate_hz = stems
+        .first()
+        .ok_or(OfflineExportError::NoAudioTrackStems)?
+        .audio
+        .sample_rate_hz();
+    if stems.iter().any(|stem| {
+        stem.audio.frame_count() != frame_count || stem.audio.sample_rate_hz() != sample_rate_hz
+    }) {
+        return Err(OfflineExportError::StemDestination(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "aligned stems do not share one sample rate and frame extent",
+        )));
+    }
+
+    let report = OfflineTrackStemExportReport {
+        frame_count,
+        sample_rate_hz,
+        format,
+        files,
+    };
+    publish_rendered_track_stem_files(stems, &report, destination_directory)?;
+    Ok(report)
+}
+
+fn describe_track_stem_files(
+    stems: &[OfflineTrackStem],
+    format: OfflineTrackStemExportFormat,
+) -> Result<Vec<OfflineTrackStemExportFile>, OfflineExportError> {
+    if stems.is_empty() {
+        return Err(OfflineExportError::NoAudioTrackStems);
+    }
+    let mut files = Vec::new();
+    files
+        .try_reserve_exact(stems.len())
+        .map_err(|_| OfflineExportError::CapacityUnavailable)?;
+    for (index, stem) in stems.iter().enumerate() {
+        let ordinal = index
+            .checked_add(1)
+            .ok_or(OfflineExportError::CapacityUnavailable)?;
+        files.push(OfflineTrackStemExportFile {
+            ordinal,
+            track_id: stem.track_id.clone(),
+            track_name: stem.track_name.clone(),
+            file_name: stem_file_name(ordinal, &stem.track_name, format)?,
+        });
+    }
+    Ok(files)
+}
+
+fn stem_file_name(
+    ordinal: usize,
+    track_name: &str,
+    format: OfflineTrackStemExportFormat,
+) -> Result<String, OfflineExportError> {
+    const MAX_PORTABLE_FILE_NAME_BYTES: usize = 200;
+    let prefix = format!("{ordinal:03}-");
+    let suffix = format!(".{}", format.extension());
+    let available = MAX_PORTABLE_FILE_NAME_BYTES
+        .checked_sub(prefix.len())
+        .and_then(|available| available.checked_sub(suffix.len()))
+        .ok_or(OfflineExportError::CapacityUnavailable)?;
+    let mut encoded_name = String::new();
+    for byte in track_name.bytes() {
+        let encoded = match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => {
+                char::from(byte).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        };
+        if encoded_name.len().saturating_add(encoded.len()) > available {
+            break;
+        }
+        encoded_name.push_str(&encoded);
+    }
+    if encoded_name.is_empty() {
+        encoded_name.push_str("track");
+    }
+    Ok(format!("{prefix}{encoded_name}{suffix}"))
+}
+
+fn encode_verified_wav(audio: &DecodedAudio) -> Result<Vec<u8>, OfflineExportError> {
+    let encoded = encode_float_wav(audio).map_err(OfflineExportError::Output)?;
+    let maximum_file_bytes =
+        u64::try_from(encoded.len()).map_err(|_| OfflineExportError::CapacityUnavailable)?;
+    let maximum_decoded_bytes = audio
+        .frame_count()
+        .checked_mul(audio.channels())
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or(OfflineExportError::CapacityUnavailable)?;
+    let limits = DecodeLimits::new(
+        maximum_file_bytes,
+        u64::try_from(audio.frame_count()).map_err(|_| OfflineExportError::CapacityUnavailable)?,
+        maximum_decoded_bytes,
+    )
+    .map_err(OfflineExportError::Output)?;
+    let decoded = decode_bytes(
+        encoded.clone(),
+        AudioContainer::Wav,
+        audio.sample_rate_hz(),
+        limits,
+    )
+    .map_err(OfflineExportError::Output)?;
+    let exact_planes = (0..audio.channels()).all(|channel| {
+        let Some(expected) = audio.plane(channel) else {
+            return false;
+        };
+        let Some(actual) = decoded.plane(channel) else {
+            return false;
+        };
+        expected
+            .iter()
+            .zip(actual)
+            .all(|(&expected, &actual)| expected.to_bits() == actual.to_bits())
+    });
+    if decoded.sample_rate_hz() != audio.sample_rate_hz()
+        || decoded.frame_count() != audio.frame_count()
+        || decoded.channels() != audio.channels()
+        || !exact_planes
+    {
+        return Err(OfflineExportError::Output(DecodeError::InvalidDecodedAudio(
+            "encoded WAV does not exactly reproduce its rendered samples",
+        )));
+    }
+    Ok(encoded)
+}
+
+fn publish_rendered_track_stem_files(
+    stems: &[OfflineTrackStem],
+    report: &OfflineTrackStemExportReport,
+    destination_directory: &Path,
+) -> Result<(), OfflineExportError> {
+    if stems.len() != report.files.len() {
+        return Err(OfflineExportError::StemDestination(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "every rendered stem must have exactly one generated output file",
+        )));
+    }
+    let (parent_path, destination_name) = stem_destination_parts(destination_directory)?;
+    let parent = open_syncable_directory_ambient(&parent_path)
+        .map_err(OfflineExportError::StemDestination)?;
+    match parent.symlink_metadata(&destination_name) {
+        Ok(_) => {
+            return Err(OfflineExportError::StemDestination(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "stem export destination already exists",
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(OfflineExportError::StemDestination(error)),
+    }
+
+    let stage_name = format!(".hyper-stem-stage-{}", uuid::Uuid::new_v4());
+    let (stage, stage_identity) = create_syncable_directory_at(&parent, &stage_name)
+        .map_err(OfflineExportError::StemDestination)?;
+    let result = (|| {
+        for (stem, file) in stems.iter().zip(&report.files) {
+            let bytes = match report.format {
+                OfflineTrackStemExportFormat::Wav => encode_verified_wav(&stem.audio)?,
+                OfflineTrackStemExportFormat::Flac => encode_verified_flac(&stem.audio)?,
+            };
+            publish_stem_bytes(&stage, &file.file_name, &bytes)?;
+        }
+        sync_directory(&stage).map_err(OfflineExportError::StemDestination)?;
+        Ok::<(), OfflineExportError>(())
+    })();
+    drop(stage);
+    if let Err(primary) = result {
+        return cleanup_stem_stage(primary, &parent, &stage_name, stage_identity);
+    }
+
+    rename_no_replace(
+        &parent,
+        &stage_name,
+        stage_identity,
+        &parent,
+        &destination_name,
+    )
+    .map_err(OfflineExportError::StemDestination)?;
+    sync_directory(&parent).map_err(|source| {
+        OfflineExportError::StemPublicationCommittedWithWarning {
+            source,
+            report: Box::new(report.clone()),
+        }
+    })
+}
+
+fn cleanup_stem_stage<T>(
+    primary: OfflineExportError,
+    parent: &cap_std::fs::Dir,
+    stage_name: &str,
+    stage_identity: (u64, u64),
+) -> Result<T, OfflineExportError> {
+    match remove_directory_entry(parent, stage_name, stage_identity) {
+        Ok(()) => {
+            let _ = sync_directory(parent);
+            Err(primary)
+        }
+        Err(cleanup) => Err(OfflineExportError::StemDestination(std::io::Error::new(
+            cleanup.kind(),
+            format!("{primary}; stem staging cleanup also failed: {cleanup}"),
+        ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn publish_stem_bytes(
+    directory: &cap_std::fs::Dir,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), OfflineExportError> {
+    publish_bytes_no_replace(directory, name, bytes).map_err(OfflineExportError::StemDestination)
+}
+
+#[cfg(windows)]
+fn publish_stem_bytes(
+    directory: &cap_std::fs::Dir,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), OfflineExportError> {
+    publish_verified_bytes_in_directory(directory, name, bytes)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn publish_stem_bytes(
+    _: &cap_std::fs::Dir,
+    _: &str,
+    _: &[u8],
+) -> Result<(), OfflineExportError> {
+    Err(OfflineExportError::StemDestination(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "verified stem publication is supported only on Linux and Windows",
+    )))
+}
+
+fn stem_destination_parts(
+    destination_directory: &Path,
+) -> Result<(PathBuf, String), OfflineExportError> {
+    let parent = destination_directory
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = destination_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or(OfflineExportError::StemDestination(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "stem export directory name is not valid Unicode",
+        )))?;
+    Ok((parent.to_path_buf(), name.to_owned()))
 }
 
 struct StemRenderBuffer {
@@ -642,6 +997,12 @@ fn publish_rendered_flac(
     spec: OfflineExportSpec,
     flac_path: &Path,
 ) -> Result<OfflineExportReport, OfflineExportError> {
+    let encoded = encode_verified_flac(rendered)?;
+    publish_verified_flac(flac_path, &encoded)?;
+    measure_rendered_audio(rendered, spec)
+}
+
+fn encode_verified_flac(rendered: &DecodedAudio) -> Result<Vec<u8>, OfflineExportError> {
     let frame_count = rendered.frame_count();
     if frame_count < FLAC_MINIMUM_FRAMES {
         return Err(OfflineExportError::FlacMinimumFrames);
@@ -651,9 +1012,11 @@ fn publish_rendered_flac(
     let right = rendered.plane(1).unwrap_or(left);
     let pcm = quantize_flac_pcm(left, right)?;
     let encoded = encode_flac_pcm(&pcm, sample_rate_hz)?;
-    verify_and_publish_flac(rendered, spec, flac_path, &pcm, &encoded)
+    verify_flac_pcm(&encoded, sample_rate_hz, frame_count, &pcm)?;
+    Ok(encoded)
 }
 
+#[cfg(test)]
 fn verify_and_publish_flac(
     rendered: &DecodedAudio,
     spec: OfflineExportSpec,
@@ -853,6 +1216,67 @@ fn publish_verified_flac_observed(
     result
 }
 
+#[cfg(windows)]
+fn publish_verified_bytes_in_directory(
+    directory: &cap_std::fs::Dir,
+    destination_name: &str,
+    bytes: &[u8],
+) -> Result<(), OfflineExportError> {
+    match directory.symlink_metadata(destination_name) {
+        Ok(_) => {
+            return Err(OfflineExportError::StemDestination(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "staged stem file already exists",
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(OfflineExportError::StemDestination(error)),
+    }
+    let stage_name = format!(".hyper-stem-file-stage-{}", uuid::Uuid::new_v4());
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut staged = directory
+        .open_with(&stage_name, &options)
+        .map_err(OfflineExportError::StemDestination)?;
+    let stage_identity = identity(
+        &staged
+            .metadata()
+            .map_err(OfflineExportError::StemDestination)?,
+    );
+    let result = (|| {
+        staged
+            .write_all(bytes)
+            .map_err(OfflineExportError::StemDestination)?;
+        staged
+            .sync_all()
+            .map_err(OfflineExportError::StemDestination)?;
+        drop(staged);
+        let maximum_stage_bytes =
+            u64::try_from(bytes.len()).map_err(|_| OfflineExportError::CapacityUnavailable)?;
+        let snapshot = read_stable_file_snapshot(directory, &stage_name, maximum_stage_bytes)
+            .map_err(OfflineExportError::StemDestination)?;
+        let (staged_bytes, staged_evidence) = snapshot.into_parts();
+        if staged_bytes != bytes {
+            return Err(OfflineExportError::StemDestination(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "staged stem file does not match its verified bytes",
+            )));
+        }
+        rename_no_replace(
+            directory,
+            &stage_name,
+            staged_evidence.identity(),
+            directory,
+            destination_name,
+        )
+        .map_err(OfflineExportError::StemDestination)
+    })();
+    if result.is_err() {
+        let _ = remove_file_if_identity(directory, &stage_name, stage_identity);
+    }
+    result
+}
+
 fn flac_destination_parts(flac_path: &Path) -> Result<(PathBuf, String), OfflineExportError> {
     let parent = flac_path
         .parent()
@@ -993,13 +1417,126 @@ fn publish_rendered_wav(
 #[cfg(test)]
 mod tests {
     use super::{
-        OfflineExportError, OfflineExportSpec, encode_flac_pcm, flac_destination_parts,
-        publish_rendered_flac, quantize_flac_pcm, verify_and_publish_flac, verify_flac_pcm,
+        OfflineExportError, OfflineExportSpec, OfflineTrackStem, OfflineTrackStemExportFormat,
+        encode_flac_pcm, flac_destination_parts, publish_rendered_flac,
+        publish_rendered_track_stems, quantize_flac_pcm, verify_and_publish_flac,
+        verify_flac_pcm,
     };
     #[cfg(windows)]
     use super::publish_verified_flac_observed;
-    use hyper_audio_source::DecodedAudio;
+    use hyper_audio_source::{AudioContainer, DecodeLimits, DecodedAudio, decode_bytes};
     use std::path::Path;
+
+    #[test]
+    fn stem_export_activates_only_a_complete_verified_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("aligned-stems");
+        let stems = vec![
+            OfflineTrackStem {
+                track_id: "track-lead".to_owned(),
+                track_name: "Lead / Voice".to_owned(),
+                audio: DecodedAudio::from_stereo(
+                    48_000,
+                    (0..32_i16).map(|frame| f32::from(frame) / 100.0).collect(),
+                    (0..32_i16).map(|frame| -f32::from(frame) / 100.0).collect(),
+                )
+                .unwrap(),
+            },
+            OfflineTrackStem {
+                track_id: "track-drums".to_owned(),
+                track_name: "Drums".to_owned(),
+                audio: DecodedAudio::from_stereo(
+                    48_000,
+                    vec![0.25; 32],
+                    vec![-0.5; 32],
+                )
+                .unwrap(),
+            },
+        ];
+
+        let report = publish_rendered_track_stems(
+            &stems,
+            OfflineTrackStemExportFormat::Wav,
+            &destination,
+        )
+        .unwrap();
+
+        assert_eq!(report.frame_count, 32);
+        assert_eq!(report.sample_rate_hz, 48_000);
+        assert_eq!(
+            report.files.iter().map(|file| file.file_name.as_str()).collect::<Vec<_>>(),
+            vec!["001-Lead%20%2F%20Voice.wav", "002-Drums.wav"]
+        );
+        for (stem, file) in stems.iter().zip(&report.files) {
+            let bytes = std::fs::read(destination.join(&file.file_name)).unwrap();
+            let decoded = decode_bytes(
+                bytes,
+                AudioContainer::Wav,
+                48_000,
+                DecodeLimits::new(1_048_576, 32, 1_024).unwrap(),
+            )
+            .unwrap();
+            for channel in 0..2 {
+                assert_eq!(decoded.plane(channel), stem.audio.plane(channel));
+            }
+        }
+        assert_eq!(
+            std::fs::read_dir(&destination).unwrap().count(),
+            report.files.len(),
+            "the activated directory contains only the complete ordered stem set"
+        );
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("hyper-stem-stage")));
+    }
+
+    #[test]
+    fn stem_export_refuses_an_existing_destination_without_staging_or_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("aligned-stems");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("preserve"), b"existing export").unwrap();
+        let stems = vec![OfflineTrackStem {
+            track_id: "track".to_owned(),
+            track_name: "Track".to_owned(),
+            audio: DecodedAudio::from_stereo(48_000, vec![0.0; 32], vec![0.0; 32]).unwrap(),
+        }];
+
+        let refused = publish_rendered_track_stems(
+            &stems,
+            OfflineTrackStemExportFormat::Wav,
+            &destination,
+        );
+
+        assert!(matches!(refused, Err(OfflineExportError::StemDestination(_))));
+        assert_eq!(std::fs::read(destination.join("preserve")).unwrap(), b"existing export");
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("hyper-stem-stage")));
+    }
+
+    #[test]
+    fn stem_export_refuses_invalid_files_without_activation_or_stage_residue() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("aligned-stems");
+        let stems = vec![OfflineTrackStem {
+            track_id: "track".to_owned(),
+            track_name: "Track".to_owned(),
+            audio: DecodedAudio::from_stereo(48_000, vec![0.0; 31], vec![0.0; 31]).unwrap(),
+        }];
+
+        let refused = publish_rendered_track_stems(
+            &stems,
+            OfflineTrackStemExportFormat::Flac,
+            &destination,
+        );
+
+        assert!(matches!(refused, Err(OfflineExportError::FlacMinimumFrames)));
+        assert!(!destination.exists());
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("hyper-stem-stage")));
+    }
 
     #[test]
     fn flac_export_round_trips_exact_quantized_stereo_pcm_to_a_new_destination() {

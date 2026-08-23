@@ -308,6 +308,7 @@ export global IdeActions {
     callback set-control-binding-active(string, bool);
     callback remove-control-binding(string);
     callback export-project();
+    callback export-track-stems(bool);
     callback prepare-runtime();
     callback undo-edit();
     callback redo-edit();
@@ -1357,6 +1358,18 @@ export component MainWindow inherits Window {
                             enabled: root.app-mode == AppMode.running && root.export-available;
                             accessible-label: "Export the project as a WAV file";
                             clicked => { IdeActions.export-project(); }
+                        }
+                        if !root.new-project-visible && !root.new-track-visible : Button {
+                            text: root.app-mode == AppMode.exporting-project ? "Exporting…" : "Export WAV stems";
+                            enabled: root.app-mode == AppMode.running && root.export-available;
+                            accessible-label: "Export every audio track as aligned WAV stems";
+                            clicked => { IdeActions.export-track-stems(false); }
+                        }
+                        if !root.new-project-visible && !root.new-track-visible : Button {
+                            text: root.app-mode == AppMode.exporting-project ? "Exporting…" : "Export FLAC stems";
+                            enabled: root.app-mode == AppMode.running && root.export-available;
+                            accessible-label: "Export every audio track as aligned FLAC stems";
+                            clicked => { IdeActions.export-track-stems(true); }
                         }
                         if root.export-summary != "" : Text {
                             text: root.export-summary;

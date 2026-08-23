@@ -656,6 +656,37 @@ pub fn open_syncable_directory_at(parent: &Dir, name: &str) -> io::Result<Dir> {
     }
 }
 
+/// Creates a new child directory through retained parent authority and returns
+/// its synchronization-capable handle with its retained identity.
+///
+/// Existing entries are never reused. Callers can use the identity with
+/// [`rename_no_replace`] or [`remove_directory_entry`] after staging a complete
+/// directory transaction.
+///
+/// # Errors
+///
+/// Returns an I/O or validation error when the name is not one normal component,
+/// already exists, or the new child cannot be reopened as a real directory.
+pub fn create_syncable_directory_at(parent: &Dir, name: &str) -> io::Result<(Dir, (u64, u64))> {
+    validate_entry_name(name)?;
+    #[cfg(unix)]
+    {
+        use cap_std::fs::DirBuilderExt;
+
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700);
+        parent.create_dir_with(name, &builder)?;
+    }
+    #[cfg(not(unix))]
+    parent.create_dir(name)?;
+    let directory = open_syncable_directory_at(parent, name)?;
+    let metadata = directory.dir_metadata()?;
+    if !metadata.is_dir() {
+        return Err(invalid_argument("created entry is not a directory"));
+    }
+    Ok((directory, identity(&metadata)))
+}
+
 fn read_bounded(file: &mut File, expected_bytes: u64, maximum_bytes: u64) -> io::Result<Vec<u8>> {
     let capacity = usize::try_from(expected_bytes)
         .map_err(|_| invalid_argument("stable file cannot fit in memory"))?;
@@ -1193,7 +1224,6 @@ pub fn publish_bytes_no_replace(
     )?)
 }
 
-#[cfg(target_os = "linux")]
 fn validate_entry_name(name: &str) -> io::Result<()> {
     let mut components = Path::new(name).components();
     if matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none() {
@@ -1502,7 +1532,7 @@ mod directory_entry_tests {
     use cap_std::ambient_authority;
     use cap_std::fs::Dir;
 
-    use super::{identity, remove_directory_entry};
+    use super::{create_syncable_directory_at, identity, remove_directory_entry};
 
     struct TemporaryDirectory(PathBuf);
 
@@ -1549,5 +1579,17 @@ mod directory_entry_tests {
         assert!(result.is_err());
         assert_eq!(fs::read(original.join("replacement")).unwrap(), b"preserve");
         assert!(displaced.is_dir());
+    }
+
+    #[test]
+    fn retained_parent_creates_one_new_syncable_child() {
+        let temporary = TemporaryDirectory::new();
+        let parent = Dir::open_ambient_dir(temporary.path(), ambient_authority()).unwrap();
+        let (child, child_identity) = create_syncable_directory_at(&parent, "stems").unwrap();
+
+        assert!(child.dir_metadata().unwrap().is_dir());
+        assert_eq!(identity(&child.dir_metadata().unwrap()), child_identity);
+        assert!(create_syncable_directory_at(&parent, "stems").is_err());
+        assert!(create_syncable_directory_at(&parent, "nested/stems").is_err());
     }
 }

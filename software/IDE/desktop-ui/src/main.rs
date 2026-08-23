@@ -30,7 +30,7 @@ use hyper_desktop_ide::{
     bpm_for_microseconds_per_quarter, microseconds_per_quarter_for_bpm,
     TransportAction, TriggerBehavior,
     IdeAutomationTakeRequest, IdeAutomationTarget, IdeOutputTestState, IdePlaybackArrangement,
-    OfflineExportReport, IdeProjectExportFormat,
+    OfflineExportReport, OfflineTrackStemExportFormat, IdeProjectExportFormat,
     IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent, IdeRecordingAbortOutcome,
     IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation,
     IdeUnusedSampleCleanupSummary,
@@ -2570,6 +2570,7 @@ fn bind_arrangement_scene_launch_callback(
     bind_automation_take_removal_callback(ui, worker, project_state);
     bind_control_mapping_callbacks(ui, worker, project_state);
     bind_project_export_callback(ui, worker);
+    bind_project_stem_export_callback(ui, worker);
     bind_undo_callbacks(ui, worker);
     bind_loop_callbacks(ui, worker, project_state);
     bind_tempo_callback(ui, worker);
@@ -4173,7 +4174,9 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::RemoveAutomationTake => AppMode::RemovingAutomationTake,
         IdeWorkerCommandKind::EditControlMapping => AppMode::EditingControlMapping,
         IdeWorkerCommandKind::EditNativeFilter => AppMode::EditingNativeFilter,
-        IdeWorkerCommandKind::ExportProject => AppMode::ExportingProject,
+        IdeWorkerCommandKind::ExportProject | IdeWorkerCommandKind::ExportTrackStems => {
+            AppMode::ExportingProject
+        }
         IdeWorkerCommandKind::PrepareRuntime => AppMode::PreparingRuntime,
         IdeWorkerCommandKind::Undo | IdeWorkerCommandKind::Redo => AppMode::RestoringEdit,
         IdeWorkerCommandKind::MoveArrangementSceneLaunch => AppMode::MovingArrangementSceneLaunch,
@@ -4362,7 +4365,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::EditNativeFilter => {
             "Preserving mixer state, editing the native device chain, and reopening project..."
         }
-        IdeWorkerCommandKind::ExportProject => {
+        IdeWorkerCommandKind::ExportProject | IdeWorkerCommandKind::ExportTrackStems => {
             "Rendering the project through the playback runtime..."
         }
         IdeWorkerCommandKind::Undo => {
@@ -4720,6 +4723,11 @@ fn apply_event(
         }
         event @ (IdeWorkerEvent::ProjectExporting | IdeWorkerEvent::ProjectExported { .. }) => {
             apply_project_export_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::ProjectStemExporting
+        | IdeWorkerEvent::ProjectStemsExported { .. }
+        | IdeWorkerEvent::ProjectStemsExportedWithWarning { .. }) => {
+            apply_track_stem_export_event(ui, &event);
         }
         IdeWorkerEvent::RuntimePreparing => {
             ui.set_app_mode(AppMode::PreparingRuntime);
@@ -7745,7 +7753,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::EditNativeFilter if current == AppMode::EditingNativeFilter => {
             AppMode::Running
         }
-        IdeWorkerCommandKind::ExportProject if current == AppMode::ExportingProject => {
+        IdeWorkerCommandKind::ExportProject | IdeWorkerCommandKind::ExportTrackStems
+            if current == AppMode::ExportingProject =>
+        {
             AppMode::Running
         }
         IdeWorkerCommandKind::PrepareRuntime if current == AppMode::PreparingRuntime => {
@@ -9700,6 +9710,42 @@ fn apply_project_export_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     }
 }
 
+fn track_stem_export_summary(report: &hyper_desktop_ide::OfflineTrackStemExportReport) -> String {
+    let seconds = u32::try_from(report.frame_count).map_or(f64::NAN, |frames| {
+        f64::from(frames) / f64::from(report.sample_rate_hz)
+    });
+    let container = match report.format {
+        OfflineTrackStemExportFormat::Wav => "WAV",
+        OfflineTrackStemExportFormat::Flac => "FLAC",
+    };
+    format!(
+        "{} aligned {container} stems  ·  {seconds:.2} s",
+        report.files.len()
+    )
+}
+
+fn apply_track_stem_export_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::ProjectStemExporting => {
+            ui.set_app_mode(AppMode::ExportingProject);
+            ui.set_status_text("Rendering aligned track stems through the playback runtime…".into());
+        }
+        IdeWorkerEvent::ProjectStemsExported { report } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_export_summary(track_stem_export_summary(report).into());
+            ui.set_status_text("Track stems exported".into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ProjectStemsExportedWithWarning { report, warning } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_export_summary(track_stem_export_summary(report).into());
+            ui.set_status_text("Track stems exported, but filesystem durability needs attention".into());
+            ui.set_error_text(warning.to_string().into());
+        }
+        _ => unreachable!("track-stem export event dispatcher received another event"),
+    }
+}
+
 fn restoring_status_text(redo: bool, label: &str) -> String {
     if redo {
         format!("Reapplying the undone {label}…")
@@ -10186,6 +10232,50 @@ fn bind_project_export_callback(ui: &MainWindow, worker: &WorkerCell) {
     });
 }
 
+fn bind_project_stem_export_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_export = Rc::clone(worker);
+    actions.on_export_track_stems(move |flac| {
+        let weak = weak.clone();
+        let worker = Rc::clone(&worker_for_export);
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_export_available() {
+            return;
+        }
+        ui.set_error_text(SharedString::default());
+        ui.set_status_text("Waiting for a new stem export folder…".into());
+        let spawn_result = slint::spawn_local(async move {
+            let selection = rfd::AsyncFileDialog::new()
+                .set_title(if flac {
+                    "Name a new aligned FLAC stem folder"
+                } else {
+                    "Name a new aligned WAV stem folder"
+                })
+                .set_file_name(if flac { "project-flac-stems" } else { "project-wav-stems" })
+                .save_file()
+                .await;
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Some(selection) = selection else {
+                ui.set_status_text("Stem export cancelled".into());
+                return;
+            };
+            let destination_directory = selection.path().to_path_buf();
+            ui.set_export_destination(destination_directory.display().to_string().into());
+            ui.set_export_summary(SharedString::default());
+            let command = track_stem_export_command(destination_directory, flac);
+            submit_to_ui(&ui, &worker, command);
+        });
+        if spawn_result.is_err() {
+            ui.set_status_text("Stem export folder selection is unavailable".into());
+        }
+    });
+}
+
 fn project_export_command(destination_path: PathBuf) -> Result<IdeWorkerCommand, String> {
     let format = IdeProjectExportFormat::from_destination(&destination_path)
         .map_err(|error| error.to_string())?;
@@ -10194,6 +10284,18 @@ fn project_export_command(destination_path: PathBuf) -> Result<IdeWorkerCommand,
         format,
         block_frames: EXPORT_BLOCK_FRAMES,
     })
+}
+
+fn track_stem_export_command(destination_directory: PathBuf, flac: bool) -> IdeWorkerCommand {
+    IdeWorkerCommand::ExportTrackStems {
+        destination_directory,
+        format: if flac {
+            IdeProjectExportFormat::Flac
+        } else {
+            IdeProjectExportFormat::Wav
+        },
+        block_frames: EXPORT_BLOCK_FRAMES,
+    }
 }
 
 fn parse_control_millionths(value: &str) -> Result<i32, &'static str> {
@@ -10902,6 +11004,63 @@ mod tests {
             })
         ));
         assert!(project_export_command(PathBuf::from("C:/Renders/mix.aiff")).is_err());
+        assert!(matches!(
+            track_stem_export_command(PathBuf::from("C:/Renders/Session stems"), false),
+            IdeWorkerCommand::ExportTrackStems {
+                format: IdeProjectExportFormat::Wav,
+                ..
+            }
+        ));
+        assert!(matches!(
+            track_stem_export_command(PathBuf::from("C:/Renders/Session stems"), true),
+            IdeWorkerCommand::ExportTrackStems {
+                format: IdeProjectExportFormat::Flac,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn track_stem_export_buttons_preserve_format_and_running_authority() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_export_available(true);
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        ui.global::<IdeActions>()
+            .on_export_track_stems(move |flac| submitted_by_callback.borrow_mut().push(flac));
+        ui.show().unwrap();
+
+        let wav = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Export every audio track as aligned WAV stems",
+        )
+        .next()
+        .expect("the WAV-stem action is visible for a running verified project");
+        let flac = ElementHandle::find_by_accessible_label(
+            &ui,
+            "Export every audio track as aligned FLAC stems",
+        )
+        .next()
+        .expect("the FLAC-stem action is visible for a running verified project");
+        assert_eq!(wav.accessible_enabled(), Some(true));
+        assert_eq!(flac.accessible_enabled(), Some(true));
+        wav.mock_single_click(PointerEventButton::Left);
+        flac.mock_single_click(PointerEventButton::Left);
+        assert_eq!(submitted.borrow().as_slice(), &[false, true]);
+
+        ui.set_export_available(false);
+        assert_eq!(wav.accessible_enabled(), Some(false));
+        assert_eq!(flac.accessible_enabled(), Some(false));
+        wav.mock_single_click(PointerEventButton::Left);
+        flac.mock_single_click(PointerEventButton::Left);
+        assert_eq!(
+            submitted.borrow().as_slice(),
+            &[false, true],
+            "revoked export authority cannot enqueue a speculative stem request"
+        );
+        ui.hide().unwrap();
     }
 
     fn assert_project_creation_shortcut_contract(ui: &MainWindow) {

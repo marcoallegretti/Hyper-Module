@@ -79,7 +79,9 @@ mod offline_export;
 mod capture;
 pub use offline_export::{
     OfflineExportError, OfflineExportReport, OfflineExportSpec, OfflineTrackStem,
-    export_prepared_project_flac_with_mixer, export_prepared_project_wav_with_mixer,
+    OfflineTrackStemExportFile, OfflineTrackStemExportFormat, OfflineTrackStemExportReport,
+    export_prepared_project_flac_with_mixer, export_prepared_project_track_stems_with_mixer,
+    export_prepared_project_wav_with_mixer,
     export_project_wav, export_project_wav_with_mixer,
     render_prepared_project_offline_with_mixer, render_prepared_project_track_stems_with_mixer,
     render_project_offline, render_project_offline_with_mixer, render_project_track_stems_with_mixer,
