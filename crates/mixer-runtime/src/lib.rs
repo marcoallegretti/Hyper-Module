@@ -1563,6 +1563,17 @@ pub struct LatestOutputMeterSnapshot {
 }
 
 impl LatestOutputMeterSnapshot {
+    /// Returns an empty observation before any output callback has published.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            snapshot: None,
+            coalesced_snapshot_count: 0,
+            dropped_snapshot_count: 0,
+            sender_disconnected: false,
+        }
+    }
+
     #[must_use]
     pub const fn snapshot(self) -> Option<OutputMeterSnapshot> {
         self.snapshot
@@ -1581,6 +1592,12 @@ impl LatestOutputMeterSnapshot {
     #[must_use]
     pub const fn sender_disconnected(self) -> bool {
         self.sender_disconnected
+    }
+}
+
+impl Default for LatestOutputMeterSnapshot {
+    fn default() -> Self {
+        Self::empty()
     }
 }
 

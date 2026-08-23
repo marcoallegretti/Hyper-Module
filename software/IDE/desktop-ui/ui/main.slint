@@ -542,8 +542,11 @@ export component MainWindow inherits Window {
     in-out property <string> clip-source-trim-start: "";
     in-out property <string> clip-source-trim-frame-count: "";
     in-out property <bool> add-arrangement-placement-visible: false;
+    private property <bool> project-form-visible:
+        root.new-project-visible || root.new-track-visible;
     private property <bool> audio-import-available:
         root.app-mode == AppMode.running
+        && !root.project-form-visible
         && root.clips-visible
         && !root.clip-rename-visible
         && !root.clip-duplicate-visible
@@ -701,7 +704,8 @@ export component MainWindow inherits Window {
     in property <string> status-text: "Discovering desktop audio outputs…";
     in property <string> error-text: "";
     private property <bool> performance-visible:
-        !root.mixer-visible
+        !root.project-form-visible
+        && !root.mixer-visible
         && !root.takes-visible
         && !root.arrangement-visible
         && !root.clips-visible

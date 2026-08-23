@@ -317,6 +317,19 @@ pub struct DesktopAudioPreviewSnapshot {
 }
 
 impl DesktopAudioPreviewSnapshot {
+    /// Returns the idle preview state before any take is selected.
+    #[must_use]
+    pub const fn idle() -> Self {
+        Self {
+            state: DesktopAudioPreviewState::Idle,
+            recording_index: None,
+            played_frames: 0,
+            total_frames: 0,
+            gain: INITIAL_PREVIEW_GAIN,
+            muted: false,
+        }
+    }
+
     #[must_use]
     pub const fn state(self) -> DesktopAudioPreviewState {
         self.state

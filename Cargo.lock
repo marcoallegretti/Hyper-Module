@@ -2208,6 +2208,7 @@ name = "hyper-desktop-ui"
 version = "0.1.0"
 dependencies = [
  "hyper-desktop-ide",
+ "hyper-mixer-runtime",
  "i-slint-backend-testing",
  "rfd",
  "slint",

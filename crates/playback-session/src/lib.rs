@@ -478,6 +478,20 @@ impl PlaybackArrangementLoopRange {
 }
 
 impl PlaybackArrangement {
+    /// Returns an empty, finite arrangement view.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            track_names: Vec::new(),
+            clip_names: Vec::new(),
+            scene_names: Vec::new(),
+            placements: Vec::new(),
+            scene_launches: Vec::new(),
+            loop_range: None,
+            end_frame: 0,
+        }
+    }
+
     #[must_use]
     pub fn track_name(&self, index: usize) -> Option<&str> {
         self.track_names.get(index).map(String::as_str)

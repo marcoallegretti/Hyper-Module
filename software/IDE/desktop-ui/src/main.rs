@@ -45,6 +45,8 @@ use hyper_desktop_ide::{
     ide_audio_clip_gain_is_supported,
 };
 #[cfg(test)]
+use hyper_mixer_runtime::PlaybackRecoverySnapshot;
+#[cfg(test)]
 use hyper_desktop_ide::{
     IdeArrangementPlacementEditError, IdeAudioClipEditCommittedWarning, IdeAudioClipFadeEditError,
     IdeAudioClipLoopEditError, IdeAudioClipReverseEditError, IdeAudioClipSourceSlipEditError,
@@ -10368,6 +10370,9 @@ mod tests {
         ui.set_transport_stop_available(false);
         dispatch_ide_space(ui, false, false, false, false, false);
         ui.set_transport_start_available(true);
+        ui.set_new_track_visible(true);
+        dispatch_ide_space(ui, false, false, false, false, false);
+        ui.set_new_track_visible(false);
         ui.set_clips_visible(true);
         dispatch_ide_space(ui, false, false, false, false, false);
         ui.set_clips_visible(false);
@@ -10377,11 +10382,82 @@ mod tests {
         assert_eq!(
             stops.get(),
             1,
-            "modifiers, revoked authority, hidden performance controls, and non-running modes remain inert"
+            "modifiers, revoked authority, local forms, hidden performance controls, and non-running modes remain inert"
         );
 
         ui.set_app_mode(AppMode::Running);
         ui.set_transport_start_available(false);
+    }
+
+    fn assert_transport_running_observation_contract(ui: &MainWindow) {
+        let starts = Rc::new(Cell::new(0_usize));
+        let starts_by_callback = Rc::clone(&starts);
+        ui.global::<IdeActions>().on_transport_start(move || {
+            starts_by_callback.set(starts_by_callback.get() + 1);
+        });
+        let stops = Rc::new(Cell::new(0_usize));
+        let stops_by_callback = Rc::clone(&stops);
+        ui.global::<IdeActions>().on_transport_stop(move || {
+            stops_by_callback.set(stops_by_callback.get() + 1);
+        });
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_visible(false);
+        ui.set_takes_visible(false);
+        ui.set_arrangement_visible(false);
+        ui.set_clips_visible(false);
+        ui.set_loudness_visible(false);
+        ui.set_scene_create_visible(false);
+        ui.set_scene_rename_visible(false);
+        ui.set_scene_duplicate_visible(false);
+        ui.set_scene_slots_visible(false);
+        ui.set_new_track_visible(false);
+        let recording_routes = Rc::new(RefCell::new(Vec::new()));
+        let take_routes = Rc::new(RefCell::new(Vec::new()));
+        let audio_import_routes = Rc::new(RefCell::new(Vec::new()));
+        let project_state = Rc::new(ProjectUiState::default());
+
+        apply_running_event(
+            ui,
+            &recording_routes,
+            &take_routes,
+            &audio_import_routes,
+            &project_state,
+            &IdeRunningObservation::for_ui_test(PlaybackRecoverySnapshot::for_test(
+                PlaybackRecoveryTransportState::Stopped,
+                0,
+            )),
+        );
+        assert!(ui.get_transport_start_available());
+        assert!(!ui.get_transport_stop_available());
+        dispatch_ide_space(ui, false, false, false, false, false);
+        assert_eq!(
+            starts.get(),
+            1,
+            "a stopped recovery observation enables the existing Start callback"
+        );
+
+        apply_running_event(
+            ui,
+            &recording_routes,
+            &take_routes,
+            &audio_import_routes,
+            &project_state,
+            &IdeRunningObservation::for_ui_test(PlaybackRecoverySnapshot::for_test(
+                PlaybackRecoveryTransportState::Rolling,
+                256,
+            )),
+        );
+        assert!(!ui.get_transport_start_available());
+        assert!(ui.get_transport_stop_available());
+        dispatch_ide_space(ui, false, false, false, false, false);
+        assert_eq!(
+            stops.get(),
+            1,
+            "a rolling recovery observation enables the existing Stop callback"
+        );
+
+        ui.set_transport_stop_available(false);
     }
 
     fn assert_audio_import_shortcut_contract(ui: &MainWindow) {
@@ -10424,12 +10500,15 @@ mod tests {
         ui.set_clip_rename_visible(true);
         dispatch_ide_shortcut(ui, "i", false, false);
         ui.set_clip_rename_visible(false);
+        ui.set_new_track_visible(true);
+        dispatch_ide_shortcut(ui, "i", false, false);
+        ui.set_new_track_visible(false);
         ui.set_app_mode(AppMode::ImportingAudio);
         dispatch_ide_shortcut(ui, "i", false, false);
         assert_eq!(
             selected.borrow().as_slice(),
             &[1],
-            "invalid destinations, local clip forms, and pending imports keep the shortcut unavailable"
+            "invalid destinations, local forms, and pending imports keep the shortcut unavailable"
         );
 
         ui.set_app_mode(AppMode::Running);
@@ -13458,6 +13537,7 @@ mod tests {
         assert_audio_track_creation_shortcut_contract(&ui);
         assert_project_close_shortcut_contract(&ui);
         assert_transport_space_shortcut_contract(&ui);
+        assert_transport_running_observation_contract(&ui);
         assert_audio_import_shortcut_contract(&ui);
         assert_form_cancellation_shortcut_contract(&ui);
         ui.set_app_mode(AppMode::PreparingRuntime);

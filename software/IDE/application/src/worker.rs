@@ -1334,6 +1334,47 @@ impl IdeSceneTrackSlot {
 }
 
 impl IdeRunningObservation {
+    /// Builds a minimal coherent running observation for a UI consumer test.
+    ///
+    /// The helper is feature-gated so normal callers can only obtain this
+    /// project authority from a verified running application.
+    #[cfg(feature = "ui-test-support")]
+    #[must_use]
+    pub fn for_ui_test(recovery: PlaybackRecoverySnapshot) -> Self {
+        Self {
+            playback_session_generation: 0,
+            project_id: "ui-test-project".to_owned(),
+            project_name: "UI test project".to_owned(),
+            sample_rate_hz: 48_000,
+            microseconds_per_quarter: 500_000,
+            meter_events: Vec::new(),
+            tempo_events: Vec::new(),
+            playback_extent: super::IdePlaybackExtent::Bounded { end_frame: 0 },
+            arrangement: Arc::new(super::IdePlaybackArrangement::empty()),
+            automation: Arc::new(super::IdePlaybackAutomation::default()),
+            control_bindings: Vec::new(),
+            audio_clips: Vec::new(),
+            recording_takes: Vec::new(),
+            native_devices: Vec::new(),
+            native_filters: Vec::new(),
+            native_compressors: Vec::new(),
+            unused_sample_cleanup: super::IdeUnusedSampleCleanupSummary::new([0; 32], 0, 0, 0),
+            preview: IdeAudioPreviewObservation {
+                snapshot: DesktopAudioPreviewSnapshot::idle(),
+                asset_id: None,
+            },
+            scenes: Vec::new(),
+            track_count: 0,
+            mixer_channels: Vec::new(),
+            mixer_main: None,
+            output_state: OutputStreamState::Running,
+            output: OutputStreamSnapshot::default(),
+            monitoring: None,
+            recovery,
+            meter: LatestOutputMeterSnapshot::empty(),
+        }
+    }
+
     /// Identifies the playback session that produced this observation.
     ///
     /// The value changes whenever project playback is closed and reopened,

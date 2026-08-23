@@ -28,6 +28,23 @@ pub struct PlaybackRecoverySnapshot {
 }
 
 impl PlaybackRecoverySnapshot {
+    /// Builds a bounded synthetic recovery observation for consumer tests.
+    ///
+    /// This is unavailable to normal builds, so only tests can model a
+    /// checkpoint without obtaining it from the sole audio publisher.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn for_test(state: PlaybackRecoveryTransportState, position_frame: usize) -> Self {
+        Self {
+            state,
+            position_frame,
+            committed_cycle_count: 0,
+            loop_range: None,
+            loop_enabled: false,
+            mixer_parameter_state: None,
+        }
+    }
+
     #[must_use]
     pub const fn state(&self) -> PlaybackRecoveryTransportState {
         self.state
