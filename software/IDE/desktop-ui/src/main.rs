@@ -1186,6 +1186,7 @@ fn bind_playback_callbacks(
     bind_scene_callbacks(ui, worker, project_state);
 
     bind_project_save_callback(ui, worker, project_state);
+    bind_project_copy_callback(ui, worker);
 
     bind_audio_track_callback(ui, worker);
 
@@ -1292,6 +1293,60 @@ fn bind_project_save_callback_with(
             return;
         }
         submitter(&ui, project_save_command(&project_state));
+    });
+}
+
+fn bind_project_copy_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    ui.global::<IdeActions>().on_save_project_as(move |project_name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_save_project_as_visible() {
+            return;
+        }
+        let project_name = project_name.trim().to_owned();
+        if project_name.is_empty() {
+            ui.set_error_text("Enter a project name before choosing its location".into());
+            return;
+        }
+        ui.set_app_mode(AppMode::Saving);
+        ui.set_error_text(SharedString::default());
+        ui.set_status_text("Waiting for the independent project destination…".into());
+        let weak_for_dialog = weak.clone();
+        let worker = Rc::clone(&worker);
+        let spawn_result = slint::spawn_local(async move {
+            let selection = rfd::AsyncFileDialog::new()
+                .set_title("Choose parent folder for the independent Hyper Module project")
+                .pick_folder()
+                .await;
+            let Some(ui) = weak_for_dialog.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::Saving || !ui.get_save_project_as_visible() {
+                return;
+            }
+            let Some(selection) = selection else {
+                ui.set_app_mode(AppMode::Running);
+                ui.set_status_text("Save As cancelled".into());
+                return;
+            };
+            let parent = selection.path().to_path_buf();
+            submit_to_ui(
+                &ui,
+                &worker,
+                IdeWorkerCommand::SaveProjectAs {
+                    parent,
+                    directory_name: project_name.clone(),
+                    project_name,
+                },
+            );
+        });
+        if let Err(error) = spawn_result {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_error_text(format!("Save As location dialog could not start: {error}").into());
+        }
     });
 }
 
@@ -3919,6 +3974,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::CreateProject => AppMode::Creating,
         IdeWorkerCommandKind::OpenProject => AppMode::Opening,
         IdeWorkerCommandKind::SaveProject
+        | IdeWorkerCommandKind::SaveProjectAs
         | IdeWorkerCommandKind::AddScene
         | IdeWorkerCommandKind::SetSceneSlot
         | IdeWorkerCommandKind::SetArrangementLoopRange
@@ -4013,6 +4069,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::Mixer => "Mixer command queued…",
         IdeWorkerCommandKind::Monitoring => "Applying input cue control…",
         IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
+        IdeWorkerCommandKind::SaveProjectAs => {
+            "Saving and verifying an independent project copy…"
+        }
         IdeWorkerCommandKind::PrepareRuntime => {
             "Saving the project and compiling a verified Runtime bundle…"
         }
@@ -4263,6 +4322,21 @@ fn apply_event(
             ui.set_error_text(SharedString::default());
         }
         event @ IdeWorkerEvent::ProjectSaved { .. } => apply_project_saved_event(ui, &event),
+        IdeWorkerEvent::ProjectCopied { project_path } => {
+            ui.set_status_text(
+                format!("Independent project verified and opened at {}", project_path.display()).into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ProjectCopyCommittedWithWarning {
+            project_path,
+            warning,
+        } => {
+            ui.set_status_text(
+                format!("Independent project opened at {} with a durability warning", project_path.display()).into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
         event @ (IdeWorkerEvent::AudioTrackAdded { .. } | IdeWorkerEvent::AudioTrackAdding) => {
             apply_audio_track_event(ui, &event);
         }
@@ -6102,6 +6176,7 @@ fn apply_running_event(
     observation: &IdeRunningObservation,
 ) {
     ui.set_new_project_visible(false);
+    ui.set_save_project_as_visible(false);
     ui.set_project_name(observation.project_name().into());
     ui.set_project_id(observation.project_id().into());
     ui.set_sample_rate(format!("{} Hz", observation.sample_rate_hz()).into());
@@ -10249,6 +10324,20 @@ mod tests {
         assert!(
             matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::SaveProject]),
             "only a non-repeating primary save shortcut submits the existing project save command"
+        );
+
+        dispatch_ide_shortcut(ui, "s", true, false);
+        assert!(ui.get_save_project_as_visible());
+        assert_eq!(
+            ui.get_save_project_as_name(),
+            format!("{} copy", ui.get_project_name())
+        );
+        ui.set_save_project_as_visible(false);
+        dispatch_ide_shortcut_with_modifiers(ui, "s", true, true, false, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "s", true, false, true, false);
+        assert!(
+            !ui.get_save_project_as_visible(),
+            "only the exact primary Shift+S shortcut may open Save As"
         );
 
         ui.set_app_mode(AppMode::Saving);

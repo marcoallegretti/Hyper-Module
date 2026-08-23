@@ -20,7 +20,8 @@ use hyper_runtime_bundle_builder::{
     build_project_runtime_bundle,
 };
 use hyper_storage_engine::{
-    ProjectCreationError, ProjectCreationRequest, create_project as create_project_package,
+    ProjectCopyError, ProjectCopyRequest, ProjectCreationError, ProjectCreationRequest,
+    copy_project as copy_project_package, create_project as create_project_package,
 };
 use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSnapshot};
 
@@ -144,6 +145,7 @@ pub enum IdeWorkerCommandKind {
     Mixer,
     Monitoring,
     SaveProject,
+    SaveProjectAs,
     PrepareRuntime,
     AddAudioTrack,
     RemoveAudioTrack,
@@ -239,6 +241,11 @@ pub enum IdeWorkerCommand {
     Mixer(IdeMixerCommand),
     Monitoring(IdeMonitoringCommand),
     SaveProject,
+    SaveProjectAs {
+        parent: PathBuf,
+        directory_name: String,
+        project_name: String,
+    },
     PrepareRuntime {
         output_path: PathBuf,
     },
@@ -451,6 +458,7 @@ impl IdeWorkerCommand {
             Self::Mixer(_) => IdeWorkerCommandKind::Mixer,
             Self::Monitoring(_) => IdeWorkerCommandKind::Monitoring,
             Self::SaveProject => IdeWorkerCommandKind::SaveProject,
+            Self::SaveProjectAs { .. } => IdeWorkerCommandKind::SaveProjectAs,
             Self::PrepareRuntime { .. } => IdeWorkerCommandKind::PrepareRuntime,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
@@ -1610,6 +1618,52 @@ impl Error for IdeProjectCreationError {
 }
 
 #[derive(Debug)]
+pub enum IdeProjectCopyError {
+    Save(IdeProjectSaveError),
+    Copy(ProjectCopyError),
+    SourceReopen {
+        copy: Box<IdeProjectCopyError>,
+        source: Box<IdeProjectOpenError>,
+    },
+    CopiedButNotOpened {
+        project_path: PathBuf,
+        source: IdeProjectOpenError,
+    },
+}
+
+impl fmt::Display for IdeProjectCopyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Save(source) => write!(formatter, "project could not be saved before copying: {source}"),
+            Self::Copy(source) => write!(formatter, "project copy failed: {source}"),
+            Self::SourceReopen { copy, source } => write!(
+                formatter,
+                "project copy failed ({copy}) and the source project could not be reopened: {source}"
+            ),
+            Self::CopiedButNotOpened {
+                project_path,
+                source,
+            } => write!(
+                formatter,
+                "project was safely copied to {} but could not be opened: {source}",
+                project_path.display()
+            ),
+        }
+    }
+}
+
+impl Error for IdeProjectCopyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Save(source) => Some(source),
+            Self::Copy(source) => Some(source),
+            Self::SourceReopen { source, .. } => Some(source.as_ref()),
+            Self::CopiedButNotOpened { source, .. } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum IdeRuntimePreparationError {
     Save(IdeProjectSaveError),
     Bundle(RuntimeBundleBuildError),
@@ -1684,6 +1738,7 @@ pub enum IdeWorkerCommandFailure {
     OutputSelection(IdeOutputSelectionError),
     InputSelection(IdeInputSelectionError),
     ProjectCreation(Box<IdeProjectCreationError>),
+    ProjectCopy(Box<IdeProjectCopyError>),
     ProjectOpen(IdeProjectOpenError),
     RecentProjectMissing(PathBuf),
     Transport(super::DesktopDirectControlError),
@@ -1810,6 +1865,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::OutputSelection(source) => source.fmt(formatter),
             Self::InputSelection(source) => source.fmt(formatter),
             Self::ProjectCreation(source) => source.fmt(formatter),
+            Self::ProjectCopy(source) => source.fmt(formatter),
             Self::ProjectOpen(source) => source.fmt(formatter),
             Self::RecentProjectMissing(path) => {
                 write!(
@@ -1908,6 +1964,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::OutputSelection(source) => Some(source),
             Self::InputSelection(source) => Some(source),
             Self::ProjectCreation(source) => Some(source),
+            Self::ProjectCopy(source) => Some(source),
             Self::ProjectOpen(source) => Some(source),
             Self::Transport(source) => Some(source),
             Self::Seek(source) => Some(source),
@@ -2045,6 +2102,13 @@ pub enum IdeWorkerEvent {
     ProjectSaved {
         revision: u64,
         changed: bool,
+    },
+    ProjectCopied {
+        project_path: PathBuf,
+    },
+    ProjectCopyCommittedWithWarning {
+        project_path: PathBuf,
+        warning: Box<IdeProjectCopyError>,
     },
     RuntimePreparing,
     RuntimePrepared {
@@ -2799,6 +2863,11 @@ enum WorkerState {
 #[derive(Debug)]
 enum ProjectMutation {
     SaveMixer,
+    SaveProjectAs {
+        parent: PathBuf,
+        directory_name: String,
+        project_name: String,
+    },
     PrepareRuntime {
         output_path: PathBuf,
     },
@@ -2976,6 +3045,7 @@ impl ProjectMutation {
             Self::SetTempo { .. } => IdeWorkerCommandKind::SetTempo,
             Self::SetMeter { .. } => IdeWorkerCommandKind::SetMeter,
             Self::SaveMixer => IdeWorkerCommandKind::SaveProject,
+            Self::SaveProjectAs { .. } => IdeWorkerCommandKind::SaveProjectAs,
             Self::PrepareRuntime { .. } => IdeWorkerCommandKind::PrepareRuntime,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
@@ -3047,7 +3117,7 @@ impl ProjectMutation {
     )]
     fn pending_event(&self) -> IdeWorkerEvent {
         match self {
-            Self::SaveMixer => IdeWorkerEvent::Saving,
+            Self::SaveMixer | Self::SaveProjectAs { .. } => IdeWorkerEvent::Saving,
             Self::PrepareRuntime { .. } => IdeWorkerEvent::RuntimePreparing,
             Self::AddAudioTrack { .. } => IdeWorkerEvent::AudioTrackAdding,
             Self::RemoveAudioTrack { .. } => IdeWorkerEvent::AudioTrackRemoving,
@@ -3343,6 +3413,7 @@ fn push_bounded(stack: &mut Vec<UndoEntry>, entry: UndoEntry) {
 const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
     match command {
         IdeWorkerCommandKind::SaveProject => "mixer save",
+        IdeWorkerCommandKind::SaveProjectAs => "project copy",
         IdeWorkerCommandKind::PrepareRuntime => "Runtime preparation save",
         IdeWorkerCommandKind::RenameAudioTrack => "track rename",
         IdeWorkerCommandKind::SetAudioTrackActive => "track activation",
@@ -3441,6 +3512,7 @@ fn run_worker(
             events,
             &mut unpublished_native_failure,
             &mut history,
+            project_history,
         ) {
             return finish_worker(state, unpublished_native_failure);
         }
@@ -3691,6 +3763,7 @@ fn process_command(
         },
         IdeWorkerCommand::Monitoring(command) => process_monitoring_command(state, command, events),
         command @ (IdeWorkerCommand::SaveProject
+        | IdeWorkerCommand::SaveProjectAs { .. }
         | IdeWorkerCommand::PrepareRuntime { .. }
         | IdeWorkerCommand::AddAudioTrack { .. }
         | IdeWorkerCommand::RemoveAudioTrack { .. }
@@ -3832,6 +3905,19 @@ fn process_project_mutation_command(
 ) -> bool {
     match command {
         IdeWorkerCommand::SaveProject => save_project(state, events),
+        IdeWorkerCommand::SaveProjectAs {
+            parent,
+            directory_name,
+            project_name,
+        } => begin_project_mutation_request(
+            state,
+            events,
+            ProjectMutation::SaveProjectAs {
+                parent,
+                directory_name,
+                project_name,
+            },
+        ),
         IdeWorkerCommand::PrepareRuntime { output_path } => begin_project_mutation_request(
             state,
             events,
@@ -6483,6 +6569,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             HistoryEffect::Invalidate
         }
         ProjectMutationAttempt::EditNativeFilter { .. }
+        | ProjectMutationAttempt::SaveProjectAs(_)
         | ProjectMutationAttempt::RemoveAutomationTake { .. }
         | ProjectMutationAttempt::Save(Err(_))
         | ProjectMutationAttempt::AddAudioTrack(Err(_))
@@ -7165,6 +7252,9 @@ fn project_mutation_save_failure(
 ) -> IdeWorkerCommandFailure {
     match operation {
         ProjectMutation::SaveMixer => IdeWorkerCommandFailure::ProjectSave(reason),
+        ProjectMutation::SaveProjectAs { .. } => {
+            IdeWorkerCommandFailure::ProjectCopy(Box::new(IdeProjectCopyError::Save(reason)))
+        }
         ProjectMutation::PrepareRuntime { .. } => IdeWorkerCommandFailure::RuntimePreparation(
             Box::new(IdeRuntimePreparationError::Save(reason)),
         ),
@@ -7354,6 +7444,7 @@ fn begin_save_close(
     operation: ProjectMutation,
     events: &SyncSender<IdeWorkerEvent>,
     history: &mut UndoHistory,
+    project_history: Option<&ProjectHistory>,
 ) -> bool {
     match application.close_for_save() {
         IdeSaveCloseOutcome::Closed {
@@ -7368,6 +7459,7 @@ fn begin_save_close(
             failure,
             events,
             history,
+            project_history,
         ),
         IdeSaveCloseOutcome::Pending(pending) => {
             let event = operation.pending_event();
@@ -7425,6 +7517,9 @@ fn project_mutation_native_close_failure(
         ProjectMutation::SaveMixer => {
             IdeWorkerCommandFailure::ProjectSave(IdeProjectSaveError::NativeClose(failure))
         }
+        ProjectMutation::SaveProjectAs { .. } => IdeWorkerCommandFailure::ProjectCopy(Box::new(
+            IdeProjectCopyError::Save(IdeProjectSaveError::NativeClose(failure)),
+        )),
         ProjectMutation::PrepareRuntime { .. } => {
             IdeWorkerCommandFailure::RuntimePreparation(Box::new(IdeRuntimePreparationError::Save(
                 IdeProjectSaveError::NativeClose(failure),
@@ -7620,8 +7715,24 @@ struct RuntimePreparationAttempt {
     result: Result<PublishedRuntimeBundle, IdeRuntimePreparationError>,
 }
 
+struct ProjectCopyAttempt {
+    destination_path: PathBuf,
+    result: Result<(), IdeProjectCopyError>,
+}
+
+impl ProjectCopyAttempt {
+    fn publication_committed(&self) -> bool {
+        self.result.is_ok()
+            || matches!(
+                self.result.as_ref(),
+                Err(IdeProjectCopyError::Copy(error)) if error.published()
+            )
+    }
+}
+
 enum ProjectMutationAttempt {
     Save(Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeProjectSaveError>),
+    SaveProjectAs(ProjectCopyAttempt),
     PrepareRuntime(RuntimePreparationAttempt),
     AddAudioTrack(
         Result<hyper_storage_engine::AudioTrackPublicationOutcome, IdeAudioTrackAdditionError>,
@@ -8168,7 +8279,8 @@ pub(super) fn arrangement_edit_failure_event(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "all mutation completion events remain exhaustively paired with reopen publication"
+    clippy::too_many_arguments,
+    reason = "all mutation completion events remain exhaustively paired with reopen publication and history authority"
 )]
 fn complete_project_mutation(
     state: &mut WorkerState,
@@ -8178,6 +8290,7 @@ fn complete_project_mutation(
     native_failure: Option<IdeNativeCloseFailure>,
     events: &SyncSender<IdeWorkerEvent>,
     history: &mut UndoHistory,
+    project_history: Option<&ProjectHistory>,
 ) -> bool {
     let command = operation.command();
     let Some(project_path) = recovery
@@ -8197,6 +8310,17 @@ fn complete_project_mutation(
     };
     let attempt = attempt_project_mutation(&application, &recovery, operation, native_failure);
     drop(recovery);
+    if let ProjectMutationAttempt::SaveProjectAs(attempt) = attempt {
+        return complete_project_copy(
+            state,
+            application,
+            &project_path,
+            attempt,
+            events,
+            history,
+            project_history,
+        );
+    }
     observe_history(history, &attempt, command, events);
     match application.open_project(&project_path) {
         Ok(running) => {
@@ -8983,6 +9107,9 @@ fn complete_project_mutation(
                     active,
                     result: Err(reason),
                 } => send_event(events, scene_activation_failure_event(active, reason)),
+                ProjectMutationAttempt::SaveProjectAs(_) => {
+                    unreachable!("project copies complete before generic reopen handling")
+                }
             }
         }
         Err(failure) => {
@@ -8994,6 +9121,118 @@ fn complete_project_mutation(
             }
             let reason = project_mutation_reopen_failure(attempt, reopen);
             publish_failure(events, command, reason)
+        }
+    }
+}
+
+fn complete_project_copy(
+    state: &mut WorkerState,
+    application: DesktopIdeApplication,
+    source_path: &Path,
+    attempt: ProjectCopyAttempt,
+    events: &SyncSender<IdeWorkerEvent>,
+    history: &mut UndoHistory,
+    project_history: Option<&ProjectHistory>,
+) -> bool {
+    let committed = attempt.publication_committed();
+    let destination_path = attempt.destination_path;
+    let warning = attempt.result.err();
+    if !committed {
+        let reason = warning.expect("unpublished project copies must retain their failure");
+        return match application.open_project(source_path) {
+            Ok(running) => {
+                *state = WorkerState::Running(running);
+                let mut no_native_failure = None;
+                publish_state(state, events, &mut no_native_failure)
+                    && publish_failure(
+                        events,
+                        IdeWorkerCommandKind::SaveProjectAs,
+                        IdeWorkerCommandFailure::ProjectCopy(Box::new(reason)),
+                    )
+            }
+            Err(source) => {
+                let (application, source) = source.into_parts();
+                *state = WorkerState::Closed(application);
+                let mut no_native_failure = None;
+                publish_state(state, events, &mut no_native_failure)
+                    && publish_failure(
+                        events,
+                        IdeWorkerCommandKind::SaveProjectAs,
+                        IdeWorkerCommandFailure::ProjectCopy(Box::new(
+                            IdeProjectCopyError::SourceReopen {
+                                copy: Box::new(reason),
+                                source: Box::new(source),
+                            },
+                        )),
+                    )
+            }
+        };
+    }
+    match application.open_project(&destination_path) {
+        Ok(running) => {
+            if !remember_running_project(project_history, &running, events) {
+                return false;
+            }
+            if history.clear() && !send_event(events, history.state_event()) {
+                return false;
+            }
+            *state = WorkerState::Running(running);
+            let mut no_native_failure = None;
+            publish_state(state, events, &mut no_native_failure)
+                && match warning {
+                    Some(warning) => send_event(
+                        events,
+                        IdeWorkerEvent::ProjectCopyCommittedWithWarning {
+                            project_path: destination_path,
+                            warning: Box::new(warning),
+                        },
+                    ),
+                    None => send_event(
+                        events,
+                        IdeWorkerEvent::ProjectCopied {
+                            project_path: destination_path,
+                        },
+                    ),
+                }
+        }
+        Err(failure) => {
+            let (application, source) = failure.into_parts();
+            match application.open_project(source_path) {
+            Ok(running) => {
+                *state = WorkerState::Running(running);
+                let mut no_native_failure = None;
+                publish_state(state, events, &mut no_native_failure)
+                    && publish_failure(
+                        events,
+                        IdeWorkerCommandKind::SaveProjectAs,
+                        IdeWorkerCommandFailure::ProjectCopy(Box::new(
+                            IdeProjectCopyError::CopiedButNotOpened {
+                                project_path: destination_path,
+                                source,
+                            },
+                        )),
+                    )
+            }
+            Err(reopen) => {
+                let (application, reopen) = reopen.into_parts();
+                *state = WorkerState::Closed(application);
+                let mut no_native_failure = None;
+                publish_state(state, events, &mut no_native_failure)
+                    && publish_failure(
+                        events,
+                        IdeWorkerCommandKind::SaveProjectAs,
+                        IdeWorkerCommandFailure::ProjectCopy(Box::new(
+                            IdeProjectCopyError::SourceReopen {
+                                copy: Box::new(IdeProjectCopyError::CopiedButNotOpened {
+                                    project_path: destination_path,
+                                    source,
+                                }),
+                                source: Box::new(reopen),
+                            },
+                        )),
+                    )
+            }
+            }
         }
     }
 }
@@ -9019,6 +9258,44 @@ fn attempt_project_mutation(
                             .map_err(|source| IdeProjectSaveError::Publication(Box::new(source)))
                     },
                 )
+            })
+        }
+        ProjectMutation::SaveProjectAs {
+            parent,
+            directory_name,
+            project_name,
+        } => {
+            let destination_path = parent.join(&directory_name);
+            let result = if let Some(failure) = native_failure {
+                Err(IdeProjectCopyError::Save(IdeProjectSaveError::NativeClose(
+                    failure,
+                )))
+            } else {
+                RunningDesktopIdeApplication::prepare_mixer_save(application, recovery)
+                    .and_then(|plan| {
+                        plan.publish().map_err(|source| {
+                            IdeProjectSaveError::Publication(Box::new(source))
+                        })
+                    })
+                    .map_err(IdeProjectCopyError::Save)
+                    .and_then(|_| {
+                        let project = recovery
+                            .prepared_project()
+                            .ok_or(IdeProjectSaveError::ProjectSnapshotUnavailable)
+                            .map_err(IdeProjectCopyError::Save)?;
+                        copy_project_package(ProjectCopyRequest {
+                            source: project.package().root(),
+                            destination_parent: &parent,
+                            directory_name: &directory_name,
+                            project_name: &project_name,
+                        })
+                        .map(|_| ())
+                        .map_err(IdeProjectCopyError::Copy)
+                    })
+            };
+            ProjectMutationAttempt::SaveProjectAs(ProjectCopyAttempt {
+                destination_path,
+                result,
             })
         }
         ProjectMutation::PrepareRuntime { output_path } => {
@@ -10620,6 +10897,9 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::SetSceneActive { result, .. } => {
             scene_activation_reopen_failure(result, reopen)
         }
+        ProjectMutationAttempt::SaveProjectAs(_) => {
+            unreachable!("project copies complete before generic reopen handling")
+        }
     }
 }
 
@@ -11388,6 +11668,7 @@ fn poll_pending_state(
     events: &SyncSender<IdeWorkerEvent>,
     unpublished_native_failure: &mut Option<IdeNativeCloseFailure>,
     history: &mut UndoHistory,
+    project_history: Option<&ProjectHistory>,
 ) -> bool {
     match std::mem::replace(state, WorkerState::Empty) {
         WorkerState::Closing(pending) => match pending.wait(Duration::ZERO) {
@@ -11417,6 +11698,7 @@ fn poll_pending_state(
                 failure,
                 events,
                 history,
+                project_history,
             ),
             IdePendingSaveCloseWait::TimedOut(pending) => {
                 *state = WorkerState::Saving { pending, operation };
@@ -11441,7 +11723,7 @@ fn poll_pending_state(
             deadline,
         } => {
             if application.committed_mixer_fence() >= sequence {
-                begin_save_close(state, application, operation, events, history)
+                begin_save_close(state, application, operation, events, history, project_history)
             } else if Instant::now() >= deadline {
                 let command = operation.command();
                 let reason = project_mutation_save_failure(
@@ -12669,7 +12951,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             recv(&worker),
-            IdeWorkerEvent::RecentProjectsChanged { projects }
+            IdeWorkerEvent::RecentProjectsChanged { ref projects }
                 if projects.len() == 1
                     && projects[0].name() == "Daily Session"
                     && projects[0].path() == canonical_project
@@ -12841,6 +13123,85 @@ mod tests {
         assert_eq!(history.load().unwrap()[0].name(), "Created");
         assert_eq!(shutdown_report(worker).native_failure(), None);
 
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn save_as_switches_only_after_verified_copy_and_remembers_the_destination() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-save-as-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = fixture.join("config");
+        let projects = fixture.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let source = create_project_package(
+            &projects,
+            ProjectCreationRequest {
+                directory_name: "Source",
+                project_name: "Source",
+            },
+        )
+        .unwrap()
+        .project()
+        .root()
+        .to_path_buf();
+        let history = ProjectHistory::at(&config);
+        let worker = DesktopIdeWorker::start_state_with_history(
+            WorkerState::Closed(closed_application()),
+            Some(history.clone()),
+            2,
+            8,
+        )
+        .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RecentProjectsChanged { projects } if projects.is_empty()
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(source.clone()))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RecentProjectsChanged { projects }
+                if projects.len() == 1 && projects[0].path() == source
+        ));
+        let IdeWorkerEvent::Running(source_running) = recv(&worker) else {
+            panic!("the source project must open");
+        };
+        let source_id = source_running.project_id().to_owned();
+
+        worker
+            .try_send(IdeWorkerCommand::SaveProjectAs {
+                parent: projects.clone(),
+                directory_name: "Independent".to_owned(),
+                project_name: "Independent".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(recv_native_mutation(&worker), IdeWorkerEvent::Saving));
+        let destination = projects.join("Independent");
+        let recent = recv_native_mutation(&worker);
+        assert!(matches!(
+            recent,
+            IdeWorkerEvent::RecentProjectsChanged { ref projects }
+                if projects.len() == 2 && projects[0].name() == "Independent"
+        ), "unexpected Save As history event: {recent:?}");
+        let IdeWorkerEvent::Running(copied) = recv_native_mutation(&worker) else {
+            panic!("the verified copied project must open");
+        };
+        assert_eq!(copied.project_name(), "Independent");
+        assert_ne!(copied.project_id(), source_id);
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::ProjectCopied { project_path } if project_path == destination
+        ));
+        assert_eq!(
+            history.load().unwrap()[0].path(),
+            std::fs::canonicalize(&destination).unwrap()
+        );
+        assert!(source.is_dir());
+        assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
 
@@ -17035,6 +17396,7 @@ mod tests {
             &events,
             &mut native,
             &mut history,
+            None,
         ));
         assert!(
             history.undo.is_empty() && history.redo.is_empty(),
@@ -17082,6 +17444,7 @@ mod tests {
             &events,
             &mut native,
             &mut history,
+            None,
         ));
         assert!(matches!(
             receiver.try_recv(),
@@ -17153,6 +17516,7 @@ mod tests {
             &events,
             &mut native,
             &mut history,
+            None,
         ));
 
         assert!(matches!(
