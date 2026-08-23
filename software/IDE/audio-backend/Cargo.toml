@@ -15,6 +15,7 @@ hyper-audio-engine = { path = "../../../crates/audio-engine" }
 hyper-control-runtime = { path = "../../RUNTIME/control-runtime" }
 hyper-panel-protocol = { path = "../../../crates/panel-protocol" }
 hyper-control-mappings = { path = "../../../crates/control-mappings" }
+hyper-fs-authority = { path = "../../../crates/fs-authority" }
 hyper-media-cache = { path = "../../../crates/media-cache" }
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime" }
 hyper-native-device = { path = "../../../crates/native-device" }
@@ -31,6 +32,9 @@ hyper-storage-engine = { path = "../../../crates/storage-engine" }
 hyper-thread-supervisor = { path = "../../../crates/thread-supervisor" }
 ringbuf = "=0.5.1"
 rubato = { version = "=4.0.0", default-features = false }
+cap-std = "=4.0.2"
+flacenc = { version = "=0.5.1", default-features = false }
+uuid = { version = "=1.24.0", features = ["v4"] }
 
 [target.'cfg(all(target_os = "linux", target_endian = "little"))'.dependencies]
 bytemuck = "=1.24.0"
@@ -43,3 +47,4 @@ wasapi = "=0.22.0"
 
 [dev-dependencies]
 hyper-mixer-runtime = { path = "../../../crates/mixer-runtime", features = ["test-support"] }
+tempfile = "=3.27.0"

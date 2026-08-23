@@ -30,7 +30,7 @@ use hyper_desktop_ide::{
     bpm_for_microseconds_per_quarter, microseconds_per_quarter_for_bpm,
     TransportAction, TriggerBehavior,
     IdeAutomationTakeRequest, IdeAutomationTarget, IdeOutputTestState, IdePlaybackArrangement,
-    OfflineExportReport,
+    OfflineExportReport, IdeProjectExportFormat,
     IdePlaybackAutomation, IdePlaybackAutomationLane, IdePlaybackExtent, IdeRecordingAbortOutcome,
     IdeRecordingCaptureKind, IdeRecordingImportOutcome, IdeRecordingTake, IdeRunningObservation,
     IdeUnusedSampleCleanupSummary,
@@ -9689,7 +9689,7 @@ fn bind_project_export_callback(ui: &MainWindow, worker: &WorkerCell) {
             let selection = rfd::AsyncFileDialog::new()
                 .set_title("Export project audio")
                 .set_file_name("export.wav")
-                .add_filter("WAV", &["wav"])
+                .add_filter("WAV or FLAC", &["wav", "flac"])
                 .save_file()
                 .await;
             let Some(ui) = weak.upgrade() else {
@@ -9702,11 +9702,20 @@ fn bind_project_export_callback(ui: &MainWindow, worker: &WorkerCell) {
             let path = selection.path().to_path_buf();
             ui.set_export_destination(path.display().to_string().into());
             ui.set_export_summary(SharedString::default());
+            let format = match IdeProjectExportFormat::from_destination(&path) {
+                Ok(format) => format,
+                Err(error) => {
+                    ui.set_error_text(error.to_string().into());
+                    ui.set_status_text("Export destination must end in .wav or .flac".into());
+                    return;
+                }
+            };
             submit_to_ui(
                 &ui,
                 &worker,
                 IdeWorkerCommand::ExportProject {
-                    wav_path: path,
+                    destination_path: path,
+                    format,
                     block_frames: EXPORT_BLOCK_FRAMES,
                 },
             );

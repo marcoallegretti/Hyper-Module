@@ -37,7 +37,7 @@ use hyper_desktop_audio::{
     MonitoringSnapshot, OfflineExportError, OfflineExportSpec, OutputStreamSnapshot,
     OutputStreamState, PendingNativeShutdown, PendingNativeShutdownWait, StreamState,
     discover_desktop_input_targets, discover_desktop_output_targets,
-    export_prepared_project_wav_with_mixer,
+    export_prepared_project_flac_with_mixer, export_prepared_project_wav_with_mixer,
 };
 pub use hyper_desktop_audio::{
     DesktopAudioPreviewState, DesktopSceneAvailability as IdeSceneAvailability,
@@ -4446,6 +4446,29 @@ pub enum IdeProjectExportError {
     DestinationUnavailable,
     LiveMixerUnavailable,
     Export(Box<OfflineExportError>),
+}
+
+/// One explicitly supported offline project-export container.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeProjectExportFormat {
+    Wav,
+    Flac,
+}
+
+impl IdeProjectExportFormat {
+    /// Infers the requested container from a user-selected destination.
+    ///
+    /// # Errors
+    ///
+    /// Rejects destinations without a supported, case-insensitive extension.
+    pub fn from_destination(path: &Path) -> Result<Self, IdeProjectExportError> {
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        match extension.map(str::to_ascii_lowercase).as_deref() {
+            Some("wav") => Ok(Self::Wav),
+            Some("flac") => Ok(Self::Flac),
+            _ => Err(IdeProjectExportError::DestinationUnavailable),
+        }
+    }
 }
 
 /// Places the staging journal beside the destination without ever colliding
@@ -9223,7 +9246,7 @@ impl RunningDesktopIdeApplication {
         })
     }
 
-    /// Renders the open project to a WAV beside the requested destination.
+    /// Renders the open project to the selected WAV or FLAC destination.
     ///
     /// This reads the prepared project and writes outside it, so it takes no
     /// mixer fence and does not close or reopen playback.
@@ -9235,25 +9258,39 @@ impl RunningDesktopIdeApplication {
     /// fails.
     pub fn export_project(
         &self,
-        wav_path: &Path,
+        destination_path: &Path,
+        format: IdeProjectExportFormat,
         block_frames: usize,
     ) -> Result<OfflineExportReport, IdeProjectExportError> {
+        if IdeProjectExportFormat::from_destination(destination_path)? != format {
+            return Err(IdeProjectExportError::DestinationUnavailable);
+        }
         let prepared = match &self.session {
             IdePlaybackSessionOwner::Native(session) => session.prepared_project(),
             #[cfg(test)]
             IdePlaybackSessionOwner::Test(_) => None,
         }
         .ok_or(IdeProjectExportError::ProjectSnapshotUnavailable)?;
-        let journal_path =
-            export_journal_path(wav_path).ok_or(IdeProjectExportError::DestinationUnavailable)?;
         let live_mixer = self.live_compiled_mixer(prepared)?;
-        let report = export_prepared_project_wav_with_mixer(
-            prepared,
-            OfflineExportSpec { block_frames },
-            live_mixer.as_ref(),
-            &journal_path,
-            wav_path,
-        )
+        let report = match format {
+            IdeProjectExportFormat::Wav => {
+                let journal_path = export_journal_path(destination_path)
+                    .ok_or(IdeProjectExportError::DestinationUnavailable)?;
+                export_prepared_project_wav_with_mixer(
+                    prepared,
+                    OfflineExportSpec { block_frames },
+                    live_mixer.as_ref(),
+                    &journal_path,
+                    destination_path,
+                )
+            }
+            IdeProjectExportFormat::Flac => export_prepared_project_flac_with_mixer(
+                prepared,
+                OfflineExportSpec { block_frames },
+                live_mixer.as_ref(),
+                destination_path,
+            ),
+        }
         .map_err(|source| IdeProjectExportError::Export(Box::new(source)))?;
         Ok(report)
     }
@@ -15683,6 +15720,22 @@ mod tests {
 
         // A path with no file name has nowhere to stage.
         assert!(export_journal_path(Path::new("C:/")).is_none());
+    }
+
+    #[test]
+    fn export_format_is_explicitly_selected_from_a_supported_destination_extension() {
+        assert_eq!(
+            IdeProjectExportFormat::from_destination(Path::new("C:/Renders/mix.WAV")).unwrap(),
+            IdeProjectExportFormat::Wav
+        );
+        assert_eq!(
+            IdeProjectExportFormat::from_destination(Path::new("C:/Renders/mix.flac")).unwrap(),
+            IdeProjectExportFormat::Flac
+        );
+        assert!(matches!(
+            IdeProjectExportFormat::from_destination(Path::new("C:/Renders/mix.aiff")),
+            Err(IdeProjectExportError::DestinationUnavailable)
+        ));
     }
 
     #[test]

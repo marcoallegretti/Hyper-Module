@@ -47,7 +47,7 @@ use super::{
     IdeNativeCloseFailure, IdeOutputDiscoveryError, IdeOutputSelection, IdeOutputSelectionError,
     IdeOutputTestError, IdeOutputTestSnapshot, IdeOutputTestStartOutcome, IdeOutputTestStopOutcome,
     IdePendingCloseWait, IdePendingOutputTestShutdown, IdePendingOutputTestShutdownWait,
-    IdePendingSaveCloseWait, IdeProjectExportError, IdeProjectOpenError, IdeProjectSaveError,
+    IdePendingSaveCloseWait, IdeProjectExportError, IdeProjectExportFormat, IdeProjectOpenError, IdeProjectSaveError,
     IdeRecordingAbortError, IdeRecordingAbortOutcome, IdeRecordingClipCreationError,
     IdeRecordingError, IdeRecordingImportOutcome, IdeRecordingObservation, IdeResourceRestoreError,
     IdeSaveCloseOutcome, IdeSceneAvailability, IdeSceneCreationError, IdeSceneDuplicationError,
@@ -387,7 +387,8 @@ pub enum IdeWorkerCommand {
         edit: IdeControlMappingEdit,
     },
     ExportProject {
-        wav_path: std::path::PathBuf,
+        destination_path: std::path::PathBuf,
+        format: IdeProjectExportFormat,
         block_frames: usize,
     },
     Undo,
@@ -3748,9 +3749,10 @@ fn process_command(
             process_audio_preview_command(state, command, events)
         }
         IdeWorkerCommand::ExportProject {
-            wav_path,
+            destination_path,
+            format,
             block_frames,
-        } => export_project(state, events, &wav_path, block_frames),
+        } => export_project(state, events, &destination_path, format, block_frames),
         IdeWorkerCommand::Observe => publish_state(state, events, unpublished_native_failure),
         IdeWorkerCommand::CloseProject => request_project_close(
             state,
@@ -6103,7 +6105,8 @@ fn edit_native_filter(
 fn export_project(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
-    wav_path: &std::path::Path,
+    destination_path: &std::path::Path,
+    format: IdeProjectExportFormat,
     block_frames: usize,
 ) -> bool {
     let WorkerState::Running(running) = state else {
@@ -6118,7 +6121,7 @@ fn export_project(
     if !send_event(events, IdeWorkerEvent::ProjectExporting) {
         return false;
     }
-    match running.export_project(wav_path, block_frames) {
+    match running.export_project(destination_path, format, block_frames) {
         Ok(report) => send_event(events, IdeWorkerEvent::ProjectExported { report }),
         Err(reason) => publish_failure(
             events,
@@ -13978,7 +13981,8 @@ mod tests {
         let baseline_path = fixture.join("baseline.wav");
         worker
             .try_send(IdeWorkerCommand::ExportProject {
-                wav_path: baseline_path.clone(),
+                destination_path: baseline_path.clone(),
+                format: IdeProjectExportFormat::Wav,
                 block_frames: 64,
             })
             .unwrap();
@@ -13987,6 +13991,21 @@ mod tests {
         assert!(
             matches!(baseline_export, IdeWorkerEvent::ProjectExported { ref report } if report.frame_count > 0),
             "unexpected baseline export result: {baseline_export:?}"
+        );
+
+        let flac_path = fixture.join("baseline.flac");
+        worker
+            .try_send(IdeWorkerCommand::ExportProject {
+                destination_path: flac_path.clone(),
+                format: IdeProjectExportFormat::Flac,
+                block_frames: 64,
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectExporting));
+        let flac_export = recv(&worker);
+        assert!(
+            matches!(flac_export, IdeWorkerEvent::ProjectExported { ref report } if report.frame_count == 500),
+            "unexpected FLAC export result: {flac_export:?}"
         );
 
         worker
@@ -14007,7 +14026,8 @@ mod tests {
         let filtered_path = fixture.join("filtered.wav");
         worker
             .try_send(IdeWorkerCommand::ExportProject {
-                wav_path: filtered_path.clone(),
+                destination_path: filtered_path.clone(),
+                format: IdeProjectExportFormat::Wav,
                 block_frames: 64,
             })
             .unwrap();
@@ -14033,8 +14053,22 @@ mod tests {
             decode_limits,
         )
         .unwrap();
+        let flac = decode_bytes(
+            std::fs::read(&flac_path).unwrap(),
+            AudioContainer::Flac,
+            48_000,
+            decode_limits,
+        )
+        .unwrap();
         assert_eq!(baseline.frame_count(), 500);
         assert_eq!(filtered.frame_count(), baseline.frame_count());
+        assert_eq!(flac.frame_count(), baseline.frame_count());
+        for (&wav, &lossless) in baseline.plane(0).unwrap().iter().zip(flac.plane(0).unwrap()) {
+            assert!(
+                (wav - lossless).abs() <= 1.5 / 8_388_607.0,
+                "FLAC must preserve the defined 24-bit PCM export: {wav} versus {lossless}"
+            );
+        }
         let baseline_peak = baseline
             .plane(0)
             .unwrap()
@@ -17931,7 +17965,8 @@ mod tests {
 
         worker
             .try_send(IdeWorkerCommand::ExportProject {
-                wav_path: std::path::PathBuf::from("export.wav"),
+                destination_path: std::path::PathBuf::from("export.wav"),
+                format: IdeProjectExportFormat::Wav,
                 block_frames: 1_024,
             })
             .unwrap();
