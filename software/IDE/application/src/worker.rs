@@ -532,9 +532,9 @@ impl IdeWorkerCommand {
             Self::StopAudioPreview => IdeWorkerCommandKind::StopAudioPreview,
             Self::AudioPreviewControl(_) => IdeWorkerCommandKind::AudioPreviewControl,
             Self::Observe => IdeWorkerCommandKind::Observe,
-            Self::CloseProject => IdeWorkerCommandKind::CloseProject,
-            Self::DiscardCloseProject => IdeWorkerCommandKind::CloseProject,
-            Self::CancelCloseProject => IdeWorkerCommandKind::CloseProject,
+            Self::CloseProject | Self::DiscardCloseProject | Self::CancelCloseProject => {
+                IdeWorkerCommandKind::CloseProject
+            }
             Self::Shutdown => IdeWorkerCommandKind::Shutdown,
         }
     }
@@ -9125,6 +9125,10 @@ fn complete_project_mutation(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "both verified destination and source-recovery outcomes must retain the sole application owner"
+)]
 fn complete_project_copy(
     state: &mut WorkerState,
     application: DesktopIdeApplication,

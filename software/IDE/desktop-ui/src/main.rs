@@ -1386,7 +1386,7 @@ fn bind_project_copy_callback_with(
         ui.set_app_mode(AppMode::Saving);
         ui.set_error_text(SharedString::default());
         ui.set_status_text("Waiting for the independent project destination…".into());
-        choose(weak.clone(), Rc::clone(&worker), project_name.to_string());
+        choose(weak.clone(), Rc::clone(&worker), project_name);
     });
 }
 
@@ -1403,6 +1403,10 @@ fn bind_native_filter_callbacks(
     );
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the generated native-device actions share one authoritative UI-to-worker binding"
+)]
 fn bind_native_filter_callbacks_with(
     ui: &MainWindow,
     project_state: &ProjectUiStateCell,
@@ -1575,6 +1579,10 @@ fn native_filter_addition(
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the generated compressor form emits its five persisted parameters independently"
+)]
 fn native_compressor_addition(mode: AppMode, track_ids: &[String], track_index: i32, threshold: &str, ratio: &str, attack: &str, release: &str, makeup: &str) -> Result<IdeNativeFilterEdit, &'static str> {
     if mode != AppMode::Running { return Err("Native Device editing is unavailable in the current state"); }
     let track_id = usize::try_from(track_index).ok().and_then(|index| track_ids.get(index)).filter(|id| !id.is_empty()).ok_or("The selected audio track is no longer available")?;
@@ -1582,6 +1590,10 @@ fn native_compressor_addition(mode: AppMode, track_ids: &[String], track_index: 
     Ok(IdeNativeFilterEdit::AddCompressor { track_id: track_id.clone(), threshold_millidecibels, ratio_millionths, attack_microseconds, release_microseconds, makeup_millidecibels })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the generated compressor form emits its persisted state as separate controls"
+)]
 fn native_compressor_update(mode: AppMode, devices: &ModelRc<NativeDeviceRow>, index: i32, enabled: bool, threshold: &str, ratio: &str, attack: &str, release: &str, makeup: &str) -> Result<IdeNativeFilterEdit, &'static str> {
     let row = native_filter_row(mode, devices, index)?;
     if row.kind_index != 1 { return Err("The selected Native Device is not a compressor"); }
@@ -6207,6 +6219,10 @@ fn apply_recording_aborted(ui: &MainWindow, outcome: &IdeRecordingAbortOutcome) 
     ui.set_error_text(SharedString::default());
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one Running observation must update all Rust-owned presentation authority together"
+)]
 fn apply_running_event(
     ui: &MainWindow,
     recording_routes: &RecordingRoutes,
@@ -7005,7 +7021,7 @@ fn native_device_rows(
         .map(|(index, device)| {
             let (chain_id, device_instance_id, track_id, enabled, kind_index, kind_name, detail, mode_index, mode_name, cutoff_millihertz, cutoff_label, resonance_millionths, resonance_label, threshold_millidecibels, ratio_millionths, attack_microseconds, release_microseconds, makeup_millidecibels) = match device {
                 IdeNativeDevice::Filter(filter) => (
-                    filter.chain_id(), filter.device_instance_id(), filter.track_id(), filter.enabled(), 0, "FILTER", format!("{} · {}", format_millihertz(filter.cutoff_millihertz()), format!("Q {:.3}", f64::from(filter.resonance_millionths()) / 1_000_000.0)), match filter.mode() { NativeFilterMode::LowPass => 0, NativeFilterMode::HighPass => 1 }, match filter.mode() { NativeFilterMode::LowPass => "LOW-PASS", NativeFilterMode::HighPass => "HIGH-PASS" }, filter.cutoff_millihertz().to_string(), format_millihertz(filter.cutoff_millihertz()), filter.resonance_millionths().to_string(), format!("Q {:.3}", f64::from(filter.resonance_millionths()) / 1_000_000.0), String::new(), String::new(), String::new(), String::new(), String::new()),
+                    filter.chain_id(), filter.device_instance_id(), filter.track_id(), filter.enabled(), 0, "FILTER", format!("{} · Q {:.3}", format_millihertz(filter.cutoff_millihertz()), f64::from(filter.resonance_millionths()) / 1_000_000.0), match filter.mode() { NativeFilterMode::LowPass => 0, NativeFilterMode::HighPass => 1 }, match filter.mode() { NativeFilterMode::LowPass => "LOW-PASS", NativeFilterMode::HighPass => "HIGH-PASS" }, filter.cutoff_millihertz().to_string(), format_millihertz(filter.cutoff_millihertz()), filter.resonance_millionths().to_string(), format!("Q {:.3}", f64::from(filter.resonance_millionths()) / 1_000_000.0), String::new(), String::new(), String::new(), String::new(), String::new()),
                 IdeNativeDevice::Compressor(compressor) => (
                     compressor.chain_id(), compressor.device_instance_id(), compressor.track_id(), compressor.enabled(), 1, "COMPRESSOR", format!("{} dB · {:.3}:1 · {} / {} ms · {} dB", f64::from(compressor.threshold_millidecibels()) / 1_000.0, f64::from(compressor.ratio_millionths()) / 1_000_000.0, f64::from(compressor.attack_microseconds()) / 1_000.0, f64::from(compressor.release_microseconds()) / 1_000.0, f64::from(compressor.makeup_millidecibels()) / 1_000.0), 0, "", String::new(), String::new(), String::new(), String::new(), compressor.threshold_millidecibels().to_string(), compressor.ratio_millionths().to_string(), compressor.attack_microseconds().to_string(), compressor.release_microseconds().to_string(), compressor.makeup_millidecibels().to_string()),
             };
@@ -7206,6 +7222,10 @@ fn input_presentation(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "project closure clears every Rust-owned presentation capability as one transition"
+)]
 fn reset_project(
     ui: &MainWindow,
     recording_routes: &RecordingRoutes,
@@ -9754,6 +9774,10 @@ fn bind_undo_callbacks(ui: &MainWindow, worker: &WorkerCell) {
     );
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "each generated callback retains the shared command submitter for the window lifetime"
+)]
 fn bind_undo_callbacks_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
     let restore = |redo: bool| {
         let weak = ui.as_weak();
@@ -9820,7 +9844,7 @@ fn bind_project_export_callback(ui: &MainWindow, worker: &WorkerCell) {
             let command = match project_export_command(path) {
                 Ok(command) => command,
                 Err(error) => {
-                    ui.set_error_text(error.to_string().into());
+                    ui.set_error_text(error.into());
                     ui.set_status_text("Export destination must end in .wav or .flac".into());
                     return;
                 }
@@ -10170,6 +10194,10 @@ mod tests {
         dispatch_ide_shortcut_with_modifiers(ui, text, shift, false, false, repeated);
     }
 
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        reason = "the test mirrors independently dispatched keyboard modifier state"
+    )]
     fn dispatch_ide_shortcut_with_modifiers(
         ui: &MainWindow,
         text: &str,
@@ -10222,6 +10250,10 @@ mod tests {
         });
     }
 
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        reason = "the test mirrors independently dispatched keyboard modifier state"
+    )]
     fn dispatch_ide_space(
         ui: &MainWindow,
         control: bool,
@@ -10670,6 +10702,10 @@ mod tests {
         ui.set_new_track_visible(false);
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture verifies native and in-app close behavior against the same dirty mixer authority"
+    )]
     fn assert_unsaved_mixer_close_contract(ui: &MainWindow) {
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_callback = Rc::clone(&submitted);
@@ -11089,6 +11125,10 @@ mod tests {
         assert!(matches!(commands[2], IdeWorkerCommand::Redo), "{message}");
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one generated-window fixture validates the complete native-device interaction contract"
+    )]
     fn assert_native_filter_window_contract(ui: &MainWindow) {
         let project_state = Rc::new(ProjectUiState::default());
         project_state
@@ -14007,6 +14047,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the single generated-window regression preserves related reopen and warning authority ordering"
+    )]
     fn committed_audio_clip_edit_warnings_preserve_reopen_authority() {
         let ui = MainWindow::new().unwrap();
         configure_ui_contracts(&ui);

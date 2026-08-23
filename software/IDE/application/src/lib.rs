@@ -7604,11 +7604,13 @@ impl RunningDesktopIdeApplication {
     /// Returns whether a fenced live mixer checkpoint requires explicit discard
     /// before closing. `None` is an indeterminate checkpoint and must fail closed.
     pub(crate) fn mixer_close_requires_discard(&self) -> Option<bool> {
+        #[cfg(test)]
         let session = match &self.session {
             IdePlaybackSessionOwner::Native(session) => session,
-            #[cfg(test)]
             IdePlaybackSessionOwner::Test(session) => return session.close_requires_discard,
         };
+        #[cfg(not(test))]
+        let IdePlaybackSessionOwner::Native(session) = &self.session;
         let project = session.prepared_project()?;
         let (_, mixer, _, _) = project.session().parts();
         match session.recovery_checkpoint().snapshot().mixer_parameter_state() {
@@ -12678,6 +12680,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture keeps every compared mixer baseline field visible"
+    )]
     fn live_mixer_dirty_state_compares_the_compiled_baseline() {
         let parent = TestDirectory::new();
         let created = hyper_storage_engine::create_project(
