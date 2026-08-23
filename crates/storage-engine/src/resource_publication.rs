@@ -3424,20 +3424,150 @@ fn validate_track_order_document_identity(
                 "track-order mixer must preserve exactly the active channels",
             ));
         };
-        if candidate_channel != previous_channel {
+        let mut normalized_channel = candidate_channel.clone();
+        restore_track_order_channel_base_state(&mut normalized_channel, previous_channel)?;
+        if normalized_channel != *previous_channel {
             return Err(failure(
                 ProjectResourcePublicationErrorKind::InvalidResource,
-                "track-order replacement changes a mixer channel",
+                "track-order replacement changes mixer channel fields outside the live base state",
             ));
         }
         consumed[index] = true;
     }
     candidate["channels"] = previous["channels"].clone();
+    restore_track_order_main_base_state(&mut candidate, &previous)?;
     if candidate != previous {
         return Err(failure(
             ProjectResourcePublicationErrorKind::InvalidResource,
-            "track-order replacement changes mixer fields other than channel order",
+            "track-order replacement changes mixer fields outside the live base state and channel order",
         ));
+    }
+    Ok(())
+}
+
+/// Replaces the mixer fields a fenced live session may persist before its
+/// structural track-order transaction. Every identity, route, extension, and
+/// immutable document field remains compared exactly against the active mixer.
+fn restore_track_order_channel_base_state(
+    candidate: &mut Value,
+    previous: &Value,
+) -> Result<(), ProjectResourcePublicationError> {
+    let candidate = candidate.as_object_mut().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-order candidate channel is not an object",
+        )
+    })?;
+    let previous = previous.as_object().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "active track-order channel is not an object",
+        )
+    })?;
+    restore_track_order_base_fields(
+        candidate,
+        previous,
+        &["gain_millionths", "pan_millionths", "mute", "solo"],
+        "channel",
+    )?;
+    let candidate_sends = candidate
+        .get_mut("sends")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-order candidate channel sends are invalid",
+            )
+        })?;
+    let previous_sends = previous
+        .get("sends")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "active track-order channel sends are invalid",
+            )
+        })?;
+    if candidate_sends.len() != previous_sends.len() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-order replacement changes mixer send count",
+        ));
+    }
+    for (candidate_send, previous_send) in candidate_sends.iter_mut().zip(previous_sends) {
+        let candidate_send = candidate_send.as_object_mut().ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-order candidate mixer send is not an object",
+            )
+        })?;
+        let previous_send = previous_send.as_object().ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "active track-order mixer send is not an object",
+            )
+        })?;
+        if candidate_send.get("id") != previous_send.get("id") {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-order replacement changes a mixer send identity",
+            ));
+        }
+        restore_track_order_base_fields(
+            candidate_send,
+            previous_send,
+            &["gain_millionths", "pan_millionths", "enabled"],
+            "send",
+        )?;
+    }
+    Ok(())
+}
+
+fn restore_track_order_main_base_state(
+    candidate: &mut Value,
+    previous: &Value,
+) -> Result<(), ProjectResourcePublicationError> {
+    let candidate = candidate
+        .get_mut("main")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-order candidate main mixer state is invalid",
+            )
+        })?;
+    let previous = previous
+        .get("main")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "active track-order main mixer state is invalid",
+            )
+        })?;
+    restore_track_order_base_fields(candidate, previous, &["gain_millionths", "mute"], "main")
+}
+
+fn restore_track_order_base_fields(
+    candidate: &mut serde_json::Map<String, Value>,
+    previous: &serde_json::Map<String, Value>,
+    fields: &[&str],
+    label: &str,
+) -> Result<(), ProjectResourcePublicationError> {
+    for field in fields {
+        let previous_value = previous.get(*field).ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                format!("active track-order mixer {label} is missing {field}"),
+            )
+        })?;
+        let candidate_value = candidate.get_mut(*field).ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                format!("track-order candidate mixer {label} is missing {field}"),
+            )
+        })?;
+        *candidate_value = previous_value.clone();
     }
     Ok(())
 }
@@ -6864,6 +6994,15 @@ mod tests {
     fn prepared_track_order_documents(
         fixture: &AudioTrackFixture,
     ) -> ([u8; 32], hyper_playback_json::AudioTrackReorderDocuments) {
+        let package = verify_project_package(&fixture.root).unwrap();
+        let mixer = package.read_resource(&fixture.mixer_id).unwrap();
+        prepared_track_order_documents_with_mixer(fixture, &mixer)
+    }
+
+    fn prepared_track_order_documents_with_mixer(
+        fixture: &AudioTrackFixture,
+        mixer: &[u8],
+    ) -> ([u8; 32], hyper_playback_json::AudioTrackReorderDocuments) {
         use hyper_playback_json::{
             LoaderLimits, PlaybackJsonInput, load as load_playback,
             serialize_audio_track_reorder,
@@ -6906,7 +7045,6 @@ mod tests {
             LoaderLimits::VERSION_1,
         )
         .unwrap();
-        let mixer = package.read_resource(&fixture.mixer_id).unwrap();
         let source_tracks: Vec<_> = track_ids
             .iter()
             .zip(&tracks)
@@ -6916,7 +7054,7 @@ mod tests {
             &project,
             &[],
             &source_tracks,
-            &mixer,
+            mixer,
             &fixture.mixer_id,
             NEW_TRACK_ID,
             0,
@@ -8799,6 +8937,41 @@ mod tests {
             .map(hyper_playback_json::AudioTrackReorderDocument::track_id)
             .collect();
         assert_eq!(ordered_tracks, vec![NEW_TRACK_ID, track_ids[0].as_str()]);
+    }
+
+    #[test]
+    fn track_order_refuses_mixer_changes_outside_the_fenced_live_base_state() {
+        let fixture = AudioTrackFixture::new();
+        publish_audio_track(&fixture.root, fixture.request()).unwrap();
+        let package = verify_project_package(&fixture.root).unwrap();
+        let identity = *package.manifest_sha256();
+        let previous_manifest = fs::read(fixture.root.join(MANIFEST_NAME)).unwrap();
+        let previous_mixer = package.read_resource(&fixture.mixer_id).unwrap();
+        let mut unrelated_mixer: Value = serde_json::from_slice(&previous_mixer).unwrap();
+        unrelated_mixer["cue"]["mute"] = true.into();
+        let unrelated_mixer = serde_json_canonicalizer::to_vec(&unrelated_mixer).unwrap();
+        let (_, documents) = prepared_track_order_documents_with_mixer(&fixture, &unrelated_mixer);
+
+        let error = publish_track_order(
+            &fixture.root,
+            TrackOrderPublicationRequest {
+                expected_project_sha256: identity,
+                mixer_id: &fixture.mixer_id,
+                documents: &documents,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ProjectResourcePublicationErrorKind::InvalidResource
+        );
+        assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), previous_manifest);
+        assert_eq!(
+            fs::read(fixture.root.join("mixer/main.json")).unwrap(),
+            previous_mixer
+        );
+        assert_eq!(fixture.transaction_count(), 0);
     }
 
     #[test]

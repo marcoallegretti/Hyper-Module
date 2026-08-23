@@ -13697,6 +13697,177 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "one real-worker scenario proves the complete structural track-order lifecycle, including the fenced mixer state and history invalidation"
+    )]
+    fn audio_track_reorder_is_durable_through_the_real_worker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-track-reorder-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+
+        let worker = DesktopIdeWorker::start_state(
+            WorkerState::Closed(closed_application()),
+            2,
+            8,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the verified project must open before track reorder");
+        };
+        let source_track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the created project has one audio track")
+            .id()
+            .to_owned();
+
+        worker
+            .try_send(IdeWorkerCommand::AddAudioTrack {
+                name: "Target".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::AudioTrackAdding));
+        let IdeWorkerEvent::Running(with_target) = recv(&worker) else {
+            panic!("adding the second track must reopen the project");
+        };
+        let target_track_id = with_target
+            .mixer_channels()
+            .iter()
+            .find(|channel| {
+                channel.kind() == IdeMixerChannelKind::Audio && channel.id() != source_track_id
+            })
+            .expect("the added audio track is present after reopen")
+            .id()
+            .to_owned();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioTrackAdded { revision: 2 }
+        ));
+
+        add_compressor_history(&worker, source_track_id.clone());
+        worker
+            .try_send(IdeWorkerCommand::Mixer(IdeMixerCommand::ChannelGain {
+                channel_index: 0,
+                gain_millionths: 750_000,
+            }))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::MixerQueued(IdeMixerCommand::ChannelGain {
+                channel_index: 0,
+                gain_millionths: 750_000,
+            })
+        ));
+        worker
+            .try_send(IdeWorkerCommand::Mixer(IdeMixerCommand::MainMute {
+                muted: true,
+            }))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::MixerQueued(IdeMixerCommand::MainMute { muted: true })
+        ));
+        while worker.events.as_ref().unwrap().try_recv().is_ok() {
+            // The periodic observation channel is intentionally lossy and may
+            // still carry a pre-mutation Running snapshot. The lifecycle
+            // assertion begins from the command boundary below.
+        }
+
+        worker
+            .try_send(IdeWorkerCommand::ReorderAudioTracks {
+                track_id: source_track_id.clone(),
+                destination_index: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioTracksReordering
+        ));
+        loop {
+            match recv_native_mutation(&worker) {
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: None,
+                    redo_label: None,
+                } => break,
+                // A timer observation can race the close fence. It predates
+                // publication and is not a replacement for the final reopen.
+                IdeWorkerEvent::Running(_) => {}
+                event => panic!("track reorder must invalidate history before final reopen: {event:?}"),
+            }
+        }
+        let IdeWorkerEvent::Running(reordered) = recv_native_mutation(&worker) else {
+            panic!("the reordered project must reopen before completion");
+        };
+        assert_eq!(
+            reordered
+                .mixer_channels()
+                .iter()
+                .map(IdeMixerChannel::id)
+                .collect::<Vec<_>>(),
+            vec![target_track_id.as_str(), source_track_id.as_str()]
+        );
+        assert_eq!(
+            reordered.mixer_channels()[1].state(),
+            Some(IdeMixerChannelState {
+                gain: 0.75,
+                pan: 0.0,
+                muted: false,
+                solo: false,
+            }),
+            "the reorder transaction must carry the fenced channel state exactly once"
+        );
+        assert_eq!(
+            reordered.mixer_main(),
+            Some(IdeMixerMainState {
+                gain: 1.0,
+                muted: true,
+            }),
+            "the reorder transaction must carry the mixer fence exactly once"
+        );
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioTracksReordered { revision: 4 }
+        ));
+
+        let package = verify_project_package(&project).unwrap();
+        assert_eq!(package.manifest().revision(), 4);
+        let (_, mixer) = project_mixer_bytes(&project);
+        let mixer: serde_json::Value = serde_json::from_slice(&mixer).unwrap();
+        assert!(mixer["main"]["mute"].as_bool().unwrap());
+        assert_eq!(
+            mixer["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|channel| channel["track_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![target_track_id.as_str(), source_track_id.as_str()]
+        );
+        assert_eq!(mixer["channels"][1]["gain_millionths"], 750_000);
+        drop(package);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "one real-worker scenario keeps mixer fencing, history invalidation, reopen, and MRU ordering visible"
     )]
     fn rename_reopens_the_same_package_and_refreshes_its_recent_project_name() {

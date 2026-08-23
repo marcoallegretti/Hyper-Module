@@ -11180,6 +11180,76 @@ mod tests {
     }
 
     #[test]
+    fn generated_track_reorder_buttons_emit_only_the_current_bounded_direction() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_visible(true);
+        let row = |index, track_id: &str, name: &str, earlier, later| MixerChannelRow {
+            index,
+            track_id: track_id.into(),
+            name: name.into(),
+            display_name: name.into(),
+            kind: "AUDIO".into(),
+            state_available: true,
+            gain_percent: 100.0,
+            pan_percent: 0.0,
+            muted: false,
+            solo: false,
+            solo_available: true,
+            renameable: true,
+            removable: true,
+            can_move_earlier: earlier,
+            can_move_later: later,
+            active: true,
+            activation_toggleable: true,
+        };
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![
+            row(0, "018f47a2-6b2d-7c11-8a44-001122334456", "Audio 1", false, true),
+            row(1, "018f47a2-6b2d-7c11-8a44-001122334457", "Target", true, false),
+        ]))));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        ui.global::<IdeActions>()
+            .on_reorder_audio_track(move |index, earlier| {
+                submitted_by_callback.borrow_mut().push((index, earlier));
+            });
+        ui.show().unwrap();
+
+        let move_target_earlier =
+            ElementHandle::find_by_accessible_label(&ui, "Move Target earlier")
+                .next()
+                .expect("the non-edge earlier control is visible");
+        assert_eq!(move_target_earlier.accessible_enabled(), Some(true));
+        move_target_earlier.mock_single_click(PointerEventButton::Left);
+        assert_eq!(submitted.borrow().as_slice(), &[(1, true)]);
+
+        let move_first_earlier =
+            ElementHandle::find_by_accessible_label(&ui, "Move Audio 1 earlier")
+                .next()
+                .expect("the first row exposes its disabled earlier control");
+        let move_target_later =
+            ElementHandle::find_by_accessible_label(&ui, "Move Target later")
+                .next()
+                .expect("the final row exposes its disabled later control");
+        assert_eq!(move_first_earlier.accessible_enabled(), Some(false));
+        assert_eq!(move_target_later.accessible_enabled(), Some(false));
+        move_first_earlier.mock_single_click(PointerEventButton::Left);
+        move_target_later.mock_single_click(PointerEventButton::Left);
+        assert_eq!(
+            submitted.borrow().as_slice(),
+            &[(1, true)],
+            "disabled edge controls must not emit speculative reorder requests"
+        );
+
+        ui.set_app_mode(AppMode::Closed);
+        assert_eq!(move_target_earlier.accessible_enabled(), Some(false));
+        move_target_earlier.mock_single_click(PointerEventButton::Left);
+        assert_eq!(submitted.borrow().as_slice(), &[(1, true)]);
+    }
+
+    #[test]
     fn focused_line_edits_consume_project_global_chords() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().unwrap();

@@ -9485,6 +9485,7 @@ mod tests {
     fn reorders_a_complete_flat_audio_project_and_matching_mixer() {
         let first_id = "018f47a2-6b2d-7c11-8a44-001122334456";
         let second_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let third_id = "018f47a2-6b2d-7c11-8a44-001122334470";
         let mixer_id = "018f47a2-6b2d-7c11-8a44-001122334468";
         let first = serde_json_canonicalizer::to_vec(&json!({
             "format":"hyper-track", "format_version":1, "id":first_id,
@@ -9494,8 +9495,14 @@ mod tests {
         .unwrap();
         let second = serde_json_canonicalizer::to_vec(&json!({
             "format":"hyper-track", "format_version":1, "id":second_id,
-            "project_id":PROJECT_ID, "name":"Second", "kind":"audio", "order":1,
+            "project_id":PROJECT_ID, "name":"Second", "kind":"audio", "order":3,
             "active":true, "clip_ids":[], "extensions":{"org.example.track":{"second":true}}
+        }))
+        .unwrap();
+        let third = serde_json_canonicalizer::to_vec(&json!({
+            "format":"hyper-track", "format_version":1, "id":third_id,
+            "project_id":PROJECT_ID, "name":"Third", "kind":"audio", "order":7,
+            "active":true, "clip_ids":[], "extensions":{"org.example.track":{"third":true}}
         }))
         .unwrap();
         let mixer = serde_json_canonicalizer::to_vec(&json!({
@@ -9503,20 +9510,20 @@ mod tests {
             "project_id":PROJECT_ID,
             "channels":[
                 {"track_id":first_id,"gain_millionths":750_000,"pan_millionths":0,"mute":false,"solo":false,"destination":{"kind":"main"},"sends":[]},
-                {"track_id":second_id,"gain_millionths":500_000,"pan_millionths":125_000,"mute":true,"solo":false,"destination":{"kind":"main"},"sends":[]}
+                {"track_id":second_id,"gain_millionths":500_000,"pan_millionths":125_000,"mute":true,"solo":false,"destination":{"kind":"main"},"sends":[]},
+                {"track_id":third_id,"gain_millionths":250_000,"pan_millionths":-125_000,"mute":false,"solo":true,"destination":{"kind":"main"},"sends":[]}
             ],
             "return_buses":[], "main":{"gain_millionths":900_000,"mute":false},
             "cue":{"source":"solo","gain_millionths":500_000,"mute":true},
             "extensions":{"org.example.mixer":{"kept":true}}
         }))
         .unwrap();
-        let tracks: [&[u8]; 2] = [&first, &second];
+        let tracks: [&[u8]; 3] = [&first, &second, &third];
         let project = load(input(TIMELINE, &tracks, &[], None), LoaderLimits::VERSION_1).unwrap();
-
         let reordered = serialize_audio_track_reorder(
             &project,
             &[],
-            &[(first_id, &first), (second_id, &second)],
+            &[(first_id, &first), (second_id, &second), (third_id, &third)],
             &mixer,
             mixer_id,
             second_id,
@@ -9531,19 +9538,21 @@ mod tests {
                 .iter()
                 .map(AudioTrackReorderDocument::track_id)
                 .collect::<Vec<_>>(),
-            vec![second_id, first_id]
+            vec![second_id, first_id, third_id]
         );
         let reordered_first: Value = serde_json::from_slice(reordered.tracks()[1].bytes()).unwrap();
         let reordered_second: Value = serde_json::from_slice(reordered.tracks()[0].bytes()).unwrap();
-        assert_eq!(reordered_first["order"], 1);
+        let reordered_third: Value = serde_json::from_slice(reordered.tracks()[2].bytes()).unwrap();
+        assert_eq!(reordered_first["order"], 3);
         assert_eq!(reordered_second["order"], 0);
+        assert_eq!(reordered_third["order"], 7);
         assert_eq!(
-            reordered_first["extensions"]["org.example.track"],
-            json!({"first":true})
-        );
-        assert_eq!(
-            reordered_second["extensions"]["org.example.track"],
-            json!({"second":true})
+            [
+                reordered_first["extensions"]["org.example.track"].clone(),
+                reordered_second["extensions"]["org.example.track"].clone(),
+                reordered_third["extensions"]["org.example.track"].clone(),
+            ],
+            [json!({"first":true}), json!({"second":true}), json!({"third":true})]
         );
         let reordered_mixer: Value = serde_json::from_slice(reordered.mixer()).unwrap();
         assert_eq!(
@@ -9553,13 +9562,12 @@ mod tests {
                 .iter()
                 .map(|channel| channel["track_id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            vec![second_id, first_id]
+            vec![second_id, first_id, third_id]
         );
         assert_eq!(
             reordered_mixer["extensions"]["org.example.mixer"],
             json!({"kept":true})
         );
-
         let reopened_tracks: Vec<_> = reordered
             .tracks()
             .iter()
