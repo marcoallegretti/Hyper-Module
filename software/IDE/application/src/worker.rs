@@ -14339,6 +14339,132 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "one real-worker scenario proves full track-content removal fences the mixer, invalidates history, and reopens the reduced project"
+    )]
+    fn audio_track_content_removal_is_durable_through_the_real_worker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-track-content-removal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+
+        let worker = DesktopIdeWorker::start_state(
+            WorkerState::Closed(closed_application()),
+            2,
+            8,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the verified project must open before content removal");
+        };
+        let source_track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the created project has one audio track")
+            .id()
+            .to_owned();
+
+        add_compressor_history(&worker, source_track_id.clone());
+        worker
+            .try_send(IdeWorkerCommand::Mixer(IdeMixerCommand::ChannelGain {
+                channel_index: 0,
+                gain_millionths: 750_000,
+            }))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::MixerQueued(IdeMixerCommand::ChannelGain {
+                channel_index: 0,
+                gain_millionths: 750_000,
+            })
+        ));
+        while worker.events.as_ref().unwrap().try_recv().is_ok() {
+            // Timer observations predate the structural command boundary.
+        }
+
+        worker
+            .try_send(IdeWorkerCommand::RemoveAudioTrackContent {
+                track_id: source_track_id.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioTrackContentRemoving
+        ));
+        loop {
+            match recv_native_mutation(&worker) {
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: None,
+                    redo_label: None,
+                } => break,
+                IdeWorkerEvent::Running(_) => {}
+                event => panic!(
+                    "track-content removal must invalidate incompatible history before final reopen: {event:?}"
+                ),
+            }
+        }
+        let IdeWorkerEvent::Running(reopened) = recv_native_mutation(&worker) else {
+            panic!("the reduced project must reopen before completion");
+        };
+        assert!(
+            reopened
+                .mixer_channels()
+                .iter()
+                .all(|channel| channel.id() != source_track_id),
+            "the removed track must not survive the reopened project"
+        );
+        assert!(
+            reopened
+                .native_devices()
+                .iter()
+                .all(|device| match device {
+                    IdeNativeDevice::Filter(filter) => filter.track_id() != source_track_id,
+                    IdeNativeDevice::Compressor(compressor) => {
+                        compressor.track_id() != source_track_id
+                    }
+                }),
+            "the removed track's native device chain must not survive the reopened project"
+        );
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioTrackContentRemoved {
+                revision: 3,
+                track_id,
+            } if track_id == source_track_id
+        ));
+
+        let package = verify_project_package(&project).unwrap();
+        assert_eq!(package.manifest().revision(), 3);
+        assert!(
+            package
+                .manifest()
+                .resources()
+                .iter()
+                .all(|resource| resource.id() != source_track_id),
+        );
+        drop(package);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "one real-worker scenario keeps mixer fencing, history invalidation, reopen, and MRU ordering visible"
     )]
     fn rename_reopens_the_same_package_and_refreshes_its_recent_project_name() {
