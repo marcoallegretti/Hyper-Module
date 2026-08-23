@@ -2,7 +2,7 @@ import { Button, ComboBox, LineEdit, ListView, Slider } from "std-widgets.slint"
 
 component IdeLineEdit inherits LineEdit {
     key-pressed(event) => {
-        if event.modifiers.control && !event.modifiers.shift && !event.modifiers.alt && !event.modifiers.meta && !event.repeat && (event.text == "w" || event.text == "W") {
+        if event.modifiers.control && !event.modifiers.shift && !event.modifiers.alt && !event.modifiers.meta && !event.repeat && ((event.text == "w" || event.text == "W") || (event.text == "e" || event.text == "E")) {
             return accept;
         }
         reject

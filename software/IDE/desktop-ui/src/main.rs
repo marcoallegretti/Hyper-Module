@@ -10560,11 +10560,12 @@ mod tests {
     }
 
     #[test]
-    fn focused_line_edits_consume_the_project_close_chord() {
+    fn focused_line_edits_consume_project_global_chords() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = MainWindow::new().unwrap();
         configure_ui_contracts(&ui);
         ui.set_app_mode(AppMode::Running);
+        ui.set_export_available(true);
         ui.set_scene_rename_visible(true);
         ui.show().unwrap();
 
@@ -10580,11 +10581,22 @@ mod tests {
         ui.global::<IdeActions>().on_close_project(move || {
             closed_by_callback.set(closed_by_callback.get() + 1);
         });
+        let exports = Rc::new(Cell::new(0_usize));
+        let exports_by_callback = Rc::clone(&exports);
+        ui.global::<IdeActions>().on_export_project(move || {
+            exports_by_callback.set(exports_by_callback.get() + 1);
+        });
         dispatch_ide_shortcut(&ui, "w", false, false);
+        dispatch_ide_shortcut(&ui, "e", false, false);
         assert_eq!(
             closed.get(),
             0,
             "a focused LineEdit owns the primary close chord instead of abandoning its editor"
+        );
+        assert_eq!(
+            exports.get(),
+            0,
+            "a focused LineEdit owns the primary export chord instead of opening an unrelated native picker"
         );
     }
 
