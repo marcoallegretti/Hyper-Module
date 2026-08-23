@@ -10460,6 +10460,21 @@ mod tests {
         ui.set_app_mode(AppMode::Running);
         ui.set_mixer_unsaved_changes(false);
         ui.set_close_unsaved_mixer_confirming(false);
+        let dirty_observation = IdeRunningObservation::for_ui_test(
+            PlaybackRecoverySnapshot::for_test(PlaybackRecoveryTransportState::Stopped, 0),
+        )
+        .with_mixer_unsaved_changes(true);
+        apply_event(
+            ui,
+            &UiRoutes::default(),
+            &Rc::new(ProjectUiState::default()),
+            IdeWorkerEvent::Running(dirty_observation),
+        );
+        assert!(
+            ui.get_mixer_unsaved_changes(),
+            "the generated mixer presentation must retain the worker's authoritative dirty observation"
+        );
+        ui.set_close_unsaved_mixer_confirming(false);
         ui.global::<IdeActions>().invoke_close_project();
         assert!(
             matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::CloseProject]),

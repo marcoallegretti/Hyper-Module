@@ -1381,6 +1381,14 @@ impl IdeRunningObservation {
         }
     }
 
+    /// Sets the authoritative dirty-mixer projection for a generated UI test.
+    #[cfg(feature = "ui-test-support")]
+    #[must_use]
+    pub fn with_mixer_unsaved_changes(mut self, mixer_unsaved_changes: bool) -> Self {
+        self.mixer_unsaved_changes = mixer_unsaved_changes;
+        self
+    }
+
     /// Identifies the playback session that produced this observation.
     ///
     /// The value changes whenever project playback is closed and reopened,
