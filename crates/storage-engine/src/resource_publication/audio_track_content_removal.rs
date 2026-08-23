@@ -24,6 +24,7 @@ use crate::project_lock::{
 use crate::stable_file::verify_open_stable;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
+use hyper_fs_authority::{identity, rename_no_replace};
 use hyper_native_device::DeviceChain;
 use hyper_playback_json::{AudioTrackContentRemovalDocument, AudioTrackContentRemovalDocuments};
 use hyper_project_model::{ProjectManifest, ResourceRole, is_valid_entity_id};
@@ -89,7 +90,7 @@ impl AudioTrackContentRemovalPublicationRecovery {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PublicationPhase { Transaction, Resource(usize), Manifest }
+enum PublicationPhase { Transaction, ResourceMoved(usize), Resource(usize), Manifest }
 
 #[derive(Debug)]
 struct Entry<'a> {
@@ -186,7 +187,7 @@ fn publish_observed(
     }
     let entries = resolve_entries(&verified, request.documents)?;
     let removed_track_id = request.documents.track().id().to_owned();
-    let authorities = removal_authorities(&verified.root_dir, &entries)?;
+    let authorities = resource_authorities(&verified.root_dir, &entries)?;
     let backups = open_or_create_dir(&verified.root_dir, "backups")?;
     let _lock = ProjectLock::acquire(&backups).map_err(|error| {
         caused(ProjectResourcePublicationErrorKind::TransactionUnavailable, "acquire project storage transaction lock", error)
@@ -287,8 +288,22 @@ const fn role_name(role: ResourceRole) -> &'static str {
 }
 fn role_from_name(value: &str) -> Option<ResourceRole> { Some(match value { "track" => ResourceRole::Track, "clip" => ResourceRole::Clip, "mixer" => ResourceRole::Mixer, "arrangement" => ResourceRole::Arrangement, "scene" => ResourceRole::Scene, "automation-take" => ResourceRole::AutomationTake, "device-chain" => ResourceRole::DeviceChain, _ => return None }) }
 
-fn removal_authorities(root: &Dir, entries: &[Entry<'_>]) -> Result<Vec<Option<Handle>>, ProjectResourcePublicationError> {
-    entries.iter().map(|entry| match entry.replacement { Some(_) => Ok(None), None => verified_file_authority(root, &entry.path, &entry.previous, ProjectResourcePublicationErrorKind::ProjectChanged, "verify removed track-content resource before staging").map(Some) }).collect()
+fn resource_authorities(
+    root: &Dir,
+    entries: &[Entry<'_>],
+) -> Result<Vec<Handle>, ProjectResourcePublicationError> {
+    entries
+        .iter()
+        .map(|entry| {
+            verified_file_authority(
+                root,
+                &entry.path,
+                &entry.previous,
+                ProjectResourcePublicationErrorKind::ProjectChanged,
+                "verify track-content resource before staging",
+            )
+        })
+        .collect()
 }
 
 fn verified_file_authority(root: &Dir, path: &str, expected: &[u8], kind: ProjectResourcePublicationErrorKind, operation: &'static str) -> Result<Handle, ProjectResourcePublicationError> {
@@ -324,7 +339,7 @@ fn candidate_manifest(active: &[u8], entries: &[Entry<'_>], revision: u64) -> Re
 #[allow(clippy::too_many_arguments, clippy::too_many_lines, reason = "the full staging, retained deletion, and manifest-last ordering must remain auditable together")]
 fn run_publication(
     verified: &StructurallyVerifiedProject, backups: &Dir, transaction: &Dir, name: &str,
-    entries: &[Entry<'_>], authorities: &[Option<Handle>], removed_track_id: &str,
+    entries: &[Entry<'_>], authorities: &[Handle], removed_track_id: &str,
     previous_project: &[u8], candidate_project: &[u8], next_revision: u64,
     observer: &mut impl FnMut(PublicationPhase, &Path) -> Result<(), ProjectResourcePublicationError>,
 ) -> Result<AudioTrackContentRemovalPublicationOutcome, ProjectResourcePublicationError> {
@@ -348,21 +363,23 @@ fn run_publication(
     write_exclusive_synced(transaction, TRANSACTION_NAME, &bytes)?; sync_dir(transaction)?; sync_dir(backups)?;
     observer(PublicationPhase::Transaction, verified.root())?;
     for (index, (entry, authority)) in entries.iter().zip(authorities).enumerate() {
+        move_verified_resource(
+            &verified.root_dir,
+            transaction,
+            &tx.entries[index],
+            &entry.previous,
+            authority,
+        )?;
+        observer(PublicationPhase::ResourceMoved(index), verified.root())?;
         if entry.replacement.is_some() {
             let parent = open_relative_parent(&verified.root_dir, &entry.path)?;
-            publish_staged_file(transaction, &staged_name(index), &parent, &parent, file_name(&entry.path)?, &format!(".track-content-removal-{index}-{}.json", tx.id), "track-content replacement")?;
-        } else {
-            move_verified_resource(
-                &verified.root_dir,
+            publish_staged_file_no_replace(
                 transaction,
-                &tx.entries[index],
-                &entry.previous,
-                authority.as_ref().ok_or_else(|| {
-                    failure(
-                        ProjectResourcePublicationErrorKind::Integrity,
-                        "removed track-content resource authority is missing",
-                    )
-                })?,
+                &staged_name(index),
+                &parent,
+                file_name(&entry.path)?,
+                &format!(".track-content-removal-{index}-{}.json", tx.id),
+                "track-content replacement",
             )?;
         }
         observer(PublicationPhase::Resource(index), verified.root())?;
@@ -397,7 +414,7 @@ fn transaction_record(
     let records = entries.iter().enumerate().map(|(index, entry)| TransactionEntry {
         id: entry.id.clone(), role: role_name(entry.role).to_owned(), previous: transaction_file(&entry.path, &entry.previous),
         replacement: entry.replacement.map(|bytes| transaction_file(&entry.path, bytes)),
-        backup_name: entry.replacement.is_none().then(|| backup_name(index)),
+        backup_name: Some(backup_name(index)),
     }).collect();
     Ok(Transaction { format: FORMAT.to_owned(), format_version: VERSION, id: transaction_id(name)?, before_project_sha256: hex_digest(*verified.manifest_sha256()), after_project_sha256: hex_digest(digest(candidate_project)), before_project_revision: verified.manifest().revision(), after_project_revision: revision, removed_track_id: track_id.to_owned(), entries: records, removed_directories, extensions: serde_json::Map::new() })
 }
@@ -445,7 +462,7 @@ fn move_verified_resource(
     expected: &[u8],
     authority: &Handle,
 ) -> Result<(), ProjectResourcePublicationError> {
-    let backup = entry.backup_name.as_deref().ok_or_else(|| failure(ProjectResourcePublicationErrorKind::Integrity, "removed track-content transaction entry has no backup name"))?;
+    let backup = entry.backup_name.as_deref().ok_or_else(|| failure(ProjectResourcePublicationErrorKind::Integrity, "track-content transaction entry has no backup name"))?;
     let parent = open_relative_parent(root, &entry.previous.path)?; let name = file_name(&entry.previous.path)?;
     parent.rename(name, transaction, backup).map_err(|error| caused(ProjectResourcePublicationErrorKind::ProjectChanged, "move removed track-content resource into transaction", error))?; sync_dir(&parent)?; sync_dir(transaction)?;
     let moved = verified_file_authority(
@@ -453,11 +470,49 @@ fn move_verified_resource(
         backup,
         expected,
         ProjectResourcePublicationErrorKind::ProjectChanged,
-        "verify moved track-content removal resource",
+        "verify moved track-content resource",
     );
     if moved.as_ref().is_ok_and(|candidate| candidate == authority) { return Ok(()); }
     transaction.rename(backup, &parent, name).map_err(|error| caused(ProjectResourcePublicationErrorKind::Recovery, "restore changed track-content resource after authority mismatch", error))?; sync_dir(&parent)?; sync_dir(transaction)?;
-    match moved { Ok(_) => Err(failure(ProjectResourcePublicationErrorKind::ProjectChanged, "track-content resource path changed before removal")), Err(error) => Err(error) }
+    match moved { Ok(_) => Err(failure(ProjectResourcePublicationErrorKind::ProjectChanged, "track-content resource path changed before publication")), Err(error) => Err(error) }
+}
+
+fn publish_staged_file_no_replace(
+    transaction: &Dir,
+    staged_name: &str,
+    destination: &Dir,
+    destination_name: &str,
+    temporary_name: &str,
+    label: &str,
+) -> Result<(), ProjectResourcePublicationError> {
+    let bytes = read_bounded(transaction, staged_name, MAX_JSON_BYTES)?;
+    write_exclusive_synced(destination, temporary_name, &bytes)?;
+    sync_dir(destination)?;
+    let metadata = destination.symlink_metadata(temporary_name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            format!("inspect staged {label}"),
+            error,
+        )
+    })?;
+    match rename_no_replace(
+        destination,
+        temporary_name,
+        identity(&metadata),
+        destination,
+        destination_name,
+    ) {
+        Ok(()) => sync_dir(destination),
+        Err(error) => {
+            remove_optional_matching_file(destination, temporary_name, digest(&bytes))?;
+            sync_dir(destination)?;
+            Err(caused(
+                ProjectResourcePublicationErrorKind::ProjectChanged,
+                format!("publish {label} without overwriting a concurrent resource"),
+                error,
+            ))
+        }
+    }
 }
 
 fn write_intent(transaction: &Dir, name: &str, count: usize) -> Result<(), ProjectResourcePublicationError> {
@@ -552,8 +607,35 @@ fn preflight_rollback(root: &Dir, transaction: &Dir, tx: &Transaction) -> Result
     for entry in &tx.entries {
         let parent = open_relative_parent(root, &entry.previous.path)?; let active = read_optional_file(&parent, file_name(&entry.previous.path)?)?;
         if let Some(replacement) = &entry.replacement {
-            let found = active.as_deref().map(digest); let before = decode_digest(&entry.previous.sha256)?; let after = decode_digest(&replacement.sha256)?;
-            if !matches!(found, Some(value) if value == before || value == after) { return Err(failure(ProjectResourcePublicationErrorKind::Recovery, "track-content rollback refuses unrelated replacement content")); }
+            let found = active.as_deref().map(digest);
+            let before = decode_digest(&entry.previous.sha256)?;
+            let after = decode_digest(&replacement.sha256)?;
+            let backup = entry.backup_name.as_deref();
+            let (backup_present, backup_matches) = if let Some(name) = backup {
+                let present = entry_present(transaction, name)?;
+                let matches = !present
+                    || digest(&read_bounded(transaction, name, MAX_JSON_BYTES)?) == before;
+                (present, matches)
+            } else {
+                (false, true)
+            };
+            let legacy_replacement = backup.is_none();
+            let valid = if legacy_replacement {
+                matches!(found, Some(value) if value == before || value == after)
+            } else {
+                match (found, backup_present, backup_matches) {
+                    (Some(value), false, true) => value == before,
+                    (Some(value), true, true) => value == after,
+                    (None, true, true) => true,
+                    _ => false,
+                }
+            };
+            if !valid {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    "track-content rollback refuses unrelated replacement content",
+                ));
+            }
         } else {
             let backup = entry.backup_name.as_deref().ok_or_else(|| failure(ProjectResourcePublicationErrorKind::Recovery, "removed track-content entry lacks backup authority"))?;
             let backup_present = entry_present(transaction, backup)?; let expected = decode_digest(&entry.previous.sha256)?;
@@ -606,7 +688,15 @@ fn validate_staged_transaction(transaction: &Dir, tx: &Transaction) -> Result<()
         }
         expected_names.insert(previous_name(index));
         match (&entry.replacement, &entry.backup_name) {
-            (Some(replacement), None) => {
+            (Some(replacement), backup) => {
+                if let Some(backup) = backup
+                    && backup != &backup_name(index)
+                {
+                    return Err(failure(
+                        ProjectResourcePublicationErrorKind::Recovery,
+                        "track-content replacement backup name is invalid",
+                    ));
+                }
                 let bytes = read_bounded(transaction, &staged_name(index), MAX_JSON_BYTES)?;
                 if bytes.len() as u64 != replacement.byte_length
                     || digest(&bytes) != decode_digest(&replacement.sha256)?
@@ -621,6 +711,9 @@ fn validate_staged_transaction(transaction: &Dir, tx: &Transaction) -> Result<()
                     || candidate_descriptor.sha256() != replacement.sha256
                 { return Err(failure(ProjectResourcePublicationErrorKind::Recovery, "track-content removal candidate replacement descriptor changed")); }
                 expected_names.insert(staged_name(index));
+                if let Some(backup) = backup {
+                    expected_names.insert(backup.clone());
+                }
             }
             (None, Some(backup)) if backup == &backup_name(index) => {
                 if candidate_manifest.resources().iter().any(|descriptor| descriptor.id() == entry.id) {
@@ -1107,6 +1200,65 @@ mod tests {
         assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
         assert_eq!(fs::read(fixture.root.join("tracks/lead.json")).unwrap(), replacement);
         assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), previous_manifest);
+        assert!(verify_project_package(&fixture.root).is_err());
+    }
+
+    #[test]
+    fn refuses_a_replaced_replacement_resource_without_overwriting_it() {
+        let fixture = Fixture::new();
+        let (identity, documents) = fixture.documents();
+        let previous_manifest = fs::read(fixture.root.join(MANIFEST_NAME)).unwrap();
+        let mut replacement: serde_json::Value = serde_json::from_slice(&fixture.mixer).unwrap();
+        replacement["main"]["gain_millionths"] = 900_000.into();
+        let replacement = canonical(replacement);
+        let error = publish_observed(
+            &fixture.root,
+            AudioTrackContentRemovalPublicationRequest {
+                expected_project_sha256: identity,
+                documents: &documents,
+            },
+            |phase, _| {
+                if phase == PublicationPhase::Transaction {
+                    fs::write(fixture.root.join("mixer/main.json"), &replacement).unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
+        assert_eq!(fs::read(fixture.root.join("mixer/main.json")).unwrap(), replacement);
+        assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), previous_manifest);
+        assert!(verify_project_package(&fixture.root).is_err());
+    }
+
+    #[test]
+    fn refuses_a_replacement_created_after_current_authority_is_moved() {
+        let fixture = Fixture::new();
+        let (identity, documents) = fixture.documents();
+        let previous_manifest = fs::read(fixture.root.join(MANIFEST_NAME)).unwrap();
+        let mut replacement: serde_json::Value = serde_json::from_slice(&fixture.mixer).unwrap();
+        replacement["main"]["gain_millionths"] = 900_000.into();
+        let replacement = canonical(replacement);
+        let error = publish_observed(
+            &fixture.root,
+            AudioTrackContentRemovalPublicationRequest {
+                expected_project_sha256: identity,
+                documents: &documents,
+            },
+            |phase, _| {
+                if phase == PublicationPhase::ResourceMoved(0) {
+                    fs::write(fixture.root.join("mixer/main.json"), &replacement).unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
+        assert_eq!(fs::read(fixture.root.join("mixer/main.json")).unwrap(), replacement);
+        assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), previous_manifest);
+        assert!(fs::read_dir(fixture.root.join("mixer"))
+            .unwrap()
+            .all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".track-content-removal-")));
         assert!(verify_project_package(&fixture.root).is_err());
     }
 }
