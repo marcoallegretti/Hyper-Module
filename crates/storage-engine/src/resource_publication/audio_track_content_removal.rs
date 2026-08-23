@@ -1083,4 +1083,30 @@ mod tests {
         assert_eq!(package.read_resource(MIXER_ID).unwrap(), previous_mixer);
         assert_eq!(fs::read(fixture.root.join("assets/recordings/retained.wav")).unwrap(), vec![0x3C; 64]);
     }
+
+    #[test]
+    fn refuses_a_replaced_removed_resource_without_deleting_the_replacement() {
+        let fixture = Fixture::new();
+        let (identity, documents) = fixture.documents();
+        let previous_manifest = fs::read(fixture.root.join(MANIFEST_NAME)).unwrap();
+        let replacement = canonical(json!({
+            "format":"hyper-track","format_version":1,"id":TRACK_ID,
+            "project_id":PROJECT_ID,"name":"Changed","kind":"audio","order":0,
+            "active":true,"clip_ids":[],"extensions":{}
+        }));
+        let error = publish_observed(
+            &fixture.root,
+            AudioTrackContentRemovalPublicationRequest { expected_project_sha256: identity, documents: &documents },
+            |phase, _| {
+                if phase == PublicationPhase::Transaction {
+                    fs::write(fixture.root.join("tracks/lead.json"), &replacement).unwrap();
+                }
+                Ok(())
+            },
+        ).unwrap_err();
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::Recovery);
+        assert_eq!(fs::read(fixture.root.join("tracks/lead.json")).unwrap(), replacement);
+        assert_eq!(fs::read(fixture.root.join(MANIFEST_NAME)).unwrap(), previous_manifest);
+        assert!(verify_project_package(&fixture.root).is_err());
+    }
 }
