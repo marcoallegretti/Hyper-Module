@@ -13,6 +13,7 @@ use hyper_desktop_audio::{DesktopAudioPreviewSnapshot, DesktopAudioPreviewState}
 use hyper_fs_authority::path_is_proven_absent;
 use hyper_mixer_runtime::{LatestOutputMeterSnapshot, PlaybackRecoverySnapshot, TransportCommand};
 use hyper_playback_json::SceneTrackAction;
+use hyper_project_model::is_valid_interactive_project_name;
 use hyper_project_history::{ProjectHistory, ProjectHistoryError, RecentProject};
 use hyper_recording_metadata::RecordingCaptureKind;
 use hyper_runtime_bundle_builder::{
@@ -21,7 +22,9 @@ use hyper_runtime_bundle_builder::{
 };
 use hyper_storage_engine::{
     ProjectCopyError, ProjectCopyRequest, ProjectCreationError, ProjectCreationRequest,
+    ProjectRenameError, ProjectRenameOutcome, ProjectRenameRequest,
     copy_project as copy_project_package, create_project as create_project_package,
+    rename_project as rename_project_package,
 };
 use hyper_thread_supervisor::{ThreadPermit, ThreadSupervisor, ThreadSupervisorSnapshot};
 
@@ -146,6 +149,7 @@ pub enum IdeWorkerCommandKind {
     Monitoring,
     SaveProject,
     SaveProjectAs,
+    RenameProject,
     PrepareRuntime,
     AddAudioTrack,
     RemoveAudioTrack,
@@ -244,6 +248,9 @@ pub enum IdeWorkerCommand {
     SaveProjectAs {
         parent: PathBuf,
         directory_name: String,
+        project_name: String,
+    },
+    RenameProject {
         project_name: String,
     },
     PrepareRuntime {
@@ -436,6 +443,10 @@ pub enum IdeWorkerCommand {
 
 impl IdeWorkerCommand {
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive command-to-kind mapping keeps every queued command observable"
+    )]
     pub const fn kind(&self) -> IdeWorkerCommandKind {
         match self {
             Self::RetryDiscovery => IdeWorkerCommandKind::RetryDiscovery,
@@ -459,6 +470,7 @@ impl IdeWorkerCommand {
             Self::Monitoring(_) => IdeWorkerCommandKind::Monitoring,
             Self::SaveProject => IdeWorkerCommandKind::SaveProject,
             Self::SaveProjectAs { .. } => IdeWorkerCommandKind::SaveProjectAs,
+            Self::RenameProject { .. } => IdeWorkerCommandKind::RenameProject,
             Self::PrepareRuntime { .. } => IdeWorkerCommandKind::PrepareRuntime,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
@@ -1664,6 +1676,86 @@ impl Error for IdeProjectCopyError {
 }
 
 #[derive(Debug)]
+pub enum IdeProjectRenameError {
+    InvalidName,
+    Save(IdeProjectSaveError),
+    NativeClose(IdeNativeCloseFailure),
+    ProjectSnapshotUnavailable,
+    Rename(ProjectRenameError),
+    RenameAfterMixerSave {
+        source: Box<ProjectRenameError>,
+    },
+    ReopenAfterPublication {
+        outcome: Box<ProjectRenameOutcome>,
+        source: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterFailure {
+        rename: Box<IdeProjectRenameError>,
+        source: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeProjectRenameError {
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        match self {
+            Self::Rename(source) => source.published(),
+            Self::RenameAfterMixerSave { source } => source.published(),
+            Self::ReopenAfterFailure { rename, .. } => rename.publication_committed(),
+            Self::ReopenAfterPublication { .. } => true,
+            Self::InvalidName
+            | Self::Save(_)
+            | Self::NativeClose(_)
+            | Self::ProjectSnapshotUnavailable => false,
+        }
+    }
+}
+
+impl fmt::Display for IdeProjectRenameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidName => formatter.write_str(
+                "project name must contain 1 to 120 characters without outer whitespace or control characters",
+            ),
+            Self::Save(source) => write!(formatter, "project could not be saved before renaming: {source}"),
+            Self::NativeClose(source) => {
+                write!(formatter, "project could not close before renaming: {source:?}")
+            }
+            Self::ProjectSnapshotUnavailable => {
+                formatter.write_str("the opened project snapshot is unavailable for renaming")
+            }
+            Self::Rename(source) => write!(formatter, "project rename failed: {source}"),
+            Self::RenameAfterMixerSave { source } => write!(
+                formatter,
+                "live mixer changes were saved, but project rename failed: {source}"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "project was renamed through revision {} but could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::ReopenAfterFailure { rename, source } => write!(
+                formatter,
+                "project rename failed ({rename}) and the project could not be reopened: {source}"
+            ),
+        }
+    }
+}
+
+impl Error for IdeProjectRenameError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Save(source) => Some(source),
+            Self::InvalidName | Self::NativeClose(_) | Self::ProjectSnapshotUnavailable => None,
+            Self::Rename(source) => Some(source),
+            Self::RenameAfterMixerSave { source } => Some(source.as_ref()),
+            Self::ReopenAfterPublication { source, .. }
+            | Self::ReopenAfterFailure { source, .. } => Some(source.as_ref()),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum IdeRuntimePreparationError {
     Save(IdeProjectSaveError),
     Bundle(RuntimeBundleBuildError),
@@ -1739,6 +1831,7 @@ pub enum IdeWorkerCommandFailure {
     InputSelection(IdeInputSelectionError),
     ProjectCreation(Box<IdeProjectCreationError>),
     ProjectCopy(Box<IdeProjectCopyError>),
+    ProjectRename(Box<IdeProjectRenameError>),
     ProjectOpen(IdeProjectOpenError),
     RecentProjectMissing(PathBuf),
     Transport(super::DesktopDirectControlError),
@@ -1866,6 +1959,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::InputSelection(source) => source.fmt(formatter),
             Self::ProjectCreation(source) => source.fmt(formatter),
             Self::ProjectCopy(source) => source.fmt(formatter),
+            Self::ProjectRename(source) => source.fmt(formatter),
             Self::ProjectOpen(source) => source.fmt(formatter),
             Self::RecentProjectMissing(path) => {
                 write!(
@@ -1965,6 +2059,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::InputSelection(source) => Some(source),
             Self::ProjectCreation(source) => Some(source),
             Self::ProjectCopy(source) => Some(source),
+            Self::ProjectRename(source) => Some(source),
             Self::ProjectOpen(source) => Some(source),
             Self::Transport(source) => Some(source),
             Self::Seek(source) => Some(source),
@@ -2109,6 +2204,16 @@ pub enum IdeWorkerEvent {
     ProjectCopyCommittedWithWarning {
         project_path: PathBuf,
         warning: Box<IdeProjectCopyError>,
+    },
+    ProjectRenamed {
+        revision: u64,
+        changed: bool,
+        mixer_changed: bool,
+        name: String,
+    },
+    ProjectRenameCommittedWithWarning {
+        name: String,
+        warning: Box<IdeProjectRenameError>,
     },
     RuntimePreparing,
     RuntimePrepared {
@@ -2390,6 +2495,7 @@ pub enum IdeWorkerEvent {
     AudioPreviewStopRequested,
     AudioPreviewControlApplied(IdeAudioPreviewControlCommand),
     Saving,
+    ProjectRenaming,
     AudioTrackAdding,
     AudioTrackRemoving,
     AudioTrackRenaming,
@@ -2868,6 +2974,9 @@ enum ProjectMutation {
         directory_name: String,
         project_name: String,
     },
+    RenameProject {
+        project_name: String,
+    },
     PrepareRuntime {
         output_path: PathBuf,
     },
@@ -3046,6 +3155,7 @@ impl ProjectMutation {
             Self::SetMeter { .. } => IdeWorkerCommandKind::SetMeter,
             Self::SaveMixer => IdeWorkerCommandKind::SaveProject,
             Self::SaveProjectAs { .. } => IdeWorkerCommandKind::SaveProjectAs,
+            Self::RenameProject { .. } => IdeWorkerCommandKind::RenameProject,
             Self::PrepareRuntime { .. } => IdeWorkerCommandKind::PrepareRuntime,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
@@ -3118,6 +3228,7 @@ impl ProjectMutation {
     fn pending_event(&self) -> IdeWorkerEvent {
         match self {
             Self::SaveMixer | Self::SaveProjectAs { .. } => IdeWorkerEvent::Saving,
+            Self::RenameProject { .. } => IdeWorkerEvent::ProjectRenaming,
             Self::PrepareRuntime { .. } => IdeWorkerEvent::RuntimePreparing,
             Self::AddAudioTrack { .. } => IdeWorkerEvent::AudioTrackAdding,
             Self::RemoveAudioTrack { .. } => IdeWorkerEvent::AudioTrackRemoving,
@@ -3414,6 +3525,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
     match command {
         IdeWorkerCommandKind::SaveProject => "mixer save",
         IdeWorkerCommandKind::SaveProjectAs => "project copy",
+        IdeWorkerCommandKind::RenameProject => "project rename",
         IdeWorkerCommandKind::PrepareRuntime => "Runtime preparation save",
         IdeWorkerCommandKind::RenameAudioTrack => "track rename",
         IdeWorkerCommandKind::SetAudioTrackActive => "track activation",
@@ -3764,6 +3876,7 @@ fn process_command(
         IdeWorkerCommand::Monitoring(command) => process_monitoring_command(state, command, events),
         command @ (IdeWorkerCommand::SaveProject
         | IdeWorkerCommand::SaveProjectAs { .. }
+        | IdeWorkerCommand::RenameProject { .. }
         | IdeWorkerCommand::PrepareRuntime { .. }
         | IdeWorkerCommand::AddAudioTrack { .. }
         | IdeWorkerCommand::RemoveAudioTrack { .. }
@@ -3918,6 +4031,9 @@ fn process_project_mutation_command(
                 project_name,
             },
         ),
+        IdeWorkerCommand::RenameProject { project_name } => {
+            rename_project(state, events, project_name)
+        }
         IdeWorkerCommand::PrepareRuntime { output_path } => begin_project_mutation_request(
             state,
             events,
@@ -5262,6 +5378,25 @@ fn save_project(state: &mut WorkerState, events: &SyncSender<IdeWorkerEvent>) ->
     begin_project_mutation_request(state, events, ProjectMutation::SaveMixer)
 }
 
+fn rename_project(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    project_name: String,
+) -> bool {
+    if !is_valid_interactive_project_name(&project_name) {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RenameProject,
+            IdeWorkerCommandFailure::ProjectRename(Box::new(IdeProjectRenameError::InvalidName)),
+        );
+    }
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::RenameProject { project_name },
+    )
+}
+
 fn add_audio_track(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -6412,6 +6547,16 @@ enum HistoryEffect<'a> {
     reason = "the exhaustive mutation table keeps every success, partial commit, and refusal tied to its undo-history effect"
 )]
 fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
+    if let ProjectMutationAttempt::RenameProject(rename) = attempt {
+        return match &rename.result {
+            Ok(outcome) if outcome.changed() => HistoryEffect::Invalidate,
+            Err(reason) if reason.publication_committed() => HistoryEffect::Invalidate,
+            _ => rename
+                .mixer
+                .as_ref()
+                .map_or(HistoryEffect::None, HistoryEffect::Replacement),
+        };
+    }
     match attempt {
         ProjectMutationAttempt::PrepareRuntime(attempt) => attempt
             .save
@@ -6570,6 +6715,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         }
         ProjectMutationAttempt::EditNativeFilter { .. }
         | ProjectMutationAttempt::SaveProjectAs(_)
+        | ProjectMutationAttempt::RenameProject(_)
         | ProjectMutationAttempt::RemoveAutomationTake { .. }
         | ProjectMutationAttempt::Save(Err(_))
         | ProjectMutationAttempt::AddAudioTrack(Err(_))
@@ -7255,6 +7401,9 @@ fn project_mutation_save_failure(
         ProjectMutation::SaveProjectAs { .. } => {
             IdeWorkerCommandFailure::ProjectCopy(Box::new(IdeProjectCopyError::Save(reason)))
         }
+        ProjectMutation::RenameProject { .. } => {
+            IdeWorkerCommandFailure::ProjectRename(Box::new(IdeProjectRenameError::Save(reason)))
+        }
         ProjectMutation::PrepareRuntime { .. } => IdeWorkerCommandFailure::RuntimePreparation(
             Box::new(IdeRuntimePreparationError::Save(reason)),
         ),
@@ -7520,6 +7669,9 @@ fn project_mutation_native_close_failure(
         ProjectMutation::SaveProjectAs { .. } => IdeWorkerCommandFailure::ProjectCopy(Box::new(
             IdeProjectCopyError::Save(IdeProjectSaveError::NativeClose(failure)),
         )),
+        ProjectMutation::RenameProject { .. } => IdeWorkerCommandFailure::ProjectRename(Box::new(
+            IdeProjectRenameError::NativeClose(failure),
+        )),
         ProjectMutation::PrepareRuntime { .. } => {
             IdeWorkerCommandFailure::RuntimePreparation(Box::new(IdeRuntimePreparationError::Save(
                 IdeProjectSaveError::NativeClose(failure),
@@ -7733,6 +7885,7 @@ impl ProjectCopyAttempt {
 enum ProjectMutationAttempt {
     Save(Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeProjectSaveError>),
     SaveProjectAs(ProjectCopyAttempt),
+    RenameProject(ProjectRenameAttempt),
     PrepareRuntime(RuntimePreparationAttempt),
     AddAudioTrack(
         Result<hyper_storage_engine::AudioTrackPublicationOutcome, IdeAudioTrackAdditionError>,
@@ -7986,6 +8139,12 @@ enum ProjectMutationAttempt {
         active: bool,
         result: Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeSceneEditError>,
     },
+}
+
+struct ProjectRenameAttempt {
+    name: String,
+    mixer: Option<hyper_storage_engine::ProjectResourcePublicationOutcome>,
+    result: Result<ProjectRenameOutcome, IdeProjectRenameError>,
 }
 
 fn publish_arrangement_edit_failure(
@@ -8324,6 +8483,11 @@ fn complete_project_mutation(
     observe_history(history, &attempt, command, events);
     match application.open_project(&project_path) {
         Ok(running) => {
+            if matches!(&attempt, ProjectMutationAttempt::RenameProject(_))
+                && !remember_running_project(project_history, &running, events)
+            {
+                return false;
+            }
             *state = WorkerState::Running(running);
             let mut no_native_failure = None;
             if !publish_state(state, events, &mut no_native_failure) {
@@ -8341,6 +8505,38 @@ fn complete_project_mutation(
                     events,
                     IdeWorkerCommandKind::SaveProject,
                     IdeWorkerCommandFailure::ProjectSave(reason),
+                ),
+                ProjectMutationAttempt::RenameProject(ProjectRenameAttempt {
+                    name,
+                    mixer,
+                    result: Ok(outcome),
+                }) => send_event(
+                    events,
+                    IdeWorkerEvent::ProjectRenamed {
+                        revision: outcome.project_revision(),
+                        changed: outcome.changed(),
+                        mixer_changed: mixer.is_some_and(|outcome| outcome.changed()),
+                        name,
+                    },
+                ),
+                ProjectMutationAttempt::RenameProject(ProjectRenameAttempt {
+                    name,
+                    result: Err(reason),
+                    ..
+                }) if reason.publication_committed() => send_event(
+                    events,
+                    IdeWorkerEvent::ProjectRenameCommittedWithWarning {
+                        name,
+                        warning: Box::new(reason),
+                    },
+                ),
+                ProjectMutationAttempt::RenameProject(ProjectRenameAttempt {
+                    result: Err(reason),
+                    ..
+                }) => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::RenameProject,
+                    IdeWorkerCommandFailure::ProjectRename(Box::new(reason)),
                 ),
                 ProjectMutationAttempt::PrepareRuntime(attempt) => match attempt.result {
                     Ok(bundle) => send_event(events, IdeWorkerEvent::RuntimePrepared { bundle }),
@@ -9301,6 +9497,53 @@ fn attempt_project_mutation(
                 destination_path,
                 result,
             })
+        }
+        ProjectMutation::RenameProject { project_name } => {
+            let mut attempt = ProjectRenameAttempt {
+                name: project_name.clone(),
+                mixer: None,
+                result: Err(IdeProjectRenameError::ProjectSnapshotUnavailable),
+            };
+            attempt.result = if let Some(failure) = native_failure {
+                Err(IdeProjectRenameError::NativeClose(failure))
+            } else {
+                recovery
+                    .prepared_project()
+                    .ok_or(IdeProjectRenameError::ProjectSnapshotUnavailable)
+                    .and_then(|project| {
+                        RunningDesktopIdeApplication::prepare_mixer_save(application, recovery)
+                            .map_err(IdeProjectRenameError::Save)
+                            .and_then(|plan| {
+                                plan.publish().map_err(|source| {
+                                    IdeProjectRenameError::Save(IdeProjectSaveError::Publication(
+                                        Box::new(source),
+                                    ))
+                                })
+                            })
+                            .and_then(|mixer| {
+                                let mixer_changed = mixer.changed();
+                                let rename = rename_project_package(
+                                    project.package().root(),
+                                    ProjectRenameRequest {
+                                        expected_project_sha256: *mixer.project_identity(),
+                                        project_name: &project_name,
+                                    },
+                                )
+                                .map_err(|source| {
+                                    if mixer_changed {
+                                        IdeProjectRenameError::RenameAfterMixerSave {
+                                            source: Box::new(source),
+                                        }
+                                    } else {
+                                        IdeProjectRenameError::Rename(source)
+                                    }
+                                });
+                                attempt.mixer = Some(mixer);
+                                rename
+                            })
+                    })
+            };
+            ProjectMutationAttempt::RenameProject(attempt)
         }
         ProjectMutation::PrepareRuntime { output_path } => {
             if let Some(failure) = native_failure {
@@ -10900,6 +11143,19 @@ fn project_mutation_reopen_failure(
         }
         ProjectMutationAttempt::SetSceneActive { result, .. } => {
             scene_activation_reopen_failure(result, reopen)
+        }
+        ProjectMutationAttempt::RenameProject(ProjectRenameAttempt { result, .. }) => {
+            let reason = match result {
+                Ok(outcome) => IdeProjectRenameError::ReopenAfterPublication {
+                    outcome: Box::new(outcome),
+                    source: Box::new(reopen),
+                },
+                Err(rename) => IdeProjectRenameError::ReopenAfterFailure {
+                    rename: Box::new(rename),
+                    source: Box::new(reopen),
+                },
+            };
+            IdeWorkerCommandFailure::ProjectRename(Box::new(reason))
         }
         ProjectMutationAttempt::SaveProjectAs(_) => {
             unreachable!("project copies complete before generic reopen handling")
@@ -12846,6 +13102,20 @@ mod tests {
         ));
     }
 
+    fn project_mixer_bytes(project: &Path) -> (String, Vec<u8>) {
+        let package = verify_project_package(project).unwrap();
+        let mixer_id = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|resource| resource.role() == hyper_project_model::ResourceRole::Mixer)
+            .expect("the project has one mixer resource")
+            .id()
+            .to_owned();
+        let bytes = package.read_resource(&mixer_id).unwrap();
+        (mixer_id, bytes)
+    }
+
     fn add_compressor_history(worker: &DesktopIdeWorker, track_id: String) {
         worker
             .try_send(IdeWorkerCommand::EditNativeFilter {
@@ -13276,6 +13546,330 @@ mod tests {
         std::fs::remove_dir_all(fixture).unwrap();
     }
 
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker scenario keeps mixer fencing, history invalidation, reopen, and MRU ordering visible"
+    )]
+    fn rename_reopens_the_same_package_and_refreshes_its_recent_project_name() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-rename-project-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = fixture.join("config");
+        let projects = fixture.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let project = create_project_package(
+            &projects,
+            ProjectCreationRequest {
+                directory_name: "Stable-directory",
+                project_name: "Source",
+            },
+        )
+        .unwrap()
+        .project()
+        .root()
+        .to_path_buf();
+        let history = ProjectHistory::at(&config);
+        let worker = DesktopIdeWorker::start_state_with_history(
+            WorkerState::Closed(closed_application()),
+            Some(history.clone()),
+            2,
+            8,
+        )
+        .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RecentProjectsChanged { projects } if projects.is_empty()
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RecentProjectsChanged { projects }
+                if projects.len() == 1 && projects[0].name() == "Source"
+        ));
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the source project must open before renaming");
+        };
+        let project_id = opened.project_id().to_owned();
+        let (_, original_mixer) = project_mixer_bytes(&project);
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the source project exposes an audio-channel device chain")
+            .id()
+            .to_owned();
+        worker
+            .try_send(IdeWorkerCommand::Mixer(IdeMixerCommand::MainMute {
+                muted: true,
+            }))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::MixerQueued(IdeMixerCommand::MainMute { muted: true })
+        ));
+        add_compressor_history(&worker, track_id);
+
+        worker
+            .try_send(IdeWorkerCommand::RenameProject {
+                project_name: "Renamed session".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::ProjectRenaming
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: None,
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::RecentProjectsChanged { projects }
+                if projects.len() == 1
+                    && projects[0].name() == "Renamed session"
+                    && projects[0].path() == std::fs::canonicalize(&project).unwrap()
+        ));
+        let IdeWorkerEvent::Running(renamed) = recv_native_mutation(&worker) else {
+            panic!("the renamed project must reopen");
+        };
+        assert_eq!(renamed.project_id(), project_id);
+        assert_eq!(renamed.project_name(), "Renamed session");
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::ProjectRenamed {
+                revision: 4,
+                changed: true,
+                mixer_changed: false,
+                name,
+            } if name == "Renamed session"
+        ));
+        assert_eq!(project.file_name().and_then(std::ffi::OsStr::to_str), Some("Stable-directory"));
+        assert_eq!(
+            verify_project_package(&project).unwrap().manifest().name(),
+            "Renamed session"
+        );
+        assert_ne!(
+            project_mixer_bytes(&project).1,
+            original_mixer,
+            "the renamed project must retain the fenced live mixer state"
+        );
+        assert_eq!(history.load().unwrap()[0].name(), "Renamed session");
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the real worker sequence keeps the fenced save, same-name result, reopen, and undo order explicit"
+    )]
+    fn rename_to_the_current_name_records_a_fenced_mixer_change_for_undo() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-rename-project-same-name-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let projects = fixture.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let project = create_project_package(
+            &projects,
+            ProjectCreationRequest {
+                directory_name: "Stable-directory",
+                project_name: "Source",
+            },
+        )
+        .unwrap()
+        .project()
+        .root()
+        .to_path_buf();
+        let (_, original_mixer) = project_mixer_bytes(&project);
+        let worker = DesktopIdeWorker::start_state(
+            WorkerState::Closed(closed_application()),
+            2,
+            8,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::Running(opened) if opened.project_name() == "Source"
+        ));
+        worker
+            .try_send(IdeWorkerCommand::Mixer(IdeMixerCommand::MainMute {
+                muted: true,
+            }))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::MixerQueued(IdeMixerCommand::MainMute { muted: true })
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::RenameProject {
+                project_name: "Source".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::ProjectRenaming
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("project rename"),
+                redo_label: None,
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::Running(running) if running.project_name() == "Source"
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::ProjectRenamed {
+                revision: 2,
+                changed: false,
+                mixer_changed: true,
+                name,
+            } if name == "Source"
+        ));
+        assert_ne!(project_mixer_bytes(&project).1, original_mixer);
+
+        worker.try_send(IdeWorkerCommand::Undo).unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::EditRestoring {
+                redo: false,
+                label: "project rename",
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: None,
+                redo_label: Some("project rename"),
+            }
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::Running(running) if running.project_name() == "Source"
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::EditRestored {
+                redo: false,
+                label: "project rename",
+                ..
+            }
+        ));
+        assert_eq!(project_mixer_bytes(&project).1, original_mixer);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn rename_refusal_and_full_no_op_retain_existing_history() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-rename-project-refusal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let projects = fixture.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let project = create_project_package(
+            &projects,
+            ProjectCreationRequest {
+                directory_name: "Source",
+                project_name: "Source",
+            },
+        )
+        .unwrap()
+        .project()
+        .root()
+        .to_path_buf();
+        let worker = DesktopIdeWorker::start_state_with_history(
+            WorkerState::Closed(closed_application()),
+            None,
+            2,
+            8,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the project must open before a refused rename");
+        };
+        let track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the project exposes an audio-channel device chain")
+            .id()
+            .to_owned();
+        add_compressor_history(&worker, track_id);
+
+        worker
+            .try_send(IdeWorkerCommand::RenameProject {
+                project_name: "invalid\u{0007} name".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::RenameProject,
+                reason: IdeWorkerCommandFailure::ProjectRename(error),
+            } if matches!(*error, IdeProjectRenameError::InvalidName)
+        ));
+        assert_eq!(
+            verify_project_package(&project).unwrap().manifest().name(),
+            "Source"
+        );
+        assert!(matches!(
+            worker.events.as_ref().unwrap().try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::RenameProject {
+                project_name: "Source".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::ProjectRenaming
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::Running(running) if running.project_name() == "Source"
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::ProjectRenamed {
+                changed: false,
+                mixer_changed: false,
+                name,
+                ..
+            } if name == "Source"
+        ));
+        assert!(matches!(
+            worker.events.as_ref().unwrap().try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        undo_native_device_history(&worker);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
     #[test]
     fn save_as_refusal_reopens_the_source_and_retains_its_history() {
         let fixture = std::env::temp_dir().join(format!(

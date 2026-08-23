@@ -1187,6 +1187,7 @@ fn bind_playback_callbacks(
 
     bind_project_save_callback(ui, worker, project_state);
     bind_project_copy_callback(ui, worker);
+    bind_project_rename_callback(ui, worker);
 
     bind_audio_track_callback(ui, worker);
 
@@ -1387,6 +1388,33 @@ fn bind_project_copy_callback_with(
         ui.set_error_text(SharedString::default());
         ui.set_status_text("Waiting for the independent project destination…".into());
         choose(weak.clone(), Rc::clone(&worker), project_name);
+    });
+}
+
+fn bind_project_rename_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let worker = Rc::clone(worker);
+    bind_project_rename_callback_with(
+        ui,
+        Rc::new(move |ui, command| submit_to_ui(ui, &worker, command)),
+    );
+}
+
+fn bind_project_rename_callback_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
+    let weak = ui.as_weak();
+    ui.global::<IdeActions>().on_rename_project(move |project_name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_rename_project_visible() {
+            return;
+        }
+        let project_name = project_name.trim().to_owned();
+        if project_name.is_empty() {
+            ui.set_error_text("Enter a project name before renaming".into());
+            return;
+        }
+        ui.set_error_text(SharedString::default());
+        submitter(&ui, IdeWorkerCommand::RenameProject { project_name });
     });
 }
 
@@ -4027,6 +4055,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::OpenProject => AppMode::Opening,
         IdeWorkerCommandKind::SaveProject
         | IdeWorkerCommandKind::SaveProjectAs
+        | IdeWorkerCommandKind::RenameProject
         | IdeWorkerCommandKind::AddScene
         | IdeWorkerCommandKind::SetSceneSlot
         | IdeWorkerCommandKind::SetArrangementLoopRange
@@ -4123,6 +4152,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SaveProject => "Saving mixer state and reopening project…",
         IdeWorkerCommandKind::SaveProjectAs => {
             "Saving and verifying an independent project copy…"
+        }
+        IdeWorkerCommandKind::RenameProject => {
+            "Renaming the verified project package and reopening it…"
         }
         IdeWorkerCommandKind::PrepareRuntime => {
             "Saving the project and compiling a verified Runtime bundle…"
@@ -4386,6 +4418,34 @@ fn apply_event(
         } => {
             ui.set_status_text(
                 format!("Independent project opened at {} with a durability warning", project_path.display()).into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        IdeWorkerEvent::ProjectRenamed {
+            revision,
+            changed,
+            mixer_changed,
+            name,
+        } => {
+            ui.set_rename_project_visible(false);
+            ui.set_status_text(
+                if changed {
+                    format!("Project renamed to {name} in project revision {revision}")
+                } else if mixer_changed {
+                    format!(
+                        "Project already uses the name {name}; live mixer changes were saved in project revision {revision}"
+                    )
+                } else {
+                    format!("Project already uses the name {name}")
+                }
+                .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::ProjectRenameCommittedWithWarning { name, warning } => {
+            ui.set_rename_project_visible(false);
+            ui.set_status_text(
+                format!("Project was renamed to {name}, but recovery needs attention").into(),
             );
             ui.set_error_text(warning.to_string().into());
         }
@@ -4690,6 +4750,10 @@ fn apply_event(
         IdeWorkerEvent::Saving => {
             ui.set_app_mode(AppMode::Saving);
             ui.set_status_text("Waiting for native output before atomic save…".into());
+        }
+        IdeWorkerEvent::ProjectRenaming => {
+            ui.set_app_mode(AppMode::Saving);
+            ui.set_status_text("Waiting for native output before atomically renaming the project…".into());
         }
         IdeWorkerEvent::Closing => {
             ui.set_app_mode(AppMode::Closing);
@@ -6233,6 +6297,7 @@ fn apply_running_event(
 ) {
     ui.set_new_project_visible(false);
     ui.set_save_project_as_visible(false);
+    ui.set_rename_project_visible(false);
     ui.set_project_name(observation.project_name().into());
     ui.set_project_id(observation.project_id().into());
     ui.set_sample_rate(format!("{} Hz", observation.sample_rate_hz()).into());
@@ -7232,6 +7297,8 @@ fn reset_project(
     take_routes: &TakeRoutes,
     project_state: &ProjectUiStateCell,
 ) {
+    ui.set_rename_project_visible(false);
+    ui.set_rename_project_name(SharedString::default());
     ui.set_project_name("No project open".into());
     ui.set_project_id("—".into());
     ui.set_sample_rate("—".into());
@@ -11092,6 +11159,98 @@ mod tests {
             ui.get_save_project_as_visible(),
             "Save As becomes available again after the local editor is dismissed"
         );
+    }
+
+    #[test]
+    fn rename_buttons_submit_only_the_current_project_name() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_main_state_available(true);
+        ui.set_project_name("Source".into());
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_project_rename_callback_with(
+            &ui,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+        ui.show().unwrap();
+
+        let mut entries = ElementHandle::find_by_element_id(&ui, "MainWindow::rename-project-entry");
+        let entry = entries
+            .next()
+            .expect("the generated Rename Project entry button must be present");
+        assert!(entries.next().is_none(), "the Rename Project entry id is unique");
+        entry.mock_single_click(PointerEventButton::Left);
+        assert!(ui.get_rename_project_visible());
+        assert_eq!(ui.get_rename_project_name(), "Source");
+        assert!(
+            ElementHandle::find_by_element_id(&ui, "MainWindow::save-project-as-entry")
+                .next()
+                .is_none(),
+            "the active Rename Project form owns the project surface"
+        );
+
+        let mut cancels =
+            ElementHandle::find_by_element_id(&ui, "MainWindow::rename-project-cancel");
+        let cancel = cancels
+            .next()
+            .expect("the visible Rename Project form must expose its cancel button");
+        assert!(cancels.next().is_none(), "the Rename Project cancel id is unique");
+        cancel.mock_single_click(PointerEventButton::Left);
+        assert!(!ui.get_rename_project_visible());
+
+        let entry = ElementHandle::find_by_element_id(&ui, "MainWindow::rename-project-entry")
+            .next()
+            .expect("cancelling restores the generated Rename Project entry button");
+        entry.mock_single_click(PointerEventButton::Left);
+
+        ui.set_rename_project_name("Renamed session".into());
+        let mut submits =
+            ElementHandle::find_by_element_id(&ui, "MainWindow::rename-project-submit");
+        let submit = submits
+            .next()
+            .expect("the visible Rename Project form must expose its submission button");
+        assert!(submits.next().is_none(), "the Rename Project submission id is unique");
+        submit.mock_single_click(PointerEventButton::Left);
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::RenameProject { project_name }] if project_name == "Renamed session"
+        ));
+
+        ui.set_app_mode(AppMode::Saving);
+        ui.global::<IdeActions>()
+            .invoke_rename_project("Ignored while pending".into());
+        assert_eq!(submitted.borrow().len(), 1, "pending rename state is submission-inert");
+        ui.set_app_mode(AppMode::Running);
+
+        apply_event(
+            &ui,
+            &UiRoutes::default(),
+            &Rc::new(ProjectUiState::default()),
+            IdeWorkerEvent::ProjectRenamed {
+                revision: 2,
+                changed: true,
+                mixer_changed: false,
+                name: "Renamed session".to_owned(),
+            },
+        );
+        assert!(!ui.get_rename_project_visible());
+        assert!(ui.get_status_text().contains("Renamed session"));
+
+        apply_event(
+            &ui,
+            &UiRoutes::default(),
+            &Rc::new(ProjectUiState::default()),
+            IdeWorkerEvent::ProjectRenamed {
+                revision: 3,
+                changed: false,
+                mixer_changed: true,
+                name: "Renamed session".to_owned(),
+            },
+        );
+        assert!(ui.get_status_text().contains("live mixer changes were saved"));
     }
 
     #[test]

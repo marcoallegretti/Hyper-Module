@@ -6,10 +6,10 @@ use super::{
     AudioClipPublicationRecovery, AudioTrackPublicationRecovery, ControlMappingPublicationError,
     ControlMappingPublicationRecovery, ProjectResourcePublicationError,
     ProjectResourcePublicationRecovery, RecordingImportError, RecordingImportRecovery,
-    SampleCleanupRecovery,
+    ProjectRenameError, ProjectRenameRecovery, SampleCleanupRecovery,
     recover_audio_clip_publications, recover_audio_track_publications,
     recover_control_mapping_publications, recover_project_resource_publications,
-    recover_recording_imports,
+    recover_project_renames, recover_recording_imports,
     recover_sample_cleanups,
 };
 
@@ -28,6 +28,7 @@ struct ProjectTransactionRecoveryFamilies {
     audio_clips: Vec<AudioClipPublicationRecovery>,
     control_mappings: Vec<ControlMappingPublicationRecovery>,
     recordings: Vec<RecordingImportRecovery>,
+    renames: Vec<ProjectRenameRecovery>,
 }
 
 impl ProjectTransactionRecoveryReport {
@@ -38,6 +39,7 @@ impl ProjectTransactionRecoveryReport {
         audio_clips: Vec<AudioClipPublicationRecovery>,
         control_mappings: Vec<ControlMappingPublicationRecovery>,
         recordings: Vec<RecordingImportRecovery>,
+        renames: Vec<ProjectRenameRecovery>,
     ) -> Self {
         Self {
             families: Box::new(ProjectTransactionRecoveryFamilies {
@@ -47,6 +49,7 @@ impl ProjectTransactionRecoveryReport {
                 audio_clips,
                 control_mappings,
                 recordings,
+                renames,
             }),
         }
     }
@@ -82,6 +85,11 @@ impl ProjectTransactionRecoveryReport {
     }
 
     #[must_use]
+    pub fn renames(&self) -> &[ProjectRenameRecovery] {
+        &self.families.renames
+    }
+
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.families.sample_cleanups.is_empty()
             && self.families.resources.is_empty()
@@ -89,6 +97,7 @@ impl ProjectTransactionRecoveryReport {
             && self.families.audio_clips.is_empty()
             && self.families.control_mappings.is_empty()
             && self.families.recordings.is_empty()
+            && self.families.renames.is_empty()
     }
 }
 
@@ -100,6 +109,7 @@ pub enum ProjectTransactionRecoveryErrorSource {
     AudioClip(ProjectResourcePublicationError),
     ControlMapping(ControlMappingPublicationError),
     Recording(RecordingImportError),
+    Rename(ProjectRenameError),
 }
 
 impl fmt::Display for ProjectTransactionRecoveryErrorSource {
@@ -113,6 +123,7 @@ impl fmt::Display for ProjectTransactionRecoveryErrorSource {
                 write!(formatter, "control-mapping recovery failed: {source}")
             }
             Self::Recording(source) => write!(formatter, "recording recovery failed: {source}"),
+            Self::Rename(source) => write!(formatter, "project-rename recovery failed: {source}"),
         }
     }
 }
@@ -128,6 +139,7 @@ impl Error for ProjectTransactionRecoveryErrorSource {
             }
             Self::ControlMapping(source) => Some(source),
             Self::Recording(source) => Some(source),
+            Self::Rename(source) => Some(source),
         }
     }
 }
@@ -179,8 +191,8 @@ impl Error for ProjectTransactionRecoveryError {
 ///
 /// Sample cleanup is recovered first because it may restore asset files needed
 /// by later package verification. Existing-resource, audio-track, audio-clip,
-/// mapping, and recording transactions then follow in that order through the
-/// same shared lock.
+/// mapping, recording, and manifest-name transactions then follow in that
+/// order through the same shared lock.
 ///
 /// Recovery is fail-closed when another project storage transaction owns that
 /// lock. Callers may retry after the competing transaction has completed; this
@@ -190,6 +202,10 @@ impl Error for ProjectTransactionRecoveryError {
 ///
 /// Returns the failing recovery authority together with all prior completed
 /// outcomes. Unknown or unrelated filesystem state is never discarded.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete recovery order and retained completed-report state remain auditable in one coordinator"
+)]
 pub fn recover_project_transactions(
     project_path: impl AsRef<Path>,
 ) -> Result<ProjectTransactionRecoveryReport, ProjectTransactionRecoveryError> {
@@ -206,7 +222,12 @@ pub fn recover_project_transactions(
             return Err(ProjectTransactionRecoveryError {
                 completed: ProjectTransactionRecoveryReport::from_parts(
                     sample_cleanups,
-                    Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
                 ),
                 source: Box::new(ProjectTransactionRecoveryErrorSource::Resource(source)),
             });
@@ -219,6 +240,7 @@ pub fn recover_project_transactions(
                 completed: ProjectTransactionRecoveryReport::from_parts(
                     sample_cleanups,
                     resources,
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -239,6 +261,7 @@ pub fn recover_project_transactions(
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                 ),
                 source: Box::new(ProjectTransactionRecoveryErrorSource::AudioClip(source)),
             });
@@ -255,6 +278,7 @@ pub fn recover_project_transactions(
                     audio_clips,
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                 ),
                 source: Box::new(ProjectTransactionRecoveryErrorSource::ControlMapping(
                     source,
@@ -262,31 +286,49 @@ pub fn recover_project_transactions(
             });
         }
     };
-    let report = ProjectTransactionRecoveryReport::from_parts(
+    let recordings = match recover_recording_imports(project_path) {
+        Ok(recordings) => recordings,
+        Err(source) => {
+            return Err(ProjectTransactionRecoveryError {
+                completed: ProjectTransactionRecoveryReport::from_parts(
+                    sample_cleanups,
+                    resources,
+                    audio_tracks,
+                    audio_clips,
+                    control_mappings,
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                source: Box::new(ProjectTransactionRecoveryErrorSource::Recording(source)),
+            });
+        }
+    };
+    let renames = match recover_project_renames(project_path) {
+        Ok(renames) => renames,
+        Err(source) => {
+            return Err(ProjectTransactionRecoveryError {
+                completed: ProjectTransactionRecoveryReport::from_parts(
+                    sample_cleanups,
+                    resources,
+                    audio_tracks,
+                    audio_clips,
+                    control_mappings,
+                    recordings,
+                    Vec::new(),
+                ),
+                source: Box::new(ProjectTransactionRecoveryErrorSource::Rename(source)),
+            });
+        }
+    };
+    Ok(ProjectTransactionRecoveryReport::from_parts(
         sample_cleanups,
         resources,
         audio_tracks,
         audio_clips,
         control_mappings,
-        Vec::new(),
-    );
-    match recover_recording_imports(project_path) {
-        Ok(recordings) => {
-            let families = *report.families;
-            Ok(ProjectTransactionRecoveryReport::from_parts(
-                families.sample_cleanups,
-                families.resources,
-                families.audio_tracks,
-                families.audio_clips,
-                families.control_mappings,
-                recordings,
-            ))
-        }
-        Err(source) => Err(ProjectTransactionRecoveryError {
-            completed: report,
-            source: Box::new(ProjectTransactionRecoveryErrorSource::Recording(source)),
-        }),
-    }
+        recordings,
+        renames,
+    ))
 }
 
 #[cfg(test)]

@@ -310,6 +310,7 @@ export global IdeActions {
     callback redo-edit();
     callback save-project();
     callback save-project-as(string);
+    callback rename-project(string);
     callback add-audio-track(string);
     callback remove-audio-track(string);
     callback rename-audio-track(int, string);
@@ -424,6 +425,8 @@ export component MainWindow inherits Window {
     in-out property <string> new-project-name: "Untitled Project";
     in-out property <bool> save-project-as-visible: false;
     in-out property <string> save-project-as-name: "";
+    in-out property <bool> rename-project-visible: false;
+    in-out property <string> rename-project-name: "";
     in property <string> project-id: "—";
     in property <string> sample-rate: "—";
     in property <string> scene-count: "—";
@@ -548,7 +551,7 @@ export component MainWindow inherits Window {
     in-out property <string> clip-source-trim-frame-count: "";
     in-out property <bool> add-arrangement-placement-visible: false;
     private property <bool> project-form-visible:
-        root.new-project-visible || root.new-track-visible || root.save-project-as-visible;
+        root.new-project-visible || root.new-track-visible || root.save-project-as-visible || root.rename-project-visible;
     private property <bool> local-edit-form-visible:
         root.project-form-visible
         || root.scene-create-visible
@@ -1110,7 +1113,7 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
-                        if !root.new-project-visible && !root.save-project-as-visible : VerticalLayout {
+                        if !root.new-project-visible && !root.save-project-as-visible && !root.rename-project-visible : VerticalLayout {
                             vertical-stretch: 1;
                             spacing: 8px;
                             if root.new-track-visible : VerticalLayout {
@@ -1221,7 +1224,28 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
-                        if !root.new-project-visible && !root.new-track-visible && !root.save-project-as-visible : VerticalLayout {
+                        if root.rename-project-visible : VerticalLayout {
+                            vertical-stretch: 1;
+                            spacing: 6px;
+                            Text { text: "RENAME PROJECT"; color: #65758a; font-size: 9px; font-weight: 700; letter-spacing: 0.6px; }
+                            IdeLineEdit {
+                                text <=> root.rename-project-name;
+                                enabled: root.app-mode == AppMode.running;
+                                accessible-label: "Project name";
+                            }
+                            Text { text: "Updates only this verified package’s project name. Its folder, project ID, media, and resources stay unchanged."; color: #728196; font-size: 9px; wrap: word-wrap; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                rename-project-cancel := Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.rename-project-visible = false; } }
+                                rename-project-submit := Button {
+                                    horizontal-stretch: 1;
+                                    text: root.app-mode == AppMode.saving ? "Renaming…" : "Rename project";
+                                    enabled: root.app-mode == AppMode.running && root.rename-project-name != "";
+                                    clicked => { IdeActions.rename-project(root.rename-project-name); }
+                                }
+                            }
+                        }
+                        if !root.new-project-visible && !root.new-track-visible && !root.save-project-as-visible && !root.rename-project-visible : VerticalLayout {
                             spacing: 8px;
                             HorizontalLayout {
                                 spacing: 8px;
@@ -1243,6 +1267,16 @@ export component MainWindow inherits Window {
                                     clicked => {
                                         root.save-project-as-name = root.project-name + " copy";
                                         root.save-project-as-visible = true;
+                                    }
+                                }
+                                rename-project-entry := Button {
+                                    horizontal-stretch: 1;
+                                    text: "Rename";
+                                    enabled: root.app-mode == AppMode.running && root.mixer-main-state-available && !root.local-edit-form-visible;
+                                    accessible-label: "Rename this verified project package";
+                                    clicked => {
+                                        root.rename-project-name = root.project-name;
+                                        root.rename-project-visible = true;
                                     }
                                 }
                             }

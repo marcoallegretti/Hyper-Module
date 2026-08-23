@@ -6,7 +6,7 @@ use std::path::Path;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::fs::{Dir, OpenOptions};
 use hyper_fs_authority::{identity, remove_directory_entry, rename_no_replace};
-use hyper_project_model::{ProjectManifest, is_valid_project_name};
+use hyper_project_model::{ProjectManifest, is_valid_interactive_project_name};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -705,14 +705,11 @@ fn open_or_create_directory(parent: &Dir, name: &str) -> Result<Dir, ProjectCopy
 }
 
 fn validate_request(request: ProjectCopyRequest<'_>) -> Result<(), ProjectCopyError> {
-    if !is_valid_project_name(request.project_name)
-        || request.project_name.trim() != request.project_name
-        || request.project_name.chars().any(char::is_control)
-    {
+    if !is_valid_interactive_project_name(request.project_name) {
         return Err(failure(
             ProjectCopyErrorKind::InvalidRequest,
             "project_name",
-            "project name must contain 1 to 120 characters without outer whitespace",
+            "project name must contain 1 to 120 characters without outer whitespace or control characters",
         ));
     }
     let name = request.directory_name;

@@ -6,6 +6,7 @@ mod project_creation;
 mod project_copy;
 mod project_lock;
 mod project_recovery;
+mod project_rename;
 mod recording_import;
 mod resource_publication;
 mod stable_file;
@@ -27,6 +28,11 @@ pub use project_copy::{
 pub use project_recovery::{
     ProjectTransactionRecoveryError, ProjectTransactionRecoveryErrorSource,
     ProjectTransactionRecoveryReport, recover_project_transactions,
+};
+pub use project_rename::{
+    ProjectRenameError, ProjectRenameErrorKind, ProjectRenameOutcome,
+    ProjectRenameRecovery, ProjectRenameRecoveryDisposition, ProjectRenameRequest,
+    recover_project_renames, rename_project,
 };
 pub use recording_import::{
     RecordingImportError, RecordingImportOutcome, RecordingImportRecovery,

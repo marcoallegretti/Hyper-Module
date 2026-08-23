@@ -14,6 +14,7 @@ pub(crate) const AUDIO_CLIP_TRANSACTION_PREFIX: &str = ".audio-clip-publication-
 pub(crate) const SAMPLE_CLEANUP_TRANSACTION_PREFIX: &str = ".sample-cleanup-";
 pub(crate) const CONTROL_MAPPING_TRANSACTION_PREFIX: &str = ".control-mapping-publication-";
 pub(crate) const RECORDING_IMPORT_TRANSACTION_PREFIX: &str = ".recording-import-";
+pub(crate) const PROJECT_RENAME_TRANSACTION_PREFIX: &str = ".project-rename-";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProjectTransactionFamily {
@@ -23,16 +24,18 @@ pub(crate) enum ProjectTransactionFamily {
     SampleCleanup,
     ControlMapping,
     RecordingImport,
+    ProjectRename,
 }
 
 impl ProjectTransactionFamily {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::ProjectResource,
         Self::AudioTrack,
         Self::AudioClip,
         Self::SampleCleanup,
         Self::ControlMapping,
         Self::RecordingImport,
+        Self::ProjectRename,
     ];
 
     const fn prefix(self) -> &'static str {
@@ -43,6 +46,7 @@ impl ProjectTransactionFamily {
             Self::SampleCleanup => SAMPLE_CLEANUP_TRANSACTION_PREFIX,
             Self::ControlMapping => CONTROL_MAPPING_TRANSACTION_PREFIX,
             Self::RecordingImport => RECORDING_IMPORT_TRANSACTION_PREFIX,
+            Self::ProjectRename => PROJECT_RENAME_TRANSACTION_PREFIX,
         }
     }
 }

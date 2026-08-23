@@ -25,6 +25,17 @@ pub fn is_valid_project_name(name: &str) -> bool {
     (1..=120).contains(&name.chars().count())
 }
 
+/// Returns whether a project name is safe to introduce through an interactive
+/// create, copy, or rename operation.
+///
+/// This is deliberately narrower than [`is_valid_project_name`]: an importer
+/// must preserve valid version-1 manifests, while a user-originated name must
+/// remain portable and unambiguous in the desktop surface.
+#[must_use]
+pub fn is_valid_interactive_project_name(name: &str) -> bool {
+    is_valid_project_name(name) && name.trim() == name && !name.chars().any(char::is_control)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManifestErrorKind {
     Json(StrictJsonErrorKind),
@@ -707,6 +718,14 @@ mod tests {
     use super::*;
 
     const VALID_PROJECT: &[u8] = include_bytes!("../../../contracts/fixtures/valid/project.json");
+
+    #[test]
+    fn distinguishes_manifest_and_interactive_project_name_domains() {
+        assert!(is_valid_project_name("Imported\u{0007} project"));
+        assert!(!is_valid_interactive_project_name("Imported\u{0007} project"));
+        assert!(!is_valid_interactive_project_name(" Outer whitespace"));
+        assert!(is_valid_interactive_project_name("Session 01"));
+    }
 
     #[test]
     fn loads_the_published_version_one_fixture() {
