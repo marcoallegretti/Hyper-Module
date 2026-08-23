@@ -12,6 +12,7 @@ pub(crate) const PROJECT_RESOURCE_TRANSACTION_PREFIX: &str = ".project-resource-
 pub(crate) const AUDIO_TRACK_TRANSACTION_PREFIX: &str = ".audio-track-publication-";
 pub(crate) const TRACK_ORDER_TRANSACTION_PREFIX: &str = ".track-order-publication-";
 pub(crate) const AUDIO_TRACK_DUPLICATION_TRANSACTION_PREFIX: &str = ".audio-track-duplication-";
+pub(crate) const AUDIO_TRACK_CONTENT_REMOVAL_TRANSACTION_PREFIX: &str = ".audio-track-content-removal-";
 pub(crate) const AUDIO_CLIP_TRANSACTION_PREFIX: &str = ".audio-clip-publication-";
 pub(crate) const SAMPLE_CLEANUP_TRANSACTION_PREFIX: &str = ".sample-cleanup-";
 pub(crate) const CONTROL_MAPPING_TRANSACTION_PREFIX: &str = ".control-mapping-publication-";
@@ -24,6 +25,7 @@ pub(crate) enum ProjectTransactionFamily {
     AudioTrack,
     TrackOrder,
     AudioTrackDuplication,
+    AudioTrackContentRemoval,
     AudioClip,
     SampleCleanup,
     ControlMapping,
@@ -32,11 +34,12 @@ pub(crate) enum ProjectTransactionFamily {
 }
 
 impl ProjectTransactionFamily {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::ProjectResource,
         Self::AudioTrack,
         Self::TrackOrder,
         Self::AudioTrackDuplication,
+        Self::AudioTrackContentRemoval,
         Self::AudioClip,
         Self::SampleCleanup,
         Self::ControlMapping,
@@ -50,6 +53,7 @@ impl ProjectTransactionFamily {
             Self::AudioTrack => AUDIO_TRACK_TRANSACTION_PREFIX,
             Self::TrackOrder => TRACK_ORDER_TRANSACTION_PREFIX,
             Self::AudioTrackDuplication => AUDIO_TRACK_DUPLICATION_TRANSACTION_PREFIX,
+            Self::AudioTrackContentRemoval => AUDIO_TRACK_CONTENT_REMOVAL_TRANSACTION_PREFIX,
             Self::AudioClip => AUDIO_CLIP_TRANSACTION_PREFIX,
             Self::SampleCleanup => SAMPLE_CLEANUP_TRANSACTION_PREFIX,
             Self::ControlMapping => CONTROL_MAPPING_TRANSACTION_PREFIX,

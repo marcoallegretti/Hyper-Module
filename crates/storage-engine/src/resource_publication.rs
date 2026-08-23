@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 mod audio_clip_publication;
 mod audio_track_duplication;
+mod audio_track_content_removal;
 mod sample_cleanup;
 
 pub use audio_clip_publication::{
@@ -28,6 +29,12 @@ pub use audio_track_duplication::{
     AudioTrackDuplicationPublicationOutcome, AudioTrackDuplicationPublicationRecovery,
     AudioTrackDuplicationPublicationRecoveryDisposition, AudioTrackDuplicationPublicationRequest,
     publish_audio_track_duplication, recover_audio_track_duplications,
+};
+pub use audio_track_content_removal::{
+    AudioTrackContentRemovalPublicationOutcome, AudioTrackContentRemovalPublicationRecovery,
+    AudioTrackContentRemovalPublicationRecoveryDisposition,
+    AudioTrackContentRemovalPublicationRequest, publish_audio_track_content_removal,
+    recover_audio_track_content_removals,
 };
 pub use sample_cleanup::{
     SampleCleanupOutcome, SampleCleanupRecovery, SampleCleanupRecoveryDisposition,

@@ -1505,7 +1505,7 @@ fn removal_extensions_empty(
     value
         .get("extensions")
         .and_then(Value::as_object)
-        .map(|extensions| extensions.is_empty())
+        .map(serde_json::Map::is_empty)
         .ok_or(AudioTrackContentRemovalSerializationError::InvalidDocumentShape)
 }
 
@@ -1880,7 +1880,7 @@ fn removal_automation_lanes(
                     .get("send_id")
                     .and_then(Value::as_str)
                     .is_some_and(|id| source_send_ids.contains(id)),
-                Some("mixer-main") | Some("mixer-cue") => false,
+                Some("mixer-main" | "mixer-cue") => false,
                 Some(_) | None => {
                     return Err(AudioTrackContentRemovalSerializationError::InvalidDocumentShape);
                 }
