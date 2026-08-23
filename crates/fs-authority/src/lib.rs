@@ -278,6 +278,14 @@ pub struct StableFileEvidence {
     sha256: [u8; 32],
 }
 
+impl StableFileEvidence {
+    /// Returns the retained filesystem identity of the verified directory entry.
+    #[must_use]
+    pub const fn identity(&self) -> (u64, u64) {
+        self.identity
+    }
+}
+
 /// Exact bytes and evidence captured from one stable external file.
 #[derive(Debug, Eq, PartialEq)]
 pub struct StableFileSnapshot {
@@ -290,6 +298,21 @@ impl StableFileSnapshot {
     pub fn into_parts(self) -> (Vec<u8>, StableFileEvidence) {
         (self.bytes, self.evidence)
     }
+}
+
+/// Reads one bounded regular non-link file while retaining the exact bytes and
+/// the identity evidence observed during that same stable read.
+///
+/// # Errors
+///
+/// Returns an I/O or validation error when the entry is linked, non-regular,
+/// oversized, replaced, or changes while it is read.
+pub fn read_stable_file_snapshot(
+    directory: &Dir,
+    name: &str,
+    maximum_bytes: u64,
+) -> io::Result<StableFileSnapshot> {
+    read_stable_file_snapshot_observed(directory, Path::new(name), maximum_bytes, || Ok(()))
 }
 
 /// Reads one absolute regular file without following any path link, proving

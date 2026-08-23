@@ -8,7 +8,7 @@ use hyper_audio_engine::{
 };
 use hyper_audio_source::{DecodeError, DecodedAudio};
 use hyper_fs_authority::{
-    identity, open_syncable_directory_ambient, read_stable_file, rename_replace, sync_directory,
+    open_syncable_directory_ambient, read_stable_file_snapshot, rename_replace, sync_directory,
 };
 use hyper_media_cache::PreparePlaybackError;
 use hyper_mixer_runtime::{
@@ -299,8 +299,13 @@ fn allocate_silence(frames: usize) -> Result<Vec<f32>, OfflineExportError> {
     Ok(plane)
 }
 
-/// One rendered export written to disk, with the measurements the live meters
-/// would report for the same audio.
+/// One rendered export written to disk, with render-domain measurements the
+/// live meters would report for that f32 mix.
+///
+/// A float WAV contains those samples directly. A FLAC export deliberately
+/// quantizes them to its documented 24-bit PCM contract, so these values
+/// describe the source render rather than a second measurement of the
+/// serialized delivery file.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OfflineExportReport {
     pub frame_count: usize,
@@ -368,8 +373,11 @@ pub fn export_prepared_project_wav_with_mixer(
 /// 24-bit FLAC export.
 ///
 /// FLAC is lossless with respect to the explicitly quantized signed 24-bit
-/// PCM stream. Non-finite and out-of-range rendered samples are rejected;
-/// export never normalizes or silently clips the audible mix.
+/// PCM stream: every finite sample in `[-1.0, 1.0]` is multiplied by
+/// `8_388_607` and rounded with [`f32::round`]. Thus both `-1.0` and `1.0`
+/// map to the signed 24-bit extrema representable by that symmetric scale.
+/// Non-finite and out-of-range rendered samples are rejected; export never
+/// normalizes or silently clips the audible mix.
 ///
 /// # Errors
 ///
@@ -406,8 +414,23 @@ fn publish_rendered_flac(
     let right = rendered.plane(1).unwrap_or(left);
     let pcm = quantize_flac_pcm(left, right)?;
     let encoded = encode_flac_pcm(&pcm, sample_rate_hz)?;
-    verify_flac_pcm(&encoded, sample_rate_hz, frame_count, &pcm)?;
-    publish_verified_flac(flac_path, &encoded)?;
+    verify_and_publish_flac(rendered, spec, flac_path, &pcm, &encoded)
+}
+
+fn verify_and_publish_flac(
+    rendered: &DecodedAudio,
+    spec: OfflineExportSpec,
+    flac_path: &Path,
+    expected_pcm: &[i32],
+    encoded: &[u8],
+) -> Result<OfflineExportReport, OfflineExportError> {
+    verify_flac_pcm(
+        encoded,
+        rendered.sample_rate_hz(),
+        rendered.frame_count(),
+        expected_pcm,
+    )?;
+    publish_verified_flac(flac_path, encoded)?;
     measure_rendered_audio(rendered, spec)
 }
 
@@ -504,6 +527,14 @@ fn rounded_flac_pcm(value: f32) -> Result<i32, OfflineExportError> {
 }
 
 fn publish_verified_flac(flac_path: &Path, encoded: &[u8]) -> Result<(), OfflineExportError> {
+    publish_verified_flac_observed(flac_path, encoded, |_| Ok(()))
+}
+
+fn publish_verified_flac_observed(
+    flac_path: &Path,
+    encoded: &[u8],
+    after_stage_verified: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), OfflineExportError> {
     let (parent_path, destination_name) = flac_destination_parts(flac_path)?;
     let parent = open_syncable_directory_ambient(&parent_path).map_err(OfflineExportError::Destination)?;
     let stage_name = format!(".{destination_name}.flac-stage-{}", uuid::Uuid::new_v4());
@@ -518,20 +549,17 @@ fn publish_verified_flac(flac_path: &Path, encoded: &[u8]) -> Result<(), Offline
         drop(staged);
         let maximum_stage_bytes = u64::try_from(encoded.len())
             .map_err(|_| OfflineExportError::CapacityUnavailable)?;
-        let staged_bytes = read_stable_file(&parent, &stage_name, maximum_stage_bytes)
+        let snapshot = read_stable_file_snapshot(&parent, &stage_name, maximum_stage_bytes)
             .map_err(OfflineExportError::Destination)?;
+        let (staged_bytes, staged_evidence) = snapshot.into_parts();
         if staged_bytes != encoded {
             return Err(OfflineExportError::FlacVerification);
         }
-        let staged_identity = identity(
-            &parent
-                .symlink_metadata(&stage_name)
-                .map_err(OfflineExportError::Destination)?,
-        );
+        after_stage_verified(&parent_path.join(&stage_name)).map_err(OfflineExportError::Destination)?;
         rename_replace(
             &parent,
             &stage_name,
-            staged_identity,
+            staged_evidence.identity(),
             &parent,
             &destination_name,
         )
@@ -545,12 +573,10 @@ fn publish_verified_flac(flac_path: &Path, encoded: &[u8]) -> Result<(), Offline
 }
 
 fn flac_destination_parts(flac_path: &Path) -> Result<(PathBuf, String), OfflineExportError> {
-    let parent = flac_path.parent().filter(|parent| !parent.as_os_str().is_empty()).ok_or(
-        OfflineExportError::Destination(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "FLAC destination has no parent directory",
-        )),
-    )?;
+    let parent = flac_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let name = flac_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -686,10 +712,12 @@ fn publish_rendered_wav(
 #[cfg(test)]
 mod tests {
     use super::{
-        OfflineExportError, OfflineExportSpec, publish_rendered_flac, quantize_flac_pcm,
-        verify_flac_pcm,
+        OfflineExportError, OfflineExportSpec, encode_flac_pcm, flac_destination_parts,
+        publish_rendered_flac, publish_verified_flac_observed, quantize_flac_pcm,
+        verify_and_publish_flac, verify_flac_pcm,
     };
     use hyper_audio_source::DecodedAudio;
+    use std::path::Path;
 
     #[test]
     fn flac_export_round_trips_exact_quantized_stereo_pcm_and_replaces_only_after_verification() {
@@ -746,5 +774,124 @@ mod tests {
         .unwrap_err();
         assert!(matches!(refused, OfflineExportError::FlacMinimumFrames));
         assert_eq!(std::fs::read(&destination).unwrap(), b"previous export");
+    }
+
+    #[test]
+    fn flac_quantization_has_a_literal_signed_24_bit_stereo_contract() {
+        let left = [-1.0, 0.0, 0.5, 0.25].repeat(8);
+        let right = [1.0, -0.5, -0.25, 0.0].repeat(8);
+        let expected_frame = [
+            -8_388_607,
+            8_388_607,
+            0,
+            -4_194_304,
+            4_194_304,
+            -2_097_152,
+            2_097_152,
+            0,
+        ];
+        let expected = expected_frame.repeat(8);
+        let quantized = quantize_flac_pcm(&left, &right).unwrap();
+        assert_eq!(quantized, expected);
+
+        let encoded = encode_flac_pcm(&expected, 48_000).unwrap();
+        let decoded = decode_flac_pcm_for_test(encoded, 48_000, 32);
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn flac_publication_rejects_a_stage_replacement_after_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("mix.flac");
+        std::fs::write(&destination, b"previous export").unwrap();
+        let pcm = [0_i32, 0_i32].repeat(16);
+        let encoded = encode_flac_pcm(&pcm, 48_000).unwrap();
+        let refused = publish_verified_flac_observed(&destination, &encoded, |stage| {
+            std::fs::remove_file(stage)?;
+            std::fs::write(stage, b"replacement")
+        });
+        assert!(matches!(refused, Err(OfflineExportError::Destination(_))));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"previous export");
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("flac-stage")));
+    }
+
+    #[test]
+    fn flac_publication_cleans_up_after_an_unreplaceable_destination_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("mix.flac");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("preserve"), b"existing directory").unwrap();
+        let audio = DecodedAudio::from_stereo(48_000, vec![0.0; 32], vec![0.0; 32]).unwrap();
+        let refused = publish_rendered_flac(
+            &audio,
+            OfflineExportSpec { block_frames: 32 },
+            &destination,
+        );
+        assert!(matches!(refused, Err(OfflineExportError::Destination(_))));
+        assert_eq!(std::fs::read(destination.join("preserve")).unwrap(), b"existing directory");
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("flac-stage")));
+    }
+
+    #[test]
+    fn flac_verification_refusal_preserves_the_existing_destination_before_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("mix.flac");
+        std::fs::write(&destination, b"previous export").unwrap();
+        let audio = DecodedAudio::from_stereo(48_000, vec![0.0; 32], vec![0.0; 32]).unwrap();
+        let expected_pcm = [0_i32, 0_i32].repeat(16);
+        let refused = verify_and_publish_flac(
+            &audio,
+            OfflineExportSpec { block_frames: 32 },
+            &destination,
+            &expected_pcm,
+            b"not a FLAC stream",
+        );
+        assert!(matches!(refused, Err(OfflineExportError::Output(_))));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"previous export");
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("flac-stage")));
+    }
+
+    #[test]
+    fn relative_flac_destination_uses_the_current_directory_parent() {
+        assert_eq!(flac_destination_parts(Path::new("export.flac")).unwrap().0, Path::new("."));
+    }
+
+    fn decode_flac_pcm_for_test(encoded: Vec<u8>, sample_rate_hz: u32, frames: usize) -> Vec<i32> {
+        let limits = hyper_audio_source::DecodeLimits::new(
+            u64::try_from(encoded.len()).unwrap(),
+            u64::try_from(frames).unwrap(),
+            frames * 2 * std::mem::size_of::<f32>(),
+        )
+        .unwrap();
+        let decoded = hyper_audio_source::decode_bytes(
+            encoded,
+            hyper_audio_source::AudioContainer::Flac,
+            sample_rate_hz,
+            limits,
+        )
+        .unwrap();
+        decoded
+            .plane(0)
+            .unwrap()
+            .iter()
+            .zip(decoded.plane(1).unwrap())
+            .flat_map(|(&left, &right)| [decode_sample_for_test(left), decode_sample_for_test(right)])
+            .collect()
+    }
+
+    fn decode_sample_for_test(sample: f32) -> i32 {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the literal test vectors are within the signed 24-bit domain"
+        )]
+        {
+            (sample * 8_388_608.0).round() as i32
+        }
     }
 }

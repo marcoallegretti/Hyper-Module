@@ -9702,28 +9702,30 @@ fn bind_project_export_callback(ui: &MainWindow, worker: &WorkerCell) {
             let path = selection.path().to_path_buf();
             ui.set_export_destination(path.display().to_string().into());
             ui.set_export_summary(SharedString::default());
-            let format = match IdeProjectExportFormat::from_destination(&path) {
-                Ok(format) => format,
+            let command = match project_export_command(path) {
+                Ok(command) => command,
                 Err(error) => {
                     ui.set_error_text(error.to_string().into());
                     ui.set_status_text("Export destination must end in .wav or .flac".into());
                     return;
                 }
             };
-            submit_to_ui(
-                &ui,
-                &worker,
-                IdeWorkerCommand::ExportProject {
-                    destination_path: path,
-                    format,
-                    block_frames: EXPORT_BLOCK_FRAMES,
-                },
-            );
+            submit_to_ui(&ui, &worker, command);
         });
         if spawn_result.is_err() {
             ui.set_status_text("Export destination selection is unavailable".into());
         }
     });
+}
+
+fn project_export_command(destination_path: PathBuf) -> Result<IdeWorkerCommand, String> {
+    let format = IdeProjectExportFormat::from_destination(&destination_path)
+        .map_err(|error| error.to_string())?;
+    Ok(IdeWorkerCommand::ExportProject {
+        destination_path,
+        format,
+        block_frames: EXPORT_BLOCK_FRAMES,
+    })
 }
 
 fn parse_control_millionths(value: &str) -> Result<i32, &'static str> {
@@ -10296,6 +10298,25 @@ mod tests {
             1,
             "pending export, unavailable playback extent, and local project forms keep export unavailable"
         );
+    }
+
+    #[test]
+    fn export_picker_selection_builds_one_typed_command_or_refuses() {
+        assert!(matches!(
+            project_export_command(PathBuf::from("C:/Renders/mix.WAV")),
+            Ok(IdeWorkerCommand::ExportProject {
+                format: IdeProjectExportFormat::Wav,
+                ..
+            })
+        ));
+        assert!(matches!(
+            project_export_command(PathBuf::from("C:/Renders/mix.flac")),
+            Ok(IdeWorkerCommand::ExportProject {
+                format: IdeProjectExportFormat::Flac,
+                ..
+            })
+        ));
+        assert!(project_export_command(PathBuf::from("C:/Renders/mix.aiff")).is_err());
     }
 
     fn assert_project_creation_shortcut_contract(ui: &MainWindow) {

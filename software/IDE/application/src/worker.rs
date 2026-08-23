@@ -14008,6 +14008,25 @@ mod tests {
             "unexpected FLAC export result: {flac_export:?}"
         );
 
+        let mismatched_path = fixture.join("must-remain.flac");
+        std::fs::write(&mismatched_path, b"previous export").unwrap();
+        worker
+            .try_send(IdeWorkerCommand::ExportProject {
+                destination_path: mismatched_path.clone(),
+                format: IdeProjectExportFormat::Wav,
+                block_frames: 64,
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectExporting));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ExportProject,
+                reason: IdeWorkerCommandFailure::ProjectExport(reason),
+            } if matches!(reason.as_ref(), IdeProjectExportError::DestinationUnavailable)
+        ));
+        assert_eq!(std::fs::read(&mismatched_path).unwrap(), b"previous export");
+
         worker
             .try_send(IdeWorkerCommand::EditNativeFilter {
                 edit: IdeNativeFilterEdit::Add {
@@ -17980,6 +17999,21 @@ mod tests {
                 command: IdeWorkerCommandKind::ExportProject,
                 reason: IdeWorkerCommandFailure::ProjectExport(reason),
             } if matches!(reason.as_ref(), IdeProjectExportError::ProjectSnapshotUnavailable)
+        ));
+        worker
+            .try_send(IdeWorkerCommand::ExportProject {
+                destination_path: std::path::PathBuf::from("export.flac"),
+                format: IdeProjectExportFormat::Wav,
+                block_frames: 1_024,
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::ProjectExporting));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ExportProject,
+                reason: IdeWorkerCommandFailure::ProjectExport(reason),
+            } if matches!(reason.as_ref(), IdeProjectExportError::DestinationUnavailable)
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
     }
