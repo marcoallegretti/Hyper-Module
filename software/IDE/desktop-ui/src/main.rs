@@ -2211,6 +2211,7 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
     });
 
     bind_audio_track_removal_callback(ui, worker);
+    bind_audio_track_content_removal_callback(ui, worker);
 }
 
 fn bind_audio_track_removal_callback(ui: &MainWindow, worker: &WorkerCell) {
@@ -2233,6 +2234,37 @@ fn bind_audio_track_removal_callback(ui: &MainWindow, worker: &WorkerCell) {
             &ui,
             &worker_for_removal,
             IdeWorkerCommand::RemoveAudioTrack { track_id },
+        );
+    });
+}
+
+fn bind_audio_track_content_removal_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker_for_removal = Rc::clone(worker);
+    actions.on_remove_audio_track_content(move |track_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_remove_track_content_visible()
+            || ui.get_remove_track_content_id() != track_id
+        {
+            ui.set_error_text("Audio-track content removal confirmation is no longer current".into());
+            return;
+        }
+        let Ok(track_id) = validate_audio_track_content_removal(
+            ui.get_app_mode(),
+            track_id.as_str(),
+            &ui.get_mixer_channels(),
+        ) else {
+            ui.set_error_text("The selected audio track is no longer available".into());
+            return;
+        };
+        submit_to_ui(
+            &ui,
+            &worker_for_removal,
+            IdeWorkerCommand::RemoveAudioTrackContent { track_id },
         );
     });
 }
@@ -4099,7 +4131,8 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         | IdeWorkerCommandKind::SetMeter => AppMode::Saving,
         IdeWorkerCommandKind::AddAudioTrack => AppMode::AddingTrack,
         IdeWorkerCommandKind::DuplicateAudioTrack => AppMode::DuplicatingTrack,
-        IdeWorkerCommandKind::RemoveAudioTrack => AppMode::RemovingTrack,
+        IdeWorkerCommandKind::RemoveAudioTrack
+        | IdeWorkerCommandKind::RemoveAudioTrackContent => AppMode::RemovingTrack,
         IdeWorkerCommandKind::RenameAudioTrack => AppMode::RenamingTrack,
         IdeWorkerCommandKind::SetAudioTrackActive => AppMode::ChangingTrackActivation,
         IdeWorkerCommandKind::ImportAudio => AppMode::ImportingAudio,
@@ -4225,6 +4258,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::RemoveAudioTrack => {
             "Preserving mixer state, removing the empty audio track, and reopening project…"
+        }
+        IdeWorkerCommandKind::RemoveAudioTrackContent => {
+            "Preserving mixer state, removing the audio track and its content, and reopening project…"
         }
         IdeWorkerCommandKind::ReorderAudioTracks => {
             "Preserving mixer state, reordering audio tracks, and reopening project…"
@@ -4497,6 +4533,11 @@ fn apply_event(
         }
         event @ (IdeWorkerEvent::AudioTrackRemoved { .. } | IdeWorkerEvent::AudioTrackRemoving) => {
             apply_audio_track_removal_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioTrackContentRemoved { .. }
+        | IdeWorkerEvent::AudioTrackContentRemoving
+        | IdeWorkerEvent::AudioTrackContentRemovalCommittedWithWarning { .. }) => {
+            apply_audio_track_content_removal_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioTrackDuplicated { .. }
         | IdeWorkerEvent::AudioTrackDuplicating) => {
@@ -4921,6 +4962,37 @@ fn apply_audio_track_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_status_text("Waiting for native output before removing the audio track…".into());
         }
         _ => unreachable!("audio-track removal event dispatcher received another event"),
+    }
+}
+
+fn apply_audio_track_content_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioTrackContentRemoved { revision, track_id } => {
+            ui.set_remove_track_content_visible(false);
+            ui.set_remove_track_content_id(SharedString::default());
+            ui.set_remove_track_content_name(SharedString::default());
+            ui.set_status_text(
+                format!("Audio track {track_id} and its content were removed in project revision {revision}")
+                    .into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioTrackContentRemoving => {
+            ui.set_app_mode(AppMode::RemovingTrack);
+            ui.set_status_text(
+                "Waiting for native output before removing the audio track and its content…".into(),
+            );
+        }
+        IdeWorkerEvent::AudioTrackContentRemovalCommittedWithWarning { warning } => {
+            ui.set_remove_track_content_visible(false);
+            ui.set_remove_track_content_id(SharedString::default());
+            ui.set_remove_track_content_name(SharedString::default());
+            ui.set_status_text(
+                "Audio track content removal committed, but recovery needs attention".into(),
+            );
+            ui.set_error_text(warning.to_string().into());
+        }
+        _ => unreachable!("audio-track content removal event dispatcher received another event"),
     }
 }
 
@@ -7404,6 +7476,9 @@ fn reset_project(
     ui.set_remove_track_visible(false);
     ui.set_remove_track_id(SharedString::default());
     ui.set_remove_track_name(SharedString::default());
+    ui.set_remove_track_content_visible(false);
+    ui.set_remove_track_content_id(SharedString::default());
+    ui.set_remove_track_content_name(SharedString::default());
     ui.set_rename_track_index(-1);
     ui.set_rename_track_original_name(SharedString::default());
     ui.set_rename_track_name(SharedString::default());
@@ -7588,6 +7663,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::RemoveAudioTrack if current == AppMode::RemovingTrack => {
+            AppMode::Running
+        }
+        IdeWorkerCommandKind::RemoveAudioTrackContent if current == AppMode::RemovingTrack => {
             AppMode::Running
         }
         IdeWorkerCommandKind::RenameAudioTrack if current == AppMode::RenamingTrack => {
@@ -8319,6 +8397,24 @@ fn validate_audio_track_removal(
         .find(|row| row.track_id.as_str() == track_id)
         .ok_or(MixerControlFailure::StaleSelection)?;
     if mode != AppMode::Running || !row.state_available || !row.removable {
+        return Err(MixerControlFailure::StateUnavailable);
+    }
+    Ok(row.track_id.to_string())
+}
+
+fn validate_audio_track_content_removal(
+    mode: AppMode,
+    track_id: &str,
+    channels: &ModelRc<MixerChannelRow>,
+) -> Result<String, MixerControlFailure> {
+    if track_id.is_empty() {
+        return Err(MixerControlFailure::InvalidSelection);
+    }
+    let row = (0..channels.row_count())
+        .filter_map(|index| channels.row_data(index))
+        .find(|row| row.track_id.as_str() == track_id)
+        .ok_or(MixerControlFailure::StaleSelection)?;
+    if mode != AppMode::Running || !row.state_available || !row.activation_toggleable {
         return Err(MixerControlFailure::StateUnavailable);
     }
     Ok(row.track_id.to_string())
@@ -12992,6 +13088,36 @@ mod tests {
             ),
             Err(MixerControlFailure::StaleSelection)
         );
+        assert_eq!(
+            validate_audio_track_content_removal(AppMode::Running, track_a, &reordered)
+                .unwrap(),
+            track_a
+        );
+        assert_eq!(
+            validate_audio_track_content_removal(AppMode::Closed, track_a, &reordered),
+            Err(MixerControlFailure::StateUnavailable)
+        );
+        let mut non_audio = row(0, track_a);
+        non_audio.activation_toggleable = false;
+        let non_audio = ModelRc::from(Rc::new(VecModel::from(vec![non_audio])));
+        assert_eq!(
+            validate_audio_track_content_removal(AppMode::Running, track_a, &non_audio),
+            Err(MixerControlFailure::StateUnavailable)
+        );
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::RemoveAudioTrackContent,
+            ),
+            AppMode::RemovingTrack
+        );
+        assert_eq!(
+            mode_after_failure(
+                AppMode::RemovingTrack,
+                IdeWorkerCommandKind::RemoveAudioTrackContent,
+            ),
+            AppMode::Running
+        );
         assert_eq!(gain_percent_to_millionths(0.0), Ok(0));
         assert_eq!(gain_percent_to_millionths(125.5), Ok(1_255_000));
         assert_eq!(gain_percent_to_millionths(200.0), Ok(2_000_000));
@@ -14786,6 +14912,7 @@ mod tests {
     fn assert_window_contracts(ui: &MainWindow) {
         assert_recent_project_window_contract(ui);
         assert_audio_import_window_contract(ui);
+        assert_audio_track_content_removal_window_contract(ui);
         assert_audio_clip_removal_window_contract(ui);
         assert_audio_clip_source_trim_window_contract(ui);
         assert_unused_sample_cleanup_window_contract(ui);
@@ -14887,6 +15014,62 @@ mod tests {
 
         assert_audio_import_callback_contract(ui, &routes);
         assert_audio_import_event_contract(ui, &routes);
+    }
+
+    fn assert_audio_track_content_removal_window_contract(ui: &MainWindow) {
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        bind_audio_track_content_removal_callback(ui, &worker);
+        let track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(vec![
+            MixerChannelRow {
+                index: 0,
+                track_id: track_id.into(),
+                name: "Lead".into(),
+                display_name: "Lead".into(),
+                kind: "AUDIO".into(),
+                state_available: true,
+                gain_percent: 100.0,
+                pan_percent: 0.0,
+                muted: false,
+                solo: false,
+                solo_available: true,
+                renameable: true,
+                removable: false,
+                can_move_earlier: false,
+                can_move_later: false,
+                active: true,
+                activation_toggleable: true,
+            },
+        ]))));
+        ui.set_app_mode(AppMode::Running);
+        ui.set_remove_track_content_visible(false);
+        ui.set_remove_track_content_id(SharedString::default());
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>()
+            .invoke_remove_audio_track_content(track_id.into());
+        assert!(ui.get_error_text().contains("confirmation is no longer current"));
+
+        ui.set_remove_track_content_visible(true);
+        ui.set_remove_track_content_id(track_id.into());
+        ui.set_remove_track_content_name("Lead".into());
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>()
+            .invoke_remove_audio_track_content(track_id.into());
+        assert!(ui.get_error_text().contains("worker is no longer available"));
+
+        apply_audio_track_content_removal_event(ui, &IdeWorkerEvent::AudioTrackContentRemoving);
+        assert_eq!(ui.get_app_mode(), AppMode::RemovingTrack);
+        apply_audio_track_content_removal_event(
+            ui,
+            &IdeWorkerEvent::AudioTrackContentRemoved {
+                revision: 9,
+                track_id: track_id.to_owned(),
+            },
+        );
+        assert!(!ui.get_remove_track_content_visible());
+        assert!(ui.get_remove_track_content_id().is_empty());
+        assert!(ui.get_status_text().contains("revision 9"));
+        assert!(ui.get_error_text().is_empty());
     }
 
     fn assert_audio_clip_removal_window_contract(ui: &MainWindow) {

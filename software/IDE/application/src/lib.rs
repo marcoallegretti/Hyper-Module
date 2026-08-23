@@ -81,6 +81,8 @@ use hyper_playback_json::{
     AudioClipRenameSerializationError,
     AudioClipSourceStartSerializationError, AudioClipSourceViewSerializationError,
     AudioTrackAdditionSerializationError,
+    AudioTrackContentRemovalDocuments, AudioTrackContentRemovalSerializationError,
+    AudioTrackContentRemovalSource,
     AudioTrackDocumentSerializationError, AudioTrackRemovalBlockers,
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
     AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
@@ -103,6 +105,7 @@ use hyper_playback_json::{
     serialize_audio_clip_rename, serialize_audio_clip_reverse, serialize_audio_clip_source_start,
     serialize_audio_clip_source_view,
     serialize_audio_track_activation, serialize_audio_track_addition,
+    serialize_audio_track_content_removal,
     serialize_audio_track_removal, serialize_audio_track_rename,
     serialize_audio_track_duplication, serialize_audio_track_reorder,
     serialize_automation_take_activation, serialize_automation_take_addition,
@@ -149,6 +152,7 @@ use hyper_native_device::{
 use hyper_storage_engine::{
     ArrangementPublicationRequest, AudioClipPublicationOutcome, AudioClipPublicationRequest,
     AudioClipRemovalOutcome, AudioClipRemovalRequest,
+    AudioTrackContentRemovalPublicationOutcome, AudioTrackContentRemovalPublicationRequest,
     AudioTrackDuplicationPublicationOutcome, AudioTrackDuplicationPublicationRequest,
     AudioTrackPublicationOutcome, AudioTrackPublicationRequest, AudioTrackRemovalOutcome,
     AudioTrackRemovalRequest, AutomationTakePublicationRequest, AutomationTakeRemovalRequest,
@@ -158,7 +162,7 @@ use hyper_storage_engine::{
     ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest,
     RequiredControlCapabilities, SampleCleanupOutcome, SampleCleanupRequest,
     ScenePublicationRequest, StorageError, clean_unused_samples, publish_arrangement,
-    publish_audio_clip, publish_audio_track, publish_audio_track_duplication, publish_automation_take, publish_control_mapping,
+    publish_audio_clip, publish_audio_track, publish_audio_track_content_removal, publish_audio_track_duplication, publish_automation_take, publish_control_mapping,
     publish_device_chain, publish_imported_audio_clip, publish_project_resource, publish_scene,
     remove_audio_clip, remove_audio_track, remove_automation_take, remove_device_chain,
     TrackOrderPublicationOutcome, TrackOrderPublicationRequest, publish_track_order,
@@ -2321,6 +2325,143 @@ impl IdeAudioTrackRemovalBlockers {
             && self.control_mappings == 0
             && self.recording_metadata == 0
             && !self.has_automation
+    }
+}
+
+/// Rejection for a confirmed deletion of an audio track and its owned musical
+/// state. Control mappings and recording metadata remain independent resource
+/// authorities, so this operation refuses them until their own durable
+/// transformations can participate in the same transaction.
+#[derive(Debug)]
+pub enum IdeAudioTrackContentRemovalError {
+    InvalidTrackIdentity,
+    MixerSave(Box<IdeProjectSaveError>),
+    Storage(StorageError),
+    Device(DeviceChainError),
+    TrackResourceMissing,
+    TrackResourceRoleMismatch,
+    DeviceChainAmbiguous,
+    ExternalReferences {
+        control_mappings: usize,
+        recording_metadata: usize,
+    },
+    CapacityUnavailable,
+    Serialization(AudioTrackContentRemovalSerializationError),
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeAudioTrackContentRemovalError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: AudioTrackContentRemovalPublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<ProjectResourcePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeAudioTrackContentRemovalError {
+    /// Whether the durable manifest commit completed despite a later warning.
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        matches!(self, Self::Publication(source) if source.published())
+            || matches!(self, Self::ReopenAfterPublication { .. })
+            || matches!(self, Self::ReopenAfterPreparation { preparation, .. }
+                if preparation.publication_committed())
+    }
+}
+
+impl fmt::Display for IdeAudioTrackContentRemovalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTrackIdentity => {
+                formatter.write_str("full audio-track removal requires a track identity")
+            }
+            Self::MixerSave(source) => {
+                write!(formatter, "live mixer state could not be preserved: {source}")
+            }
+            Self::Storage(source) => source.fmt(formatter),
+            Self::Device(source) => source.fmt(formatter),
+            Self::TrackResourceMissing => {
+                formatter.write_str("the selected audio track is unavailable")
+            }
+            Self::TrackResourceRoleMismatch => formatter.write_str(
+                "the selected track cannot be removed with its musical state",
+            ),
+            Self::DeviceChainAmbiguous => formatter.write_str(
+                "the selected track has multiple native device chains and cannot be removed safely",
+            ),
+            Self::ExternalReferences {
+                control_mappings,
+                recording_metadata,
+            } => write!(
+                formatter,
+                "audio-track content removal refuses external references (control mappings: {control_mappings}, recording metadata: {recording_metadata})",
+            ),
+            Self::CapacityUnavailable => {
+                formatter.write_str("audio-track content removal capacity is unavailable")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before removing the audio track and its content: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before removing the audio track and its content ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-track content removal preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "audio track {} and its content were removed in project revision {} but the project could not be reopened: {source}",
+                outcome.track_id(),
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-track content removal failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAudioTrackContentRemovalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Device(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidTrackIdentity
+            | Self::TrackResourceMissing
+            | Self::TrackResourceRoleMismatch
+            | Self::DeviceChainAmbiguous
+            | Self::ExternalReferences { .. }
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
     }
 }
 
@@ -6466,6 +6607,13 @@ struct IdeAudioTrackRemovalPlan {
 }
 
 #[derive(Debug)]
+struct IdeAudioTrackContentRemovalPlan {
+    project_path: PathBuf,
+    expected_project_sha256: [u8; 32],
+    documents: AudioTrackContentRemovalDocuments,
+}
+
+#[derive(Debug)]
 struct IdeAudioClipRemovalPlan {
     mixer: IdeMixerSavePlan,
     clip_id: String,
@@ -6545,6 +6693,23 @@ impl IdeAudioTrackRemovalPlan {
                 track_id: &self.track_id,
                 mixer_id: &self.mixer_id,
                 mixer_bytes: &self.mixer_bytes,
+            },
+        )
+    }
+}
+
+impl IdeAudioTrackContentRemovalPlan {
+    fn publish(
+        &self,
+    ) -> Result<
+        AudioTrackContentRemovalPublicationOutcome,
+        ProjectResourcePublicationError,
+    > {
+        publish_audio_track_content_removal(
+            &self.project_path,
+            AudioTrackContentRemovalPublicationRequest {
+                expected_project_sha256: self.expected_project_sha256,
+                documents: &self.documents,
             },
         )
     }
@@ -8155,6 +8320,183 @@ impl RunningDesktopIdeApplication {
             track_id: owned_track_id,
             mixer_id: mixer_plan.resource_id,
             mixer_bytes,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the complete manifest source inventory makes full track removal refuse partial graph authority"
+    )]
+    fn prepare_audio_track_content_removal(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        track_id: &str,
+    ) -> Result<IdeAudioTrackContentRemovalPlan, IdeAudioTrackContentRemovalError> {
+        if track_id.is_empty() {
+            return Err(IdeAudioTrackContentRemovalError::InvalidTrackIdentity);
+        }
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAudioTrackContentRemovalError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAudioTrackContentRemovalError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == track_id)
+            .ok_or(IdeAudioTrackContentRemovalError::TrackResourceMissing)?;
+        if descriptor.role() != ResourceRole::Track {
+            return Err(IdeAudioTrackContentRemovalError::TrackResourceRoleMismatch);
+        }
+        let track = package
+            .read_resource(track_id)
+            .map_err(IdeAudioTrackContentRemovalError::Storage)?;
+        let (project, compiled_mixer, _, media) = prepared.session().parts();
+        if project.structural_track_index(track_id).is_none() {
+            return Err(IdeAudioTrackContentRemovalError::TrackResourceMissing);
+        }
+        let track_slot = compiled_mixer
+            .slots()
+            .iter()
+            .find(|slot| slot.track_id() == track_id);
+        let control_mappings = prepared.control_mapping().map_or(0, |mapping| {
+            mapping
+                .bindings()
+                .iter()
+                .filter(|binding| {
+                    control_binding_references_audio_track(binding, track_id, |send_id| {
+                        track_slot.is_some_and(|slot| {
+                            slot.sends().iter().any(|send| send.id() == send_id)
+                        })
+                    })
+                })
+                .count()
+        });
+        let recording_metadata = prepared
+            .recording_metadata()
+            .iter()
+            .filter(|metadata| metadata.track_id() == track_id)
+            .count();
+        if control_mappings != 0 || recording_metadata != 0 {
+            return Err(IdeAudioTrackContentRemovalError::ExternalReferences {
+                control_mappings,
+                recording_metadata,
+            });
+        }
+
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeAudioTrackContentRemovalError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+
+        let resources = package.manifest().resources();
+        let mut clips = Vec::new();
+        let mut scenes = Vec::new();
+        let mut automation_ids = Vec::new();
+        let mut automation_takes = Vec::new();
+        clips
+            .try_reserve_exact(resources.len())
+            .map_err(|_| IdeAudioTrackContentRemovalError::CapacityUnavailable)?;
+        scenes
+            .try_reserve_exact(resources.len())
+            .map_err(|_| IdeAudioTrackContentRemovalError::CapacityUnavailable)?;
+        automation_ids
+            .try_reserve_exact(resources.len())
+            .map_err(|_| IdeAudioTrackContentRemovalError::CapacityUnavailable)?;
+        automation_takes
+            .try_reserve_exact(resources.len())
+            .map_err(|_| IdeAudioTrackContentRemovalError::CapacityUnavailable)?;
+        let mut arrangement = None;
+        let mut device_chain_id = None;
+        let mut device_chain = None;
+        for descriptor in resources {
+            match descriptor.role() {
+                ResourceRole::Clip => {
+                    let bytes = package
+                        .read_resource(descriptor.id())
+                        .map_err(IdeAudioTrackContentRemovalError::Storage)?;
+                    clips.push((descriptor.id().to_owned(), bytes));
+                }
+                ResourceRole::Scene => {
+                    let bytes = package
+                        .read_resource(descriptor.id())
+                        .map_err(IdeAudioTrackContentRemovalError::Storage)?;
+                    scenes.push((descriptor.id().to_owned(), bytes));
+                }
+                ResourceRole::Arrangement => {
+                    if arrangement.is_some() {
+                        return Err(IdeAudioTrackContentRemovalError::TrackResourceRoleMismatch);
+                    }
+                    arrangement = Some(
+                        package
+                            .read_resource(descriptor.id())
+                            .map_err(IdeAudioTrackContentRemovalError::Storage)?,
+                    );
+                }
+                ResourceRole::AutomationTake => {
+                    let bytes = package
+                        .read_resource(descriptor.id())
+                        .map_err(IdeAudioTrackContentRemovalError::Storage)?;
+                    automation_ids.push(descriptor.id().to_owned());
+                    automation_takes.push((descriptor.id().to_owned(), bytes));
+                }
+                ResourceRole::DeviceChain => {
+                    let bytes = package
+                        .read_resource(descriptor.id())
+                        .map_err(IdeAudioTrackContentRemovalError::Storage)?;
+                    let chain = DeviceChain::parse(&bytes)
+                        .map_err(IdeAudioTrackContentRemovalError::Device)?;
+                    if chain.track_id() == track_id {
+                        if device_chain.is_some() {
+                            return Err(IdeAudioTrackContentRemovalError::DeviceChainAmbiguous);
+                        }
+                        device_chain_id = Some(descriptor.id().to_owned());
+                        device_chain = Some(bytes);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let clip_sources = clips
+            .iter()
+            .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let scene_sources = scenes
+            .iter()
+            .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let automation_take_ids = automation_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let automation_sources = automation_takes
+            .iter()
+            .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let documents = serialize_audio_track_content_removal(
+            project,
+            &assets,
+            AudioTrackContentRemovalSource {
+                track: &track,
+                clips: &clip_sources,
+                scenes: &scene_sources,
+                arrangement: arrangement.as_deref(),
+                mixer: &mixer.resource_bytes,
+                automation_take_ids: &automation_take_ids,
+                automation_takes: &automation_sources,
+                device_chain_id: device_chain_id.as_deref(),
+                device_chain: device_chain.as_deref(),
+            },
+            track_id,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeAudioTrackContentRemovalError::Serialization)?;
+        Ok(IdeAudioTrackContentRemovalPlan {
+            project_path: mixer.project_path,
+            expected_project_sha256: mixer.expected_project_sha256,
+            documents,
         })
     }
 

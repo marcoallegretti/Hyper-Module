@@ -317,6 +317,7 @@ export global IdeActions {
     callback add-audio-track(string);
     callback duplicate-audio-track(int, string);
     callback remove-audio-track(string);
+    callback remove-audio-track-content(string);
     callback reorder-audio-track(int, bool);
     callback rename-audio-track(int, string);
     callback set-audio-track-active(int, bool);
@@ -474,6 +475,9 @@ export component MainWindow inherits Window {
     in-out property <bool> remove-track-visible: false;
     in-out property <string> remove-track-id: "";
     in-out property <string> remove-track-name: "";
+    in-out property <bool> remove-track-content-visible: false;
+    in-out property <string> remove-track-content-id: "";
+    in-out property <string> remove-track-content-name: "";
     in-out property <bool> mixer-sends-visible: false;
     in-out property <bool> takes-visible: false;
     in-out property <bool> take-clip-visible: false;
@@ -574,6 +578,7 @@ export component MainWindow inherits Window {
         || root.duplicate-track-visible
         || root.rename-track-visible
         || root.remove-track-visible
+        || root.remove-track-content-visible
         || root.take-clip-visible
         || root.add-arrangement-scene-launch-visible
         || root.move-arrangement-scene-launch-visible
@@ -1967,7 +1972,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && root.remove-track-visible && !root.duplicate-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && root.remove-track-visible && !root.remove-track-content-visible && !root.duplicate-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -1999,7 +2004,39 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && root.rename-track-visible && !root.remove-track-visible && !root.duplicate-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && root.remove-track-content-visible && !root.remove-track-visible && !root.duplicate-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 14px;
+                        Text { text: "REMOVE AUDIO TRACK AND CONTENT"; color: #ff7474; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: root.remove-track-content-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
+                        Rectangle { height: 1px; background: #27313d; }
+                        Text { text: "This permanently removes this audio track, its owned clips, scene slots, arrangement placements, automation, and native device chain. Imported and recorded media files remain. It cannot be undone. Control mappings and recording metadata must be removed first."; color: #aebccc; font-size: 11px; wrap: word-wrap; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button {
+                                text: "Cancel";
+                                enabled: root.app-mode == AppMode.running;
+                                clicked => {
+                                    root.remove-track-content-visible = false;
+                                    root.remove-track-content-id = "";
+                                    root.remove-track-content-name = "";
+                                }
+                            }
+                            Button {
+                                horizontal-stretch: 1;
+                                text: root.app-mode == AppMode.removing-track ? "Removing track and content..." : "Remove track and content";
+                                enabled: root.app-mode == AppMode.running && root.remove-track-content-id != "";
+                                clicked => { IdeActions.remove-audio-track-content(root.remove-track-content-id); }
+                            }
+                        }
+                        Rectangle { vertical-stretch: 1; background: transparent; }
+                    }
+                }
+
+                if root.mixer-visible && root.rename-track-visible && !root.remove-track-visible && !root.remove-track-content-visible && !root.duplicate-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -2041,7 +2078,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && root.duplicate-track-visible && !root.rename-track-visible && !root.remove-track-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && root.duplicate-track-visible && !root.rename-track-visible && !root.remove-track-visible && !root.remove-track-content-visible && !root.mixer-sends-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -2089,7 +2126,7 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.mixer-visible && !root.duplicate-track-visible && !root.rename-track-visible && !root.remove-track-visible && !root.mixer-sends-visible && !root.mixer-automation-visible && !root.mixer-control-visible && !root.mixer-native-filter-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.mixer-visible && !root.duplicate-track-visible && !root.rename-track-visible && !root.remove-track-visible && !root.remove-track-content-visible && !root.mixer-sends-visible && !root.mixer-automation-visible && !root.mixer-control-visible && !root.mixer-native-filter-visible && !root.takes-visible && !root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {
@@ -2189,6 +2226,16 @@ export component MainWindow inherits Window {
                                         root.remove-track-id = channel.track-id;
                                         root.remove-track-name = channel.name;
                                         root.remove-track-visible = true;
+                                    }
+                                }
+                                Button {
+                                    text: "Delete…";
+                                    accessible-label: "Remove " + channel.name + " and its content";
+                                    enabled: root.app-mode == AppMode.running && channel.activation-toggleable;
+                                    clicked => {
+                                        root.remove-track-content-id = channel.track-id;
+                                        root.remove-track-content-name = channel.name;
+                                        root.remove-track-content-visible = true;
                                     }
                                 }
                                 HorizontalLayout {
