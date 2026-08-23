@@ -10161,6 +10161,44 @@ mod tests {
         );
     }
 
+    fn assert_project_export_shortcut_contract(ui: &MainWindow) {
+        let exports = Rc::new(Cell::new(0_usize));
+        let exports_by_callback = Rc::clone(&exports);
+        ui.global::<IdeActions>().on_export_project(move || {
+            exports_by_callback.set(exports_by_callback.get() + 1);
+        });
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_export_available(true);
+        ui.set_new_project_visible(false);
+        ui.set_new_track_visible(false);
+        dispatch_ide_shortcut(ui, "e", false, false);
+        dispatch_ide_shortcut(ui, "e", false, true);
+        dispatch_ide_shortcut(ui, "E", true, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "e", false, true, false, false);
+        dispatch_ide_shortcut_with_modifiers(ui, "e", false, false, true, false);
+        assert_eq!(
+            exports.get(),
+            1,
+            "only the exact primary export shortcut reaches the existing export action"
+        );
+
+        ui.set_app_mode(AppMode::ExportingProject);
+        dispatch_ide_shortcut(ui, "e", false, false);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_export_available(false);
+        dispatch_ide_shortcut(ui, "e", false, false);
+        ui.set_export_available(true);
+        ui.set_new_track_visible(true);
+        dispatch_ide_shortcut(ui, "e", false, false);
+        ui.set_new_track_visible(false);
+        assert_eq!(
+            exports.get(),
+            1,
+            "pending export, unavailable playback extent, and local project forms keep export unavailable"
+        );
+    }
+
     fn assert_project_creation_shortcut_contract(ui: &MainWindow) {
         ui.set_app_mode(AppMode::Closed);
         ui.set_new_project_visible(false);
@@ -13532,6 +13570,7 @@ mod tests {
         assert_window_contracts(&ui);
         assert_undo_redo_shortcut_contract(&ui);
         assert_project_save_shortcut_contract(&ui);
+        assert_project_export_shortcut_contract(&ui);
         assert_project_creation_shortcut_contract(&ui);
         assert_project_open_shortcut_contract(&ui);
         assert_audio_track_creation_shortcut_contract(&ui);
