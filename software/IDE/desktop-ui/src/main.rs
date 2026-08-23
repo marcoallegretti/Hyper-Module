@@ -1297,6 +1297,78 @@ fn bind_project_save_callback_with(
 }
 
 fn bind_project_copy_callback(ui: &MainWindow, worker: &WorkerCell) {
+    bind_project_copy_callback_with(ui, worker, |weak, worker, project_name| {
+        let weak_for_dialog = weak.clone();
+        let spawn_result = slint::spawn_local(async move {
+            let selection = rfd::AsyncFileDialog::new()
+                .set_title("Choose parent folder for the independent Hyper Module project")
+                .pick_folder()
+                .await;
+            let Some(ui) = weak_for_dialog.upgrade() else {
+                return;
+            };
+            if ui.get_app_mode() != AppMode::Saving || !ui.get_save_project_as_visible() {
+                return;
+            }
+            complete_project_copy_choice(
+                &ui,
+                &worker,
+                project_name,
+                selection.map_or(ProjectCopyChoice::Cancelled, |selection| {
+                    ProjectCopyChoice::Selected(selection.path().to_path_buf())
+                }),
+            );
+        });
+        if let Err(error) = spawn_result
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_error_text(format!("Save As location dialog could not start: {error}").into());
+        }
+    });
+}
+
+#[derive(Debug)]
+enum ProjectCopyChoice {
+    Selected(PathBuf),
+    Cancelled,
+}
+
+fn complete_project_copy_choice(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    project_name: String,
+    choice: ProjectCopyChoice,
+) {
+    complete_project_copy_choice_with(ui, project_name, choice, |command| {
+        submit_to_ui(ui, worker, command);
+    });
+}
+
+fn complete_project_copy_choice_with(
+    ui: &MainWindow,
+    project_name: String,
+    choice: ProjectCopyChoice,
+    submit: impl FnOnce(IdeWorkerCommand),
+) {
+    match choice {
+        ProjectCopyChoice::Selected(parent) => submit(IdeWorkerCommand::SaveProjectAs {
+            parent,
+            directory_name: project_name.clone(),
+            project_name,
+        }),
+        ProjectCopyChoice::Cancelled => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text("Save As cancelled".into());
+        }
+    }
+}
+
+fn bind_project_copy_callback_with(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell, String) + 'static,
+) {
     let weak = ui.as_weak();
     let worker = Rc::clone(worker);
     ui.global::<IdeActions>().on_save_project_as(move |project_name| {
@@ -1314,39 +1386,7 @@ fn bind_project_copy_callback(ui: &MainWindow, worker: &WorkerCell) {
         ui.set_app_mode(AppMode::Saving);
         ui.set_error_text(SharedString::default());
         ui.set_status_text("Waiting for the independent project destination…".into());
-        let weak_for_dialog = weak.clone();
-        let worker = Rc::clone(&worker);
-        let spawn_result = slint::spawn_local(async move {
-            let selection = rfd::AsyncFileDialog::new()
-                .set_title("Choose parent folder for the independent Hyper Module project")
-                .pick_folder()
-                .await;
-            let Some(ui) = weak_for_dialog.upgrade() else {
-                return;
-            };
-            if ui.get_app_mode() != AppMode::Saving || !ui.get_save_project_as_visible() {
-                return;
-            }
-            let Some(selection) = selection else {
-                ui.set_app_mode(AppMode::Running);
-                ui.set_status_text("Save As cancelled".into());
-                return;
-            };
-            let parent = selection.path().to_path_buf();
-            submit_to_ui(
-                &ui,
-                &worker,
-                IdeWorkerCommand::SaveProjectAs {
-                    parent,
-                    directory_name: project_name.clone(),
-                    project_name,
-                },
-            );
-        });
-        if let Err(error) = spawn_result {
-            ui.set_app_mode(AppMode::Running);
-            ui.set_error_text(format!("Save As location dialog could not start: {error}").into());
-        }
+        choose(weak.clone(), Rc::clone(&worker), project_name.to_string());
     });
 }
 
@@ -10351,6 +10391,67 @@ mod tests {
         );
     }
 
+    fn assert_project_copy_callback_contract(ui: &MainWindow) {
+        let worker: WorkerCell = Rc::new(RefCell::new(None));
+        bind_project_copy_callback_with(ui, &worker, move |weak, _, project_name| {
+            let ui = weak.upgrade().unwrap();
+            complete_project_copy_choice_with(
+                &ui,
+                project_name,
+                ProjectCopyChoice::Cancelled,
+                |_| panic!("a cancelled Save As chooser must not submit a command"),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.set_save_project_as_visible(true);
+        ui.global::<IdeActions>()
+            .invoke_save_project_as("Independent".into());
+        assert_eq!(ui.get_app_mode(), AppMode::Running);
+        assert_eq!(ui.get_status_text(), "Save As cancelled");
+
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_choice = Rc::clone(&submitted);
+        complete_project_copy_choice_with(
+            ui,
+            "Independent".to_owned(),
+            ProjectCopyChoice::Selected(PathBuf::from("parent")),
+            move |command| submitted_by_choice.borrow_mut().push(command),
+        );
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [IdeWorkerCommand::SaveProjectAs {
+                parent,
+                directory_name,
+                project_name,
+            }] if parent == &PathBuf::from("parent")
+                && directory_name == "Independent"
+                && project_name == "Independent"
+        ));
+
+        bind_project_copy_callback_with(ui, &worker, move |weak, worker, project_name| {
+            let ui = weak.upgrade().unwrap();
+            complete_project_copy_choice(
+                &ui,
+                &worker,
+                project_name,
+                ProjectCopyChoice::Selected(PathBuf::from("parent")),
+            );
+        });
+        ui.set_app_mode(AppMode::Running);
+        ui.set_save_project_as_visible(true);
+        ui.global::<IdeActions>()
+            .invoke_save_project_as("Independent".into());
+        assert_eq!(ui.get_app_mode(), AppMode::Unavailable);
+        assert!(ui.get_error_text().contains("no longer available"));
+        ui.set_app_mode(AppMode::Saving);
+        ui.set_error_text(SharedString::default());
+        ui.global::<IdeActions>()
+            .invoke_save_project_as("Ignored".into());
+        assert!(ui.get_error_text().is_empty());
+        ui.set_save_project_as_visible(false);
+        ui.set_app_mode(AppMode::Running);
+    }
+
     fn assert_project_export_shortcut_contract(ui: &MainWindow) {
         let exports = Rc::new(Cell::new(0_usize));
         let exports_by_callback = Rc::clone(&exports);
@@ -13916,6 +14017,7 @@ mod tests {
         assert_window_contracts(&ui);
         assert_undo_redo_shortcut_contract(&ui);
         assert_project_save_shortcut_contract(&ui);
+        assert_project_copy_callback_contract(&ui);
         assert_project_export_shortcut_contract(&ui);
         assert_project_creation_shortcut_contract(&ui);
         assert_project_open_shortcut_contract(&ui);
