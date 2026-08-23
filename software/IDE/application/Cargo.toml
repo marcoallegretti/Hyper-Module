@@ -39,6 +39,7 @@ ui-test-support = []
 
 [dev-dependencies]
 hyper-clip-engine = { path = "../../../crates/clip-engine" }
+hyper-mixer-runtime = { path = "../../../crates/mixer-runtime", features = ["test-support"] }
 serde_json = "=1.0.151"
 serde_json_canonicalizer = "=0.3.2"
 sha2 = "=0.10.9"

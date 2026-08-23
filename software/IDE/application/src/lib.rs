@@ -7489,6 +7489,7 @@ pub struct RunningIdeSnapshot<'a> {
         hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT];
         MAX_IDE_MIXER_CHANNELS],
     pub mixer_main_state: Option<IdeMixerMainState>,
+    pub mixer_unsaved_changes: bool,
     pub control_bindings: &'a [ControlBinding],
     pub output_state: OutputStreamState,
     pub output: OutputStreamSnapshot,
@@ -10808,6 +10809,10 @@ impl RunningDesktopIdeApplication {
         if mixer_parameters.is_some_and(|state| state.channel_count() != mixer_channel_count) {
             return None;
         }
+        let mixer_unsaved_changes = match mixer_parameters {
+            Some(state) => live_mixer_state_is_dirty(mixer, &state)?,
+            None => false,
+        };
         let mut mixer_channel_ids = [""; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_names = [""; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_channel_kinds = [IdeMixerChannelKind::Audio; MAX_IDE_MIXER_CHANNELS];
@@ -10896,6 +10901,7 @@ impl RunningDesktopIdeApplication {
             mixer_send_taps,
             mixer_send_states,
             mixer_main_state,
+            mixer_unsaved_changes,
             control_bindings: project
                 .control_mapping()
                 .map_or(&[] as &[ControlBinding], ControlMappingDocument::bindings),
@@ -11496,6 +11502,38 @@ fn ide_mixer_main_state(
         gain: state.main_gain().value(),
         muted: state.main_muted(),
     }
+}
+
+/// Compares one committed runtime checkpoint with the compiled project base
+/// state without reading or writing project storage.
+///
+/// A missing checkpoint means the prepared project is still audible unchanged.
+/// A layout mismatch is not a clean state and must prevent publication of a
+/// misleading observation.
+fn live_mixer_state_is_dirty(
+    mixer: &CompiledMixerGraph,
+    live: &MixerParameterStateSnapshot,
+) -> Option<bool> {
+    if live.channel_count() != mixer.slots().len() {
+        return None;
+    }
+    for (index, slot) in mixer.slots().iter().enumerate() {
+        let channel = live.channel(index)?;
+        if channel.parameters() != slot.parameters()
+            || channel.muted() != slot.muted()
+            || channel.solo() != slot.solo()
+            || channel.send_count() != slot.sends().len()
+        {
+            return Some(true);
+        }
+        for (send_index, send) in slot.sends().iter().enumerate() {
+            let state = channel.send(send_index)?;
+            if state.parameters() != send.parameters() || state.enabled() != send.enabled() {
+                return Some(true);
+            }
+        }
+    }
+    Some(live.main_gain() != mixer.main_gain() || live.main_muted() != mixer.main_muted())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12582,6 +12620,82 @@ mod tests {
             track_id,
             |_| false
         ));
+    }
+
+    #[test]
+    fn live_mixer_dirty_state_compares_the_compiled_baseline() {
+        let parent = TestDirectory::new();
+        let created = hyper_storage_engine::create_project(
+            &parent.0,
+            hyper_storage_engine::ProjectCreationRequest {
+                directory_name: "Project",
+                project_name: "Mixer dirty state",
+            },
+        )
+        .unwrap();
+        let prepared = hyper_project_loader::prepare_project_playback(
+            created.project().root(),
+            desktop_ide_application_config().unwrap().project_limits(),
+        )
+        .unwrap();
+        let (_, mixer, _, _) = prepared.session().parts();
+        let channels: Vec<_> = mixer
+            .slots()
+            .iter()
+            .map(|slot| {
+                let sends: Vec<_> = slot
+                    .sends()
+                    .iter()
+                    .map(|send| {
+                        hyper_mixer_runtime::MixerSendParameterState::for_test(
+                            send.parameters(),
+                            send.enabled(),
+                        )
+                    })
+                    .collect();
+                hyper_mixer_runtime::MixerChannelParameterState::for_test(
+                    slot.parameters(),
+                    slot.muted(),
+                    slot.solo(),
+                    &sends,
+                )
+            })
+            .collect();
+        let clean = hyper_mixer_runtime::MixerParameterStateSnapshot::for_test(
+            &channels,
+            mixer.main_gain(),
+            mixer.main_muted(),
+        );
+        assert_eq!(live_mixer_state_is_dirty(mixer, &clean), Some(false));
+
+        let mut changed_channels = channels.clone();
+        let original = changed_channels[0];
+        let sends: Vec<_> = (0..original.send_count())
+            .map(|index| original.send(index).unwrap())
+            .collect();
+        changed_channels[0] = hyper_mixer_runtime::MixerChannelParameterState::for_test(
+            hyper_audio_engine::ChannelParameters::new(
+                LinearGain::from_millionths(750_000).unwrap(),
+                original.parameters().pan,
+                original.parameters().audible,
+            ),
+            original.muted(),
+            original.solo(),
+            &sends,
+        );
+        let changed_channel = hyper_mixer_runtime::MixerParameterStateSnapshot::for_test(
+            &changed_channels,
+            mixer.main_gain(),
+            mixer.main_muted(),
+        );
+        assert_eq!(live_mixer_state_is_dirty(mixer, &changed_channel), Some(true));
+
+        let changed_main = hyper_mixer_runtime::MixerParameterStateSnapshot::for_test(
+            &channels,
+            LinearGain::from_millionths(750_000).unwrap(),
+            mixer.main_muted(),
+        );
+        assert_eq!(live_mixer_state_is_dirty(mixer, &changed_main), Some(true));
     }
 
     #[test]

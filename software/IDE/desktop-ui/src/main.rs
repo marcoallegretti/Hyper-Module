@@ -58,7 +58,8 @@ use hyper_desktop_ide::{
 };
 use slint::platform::PlatformError;
 use slint::{
-    ComponentHandle, Model, ModelRc, ModelTracker, SharedString, Timer, TimerMode, VecModel,
+    CloseRequestResponse, ComponentHandle, Model, ModelRc, ModelTracker, SharedString, Timer,
+    TimerMode, VecModel,
 };
 
 slint::include_modules!();
@@ -1188,14 +1189,73 @@ fn bind_playback_callbacks(
 
     bind_audio_track_callback(ui, worker);
 
-    let weak = ui.as_weak();
-    let worker_for_close = Rc::clone(worker);
-    actions.on_close_project(move || {
-        submit(&weak, &worker_for_close, IdeWorkerCommand::CloseProject);
-    });
+    bind_project_close_callback(ui, worker);
 
     bind_mixer_callbacks(ui, worker);
     bind_native_filter_callbacks(ui, worker, project_state);
+    bind_window_close_callback(ui);
+}
+
+fn bind_project_close_callback(ui: &MainWindow, worker: &WorkerCell) {
+    let worker = Rc::clone(worker);
+    bind_project_close_callback_with(
+        ui,
+        Rc::new(move |ui, command| submit_to_ui(ui, &worker, command)),
+    );
+}
+
+fn bind_project_close_callback_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let close_submitter = Rc::clone(&submitter);
+    actions.on_close_project(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if matches!(ui.get_app_mode(), AppMode::Running | AppMode::Previewing)
+            && ui.get_mixer_unsaved_changes()
+        {
+            ui.set_close_unsaved_mixer_confirming(true);
+            ui.set_status_text("Live mixer changes need a save or explicit discard before closing".into());
+            ui.set_error_text(SharedString::default());
+            return;
+        }
+        close_submitter(&ui, IdeWorkerCommand::CloseProject);
+    });
+    let weak = ui.as_weak();
+    actions.on_confirm_close_project(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if !matches!(ui.get_app_mode(), AppMode::Running | AppMode::Previewing)
+            || !ui.get_close_unsaved_mixer_confirming()
+        {
+            return;
+        }
+        ui.set_close_unsaved_mixer_confirming(false);
+        submitter(&ui, IdeWorkerCommand::CloseProject);
+    });
+}
+
+fn bind_window_close_callback(ui: &MainWindow) {
+    let weak = ui.as_weak();
+    ui.window().on_close_requested(move || {
+        let Some(ui) = weak.upgrade() else {
+            return CloseRequestResponse::HideWindow;
+        };
+        window_close_response(&ui)
+    });
+}
+
+fn window_close_response(ui: &MainWindow) -> CloseRequestResponse {
+    if matches!(ui.get_app_mode(), AppMode::Running | AppMode::Previewing)
+        && ui.get_mixer_unsaved_changes()
+    {
+        ui.global::<IdeActions>().invoke_close_project();
+        CloseRequestResponse::KeepWindowShown
+    } else {
+        CloseRequestResponse::HideWindow
+    }
 }
 
 fn bind_project_save_callback(
@@ -6711,6 +6771,11 @@ fn set_audio_import_targets(
 
 fn apply_mixer_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
     set_mixer(ui, observation.mixer_channels());
+    let unsaved_changes = observation.mixer_unsaved_changes();
+    ui.set_mixer_unsaved_changes(unsaved_changes);
+    if !unsaved_changes {
+        ui.set_close_unsaved_mixer_confirming(false);
+    }
     if let Some(main) = observation.mixer_main() {
         ui.set_mixer_main_state_available(true);
         ui.set_mixer_main_gain_percent(main.gain * 100.0);
@@ -7037,6 +7102,8 @@ fn reset_project(
     ui.set_mixer_main_state_available(false);
     ui.set_mixer_main_gain_percent(0.0);
     ui.set_mixer_main_muted(false);
+    ui.set_mixer_unsaved_changes(false);
+    ui.set_close_unsaved_mixer_confirming(false);
     recording_routes.borrow_mut().clear();
     ui.set_recording_target_names(ModelRc::default());
     ui.set_selected_recording_target_index(0);
@@ -10358,6 +10425,80 @@ mod tests {
         ui.set_new_track_visible(false);
     }
 
+    fn assert_unsaved_mixer_close_contract(ui: &MainWindow) {
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_project_close_callback_with(
+            ui,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+        bind_window_close_callback(ui);
+
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_unsaved_changes(false);
+        ui.set_close_unsaved_mixer_confirming(false);
+        ui.global::<IdeActions>().invoke_close_project();
+        assert!(
+            matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::CloseProject]),
+            "a clean running project may close through the existing worker command"
+        );
+
+        submitted.borrow_mut().clear();
+        ui.set_mixer_unsaved_changes(true);
+        ui.window()
+            .try_dispatch_event(slint::platform::WindowEvent::CloseRequested)
+            .expect("a rejected native close request must remain dispatchable");
+        assert!(submitted.borrow().is_empty());
+        assert!(
+            ui.get_close_unsaved_mixer_confirming(),
+            "a native close request with a committed live-mixer difference must require an explicit close decision"
+        );
+        ui.global::<IdeActions>().invoke_close_project();
+        assert!(
+            submitted.borrow().is_empty(),
+            "repeating the ordinary close action cannot silently confirm discard"
+        );
+        ui.global::<IdeActions>().invoke_confirm_close_project();
+        assert!(
+            matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::CloseProject]),
+            "only the explicit discard confirmation may send close"
+        );
+
+        submitted.borrow_mut().clear();
+        ui.set_app_mode(AppMode::Previewing);
+        ui.set_close_unsaved_mixer_confirming(false);
+        ui.global::<IdeActions>().invoke_close_project();
+        assert!(submitted.borrow().is_empty());
+        assert!(
+            ui.get_close_unsaved_mixer_confirming(),
+            "take audition cannot bypass a pending live-mixer discard decision"
+        );
+        ui.global::<IdeActions>().invoke_confirm_close_project();
+        assert!(
+            matches!(submitted.borrow().as_slice(), [IdeWorkerCommand::CloseProject]),
+            "the explicit discard path remains available while auditioning"
+        );
+
+        submitted.borrow_mut().clear();
+        ui.set_app_mode(AppMode::Running);
+        ui.set_close_unsaved_mixer_confirming(true);
+        ui.set_mixer_unsaved_changes(false);
+        let observation = IdeRunningObservation::for_ui_test(PlaybackRecoverySnapshot::for_test(
+            PlaybackRecoveryTransportState::Stopped,
+            0,
+        ));
+        apply_mixer_observation(ui, &observation);
+        assert!(
+            !ui.get_close_unsaved_mixer_confirming(),
+            "a later clean recovery observation withdraws an obsolete discard confirmation"
+        );
+        assert_eq!(
+            window_close_response(ui),
+            CloseRequestResponse::HideWindow,
+            "a clean project does not block ordinary application exit"
+        );
+    }
+
     fn assert_transport_space_shortcut_contract(ui: &MainWindow) {
         let starts = Rc::new(Cell::new(0_usize));
         let starts_by_callback = Rc::clone(&starts);
@@ -13587,6 +13728,7 @@ mod tests {
         assert_project_open_shortcut_contract(&ui);
         assert_audio_track_creation_shortcut_contract(&ui);
         assert_project_close_shortcut_contract(&ui);
+        assert_unsaved_mixer_close_contract(&ui);
         assert_transport_space_shortcut_contract(&ui);
         assert_transport_running_observation_contract(&ui);
         assert_audio_import_shortcut_contract(&ui);

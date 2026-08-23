@@ -705,6 +705,7 @@ pub struct IdeRunningObservation {
     track_count: usize,
     mixer_channels: Vec<IdeMixerChannel>,
     mixer_main: Option<IdeMixerMainState>,
+    mixer_unsaved_changes: bool,
     output_state: OutputStreamState,
     output: OutputStreamSnapshot,
     monitoring: Option<IdeMonitoringState>,
@@ -1367,6 +1368,7 @@ impl IdeRunningObservation {
             track_count: 0,
             mixer_channels: Vec::new(),
             mixer_main: None,
+            mixer_unsaved_changes: false,
             output_state: OutputStreamState::Running,
             output: OutputStreamSnapshot::default(),
             monitoring: None,
@@ -1495,6 +1497,12 @@ impl IdeRunningObservation {
     #[must_use]
     pub const fn mixer_main(&self) -> Option<IdeMixerMainState> {
         self.mixer_main
+    }
+
+    /// Whether the committed live mixer differs from the project's stored base state.
+    #[must_use]
+    pub const fn mixer_unsaved_changes(&self) -> bool {
+        self.mixer_unsaved_changes
     }
 
     #[must_use]
@@ -11774,6 +11782,7 @@ fn running_observation(
         track_count: snapshot.track_count,
         mixer_channels,
         mixer_main: snapshot.mixer_main_state,
+        mixer_unsaved_changes: snapshot.mixer_unsaved_changes,
         output_state: snapshot.output_state,
         output: snapshot.output,
         monitoring: snapshot.monitoring,
