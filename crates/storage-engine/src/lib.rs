@@ -55,10 +55,13 @@ pub use resource_publication::{
     ProjectResourcePublicationRequest, ScenePublicationRequest, publish_arrangement,
     publish_audio_clip, publish_audio_track, publish_automation_take, publish_device_chain,
     publish_imported_audio_clip,
-    publish_project_resource, publish_scene, recover_audio_clip_publications,
-    recover_audio_track_publications, recover_project_resource_publications,
+    publish_project_resource, publish_scene, publish_track_order,
+    recover_audio_clip_publications, recover_audio_track_publications,
+    recover_project_resource_publications, recover_track_order_publications,
     recover_sample_cleanups, remove_audio_clip, remove_audio_track, remove_automation_take,
-    remove_device_chain, clean_unused_samples,
+    remove_device_chain, clean_unused_samples, TrackOrderPublicationOutcome,
+    TrackOrderPublicationRecovery, TrackOrderPublicationRecoveryDisposition,
+    TrackOrderPublicationRequest,
 };
 
 use core::error::Error;

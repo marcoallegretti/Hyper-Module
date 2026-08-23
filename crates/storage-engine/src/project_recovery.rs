@@ -10,7 +10,7 @@ use super::{
     recover_audio_clip_publications, recover_audio_track_publications,
     recover_control_mapping_publications, recover_project_resource_publications,
     recover_project_renames, recover_recording_imports,
-    recover_sample_cleanups,
+    recover_sample_cleanups, TrackOrderPublicationRecovery, recover_track_order_publications,
 };
 
 /// Complete transaction-recovery evidence produced before an editable project
@@ -25,6 +25,7 @@ struct ProjectTransactionRecoveryFamilies {
     sample_cleanups: Vec<SampleCleanupRecovery>,
     resources: Vec<ProjectResourcePublicationRecovery>,
     audio_tracks: Vec<AudioTrackPublicationRecovery>,
+    track_orders: Vec<TrackOrderPublicationRecovery>,
     audio_clips: Vec<AudioClipPublicationRecovery>,
     control_mappings: Vec<ControlMappingPublicationRecovery>,
     recordings: Vec<RecordingImportRecovery>,
@@ -32,10 +33,15 @@ struct ProjectTransactionRecoveryFamilies {
 }
 
 impl ProjectTransactionRecoveryReport {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each transaction family retains an independently typed recovery report"
+    )]
     fn from_parts(
         sample_cleanups: Vec<SampleCleanupRecovery>,
         resources: Vec<ProjectResourcePublicationRecovery>,
         audio_tracks: Vec<AudioTrackPublicationRecovery>,
+        track_orders: Vec<TrackOrderPublicationRecovery>,
         audio_clips: Vec<AudioClipPublicationRecovery>,
         control_mappings: Vec<ControlMappingPublicationRecovery>,
         recordings: Vec<RecordingImportRecovery>,
@@ -46,6 +52,7 @@ impl ProjectTransactionRecoveryReport {
                 sample_cleanups,
                 resources,
                 audio_tracks,
+                track_orders,
                 audio_clips,
                 control_mappings,
                 recordings,
@@ -67,6 +74,11 @@ impl ProjectTransactionRecoveryReport {
     #[must_use]
     pub fn audio_tracks(&self) -> &[AudioTrackPublicationRecovery] {
         &self.families.audio_tracks
+    }
+
+    #[must_use]
+    pub fn track_orders(&self) -> &[TrackOrderPublicationRecovery] {
+        &self.families.track_orders
     }
 
     #[must_use]
@@ -94,6 +106,7 @@ impl ProjectTransactionRecoveryReport {
         self.families.sample_cleanups.is_empty()
             && self.families.resources.is_empty()
             && self.families.audio_tracks.is_empty()
+            && self.families.track_orders.is_empty()
             && self.families.audio_clips.is_empty()
             && self.families.control_mappings.is_empty()
             && self.families.recordings.is_empty()
@@ -106,6 +119,7 @@ pub enum ProjectTransactionRecoveryErrorSource {
     Resource(ProjectResourcePublicationError),
     SampleCleanup(ProjectResourcePublicationError),
     AudioTrack(ProjectResourcePublicationError),
+    TrackOrder(ProjectResourcePublicationError),
     AudioClip(ProjectResourcePublicationError),
     ControlMapping(ControlMappingPublicationError),
     Recording(RecordingImportError),
@@ -118,6 +132,7 @@ impl fmt::Display for ProjectTransactionRecoveryErrorSource {
             Self::Resource(source) => write!(formatter, "resource recovery failed: {source}"),
             Self::SampleCleanup(source) => write!(formatter, "sample cleanup recovery failed: {source}"),
             Self::AudioTrack(source) => write!(formatter, "audio-track recovery failed: {source}"),
+            Self::TrackOrder(source) => write!(formatter, "track-order recovery failed: {source}"),
             Self::AudioClip(source) => write!(formatter, "audio-clip recovery failed: {source}"),
             Self::ControlMapping(source) => {
                 write!(formatter, "control-mapping recovery failed: {source}")
@@ -134,6 +149,7 @@ impl Error for ProjectTransactionRecoveryErrorSource {
             Self::Resource(source)
             | Self::SampleCleanup(source)
             | Self::AudioTrack(source)
+            | Self::TrackOrder(source)
             | Self::AudioClip(source) => {
                 Some(source)
             }
@@ -228,6 +244,7 @@ pub fn recover_project_transactions(
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                 ),
                 source: Box::new(ProjectTransactionRecoveryErrorSource::Resource(source)),
             });
@@ -245,8 +262,27 @@ pub fn recover_project_transactions(
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                 ),
                 source: Box::new(ProjectTransactionRecoveryErrorSource::AudioTrack(source)),
+            });
+        }
+    };
+    let track_orders = match recover_track_order_publications(project_path) {
+        Ok(track_orders) => track_orders,
+        Err(source) => {
+            return Err(ProjectTransactionRecoveryError {
+                completed: ProjectTransactionRecoveryReport::from_parts(
+                    sample_cleanups,
+                    resources,
+                    audio_tracks,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                source: Box::new(ProjectTransactionRecoveryErrorSource::TrackOrder(source)),
             });
         }
     };
@@ -258,6 +294,7 @@ pub fn recover_project_transactions(
                     sample_cleanups,
                     resources,
                     audio_tracks,
+                    track_orders,
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -275,6 +312,7 @@ pub fn recover_project_transactions(
                     sample_cleanups,
                     resources,
                     audio_tracks,
+                    track_orders,
                     audio_clips,
                     Vec::new(),
                     Vec::new(),
@@ -294,6 +332,7 @@ pub fn recover_project_transactions(
                     sample_cleanups,
                     resources,
                     audio_tracks,
+                    track_orders,
                     audio_clips,
                     control_mappings,
                     Vec::new(),
@@ -311,6 +350,7 @@ pub fn recover_project_transactions(
                     sample_cleanups,
                     resources,
                     audio_tracks,
+                    track_orders,
                     audio_clips,
                     control_mappings,
                     recordings,
@@ -324,6 +364,7 @@ pub fn recover_project_transactions(
         sample_cleanups,
         resources,
         audio_tracks,
+        track_orders,
         audio_clips,
         control_mappings,
         recordings,

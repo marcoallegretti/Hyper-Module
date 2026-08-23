@@ -41,7 +41,8 @@ use super::{
     IdeAudioImportBatchOutcome,
     IdeAudioImportError, IdeAudioInputInventory, IdeAudioOutputInventory,
     IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioTrackAdditionError,
-    IdeAudioTrackEditError, IdeAudioTrackRemovalError, IdeAutomationTakeCreationError,
+    IdeAudioTrackEditError, IdeAudioTrackRemovalError, IdeAudioTrackReorderError,
+    IdeAutomationTakeCreationError,
     IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
     IdeHistoryOperation, IdeNativeFilterEdit, IdeNativeFilterEditError, NativeFilterMode,
     IdeControlMappingEdit, IdeControlMappingEditError, IdeInputDiscoveryError, IdeInputSelection,
@@ -153,6 +154,7 @@ pub enum IdeWorkerCommandKind {
     PrepareRuntime,
     AddAudioTrack,
     RemoveAudioTrack,
+    ReorderAudioTracks,
     RenameAudioTrack,
     SetAudioTrackActive,
     ImportAudio,
@@ -261,6 +263,10 @@ pub enum IdeWorkerCommand {
     },
     RemoveAudioTrack {
         track_id: String,
+    },
+    ReorderAudioTracks {
+        track_id: String,
+        destination_index: usize,
     },
     RenameAudioTrack {
         track_id: String,
@@ -474,6 +480,7 @@ impl IdeWorkerCommand {
             Self::PrepareRuntime { .. } => IdeWorkerCommandKind::PrepareRuntime,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
+            Self::ReorderAudioTracks { .. } => IdeWorkerCommandKind::ReorderAudioTracks,
             Self::RenameAudioTrack { .. } => IdeWorkerCommandKind::RenameAudioTrack,
             Self::SetAudioTrackActive { .. } => IdeWorkerCommandKind::SetAudioTrackActive,
             Self::ImportAudio { .. } => IdeWorkerCommandKind::ImportAudio,
@@ -728,6 +735,7 @@ pub struct IdeRunningObservation {
     preview: IdeAudioPreviewObservation,
     scenes: Vec<IdeScene>,
     track_count: usize,
+    flat_audio_track_reorder_available: bool,
     mixer_channels: Vec<IdeMixerChannel>,
     mixer_main: Option<IdeMixerMainState>,
     mixer_unsaved_changes: bool,
@@ -1391,6 +1399,7 @@ impl IdeRunningObservation {
             },
             scenes: Vec::new(),
             track_count: 0,
+            flat_audio_track_reorder_available: false,
             mixer_channels: Vec::new(),
             mixer_main: None,
             mixer_unsaved_changes: false,
@@ -1525,6 +1534,13 @@ impl IdeRunningObservation {
     #[must_use]
     pub fn mixer_channels(&self) -> &[IdeMixerChannel] {
         &self.mixer_channels
+    }
+
+    /// The verified project shape supports the initial coupled audio-track
+    /// reorder operation.
+    #[must_use]
+    pub const fn flat_audio_track_reorder_available(&self) -> bool {
+        self.flat_audio_track_reorder_available
     }
 
     #[must_use]
@@ -1846,6 +1862,7 @@ pub enum IdeWorkerCommandFailure {
     RuntimePreparation(Box<IdeRuntimePreparationError>),
     AudioTrackAddition(Box<super::IdeAudioTrackAdditionError>),
     AudioTrackRemoval(Box<super::IdeAudioTrackRemovalError>),
+    AudioTrackReorder(Box<super::IdeAudioTrackReorderError>),
     AudioTrackRename(Box<super::IdeAudioTrackEditError>),
     AudioTrackActivation(Box<super::IdeAudioTrackEditError>),
     AudioImport(Box<super::IdeAudioImportBatchFailure>),
@@ -1980,6 +1997,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::RuntimePreparation(source) => source.fmt(formatter),
             Self::AudioTrackAddition(source) => source.fmt(formatter),
             Self::AudioTrackRemoval(source) => source.fmt(formatter),
+            Self::AudioTrackReorder(source) => source.fmt(formatter),
             Self::AudioTrackRename(source) | Self::AudioTrackActivation(source) => {
                 source.fmt(formatter)
             }
@@ -2073,6 +2091,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::RuntimePreparation(source) => Some(source.as_ref()),
             Self::AudioTrackAddition(source) => Some(source),
             Self::AudioTrackRemoval(source) => Some(source),
+            Self::AudioTrackReorder(source) => Some(source),
             Self::AudioTrackRename(source) | Self::AudioTrackActivation(source) => Some(source),
             Self::AudioImport(source) => Some(source),
             Self::AudioImportReopen { source, .. } => Some(source.as_ref()),
@@ -2223,6 +2242,9 @@ pub enum IdeWorkerEvent {
         revision: u64,
     },
     AudioTrackRemoved {
+        revision: u64,
+    },
+    AudioTracksReordered {
         revision: u64,
     },
     AudioTrackRenamed {
@@ -2498,6 +2520,7 @@ pub enum IdeWorkerEvent {
     ProjectRenaming,
     AudioTrackAdding,
     AudioTrackRemoving,
+    AudioTracksReordering,
     AudioTrackRenaming,
     AudioTrackActivationChanging {
         active: bool,
@@ -2986,6 +3009,10 @@ enum ProjectMutation {
     RemoveAudioTrack {
         track_id: String,
     },
+    ReorderAudioTracks {
+        track_id: String,
+        destination_index: usize,
+    },
     RenameAudioTrack {
         track_id: String,
         name: String,
@@ -3159,6 +3186,7 @@ impl ProjectMutation {
             Self::PrepareRuntime { .. } => IdeWorkerCommandKind::PrepareRuntime,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
+            Self::ReorderAudioTracks { .. } => IdeWorkerCommandKind::ReorderAudioTracks,
             Self::RenameAudioTrack { .. } => IdeWorkerCommandKind::RenameAudioTrack,
             Self::SetAudioTrackActive { .. } => IdeWorkerCommandKind::SetAudioTrackActive,
             Self::ImportAudio { .. } => IdeWorkerCommandKind::ImportAudio,
@@ -3232,6 +3260,7 @@ impl ProjectMutation {
             Self::PrepareRuntime { .. } => IdeWorkerEvent::RuntimePreparing,
             Self::AddAudioTrack { .. } => IdeWorkerEvent::AudioTrackAdding,
             Self::RemoveAudioTrack { .. } => IdeWorkerEvent::AudioTrackRemoving,
+            Self::ReorderAudioTracks { .. } => IdeWorkerEvent::AudioTracksReordering,
             Self::RenameAudioTrack { .. } => IdeWorkerEvent::AudioTrackRenaming,
             Self::SetAudioTrackActive { active, .. } => {
                 IdeWorkerEvent::AudioTrackActivationChanging { active: *active }
@@ -3583,6 +3612,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::Monitoring
         | IdeWorkerCommandKind::AddAudioTrack
         | IdeWorkerCommandKind::RemoveAudioTrack
+        | IdeWorkerCommandKind::ReorderAudioTracks
         | IdeWorkerCommandKind::ImportAudio
         | IdeWorkerCommandKind::CreateAudioClipFromTake
         | IdeWorkerCommandKind::DuplicateAudioClip
@@ -3880,6 +3910,7 @@ fn process_command(
         | IdeWorkerCommand::PrepareRuntime { .. }
         | IdeWorkerCommand::AddAudioTrack { .. }
         | IdeWorkerCommand::RemoveAudioTrack { .. }
+        | IdeWorkerCommand::ReorderAudioTracks { .. }
         | IdeWorkerCommand::RenameAudioTrack { .. }
         | IdeWorkerCommand::SetAudioTrackActive { .. }
         | IdeWorkerCommand::ImportAudio { .. }
@@ -4043,6 +4074,10 @@ fn process_project_mutation_command(
         IdeWorkerCommand::RemoveAudioTrack { track_id } => {
             remove_audio_track(state, events, &track_id)
         }
+        IdeWorkerCommand::ReorderAudioTracks {
+            track_id,
+            destination_index,
+        } => reorder_audio_tracks(state, events, &track_id, destination_index),
         IdeWorkerCommand::RenameAudioTrack { track_id, name } => {
             rename_audio_track(state, events, &track_id, &name)
         }
@@ -5464,6 +5499,42 @@ fn remove_audio_track(
     )
 }
 
+fn reorder_audio_tracks(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    track_id: &str,
+    destination_index: usize,
+) -> bool {
+    if track_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::ReorderAudioTracks,
+            IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
+                IdeAudioTrackReorderError::TrackResourceMissing,
+            )),
+        );
+    }
+    let mut owned_track_id = String::new();
+    if owned_track_id.try_reserve_exact(track_id.len()).is_err() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::ReorderAudioTracks,
+            IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
+                IdeAudioTrackReorderError::CapacityUnavailable,
+            )),
+        );
+    }
+    owned_track_id.push_str(track_id);
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::ReorderAudioTracks {
+            track_id: owned_track_id,
+            destination_index,
+        },
+    )
+}
+
 fn rename_audio_track(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -6690,6 +6761,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         } => HistoryEffect::Replacement(&publication.outcome),
         ProjectMutationAttempt::AddAudioTrack(Ok(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Ok(_))
+        | ProjectMutationAttempt::ReorderAudioTracks(Ok(_))
         | ProjectMutationAttempt::ImportAudio(
             Ok(_)
             | Err(IdeAudioImportBatchFailure {
@@ -6713,6 +6785,11 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         {
             HistoryEffect::Invalidate
         }
+        ProjectMutationAttempt::ReorderAudioTracks(Err(reason))
+            if reason.publication_committed() =>
+        {
+            HistoryEffect::Invalidate
+        }
         ProjectMutationAttempt::EditNativeFilter { .. }
         | ProjectMutationAttempt::SaveProjectAs(_)
         | ProjectMutationAttempt::RenameProject(_)
@@ -6720,6 +6797,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::Save(Err(_))
         | ProjectMutationAttempt::AddAudioTrack(Err(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Err(_))
+        | ProjectMutationAttempt::ReorderAudioTracks(Err(_))
         | ProjectMutationAttempt::ImportAudio(Err(IdeAudioImportBatchFailure {
             completed: 0,
             ..
@@ -7413,6 +7491,9 @@ fn project_mutation_save_failure(
         ProjectMutation::RemoveAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackRemoval(
             Box::new(IdeAudioTrackRemovalError::MixerSave(Box::new(reason))),
         ),
+        ProjectMutation::ReorderAudioTracks { .. } => IdeWorkerCommandFailure::AudioTrackReorder(
+            Box::new(IdeAudioTrackReorderError::MixerSave(Box::new(reason))),
+        ),
         ProjectMutation::RenameAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackRename(
             Box::new(IdeAudioTrackEditError::MixerSave(Box::new(reason))),
         ),
@@ -7683,6 +7764,9 @@ fn project_mutation_native_close_failure(
         ProjectMutation::RemoveAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackRemoval(
             Box::new(IdeAudioTrackRemovalError::NativeClose(failure)),
         ),
+        ProjectMutation::ReorderAudioTracks { .. } => IdeWorkerCommandFailure::AudioTrackReorder(
+            Box::new(IdeAudioTrackReorderError::NativeClose(failure)),
+        ),
         ProjectMutation::RenameAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackRename(
             Box::new(IdeAudioTrackEditError::NativeClose(failure)),
         ),
@@ -7892,6 +7976,9 @@ enum ProjectMutationAttempt {
     ),
     RemoveAudioTrack(
         Result<hyper_storage_engine::AudioTrackRemovalOutcome, IdeAudioTrackRemovalError>,
+    ),
+    ReorderAudioTracks(
+        Result<hyper_storage_engine::TrackOrderPublicationOutcome, IdeAudioTrackReorderError>,
     ),
     RenameAudioTrack(
         Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeAudioTrackEditError>,
@@ -8567,6 +8654,17 @@ fn complete_project_mutation(
                     events,
                     IdeWorkerCommandKind::RemoveAudioTrack,
                     IdeWorkerCommandFailure::AudioTrackRemoval(Box::new(reason)),
+                ),
+                ProjectMutationAttempt::ReorderAudioTracks(Ok(outcome)) => send_event(
+                    events,
+                    IdeWorkerEvent::AudioTracksReordered {
+                        revision: outcome.project_revision(),
+                    },
+                ),
+                ProjectMutationAttempt::ReorderAudioTracks(Err(reason)) => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::ReorderAudioTracks,
+                    IdeWorkerCommandFailure::AudioTrackReorder(Box::new(reason)),
                 ),
                 ProjectMutationAttempt::RenameAudioTrack(Ok(outcome)) => send_event(
                     events,
@@ -9617,6 +9715,23 @@ fn attempt_project_mutation(
                 })
             })
         }
+        ProjectMutation::ReorderAudioTracks {
+            track_id,
+            destination_index,
+        } => ProjectMutationAttempt::ReorderAudioTracks(if let Some(failure) = native_failure {
+            Err(IdeAudioTrackReorderError::NativeClose(failure))
+        } else {
+            RunningDesktopIdeApplication::prepare_audio_track_reorder(
+                application,
+                recovery,
+                &track_id,
+                destination_index,
+            )
+            .and_then(|plan| {
+                plan.publish()
+                    .map_err(|source| IdeAudioTrackReorderError::Publication(Box::new(source)))
+            })
+        }),
         ProjectMutation::RenameAudioTrack { track_id, name } => {
             ProjectMutationAttempt::RenameAudioTrack(if let Some(failure) = native_failure {
                 Err(IdeAudioTrackEditError::NativeClose(failure))
@@ -10875,6 +10990,38 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::RemoveAudioTrack(Err(preparation)) => {
             IdeWorkerCommandFailure::AudioTrackRemoval(Box::new(
                 IdeAudioTrackRemovalError::ReopenAfterPreparation {
+                    preparation: Box::new(preparation),
+                    reopen: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::ReorderAudioTracks(Ok(outcome)) => {
+            IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
+                IdeAudioTrackReorderError::ReopenAfterPublication {
+                    outcome,
+                    source: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::ReorderAudioTracks(Err(
+            IdeAudioTrackReorderError::Publication(publication),
+        )) => IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
+            IdeAudioTrackReorderError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::ReorderAudioTracks(Err(
+            IdeAudioTrackReorderError::NativeClose(close),
+        )) => IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
+            IdeAudioTrackReorderError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::ReorderAudioTracks(Err(preparation)) => {
+            IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
+                IdeAudioTrackReorderError::ReopenAfterPreparation {
                     preparation: Box::new(preparation),
                     reopen: Box::new(reopen),
                 },
@@ -12543,6 +12690,7 @@ fn running_observation(
         },
         scenes,
         track_count: snapshot.track_count,
+        flat_audio_track_reorder_available: snapshot.loaded.supports_flat_audio_track_reorder(),
         mixer_channels,
         mixer_main: snapshot.mixer_main_state,
         mixer_unsaved_changes: snapshot.mixer_unsaved_changes,
@@ -16668,6 +16816,58 @@ mod tests {
                 command: IdeWorkerCommandKind::RenameAudioTrack,
                 reason: IdeWorkerCommandFailure::AudioTrackRename(reason),
             } if matches!(reason.as_ref(), IdeAudioTrackEditError::MixerSave(boxed)
+                if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn audio_track_reorder_validates_identity_and_waits_for_the_mixer_fence() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession {
+                save_eligible: true,
+                commit_mixer_fences: true,
+                ..TestPlaybackSession::default()
+            }),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 5).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::ReorderAudioTracks {
+                track_id: String::new(),
+                destination_index: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ReorderAudioTracks,
+                reason: IdeWorkerCommandFailure::AudioTrackReorder(reason),
+            } if matches!(reason.as_ref(), IdeAudioTrackReorderError::TrackResourceMissing)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::ReorderAudioTracks {
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456".to_owned(),
+                destination_index: 1,
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::AudioTracksReordering));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::ReorderAudioTracks,
+                reason: IdeWorkerCommandFailure::AudioTrackReorder(reason),
+            } if matches!(reason.as_ref(), IdeAudioTrackReorderError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);

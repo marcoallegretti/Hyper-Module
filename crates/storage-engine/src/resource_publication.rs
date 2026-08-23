@@ -7,6 +7,7 @@ use std::path::Path;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::fs::{Dir, OpenOptions};
 use hyper_native_device::DeviceChain;
+use hyper_playback_json::AudioTrackReorderDocuments;
 use hyper_project_model::{ProjectManifest, ResourceDescriptor, ResourceRole, is_valid_entity_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,11 +30,12 @@ pub use sample_cleanup::{
 
 use super::project_lock::{
     AUDIO_TRACK_TRANSACTION_PREFIX, PROJECT_RESOURCE_TRANSACTION_PREFIX as TRANSACTION_PREFIX,
+    TRACK_ORDER_TRANSACTION_PREFIX,
     ProjectLock, ProjectTransactionFamily, find_unhandled_project_transaction,
 };
 use super::stable_file::read_open_stable;
 use super::{
-    MANIFEST_NAME, MAX_JSON_BYTES, MAX_JSON_FILE_BYTES, StructurallyVerifiedProject,
+    MANIFEST_NAME, MAX_ENTRIES, MAX_JSON_BYTES, MAX_JSON_FILE_BYTES, StructurallyVerifiedProject,
     open_stable_project_root, same_directory, verify_project_candidate, verify_project_package,
     verify_retained_project_candidate,
 };
@@ -48,6 +50,8 @@ const TRANSACTION_NAME: &str = "transaction.json";
 const AUDIO_TRACK_STAGING_NAME: &str = "track.json";
 const AUDIO_TRACK_MIXER_STAGING_NAME: &str = "mixer.json";
 const AUDIO_TRACK_PREVIOUS_MIXER_NAME: &str = "previous-mixer.json";
+const TRACK_ORDER_MIXER_STAGING_NAME: &str = "mixer.json";
+const TRACK_ORDER_PREVIOUS_MIXER_NAME: &str = "previous-mixer.json";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Copy, Debug)]
@@ -218,6 +222,67 @@ pub struct AudioTrackRemovalRequest<'a> {
     pub track_id: &'a str,
     pub mixer_id: &'a str,
     pub mixer_bytes: &'a [u8],
+}
+
+/// Replaces every structural track document and the matching mixer through one
+/// manifest-last transaction.  The request is intentionally complete: a track
+/// order is a project-wide permutation, never a sequence of independently
+/// publishable edits.
+#[derive(Clone, Copy, Debug)]
+pub struct TrackOrderPublicationRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub mixer_id: &'a str,
+    /// The opaque canonical output of the playback-document reorder boundary.
+    /// It cannot be assembled from arbitrary bytes by a storage caller.
+    pub documents: &'a AudioTrackReorderDocuments,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrackOrderPublicationTrack<'a> {
+    track_id: &'a str,
+    track_bytes: &'a [u8],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrackOrderPublicationOutcome {
+    project_identity: [u8; 32],
+    project_revision: u64,
+}
+
+impl TrackOrderPublicationOutcome {
+    #[must_use]
+    pub const fn project_identity(&self) -> &[u8; 32] {
+        &self.project_identity
+    }
+
+    #[must_use]
+    pub const fn project_revision(&self) -> u64 {
+        self.project_revision
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrackOrderPublicationRecoveryDisposition {
+    Committed,
+    RolledBack,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrackOrderPublicationRecovery {
+    transaction_id: String,
+    disposition: TrackOrderPublicationRecoveryDisposition,
+}
+
+impl TrackOrderPublicationRecovery {
+    #[must_use]
+    pub fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> TrackOrderPublicationRecoveryDisposition {
+        self.disposition
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -400,6 +465,41 @@ struct AudioTrackTransactionRecord {
     extensions: serde_json::Map<String, Value>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TrackOrderTransactionTrack {
+    track_id: String,
+    track: TransactionFile,
+    previous_track: TransactionFile,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TrackOrderTransactionRecord {
+    format: String,
+    format_version: u8,
+    id: String,
+    before_project_sha256: String,
+    after_project_sha256: String,
+    before_project_revision: u64,
+    after_project_revision: u64,
+    mixer_id: String,
+    mixer: TransactionFile,
+    previous_mixer: TransactionFile,
+    tracks: Vec<TrackOrderTransactionTrack>,
+    extensions: serde_json::Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TrackOrderTransactionIntent {
+    format: String,
+    format_version: u8,
+    id: String,
+    track_count: usize,
+    extensions: serde_json::Map<String, Value>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum AudioTrackTransactionOperation {
@@ -447,6 +547,14 @@ impl ProjectResourcePublicationMode {
 enum AudioTrackPublicationPhase {
     Transaction,
     Track,
+    Mixer,
+    Manifest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrackOrderPublicationPhase {
+    Transaction,
+    Track(usize),
     Mixer,
     Manifest,
 }
@@ -679,6 +787,21 @@ pub fn remove_audio_track(
     remove_audio_track_observed(project_path.as_ref(), request, |_, _| Ok(()))
 }
 
+/// Publishes a complete audio-track order permutation and its matching mixer
+/// through one serialized, recoverable manifest-last transaction.
+///
+/// # Errors
+///
+/// Returns a classified validation, conflict, integrity, I/O, or recovery
+/// error. [`ProjectResourcePublicationError::published`] is true only when
+/// recovery proved the complete replacement set and manifest became active.
+pub fn publish_track_order(
+    project_path: impl AsRef<Path>,
+    request: TrackOrderPublicationRequest<'_>,
+) -> Result<TrackOrderPublicationOutcome, ProjectResourcePublicationError> {
+    publish_track_order_observed(project_path.as_ref(), request, |_, _| Ok(()))
+}
+
 /// Recovers every durable audio-track publication in one project.
 ///
 /// # Errors
@@ -706,6 +829,35 @@ pub fn recover_audio_track_publications(
         )
     })?;
     recover_audio_track_transactions_locked(&root_path, &root, &backups)
+}
+
+/// Recovers every durable track-order transaction in one project.
+///
+/// # Errors
+///
+/// Returns an error rather than discarding or overwriting content that does
+/// not match either recorded side of a transaction.
+pub fn recover_track_order_publications(
+    project_path: impl AsRef<Path>,
+) -> Result<Vec<TrackOrderPublicationRecovery>, ProjectResourcePublicationError> {
+    let (root_path, root) = open_stable_project_root(project_path.as_ref()).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "open project root for track-order recovery",
+            error,
+        )
+    })?;
+    let Some(backups) = open_optional_dir(&root, "backups")? else {
+        return Ok(Vec::new());
+    };
+    let _lock = ProjectLock::acquire(&backups).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::TransactionUnavailable,
+            "acquire project storage transaction lock",
+            error,
+        )
+    })?;
+    recover_track_order_transactions_locked(&root_path, &root, &backups)
 }
 
 #[allow(
@@ -968,7 +1120,6 @@ fn remove_audio_track_observed(
             error,
         )
     })?;
-    reject_unhandled_resource_transactions(&backups)?;
     let recovered_resources =
         recover_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
     let recovered_tracks =
@@ -1111,6 +1262,219 @@ fn remove_audio_track_observed(
                 Err(recovery_error) => Err(publication_recovery_failure(
                     "audio-track removal and recovery both failed",
                     "audio track was removed but verification or transaction recovery is incomplete",
+                    recovery_error,
+                )),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TrackOrderActiveTrack {
+    path: String,
+    previous: Vec<u8>,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete batch authority, staging, publication, and recovery ordering must remain auditable together"
+)]
+fn publish_track_order_observed(
+    project_path: &Path,
+    request: TrackOrderPublicationRequest<'_>,
+    mut observer: impl FnMut(
+        TrackOrderPublicationPhase,
+        &Path,
+    ) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<TrackOrderPublicationOutcome, ProjectResourcePublicationError> {
+    validate_track_order_request(request)?;
+    let verified = verify_project_package(project_path).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "project verification failed before track-order publication",
+            error,
+        )
+    })?;
+    if request.expected_project_sha256 != *verified.manifest_sha256() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "project changed after the track reorder began",
+        ));
+    }
+    let mixer_descriptor = unique_resource(&verified, request.mixer_id, ResourceRole::Mixer)?;
+    let previous_mixer = verified.read_resource(request.mixer_id).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "read current mixer resource",
+            error,
+        )
+    })?;
+    let tracks = resolve_track_order_tracks(&verified, request)?;
+    validate_track_order_document_identity(
+        &verified,
+        request,
+        &tracks,
+        &previous_mixer,
+    )?;
+    if previous_mixer == request.documents.mixer()
+        && tracks
+            .iter()
+            .zip(request.documents.tracks())
+            .all(|(active, replacement)| active.previous == replacement.bytes())
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track reorder does not change the active project order",
+        ));
+    }
+
+    let backups = open_or_create_dir(&verified.root_dir, "backups")?;
+    let _lock = ProjectLock::acquire(&backups).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::TransactionUnavailable,
+            "acquire project storage transaction lock",
+            error,
+        )
+    })?;
+    let recovered_resources =
+        recover_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
+    let recovered_tracks =
+        recover_audio_track_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
+    let recovered_orders =
+        recover_track_order_transactions_locked(verified.root(), &verified.root_dir, &backups)?;
+    if !recovered_resources.is_empty() || !recovered_tracks.is_empty() || !recovered_orders.is_empty()
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "a prior project transaction was recovered; reopen the current project revision",
+        ));
+    }
+    reject_unhandled_resource_transactions(&backups)?;
+    verified.confirm_unchanged().map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "project changed before track-order publication",
+            error,
+        )
+    })?;
+    let active_project = read_bounded(&verified.root_dir, MANIFEST_NAME, MAX_JSON_BYTES)?;
+    if digest(&active_project) != request.expected_project_sha256 {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ProjectChanged,
+            "active project identity changed before track-order staging",
+        ));
+    }
+    let next_revision = verified
+        .manifest()
+        .revision()
+        .checked_add(1)
+        .filter(|revision| *revision <= MAX_SAFE_INTEGER)
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::ResourceConflict,
+                "project revision cannot be incremented",
+            )
+        })?;
+    let replacement_tracks: Vec<_> = request
+        .documents
+        .tracks()
+        .iter()
+        .map(|track| TrackOrderPublicationTrack {
+            track_id: track.track_id(),
+            track_bytes: track.bytes(),
+        })
+        .collect();
+    let candidate_project = candidate_track_order_manifest(
+        &active_project,
+        request.mixer_id,
+        request.documents.mixer(),
+        &replacement_tracks,
+        next_revision,
+    )?;
+    let transaction_name = format!("{TRACK_ORDER_TRANSACTION_PREFIX}{}", Uuid::new_v4());
+    backups.create_dir(&transaction_name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "create track-order transaction",
+            error,
+        )
+    })?;
+    sync_dir(&backups)?;
+    let transaction = backups.open_dir_nofollow(&transaction_name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "open track-order transaction",
+            error,
+        )
+    })?;
+    let result = run_track_order_publication(
+        &verified,
+        &backups,
+        &transaction,
+        &transaction_name,
+        request,
+        &tracks,
+        mixer_descriptor.path(),
+        &previous_mixer,
+        &active_project,
+        &candidate_project,
+        next_revision,
+        &mut observer,
+    );
+    match result {
+        Ok(outcome) => {
+            clear_and_remove_track_order_transaction(&backups, transaction, &transaction_name)
+                .map_err(|error| ProjectResourcePublicationError {
+                    kind: ProjectResourcePublicationErrorKind::Recovery,
+                    message: "track order was published but transaction cleanup is incomplete"
+                        .to_owned(),
+                    published: true,
+                    source: Some(Box::new(error)),
+                })?;
+            Ok(outcome)
+        }
+        Err(operation_error) => {
+            let tx = match read_track_order_transaction(&transaction, &transaction_name) {
+                Ok(tx) => tx,
+                Err(_) if missing_file(&transaction, TRANSACTION_NAME)? => {
+                    validate_track_order_prepublication_residue(&transaction, &transaction_name)?;
+                    clear_and_remove_track_order_transaction(&backups, transaction, &transaction_name)?;
+                    return Err(operation_error);
+                }
+                Err(source) => {
+                    return Err(ProjectResourcePublicationError {
+                        kind: ProjectResourcePublicationErrorKind::Recovery,
+                        message: "track-order publication failed and its durable transaction could not be read".to_owned(),
+                        published: false,
+                        source: Some(Box::new(source)),
+                    });
+                }
+            };
+            match recover_track_order_transaction(
+                verified.root(),
+                &verified.root_dir,
+                &backups,
+                &transaction,
+                &tx,
+            ) {
+                Ok(TrackOrderPublicationRecoveryDisposition::RolledBack) => {
+                    clear_and_remove_track_order_transaction(&backups, transaction, &transaction_name)?;
+                    Err(operation_error)
+                }
+                Ok(TrackOrderPublicationRecoveryDisposition::Committed) => {
+                    let outcome = track_order_outcome(&tx)?;
+                    clear_and_remove_track_order_transaction(&backups, transaction, &transaction_name)
+                        .map_err(|error| ProjectResourcePublicationError {
+                            kind: ProjectResourcePublicationErrorKind::Recovery,
+                            message: "track order was published but transaction cleanup is incomplete".to_owned(),
+                            published: true,
+                            source: Some(Box::new(error)),
+                        })?;
+                    Ok(outcome)
+                }
+                Err(recovery_error) => Err(publication_recovery_failure(
+                    "track-order publication and recovery both failed",
+                    "track order was published but verification or transaction recovery is incomplete",
                     recovery_error,
                 )),
             }
@@ -1973,6 +2337,161 @@ fn run_audio_track_removal(
     audio_track_removal_outcome(&tx)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the durable batch write order and every crash observation point remain visible in one coordinator"
+)]
+fn run_track_order_publication(
+    verified: &StructurallyVerifiedProject,
+    backups: &Dir,
+    transaction: &Dir,
+    transaction_name: &str,
+    request: TrackOrderPublicationRequest<'_>,
+    active_tracks: &[TrackOrderActiveTrack],
+    mixer_path: &str,
+    previous_mixer: &[u8],
+    previous_project: &[u8],
+    candidate_project: &[u8],
+    next_revision: u64,
+    observer: &mut impl FnMut(
+        TrackOrderPublicationPhase,
+        &Path,
+    ) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<TrackOrderPublicationOutcome, ProjectResourcePublicationError> {
+    write_track_order_intent(transaction, transaction_name, request.documents.tracks().len())?;
+    for (index, (active, replacement)) in active_tracks.iter().zip(request.documents.tracks()).enumerate() {
+        write_exclusive_synced(
+            transaction,
+            &track_order_staging_name(index),
+            replacement.bytes(),
+        )?;
+        write_exclusive_synced(
+            transaction,
+            &track_order_previous_staging_name(index),
+            &active.previous,
+        )?;
+    }
+    write_exclusive_synced(
+        transaction,
+        TRACK_ORDER_MIXER_STAGING_NAME,
+        request.documents.mixer(),
+    )?;
+    write_exclusive_synced(
+        transaction,
+        TRACK_ORDER_PREVIOUS_MIXER_NAME,
+        previous_mixer,
+    )?;
+    write_exclusive_synced(transaction, PROJECT_STAGING_NAME, candidate_project)?;
+    write_exclusive_synced(transaction, PREVIOUS_PROJECT_NAME, previous_project)?;
+    let mut tracks = Vec::new();
+    tracks.try_reserve_exact(request.documents.tracks().len()).map_err(|_| {
+        failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "allocate track-order transaction records",
+        )
+    })?;
+    for (active, replacement) in active_tracks.iter().zip(request.documents.tracks()) {
+        tracks.push(TrackOrderTransactionTrack {
+            track_id: replacement.track_id().to_owned(),
+            track: TransactionFile {
+                path: active.path.clone(),
+                byte_length: replacement.bytes().len() as u64,
+                sha256: hex_digest(digest(replacement.bytes())),
+            },
+            previous_track: TransactionFile {
+                path: active.path.clone(),
+                byte_length: active.previous.len() as u64,
+                sha256: hex_digest(digest(&active.previous)),
+            },
+        });
+    }
+    let tx = TrackOrderTransactionRecord {
+        format: "hyper-track-order-publication-transaction".to_owned(),
+        format_version: 1,
+        id: track_order_transaction_id(transaction_name)?,
+        before_project_sha256: hex_digest(*verified.manifest_sha256()),
+        after_project_sha256: hex_digest(digest(candidate_project)),
+        before_project_revision: verified.manifest().revision(),
+        after_project_revision: next_revision,
+        mixer_id: request.mixer_id.to_owned(),
+        mixer: TransactionFile {
+            path: mixer_path.to_owned(),
+            byte_length: request.documents.mixer().len() as u64,
+            sha256: hex_digest(digest(request.documents.mixer())),
+        },
+        previous_mixer: TransactionFile {
+            path: mixer_path.to_owned(),
+            byte_length: previous_mixer.len() as u64,
+            sha256: hex_digest(digest(previous_mixer)),
+        },
+        tracks,
+        extensions: serde_json::Map::new(),
+    };
+    let transaction_bytes = serde_json_canonicalizer::to_vec(&tx).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "serialize track-order transaction",
+            error,
+        )
+    })?;
+    write_exclusive_synced(transaction, TRANSACTION_NAME, &transaction_bytes)?;
+    sync_dir(transaction)?;
+    sync_dir(backups)?;
+    observer(TrackOrderPublicationPhase::Transaction, verified.root())?;
+
+    for (index, track) in tx.tracks.iter().enumerate() {
+        let parent = open_relative_parent(&verified.root_dir, &track.track.path)?;
+        publish_staged_file(
+            transaction,
+            &track_order_staging_name(index),
+            &parent,
+            &parent,
+            file_name(&track.track.path)?,
+            &format!(".track-order-track-{index}-{}.json", tx.id),
+            "track-order track",
+        )?;
+        observer(TrackOrderPublicationPhase::Track(index), verified.root())?;
+    }
+    let mixer_parent = open_relative_parent(&verified.root_dir, mixer_path)?;
+    publish_staged_file(
+        transaction,
+        TRACK_ORDER_MIXER_STAGING_NAME,
+        &mixer_parent,
+        &mixer_parent,
+        file_name(mixer_path)?,
+        &format!(".track-order-mixer-{}.json", tx.id),
+        "track-order mixer",
+    )?;
+    observer(TrackOrderPublicationPhase::Mixer, verified.root())?;
+    let candidate = verify_project_candidate(verified.root(), &verified.root_dir, candidate_project)
+        .map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "track-order publication candidate does not verify",
+                error,
+            )
+        })?;
+    if candidate.revision() != next_revision {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "track-order publication candidate revision changed",
+        ));
+    }
+    publish_staged_file(
+        transaction,
+        PROJECT_STAGING_NAME,
+        backups,
+        &verified.root_dir,
+        MANIFEST_NAME,
+        &format!(".track-order-project-{}.json", tx.id),
+        "track-order project manifest",
+    )?;
+    observer(TrackOrderPublicationPhase::Manifest, verified.root())?;
+    verify_committed(verified.root(), &verified.root_dir, digest(candidate_project))?;
+    track_order_outcome(&tx)
+}
+
 fn validate_audio_track_documents(
     request: AudioTrackPublicationRequest<'_>,
 ) -> Result<(), ProjectResourcePublicationError> {
@@ -2660,6 +3179,387 @@ fn candidate_audio_track_removal_manifest(
     Ok(bytes)
 }
 
+fn validate_track_order_request(
+    request: TrackOrderPublicationRequest<'_>,
+) -> Result<(), ProjectResourcePublicationError> {
+    validate_canonical_resource(request.documents.mixer())?;
+    if request.mixer_id.is_empty()
+        || request.documents.tracks().is_empty()
+        || request.documents.tracks().len() > MAX_ENTRIES
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-order request must contain a mixer and at least one track",
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for track in request.documents.tracks() {
+        if track.track_id().is_empty() || !ids.insert(track.track_id()) {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-order request contains an invalid or duplicate track identity",
+            ));
+        }
+        validate_canonical_resource(track.bytes())?;
+    }
+    Ok(())
+}
+
+fn resolve_track_order_tracks(
+    verified: &StructurallyVerifiedProject,
+    request: TrackOrderPublicationRequest<'_>,
+) -> Result<Vec<TrackOrderActiveTrack>, ProjectResourcePublicationError> {
+    let declared = verified
+        .manifest()
+        .resources()
+        .iter()
+        .filter(|descriptor| descriptor.role() == ResourceRole::Track)
+        .count();
+    if declared != request.documents.tracks().len() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-order request does not cover every active track",
+        ));
+    }
+    let mut tracks = Vec::new();
+    tracks.try_reserve_exact(request.documents.tracks().len()).map_err(|_| {
+        failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "allocate track-order active-resource state",
+        )
+    })?;
+    for replacement in request.documents.tracks() {
+        let descriptor = unique_resource(verified, replacement.track_id(), ResourceRole::Track)?;
+        let expected_path = format!("tracks/{}.json", replacement.track_id());
+        if descriptor.path() != expected_path {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-order publication requires canonical track resource paths",
+            ));
+        }
+        let previous = verified.read_resource(replacement.track_id()).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "read current track-order resource",
+                error,
+            )
+        })?;
+        tracks.push(TrackOrderActiveTrack {
+            path: descriptor.path().to_owned(),
+            previous,
+        });
+    }
+    Ok(tracks)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete coupled track and mixer identity proof must stay together before any transaction staging"
+)]
+fn validate_track_order_document_identity(
+    verified: &StructurallyVerifiedProject,
+    request: TrackOrderPublicationRequest<'_>,
+    active_tracks: &[TrackOrderActiveTrack],
+    previous_mixer: &[u8],
+) -> Result<(), ProjectResourcePublicationError> {
+    if active_tracks.len() != request.documents.tracks().len() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "resolved track-order resources do not match the request",
+        ));
+    }
+    let mut previous_orders = BTreeSet::new();
+    let mut candidate_orders = BTreeSet::new();
+    let mut ordered_mixable_tracks = Vec::new();
+    ordered_mixable_tracks
+        .try_reserve_exact(active_tracks.len())
+        .map_err(|_| {
+            failure(
+                ProjectResourcePublicationErrorKind::ResourceConflict,
+                "allocate track-order mixer sequence",
+            )
+        })?;
+    for (active, replacement) in active_tracks.iter().zip(request.documents.tracks()) {
+        let previous: Value = serde_json::from_slice(&active.previous).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "parse current track-order track",
+                error,
+            )
+        })?;
+        let mut candidate: Value = serde_json::from_slice(replacement.bytes()).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "parse candidate track-order track",
+                error,
+            )
+        })?;
+        if previous["format"].as_str() != Some("hyper-track")
+            || previous["format_version"].as_u64() != Some(1)
+            || previous["id"].as_str() != Some(replacement.track_id())
+            || previous["project_id"].as_str() != Some(verified.manifest().project_id())
+            || candidate["format"].as_str() != Some("hyper-track")
+            || candidate["format_version"].as_u64() != Some(1)
+            || candidate["id"].as_str() != Some(replacement.track_id())
+            || candidate["project_id"].as_str() != Some(verified.manifest().project_id())
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-order track identity does not match the active project",
+            ));
+        }
+        let previous_order = previous["order"].as_u64().ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "current track-order track order is invalid",
+            )
+        })?;
+        let candidate_order = candidate["order"].as_u64().ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-order candidate order is invalid",
+            )
+        })?;
+        if !previous_orders.insert(previous_order) || !candidate_orders.insert(candidate_order) {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-order values must remain a unique permutation",
+            ));
+        }
+        candidate["order"] = previous_order.into();
+        if candidate != previous {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-order replacement changes fields other than track order",
+            ));
+        }
+        if matches!(
+            previous["kind"].as_str(),
+            Some("audio" | "external-input" | "group" | "return")
+        ) {
+            ordered_mixable_tracks.push((candidate_order, replacement.track_id()));
+        }
+    }
+    if previous_orders != candidate_orders {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-order values must preserve the active order slots",
+        ));
+    }
+    ordered_mixable_tracks.sort_unstable_by_key(|(order, _)| *order);
+
+    let previous: Value = serde_json::from_slice(previous_mixer).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "parse current track-order mixer",
+            error,
+        )
+    })?;
+    let mut candidate: Value = serde_json::from_slice(request.documents.mixer()).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse candidate track-order mixer",
+            error,
+        )
+    })?;
+    if previous["format"].as_str() != Some("hyper-mixer")
+        || previous["format_version"].as_u64() != Some(1)
+        || previous["id"].as_str() != Some(request.mixer_id)
+        || previous["project_id"].as_str() != Some(verified.manifest().project_id())
+        || candidate["format"].as_str() != Some("hyper-mixer")
+        || candidate["format_version"].as_u64() != Some(1)
+        || candidate["id"].as_str() != Some(request.mixer_id)
+        || candidate["project_id"].as_str() != Some(verified.manifest().project_id())
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-order mixer identity does not match the active project",
+        ));
+    }
+    let previous_channels = previous["channels"].as_array().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "current track-order mixer channels are invalid",
+        )
+    })?;
+    let candidate_channels = candidate["channels"].as_array().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "candidate track-order mixer channels are invalid",
+        )
+    })?;
+    if previous_channels.len() != candidate_channels.len() {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-order mixer channel count changed",
+        ));
+    }
+    if candidate_channels
+        .iter()
+        .map(|channel| channel["track_id"].as_str())
+        .ne(ordered_mixable_tracks.iter().map(|(_, id)| Some(*id)))
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-order mixer channels do not follow the candidate track order",
+        ));
+    }
+    let mut consumed = vec![false; previous_channels.len()];
+    for candidate_channel in candidate_channels {
+        let id = candidate_channel["track_id"].as_str().ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "candidate track-order mixer channel identity is invalid",
+            )
+        })?;
+        let Some((index, previous_channel)) = previous_channels
+            .iter()
+            .enumerate()
+            .find(|(index, channel)| {
+                !consumed[*index] && channel["track_id"].as_str() == Some(id)
+            })
+        else {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-order mixer must preserve exactly the active channels",
+            ));
+        };
+        if candidate_channel != previous_channel {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "track-order replacement changes a mixer channel",
+            ));
+        }
+        consumed[index] = true;
+    }
+    candidate["channels"] = previous["channels"].clone();
+    if candidate != previous {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "track-order replacement changes mixer fields other than channel order",
+        ));
+    }
+    Ok(())
+}
+
+fn candidate_track_order_manifest(
+    active: &[u8],
+    mixer_id: &str,
+    mixer_bytes: &[u8],
+    tracks: &[TrackOrderPublicationTrack<'_>],
+    revision: u64,
+) -> Result<Vec<u8>, ProjectResourcePublicationError> {
+    let mut value: Value = serde_json::from_slice(active).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "parse active project manifest",
+            error,
+        )
+    })?;
+    value["revision"] = revision.into();
+    let resources = value["resources"].as_array_mut().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "project resource declarations are invalid",
+        )
+    })?;
+    let mixer = resources
+        .iter_mut()
+        .find(|resource| resource["id"].as_str() == Some(mixer_id))
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "current mixer descriptor disappeared",
+            )
+        })?;
+    if mixer["role"].as_str() != Some("mixer") {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "track-order mixer descriptor has the wrong role",
+        ));
+    }
+    mixer["byte_length"] = mixer_bytes.len().into();
+    mixer["sha256"] = hex_digest(digest(mixer_bytes)).into();
+    for replacement in tracks {
+        let descriptor = resources
+            .iter_mut()
+            .find(|resource| resource["id"].as_str() == Some(replacement.track_id))
+            .ok_or_else(|| {
+                failure(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "current track descriptor disappeared",
+                )
+            })?;
+        if descriptor["role"].as_str() != Some("track") {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Integrity,
+                "track-order descriptor has the wrong role",
+            ));
+        }
+        descriptor["byte_length"] = replacement.track_bytes.len().into();
+        descriptor["sha256"] = hex_digest(digest(replacement.track_bytes)).into();
+    }
+    let bytes = serde_json_canonicalizer::to_vec(&value).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "serialize track-order project manifest",
+            error,
+        )
+    })?;
+    if bytes.len() > MAX_JSON_BYTES {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::ResourceConflict,
+            "candidate project manifest exceeds its size limit",
+        ));
+    }
+    ProjectManifest::parse(&bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "candidate track-order project manifest is invalid",
+            error,
+        )
+    })?;
+    Ok(bytes)
+}
+
+fn track_order_staging_name(index: usize) -> String {
+    format!("track-{index}.json")
+}
+
+fn track_order_previous_staging_name(index: usize) -> String {
+    format!("previous-track-{index}.json")
+}
+
+fn write_track_order_intent(
+    transaction: &Dir,
+    directory_name: &str,
+    track_count: usize,
+) -> Result<(), ProjectResourcePublicationError> {
+    let intent = TrackOrderTransactionIntent {
+        format: "hyper-track-order-publication-intent".to_owned(),
+        format_version: 1,
+        id: track_order_transaction_id(directory_name)?,
+        track_count,
+        extensions: serde_json::Map::new(),
+    };
+    let bytes = serde_json_canonicalizer::to_vec(&intent).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "serialize track-order publication intent",
+            error,
+        )
+    })?;
+    write_exclusive_synced(transaction, INTENT_STAGING_NAME, &bytes)?;
+    transaction.rename(INTENT_STAGING_NAME, transaction, INTENT_NAME).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "publish track-order transaction intent",
+            error,
+        )
+    })?;
+    sync_dir(transaction)
+}
+
 fn write_audio_track_intent(
     transaction: &Dir,
     directory_name: &str,
@@ -3141,6 +4041,449 @@ fn recover_audio_track_transaction(
     Ok(AudioTrackPublicationRecoveryDisposition::RolledBack)
 }
 
+fn recover_track_order_transactions_locked(
+    root_path: &Path,
+    root: &Dir,
+    backups: &Dir,
+) -> Result<Vec<TrackOrderPublicationRecovery>, ProjectResourcePublicationError> {
+    let mut names = Vec::new();
+    for entry in backups.entries().map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Io,
+            "read project backups",
+            error,
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "read project backup entry",
+                error,
+            )
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.starts_with(TRACK_ORDER_TRANSACTION_PREFIX) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    let mut outcomes = Vec::new();
+    for name in names {
+        let transaction = backups.open_dir_nofollow(&name).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Io,
+                "open track-order recovery transaction",
+                error,
+            )
+        })?;
+        let tx = match read_track_order_transaction(&transaction, &name) {
+            Ok(tx) => tx,
+            Err(_) if missing_file(&transaction, TRANSACTION_NAME)? => {
+                validate_track_order_prepublication_residue(&transaction, &name)?;
+                let id = track_order_transaction_id(&name)?;
+                clear_and_remove_track_order_transaction(backups, transaction, &name)?;
+                outcomes.push(TrackOrderPublicationRecovery {
+                    transaction_id: id,
+                    disposition: TrackOrderPublicationRecoveryDisposition::RolledBack,
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let disposition =
+            recover_track_order_transaction(root_path, root, backups, &transaction, &tx)?;
+        clear_and_remove_track_order_transaction(backups, transaction, &name)?;
+        outcomes.push(TrackOrderPublicationRecovery {
+            transaction_id: tx.id,
+            disposition,
+        });
+    }
+    Ok(outcomes)
+}
+
+fn recover_track_order_transaction(
+    root_path: &Path,
+    root: &Dir,
+    backups: &Dir,
+    transaction: &Dir,
+    tx: &TrackOrderTransactionRecord,
+) -> Result<TrackOrderPublicationRecoveryDisposition, ProjectResourcePublicationError> {
+    validate_staged_track_order_transaction(transaction, tx)?;
+    let before = decode_digest(&tx.before_project_sha256)?;
+    let after = decode_digest(&tx.after_project_sha256)?;
+    let active = match read_bounded(root, MANIFEST_NAME, MAX_JSON_BYTES) {
+        Ok(bytes) => digest(&bytes),
+        Err(error) if error_is_not_found(&error) => {
+            restore_previous_manifest(root, backups, transaction, &tx.id, before)?;
+            before
+        }
+        Err(error) => return Err(error),
+    };
+    if active == after {
+        cleanup_track_order_temporaries(root, backups, transaction, tx)
+            .and_then(|()| verify_committed(root_path, root, after))
+            .map_err(|source| ProjectResourcePublicationError {
+                kind: ProjectResourcePublicationErrorKind::Recovery,
+                message: "committed track-order transaction could not be verified or fully recovered"
+                    .to_owned(),
+                published: true,
+                source: Some(Box::new(source)),
+            })?;
+        return Ok(TrackOrderPublicationRecoveryDisposition::Committed);
+    }
+    if active != before {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-order recovery found an unrelated project identity",
+        ));
+    }
+    validate_track_order_rollback_authority(root, tx)?;
+    rollback_track_order_mixer(root, transaction, tx)?;
+    for (index, track) in tx.tracks.iter().enumerate() {
+        rollback_track_order_track(root, transaction, tx, index, track)?;
+    }
+    cleanup_track_order_temporaries(root, backups, transaction, tx)?;
+    let previous = read_bounded(transaction, PREVIOUS_PROJECT_NAME, MAX_JSON_BYTES)?;
+    if digest(&previous) != before {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "previous project manifest does not match its recorded identity",
+        ));
+    }
+    verify_retained_project_candidate(root, &previous).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "rolled-back track-order project does not verify",
+            error,
+        )
+    })?;
+    Ok(TrackOrderPublicationRecoveryDisposition::RolledBack)
+}
+
+fn validate_track_order_rollback_authority(
+    root: &Dir,
+    tx: &TrackOrderTransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    validate_track_order_active_file(
+        root,
+        &tx.mixer.path,
+        &tx.previous_mixer,
+        &tx.mixer,
+        "mixer",
+    )?;
+    for track in &tx.tracks {
+        validate_track_order_active_file(
+            root,
+            &track.track.path,
+            &track.previous_track,
+            &track.track,
+            "track",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_track_order_active_file(
+    root: &Dir,
+    path: &str,
+    before: &TransactionFile,
+    after: &TransactionFile,
+    label: &str,
+) -> Result<(), ProjectResourcePublicationError> {
+    let parent = open_relative_parent(root, path)?;
+    let current = read_optional_file(&parent, file_name(path)?)?.ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            format!("track-order rollback is missing its active {label}"),
+        )
+    })?;
+    let found = digest(&current);
+    if found != decode_digest(&before.sha256)? && found != decode_digest(&after.sha256)? {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            format!("track-order rollback refuses unrelated active {label} content"),
+        ));
+    }
+    Ok(())
+}
+
+fn rollback_track_order_mixer(
+    root: &Dir,
+    transaction: &Dir,
+    tx: &TrackOrderTransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    let parent = open_relative_parent(root, &tx.mixer.path)?;
+    let current = read_optional_file(&parent, file_name(&tx.mixer.path)?)?;
+    let previous = decode_digest(&tx.previous_mixer.sha256)?;
+    if current.as_deref().is_some_and(|bytes| digest(bytes) == previous) {
+        return Ok(());
+    }
+    publish_staged_file(
+        transaction,
+        TRACK_ORDER_PREVIOUS_MIXER_NAME,
+        &parent,
+        &parent,
+        file_name(&tx.previous_mixer.path)?,
+        &format!(".track-order-mixer-rollback-{}.json", tx.id),
+        "previous track-order mixer",
+    )
+}
+
+fn rollback_track_order_track(
+    root: &Dir,
+    transaction: &Dir,
+    tx: &TrackOrderTransactionRecord,
+    index: usize,
+    track: &TrackOrderTransactionTrack,
+) -> Result<(), ProjectResourcePublicationError> {
+    let parent = open_relative_parent(root, &track.track.path)?;
+    let current = read_optional_file(&parent, file_name(&track.track.path)?)?;
+    let previous = decode_digest(&track.previous_track.sha256)?;
+    if current.as_deref().is_some_and(|bytes| digest(bytes) == previous) {
+        return Ok(());
+    }
+    publish_staged_file(
+        transaction,
+        &track_order_previous_staging_name(index),
+        &parent,
+        &parent,
+        file_name(&track.previous_track.path)?,
+        &format!(".track-order-track-{index}-rollback-{}.json", tx.id),
+        "previous track-order track",
+    )
+}
+
+fn cleanup_track_order_temporaries(
+    root: &Dir,
+    backups: &Dir,
+    transaction: &Dir,
+    tx: &TrackOrderTransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    if let Ok(parent) = open_relative_parent(root, &tx.mixer.path) {
+        remove_optional_matching_file(
+            &parent,
+            &format!(".track-order-mixer-{}.json", tx.id),
+            decode_digest(&tx.mixer.sha256)?,
+        )?;
+        remove_optional_matching_file(
+            &parent,
+            &format!(".track-order-mixer-rollback-{}.json", tx.id),
+            decode_digest(&tx.previous_mixer.sha256)?,
+        )?;
+    }
+    for (index, track) in tx.tracks.iter().enumerate() {
+        if let Ok(parent) = open_relative_parent(root, &track.track.path) {
+            remove_optional_matching_file(
+                &parent,
+                &format!(".track-order-track-{index}-{}.json", tx.id),
+                decode_digest(&track.track.sha256)?,
+            )?;
+            remove_optional_matching_file(
+                &parent,
+                &format!(".track-order-track-{index}-rollback-{}.json", tx.id),
+                decode_digest(&track.previous_track.sha256)?,
+            )?;
+        }
+    }
+    remove_optional_matching_file(
+        backups,
+        &format!(".track-order-project-{}.json", tx.id),
+        decode_digest(&tx.after_project_sha256)?,
+    )?;
+    let previous = read_bounded(transaction, PREVIOUS_PROJECT_NAME, MAX_JSON_BYTES)?;
+    remove_optional_matching_file(
+        backups,
+        &format!(".project-rollback-{}.json", tx.id),
+        digest(&previous),
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "recovery validates every staged document and the complete candidate manifest before any filesystem mutation"
+)]
+fn validate_staged_track_order_transaction(
+    transaction: &Dir,
+    tx: &TrackOrderTransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    let mixer = read_bounded(transaction, TRACK_ORDER_MIXER_STAGING_NAME, MAX_JSON_BYTES)?;
+    let previous_mixer =
+        read_bounded(transaction, TRACK_ORDER_PREVIOUS_MIXER_NAME, MAX_JSON_BYTES)?;
+    validate_canonical_resource(&mixer).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "staged track-order mixer is not canonical",
+            error,
+        )
+    })?;
+    validate_canonical_resource(&previous_mixer).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "staged previous track-order mixer is not canonical",
+            error,
+        )
+    })?;
+    if mixer.len() as u64 != tx.mixer.byte_length
+        || digest(&mixer) != decode_digest(&tx.mixer.sha256)?
+        || previous_mixer.len() as u64 != tx.previous_mixer.byte_length
+        || digest(&previous_mixer) != decode_digest(&tx.previous_mixer.sha256)?
+        || tx.mixer.path != tx.previous_mixer.path
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "staged track-order mixer bytes do not match the transaction record",
+        ));
+    }
+    let mut replacements = Vec::new();
+    replacements.try_reserve_exact(tx.tracks.len()).map_err(|_| {
+        failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "allocate staged track-order resources",
+        )
+    })?;
+    for (index, track) in tx.tracks.iter().enumerate() {
+        let bytes = read_bounded(transaction, &track_order_staging_name(index), MAX_JSON_BYTES)?;
+        let previous = read_bounded(
+            transaction,
+            &track_order_previous_staging_name(index),
+            MAX_JSON_BYTES,
+        )?;
+        validate_canonical_resource(&bytes).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "staged track-order track is not canonical",
+                error,
+            )
+        })?;
+        validate_canonical_resource(&previous).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "staged previous track-order track is not canonical",
+                error,
+            )
+        })?;
+        if bytes.len() as u64 != track.track.byte_length
+            || digest(&bytes) != decode_digest(&track.track.sha256)?
+            || previous.len() as u64 != track.previous_track.byte_length
+            || digest(&previous) != decode_digest(&track.previous_track.sha256)?
+            || track.track.path != track.previous_track.path
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "staged track-order track bytes do not match the transaction record",
+            ));
+        }
+        replacements.push((bytes, previous));
+    }
+    let previous_project = read_bounded(transaction, PREVIOUS_PROJECT_NAME, MAX_JSON_BYTES)?;
+    let candidate_project = read_bounded(transaction, PROJECT_STAGING_NAME, MAX_JSON_BYTES)?;
+    if digest(&previous_project) != decode_digest(&tx.before_project_sha256)?
+        || digest(&candidate_project) != decode_digest(&tx.after_project_sha256)?
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "staged track-order project identity changed",
+        ));
+    }
+    let previous_manifest = ProjectManifest::parse(&previous_project).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "staged previous project manifest is invalid",
+            error,
+        )
+    })?;
+    let candidate_manifest = ProjectManifest::parse(&candidate_project).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "staged candidate project manifest is invalid",
+            error,
+        )
+    })?;
+    if previous_manifest.project_id() != candidate_manifest.project_id()
+        || previous_manifest.revision() != tx.before_project_revision
+        || candidate_manifest.revision() != tx.after_project_revision
+        || tx.before_project_revision.checked_add(1) != Some(tx.after_project_revision)
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-order transaction project revisions are inconsistent",
+        ));
+    }
+    validate_track_order_manifest_descriptor(
+        &previous_manifest,
+        &tx.mixer_id,
+        ResourceRole::Mixer,
+        &tx.previous_mixer,
+    )?;
+    validate_track_order_manifest_descriptor(
+        &candidate_manifest,
+        &tx.mixer_id,
+        ResourceRole::Mixer,
+        &tx.mixer,
+    )?;
+    let mut request_tracks = Vec::new();
+    request_tracks.try_reserve_exact(tx.tracks.len()).map_err(|_| {
+        failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "allocate track-order candidate request",
+        )
+    })?;
+    for (entry, (bytes, _)) in tx.tracks.iter().zip(&replacements) {
+        validate_track_order_manifest_descriptor(
+            &previous_manifest,
+            &entry.track_id,
+            ResourceRole::Track,
+            &entry.previous_track,
+        )?;
+        validate_track_order_manifest_descriptor(
+            &candidate_manifest,
+            &entry.track_id,
+            ResourceRole::Track,
+            &entry.track,
+        )?;
+        request_tracks.push(TrackOrderPublicationTrack {
+            track_id: &entry.track_id,
+            track_bytes: bytes,
+        });
+    }
+    let expected = candidate_track_order_manifest(
+        &previous_project,
+        &tx.mixer_id,
+        &mixer,
+        &request_tracks,
+        tx.after_project_revision,
+    )?;
+    if expected != candidate_project {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-order candidate manifest contains unrelated changes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_track_order_manifest_descriptor(
+    manifest: &ProjectManifest,
+    id: &str,
+    role: ResourceRole,
+    file: &TransactionFile,
+) -> Result<(), ProjectResourcePublicationError> {
+    let descriptor = manifest_resource(manifest, id)?;
+    if descriptor.role() != role
+        || descriptor.path() != file.path
+        || descriptor.byte_length() != file.byte_length
+        || descriptor.sha256() != file.sha256
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-order descriptor does not match the transaction",
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_audio_track_absent(
     root: &Dir,
     tx: &AudioTrackTransactionRecord,
@@ -3479,6 +4822,141 @@ fn read_audio_track_transaction(
     Ok(tx)
 }
 
+fn read_track_order_transaction(
+    transaction: &Dir,
+    directory_name: &str,
+) -> Result<TrackOrderTransactionRecord, ProjectResourcePublicationError> {
+    let intent_bytes = read_bounded(transaction, INTENT_NAME, MAX_JSON_BYTES)?;
+    require_canonical(&intent_bytes, "track-order transaction intent")?;
+    let intent: TrackOrderTransactionIntent = serde_json::from_slice(&intent_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "parse track-order transaction intent",
+            error,
+        )
+    })?;
+    let bytes = read_bounded(transaction, TRANSACTION_NAME, MAX_JSON_BYTES)?;
+    require_canonical(&bytes, "track-order transaction")?;
+    let tx: TrackOrderTransactionRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "parse track-order transaction",
+            error,
+        )
+    })?;
+    let expected_id = track_order_transaction_id(directory_name)?;
+    let mut track_ids = BTreeSet::new();
+    let records_valid = tx.tracks.iter().all(|track| {
+        track_ids.insert(track.track_id.as_str())
+            && is_valid_entity_id(&track.track_id)
+            && track.track.path == format!("tracks/{}.json", track.track_id)
+            && track.track.path == track.previous_track.path
+            && ["current", "previous"].iter().zip([&track.track, &track.previous_track]).all(
+                |(_, file)| {
+                    file.byte_length > 0
+                        && file.byte_length <= MAX_JSON_FILE_BYTES
+                        && decode_digest(&file.sha256).is_ok()
+                },
+            )
+    });
+    if intent.format != "hyper-track-order-publication-intent"
+        || intent.format_version != 1
+        || !intent.extensions.is_empty()
+        || intent.id != expected_id
+        || intent.track_count != tx.tracks.len()
+        || tx.format != "hyper-track-order-publication-transaction"
+        || tx.format_version != 1
+        || !tx.extensions.is_empty()
+        || tx.id != expected_id
+        || !is_valid_entity_id(&tx.mixer_id)
+        || tx.tracks.is_empty()
+        || tx.tracks.len() > MAX_ENTRIES
+        || !records_valid
+        || tx.mixer.path != tx.previous_mixer.path
+        || [&tx.mixer, &tx.previous_mixer].iter().any(|file| {
+            file.byte_length == 0
+                || file.byte_length > MAX_JSON_FILE_BYTES
+                || decode_digest(&file.sha256).is_err()
+        })
+        || decode_digest(&tx.before_project_sha256).is_err()
+        || decode_digest(&tx.after_project_sha256).is_err()
+        || tx.before_project_revision.checked_add(1) != Some(tx.after_project_revision)
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-order publication transaction is invalid",
+        ));
+    }
+    Ok(tx)
+}
+
+fn validate_track_order_prepublication_residue(
+    transaction: &Dir,
+    directory_name: &str,
+) -> Result<(), ProjectResourcePublicationError> {
+    let id = track_order_transaction_id(directory_name)?;
+    let mut track_count = None;
+    if !missing_file(transaction, INTENT_NAME)? {
+        let bytes = read_bounded(transaction, INTENT_NAME, MAX_JSON_BYTES)?;
+        require_canonical(&bytes, "track-order transaction intent")?;
+        let intent: TrackOrderTransactionIntent = serde_json::from_slice(&bytes).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "parse incomplete track-order transaction intent",
+                error,
+            )
+        })?;
+        if intent.format != "hyper-track-order-publication-intent"
+            || intent.format_version != 1
+            || intent.id != id
+            || intent.track_count == 0
+            || intent.track_count > MAX_ENTRIES
+            || !intent.extensions.is_empty()
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "incomplete track-order transaction intent is invalid",
+            ));
+        }
+        track_count = Some(intent.track_count);
+    }
+    let count = track_count.unwrap_or(0);
+    let mut expected = BTreeSet::new();
+    expected.insert(INTENT_STAGING_NAME.to_owned());
+    expected.insert(INTENT_NAME.to_owned());
+    expected.insert(TRACK_ORDER_MIXER_STAGING_NAME.to_owned());
+    expected.insert(TRACK_ORDER_PREVIOUS_MIXER_NAME.to_owned());
+    expected.insert(PROJECT_STAGING_NAME.to_owned());
+    expected.insert(PREVIOUS_PROJECT_NAME.to_owned());
+    for index in 0..count {
+        expected.insert(track_order_staging_name(index));
+        expected.insert(track_order_previous_staging_name(index));
+    }
+    for entry in transaction.entries().map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "read incomplete track-order transaction",
+            error,
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "read incomplete track-order transaction entry",
+                error,
+            )
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !expected.contains(&name) {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "incomplete track-order transaction contains an unknown entry",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_audio_track_prepublication_residue(
     transaction: &Dir,
     directory_name: &str,
@@ -3563,6 +5041,15 @@ fn audio_track_removal_outcome(
         project_identity: decode_digest(&tx.after_project_sha256)?,
         project_revision: tx.after_project_revision,
         track_id: tx.track_id.clone(),
+    })
+}
+
+fn track_order_outcome(
+    tx: &TrackOrderTransactionRecord,
+) -> Result<TrackOrderPublicationOutcome, ProjectResourcePublicationError> {
+    Ok(TrackOrderPublicationOutcome {
+        project_identity: decode_digest(&tx.after_project_sha256)?,
+        project_revision: tx.after_project_revision,
     })
 }
 
@@ -4618,6 +6105,33 @@ fn audio_track_transaction_id(
     Ok(id.to_owned())
 }
 
+fn track_order_transaction_id(
+    directory_name: &str,
+) -> Result<String, ProjectResourcePublicationError> {
+    let id = directory_name
+        .strip_prefix(TRACK_ORDER_TRANSACTION_PREFIX)
+        .ok_or_else(|| {
+            failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "track-order transaction directory name is invalid",
+            )
+        })?;
+    let parsed = Uuid::parse_str(id).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-order transaction identity is invalid",
+            error,
+        )
+    })?;
+    if parsed.to_string() != id {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-order transaction identity is not canonical",
+        ));
+    }
+    Ok(id.to_owned())
+}
+
 fn require_canonical(bytes: &[u8], label: &str) -> Result<(), ProjectResourcePublicationError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|error| {
         caused(
@@ -4718,6 +6232,71 @@ fn clear_audio_track_transaction(transaction: &Dir) -> Result<(), ProjectResourc
     sync_dir(transaction)
 }
 
+fn clear_track_order_transaction(
+    transaction: &Dir,
+    track_count: usize,
+) -> Result<(), ProjectResourcePublicationError> {
+    let mut names = vec![
+        INTENT_STAGING_NAME.to_owned(),
+        INTENT_NAME.to_owned(),
+        TRACK_ORDER_MIXER_STAGING_NAME.to_owned(),
+        TRACK_ORDER_PREVIOUS_MIXER_NAME.to_owned(),
+        PROJECT_STAGING_NAME.to_owned(),
+        PREVIOUS_PROJECT_NAME.to_owned(),
+        TRANSACTION_NAME.to_owned(),
+    ];
+    names.try_reserve(track_count.saturating_mul(2)).map_err(|_| {
+        failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "allocate track-order transaction cleanup names",
+        )
+    })?;
+    for index in 0..track_count {
+        names.push(track_order_staging_name(index));
+        names.push(track_order_previous_staging_name(index));
+    }
+    for name in names {
+        match transaction.remove_file(&name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(caused(
+                    ProjectResourcePublicationErrorKind::Recovery,
+                    format!("remove track-order transaction file {name}"),
+                    error,
+                ));
+            }
+        }
+    }
+    sync_dir(transaction)
+}
+
+fn track_order_transaction_count(
+    transaction: &Dir,
+) -> Result<usize, ProjectResourcePublicationError> {
+    let bytes = read_bounded(transaction, INTENT_NAME, MAX_JSON_BYTES)?;
+    require_canonical(&bytes, "track-order transaction intent")?;
+    let intent: TrackOrderTransactionIntent = serde_json::from_slice(&bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "parse track-order transaction intent for cleanup",
+            error,
+        )
+    })?;
+    if intent.format != "hyper-track-order-publication-intent"
+        || intent.format_version != 1
+        || intent.track_count == 0
+        || intent.track_count > MAX_ENTRIES
+        || !intent.extensions.is_empty()
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-order transaction intent is invalid during cleanup",
+        ));
+    }
+    Ok(intent.track_count)
+}
+
 #[cfg(not(windows))]
 fn clear_and_remove_transaction(
     backups: &Dir,
@@ -4814,6 +6393,53 @@ fn clear_and_remove_audio_track_transaction(
     sync_dir(backups)
 }
 
+#[cfg(not(windows))]
+fn clear_and_remove_track_order_transaction(
+    backups: &Dir,
+    transaction: Dir,
+    name: &str,
+) -> Result<(), ProjectResourcePublicationError> {
+    let quarantine = format!(".track-order-cleanup-{}", Uuid::new_v4());
+    backups.rename(name, backups, &quarantine).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "quarantine track-order transaction",
+            error,
+        )
+    })?;
+    let moved = backups.open_dir_nofollow(&quarantine).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "open quarantined track-order transaction",
+            error,
+        )
+    })?;
+    if !same_directory(&transaction, &moved).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "compare quarantined track-order transaction",
+            error,
+        )
+    })? {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "track-order transaction changed before cleanup",
+        ));
+    }
+    drop(moved);
+    let count = track_order_transaction_count(&transaction)?;
+    clear_track_order_transaction(&transaction, count)?;
+    drop(transaction);
+    backups.remove_dir(&quarantine).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "remove track-order transaction",
+            error,
+        )
+    })?;
+    sync_dir(backups)
+}
+
 #[cfg(windows)]
 fn clear_and_remove_transaction(
     backups: &Dir,
@@ -4844,6 +6470,25 @@ fn clear_and_remove_audio_track_transaction(
         caused(
             ProjectResourcePublicationErrorKind::Recovery,
             "remove audio-track transaction",
+            error,
+        )
+    })?;
+    sync_dir(backups)
+}
+
+#[cfg(windows)]
+fn clear_and_remove_track_order_transaction(
+    backups: &Dir,
+    transaction: Dir,
+    name: &str,
+) -> Result<(), ProjectResourcePublicationError> {
+    let count = track_order_transaction_count(&transaction)?;
+    clear_track_order_transaction(&transaction, count)?;
+    drop(transaction);
+    backups.remove_dir(name).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "remove track-order transaction",
             error,
         )
     })?;
@@ -5214,6 +6859,71 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.parent);
         }
+    }
+
+    fn prepared_track_order_documents(
+        fixture: &AudioTrackFixture,
+    ) -> ([u8; 32], hyper_playback_json::AudioTrackReorderDocuments) {
+        use hyper_playback_json::{
+            LoaderLimits, PlaybackJsonInput, load as load_playback,
+            serialize_audio_track_reorder,
+        };
+
+        let package = verify_project_package(&fixture.root).unwrap();
+        let identity = *package.manifest_sha256();
+        let timeline = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|resource| resource.role() == ResourceRole::Timeline)
+            .map(|resource| package.read_resource(resource.id()).unwrap())
+            .unwrap();
+        let track_descriptors: Vec<_> = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|resource| resource.role() == ResourceRole::Track)
+            .collect();
+        let track_ids: Vec<_> = track_descriptors
+            .iter()
+            .map(|resource| resource.id().to_owned())
+            .collect();
+        let tracks: Vec<_> = track_descriptors
+            .iter()
+            .map(|resource| package.read_resource(resource.id()).unwrap())
+            .collect();
+        let track_slices: Vec<_> = tracks.iter().map(Vec::as_slice).collect();
+        let project = load_playback(
+            PlaybackJsonInput {
+                project_id: package.manifest().project_id(),
+                sample_rate_hz: package.manifest().sample_rate_hz(),
+                timeline: &timeline,
+                tracks: &track_slices,
+                clips: &[],
+                scenes: &[],
+                arrangement: None,
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer = package.read_resource(&fixture.mixer_id).unwrap();
+        let source_tracks: Vec<_> = track_ids
+            .iter()
+            .zip(&tracks)
+            .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
+            .collect();
+        let documents = serialize_audio_track_reorder(
+            &project,
+            &[],
+            &source_tracks,
+            &mixer,
+            &fixture.mixer_id,
+            NEW_TRACK_ID,
+            0,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        (identity, documents)
     }
 
     struct ArrangementFixture {
@@ -6992,6 +8702,157 @@ mod tests {
                 .all(|descriptor| descriptor.id() != NEW_TRACK_ID)
         );
         assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
+    fn reorders_every_track_and_the_matching_mixer_in_one_publication() {
+        use hyper_playback_json::{
+            LoaderLimits, PlaybackJsonInput, load as load_playback,
+            serialize_audio_track_reorder,
+        };
+
+        let fixture = AudioTrackFixture::new();
+        publish_audio_track(&fixture.root, fixture.request()).unwrap();
+        let package = verify_project_package(&fixture.root).unwrap();
+        let timeline = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|resource| resource.role() == ResourceRole::Timeline)
+            .map(|resource| package.read_resource(resource.id()).unwrap())
+            .unwrap();
+        let track_descriptors: Vec<_> = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|resource| resource.role() == ResourceRole::Track)
+            .collect();
+        let track_ids: Vec<_> = track_descriptors
+            .iter()
+            .map(|resource| resource.id().to_owned())
+            .collect();
+        let tracks: Vec<_> = track_descriptors
+            .iter()
+            .map(|resource| package.read_resource(resource.id()).unwrap())
+            .collect();
+        let track_slices: Vec<_> = tracks.iter().map(Vec::as_slice).collect();
+        let project = load_playback(
+            PlaybackJsonInput {
+                project_id: package.manifest().project_id(),
+                sample_rate_hz: package.manifest().sample_rate_hz(),
+                timeline: &timeline,
+                tracks: &track_slices,
+                clips: &[],
+                scenes: &[],
+                arrangement: None,
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer = package.read_resource(&fixture.mixer_id).unwrap();
+        let source_tracks: Vec<_> = track_ids
+            .iter()
+            .zip(&tracks)
+            .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
+            .collect();
+        let documents = serialize_audio_track_reorder(
+            &project,
+            &[],
+            &source_tracks,
+            &mixer,
+            &fixture.mixer_id,
+            NEW_TRACK_ID,
+            0,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let outcome = publish_track_order(
+            &fixture.root,
+            TrackOrderPublicationRequest {
+                expected_project_sha256: *package.manifest_sha256(),
+                mixer_id: &fixture.mixer_id,
+                documents: &documents,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.project_revision(), 3);
+        let reopened = verify_project_package(&fixture.root).unwrap();
+        assert_eq!(*reopened.manifest_sha256(), *outcome.project_identity());
+        let mixer: Value = serde_json::from_slice(
+            &reopened.read_resource(&fixture.mixer_id).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            mixer["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|channel| channel["track_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![NEW_TRACK_ID, track_ids[0].as_str()]
+        );
+        let ordered_tracks: Vec<_> = documents
+            .tracks()
+            .iter()
+            .map(hyper_playback_json::AudioTrackReorderDocument::track_id)
+            .collect();
+        assert_eq!(ordered_tracks, vec![NEW_TRACK_ID, track_ids[0].as_str()]);
+    }
+
+    #[test]
+    fn track_order_crashes_recover_to_one_complete_project_identity() {
+        for crash_phase in [
+            TrackOrderPublicationPhase::Transaction,
+            TrackOrderPublicationPhase::Track(0),
+            TrackOrderPublicationPhase::Track(1),
+            TrackOrderPublicationPhase::Mixer,
+            TrackOrderPublicationPhase::Manifest,
+        ] {
+            let fixture = AudioTrackFixture::new();
+            publish_audio_track(&fixture.root, fixture.request()).unwrap();
+            let (before, documents) = prepared_track_order_documents(&fixture);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = publish_track_order_observed(
+                    &fixture.root,
+                    TrackOrderPublicationRequest {
+                        expected_project_sha256: before,
+                        mixer_id: &fixture.mixer_id,
+                        documents: &documents,
+                    },
+                    |phase, _| {
+                        assert_ne!(phase, crash_phase, "simulated process crash");
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+
+            let recovered = crate::recover_project_transactions(&fixture.root).unwrap();
+            assert_eq!(recovered.track_orders().len(), 1);
+            assert_eq!(
+                recovered.track_orders()[0].disposition(),
+                if crash_phase == TrackOrderPublicationPhase::Manifest {
+                    TrackOrderPublicationRecoveryDisposition::Committed
+                } else {
+                    TrackOrderPublicationRecoveryDisposition::RolledBack
+                }
+            );
+            let package = verify_project_package(&fixture.root).unwrap();
+            if crash_phase == TrackOrderPublicationPhase::Manifest {
+                let mixer: Value = serde_json::from_slice(
+                    &package.read_resource(&fixture.mixer_id).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    mixer["channels"][0]["track_id"].as_str(),
+                    Some(NEW_TRACK_ID)
+                );
+            } else {
+                assert_eq!(*package.manifest_sha256(), before);
+            }
+        }
     }
 
     #[test]

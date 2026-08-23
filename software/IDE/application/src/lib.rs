@@ -83,6 +83,7 @@ use hyper_playback_json::{
     AudioTrackAdditionSerializationError,
     AudioTrackDocumentSerializationError, AudioTrackRemovalBlockers,
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
+    AudioTrackReorderSerializationError,
     AutomationTakeAddition, AutomationTakeAdditionSerializationError,
     AutomationTakeEditSerializationError, AutomationTargetSelection, CompiledMixerGraph,
     CompiledMixerTap, CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits,
@@ -102,6 +103,7 @@ use hyper_playback_json::{
     serialize_audio_clip_source_view,
     serialize_audio_track_activation, serialize_audio_track_addition,
     serialize_audio_track_removal, serialize_audio_track_rename,
+    serialize_audio_track_reorder,
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_mixer_base_state, serialize_recording_audio_clip_addition,
     serialize_scene_activation, serialize_scene_addition, serialize_scene_duplication,
@@ -157,6 +159,7 @@ use hyper_storage_engine::{
     publish_audio_clip, publish_audio_track, publish_automation_take, publish_control_mapping,
     publish_device_chain, publish_imported_audio_clip, publish_project_resource, publish_scene,
     remove_audio_clip, remove_audio_track, remove_automation_take, remove_device_chain,
+    TrackOrderPublicationOutcome, TrackOrderPublicationRequest, publish_track_order,
 };
 
 mod recording;
@@ -2069,6 +2072,118 @@ impl Error for IdeAudioTrackAdditionError {
             Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
             Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
             Self::InvalidName | Self::CapacityUnavailable | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+/// A complete, recoverable reorder of the project-wide audio-track sequence.
+///
+/// The operation publishes every track order and the matching mixer channel
+/// order together, so no successful or recovered state can expose an
+/// internally inconsistent project graph.
+#[derive(Debug)]
+pub enum IdeAudioTrackReorderError {
+    MixerSave(Box<IdeProjectSaveError>),
+    Storage(StorageError),
+    TrackResourceMissing,
+    TrackResourceRoleMismatch,
+    CapacityUnavailable,
+    Serialization(AudioTrackReorderSerializationError),
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeAudioTrackReorderError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: TrackOrderPublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<ProjectResourcePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl IdeAudioTrackReorderError {
+    /// Whether the coupled track-and-mixer transaction reached its manifest.
+    #[must_use]
+    pub fn publication_committed(&self) -> bool {
+        matches!(self, Self::Publication(source) if source.published())
+            || matches!(self, Self::ReopenAfterPublication { .. })
+            || matches!(self, Self::ReopenAfterPreparation { preparation, .. }
+                if preparation.publication_committed())
+    }
+}
+
+impl fmt::Display for IdeAudioTrackReorderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MixerSave(source) => {
+                write!(formatter, "live mixer state could not be preserved: {source}")
+            }
+            Self::TrackResourceMissing => {
+                formatter.write_str("a track required for the audio-track reorder is unavailable")
+            }
+            Self::TrackResourceRoleMismatch => formatter.write_str(
+                "the project cannot safely reorder this set of structural tracks",
+            ),
+            Self::Storage(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("audio-track reorder capacity is unavailable")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before reordering audio tracks: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before reordering audio tracks ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-track reorder preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "audio tracks were reordered in project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "audio-track reorder publication failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeAudioTrackReorderError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Storage(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::TrackResourceMissing
+            | Self::TrackResourceRoleMismatch
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
         }
     }
 }
@@ -6325,6 +6440,12 @@ struct IdeAudioTrackEditPlan {
 }
 
 #[derive(Debug)]
+struct IdeAudioTrackReorderPlan {
+    mixer: IdeMixerSavePlan,
+    documents: hyper_playback_json::AudioTrackReorderDocuments,
+}
+
+#[derive(Debug)]
 struct IdeArrangementPlacementEditPlan {
     mixer: IdeMixerSavePlan,
     arrangement_id: String,
@@ -7401,6 +7522,20 @@ impl IdeAudioTrackEditPlan {
     }
 }
 
+impl IdeAudioTrackReorderPlan {
+    fn publish(&self) -> Result<TrackOrderPublicationOutcome, ProjectResourcePublicationError> {
+        publish_track_order(
+            &self.mixer.project_path,
+            TrackOrderPublicationRequest {
+                expected_project_sha256: self.mixer.expected_project_sha256,
+                mixer_id: &self.mixer.resource_id,
+                documents: &self.documents,
+            },
+        )
+    }
+
+}
+
 impl IdeAudioTrackAdditionPlan {
     fn publish(&self) -> Result<AudioTrackPublicationOutcome, ProjectResourcePublicationError> {
         publish_audio_track(
@@ -7911,6 +8046,83 @@ impl RunningDesktopIdeApplication {
                 )
             },
         )
+    }
+
+    fn prepare_audio_track_reorder(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        track_id: &str,
+        destination_index: usize,
+    ) -> Result<IdeAudioTrackReorderPlan, IdeAudioTrackReorderError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeAudioTrackReorderError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeAudioTrackReorderError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let package = prepared.package();
+        let descriptor = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.id() == track_id)
+            .ok_or(IdeAudioTrackReorderError::TrackResourceMissing)?;
+        if descriptor.role() != ResourceRole::Track {
+            return Err(IdeAudioTrackReorderError::TrackResourceRoleMismatch);
+        }
+        let (project, _, _, media) = prepared.session().parts();
+        if !project.supports_flat_audio_track_reorder() {
+            return Err(IdeAudioTrackReorderError::TrackResourceRoleMismatch);
+        }
+        if project.structural_track_index(track_id).is_none() {
+            return Err(IdeAudioTrackReorderError::TrackResourceMissing);
+        }
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeAudioTrackReorderError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+
+        let track_descriptors = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|descriptor| descriptor.role() == ResourceRole::Track)
+            .collect::<Vec<_>>();
+        let mut source_tracks = Vec::new();
+        source_tracks
+            .try_reserve_exact(track_descriptors.len())
+            .map_err(|_| IdeAudioTrackReorderError::CapacityUnavailable)?;
+        for descriptor in track_descriptors {
+            let mut id = String::new();
+            id.try_reserve_exact(descriptor.id().len())
+                .map_err(|_| IdeAudioTrackReorderError::CapacityUnavailable)?;
+            id.push_str(descriptor.id());
+            let bytes = package
+                .read_resource(descriptor.id())
+                .map_err(IdeAudioTrackReorderError::Storage)?;
+            source_tracks.push((id, bytes));
+        }
+        let sources = source_tracks
+            .iter()
+            .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let documents = serialize_audio_track_reorder(
+            project,
+            &assets,
+            &sources,
+            &mixer.resource_bytes,
+            &mixer.resource_id,
+            track_id,
+            destination_index,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeAudioTrackReorderError::Serialization)?;
+        Ok(IdeAudioTrackReorderPlan {
+            mixer,
+            documents,
+        })
     }
 
     fn prepare_audio_track_activation(

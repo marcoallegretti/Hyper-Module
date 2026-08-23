@@ -2150,6 +2150,23 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
     });
 
     let weak = ui.as_weak();
+    let worker_for_reorder = Rc::clone(worker);
+    actions.on_reorder_audio_track(move |index, earlier| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        match audio_track_reorder_command(
+            ui.get_app_mode(),
+            index,
+            earlier,
+            &ui.get_mixer_channels(),
+        ) {
+            Ok(command) => submit_to_ui(&ui, &worker_for_reorder, command),
+            Err(reason) => ui.set_error_text(reason.message().into()),
+        }
+    });
+
+    let weak = ui.as_weak();
     let worker_for_activation = Rc::clone(worker);
     actions.on_set_audio_track_active(move |index, active| {
         let Some(ui) = weak.upgrade() else {
@@ -4056,6 +4073,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         IdeWorkerCommandKind::SaveProject
         | IdeWorkerCommandKind::SaveProjectAs
         | IdeWorkerCommandKind::RenameProject
+        | IdeWorkerCommandKind::ReorderAudioTracks
         | IdeWorkerCommandKind::AddScene
         | IdeWorkerCommandKind::SetSceneSlot
         | IdeWorkerCommandKind::SetArrangementLoopRange
@@ -4185,6 +4203,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::RemoveAudioTrack => {
             "Preserving mixer state, removing the empty audio track, and reopening project…"
+        }
+        IdeWorkerCommandKind::ReorderAudioTracks => {
+            "Preserving mixer state, reordering audio tracks, and reopening project…"
         }
         IdeWorkerCommandKind::RenameAudioTrack => {
             "Preserving mixer state, renaming the audio track, and reopening project…"
@@ -4454,6 +4475,10 @@ fn apply_event(
         }
         event @ (IdeWorkerEvent::AudioTrackRemoved { .. } | IdeWorkerEvent::AudioTrackRemoving) => {
             apply_audio_track_removal_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::AudioTracksReordered { .. }
+        | IdeWorkerEvent::AudioTracksReordering) => {
+            apply_audio_track_reorder_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioTrackRenamed { .. } | IdeWorkerEvent::AudioTrackRenaming) => {
             apply_audio_track_rename_event(ui, &event);
@@ -4870,6 +4895,19 @@ fn apply_audio_track_removal_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_status_text("Waiting for native output before removing the audio track…".into());
         }
         _ => unreachable!("audio-track removal event dispatcher received another event"),
+    }
+}
+
+fn apply_audio_track_reorder_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::AudioTracksReordered { revision } => {
+            ui.set_status_text(format!("Audio tracks reordered in project revision {revision}").into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::AudioTracksReordering => {
+            ui.set_status_text("Waiting for native output before reordering audio tracks…".into());
+        }
+        _ => unreachable!("audio-track reorder event dispatcher received another event"),
     }
 }
 
@@ -6989,7 +7027,11 @@ fn set_audio_import_targets(
 }
 
 fn apply_mixer_observation(ui: &MainWindow, observation: &IdeRunningObservation) {
-    set_mixer(ui, observation.mixer_channels());
+    set_mixer(
+        ui,
+        observation.mixer_channels(),
+        observation.flat_audio_track_reorder_available(),
+    );
     let unsaved_changes = observation.mixer_unsaved_changes();
     ui.set_mixer_unsaved_changes(unsaved_changes);
     if !unsaved_changes {
@@ -7480,6 +7522,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::Observe if current == AppMode::Opening => AppMode::Running,
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
         IdeWorkerCommandKind::SaveProject
+        | IdeWorkerCommandKind::ReorderAudioTracks
         | IdeWorkerCommandKind::AddScene
         | IdeWorkerCommandKind::SetSceneSlot
         | IdeWorkerCommandKind::SetArrangementLoopRange
@@ -8163,6 +8206,28 @@ fn validate_mixer_channel(
     Ok((channel_index, row))
 }
 
+fn audio_track_reorder_command(
+    mode: AppMode,
+    index: i32,
+    earlier: bool,
+    channels: &ModelRc<MixerChannelRow>,
+) -> Result<IdeWorkerCommand, MixerControlFailure> {
+    let (current_index, row) = validate_mixer_channel(mode, index, channels)?;
+    if (earlier && !row.can_move_earlier) || (!earlier && !row.can_move_later) {
+        return Err(MixerControlFailure::StateUnavailable);
+    }
+    let destination_index = if earlier {
+        current_index.checked_sub(1)
+    } else {
+        current_index.checked_add(1)
+    }
+    .ok_or(MixerControlFailure::InvalidSelection)?;
+    Ok(IdeWorkerCommand::ReorderAudioTracks {
+        track_id: row.track_id.to_string(),
+        destination_index,
+    })
+}
+
 fn validate_audio_track_removal(
     mode: AppMode,
     track_id: &str,
@@ -8274,7 +8339,10 @@ fn set_observed_scenes(
     )
 }
 
-fn mixer_rows(channels: &[IdeMixerChannel]) -> Vec<MixerChannelRow> {
+fn mixer_rows(
+    channels: &[IdeMixerChannel],
+    flat_audio_track_reorder_available: bool,
+) -> Vec<MixerChannelRow> {
     channels
         .iter()
         .enumerate()
@@ -8294,6 +8362,8 @@ fn mixer_rows(channels: &[IdeMixerChannel]) -> Vec<MixerChannelRow> {
                 solo_available: channel.kind() == IdeMixerChannelKind::Audio,
                 renameable: channel.kind() == IdeMixerChannelKind::Audio,
                 removable: channel.kind() == IdeMixerChannelKind::Audio,
+                can_move_earlier: flat_audio_track_reorder_available && index > 0,
+                can_move_later: flat_audio_track_reorder_available && index + 1 < channels.len(),
                 active: channel.active(),
                 activation_toggleable: channel.kind() == IdeMixerChannelKind::Audio,
             }
@@ -9965,7 +10035,11 @@ fn encode_sha256(digest: &[u8; 32]) -> String {
     encoded
 }
 
-fn set_mixer(ui: &MainWindow, channels: &[IdeMixerChannel]) {
+fn set_mixer(
+    ui: &MainWindow,
+    channels: &[IdeMixerChannel],
+    flat_audio_track_reorder_available: bool,
+) {
     let current = ui.get_mixer_channels();
     let unchanged = current.row_count() == channels.len()
         && channels.iter().enumerate().all(|(index, expected)| {
@@ -9985,13 +10059,20 @@ fn set_mixer(ui: &MainWindow, channels: &[IdeMixerChannel]) {
                     && actual.solo_available == (expected.kind() == IdeMixerChannelKind::Audio)
                     && actual.renameable == (expected.kind() == IdeMixerChannelKind::Audio)
                     && actual.removable == (expected.kind() == IdeMixerChannelKind::Audio)
+                    && actual.can_move_earlier
+                        == (flat_audio_track_reorder_available && index > 0)
+                    && actual.can_move_later
+                        == (flat_audio_track_reorder_available && index + 1 < channels.len())
                     && actual.active == expected.active()
                     && actual.activation_toggleable
                         == (expected.kind() == IdeMixerChannelKind::Audio)
             })
         });
     if !unchanged {
-        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(mixer_rows(channels)))));
+        ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(mixer_rows(
+            channels,
+            flat_audio_track_reorder_available,
+        )))));
     }
     let current_sends = ui.get_mixer_sends();
     if !mixer_sends_unchanged(&current_sends, channels) {
@@ -12609,6 +12690,8 @@ mod tests {
             solo_available: true,
             renameable: true,
             removable: true,
+            can_move_earlier: index > 0,
+            can_move_later: true,
             active: true,
             activation_toggleable: true,
         };
@@ -12632,6 +12715,30 @@ mod tests {
             row(0, track_b),
             row(1, track_a),
         ])));
+        assert!(matches!(
+            audio_track_reorder_command(AppMode::Running, 1, true, &reordered),
+            Ok(IdeWorkerCommand::ReorderAudioTracks { track_id, destination_index })
+                if track_id == track_a && destination_index == 0
+        ));
+        assert!(matches!(
+            audio_track_reorder_command(AppMode::Running, 0, true, &reordered),
+            Err(MixerControlFailure::StateUnavailable)
+        ));
+        assert!(matches!(
+            audio_track_reorder_command(AppMode::Closed, 1, true, &reordered),
+            Err(MixerControlFailure::StateUnavailable)
+        ));
+        assert_eq!(
+            mode_after_successful_submission(
+                AppMode::Running,
+                IdeWorkerCommandKind::ReorderAudioTracks,
+            ),
+            AppMode::Saving
+        );
+        assert_eq!(
+            mode_after_failure(AppMode::Saving, IdeWorkerCommandKind::ReorderAudioTracks),
+            AppMode::Running
+        );
         assert_eq!(
             validate_audio_track_removal(AppMode::Running, track_a, &reordered).unwrap(),
             track_a

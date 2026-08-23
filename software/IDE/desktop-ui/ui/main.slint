@@ -102,6 +102,8 @@ export struct MixerChannelRow {
     solo-available: bool,
     renameable: bool,
     removable: bool,
+    can-move-earlier: bool,
+    can-move-later: bool,
     active: bool,
     activation-toggleable: bool,
 }
@@ -313,6 +315,7 @@ export global IdeActions {
     callback rename-project(string);
     callback add-audio-track(string);
     callback remove-audio-track(string);
+    callback reorder-audio-track(int, bool);
     callback rename-audio-track(int, string);
     callback set-audio-track-active(int, bool);
     callback start-recording();
@@ -2113,6 +2116,21 @@ export component MainWindow inherits Window {
                                         root.remove-track-id = channel.track-id;
                                         root.remove-track-name = channel.name;
                                         root.remove-track-visible = true;
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 3px;
+                                    Button {
+                                        text: "↑";
+                                        accessible-label: "Move " + channel.name + " earlier";
+                                        enabled: root.app-mode == AppMode.running && channel.can-move-earlier;
+                                        clicked => { IdeActions.reorder-audio-track(channel.index, true); }
+                                    }
+                                    Button {
+                                        text: "↓";
+                                        accessible-label: "Move " + channel.name + " later";
+                                        enabled: root.app-mode == AppMode.running && channel.can-move-later;
+                                        clicked => { IdeActions.reorder-audio-track(channel.index, false); }
                                     }
                                 }
                                 Slider {

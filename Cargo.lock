@@ -2588,6 +2588,7 @@ dependencies = [
  "hyper-control-mappings",
  "hyper-fs-authority",
  "hyper-native-device",
+ "hyper-playback-json",
  "hyper-project-model",
  "hyper-recording-metadata",
  "hyper-strict-json",
