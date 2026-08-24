@@ -1596,7 +1596,7 @@ fn native_filter_addition(
         .ok()
         .and_then(|index| track_ids.get(index))
         .filter(|track_id| !track_id.is_empty())
-        .ok_or("The selected audio track is no longer available")?;
+        .ok_or("The selected mixer channel is no longer available")?;
     let (mode, cutoff_millihertz, resonance_millionths) =
         parse_native_filter_state(mode_index, cutoff, resonance)?;
     Ok(IdeNativeFilterEdit::Add {
@@ -1613,7 +1613,7 @@ fn native_filter_addition(
 )]
 fn native_compressor_addition(mode: AppMode, track_ids: &[String], track_index: i32, threshold: &str, ratio: &str, attack: &str, release: &str, makeup: &str) -> Result<IdeNativeFilterEdit, &'static str> {
     if mode != AppMode::Running { return Err("Native Device editing is unavailable in the current state"); }
-    let track_id = usize::try_from(track_index).ok().and_then(|index| track_ids.get(index)).filter(|id| !id.is_empty()).ok_or("The selected audio track is no longer available")?;
+    let track_id = usize::try_from(track_index).ok().and_then(|index| track_ids.get(index)).filter(|id| !id.is_empty()).ok_or("The selected mixer channel is no longer available")?;
     let (threshold_millidecibels, ratio_millionths, attack_microseconds, release_microseconds, makeup_millidecibels) = parse_native_compressor_state(threshold, ratio, attack, release, makeup)?;
     Ok(IdeNativeFilterEdit::AddCompressor { track_id: track_id.clone(), threshold_millidecibels, ratio_millionths, attack_microseconds, release_microseconds, makeup_millidecibels })
 }
@@ -7245,7 +7245,6 @@ fn set_native_filter_observation(
     *project_state.native_filter_tracks.borrow_mut() = observation
         .mixer_channels()
         .iter()
-        .filter(|channel| channel.kind() == IdeMixerChannelKind::Audio)
         .map(|channel| channel.id().to_owned())
         .collect();
     set_native_devices(ui, observation.native_devices(), observation.mixer_channels());
@@ -7258,7 +7257,6 @@ fn set_native_devices(
 ) {
     let track_names = channels
         .iter()
-        .filter(|channel| channel.kind() == IdeMixerChannelKind::Audio)
         .map(|channel| SharedString::from(channel.name()))
         .collect::<Vec<_>>();
     ui.set_native_filter_track_names(ModelRc::from(Rc::new(VecModel::from(track_names))));
@@ -11975,6 +11973,18 @@ mod tests {
         reason = "one generated-window fixture validates the complete native-device interaction contract"
     )]
     fn assert_native_filter_window_contract(ui: &MainWindow) {
+        let channels = [
+            IdeMixerChannel::for_test("track-a", "Audio", IdeMixerChannelKind::Audio),
+            IdeMixerChannel::for_test("group-a", "Group", IdeMixerChannelKind::Group),
+            IdeMixerChannel::for_test("return-a", "Return", IdeMixerChannelKind::Return),
+        ];
+        set_native_devices(ui, &[], &channels);
+        let targets = ui.get_native_filter_track_names();
+        assert_eq!(targets.row_count(), 3);
+        assert_eq!(targets.row_data(0).unwrap(), "Audio");
+        assert_eq!(targets.row_data(1).unwrap(), "Group");
+        assert_eq!(targets.row_data(2).unwrap(), "Return");
+
         let project_state = Rc::new(ProjectUiState::default());
         project_state
             .native_filter_tracks

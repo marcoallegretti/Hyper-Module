@@ -2374,7 +2374,7 @@ export component MainWindow inherits Window {
                         if root.native-filter-add-visible : HorizontalLayout {
                             height: 48px;
                             spacing: 8px;
-                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "TRACK"; color: #65758a; font-size: 8px; } ComboBox { model: root.native-filter-track-names; current-index <=> root.native-filter-add-track-index; } }
+                            VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "CHANNEL"; color: #65758a; font-size: 8px; } ComboBox { model: root.native-filter-track-names; current-index <=> root.native-filter-add-track-index; } }
                             VerticalLayout { min-width: 130px; max-width: 130px; spacing: 2px; Text { text: "MODE"; color: #65758a; font-size: 8px; } ComboBox { model: ["Low-pass", "High-pass"]; current-index <=> root.native-filter-add-mode-index; } }
                             VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "CUTOFF · mHz"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-filter-add-cutoff; } }
                             VerticalLayout { min-width: 140px; max-width: 140px; spacing: 2px; Text { text: "RESONANCE · millionths"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-filter-add-resonance; } }
@@ -2388,7 +2388,7 @@ export component MainWindow inherits Window {
 
                         if root.native-compressor-add-visible : HorizontalLayout {
                             height: 48px; spacing: 8px;
-                            VerticalLayout { min-width: 120px; max-width: 120px; spacing: 2px; Text { text: "TRACK"; color: #65758a; font-size: 8px; } ComboBox { model: root.native-filter-track-names; current-index <=> root.native-filter-add-track-index; } }
+                            VerticalLayout { min-width: 120px; max-width: 120px; spacing: 2px; Text { text: "CHANNEL"; color: #65758a; font-size: 8px; } ComboBox { model: root.native-filter-track-names; current-index <=> root.native-filter-add-track-index; } }
                             VerticalLayout { min-width: 100px; max-width: 100px; spacing: 2px; Text { text: "THRESHOLD · mdB"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-compressor-add-threshold; } }
                             VerticalLayout { min-width: 100px; max-width: 100px; spacing: 2px; Text { text: "RATIO · millionths"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-compressor-add-ratio; } }
                             VerticalLayout { min-width: 88px; max-width: 88px; spacing: 2px; Text { text: "ATTACK · μs"; color: #65758a; font-size: 8px; } IdeLineEdit { text <=> root.native-compressor-add-attack; } }
@@ -2533,7 +2533,7 @@ export component MainWindow inherits Window {
                         if root.native-devices.length == 0 : Rectangle {
                             vertical-stretch: 1;
                             background: transparent;
-                            Text { text: "No Native Devices on audio tracks"; color: #65758a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "No Native Devices"; color: #65758a; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
                         }
                     }
                 }
