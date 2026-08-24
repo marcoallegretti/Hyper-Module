@@ -686,12 +686,6 @@ dependencies = [
 
 [[package]]
 name = "built"
-version = "0.7.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56ed6191a7e78c36abdb16ab65341eefd73d64d303fffccdbb00d51e4205967b"
-
-[[package]]
-name = "built"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c0e531d93d39c34eef561e929e8a7f86d77a5af08aac4f6d6e39976c51858e9"
@@ -939,7 +933,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd93fd2c1b27acd030440c9dbd9d14c1122aad622374fe05a670b67a4bc034be"
 dependencies = [
- "heapless 0.9.3",
+ "heapless",
  "thiserror 2.0.19",
 ]
 
@@ -1559,18 +1553,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "flacenc"
-version = "0.5.1"
+name = "flac-codec"
+version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74c892c2b5fa08f967e8b5ad29121570b4762202f2402033ce08479ec65eccd0"
+checksum = "f3a62dbcc8c85ee094d1380035e631f9c236fb610bd49d3eaa41ad839ff2e2cc"
 dependencies = [
- "built 0.7.7",
- "crc",
- "heapless 0.8.0",
- "md-5",
- "num-traits",
- "rustversion",
- "seq-macro",
+ "arrayvec",
+ "bitstream-io",
+ "md5",
 ]
 
 [[package]]
@@ -2057,16 +2047,6 @@ dependencies = [
 
 [[package]]
 name = "heapless"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
-dependencies = [
- "hash32",
- "stable_deref_trait",
-]
-
-[[package]]
-name = "heapless"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
@@ -2173,7 +2153,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "cap-std",
- "flacenc",
+ "flac-codec",
  "hyper-arrangement-renderer",
  "hyper-audio-engine",
  "hyper-audio-source",
@@ -3597,14 +3577,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "md-5"
-version = "0.10.6"
+name = "md5"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
-dependencies = [
- "cfg-if",
- "digest",
-]
+checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "memchr"
@@ -4720,7 +4696,7 @@ dependencies = [
  "av-scenechange",
  "av1-grain",
  "bitstream-io",
- "built 0.8.1",
+ "built",
  "cfg-if",
  "interpolate_name",
  "itertools 0.14.0",
@@ -5148,12 +5124,6 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
-
-[[package]]
-name = "seq-macro"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bc711410fbe7399f390ca1c3b60ad0f53f80e95c5eb935e52268a0e2cd49acc"
 
 [[package]]
 name = "serde"

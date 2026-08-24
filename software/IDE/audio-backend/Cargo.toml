@@ -33,7 +33,7 @@ hyper-thread-supervisor = { path = "../../../crates/thread-supervisor" }
 ringbuf = "=0.5.1"
 rubato = { version = "=4.0.0", default-features = false }
 cap-std = "=4.0.2"
-flacenc = { version = "=0.5.1", default-features = false }
+flac-codec = "=1.3.2"
 uuid = { version = "=1.24.0", features = ["v4"] }
 
 [target.'cfg(all(target_os = "linux", target_endian = "little"))'.dependencies]

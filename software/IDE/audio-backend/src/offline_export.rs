@@ -32,18 +32,14 @@ use hyper_playback_session::{PlaybackExtent, PreparedPlaybackSession};
 use hyper_project_loader::PreparedProjectPlayback;
 use hyper_recording_journal::{JournalConfig, JournalError, JournalWriter};
 use std::{
+    cell::RefCell,
     fs::File,
-    io::{BufWriter, Seek, SeekFrom, Write},
+    io::{BufWriter, Cursor, Seek, Write},
     path::{Path, PathBuf},
+    rc::Rc,
 };
 use cap_std::fs::OpenOptions;
-use flacenc::{
-    bitsink::ByteSink,
-    component::{BitRepr, Stream},
-    error::Verify,
-    source::{Context, Fill, FrameBuf, MemSource},
-    encode_fixed_size_frame,
-};
+use flac_codec::encode::{FlacSampleWriter, Options as FlacOptions};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OfflineExportSpec {
@@ -780,7 +776,6 @@ fn publish_rendered_track_stem_files(
 }
 
 const WAV_MAX_DATA_BYTES: u64 = u32::MAX as u64 - 36;
-const FLAC_STREAM_BLOCK_FRAMES: usize = 4096;
 
 struct StemDescriptor {
     channel_index: usize,
@@ -805,13 +800,9 @@ struct WavStemWriter {
 }
 
 struct FlacStemWriter {
-    file: BufWriter<File>,
-    stream: Stream,
-    encoder: flacenc::error::Verified<flacenc::config::Encoder>,
-    frame_buffer: FrameBuf,
-    context: Context,
+    writer: Option<FlacSampleWriter<File>>,
+    sync_file: File,
     pending_pcm: Vec<i32>,
-    encoded_frame: ByteSink,
     expected_frames: usize,
     written_frames: usize,
 }
@@ -920,29 +911,30 @@ impl FlacStemWriter {
         sample_rate_hz: u32,
         expected_frames: usize,
     ) -> Result<Self, OfflineExportError> {
-        let encoder = flacenc::config::Encoder::default()
-            .into_verified()
-            .map_err(|(_, source)| OfflineExportError::FlacEncoding(source.to_string()))?;
-        let stream = Stream::new(sample_rate_hz as usize, 2, FLAC_BITS_PER_SAMPLE)
-            .map_err(|source| OfflineExportError::FlacEncoding(source.to_string()))?;
-        let header = flac_stream_header(&stream)?;
-        debug_assert_eq!(header.len(), 42);
+        let total_samples = u64::try_from(expected_frames)
+            .map_err(|_| OfflineExportError::CapacityUnavailable)?
+            .checked_mul(2)
+            .ok_or(OfflineExportError::CapacityUnavailable)?;
+        let sync_file = file
+            .try_clone()
+            .map_err(OfflineExportError::StemDestination)?;
+        let writer = FlacSampleWriter::new(
+            file,
+            FlacOptions::default(),
+            sample_rate_hz,
+            FLAC_BITS_PER_SAMPLE,
+            2,
+            Some(total_samples),
+        )
+        .map_err(flac_encoding_error)?;
         let mut pending_pcm = Vec::new();
         pending_pcm
-            .try_reserve_exact(FLAC_STREAM_BLOCK_FRAMES * 2)
+            .try_reserve_exact(hyper_audio_engine::MAX_PROCESS_FRAMES * 2)
             .map_err(|_| OfflineExportError::CapacityUnavailable)?;
-        let mut file = BufWriter::new(file);
-        file.write_all(&header)
-            .map_err(OfflineExportError::StemDestination)?;
         Ok(Self {
-            file,
-            stream,
-            encoder,
-            frame_buffer: FrameBuf::with_size(2, FLAC_STREAM_BLOCK_FRAMES)
-                .map_err(|source| OfflineExportError::FlacEncoding(source.to_string()))?,
-            context: Context::new(FLAC_BITS_PER_SAMPLE, 2),
+            writer: Some(writer),
+            sync_file,
             pending_pcm,
-            encoded_frame: ByteSink::new(),
             expected_frames,
             written_frames: 0,
         })
@@ -959,13 +951,16 @@ impl FlacStemWriter {
         if next > self.expected_frames {
             return Err(OfflineExportError::FlacVerification);
         }
+        self.pending_pcm.clear();
         for (&left, &right) in left.iter().zip(right) {
             self.pending_pcm.push(quantize_flac_sample(left)?);
             self.pending_pcm.push(quantize_flac_sample(right)?);
-            if self.pending_pcm.len() == FLAC_STREAM_BLOCK_FRAMES * 2 {
-                self.write_pending_frame()?;
-            }
         }
+        self.writer
+            .as_mut()
+            .ok_or(OfflineExportError::FlacVerification)?
+            .write(&self.pending_pcm)
+            .map_err(flac_encoding_error)?;
         self.written_frames = next;
         Ok(())
     }
@@ -974,56 +969,14 @@ impl FlacStemWriter {
         if self.written_frames != self.expected_frames || self.written_frames < FLAC_MINIMUM_FRAMES {
             return Err(OfflineExportError::FlacMinimumFrames);
         }
-        if !self.pending_pcm.is_empty() {
-            self.write_pending_frame()?;
-        }
-        self.stream
-            .stream_info_mut()
-            .set_md5_digest(&self.context.md5_digest());
-        let header = flac_stream_header(&self.stream)?;
-        if header.len() != 42 {
-            return Err(OfflineExportError::FlacEncoding(
-                "the finalized FLAC stream header has an unexpected length".to_owned(),
-            ));
-        }
-        self.file
-            .seek(SeekFrom::Start(0))
-            .and_then(|_| self.file.write_all(&header))
-            .and_then(|()| self.file.flush())
-            .and_then(|()| self.file.get_ref().sync_all())
+        self.writer
+            .take()
+            .ok_or(OfflineExportError::FlacVerification)?
+            .finalize()
+            .map_err(flac_encoding_error)?;
+        self.sync_file
+            .sync_all()
             .map_err(OfflineExportError::StemDestination)
-    }
-
-    fn write_pending_frame(&mut self) -> Result<(), OfflineExportError> {
-        self.frame_buffer
-            .fill_interleaved(&self.pending_pcm)
-            .map_err(|source| OfflineExportError::FlacEncoding(source.to_string()))?;
-        self.context
-            .fill_interleaved(&self.pending_pcm)
-            .map_err(|source| OfflineExportError::FlacEncoding(source.to_string()))?;
-        let frame_number = self.context.current_frame_number().ok_or_else(|| {
-            OfflineExportError::FlacEncoding("the FLAC context did not retain a frame number".to_owned())
-        })?;
-        let frame = encode_fixed_size_frame(
-            &self.encoder,
-            &self.frame_buffer,
-            frame_number,
-            self.stream.stream_info(),
-        )
-        .map_err(|source| OfflineExportError::FlacEncoding(source.to_string()))?;
-        frame
-            .verify()
-            .map_err(|source| OfflineExportError::FlacEncoding(source.to_string()))?;
-        self.encoded_frame.clear();
-        frame
-            .write(&mut self.encoded_frame)
-            .map_err(|source| OfflineExportError::FlacEncoding(source.to_string()))?;
-        self.file
-            .write_all(self.encoded_frame.as_slice())
-            .map_err(OfflineExportError::StemDestination)?;
-        self.stream.stream_info_mut().update_frame_info(&frame);
-        self.pending_pcm.clear();
-        Ok(())
     }
 }
 
@@ -1041,13 +994,6 @@ fn wav_data_bytes(frame_count: usize) -> Result<u64, OfflineExportError> {
     Ok(data_bytes)
 }
 
-fn flac_stream_header(stream: &Stream) -> Result<Vec<u8>, OfflineExportError> {
-    let mut header = ByteSink::new();
-    stream
-        .write(&mut header)
-        .map_err(|source| OfflineExportError::FlacEncoding(source.to_string()))?;
-    Ok(header.into_inner())
-}
 
 fn create_track_stem_file_writers(
     stage: &cap_std::fs::Dir,
@@ -1560,7 +1506,7 @@ pub fn export_prepared_project_flac_with_mixer(
     publish_rendered_flac(&rendered, spec, flac_path)
 }
 
-const FLAC_BITS_PER_SAMPLE: usize = 24;
+const FLAC_BITS_PER_SAMPLE: u32 = 24;
 const FLAC_MINIMUM_FRAMES: usize = 32;
 const FLAC_PCM_SCALE: f32 = 8_388_607.0;
 const FLAC_DECODE_SCALE: f32 = 8_388_608.0;
@@ -1633,19 +1579,65 @@ fn quantize_flac_sample(sample: f32) -> Result<i32, OfflineExportError> {
 }
 
 fn encode_flac_pcm(pcm: &[i32], sample_rate_hz: u32) -> Result<Vec<u8>, OfflineExportError> {
-    let config = flacenc::config::Encoder::default()
-        .into_verified()
-        .map_err(|(_, source)| OfflineExportError::FlacEncoding(source.to_string()))?;
-    let source = MemSource::from_samples(pcm, 2, FLAC_BITS_PER_SAMPLE, sample_rate_hz as usize);
-    let frames = pcm.len() / 2;
-    let block_size = frames.min(config.block_size).max(FLAC_MINIMUM_FRAMES);
-    let stream = flacenc::encode_with_fixed_block_size(&config, source, block_size)
-        .map_err(|source| OfflineExportError::FlacEncoding(source.to_string()))?;
-    let mut sink = ByteSink::new();
-    stream
-        .write(&mut sink)
-        .map_err(|source| OfflineExportError::FlacEncoding(source.to_string()))?;
-    Ok(sink.into_inner())
+    if !pcm.len().is_multiple_of(2) {
+        return Err(OfflineExportError::FlacVerification);
+    }
+    let total_samples = u64::try_from(pcm.len()).map_err(|_| OfflineExportError::CapacityUnavailable)?;
+    let sink = MemoryFlacSink::new();
+    let mut writer = FlacSampleWriter::new(
+        sink.clone(),
+        FlacOptions::default(),
+        sample_rate_hz,
+        FLAC_BITS_PER_SAMPLE,
+        2,
+        Some(total_samples),
+    )
+    .map_err(flac_encoding_error)?;
+    writer.write(pcm).map_err(flac_encoding_error)?;
+    writer.finalize().map_err(flac_encoding_error)?;
+    sink.into_bytes()
+}
+
+#[derive(Clone)]
+struct MemoryFlacSink(Rc<RefCell<Cursor<Vec<u8>>>>);
+
+impl MemoryFlacSink {
+    fn new() -> Self {
+        Self(Rc::new(RefCell::new(Cursor::new(Vec::new()))))
+    }
+
+    fn into_bytes(self) -> Result<Vec<u8>, OfflineExportError> {
+        Rc::try_unwrap(self.0)
+            .map_err(|_| {
+                OfflineExportError::FlacEncoding(
+                    "the in-memory FLAC sink remained retained after finalization".to_owned(),
+                )
+            })
+            .map(|sink| sink.into_inner().into_inner())
+    }
+}
+
+impl Write for MemoryFlacSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.borrow_mut().flush()
+    }
+}
+
+impl Seek for MemoryFlacSink {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.borrow_mut().seek(position)
+    }
+}
+
+fn flac_encoding_error(source: flac_codec::Error) -> OfflineExportError {
+    match source {
+        flac_codec::Error::Io(source) => OfflineExportError::StemDestination(source),
+        source => OfflineExportError::FlacEncoding(source.to_string()),
+    }
 }
 
 fn verify_flac_pcm(
@@ -2005,7 +1997,9 @@ mod tests {
     fn bounded_stem_writers_finalize_exact_wav_and_quantized_flac() {
         let directory = tempfile::tempdir().unwrap();
         let stage = hyper_fs_authority::open_syncable_directory_ambient(directory.path()).unwrap();
-        let left: Vec<_> = (0..32_i16).map(|frame| f32::from(frame) / 100.0).collect();
+        let left: Vec<_> = (0..4_097_i16)
+            .map(|frame| f32::from(frame % 200) / 200.0 - 0.5)
+            .collect();
         let right: Vec<_> = left.iter().map(|sample| -*sample).collect();
         let stems = vec![StemDescriptor {
             channel_index: 3,
@@ -2044,7 +2038,7 @@ mod tests {
                         encoded,
                         AudioContainer::Wav,
                         48_000,
-                        DecodeLimits::new(1_048_576, 32, 1_024).unwrap(),
+                        DecodeLimits::new(1_048_576, 4_097, 65_536).unwrap(),
                     )
                     .unwrap();
                     assert_eq!(decoded.plane(0), Some(left.as_slice()));
@@ -2052,7 +2046,9 @@ mod tests {
                 }
                 OfflineTrackStemExportFormat::Flac => {
                     let expected = quantize_flac_pcm(&left, &right).unwrap();
-                    verify_flac_pcm(&encoded, 48_000, 32, &expected).unwrap();
+                    let reference = encode_flac_pcm(&expected, 48_000).unwrap();
+                    verify_flac_pcm(&reference, 48_000, 4_097, &expected).unwrap();
+                    verify_flac_pcm(&encoded, 48_000, 4_097, &expected).unwrap();
                 }
             }
         }
