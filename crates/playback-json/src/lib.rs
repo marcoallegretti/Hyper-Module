@@ -827,6 +827,27 @@ pub enum ReturnSendSerializationError {
     Serialization(serde_json::Error),
 }
 
+/// One explicit primary route available to an existing audio channel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioPrimaryRouteTarget<'a> {
+    Main,
+    Group(&'a str),
+}
+
+/// Failure to change one audio channel's primary route.
+#[derive(Debug)]
+pub enum AudioPrimaryRouteSerializationError {
+    Source(LoadError),
+    MixerIdentityMismatch,
+    SourceTrackMissing,
+    SourceTrackNotAudio,
+    TargetGroupMissing,
+    TargetTrackNotGroup,
+    NoChange,
+    InvalidDocumentShape,
+    Serialization(serde_json::Error),
+}
+
 #[derive(Debug)]
 pub enum AudioClipAdditionSerializationError {
     Source(LoadError),
@@ -1813,6 +1834,50 @@ impl Error for ReturnSendSerializationError {
             | Self::DuplicateReturnSend
             | Self::SendCapacity
             | Self::SendMissing
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
+impl fmt::Display for AudioPrimaryRouteSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => source.fmt(formatter),
+            Self::MixerIdentityMismatch => {
+                formatter.write_str("source mixer identity does not match the primary-route request")
+            }
+            Self::SourceTrackMissing => {
+                formatter.write_str("the primary-route source track is not present")
+            }
+            Self::SourceTrackNotAudio => {
+                formatter.write_str("only an audio track can change primary route")
+            }
+            Self::TargetGroupMissing => {
+                formatter.write_str("the primary-route target group is not present")
+            }
+            Self::TargetTrackNotGroup => {
+                formatter.write_str("the primary-route target is not a group track")
+            }
+            Self::NoChange => formatter.write_str("the audio track already uses that primary route"),
+            Self::InvalidDocumentShape => {
+                formatter.write_str("source mixer shape changed after typed validation")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for AudioPrimaryRouteSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::MixerIdentityMismatch
+            | Self::SourceTrackMissing
+            | Self::SourceTrackNotAudio
+            | Self::TargetGroupMissing
+            | Self::TargetTrackNotGroup
+            | Self::NoChange
             | Self::InvalidDocumentShape => None,
         }
     }
@@ -2872,6 +2937,87 @@ pub fn serialize_return_send_removal(
     project
         .load_mixer(&candidate, assets, limits)
         .map_err(ReturnSendSerializationError::Source)?;
+    Ok(candidate)
+}
+
+/// Changes one existing audio channel's primary destination to Main or an
+/// existing group and reloads the canonical candidate before returning it.
+///
+/// # Errors
+///
+/// Returns a classified rejection when either identity is unsuitable, the
+/// request is already current, the source mixer is stale or malformed, or the
+/// candidate fails complete playback loading.
+pub fn serialize_audio_primary_route_change(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_mixer: &[u8],
+    mixer_id: &str,
+    source_track_id: &str,
+    target: AudioPrimaryRouteTarget<'_>,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, AudioPrimaryRouteSerializationError> {
+    let source_track = project
+        .tracks
+        .iter()
+        .find(|track| track.id == source_track_id)
+        .ok_or(AudioPrimaryRouteSerializationError::SourceTrackMissing)?;
+    if source_track.kind != TrackKind::Audio {
+        return Err(AudioPrimaryRouteSerializationError::SourceTrackNotAudio);
+    }
+    if let AudioPrimaryRouteTarget::Group(target_track_id) = target {
+        let target_track = project
+            .tracks
+            .iter()
+            .find(|track| track.id == target_track_id)
+            .ok_or(AudioPrimaryRouteSerializationError::TargetGroupMissing)?;
+        if target_track.kind != TrackKind::Group {
+            return Err(AudioPrimaryRouteSerializationError::TargetTrackNotGroup);
+        }
+    }
+    let loaded_mixer = project
+        .load_mixer(source_mixer, assets, limits)
+        .map_err(AudioPrimaryRouteSerializationError::Source)?;
+    if loaded_mixer.id() != mixer_id {
+        return Err(AudioPrimaryRouteSerializationError::MixerIdentityMismatch);
+    }
+    let source_channel = loaded_mixer
+        .channels
+        .iter()
+        .find(|channel| channel.track_id == source_track_id)
+        .ok_or(AudioPrimaryRouteSerializationError::InvalidDocumentShape)?;
+    let already_current = match (target, &source_channel.destination) {
+        (AudioPrimaryRouteTarget::Main, MixerDestination::Main) => true,
+        (AudioPrimaryRouteTarget::Group(target_id), MixerDestination::Track(current_id)) => {
+            target_id == current_id
+        }
+        _ => false,
+    };
+    if already_current {
+        return Err(AudioPrimaryRouteSerializationError::NoChange);
+    }
+
+    let mut mixer_value: Value = serde_json::from_slice(source_mixer)
+        .map_err(AudioPrimaryRouteSerializationError::Serialization)?;
+    let channels = mixer_value
+        .get_mut("channels")
+        .and_then(Value::as_array_mut)
+        .ok_or(AudioPrimaryRouteSerializationError::InvalidDocumentShape)?;
+    let source_channel = channels
+        .iter_mut()
+        .find(|channel| channel.get("track_id").and_then(Value::as_str) == Some(source_track_id))
+        .ok_or(AudioPrimaryRouteSerializationError::InvalidDocumentShape)?;
+    source_channel["destination"] = match target {
+        AudioPrimaryRouteTarget::Main => json!({"kind": "main"}),
+        AudioPrimaryRouteTarget::Group(track_id) => {
+            json!({"kind": "track", "track_id": track_id})
+        }
+    };
+    let candidate = serde_json_canonicalizer::to_vec(&mixer_value)
+        .map_err(AudioPrimaryRouteSerializationError::Serialization)?;
+    project
+        .load_mixer(&candidate, assets, limits)
+        .map_err(AudioPrimaryRouteSerializationError::Source)?;
     Ok(candidate)
 }
 
@@ -10120,6 +10266,143 @@ mod tests {
             .unwrap(),
             added.mixer()
         );
+    }
+
+    #[test]
+    fn audio_primary_route_edits_preserve_the_verified_mixer_graph() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer_id = "018f47a2-6b2d-7c11-8a44-001122334468";
+        let source_track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
+        let group_track_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let group = serialize_routing_bus_creation(
+            &loaded,
+            &asset_facts(),
+            MIXER,
+            mixer_id,
+            RoutingBusKind::Group,
+            group_track_id,
+            "Drum Bus",
+            &[source_track_id],
+            &[],
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let group_tracks: [&[u8]; 2] = [TRACK, group.track()];
+        let group_project = load(
+            input(TIMELINE, &group_tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let added_track_id = "018f47a2-6b2d-7c11-8a44-00112233446a";
+        let added = serialize_audio_track_addition(
+            &group_project,
+            &asset_facts(),
+            group.mixer(),
+            mixer_id,
+            added_track_id,
+            "Backing",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let expanded_tracks: [&[u8]; 3] = [TRACK, group.track(), added.track()];
+        let expanded_project = load(
+            input(TIMELINE, &expanded_tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let routed = serialize_audio_primary_route_change(
+            &expanded_project,
+            &asset_facts(),
+            added.mixer(),
+            mixer_id,
+            added_track_id,
+            AudioPrimaryRouteTarget::Group(group_track_id),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&routed).unwrap();
+        assert_eq!(
+            value["channels"][0]["destination"],
+            json!({"kind": "track", "track_id": group_track_id})
+        );
+        assert_eq!(
+            value["channels"][2]["destination"],
+            json!({"kind": "track", "track_id": group_track_id})
+        );
+        assert_eq!(value["main"], json!({"gain_millionths":1_000_000,"mute":true}));
+        assert_eq!(serde_json_canonicalizer::to_vec(&value).unwrap(), routed);
+        expanded_project
+            .load_mixer(&routed, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+        assert_eq!(
+            serialize_audio_primary_route_change(
+                &expanded_project,
+                &asset_facts(),
+                &routed,
+                mixer_id,
+                added_track_id,
+                AudioPrimaryRouteTarget::Main,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap(),
+            added.mixer()
+        );
+
+        assert!(matches!(
+            serialize_audio_primary_route_change(
+                &expanded_project,
+                &asset_facts(),
+                added.mixer(),
+                mixer_id,
+                added_track_id,
+                AudioPrimaryRouteTarget::Main,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioPrimaryRouteSerializationError::NoChange)
+        ));
+        assert!(matches!(
+            serialize_audio_primary_route_change(
+                &expanded_project,
+                &asset_facts(),
+                added.mixer(),
+                mixer_id,
+                group_track_id,
+                AudioPrimaryRouteTarget::Main,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioPrimaryRouteSerializationError::SourceTrackNotAudio)
+        ));
+        assert!(matches!(
+            serialize_audio_primary_route_change(
+                &expanded_project,
+                &asset_facts(),
+                added.mixer(),
+                mixer_id,
+                added_track_id,
+                AudioPrimaryRouteTarget::Group(source_track_id),
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioPrimaryRouteSerializationError::TargetTrackNotGroup)
+        ));
+        assert!(matches!(
+            serialize_audio_primary_route_change(
+                &expanded_project,
+                &asset_facts(),
+                added.mixer(),
+                mixer_id,
+                added_track_id,
+                AudioPrimaryRouteTarget::Group("018f47a2-6b2d-7c11-8a44-001122334499"),
+                LoaderLimits::VERSION_1,
+            ),
+            Err(AudioPrimaryRouteSerializationError::TargetGroupMissing)
+        ));
     }
 
     #[test]
