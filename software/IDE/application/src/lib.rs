@@ -90,6 +90,7 @@ use hyper_playback_json::{
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
     AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
     AudioTrackReorderSerializationError,
+    RoutingBusCreationSerializationError, RoutingBusKind as PlaybackRoutingBusKind,
     AutomationTakeAddition, AutomationTakeAdditionSerializationError,
     AutomationTakeEditSerializationError, AutomationTargetSelection, CompiledMixerGraph,
     CompiledMixerTap, CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits,
@@ -111,6 +112,7 @@ use hyper_playback_json::{
     serialize_audio_track_content_removal,
     serialize_audio_track_removal, serialize_audio_track_rename,
     serialize_audio_track_duplication, serialize_audio_track_reorder,
+    serialize_routing_bus_creation,
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_mixer_base_state, serialize_recording_audio_clip_addition,
     serialize_scene_activation, serialize_scene_addition, serialize_scene_duplication,
@@ -164,9 +166,10 @@ use hyper_storage_engine::{
     ImportedAudioClipPublicationRequest, ProjectResourcePublicationError,
     ProjectResourcePublicationOutcome, ProjectResourcePublicationRequest,
     RequiredControlCapabilities, SampleCleanupOutcome, SampleCleanupRequest,
+    RoutingBusPublicationKind, RoutingBusPublicationRequest,
     ScenePublicationRequest, StorageError, clean_unused_samples, publish_arrangement,
     publish_audio_clip, publish_audio_track, publish_audio_track_content_removal, publish_audio_track_duplication, publish_automation_take, publish_control_mapping,
-    publish_device_chain, publish_imported_audio_clip, publish_project_resource, publish_scene,
+    publish_device_chain, publish_imported_audio_clip, publish_project_resource, publish_routing_bus, publish_scene,
     remove_audio_clip, remove_audio_track, remove_automation_take, remove_device_chain,
     TrackOrderPublicationOutcome, TrackOrderPublicationRequest, publish_track_order,
 };
@@ -2081,6 +2084,108 @@ impl Error for IdeAudioTrackAdditionError {
             Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
             Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
             Self::InvalidName | Self::CapacityUnavailable | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+/// The two explicit mixer topologies the desktop can create from selected
+/// audio source channels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdeRoutingBusKind {
+    Group,
+    Return,
+}
+
+#[derive(Debug)]
+pub enum IdeRoutingBusCreationError {
+    InvalidName,
+    EmptySourceSelection,
+    MixerSave(Box<IdeProjectSaveError>),
+    Serialization(RoutingBusCreationSerializationError),
+    CapacityUnavailable,
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeRoutingBusCreationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: AudioTrackPublicationOutcome,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<ProjectResourcePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl fmt::Display for IdeRoutingBusCreationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidName => {
+                formatter.write_str("routing-bus name must contain 1 through 120 characters")
+            }
+            Self::EmptySourceSelection => {
+                formatter.write_str("routing-bus creation requires at least one audio source")
+            }
+            Self::MixerSave(source) => {
+                write!(formatter, "live mixer state could not be preserved: {source}")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("routing-bus creation capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before creating the routing bus: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before creating the routing bus ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "routing-bus preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "routing bus {} was created in project revision {} but the project could not be reopened: {source}",
+                outcome.track_id(),
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "routing-bus publication failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeRoutingBusCreationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidName
+            | Self::EmptySourceSelection
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
         }
     }
 }
@@ -6616,6 +6721,19 @@ struct IdeAudioTrackAdditionPlan {
 }
 
 #[derive(Debug)]
+struct IdeRoutingBusCreationPlan {
+    project_path: PathBuf,
+    expected_project_sha256: [u8; 32],
+    track_id: String,
+    track_bytes: Vec<u8>,
+    mixer_id: String,
+    mixer_bytes: Vec<u8>,
+    kind: IdeRoutingBusKind,
+    source_track_ids: Vec<String>,
+    send_ids: Vec<String>,
+}
+
+#[derive(Debug)]
 struct IdeAudioTrackRemovalPlan {
     project_path: PathBuf,
     expected_project_sha256: [u8; 32],
@@ -7873,6 +7991,33 @@ impl IdeAudioTrackAdditionPlan {
     }
 }
 
+impl IdeRoutingBusCreationPlan {
+    fn publish(&self) -> Result<AudioTrackPublicationOutcome, ProjectResourcePublicationError> {
+        let source_track_ids = self
+            .source_track_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let send_ids = self.send_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        publish_routing_bus(
+            &self.project_path,
+            RoutingBusPublicationRequest {
+                expected_project_sha256: self.expected_project_sha256,
+                track_id: &self.track_id,
+                track_bytes: &self.track_bytes,
+                mixer_id: &self.mixer_id,
+                mixer_bytes: &self.mixer_bytes,
+                kind: match self.kind {
+                    IdeRoutingBusKind::Group => RoutingBusPublicationKind::Group,
+                    IdeRoutingBusKind::Return => RoutingBusPublicationKind::Return,
+                },
+                source_track_ids: &source_track_ids,
+                send_ids: &send_ids,
+            },
+        )
+    }
+}
+
 impl IdeMixerSavePlan {
     fn publish(
         &self,
@@ -8265,6 +8410,88 @@ impl RunningDesktopIdeApplication {
             track_bytes,
             mixer_id: mixer_plan.resource_id,
             mixer_bytes,
+        })
+    }
+
+    fn prepare_routing_bus_creation(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        kind: IdeRoutingBusKind,
+        track_name: &str,
+        source_track_ids: &[String],
+    ) -> Result<IdeRoutingBusCreationPlan, IdeRoutingBusCreationError> {
+        let name_length = track_name.chars().count();
+        if track_name.trim() != track_name || !(1..=120).contains(&name_length) {
+            return Err(IdeRoutingBusCreationError::InvalidName);
+        }
+        if source_track_ids.is_empty() {
+            return Err(IdeRoutingBusCreationError::EmptySourceSelection);
+        }
+        let mixer_plan = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeRoutingBusCreationError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeRoutingBusCreationError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeRoutingBusCreationError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let mut sources = Vec::new();
+        sources
+            .try_reserve_exact(source_track_ids.len())
+            .map_err(|_| IdeRoutingBusCreationError::CapacityUnavailable)?;
+        sources.extend(source_track_ids.iter().map(String::as_str));
+        let mut send_ids = Vec::new();
+        if kind == IdeRoutingBusKind::Return {
+            send_ids
+                .try_reserve_exact(source_track_ids.len())
+                .map_err(|_| IdeRoutingBusCreationError::CapacityUnavailable)?;
+            for _ in source_track_ids {
+                send_ids.push(uuid::Uuid::new_v4().to_string());
+            }
+        }
+        let mut send_references = Vec::new();
+        send_references
+            .try_reserve_exact(send_ids.len())
+            .map_err(|_| IdeRoutingBusCreationError::CapacityUnavailable)?;
+        send_references.extend(send_ids.iter().map(String::as_str));
+        let track_id = uuid::Uuid::new_v4().to_string();
+        let documents = serialize_routing_bus_creation(
+            project,
+            &assets,
+            &mixer_plan.resource_bytes,
+            &mixer_plan.resource_id,
+            match kind {
+                IdeRoutingBusKind::Group => PlaybackRoutingBusKind::Group,
+                IdeRoutingBusKind::Return => PlaybackRoutingBusKind::Return,
+            },
+            &track_id,
+            track_name,
+            &sources,
+            &send_references,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(|source| match source {
+            RoutingBusCreationSerializationError::EmptySourceSelection => {
+                IdeRoutingBusCreationError::EmptySourceSelection
+            }
+            source => IdeRoutingBusCreationError::Serialization(source),
+        })?;
+        let (track_bytes, mixer_bytes, _) = documents.into_parts();
+        Ok(IdeRoutingBusCreationPlan {
+            project_path: mixer_plan.project_path,
+            expected_project_sha256: mixer_plan.expected_project_sha256,
+            track_id,
+            track_bytes,
+            mixer_id: mixer_plan.resource_id,
+            mixer_bytes,
+            kind,
+            source_track_ids: source_track_ids.to_vec(),
+            send_ids,
         })
     }
 

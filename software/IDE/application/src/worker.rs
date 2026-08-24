@@ -42,7 +42,8 @@ use super::{
     IdeAudioImportError, IdeAudioInputInventory, IdeAudioOutputInventory,
     IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioTrackAdditionError,
     IdeAudioTrackContentRemovalError, IdeAudioTrackDuplicationError, IdeAudioTrackEditError,
-    IdeAudioTrackRemovalError, IdeAudioTrackReorderError,
+    IdeAudioTrackRemovalError, IdeAudioTrackReorderError, IdeRoutingBusCreationError,
+    IdeRoutingBusKind,
     IdeAutomationTakeCreationError,
     IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
     IdeHistoryOperation, IdeNativeFilterEdit, IdeNativeFilterEditError, NativeFilterMode,
@@ -154,6 +155,7 @@ pub enum IdeWorkerCommandKind {
     RenameProject,
     PrepareRuntime,
     AddAudioTrack,
+    AddRoutingBus,
     RemoveAudioTrack,
     RemoveAudioTrackContent,
     ReorderAudioTracks,
@@ -264,6 +266,11 @@ pub enum IdeWorkerCommand {
     },
     AddAudioTrack {
         name: String,
+    },
+    AddRoutingBus {
+        kind: IdeRoutingBusKind,
+        name: String,
+        source_track_ids: Vec<String>,
     },
     RemoveAudioTrack {
         track_id: String,
@@ -495,6 +502,7 @@ impl IdeWorkerCommand {
             Self::RenameProject { .. } => IdeWorkerCommandKind::RenameProject,
             Self::PrepareRuntime { .. } => IdeWorkerCommandKind::PrepareRuntime,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
+            Self::AddRoutingBus { .. } => IdeWorkerCommandKind::AddRoutingBus,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
             Self::RemoveAudioTrackContent { .. } => {
                 IdeWorkerCommandKind::RemoveAudioTrackContent
@@ -1882,6 +1890,7 @@ pub enum IdeWorkerCommandFailure {
     ProjectClose(IdeProjectCloseError),
     RuntimePreparation(Box<IdeRuntimePreparationError>),
     AudioTrackAddition(Box<super::IdeAudioTrackAdditionError>),
+    RoutingBusCreation(Box<super::IdeRoutingBusCreationError>),
     AudioTrackRemoval(Box<super::IdeAudioTrackRemovalError>),
     AudioTrackContentRemoval(Box<super::IdeAudioTrackContentRemovalError>),
     AudioTrackReorder(Box<super::IdeAudioTrackReorderError>),
@@ -2019,6 +2028,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::ProjectClose(source) => source.fmt(formatter),
             Self::RuntimePreparation(source) => source.fmt(formatter),
             Self::AudioTrackAddition(source) => source.fmt(formatter),
+            Self::RoutingBusCreation(source) => source.fmt(formatter),
             Self::AudioTrackRemoval(source) => source.fmt(formatter),
             Self::AudioTrackContentRemoval(source) => source.fmt(formatter),
             Self::AudioTrackReorder(source) => source.fmt(formatter),
@@ -2115,6 +2125,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::ProjectClose(source) => Some(source),
             Self::RuntimePreparation(source) => Some(source.as_ref()),
             Self::AudioTrackAddition(source) => Some(source),
+            Self::RoutingBusCreation(source) => Some(source),
             Self::AudioTrackRemoval(source) => Some(source),
             Self::AudioTrackContentRemoval(source) => Some(source),
             Self::AudioTrackReorder(source) => Some(source),
@@ -2264,6 +2275,10 @@ pub enum IdeWorkerEvent {
     RuntimePreparing,
     RuntimePrepared {
         bundle: PublishedRuntimeBundle,
+    },
+    RoutingBusAdded {
+        revision: u64,
+        track_id: String,
     },
     AudioTrackAdded {
         revision: u64,
@@ -2564,6 +2579,9 @@ pub enum IdeWorkerEvent {
     AudioPreviewControlApplied(IdeAudioPreviewControlCommand),
     Saving,
     ProjectRenaming,
+    RoutingBusAdding {
+        kind: IdeRoutingBusKind,
+    },
     AudioTrackAdding,
     AudioTrackRemoving,
     AudioTrackContentRemoving,
@@ -3054,6 +3072,11 @@ enum ProjectMutation {
     AddAudioTrack {
         name: String,
     },
+    AddRoutingBus {
+        kind: IdeRoutingBusKind,
+        name: String,
+        source_track_ids: Vec<String>,
+    },
     RemoveAudioTrack {
         track_id: String,
     },
@@ -3240,6 +3263,7 @@ impl ProjectMutation {
             Self::RenameProject { .. } => IdeWorkerCommandKind::RenameProject,
             Self::PrepareRuntime { .. } => IdeWorkerCommandKind::PrepareRuntime,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
+            Self::AddRoutingBus { .. } => IdeWorkerCommandKind::AddRoutingBus,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
             Self::RemoveAudioTrackContent { .. } => {
                 IdeWorkerCommandKind::RemoveAudioTrackContent
@@ -3318,6 +3342,7 @@ impl ProjectMutation {
             Self::RenameProject { .. } => IdeWorkerEvent::ProjectRenaming,
             Self::PrepareRuntime { .. } => IdeWorkerEvent::RuntimePreparing,
             Self::AddAudioTrack { .. } => IdeWorkerEvent::AudioTrackAdding,
+            Self::AddRoutingBus { kind, .. } => IdeWorkerEvent::RoutingBusAdding { kind: *kind },
             Self::RemoveAudioTrack { .. } => IdeWorkerEvent::AudioTrackRemoving,
             Self::RemoveAudioTrackContent { .. } => IdeWorkerEvent::AudioTrackContentRemoving,
             Self::ReorderAudioTracks { .. } => IdeWorkerEvent::AudioTracksReordering,
@@ -3672,6 +3697,7 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         | IdeWorkerCommandKind::Mixer
         | IdeWorkerCommandKind::Monitoring
         | IdeWorkerCommandKind::AddAudioTrack
+        | IdeWorkerCommandKind::AddRoutingBus
         | IdeWorkerCommandKind::RemoveAudioTrack
         | IdeWorkerCommandKind::RemoveAudioTrackContent
         | IdeWorkerCommandKind::ReorderAudioTracks
@@ -3972,6 +3998,7 @@ fn process_command(
         | IdeWorkerCommand::SaveProjectAs { .. }
         | IdeWorkerCommand::RenameProject { .. }
         | IdeWorkerCommand::PrepareRuntime { .. }
+        | IdeWorkerCommand::AddRoutingBus { .. }
         | IdeWorkerCommand::AddAudioTrack { .. }
         | IdeWorkerCommand::RemoveAudioTrack { .. }
         | IdeWorkerCommand::RemoveAudioTrackContent { .. }
@@ -4148,6 +4175,19 @@ fn process_project_mutation_command(
             ProjectMutation::PrepareRuntime { output_path },
         ),
         IdeWorkerCommand::AddAudioTrack { name } => add_audio_track(state, events, &name),
+        IdeWorkerCommand::AddRoutingBus {
+            kind,
+            name,
+            source_track_ids,
+        } => begin_project_mutation_request(
+            state,
+            events,
+            ProjectMutation::AddRoutingBus {
+                kind,
+                name,
+                source_track_ids,
+            },
+        ),
         IdeWorkerCommand::RemoveAudioTrack { track_id } => {
             remove_audio_track(state, events, &track_id)
         }
@@ -6968,6 +7008,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             ..
         } => HistoryEffect::Replacement(&publication.outcome),
         ProjectMutationAttempt::AddAudioTrack(Ok(_))
+        | ProjectMutationAttempt::AddRoutingBus(Ok(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Ok(_))
         | ProjectMutationAttempt::RemoveAudioTrackContent(Ok(_))
         | ProjectMutationAttempt::ReorderAudioTracks(Ok(_))
@@ -7016,6 +7057,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::RemoveAutomationTake { .. }
         | ProjectMutationAttempt::Save(Err(_))
         | ProjectMutationAttempt::AddAudioTrack(Err(_))
+        | ProjectMutationAttempt::AddRoutingBus(Err(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Err(_))
         | ProjectMutationAttempt::RemoveAudioTrackContent(Err(_))
         | ProjectMutationAttempt::ReorderAudioTracks(Err(_))
@@ -7710,6 +7752,9 @@ fn project_mutation_save_failure(
         ProjectMutation::AddAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackAddition(
             Box::new(IdeAudioTrackAdditionError::MixerSave(Box::new(reason))),
         ),
+        ProjectMutation::AddRoutingBus { .. } => IdeWorkerCommandFailure::RoutingBusCreation(
+            Box::new(IdeRoutingBusCreationError::MixerSave(Box::new(reason))),
+        ),
         ProjectMutation::RemoveAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackRemoval(
             Box::new(IdeAudioTrackRemovalError::MixerSave(Box::new(reason))),
         ),
@@ -7993,6 +8038,9 @@ fn project_mutation_native_close_failure(
         ProjectMutation::AddAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackAddition(
             Box::new(IdeAudioTrackAdditionError::NativeClose(failure)),
         ),
+        ProjectMutation::AddRoutingBus { .. } => IdeWorkerCommandFailure::RoutingBusCreation(
+            Box::new(IdeRoutingBusCreationError::NativeClose(failure)),
+        ),
         ProjectMutation::RemoveAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackRemoval(
             Box::new(IdeAudioTrackRemovalError::NativeClose(failure)),
         ),
@@ -8215,6 +8263,9 @@ enum ProjectMutationAttempt {
     PrepareRuntime(RuntimePreparationAttempt),
     AddAudioTrack(
         Result<hyper_storage_engine::AudioTrackPublicationOutcome, IdeAudioTrackAdditionError>,
+    ),
+    AddRoutingBus(
+        Result<hyper_storage_engine::AudioTrackPublicationOutcome, IdeRoutingBusCreationError>,
     ),
     RemoveAudioTrack(
         Result<hyper_storage_engine::AudioTrackRemovalOutcome, IdeAudioTrackRemovalError>,
@@ -8905,10 +8956,22 @@ fn complete_project_mutation(
                         revision: outcome.project_revision(),
                     },
                 ),
+                ProjectMutationAttempt::AddRoutingBus(Ok(outcome)) => send_event(
+                    events,
+                    IdeWorkerEvent::RoutingBusAdded {
+                        revision: outcome.project_revision(),
+                        track_id: outcome.track_id().to_owned(),
+                    },
+                ),
                 ProjectMutationAttempt::AddAudioTrack(Err(reason)) => publish_failure(
                     events,
                     IdeWorkerCommandKind::AddAudioTrack,
                     IdeWorkerCommandFailure::AudioTrackAddition(Box::new(reason)),
+                ),
+                ProjectMutationAttempt::AddRoutingBus(Err(reason)) => publish_failure(
+                    events,
+                    IdeWorkerCommandKind::AddRoutingBus,
+                    IdeWorkerCommandFailure::RoutingBusCreation(Box::new(reason)),
                 ),
                 ProjectMutationAttempt::RemoveAudioTrack(Ok(outcome)) => send_event(
                     events,
@@ -9988,6 +10051,25 @@ fn attempt_project_mutation(
                 })
             })
         }
+        ProjectMutation::AddRoutingBus {
+            kind,
+            name,
+            source_track_ids,
+        } => ProjectMutationAttempt::AddRoutingBus(if let Some(failure) = native_failure {
+            Err(IdeRoutingBusCreationError::NativeClose(failure))
+        } else {
+            RunningDesktopIdeApplication::prepare_routing_bus_creation(
+                application,
+                recovery,
+                kind,
+                &name,
+                &source_track_ids,
+            )
+            .and_then(|plan| {
+                plan.publish()
+                    .map_err(|source| IdeRoutingBusCreationError::Publication(Box::new(source)))
+            })
+        }),
         ProjectMutation::RemoveAudioTrack { track_id } => {
             ProjectMutationAttempt::RemoveAudioTrack(if let Some(failure) = native_failure {
                 Err(IdeAudioTrackRemovalError::NativeClose(failure))
@@ -11279,6 +11361,38 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::AddAudioTrack(Err(preparation)) => {
             IdeWorkerCommandFailure::AudioTrackAddition(Box::new(
                 IdeAudioTrackAdditionError::ReopenAfterPreparation {
+                    preparation: Box::new(preparation),
+                    reopen: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::AddRoutingBus(Ok(outcome)) => {
+            IdeWorkerCommandFailure::RoutingBusCreation(Box::new(
+                IdeRoutingBusCreationError::ReopenAfterPublication {
+                    outcome,
+                    source: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::AddRoutingBus(Err(IdeRoutingBusCreationError::Publication(
+            publication,
+        ))) => IdeWorkerCommandFailure::RoutingBusCreation(Box::new(
+            IdeRoutingBusCreationError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::AddRoutingBus(Err(IdeRoutingBusCreationError::NativeClose(
+            close,
+        ))) => IdeWorkerCommandFailure::RoutingBusCreation(Box::new(
+            IdeRoutingBusCreationError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::AddRoutingBus(Err(preparation)) => {
+            IdeWorkerCommandFailure::RoutingBusCreation(Box::new(
+                IdeRoutingBusCreationError::ReopenAfterPreparation {
                     preparation: Box::new(preparation),
                     reopen: Box::new(reopen),
                 },
@@ -14246,6 +14360,133 @@ mod tests {
         );
         assert_eq!(mixer["channels"][1]["gain_millionths"], 750_000);
         drop(package);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn routing_buses_are_created_and_reopened_through_the_real_worker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-routing-bus-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+
+        let worker = DesktopIdeWorker::start_state(
+            WorkerState::Closed(closed_application()),
+            2,
+            8,
+        )
+        .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the verified project must open before routing-bus creation");
+        };
+        let source_track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the created project has one audio source")
+            .id()
+            .to_owned();
+
+        worker
+            .try_send(IdeWorkerCommand::AddAudioTrack {
+                name: "Target".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::AudioTrackAdding));
+        let IdeWorkerEvent::Running(with_target) = recv(&worker) else {
+            panic!("the added audio source must reopen the project");
+        };
+        let target_track_id = with_target
+            .mixer_channels()
+            .iter()
+            .find(|channel| {
+                channel.kind() == IdeMixerChannelKind::Audio && channel.id() != source_track_id
+            })
+            .expect("the added audio source is present after reopen")
+            .id()
+            .to_owned();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::AudioTrackAdded { revision: 2 }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::AddRoutingBus {
+                kind: IdeRoutingBusKind::Group,
+                name: "Drums".to_owned(),
+                source_track_ids: vec![source_track_id.clone(), target_track_id.clone()],
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusAdding {
+                kind: IdeRoutingBusKind::Group
+            }
+        ));
+        let IdeWorkerEvent::Running(with_group) = recv(&worker) else {
+            panic!("the group must reopen from the published project");
+        };
+        let group = with_group
+            .mixer_channels()
+            .iter()
+            .find(|channel| {
+                channel.kind() == IdeMixerChannelKind::Group && channel.name() == "Drums"
+            })
+            .expect("the reopened project exposes the created group");
+        let group_id = group.id().to_owned();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusAdded { revision: 3, track_id } if track_id == group_id
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::AddRoutingBus {
+                kind: IdeRoutingBusKind::Return,
+                name: "Verb".to_owned(),
+                source_track_ids: vec![source_track_id.clone()],
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusAdding {
+                kind: IdeRoutingBusKind::Return
+            }
+        ));
+        let IdeWorkerEvent::Running(with_return) = recv(&worker) else {
+            panic!("the return must reopen from the published project");
+        };
+        assert!(with_return.mixer_channels().iter().any(|channel| {
+            channel.kind() == IdeMixerChannelKind::Return && channel.name() == "Verb"
+        }));
+        let source = with_return
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.id() == source_track_id)
+            .expect("the selected return source remains present after routing edits");
+        assert!(matches!(
+            source.sends(),
+            [send] if send.target_name() == "Verb" && send.state().is_some()
+        ));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusAdded { revision: 4, .. }
+        ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }

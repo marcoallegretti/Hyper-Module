@@ -18,6 +18,7 @@ use hyper_desktop_ide::{
     IdeMaximumTruePeakDisplay, IdeMixerChannel, IdeMixerChannelKind, IdeMixerCommand,
     IdeMixerSendTap, IdeMonitoringCommand, IdeNativeCloseFailure, IdeNativeDevice,
     IdeNativeFilterEdit, NativeFilterMode, IdeOutputSelection,
+    IdeRoutingBusKind,
     MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MAX_COMPRESSOR_THRESHOLD_MILLIDECIBELS,
     MIN_COMPRESSOR_RATIO_MILLIONTHS, MAX_COMPRESSOR_RATIO_MILLIONTHS,
     MIN_COMPRESSOR_ATTACK_MICROSECONDS, MAX_COMPRESSOR_ATTACK_MICROSECONDS,
@@ -2090,12 +2091,91 @@ fn bind_scene_callbacks(ui: &MainWindow, worker: &WorkerCell, project_state: &Pr
 
 fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
     bind_audio_track_add_callback(ui, worker);
+    bind_routing_bus_callbacks(ui, worker);
     bind_audio_track_duplication_callback(ui, worker);
     bind_audio_track_rename_callback(ui, worker);
     bind_audio_track_reorder_callback(ui, worker);
     bind_audio_track_activation_callback(ui, worker);
     bind_audio_track_removal_callback(ui, worker);
     bind_audio_track_content_removal_callback(ui, worker);
+}
+
+fn bind_routing_bus_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    actions.on_toggle_routing_bus_source(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_routing_bus_create_visible() {
+            ui.set_error_text("Routing-bus source selection is no longer available".into());
+            return;
+        }
+        let Ok(index) = usize::try_from(index) else {
+            ui.set_error_text("The selected audio source is no longer available".into());
+            return;
+        };
+        let sources = ui.get_routing_bus_sources();
+        let Some(mut source) = sources.row_data(index) else {
+            ui.set_error_text("The selected audio source is no longer available".into());
+            return;
+        };
+        source.selected = !source.selected;
+        let mut next = sources.iter().collect::<Vec<_>>();
+        next[index] = source;
+        let selected_count = next.iter().filter(|source| source.selected).count();
+        ui.set_routing_bus_sources(ModelRc::from(Rc::new(VecModel::from(next))));
+        ui.set_routing_bus_selected_source_count(i32::try_from(selected_count).unwrap_or(-1));
+        ui.set_error_text(SharedString::default());
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_bus = Rc::clone(worker);
+    actions.on_add_routing_bus(move |kind_index, name| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_routing_bus_create_visible() {
+            ui.set_error_text("Routing-bus creation is unavailable in the current state".into());
+            return;
+        }
+        if ui.get_track_count() >= 8 {
+            ui.set_error_text("The current project cannot add another routing bus".into());
+            return;
+        }
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 120 {
+            ui.set_error_text("Routing-bus name must contain 1 through 120 characters".into());
+            return;
+        }
+        let kind = match kind_index {
+            0 => IdeRoutingBusKind::Group,
+            1 => IdeRoutingBusKind::Return,
+            _ => {
+                ui.set_error_text("The selected routing-bus type is no longer available".into());
+                return;
+            }
+        };
+        let source_track_ids = ui
+            .get_routing_bus_sources()
+            .iter()
+            .filter(|source| source.selected)
+            .map(|source| source.track_id.to_string())
+            .collect::<Vec<_>>();
+        if source_track_ids.is_empty() {
+            ui.set_error_text("Select at least one audio source for the routing bus".into());
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_bus,
+            IdeWorkerCommand::AddRoutingBus {
+                kind,
+                name: name.to_owned(),
+                source_track_ids,
+            },
+        );
+    });
 }
 
 fn bind_audio_track_add_callback(ui: &MainWindow, worker: &WorkerCell) {
@@ -4150,6 +4230,7 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         | IdeWorkerCommandKind::SetTempo
         | IdeWorkerCommandKind::SetMeter => AppMode::Saving,
         IdeWorkerCommandKind::AddAudioTrack => AppMode::AddingTrack,
+        IdeWorkerCommandKind::AddRoutingBus => AppMode::AddingRoutingBus,
         IdeWorkerCommandKind::DuplicateAudioTrack => AppMode::DuplicatingTrack,
         IdeWorkerCommandKind::RemoveAudioTrack
         | IdeWorkerCommandKind::RemoveAudioTrackContent => AppMode::RemovingTrack,
@@ -4274,6 +4355,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::AddAudioTrack => {
             "Saving mixer state, adding the audio track, and reopening project…"
+        }
+        IdeWorkerCommandKind::AddRoutingBus => {
+            "Saving mixer state, creating the routing bus, and reopening project…"
         }
         IdeWorkerCommandKind::DuplicateAudioTrack => {
             "Preserving mixer state, duplicating the audio track, and reopening project…"
@@ -4552,6 +4636,10 @@ fn apply_event(
         }
         event @ (IdeWorkerEvent::AudioTrackAdded { .. } | IdeWorkerEvent::AudioTrackAdding) => {
             apply_audio_track_event(ui, &event);
+        }
+        event @ (IdeWorkerEvent::RoutingBusAdded { .. }
+        | IdeWorkerEvent::RoutingBusAdding { .. }) => {
+            apply_routing_bus_event(ui, &event);
         }
         event @ (IdeWorkerEvent::AudioTrackRemoved { .. } | IdeWorkerEvent::AudioTrackRemoving) => {
             apply_audio_track_removal_event(ui, &event);
@@ -4970,6 +5058,33 @@ fn apply_audio_track_event(ui: &MainWindow, event: &IdeWorkerEvent) {
             ui.set_status_text("Waiting for native output before adding the audio track…".into());
         }
         _ => unreachable!("audio-track event dispatcher received another event"),
+    }
+}
+
+fn apply_routing_bus_event(ui: &MainWindow, event: &IdeWorkerEvent) {
+    match event {
+        IdeWorkerEvent::RoutingBusAdded { revision, track_id } => {
+            ui.set_routing_bus_create_visible(false);
+            ui.set_status_text(
+                format!("Routing bus {track_id} added in project revision {revision}").into(),
+            );
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::RoutingBusAdding { kind } => {
+            ui.set_app_mode(AppMode::AddingRoutingBus);
+            ui.set_status_text(
+                match kind {
+                    IdeRoutingBusKind::Group => {
+                        "Waiting for native output before creating the routing group…"
+                    }
+                    IdeRoutingBusKind::Return => {
+                        "Waiting for native output before creating the routing return…"
+                    }
+                }
+                .into(),
+            );
+        }
+        _ => unreachable!("routing-bus event dispatcher received another event"),
     }
 }
 
@@ -6496,6 +6611,7 @@ fn apply_running_event(
     let scenes_changed = set_observed_scenes(ui, project_state, observation);
     set_native_filter_observation(ui, project_state, observation);
     apply_mixer_observation(ui, observation);
+    set_routing_bus_sources(ui, observation.mixer_channels());
     set_recording_targets(ui, recording_routes, observation.mixer_channels());
     set_audio_import_targets(ui, audio_import_routes, observation.mixer_channels());
     apply_unused_sample_cleanup_observation(ui, project_state, observation);
@@ -7197,6 +7313,37 @@ fn apply_mixer_observation(ui: &MainWindow, observation: &IdeRunningObservation)
     }
 }
 
+fn set_routing_bus_sources(ui: &MainWindow, channels: &[IdeMixerChannel]) {
+    let audio_channels = channels
+        .iter()
+        .filter(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+        .collect::<Vec<_>>();
+    let current = ui.get_routing_bus_sources();
+    let unchanged = current.row_count() == audio_channels.len()
+        && audio_channels.iter().enumerate().all(|(index, channel)| {
+            current.row_data(index).is_some_and(|source| {
+                source.index == i32::try_from(index).unwrap_or(-1)
+                    && source.track_id.as_str() == channel.id()
+                    && source.name.as_str() == channel.name()
+            })
+        });
+    if unchanged {
+        return;
+    }
+    let rows = audio_channels
+        .iter()
+        .enumerate()
+        .map(|(index, channel)| RoutingBusSourceRow {
+            index: i32::try_from(index).unwrap_or(-1),
+            track_id: channel.id().into(),
+            name: channel.name().into(),
+            selected: false,
+        })
+        .collect::<Vec<_>>();
+    ui.set_routing_bus_selected_source_count(0);
+    ui.set_routing_bus_sources(ModelRc::from(Rc::new(VecModel::from(rows))));
+}
+
 fn reset_native_filter_ui(ui: &MainWindow, project_state: &ProjectUiStateCell) {
     ui.set_native_devices(ModelRc::default());
     ui.set_native_filter_track_names(ModelRc::default());
@@ -7496,6 +7643,11 @@ fn reset_project(
     reset_scene_creation_form(ui);
     ui.set_new_track_visible(false);
     ui.set_new_track_name("Audio 2".into());
+    ui.set_routing_bus_create_visible(false);
+    ui.set_routing_bus_kind_index(0);
+    ui.set_routing_bus_name("Group".into());
+    ui.set_routing_bus_sources(ModelRc::default());
+    ui.set_routing_bus_selected_source_count(0);
     reset_audio_track_duplication_form(ui);
     ui.set_rename_track_visible(false);
     ui.set_remove_track_visible(false);
@@ -7684,6 +7836,9 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
             AppMode::Running
         }
         IdeWorkerCommandKind::AddAudioTrack if current == AppMode::AddingTrack => AppMode::Running,
+        IdeWorkerCommandKind::AddRoutingBus if current == AppMode::AddingRoutingBus => {
+            AppMode::Running
+        }
         IdeWorkerCommandKind::DuplicateAudioTrack if current == AppMode::DuplicatingTrack => {
             AppMode::Running
         }
@@ -11678,6 +11833,118 @@ mod tests {
             &[(0, "Audio 1 copy".to_owned())],
             "the generated row and form must forward the source row and chosen name exactly"
         );
+    }
+
+    #[test]
+    fn routing_bus_form_exposes_only_selected_audio_sources_to_its_callback() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_track_count(2);
+        ui.set_routing_bus_create_visible(true);
+        ui.set_routing_bus_name("Drums".into());
+        ui.set_routing_bus_sources(ModelRc::from(Rc::new(VecModel::from(vec![
+            RoutingBusSourceRow {
+                index: 0,
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456".into(),
+                name: "Audio 1".into(),
+                selected: false,
+            },
+        ]))));
+        let selected = Rc::new(RefCell::new(Vec::new()));
+        let selected_by_callback = Rc::clone(&selected);
+        ui.global::<IdeActions>()
+            .on_toggle_routing_bus_source(move |index| {
+                selected_by_callback.borrow_mut().push(index);
+            });
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        ui.global::<IdeActions>()
+            .on_add_routing_bus(move |kind, name| {
+                submitted_by_callback.borrow_mut().push((kind, name.to_string()));
+            });
+        ui.show().unwrap();
+
+        let source = ElementHandle::find_by_accessible_label(&ui, "Select audio source Audio 1")
+            .next()
+            .expect("the form exposes its only valid audio source");
+        assert_eq!(source.accessible_enabled(), Some(true));
+        source.mock_single_click(PointerEventButton::Left);
+        assert_eq!(selected.borrow().as_slice(), &[0]);
+
+        let mut sources = ui.get_routing_bus_sources().iter().collect::<Vec<_>>();
+        sources[0].selected = true;
+        ui.set_routing_bus_sources(ModelRc::from(Rc::new(VecModel::from(sources))));
+        ui.set_routing_bus_selected_source_count(1);
+        let submit = ElementHandle::find_by_accessible_label(&ui, "Create routing bus")
+            .next()
+            .expect("a selected source enables one bus-creation action");
+        assert_eq!(submit.accessible_enabled(), Some(true));
+        submit.mock_single_click(PointerEventButton::Left);
+        assert_eq!(submitted.borrow().as_slice(), &[(0, "Drums".to_owned())]);
+
+        apply_routing_bus_event(
+            &ui,
+            &IdeWorkerEvent::RoutingBusAdded {
+                revision: 3,
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334499".to_owned(),
+            },
+        );
+        assert!(!ui.get_routing_bus_create_visible());
+        assert!(ui.get_status_text().contains("project revision 3"));
+    }
+
+    #[test]
+    fn routing_bus_sources_follow_audio_channels_without_losing_current_selection() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        let channels = vec![
+            IdeMixerChannel::for_test(
+                "018f47a2-6b2d-7c11-8a44-001122334456",
+                "Audio 1",
+                IdeMixerChannelKind::Audio,
+            ),
+            IdeMixerChannel::for_test(
+                "018f47a2-6b2d-7c11-8a44-001122334457",
+                "Drums",
+                IdeMixerChannelKind::Group,
+            ),
+            IdeMixerChannel::for_test(
+                "018f47a2-6b2d-7c11-8a44-001122334458",
+                "Verb",
+                IdeMixerChannelKind::Return,
+            ),
+        ];
+        set_routing_bus_sources(&ui, &channels);
+        assert!(matches!(
+            ui.get_routing_bus_sources().iter().collect::<Vec<_>>().as_slice(),
+            [source] if source.track_id == "018f47a2-6b2d-7c11-8a44-001122334456"
+                && source.name == "Audio 1" && !source.selected
+        ));
+
+        let mut selected = ui.get_routing_bus_sources().iter().collect::<Vec<_>>();
+        selected[0].selected = true;
+        ui.set_routing_bus_sources(ModelRc::from(Rc::new(VecModel::from(selected))));
+        ui.set_routing_bus_selected_source_count(1);
+        set_routing_bus_sources(&ui, &channels);
+        assert!(ui.get_routing_bus_sources().row_data(0).unwrap().selected);
+        assert_eq!(ui.get_routing_bus_selected_source_count(), 1);
+
+        let mut changed = channels;
+        changed.push(IdeMixerChannel::for_test(
+            "018f47a2-6b2d-7c11-8a44-001122334459",
+            "Audio 2",
+            IdeMixerChannelKind::Audio,
+        ));
+        set_routing_bus_sources(&ui, &changed);
+        assert_eq!(ui.get_routing_bus_sources().row_count(), 2);
+        assert!(ui
+            .get_routing_bus_sources()
+            .iter()
+            .all(|source| !source.selected));
+        assert_eq!(ui.get_routing_bus_selected_source_count(), 0);
     }
 
     #[test]

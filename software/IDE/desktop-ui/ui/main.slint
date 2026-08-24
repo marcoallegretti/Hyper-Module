@@ -20,6 +20,7 @@ export enum AppMode {
     stopping-output-test,
     running,
     adding-track,
+    adding-routing-bus,
     duplicating-track,
     removing-track,
     renaming-track,
@@ -120,6 +121,13 @@ export struct MixerSendRow {
     gain-percent: float,
     pan-percent: float,
     enabled: bool,
+}
+
+export struct RoutingBusSourceRow {
+    index: int,
+    track-id: string,
+    name: string,
+    selected: bool,
 }
 
 export struct NativeDeviceRow {
@@ -316,6 +324,8 @@ export global IdeActions {
     callback save-project-as(string);
     callback rename-project(string);
     callback add-audio-track(string);
+    callback add-routing-bus(int, string);
+    callback toggle-routing-bus-source(int);
     callback duplicate-audio-track(int, string);
     callback remove-audio-track(string);
     callback remove-audio-track-content(string);
@@ -465,6 +475,11 @@ export component MainWindow inherits Window {
     in-out property <bool> mixer-visible: false;
     in-out property <bool> new-track-visible: false;
     in-out property <string> new-track-name: "Audio 2";
+    in-out property <bool> routing-bus-create-visible: false;
+    in-out property <int> routing-bus-kind-index: 0;
+    in-out property <string> routing-bus-name: "Group";
+    in-out property <[RoutingBusSourceRow]> routing-bus-sources: [];
+    in property <int> routing-bus-selected-source-count: 0;
     in-out property <bool> duplicate-track-visible: false;
     in-out property <int> duplicate-track-index: -1;
     in-out property <string> duplicate-track-source-name: "";
@@ -1174,7 +1189,92 @@ export component MainWindow inherits Window {
                                     wrap: word-wrap;
                                 }
                             }
-                            if !root.new-track-visible : VerticalLayout {
+                            if root.routing-bus-create-visible : VerticalLayout {
+                                vertical-stretch: 1;
+                                spacing: 6px;
+                                Text { text: "NEW ROUTING BUS"; color: #65758a; font-size: 9px; font-weight: 700; letter-spacing: 0.6px; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Button {
+                                        horizontal-stretch: 1;
+                                        text: root.routing-bus-kind-index == 0 ? "GROUP" : "Group";
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => {
+                                            root.routing-bus-kind-index = 0;
+                                            root.routing-bus-name = "Group";
+                                        }
+                                    }
+                                    Button {
+                                        horizontal-stretch: 1;
+                                        text: root.routing-bus-kind-index == 1 ? "RETURN" : "Return";
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => {
+                                            root.routing-bus-kind-index = 1;
+                                            root.routing-bus-name = "Return";
+                                        }
+                                    }
+                                }
+                                IdeLineEdit {
+                                    text <=> root.routing-bus-name;
+                                    enabled: root.app-mode == AppMode.running;
+                                    accessible-label: "Routing bus name";
+                                }
+                                Text {
+                                    text: root.routing-bus-kind-index == 0
+                                        ? "A group reroutes each selected audio channel to this bus."
+                                        : "A return adds a unity post-fader send from each selected audio channel.";
+                                    color: #728196;
+                                    font-size: 9px;
+                                    wrap: word-wrap;
+                                }
+                                Text { text: "AUDIO SOURCES"; color: #65758a; font-size: 9px; font-weight: 700; letter-spacing: 0.6px; }
+                                ListView {
+                                    vertical-stretch: 1;
+                                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+                                    for source in root.routing-bus-sources : Button {
+                                        width: 100%;
+                                        height: 28px;
+                                        text: source.selected ? "✓ " + source.name : source.name;
+                                        enabled: root.app-mode == AppMode.running;
+                                        accessible-label: "Select audio source " + source.name;
+                                        clicked => { IdeActions.toggle-routing-bus-source(source.index); }
+                                    }
+                                }
+                                Text {
+                                    text: root.routing-bus-selected-source-count == 0
+                                        ? "Select one or more audio channels."
+                                        : "" + root.routing-bus-selected-source-count + " audio source(s) selected.";
+                                    color: root.routing-bus-selected-source-count == 0 ? #ffaaa6 : #728196;
+                                    font-size: 9px;
+                                    wrap: word-wrap;
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Button {
+                                        text: "Cancel";
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => { root.routing-bus-create-visible = false; }
+                                    }
+                                    Button {
+                                        horizontal-stretch: 1;
+                                        text: root.app-mode == AppMode.adding-routing-bus ? "Creating bus…" : "Create routing bus";
+                                        enabled: root.app-mode == AppMode.running
+                                            && root.routing-bus-name != ""
+                                            && root.routing-bus-selected-source-count > 0
+                                            && root.track-count < 8;
+                                        clicked => { IdeActions.add-routing-bus(root.routing-bus-kind-index, root.routing-bus-name); }
+                                    }
+                                }
+                                Text {
+                                    text: root.track-count >= 8
+                                        ? "Version 1 supports at most eight structural tracks."
+                                        : "The current live mixer state is saved before the project is reopened.";
+                                    color: root.track-count >= 8 ? #ffaaa6 : #728196;
+                                    font-size: 9px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            if !root.new-track-visible && !root.routing-bus-create-visible : VerticalLayout {
                                 spacing: 8px;
                             Text { text: root.project-name; color: #edf2f8; font-size: 18px; font-weight: 600; overflow: elide; }
                             Text { text: root.project-location; color: #8290a2; font-size: 11px; wrap: word-wrap; vertical-stretch: 1; }
@@ -1211,6 +1311,15 @@ export component MainWindow inherits Window {
                                         } else {
                                             root.new-project-visible = true;
                                         }
+                                    }
+                                }
+                                if root.app-mode == AppMode.running && root.routing-bus-sources.length > 0 : Button {
+                                    text: "New routing bus";
+                                    enabled: root.track-count < 8;
+                                    clicked => {
+                                        root.routing-bus-create-visible = true;
+                                        root.routing-bus-kind-index = 0;
+                                        root.routing-bus-name = "Group";
                                     }
                                 }
                                 Button {
