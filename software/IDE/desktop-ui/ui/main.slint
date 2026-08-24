@@ -3131,12 +3131,19 @@ export component MainWindow inherits Window {
                                 font-weight: 700;
                                 vertical-alignment: center;
                             }
-                            for candidate in root.return-send-candidates : Button {
-                                text: candidate.source-name + " → " + candidate.return-name;
-                                accessible-label: "Add send from " + candidate.source-name + " to " + candidate.return-name;
-                                enabled: root.app-mode == AppMode.running;
-                                clicked => {
-                                    IdeActions.add-return-send(candidate.source-track-id, candidate.return-track-id);
+                            Flickable {
+                                horizontal-stretch: 1;
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    for candidate in root.return-send-candidates : Button {
+                                        min-width: 132px;
+                                        text: candidate.source-name + " → " + candidate.return-name;
+                                        accessible-label: "Add send from " + candidate.source-name + " to " + candidate.return-name;
+                                        enabled: root.app-mode == AppMode.running;
+                                        clicked => {
+                                            IdeActions.add-return-send(candidate.source-track-id, candidate.return-track-id);
+                                        }
+                                    }
                                 }
                             }
                         }

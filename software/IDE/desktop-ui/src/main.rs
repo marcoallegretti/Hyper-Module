@@ -2563,8 +2563,26 @@ fn bind_send_callbacks(ui: &MainWindow, worker: &WorkerCell) {
         });
     });
 
+    bind_return_send_callbacks(ui, worker);
+}
+
+fn bind_return_send_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let worker = Rc::clone(worker);
+    bind_return_send_callbacks_with(
+        ui,
+        Rc::new(move |ui, command| submit_to_ui(ui, &worker, command)),
+    );
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "each generated callback retains the shared command submitter for the window lifetime"
+)]
+fn bind_return_send_callbacks_with(ui: &MainWindow, submitter: UiCommandSubmitter) {
+    let actions = ui.global::<IdeActions>();
+
     let weak = ui.as_weak();
-    let worker_for_add = Rc::clone(worker);
+    let add_submitter = Rc::clone(&submitter);
     actions.on_add_return_send(move |source_track_id, return_track_id| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -2578,9 +2596,8 @@ fn bind_send_callbacks(ui: &MainWindow, worker: &WorkerCell) {
             ui.set_error_text("The selected return-send route is no longer available".into());
             return;
         }
-        submit_to_ui(
+        add_submitter(
             &ui,
-            &worker_for_add,
             IdeWorkerCommand::AddReturnSend {
                 source_track_id: source_track_id.to_string(),
                 return_track_id: return_track_id.to_string(),
@@ -2589,7 +2606,6 @@ fn bind_send_callbacks(ui: &MainWindow, worker: &WorkerCell) {
     });
 
     let weak = ui.as_weak();
-    let worker_for_remove = Rc::clone(worker);
     actions.on_remove_return_send(move |send_id| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -2603,9 +2619,8 @@ fn bind_send_callbacks(ui: &MainWindow, worker: &WorkerCell) {
             ui.set_error_text("The selected return send is no longer available".into());
             return;
         }
-        submit_to_ui(
+        submitter(
             &ui,
-            &worker_for_remove,
             IdeWorkerCommand::RemoveReturnSend {
                 send_id: send_id.to_string(),
             },
@@ -13812,6 +13827,85 @@ mod tests {
             validate_mixer_send(AppMode::Running, -1, &sends).unwrap_err(),
             MixerControlFailure::InvalidSelection
         );
+    }
+
+    #[test]
+    fn return_send_actions_forward_only_current_generated_rows() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_mixer_visible(true);
+        ui.set_mixer_sends_visible(true);
+        ui.set_return_send_candidates(ModelRc::from(Rc::new(VecModel::from(vec![
+            ReturnSendCandidateRow {
+                source_track_id: "018f47a2-6b2d-7c11-8a44-001122334456".into(),
+                source_name: "Drums".into(),
+                return_track_id: "018f47a2-6b2d-7c11-8a44-001122334457".into(),
+                return_name: "Reverb".into(),
+            },
+        ]))));
+        ui.set_mixer_sends(ModelRc::from(Rc::new(VecModel::from(vec![MixerSendRow {
+            index: 0,
+            channel_index: 0,
+            send_index: 0,
+            send_id: "018f47a2-6b2d-7c11-8a44-001122334458".into(),
+            source_name: "Drums".into(),
+            target_name: "Reverb".into(),
+            tap: "POST-FADER".into(),
+            state_available: true,
+            gain_percent: 100.0,
+            pan_percent: 0.0,
+            enabled: true,
+        }]))));
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let submitted_by_callback = Rc::clone(&submitted);
+        bind_return_send_callbacks_with(
+            &ui,
+            Rc::new(move |_, command| submitted_by_callback.borrow_mut().push(command)),
+        );
+        ui.show().unwrap();
+
+        let add = ElementHandle::find_by_accessible_label(&ui, "Add send from Drums to Reverb")
+            .next()
+            .expect("the generated return-send candidate is reachable");
+        assert_eq!(add.accessible_enabled(), Some(true));
+        add.mock_single_click(PointerEventButton::Left);
+        let remove =
+            ElementHandle::find_by_accessible_label(&ui, "Remove send from Drums to Reverb")
+                .next()
+                .expect("the generated return-send removal is reachable");
+        assert_eq!(remove.accessible_enabled(), Some(true));
+        remove.mock_single_click(PointerEventButton::Left);
+        assert!(matches!(
+            submitted.borrow().as_slice(),
+            [
+                IdeWorkerCommand::AddReturnSend {
+                    source_track_id,
+                    return_track_id,
+                },
+                IdeWorkerCommand::RemoveReturnSend { send_id },
+            ] if source_track_id == "018f47a2-6b2d-7c11-8a44-001122334456"
+                && return_track_id == "018f47a2-6b2d-7c11-8a44-001122334457"
+                && send_id == "018f47a2-6b2d-7c11-8a44-001122334458"
+        ));
+
+        let actions = ui.global::<IdeActions>();
+        actions.invoke_add_return_send(
+            "018f47a2-6b2d-7c11-8a44-001122334499".into(),
+            "018f47a2-6b2d-7c11-8a44-001122334457".into(),
+        );
+        actions.invoke_remove_return_send("018f47a2-6b2d-7c11-8a44-001122334499".into());
+        assert_eq!(
+            submitted.borrow().len(),
+            2,
+            "stale return-send identities must not enqueue a mutation"
+        );
+        assert_eq!(
+            ui.get_error_text(),
+            "The selected return send is no longer available"
+        );
+        ui.hide().unwrap();
     }
 
     #[test]
