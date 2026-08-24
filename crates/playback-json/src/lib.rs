@@ -809,6 +809,24 @@ pub enum RoutingBusCreationSerializationError {
     Serialization(serde_json::Error),
 }
 
+/// Failure to create or remove one version-1 send to an existing return bus.
+#[derive(Debug)]
+pub enum ReturnSendSerializationError {
+    Source(LoadError),
+    MixerIdentityMismatch,
+    InvalidSendIdentity,
+    SourceTrackMissing,
+    SourceTrackUnsupported,
+    ReturnTrackMissing,
+    ReturnTrackNotReturn,
+    ReturnMappingMissing,
+    DuplicateReturnSend,
+    SendCapacity,
+    SendMissing,
+    InvalidDocumentShape,
+    Serialization(serde_json::Error),
+}
+
 #[derive(Debug)]
 pub enum AudioClipAdditionSerializationError {
     Source(LoadError),
@@ -1744,6 +1762,62 @@ impl Error for RoutingBusCreationSerializationError {
     }
 }
 
+impl fmt::Display for ReturnSendSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => source.fmt(formatter),
+            Self::MixerIdentityMismatch => {
+                formatter.write_str("source mixer identity does not match the return-send request")
+            }
+            Self::InvalidSendIdentity => {
+                formatter.write_str("the return-send identity is invalid or already in use")
+            }
+            Self::SourceTrackMissing => formatter.write_str("the return-send source track is not present"),
+            Self::SourceTrackUnsupported => {
+                formatter.write_str("a return send can originate only from an audio or group track")
+            }
+            Self::ReturnTrackMissing => formatter.write_str("the return-send target track is not present"),
+            Self::ReturnTrackNotReturn => {
+                formatter.write_str("the return-send target track is not a return track")
+            }
+            Self::ReturnMappingMissing => {
+                formatter.write_str("the return-send target has no configured mixer bus")
+            }
+            Self::DuplicateReturnSend => {
+                formatter.write_str("the source track already sends to that return track")
+            }
+            Self::SendCapacity => {
+                formatter.write_str("the source track cannot contain another return send")
+            }
+            Self::SendMissing => formatter.write_str("the return send is not present"),
+            Self::InvalidDocumentShape => {
+                formatter.write_str("source mixer shape changed after typed validation")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ReturnSendSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::MixerIdentityMismatch
+            | Self::InvalidSendIdentity
+            | Self::SourceTrackMissing
+            | Self::SourceTrackUnsupported
+            | Self::ReturnTrackMissing
+            | Self::ReturnTrackNotReturn
+            | Self::ReturnMappingMissing
+            | Self::DuplicateReturnSend
+            | Self::SendCapacity
+            | Self::SendMissing
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
 impl fmt::Display for AudioClipAdditionSerializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2600,6 +2674,205 @@ pub fn serialize_routing_bus_creation(
         .load_mixer(&mixer, assets, limits)
         .map_err(RoutingBusCreationSerializationError::Source)?;
     Ok(RoutingBusCreationDocuments { track, mixer, kind })
+}
+
+/// Adds one canonical unity post-fader send from an existing source channel to
+/// an existing return track.
+///
+/// The candidate preserves every unrelated mixer field, uses the return's
+/// configured bus identity, and is loaded again before it is returned to a
+/// durable caller.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the source or target cannot form a
+/// version-1 return send, the requested identity is unsafe, the source mixer
+/// is stale or malformed, or the verified candidate cannot be loaded.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the edit boundary binds project, media, mixer, source, target, and fresh send identity"
+)]
+pub fn serialize_return_send_addition(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_mixer: &[u8],
+    mixer_id: &str,
+    source_track_id: &str,
+    return_track_id: &str,
+    send_id: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, ReturnSendSerializationError> {
+    let source_track = project
+        .tracks
+        .iter()
+        .find(|track| track.id == source_track_id)
+        .ok_or(ReturnSendSerializationError::SourceTrackMissing)?;
+    if !matches!(source_track.kind, TrackKind::Audio | TrackKind::Group) {
+        return Err(ReturnSendSerializationError::SourceTrackUnsupported);
+    }
+    let return_track = project
+        .tracks
+        .iter()
+        .find(|track| track.id == return_track_id)
+        .ok_or(ReturnSendSerializationError::ReturnTrackMissing)?;
+    if return_track.kind != TrackKind::Return {
+        return Err(ReturnSendSerializationError::ReturnTrackNotReturn);
+    }
+    if !is_valid_entity_id(send_id)
+        || send_id == project.project_id
+        || project_contains_identity(project, send_id)
+        || assets.iter().any(|asset| asset.id == send_id)
+    {
+        return Err(ReturnSendSerializationError::InvalidSendIdentity);
+    }
+    let loaded_mixer = project
+        .load_mixer(source_mixer, assets, limits)
+        .map_err(ReturnSendSerializationError::Source)?;
+    if loaded_mixer.id() != mixer_id {
+        return Err(ReturnSendSerializationError::MixerIdentityMismatch);
+    }
+    if loaded_mixer
+        .channels
+        .iter()
+        .flat_map(|channel| &channel.sends)
+        .any(|send| send.id == send_id)
+    {
+        return Err(ReturnSendSerializationError::InvalidSendIdentity);
+    }
+
+    let mut mixer_value: Value = serde_json::from_slice(source_mixer)
+        .map_err(ReturnSendSerializationError::Serialization)?;
+    let return_bus = mixer_value
+        .get("return_buses")
+        .and_then(Value::as_array)
+        .and_then(|return_buses| {
+            return_buses
+                .iter()
+                .find(|return_bus| {
+                    return_bus.get("track_id").and_then(Value::as_str) == Some(return_track_id)
+                })
+                .and_then(|return_bus| return_bus.get("bus").and_then(Value::as_str))
+                .map(str::to_owned)
+        })
+        .ok_or(ReturnSendSerializationError::ReturnMappingMissing)?;
+    let channels = mixer_value
+        .get_mut("channels")
+        .and_then(Value::as_array_mut)
+        .ok_or(ReturnSendSerializationError::InvalidDocumentShape)?;
+    let channel = channels
+        .iter_mut()
+        .find(|channel| channel.get("track_id").and_then(Value::as_str) == Some(source_track_id))
+        .ok_or(ReturnSendSerializationError::InvalidDocumentShape)?;
+    let sends = channel
+        .get_mut("sends")
+        .and_then(Value::as_array_mut)
+        .ok_or(ReturnSendSerializationError::InvalidDocumentShape)?;
+    if sends.len() >= MAX_VERSION_1_SENDS_PER_CHANNEL {
+        return Err(ReturnSendSerializationError::SendCapacity);
+    }
+    if sends
+        .iter()
+        .any(|send| send.get("bus").and_then(Value::as_str) == Some(return_bus.as_str()))
+    {
+        return Err(ReturnSendSerializationError::DuplicateReturnSend);
+    }
+    sends.push(json!({
+        "id": send_id,
+        "bus": return_bus,
+        "tap": "post-fader",
+        "gain_millionths": 1_000_000,
+        "pan_millionths": 0,
+        "enabled": true
+    }));
+    sends.sort_by_key(|entry| entry["bus"].as_str().unwrap_or_default().to_owned());
+    let candidate = serde_json_canonicalizer::to_vec(&mixer_value)
+        .map_err(ReturnSendSerializationError::Serialization)?;
+    project
+        .load_mixer(&candidate, assets, limits)
+        .map_err(ReturnSendSerializationError::Source)?;
+    Ok(candidate)
+}
+
+/// Removes one canonical send only when it currently belongs to an eligible
+/// source channel and targets a configured return track.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the exact send is missing, has a
+/// non-return target, its source is unsupported, the mixer is stale or
+/// malformed, or the resulting candidate cannot be loaded.
+pub fn serialize_return_send_removal(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_mixer: &[u8],
+    mixer_id: &str,
+    send_id: &str,
+    limits: LoaderLimits,
+) -> Result<Vec<u8>, ReturnSendSerializationError> {
+    let loaded_mixer = project
+        .load_mixer(source_mixer, assets, limits)
+        .map_err(ReturnSendSerializationError::Source)?;
+    if loaded_mixer.id() != mixer_id {
+        return Err(ReturnSendSerializationError::MixerIdentityMismatch);
+    }
+    let (source_track_id, return_bus) = loaded_mixer
+        .channels
+        .iter()
+        .find_map(|channel| {
+            channel
+                .sends
+                .iter()
+                .find(|send| send.id == send_id)
+                .map(|send| (channel.track_id.as_str(), send.bus))
+        })
+        .ok_or(ReturnSendSerializationError::SendMissing)?;
+    let source_track = project
+        .tracks
+        .iter()
+        .find(|track| track.id == source_track_id)
+        .ok_or(ReturnSendSerializationError::SourceTrackMissing)?;
+    if !matches!(source_track.kind, TrackKind::Audio | TrackKind::Group) {
+        return Err(ReturnSendSerializationError::SourceTrackUnsupported);
+    }
+    let return_track_id = loaded_mixer
+        .return_buses
+        .iter()
+        .find_map(|(bus, track_id)| (*bus == return_bus).then_some(track_id.as_str()))
+        .ok_or(ReturnSendSerializationError::ReturnMappingMissing)?;
+    let return_track = project
+        .tracks
+        .iter()
+        .find(|track| track.id == return_track_id)
+        .ok_or(ReturnSendSerializationError::ReturnTrackMissing)?;
+    if return_track.kind != TrackKind::Return {
+        return Err(ReturnSendSerializationError::ReturnTrackNotReturn);
+    }
+
+    let mut mixer_value: Value = serde_json::from_slice(source_mixer)
+        .map_err(ReturnSendSerializationError::Serialization)?;
+    let channels = mixer_value
+        .get_mut("channels")
+        .and_then(Value::as_array_mut)
+        .ok_or(ReturnSendSerializationError::InvalidDocumentShape)?;
+    let channel = channels
+        .iter_mut()
+        .find(|channel| channel.get("track_id").and_then(Value::as_str) == Some(source_track_id))
+        .ok_or(ReturnSendSerializationError::InvalidDocumentShape)?;
+    let sends = channel
+        .get_mut("sends")
+        .and_then(Value::as_array_mut)
+        .ok_or(ReturnSendSerializationError::InvalidDocumentShape)?;
+    let index = sends
+        .iter()
+        .position(|send| send.get("id").and_then(Value::as_str) == Some(send_id))
+        .ok_or(ReturnSendSerializationError::InvalidDocumentShape)?;
+    sends.remove(index);
+    let candidate = serde_json_canonicalizer::to_vec(&mixer_value)
+        .map_err(ReturnSendSerializationError::Serialization)?;
+    project
+        .load_mixer(&candidate, assets, limits)
+        .map_err(ReturnSendSerializationError::Source)?;
+    Ok(candidate)
 }
 
 /// Creates one complete reusable audio-clip view from a verified recorded asset
@@ -9718,6 +9991,135 @@ mod tests {
                 LoaderLimits::VERSION_1,
             )
             .unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one graph lifecycle proves canonical addition, removal, and refusal behavior"
+    )]
+    fn return_send_edits_preserve_the_verified_mixer_graph() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer_id = "018f47a2-6b2d-7c11-8a44-001122334468";
+        let source_track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
+        let return_track_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let return_bus = serialize_routing_bus_creation(
+            &loaded,
+            &asset_facts(),
+            MIXER,
+            mixer_id,
+            RoutingBusKind::Return,
+            return_track_id,
+            "Reverb",
+            &[source_track_id],
+            &["018f47a2-6b2d-7c11-8a44-00112233446a"],
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let return_tracks: [&[u8]; 2] = [TRACK, return_bus.track()];
+        let return_project = load(
+            input(TIMELINE, &return_tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let added_track_id = "018f47a2-6b2d-7c11-8a44-00112233446b";
+        let added = serialize_audio_track_addition(
+            &return_project,
+            &asset_facts(),
+            return_bus.mixer(),
+            mixer_id,
+            added_track_id,
+            "Backing",
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let expanded_tracks: [&[u8]; 3] = [TRACK, return_bus.track(), added.track()];
+        let expanded_project = load(
+            input(TIMELINE, &expanded_tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let send_id = "018f47a2-6b2d-7c11-8a44-00112233446c";
+
+        let with_send = serialize_return_send_addition(
+            &expanded_project,
+            &asset_facts(),
+            added.mixer(),
+            mixer_id,
+            added_track_id,
+            return_track_id,
+            send_id,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&with_send).unwrap();
+        assert_eq!(
+            value["channels"][2]["sends"],
+            json!([{
+                "id":send_id, "bus":"a", "tap":"post-fader",
+                "gain_millionths":1_000_000, "pan_millionths":0, "enabled":true
+            }])
+        );
+        assert_eq!(value["return_buses"], json!([{ "bus":"a", "track_id":return_track_id }]));
+        expanded_project
+            .load_mixer(&with_send, &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+
+        assert!(matches!(
+            serialize_return_send_addition(
+                &expanded_project,
+                &asset_facts(),
+                &with_send,
+                mixer_id,
+                added_track_id,
+                return_track_id,
+                "018f47a2-6b2d-7c11-8a44-00112233446d",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ReturnSendSerializationError::DuplicateReturnSend)
+        ));
+        assert!(matches!(
+            serialize_return_send_addition(
+                &expanded_project,
+                &asset_facts(),
+                &with_send,
+                mixer_id,
+                added_track_id,
+                source_track_id,
+                "018f47a2-6b2d-7c11-8a44-00112233446d",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ReturnSendSerializationError::ReturnTrackNotReturn)
+        ));
+        assert!(matches!(
+            serialize_return_send_removal(
+                &expanded_project,
+                &asset_facts(),
+                &with_send,
+                mixer_id,
+                "018f47a2-6b2d-7c11-8a44-00112233446d",
+                LoaderLimits::VERSION_1,
+            ),
+            Err(ReturnSendSerializationError::SendMissing)
+        ));
+        assert_eq!(
+            serialize_return_send_removal(
+                &expanded_project,
+                &asset_facts(),
+                &with_send,
+                mixer_id,
+                send_id,
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap(),
+            added.mixer()
+        );
     }
 
     #[test]

@@ -45,6 +45,9 @@ use hyper_desktop_audio::{
 pub use hyper_desktop_audio::{
     DesktopAudioPreviewState, DesktopSceneAvailability as IdeSceneAvailability,
 };
+
+/// Version-1 maximum number of return sends authored by one source channel.
+pub const MAX_IDE_MIXER_SENDS_PER_CHANNEL: usize = hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT;
 use hyper_mapping_compiler::{ControlMappingResolver, MixerSendAddress};
 use hyper_fs_authority::{
     StableFileEvidence, confirm_stable_absolute_file, read_stable_absolute_file,
@@ -90,7 +93,8 @@ use hyper_playback_json::{
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
     AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
     AudioTrackReorderSerializationError,
-    RoutingBusCreationSerializationError, RoutingBusKind as PlaybackRoutingBusKind,
+    ReturnSendSerializationError, RoutingBusCreationSerializationError,
+    RoutingBusKind as PlaybackRoutingBusKind,
     AutomationTakeAddition, AutomationTakeAdditionSerializationError,
     AutomationTakeEditSerializationError, AutomationTargetSelection, CompiledMixerGraph,
     CompiledMixerTap, CompiledMixerTrackKind, LoadError as PlaybackDocumentLoadError, LoaderLimits,
@@ -112,6 +116,7 @@ use hyper_playback_json::{
     serialize_audio_track_content_removal,
     serialize_audio_track_removal, serialize_audio_track_rename,
     serialize_audio_track_duplication, serialize_audio_track_reorder,
+    serialize_return_send_addition, serialize_return_send_removal,
     serialize_routing_bus_creation,
     serialize_automation_take_activation, serialize_automation_take_addition,
     serialize_mixer_base_state, serialize_recording_audio_clip_addition,
@@ -2184,6 +2189,105 @@ impl Error for IdeRoutingBusCreationError {
             Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
             Self::InvalidName
             | Self::EmptySourceSelection
+            | Self::CapacityUnavailable
+            | Self::NativeClose(_) => None,
+        }
+    }
+}
+
+/// A durable change to one existing return-send edge in the mixer graph.
+#[derive(Debug)]
+pub enum IdeReturnSendEditError {
+    InvalidSendIdentity,
+    Blocked {
+        control_mappings: usize,
+        automation_lanes: usize,
+    },
+    MixerSave(Box<IdeProjectSaveError>),
+    Serialization(ReturnSendSerializationError),
+    CapacityUnavailable,
+    Publication(Box<ProjectResourcePublicationError>),
+    NativeClose(IdeNativeCloseFailure),
+    NativeCloseAndReopen {
+        close: IdeNativeCloseFailure,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPreparation {
+        preparation: Box<IdeReturnSendEditError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+    ReopenAfterPublication {
+        outcome: Box<ProjectResourcePublicationOutcome>,
+        source: Box<IdeProjectOpenError>,
+    },
+    PublicationAndReopen {
+        publication: Box<ProjectResourcePublicationError>,
+        reopen: Box<IdeProjectOpenError>,
+    },
+}
+
+impl fmt::Display for IdeReturnSendEditError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSendIdentity => formatter.write_str("return-send identity is required"),
+            Self::Blocked {
+                control_mappings,
+                automation_lanes,
+            } => write!(
+                formatter,
+                "return-send removal is blocked by {control_mappings} control mapping(s) and {automation_lanes} automation lane(s)"
+            ),
+            Self::MixerSave(source) => {
+                write!(formatter, "live mixer state could not be preserved: {source}")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::CapacityUnavailable => {
+                formatter.write_str("return-send edit capacity is unavailable")
+            }
+            Self::Publication(source) => source.fmt(formatter),
+            Self::NativeClose(source) => write!(
+                formatter,
+                "native playback did not close cleanly before editing the return send: {source:?}"
+            ),
+            Self::NativeCloseAndReopen { close, reopen } => write!(
+                formatter,
+                "native playback did not close cleanly before editing the return send ({close:?}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPreparation {
+                preparation,
+                reopen,
+            } => write!(
+                formatter,
+                "return-send preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+            ),
+            Self::ReopenAfterPublication { outcome, source } => write!(
+                formatter,
+                "return send was edited in project revision {} but the project could not be reopened: {source}",
+                outcome.project_revision()
+            ),
+            Self::PublicationAndReopen {
+                publication,
+                reopen,
+            } => write!(
+                formatter,
+                "return-send publication failed ({publication}) and the project could not be reopened ({reopen})"
+            ),
+        }
+    }
+}
+
+impl Error for IdeReturnSendEditError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MixerSave(source) => Some(source.as_ref()),
+            Self::Serialization(source) => Some(source),
+            Self::Publication(source) => Some(source.as_ref()),
+            Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
+            Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
+            Self::ReopenAfterPublication { source, .. } => Some(source.as_ref()),
+            Self::PublicationAndReopen { publication, .. } => Some(publication.as_ref()),
+            Self::InvalidSendIdentity
+            | Self::Blocked { .. }
             | Self::CapacityUnavailable
             | Self::NativeClose(_) => None,
         }
@@ -8106,6 +8210,8 @@ pub struct RunningIdeSnapshot<'a> {
     pub mixer_send_counts: [usize; MAX_IDE_MIXER_CHANNELS],
     pub mixer_send_ids:
         [[&'a str; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS],
+    pub mixer_send_target_track_ids:
+        [[&'a str; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS],
     pub mixer_send_target_names:
         [[&'a str; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS],
     pub mixer_send_taps:
@@ -8493,6 +8599,118 @@ impl RunningDesktopIdeApplication {
             source_track_ids: source_track_ids.to_vec(),
             send_ids,
         })
+    }
+
+    fn prepare_return_send_addition(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        source_track_id: &str,
+        return_track_id: &str,
+    ) -> Result<IdeMixerSavePlan, IdeReturnSendEditError> {
+        let mut mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeReturnSendEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeReturnSendEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let (project, _, _, media) = prepared.session().parts();
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeReturnSendEditError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        let send_id = uuid::Uuid::new_v4().to_string();
+        mixer.resource_bytes = serialize_return_send_addition(
+            project,
+            &assets,
+            &mixer.resource_bytes,
+            &mixer.resource_id,
+            source_track_id,
+            return_track_id,
+            &send_id,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeReturnSendEditError::Serialization)?;
+        Ok(mixer)
+    }
+
+    fn prepare_return_send_removal(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        send_id: &str,
+    ) -> Result<IdeMixerSavePlan, IdeReturnSendEditError> {
+        if send_id.is_empty() {
+            return Err(IdeReturnSendEditError::InvalidSendIdentity);
+        }
+        let mut mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeReturnSendEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeReturnSendEditError::MixerSave(Box::new(
+                IdeProjectSaveError::ProjectSnapshotUnavailable,
+            ))
+        })?;
+        let (project, compiled_mixer, _, media) = prepared.session().parts();
+        let address = compiled_mixer.slots().iter().enumerate().find_map(|(slot, channel)| {
+            channel
+                .sends()
+                .iter()
+                .position(|send| send.id() == send_id)
+                .map(|send| (slot, send))
+        });
+        let (control_mappings, automation_lanes) = address.map_or((0, 0), |(slot, send)| {
+            let control_mappings = prepared.control_mapping().map_or(0, |mapping| {
+                mapping
+                    .bindings()
+                    .iter()
+                    .filter(|binding| {
+                        matches!(
+                            binding.target(),
+                            ControlTarget::MixerSend { send_id: id, .. } if id == send_id
+                        )
+                    })
+                    .count()
+            });
+            let automation_lanes = prepared
+                .session()
+                .automation_takes()
+                .takes()
+                .iter()
+                .flat_map(hyper_playback_session::PlaybackAutomationTake::lanes)
+                .filter(|lane| {
+                    matches!(
+                        lane.target(),
+                        AutomationTarget::Send {
+                            slot: lane_slot,
+                            send: lane_send,
+                            ..
+                        } if lane_slot == slot && lane_send == send
+                    )
+                })
+                .count();
+            (control_mappings, automation_lanes)
+        });
+        if control_mappings != 0 || automation_lanes != 0 {
+            return Err(IdeReturnSendEditError::Blocked {
+                control_mappings,
+                automation_lanes,
+            });
+        }
+        let mut assets = Vec::new();
+        assets
+            .try_reserve_exact(media.asset_count())
+            .map_err(|_| IdeReturnSendEditError::CapacityUnavailable)?;
+        assets.extend(media.media_asset_facts());
+        mixer.resource_bytes = serialize_return_send_removal(
+            project,
+            &assets,
+            &mixer.resource_bytes,
+            &mixer.resource_id,
+            send_id,
+            application.config.project_limits.session.documents,
+        )
+        .map_err(IdeReturnSendEditError::Serialization)?;
+        Ok(mixer)
     }
 
     fn prepare_audio_track_removal(
@@ -12007,6 +12225,8 @@ impl RunningDesktopIdeApplication {
         let mut mixer_send_counts = [0; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_send_ids =
             [[""; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS];
+        let mut mixer_send_target_track_ids =
+            [[""; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_send_target_names =
             [[""; hyper_mixer_runtime::MAX_MIXER_SENDS_PER_SLOT]; MAX_IDE_MIXER_CHANNELS];
         let mut mixer_send_taps = [[IdeMixerSendTap::PostFader;
@@ -12039,6 +12259,7 @@ impl RunningDesktopIdeApplication {
             for (send_index, send) in slot.sends().iter().enumerate() {
                 let target = mixer.slots().get(send.target_slot())?;
                 mixer_send_ids[channel_index][send_index] = send.id();
+                mixer_send_target_track_ids[channel_index][send_index] = target.track_id();
                 mixer_send_target_names[channel_index][send_index] =
                     loaded.track_name(target.track_id())?;
                 mixer_send_taps[channel_index][send_index] = match send.tap() {
@@ -12083,6 +12304,7 @@ impl RunningDesktopIdeApplication {
             mixer_channel_states,
             mixer_send_counts,
             mixer_send_ids,
+            mixer_send_target_track_ids,
             mixer_send_target_names,
             mixer_send_taps,
             mixer_send_states,

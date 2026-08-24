@@ -42,7 +42,8 @@ use super::{
     IdeAudioImportError, IdeAudioInputInventory, IdeAudioOutputInventory,
     IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioTrackAdditionError,
     IdeAudioTrackContentRemovalError, IdeAudioTrackDuplicationError, IdeAudioTrackEditError,
-    IdeAudioTrackRemovalError, IdeAudioTrackReorderError, IdeRoutingBusCreationError,
+    IdeAudioTrackRemovalError, IdeAudioTrackReorderError, IdeReturnSendEditError,
+    IdeRoutingBusCreationError,
     IdeRoutingBusKind,
     IdeAutomationTakeCreationError,
     IdeAutomationTakeEditError, IdeAutomationTakeRequest, IdeAutomationTarget, IdeCloseOutcome,
@@ -156,6 +157,8 @@ pub enum IdeWorkerCommandKind {
     PrepareRuntime,
     AddAudioTrack,
     AddRoutingBus,
+    AddReturnSend,
+    RemoveReturnSend,
     RemoveAudioTrack,
     RemoveAudioTrackContent,
     ReorderAudioTracks,
@@ -271,6 +274,13 @@ pub enum IdeWorkerCommand {
         kind: IdeRoutingBusKind,
         name: String,
         source_track_ids: Vec<String>,
+    },
+    AddReturnSend {
+        source_track_id: String,
+        return_track_id: String,
+    },
+    RemoveReturnSend {
+        send_id: String,
     },
     RemoveAudioTrack {
         track_id: String,
@@ -503,6 +513,8 @@ impl IdeWorkerCommand {
             Self::PrepareRuntime { .. } => IdeWorkerCommandKind::PrepareRuntime,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
             Self::AddRoutingBus { .. } => IdeWorkerCommandKind::AddRoutingBus,
+            Self::AddReturnSend { .. } => IdeWorkerCommandKind::AddReturnSend,
+            Self::RemoveReturnSend { .. } => IdeWorkerCommandKind::RemoveReturnSend,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
             Self::RemoveAudioTrackContent { .. } => {
                 IdeWorkerCommandKind::RemoveAudioTrackContent
@@ -1254,6 +1266,7 @@ fn ide_control_binding(
 #[derive(Clone, Debug, PartialEq)]
 pub struct IdeMixerSend {
     id: String,
+    target_track_id: String,
     target_name: String,
     tap: super::IdeMixerSendTap,
     state: Option<super::IdeMixerSendState>,
@@ -1313,6 +1326,11 @@ impl IdeMixerSend {
     #[must_use]
     pub fn target_name(&self) -> &str {
         &self.target_name
+    }
+
+    #[must_use]
+    pub fn target_track_id(&self) -> &str {
+        &self.target_track_id
     }
 
     #[must_use]
@@ -1891,6 +1909,7 @@ pub enum IdeWorkerCommandFailure {
     RuntimePreparation(Box<IdeRuntimePreparationError>),
     AudioTrackAddition(Box<super::IdeAudioTrackAdditionError>),
     RoutingBusCreation(Box<super::IdeRoutingBusCreationError>),
+    ReturnSendEdit(Box<super::IdeReturnSendEditError>),
     AudioTrackRemoval(Box<super::IdeAudioTrackRemovalError>),
     AudioTrackContentRemoval(Box<super::IdeAudioTrackContentRemovalError>),
     AudioTrackReorder(Box<super::IdeAudioTrackReorderError>),
@@ -2029,6 +2048,7 @@ impl fmt::Display for IdeWorkerCommandFailure {
             Self::RuntimePreparation(source) => source.fmt(formatter),
             Self::AudioTrackAddition(source) => source.fmt(formatter),
             Self::RoutingBusCreation(source) => source.fmt(formatter),
+            Self::ReturnSendEdit(source) => source.fmt(formatter),
             Self::AudioTrackRemoval(source) => source.fmt(formatter),
             Self::AudioTrackContentRemoval(source) => source.fmt(formatter),
             Self::AudioTrackReorder(source) => source.fmt(formatter),
@@ -2126,6 +2146,7 @@ impl Error for IdeWorkerCommandFailure {
             Self::RuntimePreparation(source) => Some(source.as_ref()),
             Self::AudioTrackAddition(source) => Some(source),
             Self::RoutingBusCreation(source) => Some(source),
+            Self::ReturnSendEdit(source) => Some(source),
             Self::AudioTrackRemoval(source) => Some(source),
             Self::AudioTrackContentRemoval(source) => Some(source),
             Self::AudioTrackReorder(source) => Some(source),
@@ -2279,6 +2300,9 @@ pub enum IdeWorkerEvent {
     RoutingBusAdded {
         revision: u64,
         track_id: String,
+    },
+    ReturnSendEdited {
+        revision: u64,
     },
     AudioTrackAdded {
         revision: u64,
@@ -3077,6 +3101,13 @@ enum ProjectMutation {
         name: String,
         source_track_ids: Vec<String>,
     },
+    AddReturnSend {
+        source_track_id: String,
+        return_track_id: String,
+    },
+    RemoveReturnSend {
+        send_id: String,
+    },
     RemoveAudioTrack {
         track_id: String,
     },
@@ -3264,6 +3295,8 @@ impl ProjectMutation {
             Self::PrepareRuntime { .. } => IdeWorkerCommandKind::PrepareRuntime,
             Self::AddAudioTrack { .. } => IdeWorkerCommandKind::AddAudioTrack,
             Self::AddRoutingBus { .. } => IdeWorkerCommandKind::AddRoutingBus,
+            Self::AddReturnSend { .. } => IdeWorkerCommandKind::AddReturnSend,
+            Self::RemoveReturnSend { .. } => IdeWorkerCommandKind::RemoveReturnSend,
             Self::RemoveAudioTrack { .. } => IdeWorkerCommandKind::RemoveAudioTrack,
             Self::RemoveAudioTrackContent { .. } => {
                 IdeWorkerCommandKind::RemoveAudioTrackContent
@@ -3338,7 +3371,10 @@ impl ProjectMutation {
     )]
     fn pending_event(&self) -> IdeWorkerEvent {
         match self {
-            Self::SaveMixer | Self::SaveProjectAs { .. } => IdeWorkerEvent::Saving,
+            Self::SaveMixer
+            | Self::SaveProjectAs { .. }
+            | Self::AddReturnSend { .. }
+            | Self::RemoveReturnSend { .. } => IdeWorkerEvent::Saving,
             Self::RenameProject { .. } => IdeWorkerEvent::ProjectRenaming,
             Self::PrepareRuntime { .. } => IdeWorkerEvent::RuntimePreparing,
             Self::AddAudioTrack { .. } => IdeWorkerEvent::AudioTrackAdding,
@@ -3642,6 +3678,8 @@ const fn undo_label(command: IdeWorkerCommandKind) -> &'static str {
         IdeWorkerCommandKind::SaveProjectAs => "project copy",
         IdeWorkerCommandKind::RenameProject => "project rename",
         IdeWorkerCommandKind::PrepareRuntime => "Runtime preparation save",
+        IdeWorkerCommandKind::AddReturnSend => "return-send addition",
+        IdeWorkerCommandKind::RemoveReturnSend => "return-send removal",
         IdeWorkerCommandKind::RenameAudioTrack => "track rename",
         IdeWorkerCommandKind::SetAudioTrackActive => "track activation",
         IdeWorkerCommandKind::MoveArrangementPlacement => "placement move",
@@ -3999,6 +4037,8 @@ fn process_command(
         | IdeWorkerCommand::RenameProject { .. }
         | IdeWorkerCommand::PrepareRuntime { .. }
         | IdeWorkerCommand::AddRoutingBus { .. }
+        | IdeWorkerCommand::AddReturnSend { .. }
+        | IdeWorkerCommand::RemoveReturnSend { .. }
         | IdeWorkerCommand::AddAudioTrack { .. }
         | IdeWorkerCommand::RemoveAudioTrack { .. }
         | IdeWorkerCommand::RemoveAudioTrackContent { .. }
@@ -4180,6 +4220,11 @@ fn process_project_mutation_command(
             name,
             source_track_ids,
         } => add_routing_bus(state, events, kind, name, source_track_ids),
+        IdeWorkerCommand::AddReturnSend {
+            source_track_id,
+            return_track_id,
+        } => add_return_send(state, events, &source_track_id, &return_track_id),
+        IdeWorkerCommand::RemoveReturnSend { send_id } => remove_return_send(state, events, &send_id),
         IdeWorkerCommand::RemoveAudioTrack { track_id } => {
             remove_audio_track(state, events, &track_id)
         }
@@ -5617,6 +5662,54 @@ fn add_routing_bus(
     )
 }
 
+fn add_return_send(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    source_track_id: &str,
+    return_track_id: &str,
+) -> bool {
+    if source_track_id.is_empty() || return_track_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::AddReturnSend,
+            IdeWorkerCommandFailure::ReturnSendEdit(Box::new(
+                IdeReturnSendEditError::InvalidSendIdentity,
+            )),
+        );
+    }
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::AddReturnSend {
+            source_track_id: source_track_id.to_owned(),
+            return_track_id: return_track_id.to_owned(),
+        },
+    )
+}
+
+fn remove_return_send(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    send_id: &str,
+) -> bool {
+    if send_id.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::RemoveReturnSend,
+            IdeWorkerCommandFailure::ReturnSendEdit(Box::new(
+                IdeReturnSendEditError::InvalidSendIdentity,
+            )),
+        );
+    }
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::RemoveReturnSend {
+            send_id: send_id.to_owned(),
+        },
+    )
+}
+
 fn remove_audio_track(
     state: &mut WorkerState,
     events: &SyncSender<IdeWorkerEvent>,
@@ -6911,6 +7004,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
             .as_ref()
             .map_or(HistoryEffect::None, HistoryEffect::Replacement),
         ProjectMutationAttempt::Save(Ok(outcome))
+        | ProjectMutationAttempt::ReturnSendEdit(Ok(outcome))
         | ProjectMutationAttempt::RenameAudioTrack(Ok(outcome))
         | ProjectMutationAttempt::RemoveArrangementPlacement(Ok(outcome))
         | ProjectMutationAttempt::SetAudioTrackActive {
@@ -7085,6 +7179,7 @@ fn history_effect(attempt: &ProjectMutationAttempt) -> HistoryEffect<'_> {
         | ProjectMutationAttempt::RenameProject(_)
         | ProjectMutationAttempt::RemoveAutomationTake { .. }
         | ProjectMutationAttempt::Save(Err(_))
+        | ProjectMutationAttempt::ReturnSendEdit(Err(_))
         | ProjectMutationAttempt::AddAudioTrack(Err(_))
         | ProjectMutationAttempt::AddRoutingBus(Err(_))
         | ProjectMutationAttempt::RemoveAudioTrack(Err(_))
@@ -7784,6 +7879,11 @@ fn project_mutation_save_failure(
         ProjectMutation::AddRoutingBus { .. } => IdeWorkerCommandFailure::RoutingBusCreation(
             Box::new(IdeRoutingBusCreationError::MixerSave(Box::new(reason))),
         ),
+        ProjectMutation::AddReturnSend { .. } | ProjectMutation::RemoveReturnSend { .. } => {
+            IdeWorkerCommandFailure::ReturnSendEdit(Box::new(IdeReturnSendEditError::MixerSave(
+                Box::new(reason),
+            )))
+        }
         ProjectMutation::RemoveAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackRemoval(
             Box::new(IdeAudioTrackRemovalError::MixerSave(Box::new(reason))),
         ),
@@ -8070,6 +8170,11 @@ fn project_mutation_native_close_failure(
         ProjectMutation::AddRoutingBus { .. } => IdeWorkerCommandFailure::RoutingBusCreation(
             Box::new(IdeRoutingBusCreationError::NativeClose(failure)),
         ),
+        ProjectMutation::AddReturnSend { .. } | ProjectMutation::RemoveReturnSend { .. } => {
+            IdeWorkerCommandFailure::ReturnSendEdit(Box::new(IdeReturnSendEditError::NativeClose(
+                failure,
+            )))
+        }
         ProjectMutation::RemoveAudioTrack { .. } => IdeWorkerCommandFailure::AudioTrackRemoval(
             Box::new(IdeAudioTrackRemovalError::NativeClose(failure)),
         ),
@@ -8295,6 +8400,9 @@ enum ProjectMutationAttempt {
     ),
     AddRoutingBus(
         Result<hyper_storage_engine::AudioTrackPublicationOutcome, IdeRoutingBusCreationError>,
+    ),
+    ReturnSendEdit(
+        Result<hyper_storage_engine::ProjectResourcePublicationOutcome, IdeReturnSendEditError>,
     ),
     RemoveAudioTrack(
         Result<hyper_storage_engine::AudioTrackRemovalOutcome, IdeAudioTrackRemovalError>,
@@ -8992,6 +9100,12 @@ fn complete_project_mutation(
                         track_id: outcome.track_id().to_owned(),
                     },
                 ),
+                ProjectMutationAttempt::ReturnSendEdit(Ok(outcome)) => send_event(
+                    events,
+                    IdeWorkerEvent::ReturnSendEdited {
+                        revision: outcome.project_revision(),
+                    },
+                ),
                 ProjectMutationAttempt::AddAudioTrack(Err(reason)) => publish_failure(
                     events,
                     IdeWorkerCommandKind::AddAudioTrack,
@@ -9001,6 +9115,11 @@ fn complete_project_mutation(
                     events,
                     IdeWorkerCommandKind::AddRoutingBus,
                     IdeWorkerCommandFailure::RoutingBusCreation(Box::new(reason)),
+                ),
+                ProjectMutationAttempt::ReturnSendEdit(Err(reason)) => publish_failure(
+                    events,
+                    command,
+                    IdeWorkerCommandFailure::ReturnSendEdit(Box::new(reason)),
                 ),
                 ProjectMutationAttempt::RemoveAudioTrack(Ok(outcome)) => send_event(
                     events,
@@ -10099,6 +10218,35 @@ fn attempt_project_mutation(
                     .map_err(|source| IdeRoutingBusCreationError::Publication(Box::new(source)))
             })
         }),
+        ProjectMutation::AddReturnSend {
+            source_track_id,
+            return_track_id,
+        } => ProjectMutationAttempt::ReturnSendEdit(if let Some(failure) = native_failure {
+            Err(IdeReturnSendEditError::NativeClose(failure))
+        } else {
+            RunningDesktopIdeApplication::prepare_return_send_addition(
+                application,
+                recovery,
+                &source_track_id,
+                &return_track_id,
+            )
+            .and_then(|plan| {
+                plan.publish()
+                    .map_err(|source| IdeReturnSendEditError::Publication(Box::new(source)))
+            })
+        }),
+        ProjectMutation::RemoveReturnSend { send_id } => {
+            ProjectMutationAttempt::ReturnSendEdit(if let Some(failure) = native_failure {
+                Err(IdeReturnSendEditError::NativeClose(failure))
+            } else {
+                RunningDesktopIdeApplication::prepare_return_send_removal(application, recovery, &send_id)
+                    .and_then(|plan| {
+                        plan.publish().map_err(|source| {
+                            IdeReturnSendEditError::Publication(Box::new(source))
+                        })
+                    })
+            })
+        }
         ProjectMutation::RemoveAudioTrack { track_id } => {
             ProjectMutationAttempt::RemoveAudioTrack(if let Some(failure) = native_failure {
                 Err(IdeAudioTrackRemovalError::NativeClose(failure))
@@ -11422,6 +11570,38 @@ fn project_mutation_reopen_failure(
         ProjectMutationAttempt::AddRoutingBus(Err(preparation)) => {
             IdeWorkerCommandFailure::RoutingBusCreation(Box::new(
                 IdeRoutingBusCreationError::ReopenAfterPreparation {
+                    preparation: Box::new(preparation),
+                    reopen: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::ReturnSendEdit(Ok(outcome)) => {
+            IdeWorkerCommandFailure::ReturnSendEdit(Box::new(
+                IdeReturnSendEditError::ReopenAfterPublication {
+                    outcome: Box::new(outcome),
+                    source: Box::new(reopen),
+                },
+            ))
+        }
+        ProjectMutationAttempt::ReturnSendEdit(Err(IdeReturnSendEditError::Publication(
+            publication,
+        ))) => IdeWorkerCommandFailure::ReturnSendEdit(Box::new(
+            IdeReturnSendEditError::PublicationAndReopen {
+                publication,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::ReturnSendEdit(Err(IdeReturnSendEditError::NativeClose(
+            close,
+        ))) => IdeWorkerCommandFailure::ReturnSendEdit(Box::new(
+            IdeReturnSendEditError::NativeCloseAndReopen {
+                close,
+                reopen: Box::new(reopen),
+            },
+        )),
+        ProjectMutationAttempt::ReturnSendEdit(Err(preparation)) => {
+            IdeWorkerCommandFailure::ReturnSendEdit(Box::new(
+                IdeReturnSendEditError::ReopenAfterPreparation {
                     preparation: Box::new(preparation),
                     reopen: Box::new(reopen),
                 },
@@ -13167,6 +13347,9 @@ fn running_observation(
         for send_index in 0..snapshot.mixer_send_counts[channel_index] {
             sends.push(IdeMixerSend {
                 id: try_project_owned(snapshot.mixer_send_ids[channel_index][send_index])?,
+                target_track_id: try_project_owned(
+                    snapshot.mixer_send_target_track_ids[channel_index][send_index],
+                )?,
                 target_name: try_project_owned(
                     snapshot.mixer_send_target_names[channel_index][send_index],
                 )?,
@@ -14504,9 +14687,13 @@ mod tests {
         let IdeWorkerEvent::Running(with_return) = recv(&worker) else {
             panic!("the return must reopen from the published project");
         };
-        assert!(with_return.mixer_channels().iter().any(|channel| {
-            channel.kind() == IdeMixerChannelKind::Return && channel.name() == "Verb"
-        }));
+        let return_id = with_return
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Return && channel.name() == "Verb")
+            .expect("the reopened project exposes the created return")
+            .id()
+            .to_owned();
         let source = with_return
             .mixer_channels()
             .iter()
@@ -14519,6 +14706,68 @@ mod tests {
         assert!(matches!(
             recv(&worker),
             IdeWorkerEvent::RoutingBusAdded { revision: 4, .. }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::AddReturnSend {
+                source_track_id: group_id.clone(),
+                return_track_id: return_id,
+            })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Saving));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("return-send addition"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(with_added_send) = recv(&worker) else {
+            panic!("adding the return send must reopen the project");
+        };
+        let send_id = with_added_send
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.id() == group_id)
+            .expect("the group remains present after send addition")
+            .sends()
+            .iter()
+            .find(|send| send.target_name() == "Verb")
+            .expect("the group has the newly authored return send")
+            .id()
+            .to_owned();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ReturnSendEdited { revision: 5 }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::RemoveReturnSend { send_id })
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Saving));
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("return-send removal"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(with_removed_send) = recv(&worker) else {
+            panic!("removing the return send must reopen the project");
+        };
+        assert!(
+            with_removed_send
+                .mixer_channels()
+                .iter()
+                .find(|channel| channel.id() == group_id)
+                .expect("the group remains present after send removal")
+                .sends()
+                .is_empty(),
+            "the exact return send was removed"
+        );
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::ReturnSendEdited { revision: 6 }
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();

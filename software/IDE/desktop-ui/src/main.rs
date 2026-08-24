@@ -42,6 +42,7 @@ use hyper_desktop_ide::{
     MAX_FILTER_CUTOFF_MILLIHERTZ, MAX_FILTER_RESONANCE_MILLIONTHS,
     MIN_FILTER_CUTOFF_MILLIHERTZ, MIN_FILTER_RESONANCE_MILLIONTHS,
     PlaybackRecoveryTransportState, TransportCommand, TransportLoopRange,
+    MAX_IDE_MIXER_SENDS_PER_CHANNEL,
     desktop_ide_application_config,
     ide_audio_clip_gain_is_supported,
 };
@@ -2561,6 +2562,55 @@ fn bind_send_callbacks(ui: &MainWindow, worker: &WorkerCell) {
             })
         });
     });
+
+    let weak = ui.as_weak();
+    let worker_for_add = Rc::clone(worker);
+    actions.on_add_return_send(move |source_track_id, return_track_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui.get_return_send_candidates().iter().any(|candidate| {
+                candidate.source_track_id == source_track_id
+                    && candidate.return_track_id == return_track_id
+            })
+        {
+            ui.set_error_text("The selected return-send route is no longer available".into());
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_add,
+            IdeWorkerCommand::AddReturnSend {
+                source_track_id: source_track_id.to_string(),
+                return_track_id: return_track_id.to_string(),
+            },
+        );
+    });
+
+    let weak = ui.as_weak();
+    let worker_for_remove = Rc::clone(worker);
+    actions.on_remove_return_send(move |send_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || !ui
+                .get_mixer_sends()
+                .iter()
+                .any(|send| send.send_id == send_id)
+        {
+            ui.set_error_text("The selected return send is no longer available".into());
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_remove,
+            IdeWorkerCommand::RemoveReturnSend {
+                send_id: send_id.to_string(),
+            },
+        );
+    });
 }
 
 fn bind_arrangement_callback(
@@ -4238,6 +4288,8 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         | IdeWorkerCommandKind::SaveProjectAs
         | IdeWorkerCommandKind::RenameProject
         | IdeWorkerCommandKind::ReorderAudioTracks
+        | IdeWorkerCommandKind::AddReturnSend
+        | IdeWorkerCommandKind::RemoveReturnSend
         | IdeWorkerCommandKind::AddScene
         | IdeWorkerCommandKind::SetSceneSlot
         | IdeWorkerCommandKind::SetArrangementLoopRange
@@ -4372,6 +4424,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::AddRoutingBus => {
             "Saving mixer state, creating the routing bus, and reopening project…"
+        }
+        IdeWorkerCommandKind::AddReturnSend | IdeWorkerCommandKind::RemoveReturnSend => {
+            "Preserving mixer state, editing the return send, and reopening project…"
         }
         IdeWorkerCommandKind::DuplicateAudioTrack => {
             "Preserving mixer state, duplicating the audio track, and reopening project…"
@@ -4654,6 +4709,10 @@ fn apply_event(
         event @ (IdeWorkerEvent::RoutingBusAdded { .. }
         | IdeWorkerEvent::RoutingBusAdding { .. }) => {
             apply_routing_bus_event(ui, &event);
+        }
+        IdeWorkerEvent::ReturnSendEdited { revision } => {
+            ui.set_status_text(format!("Return send edited in project revision {revision}").into());
+            ui.set_error_text(SharedString::default());
         }
         event @ (IdeWorkerEvent::AudioTrackRemoved { .. } | IdeWorkerEvent::AudioTrackRemoving) => {
             apply_audio_track_removal_event(ui, &event);
@@ -7699,6 +7758,7 @@ fn reset_project(
     ui.set_mixer_sends_visible(false);
     ui.set_mixer_channels(ModelRc::default());
     ui.set_mixer_sends(ModelRc::default());
+    ui.set_return_send_candidates(ModelRc::default());
     reset_native_filter_ui(ui, project_state);
     ui.set_mixer_main_state_available(false);
     ui.set_mixer_main_gain_percent(0.0);
@@ -7857,6 +7917,8 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         IdeWorkerCommandKind::CloseProject if current == AppMode::Closing => AppMode::Running,
         IdeWorkerCommandKind::SaveProject
         | IdeWorkerCommandKind::ReorderAudioTracks
+        | IdeWorkerCommandKind::AddReturnSend
+        | IdeWorkerCommandKind::RemoveReturnSend
         | IdeWorkerCommandKind::AddScene
         | IdeWorkerCommandKind::SetSceneSlot
         | IdeWorkerCommandKind::SetArrangementLoopRange
@@ -8772,6 +8834,7 @@ fn mixer_send_rows(channels: &[IdeMixerChannel]) -> Vec<MixerSendRow> {
                         index: -1,
                         channel_index: i32::try_from(channel_index).unwrap_or(-1),
                         send_index: i32::try_from(send_index).unwrap_or(-1),
+                        send_id: send.id().into(),
                         source_name: channel.name().into(),
                         target_name: send.target_name().into(),
                         tap: match send.tap() {
@@ -8790,6 +8853,33 @@ fn mixer_send_rows(channels: &[IdeMixerChannel]) -> Vec<MixerSendRow> {
         .map(|(index, mut row)| {
             row.index = i32::try_from(index).unwrap_or(-1);
             row
+        })
+        .collect()
+}
+
+fn return_send_candidate_rows(channels: &[IdeMixerChannel]) -> Vec<ReturnSendCandidateRow> {
+    channels
+        .iter()
+        .filter(|source| {
+            matches!(source.kind(), IdeMixerChannelKind::Audio | IdeMixerChannelKind::Group)
+                && source.sends().len() < MAX_IDE_MIXER_SENDS_PER_CHANNEL
+        })
+        .flat_map(|source| {
+            channels
+                .iter()
+                .filter(move |target| {
+                    target.kind() == IdeMixerChannelKind::Return
+                        && !source
+                            .sends()
+                            .iter()
+                            .any(|send| send.target_track_id() == target.id())
+                })
+                .map(move |target| ReturnSendCandidateRow {
+                    source_track_id: source.id().into(),
+                    source_name: source.name().into(),
+                    return_track_id: target.id().into(),
+                    return_name: target.name().into(),
+                })
         })
         .collect()
 }
@@ -10558,6 +10648,9 @@ fn set_mixer(
             channels,
         )))));
     }
+    ui.set_return_send_candidates(ModelRc::from(Rc::new(VecModel::from(
+        return_send_candidate_rows(channels),
+    ))));
 }
 
 fn mixer_sends_unchanged(sends: &ModelRc<MixerSendRow>, channels: &[IdeMixerChannel]) -> bool {
@@ -10583,6 +10676,7 @@ fn mixer_sends_unchanged(sends: &ModelRc<MixerSendRow>, channels: &[IdeMixerChan
             if actual.index != i32::try_from(flat_index).unwrap_or(-1)
                 || actual.channel_index != i32::try_from(channel_index).unwrap_or(-1)
                 || actual.send_index != i32::try_from(send_index).unwrap_or(-1)
+                || actual.send_id.as_str() != expected.id()
                 || actual.source_name.as_str() != channel.name()
                 || actual.target_name.as_str() != expected.target_name()
                 || actual.tap.as_str() != tap
@@ -13694,6 +13788,7 @@ mod tests {
             index: 0,
             channel_index: 2,
             send_index: 1,
+            send_id: "018f47a2-6b2d-7c11-8a44-00112233446a".into(),
             source_name: "Drums".into(),
             target_name: "Reverb".into(),
             tap: "POST-FADER".into(),

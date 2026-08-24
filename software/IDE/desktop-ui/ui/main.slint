@@ -114,6 +114,7 @@ export struct MixerSendRow {
     index: int,
     channel-index: int,
     send-index: int,
+    send-id: string,
     source-name: string,
     target-name: string,
     tap: string,
@@ -121,6 +122,13 @@ export struct MixerSendRow {
     gain-percent: float,
     pan-percent: float,
     enabled: bool,
+}
+
+export struct ReturnSendCandidateRow {
+    source-track-id: string,
+    source-name: string,
+    return-track-id: string,
+    return-name: string,
 }
 
 export struct RoutingBusSourceRow {
@@ -300,6 +308,8 @@ export global IdeActions {
     callback mixer-send-gain(int, float);
     callback mixer-send-pan(int, float);
     callback mixer-send-enabled(int);
+    callback add-return-send(string, string);
+    callback remove-return-send(string);
     callback add-native-filter(int, int, string, string);
     callback update-native-filter(int, bool, int, string, string);
     callback add-native-compressor(int, string, string, string, string, string);
@@ -664,6 +674,7 @@ export component MainWindow inherits Window {
     in property <string> loudness-lra-status: "Waiting for final-output meter evidence";
     in property <[MixerChannelRow]> mixer-channels: [];
     in property <[MixerSendRow]> mixer-sends: [];
+    in property <[ReturnSendCandidateRow]> return-send-candidates: [];
     in property <[NativeDeviceRow]> native-devices: [];
     in property <[string]> native-filter-track-names: [];
     in-out property <bool> native-device-copy-available: false;
@@ -3103,6 +3114,34 @@ export component MainWindow inherits Window {
 
                     Rectangle { height: 1px; background: #27313d; }
 
+                    if root.return-send-candidates.length > 0 : Rectangle {
+                        height: 54px;
+                        background: #0e141b;
+                        border-color: #27313d;
+                        border-width: 1px;
+                        border-radius: 6px;
+                        HorizontalLayout {
+                            padding: 6px;
+                            spacing: 6px;
+                            Text {
+                                width: 92px;
+                                text: "ADD RETURN SEND";
+                                color: #6f8197;
+                                font-size: 8px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            for candidate in root.return-send-candidates : Button {
+                                text: candidate.source-name + " → " + candidate.return-name;
+                                accessible-label: "Add send from " + candidate.source-name + " to " + candidate.return-name;
+                                enabled: root.app-mode == AppMode.running;
+                                clicked => {
+                                    IdeActions.add-return-send(candidate.source-track-id, candidate.return-track-id);
+                                }
+                            }
+                        }
+                    }
+
                     if root.mixer-sends.length == 0 : Text {
                         text: "This compiled mixer has no sends.";
                         color: #8fa0b4;
@@ -3131,6 +3170,13 @@ export component MainWindow inherits Window {
                                     Text { text: send.tap; color: #65758a; font-size: 7px; }
                                 }
                                 Button { width: 48px; text: send.enabled ? "ON" : "OFF"; enabled: root.app-mode == AppMode.running && send.state-available; clicked => { IdeActions.mixer-send-enabled(send.index); } }
+                                Button {
+                                    width: 58px;
+                                    text: "Remove";
+                                    accessible-label: "Remove send from " + send.source-name + " to " + send.target-name;
+                                    enabled: root.app-mode == AppMode.running;
+                                    clicked => { IdeActions.remove-return-send(send.send-id); }
+                                }
                                 VerticalLayout {
                                     horizontal-stretch: 1;
                                     Text { text: "GAIN " + Math.round(send.gain-percent) + "%"; color: #8fa0b4; font-size: 8px; }
