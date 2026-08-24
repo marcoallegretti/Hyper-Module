@@ -431,6 +431,7 @@ pub fn export_prepared_project_track_stems_with_mixer(
     format: OfflineTrackStemExportFormat,
     destination_directory: &Path,
 ) -> Result<OfflineTrackStemExportReport, OfflineExportError> {
+    preflight_track_stem_destination(destination_directory)?;
     let stems = render_prepared_project_track_stems_with_mixer(project, spec, live_mixer)?;
     publish_rendered_track_stems(&stems, format, destination_directory)
 }
@@ -584,18 +585,7 @@ fn publish_rendered_track_stem_files(
         )));
     }
     let (parent_path, destination_name) = stem_destination_parts(destination_directory)?;
-    let parent = open_syncable_directory_ambient(&parent_path)
-        .map_err(OfflineExportError::StemDestination)?;
-    match parent.symlink_metadata(&destination_name) {
-        Ok(_) => {
-            return Err(OfflineExportError::StemDestination(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "stem export destination already exists",
-            )));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(OfflineExportError::StemDestination(error)),
-    }
+    let parent = open_track_stem_destination_parent(&parent_path, &destination_name)?;
 
     let stage_name = format!(".hyper-stem-stage-{}", uuid::Uuid::new_v4());
     let (stage, stage_identity) = create_syncable_directory_at(&parent, &stage_name)
@@ -630,6 +620,28 @@ fn publish_rendered_track_stem_files(
             report: Box::new(report.clone()),
         }
     })
+}
+
+fn preflight_track_stem_destination(destination_directory: &Path) -> Result<(), OfflineExportError> {
+    let (parent_path, destination_name) = stem_destination_parts(destination_directory)?;
+    let _ = open_track_stem_destination_parent(&parent_path, &destination_name)?;
+    Ok(())
+}
+
+fn open_track_stem_destination_parent(
+    parent_path: &Path,
+    destination_name: &str,
+) -> Result<cap_std::fs::Dir, OfflineExportError> {
+    let parent = open_syncable_directory_ambient(parent_path)
+        .map_err(OfflineExportError::StemDestination)?;
+    match parent.symlink_metadata(destination_name) {
+        Ok(_) => Err(OfflineExportError::StemDestination(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "stem export destination already exists",
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(parent),
+        Err(error) => Err(OfflineExportError::StemDestination(error)),
+    }
 }
 
 fn cleanup_stem_stage<T>(
