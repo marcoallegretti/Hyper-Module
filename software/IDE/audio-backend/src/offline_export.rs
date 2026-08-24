@@ -1469,7 +1469,7 @@ mod tests {
     use super::{
         OfflineExportError, OfflineExportSpec, OfflineTrackStem, OfflineTrackStemExportFormat,
         encode_flac_pcm, flac_destination_parts, publish_rendered_flac,
-        publish_rendered_track_stems, quantize_flac_pcm, verify_and_publish_flac,
+        preflight_track_stem_destination, publish_rendered_track_stems, quantize_flac_pcm, verify_and_publish_flac,
         verify_flac_pcm,
     };
     #[cfg(windows)]
@@ -1563,6 +1563,19 @@ mod tests {
         assert!(std::fs::read_dir(directory.path())
             .unwrap()
             .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains("hyper-stem-stage")));
+    }
+
+    #[test]
+    fn stem_export_preflight_refuses_an_existing_destination_before_rendering() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("aligned-stems");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("preserve"), b"existing export").unwrap();
+
+        let refusal = preflight_track_stem_destination(&destination);
+
+        assert!(matches!(refusal, Err(OfflineExportError::StemDestination(error)) if error.kind() == std::io::ErrorKind::AlreadyExists));
+        assert_eq!(std::fs::read(destination.join("preserve")).unwrap(), b"existing export");
     }
 
     #[test]
