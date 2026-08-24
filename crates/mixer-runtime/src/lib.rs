@@ -2941,11 +2941,12 @@ impl<R: TrackWindowRenderer> RoutedMainRuntime<R> {
     }
 
     /// Renders the normal main output while copying a distinct set of compiled
-    /// audio channels into caller-owned buffers at the direct-channel tap.
+    /// mixer channels into caller-owned buffers at the channel-output tap.
     ///
-    /// Each selected channel follows its own automation, device, mute, fader,
-    /// and pan. Taps are taken before sends, groups, returns, and master
-    /// processing. The set must name each compiled channel at most once.
+    /// An audio-channel tap is taken before its sends and downstream routing;
+    /// a group or return tap contains that channel's processed routed input.
+    /// Each selected channel includes its own automation, device, mute, fader,
+    /// and pan. The set must name each compiled channel at most once.
     ///
     /// # Errors
     ///

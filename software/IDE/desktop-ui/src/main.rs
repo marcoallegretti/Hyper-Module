@@ -2103,6 +2103,20 @@ fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
 fn bind_routing_bus_callbacks(ui: &MainWindow, worker: &WorkerCell) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
+    actions.on_begin_routing_bus_creation(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running
+            || ui.get_track_count() >= 8
+            || ui.get_routing_bus_create_visible()
+        {
+            return;
+        }
+        begin_routing_bus_creation(&ui);
+    });
+
+    let weak = ui.as_weak();
     actions.on_toggle_routing_bus_source(move |index| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -7344,6 +7358,23 @@ fn set_routing_bus_sources(ui: &MainWindow, channels: &[IdeMixerChannel]) {
     ui.set_routing_bus_sources(ModelRc::from(Rc::new(VecModel::from(rows))));
 }
 
+fn begin_routing_bus_creation(ui: &MainWindow) {
+    let rows = ui
+        .get_routing_bus_sources()
+        .iter()
+        .map(|mut source| {
+            source.selected = false;
+            source
+        })
+        .collect::<Vec<_>>();
+    ui.set_routing_bus_sources(ModelRc::from(Rc::new(VecModel::from(rows))));
+    ui.set_routing_bus_selected_source_count(0);
+    ui.set_routing_bus_kind_index(0);
+    ui.set_routing_bus_name("Group".into());
+    ui.set_routing_bus_create_visible(true);
+    ui.set_error_text(SharedString::default());
+}
+
 fn reset_native_filter_ui(ui: &MainWindow, project_state: &ProjectUiStateCell) {
     ui.set_native_devices(ModelRc::default());
     ui.set_native_filter_track_names(ModelRc::default());
@@ -11945,6 +11976,47 @@ mod tests {
             .iter()
             .all(|source| !source.selected));
         assert_eq!(ui.get_routing_bus_selected_source_count(), 0);
+    }
+
+    #[test]
+    fn beginning_a_routing_bus_form_clears_previous_source_selection() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = MainWindow::new().unwrap();
+        configure_ui_contracts(&ui);
+        ui.set_app_mode(AppMode::Running);
+        ui.set_track_count(2);
+        ui.set_routing_bus_kind_index(1);
+        ui.set_routing_bus_name("Old return".into());
+        ui.set_routing_bus_sources(ModelRc::from(Rc::new(VecModel::from(vec![
+            RoutingBusSourceRow {
+                index: 0,
+                track_id: "018f47a2-6b2d-7c11-8a44-001122334456".into(),
+                name: "Audio 1".into(),
+                selected: true,
+            },
+        ]))));
+        ui.set_routing_bus_selected_source_count(1);
+        let weak = ui.as_weak();
+        ui.global::<IdeActions>()
+            .on_begin_routing_bus_creation(move || {
+                if let Some(ui) = weak.upgrade() {
+                    begin_routing_bus_creation(&ui);
+                }
+            });
+        ui.show().unwrap();
+        ElementHandle::find_by_accessible_label(&ui, "New routing bus")
+            .next()
+            .expect("the current project exposes routing-bus creation")
+            .mock_single_click(PointerEventButton::Left);
+
+        assert!(ui.get_routing_bus_create_visible());
+        assert_eq!(ui.get_routing_bus_kind_index(), 0);
+        assert_eq!(ui.get_routing_bus_name(), "Group");
+        assert_eq!(ui.get_routing_bus_selected_source_count(), 0);
+        assert!(ui
+            .get_routing_bus_sources()
+            .iter()
+            .all(|source| !source.selected));
     }
 
     #[test]

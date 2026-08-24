@@ -324,6 +324,7 @@ export global IdeActions {
     callback save-project-as(string);
     callback rename-project(string);
     callback add-audio-track(string);
+    callback begin-routing-bus-creation();
     callback add-routing-bus(int, string);
     callback toggle-routing-bus-source(int);
     callback duplicate-audio-track(int, string);
@@ -1316,11 +1317,7 @@ export component MainWindow inherits Window {
                                 if root.app-mode == AppMode.running && root.routing-bus-sources.length > 0 : Button {
                                     text: "New routing bus";
                                     enabled: root.track-count < 8;
-                                    clicked => {
-                                        root.routing-bus-create-visible = true;
-                                        root.routing-bus-kind-index = 0;
-                                        root.routing-bus-name = "Group";
-                                    }
+                                    clicked => { IdeActions.begin-routing-bus-creation(); }
                                 }
                                 Button {
                                     horizontal-stretch: 1;

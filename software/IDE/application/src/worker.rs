@@ -4179,15 +4179,7 @@ fn process_project_mutation_command(
             kind,
             name,
             source_track_ids,
-        } => begin_project_mutation_request(
-            state,
-            events,
-            ProjectMutation::AddRoutingBus {
-                kind,
-                name,
-                source_track_ids,
-            },
-        ),
+        } => add_routing_bus(state, events, kind, name, source_track_ids),
         IdeWorkerCommand::RemoveAudioTrack { track_id } => {
             remove_audio_track(state, events, &track_id)
         }
@@ -5585,6 +5577,43 @@ fn add_audio_track(
         state,
         events,
         ProjectMutation::AddAudioTrack { name: normalized },
+    )
+}
+
+fn add_routing_bus(
+    state: &mut WorkerState,
+    events: &SyncSender<IdeWorkerEvent>,
+    kind: IdeRoutingBusKind,
+    name: String,
+    source_track_ids: Vec<String>,
+) -> bool {
+    let name_length = name.chars().count();
+    if name.trim() != name || !(1..=120).contains(&name_length) {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::AddRoutingBus,
+            IdeWorkerCommandFailure::RoutingBusCreation(Box::new(
+                IdeRoutingBusCreationError::InvalidName,
+            )),
+        );
+    }
+    if source_track_ids.is_empty() {
+        return publish_failure(
+            events,
+            IdeWorkerCommandKind::AddRoutingBus,
+            IdeWorkerCommandFailure::RoutingBusCreation(Box::new(
+                IdeRoutingBusCreationError::EmptySourceSelection,
+            )),
+        );
+    }
+    begin_project_mutation_request(
+        state,
+        events,
+        ProjectMutation::AddRoutingBus {
+            kind,
+            name,
+            source_track_ids,
+        },
     )
 }
 
@@ -17857,6 +17886,61 @@ mod tests {
                 reason: IdeWorkerCommandFailure::AudioTrackAddition(reason),
             } if matches!(reason.as_ref(), IdeAudioTrackAdditionError::InvalidName)
         ));
+        worker
+            .try_send(IdeWorkerCommand::Transport(TransportCommand::Stop))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::TransportQueued(TransportCommand::Stop)
+        ));
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+    }
+
+    #[test]
+    fn routing_bus_addition_validates_input_before_changing_running_state() {
+        let running = RunningDesktopIdeApplication {
+            application: closed_application(),
+            session: IdePlaybackSessionOwner::Test(TestPlaybackSession::default()),
+        };
+        let worker = DesktopIdeWorker::start_state(WorkerState::Running(running), 2, 3).unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::Observe,
+                reason: IdeWorkerCommandFailure::ProjectSnapshotUnavailable,
+            }
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::AddRoutingBus {
+                kind: IdeRoutingBusKind::Group,
+                name: " Invalid ".to_owned(),
+                source_track_ids: vec!["018f47a2-6b2d-7c11-8a44-001122334456".to_owned()],
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::AddRoutingBus,
+                reason: IdeWorkerCommandFailure::RoutingBusCreation(reason),
+            } if matches!(reason.as_ref(), IdeRoutingBusCreationError::InvalidName)
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::AddRoutingBus {
+                kind: IdeRoutingBusKind::Return,
+                name: "Verb".to_owned(),
+                source_track_ids: Vec::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::CommandFailed {
+                command: IdeWorkerCommandKind::AddRoutingBus,
+                reason: IdeWorkerCommandFailure::RoutingBusCreation(reason),
+            } if matches!(reason.as_ref(), IdeRoutingBusCreationError::EmptySourceSelection)
+        ));
+
         worker
             .try_send(IdeWorkerCommand::Transport(TransportCommand::Stop))
             .unwrap();

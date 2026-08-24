@@ -46,12 +46,12 @@ pub struct OfflineExportSpec {
     pub block_frames: usize,
 }
 
-/// One aligned direct audio-track render from a verified project.
+/// One aligned mixer-channel render from a verified project.
 ///
-/// `audio` includes the track's device chain, automation, mute, fader, and
-/// pan. It deliberately excludes sends, groups, returns, and master
-/// processing, so every stem is independently usable while remaining aligned
-/// to the project extent.
+/// For an audio channel, `audio` includes its device chain, automation, mute,
+/// fader, and pan before sends, groups, returns, and master processing. For a
+/// group or return channel, it is that channel's processed routed output at
+/// the same mixer tap. Every stem remains aligned to the project extent.
 pub struct OfflineTrackStem {
     pub track_id: String,
     pub track_name: String,
@@ -149,7 +149,7 @@ impl fmt::Display for OfflineExportError {
             }
             Self::StemTrackMetadataUnavailable { channel_index } => write!(
                 formatter,
-                "compiled audio channel {channel_index} has no verified track metadata"
+                "compiled mixer channel {channel_index} has no verified track metadata"
             ),
             Self::NoMixerStems => {
                 formatter.write_str("this project has no mixer channels to export as stems")
