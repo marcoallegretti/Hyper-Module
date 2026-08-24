@@ -22,7 +22,7 @@ use hyper_fs_authority::remove_file_if_identity;
 use hyper_media_cache::PreparePlaybackError;
 use hyper_mixer_runtime::{
     RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError, RuntimeProcessError,
-    TransportCommand, TransportState,
+    TrackWindowRenderer, TransportCommand, TransportState,
 };
 use hyper_native_device::DeviceChain;
 use hyper_playback_compiler::graph::GraphLimits;
@@ -790,33 +790,27 @@ fn render_project_track_stems_with_devices(
         .map_err(|_| OfflineExportError::CapacityUnavailable)?;
     channel_indices.extend(stems.iter().map(|stem| stem.channel_index));
 
-    let mut rendered = 0_usize;
-    while rendered < end_frame {
-        let frames = block_frames.min(end_frame - rendered);
-        let block_end = rendered
-            .checked_add(frames)
-            .ok_or(OfflineExportError::CapacityUnavailable)?;
-        runtime
-            .process_window_with_channel_tap_sink(
-                rendered,
-                &mut scratch,
-                StereoOutput {
-                    left: &mut main_left[..frames],
-                    right: &mut main_right[..frames],
-                },
-                &channel_indices,
-                |channel_index, left, right| {
-                    let stem = stems
-                        .iter_mut()
-                        .find(|stem| stem.channel_index == channel_index)
-                        .expect("the runtime emits only the prevalidated selected channels");
-                    stem.left[rendered..block_end].copy_from_slice(left);
-                    stem.right[rendered..block_end].copy_from_slice(right);
-                },
-            )
-            .map_err(OfflineExportError::Process)?;
-        rendered = block_end;
-    }
+    render_selected_track_stem_windows(
+        &mut runtime,
+        &mut scratch,
+        &mut main_left,
+        &mut main_right,
+        &channel_indices,
+        end_frame,
+        block_frames,
+        |start_frame, channel_index, left, right| {
+            let stem = stems
+                .iter_mut()
+                .find(|stem| stem.channel_index == channel_index)
+                .expect("the runtime emits only the prevalidated selected channels");
+            let end_frame = start_frame
+                .checked_add(left.len())
+                .expect("the bounded renderer prevalidated the export extent");
+            stem.left[start_frame..end_frame].copy_from_slice(left);
+            stem.right[start_frame..end_frame].copy_from_slice(right);
+            Ok(())
+        },
+    )?;
 
     let mut output = Vec::new();
     output
@@ -831,6 +825,50 @@ fn render_project_track_stems_with_devices(
         });
     }
     Ok(output)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one bounded renderer owns the shared runtime and scratch state for every stem sink"
+)]
+fn render_selected_track_stem_windows<R: TrackWindowRenderer>(
+    runtime: &mut RoutedMainRuntime<R>,
+    scratch: &mut [RenderScratchSlot<'_>],
+    main_left: &mut [f32],
+    main_right: &mut [f32],
+    channel_indices: &[usize],
+    end_frame: usize,
+    block_frames: usize,
+    mut sink: impl FnMut(usize, usize, &[f32], &[f32]) -> Result<(), OfflineExportError>,
+) -> Result<(), OfflineExportError> {
+    let mut rendered = 0_usize;
+    while rendered < end_frame {
+        let frames = block_frames.min(end_frame - rendered);
+        let mut sink_error = None;
+        runtime
+            .process_window_with_channel_tap_sink(
+                rendered,
+                scratch,
+                StereoOutput {
+                    left: &mut main_left[..frames],
+                    right: &mut main_right[..frames],
+                },
+                channel_indices,
+                |channel_index, left, right| {
+                    if sink_error.is_none() {
+                        sink_error = sink(rendered, channel_index, left, right).err();
+                    }
+                },
+            )
+            .map_err(OfflineExportError::Process)?;
+        if let Some(error) = sink_error {
+            return Err(error);
+        }
+        rendered = rendered
+            .checked_add(frames)
+            .ok_or(OfflineExportError::CapacityUnavailable)?;
+    }
+    Ok(())
 }
 
 fn same_mixer_layout(
