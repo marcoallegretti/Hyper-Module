@@ -14365,6 +14365,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker scenario proves the complete group and return creation lifecycle, including reopened routing observations"
+    )]
     fn routing_buses_are_created_and_reopened_through_the_real_worker() {
         let fixture = std::env::temp_dir().join(format!(
             "hyper-desktop-ide-routing-bus-{}",
@@ -16231,7 +16235,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one real-worker scenario keeps import, placement, persisted device edit, and both exported signals at the actual composition boundary"
+        reason = "one real-worker scenario keeps import, routed group/return stem export, persisted device edit, and both exported signals at the actual composition boundary"
     )]
     fn real_worker_offline_export_renders_the_saved_native_filter() {
         let fixture = std::env::temp_dir().join(format!(
@@ -16315,6 +16319,66 @@ mod tests {
             "unexpected placement result for {placed:?}: {placement_result:?}"
         );
 
+        worker
+            .try_send(IdeWorkerCommand::AddRoutingBus {
+                kind: IdeRoutingBusKind::Group,
+                name: "Drums".to_owned(),
+                source_track_ids: vec![track_id.clone()],
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusAdding {
+                kind: IdeRoutingBusKind::Group
+            }
+        ));
+        let IdeWorkerEvent::Running(with_group) = recv(&worker) else {
+            panic!("the group routing edit must reopen before export");
+        };
+        let group_id = with_group
+            .mixer_channels()
+            .iter()
+            .find(|channel| {
+                channel.kind() == IdeMixerChannelKind::Group && channel.name() == "Drums"
+            })
+            .expect("the reopened project exposes the routed group")
+            .id()
+            .to_owned();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusAdded { track_id: observed, .. } if observed == group_id
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::AddRoutingBus {
+                kind: IdeRoutingBusKind::Return,
+                name: "Verb".to_owned(),
+                source_track_ids: vec![track_id.clone()],
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusAdding {
+                kind: IdeRoutingBusKind::Return
+            }
+        ));
+        let IdeWorkerEvent::Running(with_return) = recv(&worker) else {
+            panic!("the return routing edit must reopen before export");
+        };
+        let return_id = with_return
+            .mixer_channels()
+            .iter()
+            .find(|channel| {
+                channel.kind() == IdeMixerChannelKind::Return && channel.name() == "Verb"
+            })
+            .expect("the reopened project exposes the routed return")
+            .id()
+            .to_owned();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusAdded { track_id: observed, .. } if observed == return_id
+        ));
+
         let baseline_path = fixture.join("baseline.wav");
         worker
             .try_send(IdeWorkerCommand::ExportProject {
@@ -16359,8 +16423,31 @@ mod tests {
             panic!("unexpected stem export result: {stem_export:?}");
         };
         assert_eq!(report.frame_count, 500);
-        assert_eq!(report.files.len(), 1);
-        let stem_path = stem_directory.join(&report.files[0].file_name);
+        assert_eq!(report.files.len(), 3);
+        let stem_path = stem_directory.join(
+            &report
+                .files
+                .iter()
+                .find(|file| file.track_id == track_id)
+                .expect("the source track remains an exported stem")
+                .file_name,
+        );
+        let group_stem_path = stem_directory.join(
+            &report
+                .files
+                .iter()
+                .find(|file| file.track_id == group_id && file.track_name == "Drums")
+                .expect("the processed group is an exported stem")
+                .file_name,
+        );
+        let return_stem_path = stem_directory.join(
+            &report
+                .files
+                .iter()
+                .find(|file| file.track_id == return_id && file.track_name == "Verb")
+                .expect("the processed return is an exported stem")
+                .file_name,
+        );
         let stem = decode_bytes(
             std::fs::read(stem_path).unwrap(),
             AudioContainer::Wav,
@@ -16446,9 +16533,40 @@ mod tests {
             decode_limits,
         )
         .unwrap();
+        let group_stem = decode_bytes(
+            std::fs::read(group_stem_path).unwrap(),
+            AudioContainer::Wav,
+            48_000,
+            decode_limits,
+        )
+        .unwrap();
+        let return_stem = decode_bytes(
+            std::fs::read(return_stem_path).unwrap(),
+            AudioContainer::Wav,
+            48_000,
+            decode_limits,
+        )
+        .unwrap();
         assert_eq!(baseline.frame_count(), 500);
         assert_eq!(filtered.frame_count(), baseline.frame_count());
         assert_eq!(flac.frame_count(), baseline.frame_count());
+        assert_eq!(group_stem.frame_count(), baseline.frame_count());
+        assert_eq!(return_stem.frame_count(), baseline.frame_count());
+        assert_eq!(group_stem.plane(0), stem.plane(0));
+        assert_eq!(group_stem.plane(1), stem.plane(1));
+        assert_eq!(return_stem.plane(0), stem.plane(0));
+        assert_eq!(return_stem.plane(1), stem.plane(1));
+        for (((&main, &group), &returned), &source) in baseline
+            .plane(0)
+            .unwrap()
+            .iter()
+            .zip(group_stem.plane(0).unwrap())
+            .zip(return_stem.plane(0).unwrap())
+            .zip(stem.plane(0).unwrap())
+        {
+            assert!((main - (group + returned)).abs() <= f32::EPSILON);
+            assert!((source - group).abs() <= f32::EPSILON);
+        }
         for (&wav, &lossless) in baseline.plane(0).unwrap().iter().zip(flac.plane(0).unwrap()) {
             assert!(
                 (wav - lossless).abs() <= 1.5 / 8_388_607.0,

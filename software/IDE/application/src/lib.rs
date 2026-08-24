@@ -10383,8 +10383,12 @@ impl RunningDesktopIdeApplication {
         Ok(report)
     }
 
-    /// Renders every audio track to one newly activated directory of aligned
+    /// Renders every mixer channel to one newly activated directory of aligned
     /// WAV or FLAC stems.
+    ///
+    /// Audio tracks are exported from their direct channel outputs. Groups and
+    /// returns are exported from their routed, processed bus outputs before
+    /// their onward routing.
     ///
     /// This shares the live mixer snapshot used by a full-mix export, but it
     /// does not alter project state or take a project-mutation fence: the

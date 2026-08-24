@@ -9881,18 +9881,18 @@ fn apply_track_stem_export_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::ProjectStemExporting => {
             ui.set_app_mode(AppMode::ExportingProject);
-            ui.set_status_text("Rendering aligned track stems through the playback runtime…".into());
+            ui.set_status_text("Rendering aligned mixer stems through the playback runtime…".into());
         }
         IdeWorkerEvent::ProjectStemsExported { report } => {
             ui.set_app_mode(AppMode::Running);
             ui.set_export_summary(track_stem_export_summary(report).into());
-            ui.set_status_text("Track stems exported".into());
+            ui.set_status_text("Mixer stems exported".into());
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::ProjectStemsExportedWithWarning { report, warning } => {
             ui.set_app_mode(AppMode::Running);
             ui.set_export_summary(track_stem_export_summary(report).into());
-            ui.set_status_text("Track stems exported, but filesystem durability needs attention".into());
+            ui.set_status_text("Mixer stems exported, but filesystem durability needs attention".into());
             ui.set_error_text(warning.to_string().into());
         }
         _ => unreachable!("track-stem export event dispatcher received another event"),
@@ -11187,13 +11187,13 @@ mod tests {
 
         let wav = ElementHandle::find_by_accessible_label(
             &ui,
-            "Export every audio track as aligned WAV stems",
+            "Export every mixer channel as aligned WAV stems",
         )
         .next()
         .expect("the WAV-stem action is visible for a running verified project");
         let flac = ElementHandle::find_by_accessible_label(
             &ui,
-            "Export every audio track as aligned FLAC stems",
+            "Export every mixer channel as aligned FLAC stems",
         )
         .next()
         .expect("the FLAC-stem action is visible for a running verified project");

@@ -27,7 +27,7 @@ use hyper_mixer_runtime::{
 use hyper_native_device::DeviceChain;
 use hyper_playback_compiler::graph::GraphLimits;
 use hyper_playback_compiler::scene::SceneLimits;
-use hyper_playback_json::{AdapterCompileError, CompiledMixerGraph, CompiledMixerTrackKind};
+use hyper_playback_json::{AdapterCompileError, CompiledMixerGraph};
 use hyper_playback_session::{PlaybackExtent, PreparedPlaybackSession};
 use hyper_project_loader::PreparedProjectPlayback;
 use hyper_recording_journal::{JournalConfig, JournalError, JournalWriter};
@@ -111,7 +111,7 @@ pub enum OfflineExportError {
     Loudness(StereoLoudnessError),
     MixerLayoutMismatch,
     StemTrackMetadataUnavailable { channel_index: usize },
-    NoAudioTrackStems,
+    NoMixerStems,
     Destination(std::io::Error),
     StemDestination(std::io::Error),
     StemPublicationCommittedWithWarning {
@@ -151,8 +151,8 @@ impl fmt::Display for OfflineExportError {
                 formatter,
                 "compiled audio channel {channel_index} has no verified track metadata"
             ),
-            Self::NoAudioTrackStems => {
-                formatter.write_str("this project has no audio tracks to export as stems")
+            Self::NoMixerStems => {
+                formatter.write_str("this project has no mixer channels to export as stems")
             }
             Self::Destination(source) => {
                 write!(formatter, "the export destination is unusable: {source}")
@@ -193,7 +193,7 @@ impl Error for OfflineExportError {
             | Self::CapacityUnavailable
             | Self::MixerLayoutMismatch
             | Self::StemTrackMetadataUnavailable { .. }
-            | Self::NoAudioTrackStems
+            | Self::NoMixerStems
             | Self::FlacEncoding(_)
             | Self::FlacVerification
             | Self::FlacMinimumFrames => None,
@@ -367,7 +367,11 @@ fn render_project_offline_with_devices(
         .map_err(OfflineExportError::Output)
 }
 
-/// Renders every compiled audio track as an aligned direct stem.
+/// Renders every compiled mixer channel as an aligned stem.
+///
+/// Audio-track stems are direct channel outputs. Group and return stems contain
+/// the routed, processed bus output at that channel's output point, before it
+/// is forwarded to a downstream group or the main output.
 ///
 /// This uses one routed render pass per block and captures every selected
 /// channel after its device and channel controls. Consequently stateful native
@@ -385,8 +389,8 @@ pub fn render_project_track_stems_with_mixer(
     render_project_track_stems_with_devices(session, &[], spec, live_mixer)
 }
 
-/// Renders every compiled audio track of a structurally verified project as an
-/// aligned direct stem, including its verified native device chains.
+/// Renders every compiled mixer channel of a structurally verified project as
+/// an aligned stem, including its verified native device chains.
 ///
 /// # Errors
 ///
@@ -405,7 +409,7 @@ pub fn render_prepared_project_track_stems_with_mixer(
     )
 }
 
-/// Renders every verified audio track and publishes the complete aligned set
+/// Renders every verified mixer channel and publishes the complete aligned set
 /// into one new destination directory.
 ///
 /// The destination itself must be absent. Each file is streamed into a private
@@ -437,7 +441,7 @@ pub fn export_prepared_project_track_stems_with_mixer(
     )
 }
 
-/// Streams every direct track stem into a private destination stage.
+/// Streams every compiled mixer-channel stem into a private destination stage.
 ///
 /// Unlike the explicitly in-memory stem-rendering API, this path retains only
 /// the renderer scratch, codec block state, and one buffered writer per track.
@@ -594,12 +598,12 @@ fn publish_rendered_track_stems(
     let files = describe_track_stem_files(stems, format)?;
     let frame_count = stems
         .first()
-        .ok_or(OfflineExportError::NoAudioTrackStems)?
+        .ok_or(OfflineExportError::NoMixerStems)?
         .audio
         .frame_count();
     let sample_rate_hz = stems
         .first()
-        .ok_or(OfflineExportError::NoAudioTrackStems)?
+        .ok_or(OfflineExportError::NoMixerStems)?
         .audio
         .sample_rate_hz();
     if stems.iter().any(|stem| {
@@ -627,7 +631,7 @@ fn describe_track_stem_files(
     format: OfflineTrackStemExportFormat,
 ) -> Result<Vec<OfflineTrackStemExportFile>, OfflineExportError> {
     if stems.is_empty() {
-        return Err(OfflineExportError::NoAudioTrackStems);
+        return Err(OfflineExportError::NoMixerStems);
     }
     let mut files = Vec::new();
     files
@@ -1145,9 +1149,6 @@ fn select_stem_descriptors(
         .try_reserve_exact(mixer.slots().len())
         .map_err(|_| OfflineExportError::CapacityUnavailable)?;
     for (channel_index, slot) in mixer.slots().iter().enumerate() {
-        if slot.kind() != CompiledMixerTrackKind::Audio {
-            continue;
-        }
         let track_name = session
             .mixer_channel_name_at(channel_index)
             .ok_or(OfflineExportError::StemTrackMetadataUnavailable { channel_index })?;
@@ -1158,7 +1159,7 @@ fn select_stem_descriptors(
         });
     }
     if stems.is_empty() {
-        return Err(OfflineExportError::NoAudioTrackStems);
+        return Err(OfflineExportError::NoMixerStems);
     }
     Ok(stems)
 }
@@ -1170,7 +1171,7 @@ fn track_stem_export_report(
     format: OfflineTrackStemExportFormat,
 ) -> Result<OfflineTrackStemExportReport, OfflineExportError> {
     if stems.is_empty() {
-        return Err(OfflineExportError::NoAudioTrackStems);
+        return Err(OfflineExportError::NoMixerStems);
     }
     let mut files = Vec::new();
     files

@@ -1471,13 +1471,13 @@ export component MainWindow inherits Window {
                         if !root.new-project-visible && !root.new-track-visible : Button {
                             text: root.app-mode == AppMode.exporting-project ? "Exporting…" : "Export WAV stems";
                             enabled: root.app-mode == AppMode.running && root.export-available;
-                            accessible-label: "Export every audio track as aligned WAV stems";
+                            accessible-label: "Export every mixer channel as aligned WAV stems";
                             clicked => { IdeActions.export-track-stems(false); }
                         }
                         if !root.new-project-visible && !root.new-track-visible : Button {
                             text: root.app-mode == AppMode.exporting-project ? "Exporting…" : "Export FLAC stems";
                             enabled: root.app-mode == AppMode.running && root.export-available;
-                            accessible-label: "Export every audio track as aligned FLAC stems";
+                            accessible-label: "Export every mixer channel as aligned FLAC stems";
                             clicked => { IdeActions.export-track-stems(true); }
                         }
                         if root.export-summary != "" : Text {
