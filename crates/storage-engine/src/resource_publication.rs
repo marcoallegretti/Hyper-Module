@@ -229,6 +229,71 @@ pub struct AudioTrackPublicationRequest<'a> {
     pub mixer_bytes: &'a [u8],
 }
 
+/// The routing effect a new bus must prove in its candidate mixer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutingBusPublicationKind {
+    Group,
+    Return,
+}
+
+/// One canonical routing-bus resource and the complete mixer rewrite it
+/// authorizes. Selected sources and return-send identities are retained in the
+/// durable transaction record for recovery verification.
+#[derive(Clone, Copy, Debug)]
+pub struct RoutingBusPublicationRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub track_id: &'a str,
+    pub track_bytes: &'a [u8],
+    pub mixer_id: &'a str,
+    pub mixer_bytes: &'a [u8],
+    pub kind: RoutingBusPublicationKind,
+    pub source_track_ids: &'a [&'a str],
+    pub send_ids: &'a [&'a str],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrackAdditionPublicationRequest<'a> {
+    expected_project_sha256: [u8; 32],
+    track_id: &'a str,
+    track_bytes: &'a [u8],
+    mixer_id: &'a str,
+    mixer_bytes: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TrackAdditionPublicationContract<'a> {
+    Audio,
+    Routing {
+        kind: RoutingBusPublicationKind,
+        source_track_ids: &'a [String],
+        send_ids: &'a [String],
+    },
+}
+
+impl<'a> From<AudioTrackPublicationRequest<'a>> for TrackAdditionPublicationRequest<'a> {
+    fn from(request: AudioTrackPublicationRequest<'a>) -> Self {
+        Self {
+            expected_project_sha256: request.expected_project_sha256,
+            track_id: request.track_id,
+            track_bytes: request.track_bytes,
+            mixer_id: request.mixer_id,
+            mixer_bytes: request.mixer_bytes,
+        }
+    }
+}
+
+impl<'a> From<RoutingBusPublicationRequest<'a>> for TrackAdditionPublicationRequest<'a> {
+    fn from(request: RoutingBusPublicationRequest<'a>) -> Self {
+        Self {
+            expected_project_sha256: request.expected_project_sha256,
+            track_id: request.track_id,
+            track_bytes: request.track_bytes,
+            mixer_id: request.mixer_id,
+            mixer_bytes: request.mixer_bytes,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct AudioTrackRemovalRequest<'a> {
     pub expected_project_sha256: [u8; 32],
@@ -470,12 +535,112 @@ struct AudioTrackTransactionRecord {
     track: TransactionFile,
     mixer: TransactionFile,
     previous_mixer: TransactionFile,
+    #[serde(default, skip_serializing_if = "AudioTrackTransactionContract::is_audio")]
+    contract: AudioTrackTransactionContract,
     #[serde(
         default,
         skip_serializing_if = "AudioTrackTransactionOperation::is_publication"
     )]
     operation: AudioTrackTransactionOperation,
     extensions: serde_json::Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum AudioTrackTransactionContract {
+    #[default]
+    Audio,
+    RoutingGroup {
+        source_track_ids: Vec<String>,
+    },
+    RoutingReturn {
+        source_track_ids: Vec<String>,
+        send_ids: Vec<String>,
+    },
+}
+
+impl AudioTrackTransactionContract {
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde skip_serializing_if requires a shared-reference predicate"
+    )]
+    const fn is_audio(&self) -> bool {
+        matches!(self, Self::Audio)
+    }
+
+    fn publication_contract(&self) -> TrackAdditionPublicationContract<'_> {
+        match self {
+            Self::Audio => TrackAdditionPublicationContract::Audio,
+            Self::RoutingGroup { source_track_ids } => TrackAdditionPublicationContract::Routing {
+                kind: RoutingBusPublicationKind::Group,
+                source_track_ids,
+                send_ids: &[],
+            },
+            Self::RoutingReturn {
+                source_track_ids,
+                send_ids,
+            } => TrackAdditionPublicationContract::Routing {
+                kind: RoutingBusPublicationKind::Return,
+                source_track_ids,
+                send_ids,
+            },
+        }
+    }
+
+    fn is_valid(&self, operation: AudioTrackTransactionOperation) -> bool {
+        match self {
+            Self::Audio => true,
+            Self::RoutingGroup { source_track_ids } => {
+                operation == AudioTrackTransactionOperation::Publication
+                    && source_track_ids_are_valid(source_track_ids)
+            }
+            Self::RoutingReturn {
+                source_track_ids,
+                send_ids,
+            } => {
+                operation == AudioTrackTransactionOperation::Publication
+                    && source_track_ids_are_valid(source_track_ids)
+                    && send_ids.len() == source_track_ids.len()
+                    && send_ids_are_valid(send_ids)
+            }
+        }
+    }
+}
+
+fn source_track_ids_are_valid(source_track_ids: &[String]) -> bool {
+    !source_track_ids.is_empty()
+        && source_track_ids.len() <= MAX_ENTRIES
+        && source_track_ids.iter().all(|id| is_valid_entity_id(id))
+        && source_track_ids.iter().collect::<BTreeSet<_>>().len() == source_track_ids.len()
+}
+
+fn send_ids_are_valid(send_ids: &[String]) -> bool {
+    send_ids.len() <= MAX_ENTRIES
+        && send_ids.iter().all(|id| is_valid_entity_id(id))
+        && send_ids.iter().collect::<BTreeSet<_>>().len() == send_ids.len()
+}
+
+fn transaction_contract(
+    contract: TrackAdditionPublicationContract<'_>,
+) -> AudioTrackTransactionContract {
+    match contract {
+        TrackAdditionPublicationContract::Audio => AudioTrackTransactionContract::Audio,
+        TrackAdditionPublicationContract::Routing {
+            kind: RoutingBusPublicationKind::Group,
+            source_track_ids,
+            ..
+        } => AudioTrackTransactionContract::RoutingGroup {
+            source_track_ids: source_track_ids.to_vec(),
+        },
+        TrackAdditionPublicationContract::Routing {
+            kind: RoutingBusPublicationKind::Return,
+            source_track_ids,
+            send_ids,
+        } => AudioTrackTransactionContract::RoutingReturn {
+            source_track_ids: source_track_ids.to_vec(),
+            send_ids: send_ids.to_vec(),
+        },
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -784,6 +949,40 @@ pub fn publish_audio_track(
     publish_audio_track_observed(project_path.as_ref(), request, |_, _| Ok(()))
 }
 
+/// Publishes one usable group or return bus and its complete mixer routing
+/// rewrite through the same serialized, recoverable manifest-last transaction
+/// family as audio-track creation.
+///
+/// # Errors
+///
+/// Returns a classified validation, conflict, integrity, I/O, or recovery
+/// error. The request is rejected unless its candidate mixer contains exactly
+/// the routing transformation described by `kind`, `source_track_ids`, and
+/// `send_ids`.
+pub fn publish_routing_bus(
+    project_path: impl AsRef<Path>,
+    request: RoutingBusPublicationRequest<'_>,
+) -> Result<AudioTrackPublicationOutcome, ProjectResourcePublicationError> {
+    let source_track_ids = request
+        .source_track_ids
+        .iter()
+        .map(|id| (*id).to_owned())
+        .collect::<Vec<_>>();
+    let send_ids = request
+        .send_ids
+        .iter()
+        .map(|id| (*id).to_owned())
+        .collect::<Vec<_>>();
+    let contract = TrackAdditionPublicationContract::Routing {
+        kind: request.kind,
+        source_track_ids: &source_track_ids,
+        send_ids: &send_ids,
+    };
+    publish_track_addition_observed(project_path.as_ref(), request.into(), contract, |_, _| {
+        Ok(())
+    })
+}
+
 /// Removes one empty audio-track resource and its mixer channel through the
 /// same serialized, recoverable manifest-last transaction family used for
 /// publication.
@@ -885,7 +1084,28 @@ fn publish_audio_track_observed(
         &Path,
     ) -> Result<(), ProjectResourcePublicationError>,
 ) -> Result<AudioTrackPublicationOutcome, ProjectResourcePublicationError> {
-    validate_audio_track_documents(request)?;
+    publish_track_addition_observed(
+        project_path,
+        request.into(),
+        TrackAdditionPublicationContract::Audio,
+        &mut observer,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the coordinator keeps lock, recovery, staging, and disposition ordering visible as one fail-closed operation"
+)]
+fn publish_track_addition_observed(
+    project_path: &Path,
+    request: TrackAdditionPublicationRequest<'_>,
+    contract: TrackAdditionPublicationContract<'_>,
+    mut observer: impl FnMut(
+        AudioTrackPublicationPhase,
+        &Path,
+    ) -> Result<(), ProjectResourcePublicationError>,
+) -> Result<AudioTrackPublicationOutcome, ProjectResourcePublicationError> {
+    validate_track_addition_documents(request)?;
     let verified = verify_project_package(project_path).map_err(|error| {
         caused(
             ProjectResourcePublicationErrorKind::Integrity,
@@ -900,7 +1120,7 @@ fn publish_audio_track_observed(
         ));
     }
     let track_path = format!("tracks/{}.json", request.track_id);
-    reject_audio_track_collisions(&verified, request, &track_path)?;
+    reject_track_addition_collisions(&verified, request, &track_path)?;
     let mixer_descriptor = unique_resource(&verified, request.mixer_id, ResourceRole::Mixer)?;
     let previous_mixer = verified.read_resource(request.mixer_id).map_err(|error| {
         caused(
@@ -915,8 +1135,10 @@ fn publish_audio_track_observed(
             "audio-track publication does not add a mixer channel",
         ));
     }
-    validate_audio_track_document_identity(
+    validate_track_addition_document_identity(
         request,
+        contract,
+        Some(&verified),
         verified.manifest().project_id(),
         &previous_mixer,
     )?;
@@ -967,7 +1189,7 @@ fn publish_audio_track_observed(
             )
         })?;
     let candidate_project =
-        candidate_audio_track_manifest(&active_project, request, &track_path, next_revision)?;
+        candidate_track_addition_manifest(&active_project, request, &track_path, next_revision)?;
     let transaction_name = format!("{AUDIO_TRACK_TRANSACTION_PREFIX}{}", Uuid::new_v4());
     backups.create_dir(&transaction_name).map_err(|error| {
         caused(
@@ -992,6 +1214,7 @@ fn publish_audio_track_observed(
         &transaction,
         &transaction_name,
         request,
+        contract,
         mixer_descriptor.path(),
         &track_path,
         &previous_mixer,
@@ -2104,7 +2327,8 @@ fn run_audio_track_publication(
     backups: &Dir,
     transaction: &Dir,
     transaction_name: &str,
-    request: AudioTrackPublicationRequest<'_>,
+    request: TrackAdditionPublicationRequest<'_>,
+    contract: TrackAdditionPublicationContract<'_>,
     mixer_path: &str,
     track_path: &str,
     previous_mixer: &[u8],
@@ -2151,6 +2375,7 @@ fn run_audio_track_publication(
             byte_length: previous_mixer.len() as u64,
             sha256: hex_digest(digest(previous_mixer)),
         },
+        contract: transaction_contract(contract),
         operation: AudioTrackTransactionOperation::Publication,
         extensions: serde_json::Map::new(),
     };
@@ -2287,6 +2512,7 @@ fn run_audio_track_removal(
             byte_length: previous_mixer.len() as u64,
             sha256: hex_digest(digest(previous_mixer)),
         },
+        contract: AudioTrackTransactionContract::Audio,
         operation: AudioTrackTransactionOperation::Removal,
         extensions: serde_json::Map::new(),
     };
@@ -2505,8 +2731,8 @@ fn run_track_order_publication(
     track_order_outcome(&tx)
 }
 
-fn validate_audio_track_documents(
-    request: AudioTrackPublicationRequest<'_>,
+fn validate_track_addition_documents(
+    request: TrackAdditionPublicationRequest<'_>,
 ) -> Result<(), ProjectResourcePublicationError> {
     validate_canonical_resource(request.track_bytes)?;
     validate_canonical_resource(request.mixer_bytes)?;
@@ -2806,6 +3032,338 @@ fn inspect_addition_destination(
     }
 }
 
+fn validate_track_addition_document_identity(
+    request: TrackAdditionPublicationRequest<'_>,
+    contract: TrackAdditionPublicationContract<'_>,
+    verified: Option<&StructurallyVerifiedProject>,
+    project_id: &str,
+    previous_mixer: &[u8],
+) -> Result<(), ProjectResourcePublicationError> {
+    match contract {
+        TrackAdditionPublicationContract::Audio => validate_audio_track_document_identity(
+            AudioTrackPublicationRequest {
+                expected_project_sha256: request.expected_project_sha256,
+                track_id: request.track_id,
+                track_bytes: request.track_bytes,
+                mixer_id: request.mixer_id,
+                mixer_bytes: request.mixer_bytes,
+            },
+            project_id,
+            previous_mixer,
+        ),
+        TrackAdditionPublicationContract::Routing {
+            kind,
+            source_track_ids,
+            send_ids,
+        } => validate_routing_bus_document_identity(
+            request,
+            kind,
+            source_track_ids,
+            send_ids,
+            verified,
+            project_id,
+            previous_mixer,
+        ),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the persistence boundary proves the exact source-to-bus graph before it stages any filesystem changes"
+)]
+fn validate_routing_bus_document_identity(
+    request: TrackAdditionPublicationRequest<'_>,
+    kind: RoutingBusPublicationKind,
+    source_track_ids: &[String],
+    send_ids: &[String],
+    verified: Option<&StructurallyVerifiedProject>,
+    project_id: &str,
+    previous_mixer: &[u8],
+) -> Result<(), ProjectResourcePublicationError> {
+    let track: Value = serde_json::from_slice(request.track_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse new routing-bus resource",
+            error,
+        )
+    })?;
+    let mixer: Value = serde_json::from_slice(request.mixer_bytes).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "parse candidate routing-bus mixer",
+            error,
+        )
+    })?;
+    let previous: Value = serde_json::from_slice(previous_mixer).map_err(|error| {
+        caused(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "parse current mixer resource",
+            error,
+        )
+    })?;
+    let track_kind = match kind {
+        RoutingBusPublicationKind::Group => "group",
+        RoutingBusPublicationKind::Return => "return",
+    };
+    if track["format"].as_str() != Some("hyper-track")
+        || track["format_version"].as_u64() != Some(1)
+        || track["id"].as_str() != Some(request.track_id)
+        || track["project_id"].as_str() != Some(project_id)
+        || track["kind"].as_str() != Some(track_kind)
+        || track["active"].as_bool() != Some(true)
+        || track["clip_ids"].as_array().is_none_or(|clips| !clips.is_empty())
+        || mixer["format"].as_str() != Some("hyper-mixer")
+        || mixer["format_version"].as_u64() != Some(1)
+        || mixer["id"].as_str() != Some(request.mixer_id)
+        || mixer["project_id"].as_str() != Some(project_id)
+        || previous["format"].as_str() != Some("hyper-mixer")
+        || previous["format_version"].as_u64() != Some(1)
+        || previous["id"].as_str() != Some(request.mixer_id)
+        || previous["project_id"].as_str() != Some(project_id)
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "routing-bus resources do not match the active project",
+        ));
+    }
+    let mut sources = BTreeSet::new();
+    if source_track_ids.is_empty()
+        || source_track_ids
+            .iter()
+            .any(|id| !is_valid_entity_id(id) || !sources.insert(id.as_str()))
+        || (kind == RoutingBusPublicationKind::Group && !send_ids.is_empty())
+        || (kind == RoutingBusPublicationKind::Return
+            && (send_ids.len() != source_track_ids.len()
+                || send_ids
+                    .iter()
+                    .any(|id| !is_valid_entity_id(id))))
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "routing-bus source or send identities are invalid",
+        ));
+    }
+    if let Some(verified) = verified {
+        if kind == RoutingBusPublicationKind::Return
+            && send_ids.iter().any(|send_id| {
+                send_id == project_id
+                    || verified
+                        .manifest()
+                        .resources()
+                        .iter()
+                        .any(|resource| resource.id() == send_id)
+                    || verified
+                        .manifest()
+                        .assets()
+                        .iter()
+                        .any(|asset| asset.id() == send_id)
+            })
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::InvalidResource,
+                "routing-bus send identity conflicts with active project content",
+            ));
+        }
+        for source_track_id in &sources {
+            let descriptor = unique_resource(verified, source_track_id, ResourceRole::Track)?;
+            let source = verified.read_resource(descriptor.id()).map_err(|error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "read routing-bus source track",
+                    error,
+                )
+            })?;
+            let source: Value = serde_json::from_slice(&source).map_err(|error| {
+                caused(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "parse routing-bus source track",
+                    error,
+                )
+            })?;
+            if source["kind"].as_str() != Some("audio")
+                || source["active"].as_bool() != Some(true)
+            {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::InvalidResource,
+                    "routing-bus sources must be active audio tracks",
+                ));
+            }
+        }
+    }
+    let previous_channels = previous["channels"].as_array().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "current mixer channel collection is invalid",
+        )
+    })?;
+    let mut expected = previous.clone();
+    if previous_channels.len().checked_add(1) != Some(
+        mixer["channels"]
+            .as_array()
+            .map_or(usize::MAX, Vec::len),
+    ) {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "routing-bus candidate must append exactly one matching channel",
+        ));
+    }
+
+    match kind {
+        RoutingBusPublicationKind::Group => {
+            let expected_channels = expected["channels"].as_array_mut().ok_or_else(|| {
+                failure(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "current mixer channel collection changed during validation",
+                )
+            })?;
+            let mut matched = BTreeSet::new();
+            for channel in expected_channels.iter_mut().filter(|channel| {
+                channel["track_id"]
+                    .as_str()
+                    .is_some_and(|track_id| sources.contains(track_id))
+            }) {
+                matched.insert(
+                    channel["track_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                channel["destination"] = serde_json::json!({"kind": "track", "track_id": request.track_id});
+            }
+            if sources.iter().any(|source| !matched.contains(*source)) {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::InvalidResource,
+                    "routing-bus source channel is missing",
+                ));
+            }
+        }
+        RoutingBusPublicationKind::Return => {
+            let return_bus = {
+                let return_buses = expected["return_buses"].as_array().ok_or_else(|| {
+                    failure(
+                        ProjectResourcePublicationErrorKind::Integrity,
+                        "current mixer return buses are invalid",
+                    )
+                })?;
+                let used_buses = return_buses
+                    .iter()
+                    .map(|entry| entry["bus"].as_str())
+                    .collect::<Option<BTreeSet<_>>>()
+                    .ok_or_else(|| {
+                        failure(
+                            ProjectResourcePublicationErrorKind::Integrity,
+                            "current mixer return bus identity is invalid",
+                        )
+                    })?;
+                ["a", "b"]
+                    .into_iter()
+                    .find(|bus| !used_buses.contains(bus))
+                    .ok_or_else(|| {
+                        failure(
+                            ProjectResourcePublicationErrorKind::InvalidResource,
+                            "routing-bus candidate has no available return bus",
+                        )
+                    })?
+            };
+            let expected_channels = expected["channels"].as_array_mut().ok_or_else(|| {
+                failure(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "current mixer channel collection changed during validation",
+                )
+            })?;
+            let mut all_send_ids = BTreeSet::new();
+            for channel in expected_channels.iter() {
+                for send in channel["sends"].as_array().ok_or_else(|| {
+                    failure(
+                        ProjectResourcePublicationErrorKind::Integrity,
+                        "current mixer sends are invalid",
+                    )
+                })? {
+                    let id = send["id"].as_str().ok_or_else(|| {
+                        failure(
+                            ProjectResourcePublicationErrorKind::Integrity,
+                            "current mixer send identity is invalid",
+                        )
+                    })?;
+                    all_send_ids.insert(id);
+                }
+            }
+            if send_ids.iter().any(|id| {
+                id == request.track_id
+                    || id == project_id
+                    || !all_send_ids.insert(id)
+            }) {
+                return Err(failure(
+                    ProjectResourcePublicationErrorKind::InvalidResource,
+                    "routing-bus send identity conflicts with the active mixer",
+                ));
+            }
+            for (source_track_id, send_id) in source_track_ids.iter().zip(send_ids) {
+                let channel = expected_channels
+                    .iter_mut()
+                    .find(|channel| channel["track_id"].as_str() == Some(source_track_id))
+                    .ok_or_else(|| {
+                        failure(
+                            ProjectResourcePublicationErrorKind::InvalidResource,
+                            "routing-bus source channel is missing",
+                        )
+                    })?;
+                let sends = channel["sends"].as_array_mut().ok_or_else(|| {
+                    failure(
+                        ProjectResourcePublicationErrorKind::Integrity,
+                        "current mixer sends are invalid",
+                    )
+                })?;
+                if sends.len() >= 2 {
+                    return Err(failure(
+                        ProjectResourcePublicationErrorKind::InvalidResource,
+                        "routing-bus source has no remaining send capacity",
+                    ));
+                }
+                sends.push(serde_json::json!({
+                    "id": send_id,
+                    "bus": return_bus,
+                    "tap": "post-fader",
+                    "gain_millionths": 1_000_000,
+                    "pan_millionths": 0,
+                    "enabled": true
+                }));
+                sends.sort_by_key(|entry| entry["bus"].as_str().unwrap_or_default().to_owned());
+            }
+            let return_buses = expected["return_buses"].as_array_mut().ok_or_else(|| {
+                failure(
+                    ProjectResourcePublicationErrorKind::Integrity,
+                    "current mixer return buses changed during validation",
+                )
+            })?;
+            return_buses.push(serde_json::json!({"bus": return_bus, "track_id": request.track_id}));
+            return_buses.sort_by_key(|entry| entry["bus"].as_str().unwrap_or_default().to_owned());
+        }
+    }
+    expected["channels"].as_array_mut().ok_or_else(|| {
+        failure(
+            ProjectResourcePublicationErrorKind::Integrity,
+            "current mixer channel collection changed during validation",
+        )
+    })?.push(serde_json::json!({
+        "track_id": request.track_id,
+        "gain_millionths": 1_000_000,
+        "pan_millionths": 0,
+        "mute": false,
+        "solo": false,
+        "destination": {"kind": "main"},
+        "sends": []
+    }));
+    if expected != mixer {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::InvalidResource,
+            "routing-bus candidate contains changes outside its declared routing operation",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_audio_track_document_identity(
     request: AudioTrackPublicationRequest<'_>,
     project_id: &str,
@@ -3020,9 +3578,9 @@ fn validate_audio_track_removal_documents(
     Ok(())
 }
 
-fn reject_audio_track_collisions(
+fn reject_track_addition_collisions(
     verified: &StructurallyVerifiedProject,
-    request: AudioTrackPublicationRequest<'_>,
+    request: TrackAdditionPublicationRequest<'_>,
     track_path: &str,
 ) -> Result<(), ProjectResourcePublicationError> {
     if verified
@@ -3061,9 +3619,9 @@ fn reject_published_track_path(
     }
 }
 
-fn candidate_audio_track_manifest(
+fn candidate_track_addition_manifest(
     active: &[u8],
-    request: AudioTrackPublicationRequest<'_>,
+    request: TrackAdditionPublicationRequest<'_>,
     track_path: &str,
     revision: u64,
 ) -> Result<Vec<u8>, ProjectResourcePublicationError> {
@@ -4125,7 +4683,7 @@ fn recover_audio_track_transaction(
     transaction: &Dir,
     tx: &AudioTrackTransactionRecord,
 ) -> Result<AudioTrackPublicationRecoveryDisposition, ProjectResourcePublicationError> {
-    validate_staged_audio_track_transaction(transaction, tx)?;
+    validate_staged_audio_track_transaction(root, transaction, tx)?;
     let before = decode_digest(&tx.before_project_sha256)?;
     let after = decode_digest(&tx.after_project_sha256)?;
     let active = match read_bounded(root, MANIFEST_NAME, MAX_JSON_BYTES) {
@@ -4731,6 +5289,7 @@ fn remove_published_audio_track(
     reason = "recovery validates the complete transaction graph before permitting any filesystem mutation"
 )]
 fn validate_staged_audio_track_transaction(
+    root: &Dir,
     transaction: &Dir,
     tx: &AudioTrackTransactionRecord,
 ) -> Result<(), ProjectResourcePublicationError> {
@@ -4794,6 +5353,7 @@ fn validate_staged_audio_track_transaction(
             "audio-track transaction project revisions are inconsistent",
         ));
     }
+    validate_recovered_routing_bus_sources(root, &previous_manifest, tx)?;
     let previous_mixer_descriptor = manifest_resource(&previous_manifest, &tx.mixer_id)?;
     let candidate_mixer_descriptor = manifest_resource(&candidate_manifest, &tx.mixer_id)?;
     if previous_mixer_descriptor.role() != ResourceRole::Mixer
@@ -4831,9 +5391,9 @@ fn validate_staged_audio_track_transaction(
                     "published audio-track descriptor does not match the transaction",
                 ));
             }
-            candidate_audio_track_manifest(
+            candidate_track_addition_manifest(
                 &previous_project,
-                AudioTrackPublicationRequest {
+                TrackAdditionPublicationRequest {
                     expected_project_sha256: digest(&previous_project),
                     track_id: &tx.track_id,
                     track_bytes: &track,
@@ -4880,14 +5440,16 @@ fn validate_staged_audio_track_transaction(
         ));
     }
     match tx.operation {
-        AudioTrackTransactionOperation::Publication => validate_audio_track_document_identity(
-            AudioTrackPublicationRequest {
+        AudioTrackTransactionOperation::Publication => validate_track_addition_document_identity(
+            TrackAdditionPublicationRequest {
                 expected_project_sha256: digest(&previous_project),
                 track_id: &tx.track_id,
                 track_bytes: &track,
                 mixer_id: &tx.mixer_id,
                 mixer_bytes: &mixer,
             },
+            tx.contract.publication_contract(),
+            None,
             previous_manifest.project_id(),
             &previous_mixer,
         ),
@@ -4902,6 +5464,73 @@ fn validate_staged_audio_track_transaction(
             &previous_mixer,
         ),
     }
+}
+
+fn validate_recovered_routing_bus_sources(
+    root: &Dir,
+    previous_manifest: &ProjectManifest,
+    tx: &AudioTrackTransactionRecord,
+) -> Result<(), ProjectResourcePublicationError> {
+    let source_track_ids = match &tx.contract {
+        AudioTrackTransactionContract::Audio => return Ok(()),
+        AudioTrackTransactionContract::RoutingGroup { source_track_ids }
+        | AudioTrackTransactionContract::RoutingReturn {
+            source_track_ids, ..
+        } => source_track_ids,
+    };
+    if let AudioTrackTransactionContract::RoutingReturn { send_ids, .. } = &tx.contract
+        && send_ids.iter().any(|send_id| {
+            send_id == previous_manifest.project_id()
+                || previous_manifest
+                    .resources()
+                    .iter()
+                    .any(|resource| resource.id() == send_id)
+                || previous_manifest
+                    .assets()
+                    .iter()
+                    .any(|asset| asset.id() == send_id)
+        })
+    {
+        return Err(failure(
+            ProjectResourcePublicationErrorKind::Recovery,
+            "routing-bus transaction send identity conflicts with the previous project",
+        ));
+    }
+    for source_track_id in source_track_ids {
+        let descriptor = manifest_resource(previous_manifest, source_track_id)?;
+        if descriptor.role() != ResourceRole::Track {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "routing-bus transaction source is not a track",
+            ));
+        }
+        let parent = open_relative_parent(root, descriptor.path())?;
+        let source = read_bounded(&parent, file_name(descriptor.path())?, MAX_JSON_BYTES)?;
+        if source.len() as u64 != descriptor.byte_length()
+            || hex_digest(digest(&source)) != descriptor.sha256()
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "routing-bus transaction source track changed",
+            ));
+        }
+        let source: Value = serde_json::from_slice(&source).map_err(|error| {
+            caused(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "parse routing-bus transaction source track",
+                error,
+            )
+        })?;
+        if source["kind"].as_str() != Some("audio")
+            || source["active"].as_bool() != Some(true)
+        {
+            return Err(failure(
+                ProjectResourcePublicationErrorKind::Recovery,
+                "routing-bus transaction source is not an active audio track",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn read_audio_track_transaction(
@@ -4941,6 +5570,7 @@ fn read_audio_track_transaction(
         }
         || tx.format_version != 1
         || !tx.extensions.is_empty()
+        || !tx.contract.is_valid(tx.operation)
         || tx.id != expected_id
         || tx.track_id.is_empty()
         || tx.mixer_id.is_empty()
@@ -6728,7 +7358,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
@@ -6743,6 +7373,9 @@ mod tests {
     const AUTOMATION_LANE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334481";
     const DEVICE_CHAIN_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334482";
     const DEVICE_INSTANCE_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334483";
+    const GROUP_BUS_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334484";
+    const RETURN_BUS_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334485";
+    const RETURN_SEND_ID: &str = "018f47a2-6b2d-7c11-8a44-001122334486";
 
     struct Fixture {
         root: PathBuf,
@@ -7075,6 +7708,123 @@ mod tests {
         )
         .unwrap();
         (identity, documents)
+    }
+
+    fn prepared_routing_bus_documents(
+        fixture: &AudioTrackFixture,
+        kind: hyper_playback_json::RoutingBusKind,
+        track_id: &str,
+        send_id: Option<&str>,
+    ) -> (
+        [u8; 32],
+        String,
+        hyper_playback_json::RoutingBusCreationDocuments,
+    ) {
+        use hyper_playback_json::{
+            LoaderLimits, PlaybackJsonInput, load as load_playback,
+            serialize_routing_bus_creation,
+        };
+
+        let package = verify_project_package(&fixture.root).unwrap();
+        let identity = *package.manifest_sha256();
+        let timeline = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|resource| resource.role() == ResourceRole::Timeline)
+            .map(|resource| package.read_resource(resource.id()).unwrap())
+            .unwrap();
+        let track_descriptors: Vec<_> = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|resource| resource.role() == ResourceRole::Track)
+            .collect();
+        let track_ids: Vec<_> = track_descriptors
+            .iter()
+            .map(|resource| resource.id().to_owned())
+            .collect();
+        let tracks: Vec<_> = track_descriptors
+            .iter()
+            .map(|resource| package.read_resource(resource.id()).unwrap())
+            .collect();
+        let track_slices: Vec<_> = tracks.iter().map(Vec::as_slice).collect();
+        let project = load_playback(
+            PlaybackJsonInput {
+                project_id: package.manifest().project_id(),
+                sample_rate_hz: package.manifest().sample_rate_hz(),
+                timeline: &timeline,
+                tracks: &track_slices,
+                clips: &[],
+                scenes: &[],
+                arrangement: None,
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let source_track_id = track_ids[0].clone();
+        let source_track_ids = [source_track_id.as_str()];
+        let no_send_ids: [&str; 0] = [];
+        let return_send_ids = [send_id.unwrap_or_default()];
+        let mixer = package.read_resource(&fixture.mixer_id).unwrap();
+        let documents = serialize_routing_bus_creation(
+            &project,
+            &[],
+            &mixer,
+            &fixture.mixer_id,
+            kind,
+            track_id,
+            if kind == hyper_playback_json::RoutingBusKind::Group {
+                "Group"
+            } else {
+                "Return"
+            },
+            &source_track_ids,
+            if kind == hyper_playback_json::RoutingBusKind::Group {
+                &no_send_ids
+            } else {
+                &return_send_ids
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        (identity, source_track_id, documents)
+    }
+
+    fn assert_active_mixer_loads(root: &Path, mixer_id: &str) {
+        use hyper_playback_json::{LoaderLimits, PlaybackJsonInput, load as load_playback};
+
+        let package = verify_project_package(root).unwrap();
+        let timeline = package
+            .manifest()
+            .resources()
+            .iter()
+            .find(|resource| resource.role() == ResourceRole::Timeline)
+            .map(|resource| package.read_resource(resource.id()).unwrap())
+            .unwrap();
+        let tracks: Vec<_> = package
+            .manifest()
+            .resources()
+            .iter()
+            .filter(|resource| resource.role() == ResourceRole::Track)
+            .map(|resource| package.read_resource(resource.id()).unwrap())
+            .collect();
+        let track_slices: Vec<_> = tracks.iter().map(Vec::as_slice).collect();
+        let project = load_playback(
+            PlaybackJsonInput {
+                project_id: package.manifest().project_id(),
+                sample_rate_hz: package.manifest().sample_rate_hz(),
+                timeline: &timeline,
+                tracks: &track_slices,
+                clips: &[],
+                scenes: &[],
+                arrangement: None,
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer = package.read_resource(mixer_id).unwrap();
+        project.load_mixer(&mixer, &[], LoaderLimits::VERSION_1).unwrap();
     }
 
     struct ArrangementFixture {
@@ -8821,6 +9571,182 @@ mod tests {
             .unwrap();
         assert_eq!(track.role(), ResourceRole::Track);
         assert_eq!(fixture.transaction_count(), 0);
+    }
+
+    #[test]
+    fn publishes_complete_group_and_return_routing_buses_atomically() {
+        let group_fixture = AudioTrackFixture::new();
+        let (identity, source_track_id, documents) = prepared_routing_bus_documents(
+            &group_fixture,
+            hyper_playback_json::RoutingBusKind::Group,
+            GROUP_BUS_ID,
+            None,
+        );
+        let source_track_ids = [source_track_id.as_str()];
+        let no_send_ids: [&str; 0] = [];
+        let group = publish_routing_bus(
+            &group_fixture.root,
+            RoutingBusPublicationRequest {
+                expected_project_sha256: identity,
+                track_id: GROUP_BUS_ID,
+                track_bytes: documents.track(),
+                mixer_id: &group_fixture.mixer_id,
+                mixer_bytes: documents.mixer(),
+                kind: RoutingBusPublicationKind::Group,
+                source_track_ids: &source_track_ids,
+                send_ids: &no_send_ids,
+            },
+        )
+        .unwrap();
+        assert_eq!(group.project_revision(), 2);
+        let group_mixer: Value = serde_json::from_slice(
+            &verify_project_package(&group_fixture.root)
+                .unwrap()
+                .read_resource(&group_fixture.mixer_id)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            group_mixer["channels"][0]["destination"],
+            json!({"kind":"track", "track_id":GROUP_BUS_ID})
+        );
+        assert_active_mixer_loads(&group_fixture.root, &group_fixture.mixer_id);
+
+        let return_fixture = AudioTrackFixture::new();
+        let (identity, source_track_id, documents) = prepared_routing_bus_documents(
+            &return_fixture,
+            hyper_playback_json::RoutingBusKind::Return,
+            RETURN_BUS_ID,
+            Some(RETURN_SEND_ID),
+        );
+        let source_track_ids = [source_track_id.as_str()];
+        let send_ids = [RETURN_SEND_ID];
+        let returned = publish_routing_bus(
+            &return_fixture.root,
+            RoutingBusPublicationRequest {
+                expected_project_sha256: identity,
+                track_id: RETURN_BUS_ID,
+                track_bytes: documents.track(),
+                mixer_id: &return_fixture.mixer_id,
+                mixer_bytes: documents.mixer(),
+                kind: RoutingBusPublicationKind::Return,
+                source_track_ids: &source_track_ids,
+                send_ids: &send_ids,
+            },
+        )
+        .unwrap();
+        assert_eq!(returned.project_revision(), 2);
+        let return_mixer: Value = serde_json::from_slice(
+            &verify_project_package(&return_fixture.root)
+                .unwrap()
+                .read_resource(&return_fixture.mixer_id)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            return_mixer["return_buses"],
+            json!([{"bus":"a", "track_id":RETURN_BUS_ID}])
+        );
+        assert_eq!(return_mixer["channels"][0]["sends"][0]["id"], RETURN_SEND_ID);
+        assert_active_mixer_loads(&return_fixture.root, &return_fixture.mixer_id);
+    }
+
+    #[test]
+    fn group_routing_bus_crash_recovery_preserves_one_complete_project_identity() {
+        for crash_phase in [
+            AudioTrackPublicationPhase::Transaction,
+            AudioTrackPublicationPhase::Track,
+            AudioTrackPublicationPhase::Mixer,
+            AudioTrackPublicationPhase::Manifest,
+        ] {
+            let fixture = AudioTrackFixture::new();
+            let (identity, source_track_id, documents) = prepared_routing_bus_documents(
+                &fixture,
+                hyper_playback_json::RoutingBusKind::Group,
+                GROUP_BUS_ID,
+                None,
+            );
+            let source_track_ids = vec![source_track_id];
+            let no_send_ids = Vec::new();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = publish_track_addition_observed(
+                    &fixture.root,
+                    TrackAdditionPublicationRequest {
+                        expected_project_sha256: identity,
+                        track_id: GROUP_BUS_ID,
+                        track_bytes: documents.track(),
+                        mixer_id: &fixture.mixer_id,
+                        mixer_bytes: documents.mixer(),
+                    },
+                    TrackAdditionPublicationContract::Routing {
+                        kind: RoutingBusPublicationKind::Group,
+                        source_track_ids: &source_track_ids,
+                        send_ids: &no_send_ids,
+                    },
+                    |phase, _| {
+                        assert_ne!(phase, crash_phase, "simulated process crash");
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(result.is_err());
+
+            let recovered = recover_audio_track_publications(&fixture.root).unwrap();
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(
+                recovered[0].disposition(),
+                if crash_phase == AudioTrackPublicationPhase::Manifest {
+                    AudioTrackPublicationRecoveryDisposition::Committed
+                } else {
+                    AudioTrackPublicationRecoveryDisposition::RolledBack
+                }
+            );
+            let package = verify_project_package(&fixture.root).unwrap();
+            if crash_phase == AudioTrackPublicationPhase::Manifest {
+                assert_active_mixer_loads(&fixture.root, &fixture.mixer_id);
+                assert!(package
+                    .manifest()
+                    .resources()
+                    .iter()
+                    .any(|resource| resource.id() == GROUP_BUS_ID));
+            } else {
+                assert_eq!(*package.manifest_sha256(), identity);
+            }
+        }
+    }
+
+    #[test]
+    fn routing_bus_rejects_mixer_changes_outside_its_declared_graph() {
+        let fixture = AudioTrackFixture::new();
+        let (identity, source_track_id, documents) = prepared_routing_bus_documents(
+            &fixture,
+            hyper_playback_json::RoutingBusKind::Group,
+            GROUP_BUS_ID,
+            None,
+        );
+        let mut mixer: Value = serde_json::from_slice(documents.mixer()).unwrap();
+        mixer["main"]["mute"] = true.into();
+        let mixer = serde_json_canonicalizer::to_vec(&mixer).unwrap();
+        let source_track_ids = [source_track_id.as_str()];
+        let no_send_ids: [&str; 0] = [];
+
+        let error = publish_routing_bus(
+            &fixture.root,
+            RoutingBusPublicationRequest {
+                expected_project_sha256: identity,
+                track_id: GROUP_BUS_ID,
+                track_bytes: documents.track(),
+                mixer_id: &fixture.mixer_id,
+                mixer_bytes: &mixer,
+                kind: RoutingBusPublicationKind::Group,
+                source_track_ids: &source_track_ids,
+                send_ids: &no_send_ids,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ProjectResourcePublicationErrorKind::InvalidResource);
+        assert_eq!(fixture.transaction_count(), 0);
+        assert_eq!(*verify_project_package(&fixture.root).unwrap().manifest_sha256(), identity);
     }
 
     #[test]

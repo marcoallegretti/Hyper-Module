@@ -582,6 +582,25 @@ pub struct AudioTrackAdditionDocuments {
     mixer: Vec<u8>,
 }
 
+/// The two explicit routing objects that version 1 can create from selected
+/// audio sources.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutingBusKind {
+    Group,
+    Return,
+}
+
+/// Canonical version-1 resources required to create one usable routing bus.
+///
+/// The mixer includes the new channel and every selected source change, so a
+/// storage caller never needs to infer a partial routing mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutingBusCreationDocuments {
+    track: Vec<u8>,
+    mixer: Vec<u8>,
+    kind: RoutingBusKind,
+}
+
 /// One canonical track replacement produced by an audio-track reorder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioTrackReorderDocument {
@@ -709,6 +728,28 @@ impl AudioTrackAdditionDocuments {
     }
 }
 
+impl RoutingBusCreationDocuments {
+    #[must_use]
+    pub fn track(&self) -> &[u8] {
+        &self.track
+    }
+
+    #[must_use]
+    pub fn mixer(&self) -> &[u8] {
+        &self.mixer
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> RoutingBusKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, Vec<u8>, RoutingBusKind) {
+        (self.track, self.mixer, self.kind)
+    }
+}
+
 impl AudioTrackReorderDocument {
     #[must_use]
     pub fn track_id(&self) -> &str {
@@ -745,6 +786,25 @@ pub enum AudioTrackAdditionSerializationError {
     InvalidTrackIdentity,
     MixerIdentityMismatch,
     InvalidTrackName,
+    InvalidDocumentShape,
+    Serialization(serde_json::Error),
+}
+
+#[derive(Debug)]
+pub enum RoutingBusCreationSerializationError {
+    Source(LoadError),
+    TrackCapacity,
+    InvalidTrackIdentity,
+    InvalidTrackName,
+    MixerIdentityMismatch,
+    EmptySourceSelection,
+    DuplicateSourceTrack,
+    SourceTrackMissing,
+    SourceTrackNotAudio,
+    SourceSendCapacity,
+    ReturnBusUnavailable,
+    SendIdentityCountMismatch,
+    InvalidSendIdentity,
     InvalidDocumentShape,
     Serialization(serde_json::Error),
 }
@@ -1614,6 +1674,76 @@ impl Error for AudioTrackAdditionSerializationError {
     }
 }
 
+impl fmt::Display for RoutingBusCreationSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => source.fmt(formatter),
+            Self::TrackCapacity => {
+                formatter.write_str("the version-1 project cannot append another routing bus")
+            }
+            Self::InvalidTrackIdentity => {
+                formatter.write_str("the new routing-bus identity is invalid or already in use")
+            }
+            Self::InvalidTrackName => {
+                formatter.write_str("the new routing-bus name is outside the version-1 domain")
+            }
+            Self::MixerIdentityMismatch => {
+                formatter.write_str("source mixer identity does not match the routing-bus request")
+            }
+            Self::EmptySourceSelection => {
+                formatter.write_str("a routing bus needs at least one selected source track")
+            }
+            Self::DuplicateSourceTrack => {
+                formatter.write_str("a routing-bus source track was selected more than once")
+            }
+            Self::SourceTrackMissing => {
+                formatter.write_str("a selected routing-bus source track is not present")
+            }
+            Self::SourceTrackNotAudio => {
+                formatter.write_str("a selected routing-bus source track is not an audio track")
+            }
+            Self::SourceSendCapacity => {
+                formatter.write_str("a selected source track cannot contain another return send")
+            }
+            Self::ReturnBusUnavailable => {
+                formatter.write_str("the project has no available version-1 return bus")
+            }
+            Self::SendIdentityCountMismatch => {
+                formatter.write_str("the return-bus request does not provide one send identity per source")
+            }
+            Self::InvalidSendIdentity => {
+                formatter.write_str("a return-send identity is invalid or already in use")
+            }
+            Self::InvalidDocumentShape => {
+                formatter.write_str("source mixer shape changed after typed validation")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for RoutingBusCreationSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::TrackCapacity
+            | Self::InvalidTrackIdentity
+            | Self::InvalidTrackName
+            | Self::MixerIdentityMismatch
+            | Self::EmptySourceSelection
+            | Self::DuplicateSourceTrack
+            | Self::SourceTrackMissing
+            | Self::SourceTrackNotAudio
+            | Self::SourceSendCapacity
+            | Self::ReturnBusUnavailable
+            | Self::SendIdentityCountMismatch
+            | Self::InvalidSendIdentity
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
 impl fmt::Display for AudioClipAdditionSerializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2239,6 +2369,237 @@ pub fn serialize_audio_track_addition(
         .load_mixer(&mixer, assets, limits)
         .map_err(AudioTrackAdditionSerializationError::Source)?;
     Ok(AudioTrackAdditionDocuments { track, mixer })
+}
+
+/// Builds and validates the canonical track and mixer documents for one
+/// complete group or return routing operation.
+///
+/// A group reroutes every selected audio source to the new group. A return
+/// allocates one unused version-1 return bus and adds one unity post-fader send
+/// from every selected audio source. Neither operation can create a detached
+/// channel that has no source signal.
+///
+/// # Errors
+///
+/// Returns a classified rejection for malformed authority, invalid identities,
+/// an empty or unsupported source selection, unavailable return buses or send
+/// capacity, or a candidate mixer that cannot resolve against the extended
+/// project.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the routing operation binds every selected source, new identity, and candidate mixer in one authority boundary"
+)]
+pub fn serialize_routing_bus_creation(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_mixer: &[u8],
+    mixer_id: &str,
+    kind: RoutingBusKind,
+    track_id: &str,
+    track_name: &str,
+    source_track_ids: &[&str],
+    send_ids: &[&str],
+    limits: LoaderLimits,
+) -> Result<RoutingBusCreationDocuments, RoutingBusCreationSerializationError> {
+    let next_order = project
+        .tracks
+        .iter()
+        .map(|track| track.order)
+        .max()
+        .map_or(Some(0), |order| order.checked_add(1))
+        .filter(|order| *order <= 7)
+        .ok_or(RoutingBusCreationSerializationError::TrackCapacity)?;
+    if project.tracks.len() >= limits.max_track_documents {
+        return Err(RoutingBusCreationSerializationError::TrackCapacity);
+    }
+    let name_length = track_name.chars().count();
+    if track_name.trim() != track_name
+        || !(1..=MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length)
+    {
+        return Err(RoutingBusCreationSerializationError::InvalidTrackName);
+    }
+    if !is_valid_entity_id(track_id)
+        || track_id == project.project_id
+        || project_contains_identity(project, track_id)
+        || assets.iter().any(|asset| asset.id == track_id)
+    {
+        return Err(RoutingBusCreationSerializationError::InvalidTrackIdentity);
+    }
+    if source_track_ids.is_empty() {
+        return Err(RoutingBusCreationSerializationError::EmptySourceSelection);
+    }
+
+    let loaded_mixer = project
+        .load_mixer(source_mixer, assets, limits)
+        .map_err(RoutingBusCreationSerializationError::Source)?;
+    if loaded_mixer.id() != mixer_id {
+        return Err(RoutingBusCreationSerializationError::MixerIdentityMismatch);
+    }
+
+    let mut selected = BTreeSet::new();
+    for source_track_id in source_track_ids {
+        if !selected.insert(*source_track_id) {
+            return Err(RoutingBusCreationSerializationError::DuplicateSourceTrack);
+        }
+        let Some(source) = project.tracks.iter().find(|track| track.id == *source_track_id) else {
+            return Err(RoutingBusCreationSerializationError::SourceTrackMissing);
+        };
+        if source.kind != TrackKind::Audio {
+            return Err(RoutingBusCreationSerializationError::SourceTrackNotAudio);
+        }
+    }
+
+    if (kind == RoutingBusKind::Group && !send_ids.is_empty())
+        || (kind == RoutingBusKind::Return && send_ids.len() != source_track_ids.len())
+    {
+        return Err(RoutingBusCreationSerializationError::SendIdentityCountMismatch);
+    }
+
+    let track_kind = match kind {
+        RoutingBusKind::Group => "group",
+        RoutingBusKind::Return => "return",
+    };
+    let track = serde_json_canonicalizer::to_vec(&json!({
+        "format": "hyper-track",
+        "format_version": 1,
+        "id": track_id,
+        "project_id": project.project_id,
+        "name": track_name,
+        "kind": track_kind,
+        "order": next_order,
+        "active": true,
+        "clip_ids": [],
+        "extensions": {}
+    }))
+    .map_err(RoutingBusCreationSerializationError::Serialization)?;
+    let added = load_track(
+        &track,
+        project.tracks.len(),
+        &project.project_id,
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(RoutingBusCreationSerializationError::Source)?;
+    let mut extended = project.clone();
+    extended
+        .tracks
+        .try_reserve(1)
+        .map_err(|_| RoutingBusCreationSerializationError::Source(capacity_error()))?;
+    extended.tracks.push(added);
+    validate_track_hierarchy(&extended.tracks)
+        .map_err(RoutingBusCreationSerializationError::Source)?;
+    validate_loaded_identities(&extended).map_err(RoutingBusCreationSerializationError::Source)?;
+
+    let mut mixer_value: Value = serde_json::from_slice(source_mixer)
+        .map_err(RoutingBusCreationSerializationError::Serialization)?;
+    if kind == RoutingBusKind::Return {
+        let mut existing_send_ids = BTreeSet::new();
+        let channels = mixer_value
+            .get("channels")
+            .and_then(Value::as_array)
+            .ok_or(RoutingBusCreationSerializationError::InvalidDocumentShape)?;
+        for channel in channels {
+            let sends = channel
+                .get("sends")
+                .and_then(Value::as_array)
+                .ok_or(RoutingBusCreationSerializationError::InvalidDocumentShape)?;
+            for send in sends {
+                let id = send
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or(RoutingBusCreationSerializationError::InvalidDocumentShape)?;
+                existing_send_ids.insert(id);
+            }
+        }
+        for send_id in send_ids {
+            if !is_valid_entity_id(send_id)
+                || *send_id == track_id
+                || *send_id == project.project_id
+                || project_contains_identity(project, send_id)
+                || assets.iter().any(|asset| asset.id == *send_id)
+                || !existing_send_ids.insert(*send_id)
+            {
+                return Err(RoutingBusCreationSerializationError::InvalidSendIdentity);
+            }
+        }
+    }
+
+    let return_bus = if kind == RoutingBusKind::Return {
+        let return_buses = mixer_value
+            .get_mut("return_buses")
+            .and_then(Value::as_array_mut)
+            .ok_or(RoutingBusCreationSerializationError::InvalidDocumentShape)?;
+        let mut used = BTreeSet::new();
+        for return_bus in return_buses.iter() {
+            let bus = return_bus
+                .get("bus")
+                .and_then(Value::as_str)
+                .ok_or(RoutingBusCreationSerializationError::InvalidDocumentShape)?;
+            used.insert(bus);
+        }
+        let bus = ["a", "b"]
+            .into_iter()
+            .find(|bus| !used.contains(bus))
+            .ok_or(RoutingBusCreationSerializationError::ReturnBusUnavailable)?;
+        return_buses.push(json!({"bus": bus, "track_id": track_id}));
+        return_buses.sort_by_key(|entry| entry["bus"].as_str().unwrap_or_default().to_owned());
+        Some(bus)
+    } else {
+        None
+    };
+
+    let channels = mixer_value
+        .get_mut("channels")
+        .and_then(Value::as_array_mut)
+        .ok_or(RoutingBusCreationSerializationError::InvalidDocumentShape)?;
+    for (source_track_id, send_id) in source_track_ids.iter().zip(send_ids.iter().copied().map(Some).chain(std::iter::repeat(None))) {
+        let channel = channels
+            .iter_mut()
+            .find(|channel| channel["track_id"].as_str() == Some(*source_track_id))
+            .ok_or(RoutingBusCreationSerializationError::InvalidDocumentShape)?;
+        match (kind, send_id) {
+            (RoutingBusKind::Group, None) => {
+                channel["destination"] = json!({"kind": "track", "track_id": track_id});
+            }
+            (RoutingBusKind::Return, Some(send_id)) => {
+                let sends = channel
+                    .get_mut("sends")
+                    .and_then(Value::as_array_mut)
+                    .ok_or(RoutingBusCreationSerializationError::InvalidDocumentShape)?;
+                if sends.len() >= MAX_VERSION_1_SENDS_PER_CHANNEL {
+                    return Err(RoutingBusCreationSerializationError::SourceSendCapacity);
+                }
+                let return_bus = return_bus
+                    .ok_or(RoutingBusCreationSerializationError::ReturnBusUnavailable)?;
+                sends.push(json!({
+                    "id": send_id,
+                    "bus": return_bus,
+                    "tap": "post-fader",
+                    "gain_millionths": 1_000_000,
+                    "pan_millionths": 0,
+                    "enabled": true
+                }));
+                sends.sort_by_key(|entry| entry["bus"].as_str().unwrap_or_default().to_owned());
+            }
+            _ => return Err(RoutingBusCreationSerializationError::SendIdentityCountMismatch),
+        }
+    }
+    channels.push(json!({
+        "track_id": track_id,
+        "gain_millionths": 1_000_000,
+        "pan_millionths": 0,
+        "mute": false,
+        "solo": false,
+        "destination": {"kind": "main"},
+        "sends": []
+    }));
+    let mixer = serde_json_canonicalizer::to_vec(&mixer_value)
+        .map_err(RoutingBusCreationSerializationError::Serialization)?;
+    extended
+        .load_mixer(&mixer, assets, limits)
+        .map_err(RoutingBusCreationSerializationError::Source)?;
+    Ok(RoutingBusCreationDocuments { track, mixer, kind })
 }
 
 /// Creates one complete reusable audio-clip view from a verified recorded asset
@@ -9269,6 +9630,146 @@ mod tests {
                 LoaderLimits::VERSION_1,
             ),
             Err(AudioTrackAdditionSerializationError::MixerIdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn routing_bus_creation_builds_complete_group_and_return_graphs() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let source_track = "018f47a2-6b2d-7c11-8a44-001122334456";
+        let group_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let group = serialize_routing_bus_creation(
+            &loaded,
+            &asset_facts(),
+            MIXER,
+            "018f47a2-6b2d-7c11-8a44-001122334468",
+            RoutingBusKind::Group,
+            group_id,
+            "Drum Bus",
+            &[source_track],
+            &[],
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(group.kind(), RoutingBusKind::Group);
+        let group_track: Value = serde_json::from_slice(group.track()).unwrap();
+        assert_eq!(group_track["kind"], "group");
+        assert_eq!(group_track["clip_ids"], json!([]));
+        let group_mixer: Value = serde_json::from_slice(group.mixer()).unwrap();
+        assert_eq!(
+            group_mixer["channels"][0]["destination"],
+            json!({"kind":"track", "track_id":group_id})
+        );
+        assert_eq!(group_mixer["channels"][1]["track_id"], group_id);
+        let group_tracks: [&[u8]; 2] = [TRACK, group.track()];
+        let group_project = load(
+            input(TIMELINE, &group_tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        group_project
+            .load_mixer(group.mixer(), &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+
+        let return_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let return_bus = serialize_routing_bus_creation(
+            &loaded,
+            &asset_facts(),
+            MIXER,
+            "018f47a2-6b2d-7c11-8a44-001122334468",
+            RoutingBusKind::Return,
+            return_id,
+            "Reverb",
+            &[source_track],
+            &["018f47a2-6b2d-7c11-8a44-00112233446a"],
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(return_bus.kind(), RoutingBusKind::Return);
+        let return_mixer: Value = serde_json::from_slice(return_bus.mixer()).unwrap();
+        assert_eq!(
+            return_mixer["return_buses"],
+            json!([{ "bus":"a", "track_id":return_id }])
+        );
+        assert_eq!(
+            return_mixer["channels"][0]["sends"],
+            json!([{
+                "id":"018f47a2-6b2d-7c11-8a44-00112233446a", "bus":"a",
+                "tap":"post-fader", "gain_millionths":1_000_000,
+                "pan_millionths":0, "enabled":true
+            }])
+        );
+        let return_tracks: [&[u8]; 2] = [TRACK, return_bus.track()];
+        let return_project = load(
+            input(TIMELINE, &return_tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        return_project
+            .load_mixer(
+                return_bus.mixer(),
+                &asset_facts(),
+                LoaderLimits::VERSION_1,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn routing_bus_creation_refuses_incomplete_or_unsafe_requests() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let loaded = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let call = |kind, sources: &[&str], sends: &[&str]| {
+            serialize_routing_bus_creation(
+                &loaded,
+                &asset_facts(),
+                MIXER,
+                "018f47a2-6b2d-7c11-8a44-001122334468",
+                kind,
+                "018f47a2-6b2d-7c11-8a44-001122334469",
+                "Bus",
+                sources,
+                sends,
+                LoaderLimits::VERSION_1,
+            )
+        };
+        assert!(matches!(
+            call(RoutingBusKind::Group, &[], &[]),
+            Err(RoutingBusCreationSerializationError::EmptySourceSelection)
+        ));
+        assert!(matches!(
+            call(
+                RoutingBusKind::Group,
+                &["018f47a2-6b2d-7c11-8a44-001122334456"],
+                &["018f47a2-6b2d-7c11-8a44-00112233446a"]
+            ),
+            Err(RoutingBusCreationSerializationError::SendIdentityCountMismatch)
+        ));
+        assert!(matches!(
+            call(
+                RoutingBusKind::Return,
+                &["018f47a2-6b2d-7c11-8a44-001122334456"],
+                &[]
+            ),
+            Err(RoutingBusCreationSerializationError::SendIdentityCountMismatch)
+        ));
+        assert!(matches!(
+            call(
+                RoutingBusKind::Return,
+                &["018f47a2-6b2d-7c11-8a44-001122334456"],
+                &["invalid"]
+            ),
+            Err(RoutingBusCreationSerializationError::InvalidSendIdentity)
         ));
     }
 
