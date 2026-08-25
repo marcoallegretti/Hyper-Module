@@ -14523,7 +14523,10 @@ mod tests {
     use hyper_playback_json::{LoaderLimits, RoutingBusRemovalSerializationError};
     use hyper_playback_session::PlaybackSessionAssemblyLimits;
     use hyper_project_loader::ProjectPlaybackLimits;
-    use hyper_storage_engine::{ProjectCreationErrorKind, verify_project_package};
+    use hyper_storage_engine::{
+        MixerRecoverySnapshotRequest, ProjectCreationErrorKind,
+        store_mixer_recovery_snapshot, verify_project_package,
+    };
 
     const WAIT: Duration = Duration::from_secs(2);
     const AUDIO_IMPORT_FLAC_FIXTURE_BASE64: &str =
@@ -14554,6 +14557,26 @@ mod tests {
             IdeAudioOutputInventory::try_new(&[("route-a", "Output A")]).unwrap(),
             IdeAudioInputInventory::try_new(&[("input-a", "Input A")]).unwrap(),
         )
+    }
+
+    fn store_project_mixer_recovery(project: &std::path::Path) {
+        let verified = verify_project_package(project).unwrap();
+        let mixer = verified
+            .manifest()
+            .resources()
+            .iter()
+            .find(|descriptor| descriptor.role() == ResourceRole::Mixer)
+            .unwrap();
+        let mixer_bytes = verified.read_resource(mixer.id()).unwrap();
+        store_mixer_recovery_snapshot(
+            project,
+            MixerRecoverySnapshotRequest {
+                expected_project_sha256: *verified.manifest_sha256(),
+                mixer_id: mixer.id(),
+                mixer_bytes: &mixer_bytes,
+            },
+        )
+        .unwrap();
     }
 
     fn audio_import_application() -> DesktopIdeApplication {
@@ -15156,6 +15179,66 @@ mod tests {
         assert_eq!(shutdown_report(worker).native_failure(), None);
 
         remove_directory_link(&parent);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn real_worker_requires_an_explicit_mixer_recovery_decision() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-mixer-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+        let original_project_sha256 = *verify_project_package(&project).unwrap().manifest_sha256();
+
+        store_project_mixer_recovery(&project);
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 4).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::MixerRecoveryAvailable));
+        worker.try_send(IdeWorkerCommand::RestoreMixerRecovery).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
+        assert_eq!(
+            load_mixer_recovery_snapshot(&project).unwrap(),
+            None,
+            "restoring invalidates the local recovery record after publication"
+        );
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+
+        store_project_mixer_recovery(&project);
+        let worker =
+            DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 4).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::MixerRecoveryAvailable));
+        worker.try_send(IdeWorkerCommand::DiscardMixerRecovery).unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Running(_)));
+        assert_eq!(
+            load_mixer_recovery_snapshot(&project).unwrap(),
+            None,
+            "discard invalidates local recovery without a project publication"
+        );
+        assert_eq!(
+            *verify_project_package(&project).unwrap().manifest_sha256(),
+            original_project_sha256,
+            "discard leaves the verified project revision unchanged"
+        );
+        assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
 

@@ -18,9 +18,12 @@ use super::{MAX_JSON_FILE_BYTES, StructurallyVerifiedProject, decode_sha256, ver
 const BACKUPS_DIRECTORY: &str = "backups";
 const SNAPSHOT_DIRECTORY: &str = "mixer-recovery";
 const RECORD_NAME: &str = "snapshot.json";
-const MIXER_NAME: &str = "mixer.json";
+const LEGACY_MIXER_NAME: &str = "mixer.json";
+const MIXER_SLOT_A: &str = "mixer-a.json";
+const MIXER_SLOT_B: &str = "mixer-b.json";
 const FORMAT: &str = "hyper-mixer-recovery-snapshot";
-const FORMAT_VERSION: u8 = 1;
+const LEGACY_FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 const MAX_SNAPSHOT_BYTES: usize = 1_048_576;
 
 #[derive(Clone, Copy, Debug)]
@@ -104,6 +107,8 @@ struct SnapshotRecord {
     manifest_sha256: String,
     mixer_id: String,
     mixer_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mixer_file: Option<String>,
 }
 
 /// Durably stores an exact, canonical live-mixer snapshot for one verified
@@ -138,6 +143,7 @@ pub fn store_mixer_recovery_snapshot(
         )
     })?;
     let snapshot_directory = open_or_create_dir(&backups, SNAPSHOT_DIRECTORY)?;
+    let mixer_file = next_mixer_payload_name(&snapshot_directory)?;
     let record = SnapshotRecord {
         format: FORMAT.to_owned(),
         format_version: FORMAT_VERSION,
@@ -145,6 +151,7 @@ pub fn store_mixer_recovery_snapshot(
         manifest_sha256: hex_digest(*verified.manifest_sha256()),
         mixer_id: request.mixer_id.to_owned(),
         mixer_sha256: hex_digest(digest(request.mixer_bytes)),
+        mixer_file: Some(mixer_file.to_owned()),
     };
     let record_bytes = serde_json_canonicalizer::to_vec(&record).map_err(|source| {
         caused(
@@ -153,7 +160,7 @@ pub fn store_mixer_recovery_snapshot(
             source,
         )
     })?;
-    publish_bytes(&snapshot_directory, MIXER_NAME, request.mixer_bytes)?;
+    publish_bytes(&snapshot_directory, mixer_file, request.mixer_bytes)?;
     publish_bytes(&snapshot_directory, RECORD_NAME, &record_bytes)
 }
 
@@ -187,6 +194,7 @@ pub fn load_mixer_recovery_snapshot(
         Err(error) => return Err(error),
     };
     let record = parse_record(&record_bytes)?;
+    let mixer_file = mixer_payload_name(&record)?;
     let manifest_sha256 = decode_sha256(&record.manifest_sha256, RECORD_NAME).map_err(|source| {
         caused(
             MixerRecoverySnapshotErrorKind::SnapshotInvalid,
@@ -200,9 +208,9 @@ pub fn load_mixer_recovery_snapshot(
         return Ok(None);
     }
     require_mixer_descriptor(&verified, &record.mixer_id)?;
-    let mixer_bytes = read_bounded(&snapshot_directory, MIXER_NAME)?;
+    let mixer_bytes = read_bounded(&snapshot_directory, mixer_file)?;
     validate_canonical_json(&mixer_bytes)?;
-    let mixer_sha256 = decode_sha256(&record.mixer_sha256, MIXER_NAME).map_err(|source| {
+    let mixer_sha256 = decode_sha256(&record.mixer_sha256, mixer_file).map_err(|source| {
         caused(
             MixerRecoverySnapshotErrorKind::SnapshotInvalid,
             "decode mixer recovery digest",
@@ -248,7 +256,9 @@ pub fn clear_mixer_recovery_snapshot(
         return Ok(());
     };
     remove_optional_file(&snapshot_directory, RECORD_NAME)?;
-    remove_optional_file(&snapshot_directory, MIXER_NAME)?;
+    remove_optional_file(&snapshot_directory, LEGACY_MIXER_NAME)?;
+    remove_optional_file(&snapshot_directory, MIXER_SLOT_A)?;
+    remove_optional_file(&snapshot_directory, MIXER_SLOT_B)?;
     sync_dir(&snapshot_directory)
 }
 
@@ -278,6 +288,56 @@ fn require_mixer_descriptor(
             MixerRecoverySnapshotErrorKind::ProjectChanged,
             "mixer recovery snapshot does not match the current project mixer",
         ))
+    }
+}
+
+fn next_mixer_payload_name(
+    snapshot_directory: &Dir,
+) -> Result<&'static str, MixerRecoverySnapshotError> {
+    let record_bytes = match read_bounded(snapshot_directory, RECORD_NAME) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind == MixerRecoverySnapshotErrorKind::SnapshotUnavailable => {
+            return Ok(MIXER_SLOT_A);
+        }
+        Err(error) => return Err(error),
+    };
+    let record = parse_record(&record_bytes)?;
+    match mixer_payload_name(&record)? {
+        MIXER_SLOT_A => Ok(MIXER_SLOT_B),
+        MIXER_SLOT_B | LEGACY_MIXER_NAME => Ok(MIXER_SLOT_A),
+        _ => unreachable!("mixer payload name was validated before slot selection"),
+    }
+}
+
+fn mixer_payload_name(record: &SnapshotRecord) -> Result<&str, MixerRecoverySnapshotError> {
+    if record.format != FORMAT {
+        return Err(failure(
+            MixerRecoverySnapshotErrorKind::SnapshotInvalid,
+            "mixer recovery snapshot format is unsupported",
+        ));
+    }
+    match record.format_version {
+        LEGACY_FORMAT_VERSION if record.mixer_file.is_none() => Ok(LEGACY_MIXER_NAME),
+        FORMAT_VERSION => {
+            let mixer_file = record.mixer_file.as_deref().ok_or_else(|| {
+                failure(
+                    MixerRecoverySnapshotErrorKind::SnapshotInvalid,
+                    "mixer recovery snapshot payload name is missing",
+                )
+            })?;
+            if matches!(mixer_file, MIXER_SLOT_A | MIXER_SLOT_B) {
+                Ok(mixer_file)
+            } else {
+                Err(failure(
+                    MixerRecoverySnapshotErrorKind::SnapshotInvalid,
+                    "mixer recovery snapshot payload name is invalid",
+                ))
+            }
+        }
+        _ => Err(failure(
+            MixerRecoverySnapshotErrorKind::SnapshotInvalid,
+            "mixer recovery snapshot version is unsupported",
+        )),
     }
 }
 
@@ -505,6 +565,18 @@ mod tests {
             let mixer = verified.read_resource(&mixer_id).unwrap();
             (*verified.manifest_sha256(), mixer_id, mixer)
         }
+
+        fn snapshot_directory(&self) -> std::path::PathBuf {
+            self.project.join(BACKUPS_DIRECTORY).join(SNAPSHOT_DIRECTORY)
+        }
+
+        fn rewrite_record(&self, mutate: impl FnOnce(&mut serde_json::Value)) {
+            let path = self.snapshot_directory().join(RECORD_NAME);
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            mutate(&mut record);
+            fs::write(path, serde_json_canonicalizer::to_vec(&record).unwrap()).unwrap();
+        }
     }
 
     impl Drop for Fixture {
@@ -541,6 +613,108 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_payload_replacement_retains_the_last_recorded_snapshot() {
+        let fixture = Fixture::new();
+        let (expected_project_sha256, mixer_id, mixer_bytes) = fixture.mixer_snapshot_parts();
+        store_mixer_recovery_snapshot(
+            &fixture.project,
+            MixerRecoverySnapshotRequest {
+                expected_project_sha256,
+                mixer_id: &mixer_id,
+                mixer_bytes: &mixer_bytes,
+            },
+        )
+        .unwrap();
+        let mut updated_value: serde_json::Value = serde_json::from_slice(&mixer_bytes).unwrap();
+        updated_value["main"]["mute"] = serde_json::Value::Bool(true);
+        let updated_mixer = serde_json_canonicalizer::to_vec(&updated_value).unwrap();
+        assert_ne!(updated_mixer, mixer_bytes);
+
+        fs::write(
+            fixture.snapshot_directory().join(MIXER_SLOT_B),
+            &updated_mixer,
+        )
+        .unwrap();
+        let interrupted = load_mixer_recovery_snapshot(&fixture.project)
+            .unwrap()
+            .expect("the old record remains authoritative until replacement is committed");
+        assert_eq!(interrupted.mixer_bytes(), mixer_bytes);
+
+        store_mixer_recovery_snapshot(
+            &fixture.project,
+            MixerRecoverySnapshotRequest {
+                expected_project_sha256,
+                mixer_id: &mixer_id,
+                mixer_bytes: &updated_mixer,
+            },
+        )
+        .unwrap();
+        let committed = load_mixer_recovery_snapshot(&fixture.project)
+            .unwrap()
+            .expect("the replacement record addresses the newly published payload");
+        assert_eq!(committed.mixer_bytes(), updated_mixer);
+    }
+
+    #[test]
+    fn legacy_version_one_snapshot_remains_recoverable() {
+        let fixture = Fixture::new();
+        let (expected_project_sha256, mixer_id, mixer_bytes) = fixture.mixer_snapshot_parts();
+        let directory = fixture.snapshot_directory();
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(LEGACY_MIXER_NAME), &mixer_bytes).unwrap();
+        let project = verify_project_package(&fixture.project).unwrap();
+        let record = SnapshotRecord {
+            format: FORMAT.to_owned(),
+            format_version: LEGACY_FORMAT_VERSION,
+            project_id: project.manifest().project_id().to_owned(),
+            manifest_sha256: hex_digest(expected_project_sha256),
+            mixer_id: mixer_id.clone(),
+            mixer_sha256: hex_digest(digest(&mixer_bytes)),
+            mixer_file: None,
+        };
+        fs::write(
+            directory.join(RECORD_NAME),
+            serde_json_canonicalizer::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+
+        let snapshot = load_mixer_recovery_snapshot(&fixture.project)
+            .unwrap()
+            .expect("a valid snapshot created by version one remains available");
+        assert_eq!(snapshot.mixer_id(), mixer_id);
+        assert_eq!(snapshot.mixer_bytes(), mixer_bytes);
+    }
+
+    #[test]
+    fn unsupported_record_format_and_version_are_rejected() {
+        let fixture = Fixture::new();
+        let (expected_project_sha256, mixer_id, mixer_bytes) = fixture.mixer_snapshot_parts();
+        let request = MixerRecoverySnapshotRequest {
+            expected_project_sha256,
+            mixer_id: &mixer_id,
+            mixer_bytes: &mixer_bytes,
+        };
+        store_mixer_recovery_snapshot(&fixture.project, request).unwrap();
+        fixture.rewrite_record(|record| {
+            record["format"] = serde_json::Value::String("foreign-recovery".to_owned());
+        });
+        assert_eq!(
+            load_mixer_recovery_snapshot(&fixture.project).unwrap_err().kind(),
+            MixerRecoverySnapshotErrorKind::SnapshotInvalid
+        );
+
+        store_mixer_recovery_snapshot(&fixture.project, request).unwrap_err();
+        fixture.rewrite_record(|record| {
+            record["format"] = serde_json::Value::String(FORMAT.to_owned());
+            record["format_version"] = serde_json::Value::from(99_u8);
+        });
+        assert_eq!(
+            load_mixer_recovery_snapshot(&fixture.project).unwrap_err().kind(),
+            MixerRecoverySnapshotErrorKind::SnapshotInvalid
+        );
+    }
+
+    #[test]
     fn snapshot_is_ignored_after_a_durable_project_revision_change() {
         let fixture = Fixture::new();
         let (expected_project_sha256, mixer_id, mixer_bytes) = fixture.mixer_snapshot_parts();
@@ -573,12 +747,12 @@ mod tests {
             mixer_bytes: &mixer_bytes,
         };
         store_mixer_recovery_snapshot(&fixture.project, request).unwrap();
+        let record = parse_record(
+            &fs::read(fixture.snapshot_directory().join(RECORD_NAME)).unwrap(),
+        )
+        .unwrap();
         fs::write(
-            fixture
-                .project
-                .join(BACKUPS_DIRECTORY)
-                .join(SNAPSHOT_DIRECTORY)
-                .join(MIXER_NAME),
+            fixture.snapshot_directory().join(mixer_payload_name(&record).unwrap()),
             b"{}",
         )
         .unwrap();
