@@ -23,7 +23,7 @@ use crate::project_lock::{
 use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
 use hyper_native_device::DeviceChain;
-use hyper_playback_json::{AudioTrackDuplicationDocument, AudioTrackDuplicationDocuments};
+use hyper_playback_json::{AudioTrackDuplicationDocument, AudioTrackDuplicationDocuments, TrackDuplicationDocuments};
 use hyper_project_model::{ProjectManifest, ResourceRole, is_valid_entity_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,6 +42,18 @@ pub struct AudioTrackDuplicationPublicationRequest<'a> {
     /// Canonical complete output from the playback-document duplication
     /// boundary. Storage never infers a subset of this document set.
     pub documents: &'a AudioTrackDuplicationDocuments,
+}
+
+/// Publication request for a routing-bus copy.
+///
+/// The durable transaction is shared with audio-track duplication because both
+/// publish the same complete added/replaced resource graph and commit the
+/// manifest last. The serializer determines which documents are present.
+#[derive(Clone, Copy, Debug)]
+pub struct RoutingBusDuplicationPublicationRequest<'a> {
+    pub expected_project_sha256: [u8; 32],
+    pub mixer_id: &'a str,
+    pub documents: &'a TrackDuplicationDocuments,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,6 +177,28 @@ pub fn publish_audio_track_duplication(
     request: AudioTrackDuplicationPublicationRequest<'_>,
 ) -> Result<AudioTrackDuplicationPublicationOutcome, ProjectResourcePublicationError> {
     publish_audio_track_duplication_observed(project_path.as_ref(), request, |_, _| Ok(()))
+}
+
+/// Publishes one complete independent Group or Return copy through the
+/// existing recoverable manifest-last duplication transaction.
+///
+/// # Errors
+///
+/// Refuses stale, partial, noncanonical, conflicting, or unverified document
+/// sets. A reported publication is committed only after its complete project
+/// candidate verifies.
+pub fn publish_routing_bus_duplication(
+    project_path: impl AsRef<Path>,
+    request: RoutingBusDuplicationPublicationRequest<'_>,
+) -> Result<AudioTrackDuplicationPublicationOutcome, ProjectResourcePublicationError> {
+    publish_audio_track_duplication(
+        project_path,
+        AudioTrackDuplicationPublicationRequest {
+            expected_project_sha256: request.expected_project_sha256,
+            mixer_id: request.mixer_id,
+            documents: request.documents,
+        },
+    )
 }
 
 /// Recovers every durable independent audio-track duplication in a project.
@@ -2055,6 +2089,27 @@ mod tests {
             package.read_resource(MIXER_ID).unwrap(),
             documents.mixer().bytes()
         );
+    }
+
+    #[test]
+    fn routing_bus_duplication_uses_the_verified_manifest_last_batch() {
+        let fixture = Fixture::new();
+        let (identity, documents) = fixture.documents();
+        let outcome = publish_routing_bus_duplication(
+            &fixture.root,
+            RoutingBusDuplicationPublicationRequest {
+                expected_project_sha256: identity,
+                mixer_id: MIXER_ID,
+                documents: &documents,
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.track_id(), DUPLICATED_TRACK_ID);
+        assert_eq!(outcome.project_revision(), 2);
+        let package = verify_project_package(&fixture.root).unwrap();
+        assert_eq!(*package.manifest_sha256(), *outcome.project_identity());
+        assert_eq!(package.read_resource(DUPLICATED_TRACK_ID).unwrap(), documents.track().bytes());
+        assert_eq!(package.read_resource(MIXER_ID).unwrap(), documents.mixer().bytes());
     }
 
     #[test]

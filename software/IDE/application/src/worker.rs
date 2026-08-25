@@ -15922,6 +15922,125 @@ mod tests {
     }
 
     #[test]
+    fn routing_bus_duplication_preserves_existing_incoming_routes() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-routing-bus-duplication-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+        let worker = DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8)
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project.clone()))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the verified project must open before routing-bus duplication");
+        };
+        let source_track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the created project has one audio source")
+            .id()
+            .to_owned();
+        worker
+            .try_send(IdeWorkerCommand::AddRoutingBus {
+                kind: IdeRoutingBusKind::Group,
+                name: "Drums".to_owned(),
+                source_track_ids: vec![source_track_id.clone()],
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusAdding {
+                kind: IdeRoutingBusKind::Group
+            }
+        ));
+        let IdeWorkerEvent::Running(with_group) = recv(&worker) else {
+            panic!("the created group must reopen before duplication");
+        };
+        let group_id = with_group
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Group)
+            .expect("the created group is observable")
+            .id()
+            .to_owned();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusAdded { revision: 2, track_id } if track_id == group_id
+        ));
+        worker
+            .try_send(IdeWorkerCommand::DuplicateAudioTrack {
+                track_id: group_id.clone(),
+                name: "Drums copy".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioTrackDuplicating
+        ));
+        let mut duplicated_event_track_id = None;
+        let mut copied_group_id = None;
+        let mut source_kept_original_destination = false;
+        loop {
+            match recv_native_mutation(&worker) {
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: None,
+                    redo_label: None,
+                } => {}
+                IdeWorkerEvent::AudioTrackDuplicated { revision: 3, track_id } => {
+                    duplicated_event_track_id = Some(track_id);
+                }
+                IdeWorkerEvent::Running(snapshot) => {
+                    let Some(copied_group) = snapshot.mixer_channels().iter().find(|channel| {
+                        channel.kind() == IdeMixerChannelKind::Group
+                            && channel.name() == "Drums copy"
+                    }) else {
+                        continue;
+                    };
+                    copied_group_id = Some(copied_group.id().to_owned());
+                    source_kept_original_destination = matches!(
+                        snapshot
+                            .mixer_channels()
+                            .iter()
+                            .find(|channel| channel.id() == source_track_id)
+                            .expect("the original source remains after group duplication")
+                            .destination(),
+                        IdeMixerChannelDestination::Group { track_id, .. } if track_id == &group_id
+                    );
+                }
+                event => panic!(
+                    "routing-bus duplication emitted an unexpected lifecycle event: {event:?}"
+                ),
+            }
+            if copied_group_id.is_some() && duplicated_event_track_id.is_some() {
+                break;
+            }
+        }
+        let copied_group_id = copied_group_id.expect("the independently named group copy is present after reopen");
+        assert_ne!(copied_group_id, group_id);
+        assert!(source_kept_original_destination);
+        assert_eq!(duplicated_event_track_id.as_deref(), Some(copied_group_id.as_str()));
+        let package = verify_project_package(&project).unwrap();
+        assert_eq!(package.manifest().revision(), 3);
+        drop(package);
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "one real-worker scenario proves full track-content removal fences the mixer, invalidates history, and reopens the reduced project"

@@ -350,7 +350,7 @@ export global IdeActions {
     callback add-routing-bus(int, string);
     callback toggle-routing-bus-source(int);
     callback remove-routing-bus(string);
-    callback duplicate-audio-track(int, string);
+    callback duplicate-mixer-strip(int, string);
     callback remove-audio-track(string);
     callback remove-audio-track-content(string);
     callback reorder-audio-track(int, bool);
@@ -2311,17 +2311,17 @@ export component MainWindow inherits Window {
                     VerticalLayout {
                         padding: 22px;
                         spacing: 14px;
-                        Text { text: "DUPLICATE AUDIO TRACK"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        Text { text: "DUPLICATE MIXER STRIP"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
                         Text { text: root.duplicate-track-source-name; color: #edf2f8; font-size: 22px; font-weight: 600; overflow: elide; }
                         Rectangle { height: 1px; background: #27313d; }
-                        Text { text: "New track name"; color: #aebccc; font-size: 12px; }
+                        Text { text: "New strip name"; color: #aebccc; font-size: 12px; }
                         IdeLineEdit {
                             text <=> root.duplicate-track-name;
                             enabled: root.app-mode == AppMode.running;
-                            accessible-label: "Duplicated audio track name";
+                            accessible-label: "Duplicated mixer strip name";
                         }
                         Text {
-                            text: "This creates an independent audio track and remaps its mutable clips, scenes, automation, mixer state, and device chain. Project-owned media remains shared.";
+                            text: "Audio-track copies remap clips, scenes, automation, mixer state, and devices. Group and Return copies retain their owned strip state; existing incoming routes remain unchanged.";
                             color: #728196;
                             font-size: 10px;
                             wrap: word-wrap;
@@ -2340,13 +2340,13 @@ export component MainWindow inherits Window {
                             }
                             Button {
                                 horizontal-stretch: 1;
-                                text: root.app-mode == AppMode.duplicating-track ? "Duplicating track..." : "Duplicate audio track";
-                                accessible-label: "Confirm duplicate audio track";
+                                text: root.app-mode == AppMode.duplicating-track ? "Duplicating strip..." : "Duplicate mixer strip";
+                                accessible-label: "Confirm duplicate mixer strip";
                                 enabled: root.app-mode == AppMode.running
                                     && root.duplicate-track-index >= 0
                                     && root.duplicate-track-name != ""
                                     && root.track-count < 8;
-                                clicked => { IdeActions.duplicate-audio-track(root.duplicate-track-index, root.duplicate-track-name); }
+                                clicked => { IdeActions.duplicate-mixer-strip(root.duplicate-track-index, root.duplicate-track-name); }
                             }
                         }
                         Rectangle { vertical-stretch: 1; background: transparent; }

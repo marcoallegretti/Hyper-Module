@@ -2121,7 +2121,7 @@ fn bind_scene_callbacks(ui: &MainWindow, worker: &WorkerCell, project_state: &Pr
 fn bind_audio_track_callback(ui: &MainWindow, worker: &WorkerCell) {
     bind_audio_track_add_callback(ui, worker);
     bind_routing_bus_callbacks(ui, worker);
-    bind_audio_track_duplication_callback(ui, worker);
+    bind_mixer_strip_duplication_callback(ui, worker);
     bind_audio_track_rename_callback(ui, worker);
     bind_routing_bus_rename_callback(ui, worker);
     bind_mixer_strip_reorder_callback(ui, worker);
@@ -2291,15 +2291,15 @@ fn bind_audio_track_add_callback(ui: &MainWindow, worker: &WorkerCell) {
     });
 }
 
-fn bind_audio_track_duplication_callback(ui: &MainWindow, worker: &WorkerCell) {
+fn bind_mixer_strip_duplication_callback(ui: &MainWindow, worker: &WorkerCell) {
     let actions = ui.global::<IdeActions>();
     let weak = ui.as_weak();
     let worker_for_duplication = Rc::clone(worker);
-    actions.on_duplicate_audio_track(move |index, name| {
+    actions.on_duplicate_mixer_strip(move |index, name| {
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        match audio_track_duplication_command(
+        match mixer_strip_duplication_command(
             ui.get_app_mode(),
             index,
             name.as_str(),
@@ -8901,7 +8901,7 @@ fn mixer_strip_reorder_command(
     })
 }
 
-fn audio_track_duplication_command(
+fn mixer_strip_duplication_command(
     mode: AppMode,
     index: i32,
     name: &str,
@@ -12287,7 +12287,7 @@ mod tests {
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_callback = Rc::clone(&submitted);
         ui.global::<IdeActions>()
-            .on_duplicate_audio_track(move |index, name| {
+            .on_duplicate_mixer_strip(move |index, name| {
                 submitted_by_callback.borrow_mut().push((index, name.to_string()));
             });
         ui.show().unwrap();
@@ -12303,7 +12303,7 @@ mod tests {
 
         ui.set_duplicate_track_name("Audio 1 copy".into());
         let confirm =
-            ElementHandle::find_by_accessible_label(&ui, "Confirm duplicate audio track")
+            ElementHandle::find_by_accessible_label(&ui, "Confirm duplicate mixer strip")
                 .next()
                 .expect("the visible form exposes one confirmation action");
         assert_eq!(confirm.accessible_enabled(), Some(true));
@@ -14170,7 +14170,12 @@ mod tests {
             Err(MixerControlFailure::StateUnavailable)
         ));
         assert!(matches!(
-            audio_track_duplication_command(
+            mixer_strip_duplication_command(AppMode::Running, 1, "Drums copy", 3, &mixed),
+            Ok(IdeWorkerCommand::DuplicateAudioTrack { track_id, name })
+                if track_id == "018f47a2-6b2d-7c11-8a44-001122334458" && name == "Drums copy"
+        ));
+        assert!(matches!(
+            mixer_strip_duplication_command(
                 AppMode::Running,
                 1,
                 " Target copy ",
@@ -14181,11 +14186,11 @@ mod tests {
                 if track_id == track_a && name == "Target copy"
         ));
         assert!(matches!(
-            audio_track_duplication_command(AppMode::Running, 1, "Copy", 8, &reordered),
+            mixer_strip_duplication_command(AppMode::Running, 1, "Copy", 8, &reordered),
             Err(MixerControlFailure::StateUnavailable)
         ));
         assert!(matches!(
-            audio_track_duplication_command(AppMode::Running, 1, "   ", 2, &reordered),
+            mixer_strip_duplication_command(AppMode::Running, 1, "   ", 2, &reordered),
             Err(MixerControlFailure::InvalidValue)
         ));
         assert_eq!(

@@ -13,14 +13,14 @@ use crate::{
     load_track, validate_loaded_identities, validate_track_hierarchy,
 };
 
-/// One canonical resource document emitted by audio-track duplication.
+/// One canonical resource document emitted by independent track duplication.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AudioTrackDuplicationDocument {
+pub struct TrackDuplicationDocument {
     id: String,
     bytes: Vec<u8>,
 }
 
-impl AudioTrackDuplicationDocument {
+impl TrackDuplicationDocument {
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
@@ -32,58 +32,64 @@ impl AudioTrackDuplicationDocument {
     }
 }
 
-/// Complete canonical resource set for one independent audio-track copy.
+/// Complete canonical resource set for one independent track copy.
 ///
 /// Every `Some` or collection member replaces or creates exactly the resource
 /// identified by its enclosing document. Callers must publish this set as one
 /// transaction; publishing a subset would make its identity graph incomplete.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AudioTrackDuplicationDocuments {
-    track: AudioTrackDuplicationDocument,
-    clips: Vec<AudioTrackDuplicationDocument>,
-    mixer: AudioTrackDuplicationDocument,
-    arrangement: Option<AudioTrackDuplicationDocument>,
-    scenes: Vec<AudioTrackDuplicationDocument>,
-    automation_takes: Vec<AudioTrackDuplicationDocument>,
-    device_chain: Option<AudioTrackDuplicationDocument>,
+pub struct TrackDuplicationDocuments {
+    track: TrackDuplicationDocument,
+    clips: Vec<TrackDuplicationDocument>,
+    mixer: TrackDuplicationDocument,
+    arrangement: Option<TrackDuplicationDocument>,
+    scenes: Vec<TrackDuplicationDocument>,
+    automation_takes: Vec<TrackDuplicationDocument>,
+    device_chain: Option<TrackDuplicationDocument>,
 }
 
-impl AudioTrackDuplicationDocuments {
+impl TrackDuplicationDocuments {
     #[must_use]
-    pub const fn track(&self) -> &AudioTrackDuplicationDocument {
+    pub const fn track(&self) -> &TrackDuplicationDocument {
         &self.track
     }
 
     #[must_use]
-    pub fn clips(&self) -> &[AudioTrackDuplicationDocument] {
+    pub fn clips(&self) -> &[TrackDuplicationDocument] {
         &self.clips
     }
 
     #[must_use]
-    pub const fn mixer(&self) -> &AudioTrackDuplicationDocument {
+    pub const fn mixer(&self) -> &TrackDuplicationDocument {
         &self.mixer
     }
 
     #[must_use]
-    pub const fn arrangement(&self) -> Option<&AudioTrackDuplicationDocument> {
+    pub const fn arrangement(&self) -> Option<&TrackDuplicationDocument> {
         self.arrangement.as_ref()
     }
 
     #[must_use]
-    pub fn scenes(&self) -> &[AudioTrackDuplicationDocument] {
+    pub fn scenes(&self) -> &[TrackDuplicationDocument] {
         &self.scenes
     }
 
     #[must_use]
-    pub fn automation_takes(&self) -> &[AudioTrackDuplicationDocument] {
+    pub fn automation_takes(&self) -> &[TrackDuplicationDocument] {
         &self.automation_takes
     }
 
     #[must_use]
-    pub const fn device_chain(&self) -> Option<&AudioTrackDuplicationDocument> {
+    pub const fn device_chain(&self) -> Option<&TrackDuplicationDocument> {
         self.device_chain.as_ref()
     }
 }
+
+/// Backward-compatible name for the audio-track specialization.
+pub type AudioTrackDuplicationDocument = TrackDuplicationDocument;
+
+/// Backward-compatible name for the audio-track specialization.
+pub type AudioTrackDuplicationDocuments = TrackDuplicationDocuments;
 
 /// Complete verified source authority for audio-track duplication.
 ///
@@ -1141,6 +1147,645 @@ fn duplicate_automation_lanes(
         .compile_main_automation(&graph, &automation)
         .map_err(AudioTrackDuplicationSerializationError::AutomationCompilation)?;
     Ok(output)
+}
+
+/// Complete verified source authority for routing-bus duplication.
+///
+/// Incoming routes and sends are deliberately not part of this source: those
+/// edges belong to their source channels and a bus copy must not create new
+/// signal paths without an explicit routing edit.
+#[derive(Clone, Copy, Debug)]
+pub struct RoutingBusDuplicationSource<'a> {
+    pub track: &'a [u8],
+    pub mixer: &'a [u8],
+    pub automation_take_ids: &'a [&'a str],
+    pub automation_takes: &'a [(&'a str, &'a [u8])],
+    pub device_chain_id: Option<&'a str>,
+    pub device_chain: Option<&'a [u8]>,
+}
+
+/// Rejection returned before an incomplete routing-bus copy can be published.
+#[derive(Debug)]
+pub enum RoutingBusDuplicationSerializationError {
+    TrackMissing,
+    TrackNotRoutingBus,
+    ParentTrackUnsupported,
+    TrackCapacity,
+    ReturnBusUnavailable,
+    InvalidTrackName,
+    InvalidGeneratedIdentity,
+    SourceTrackMismatch,
+    SourceMixerMismatch,
+    SourceAutomationCoverage,
+    SourceDeviceChainMismatch,
+    InvalidDocumentShape,
+    UnknownExtensionSemantics,
+    Source(LoadError),
+    Device(DeviceChainError),
+    Serialization(serde_json::Error),
+    ProjectCompilation(AdapterCompileError),
+    MixerCompilation(MixerCompileError),
+    AutomationCompilation(AutomationCompileError),
+}
+
+impl fmt::Display for RoutingBusDuplicationSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TrackMissing => formatter.write_str("the selected routing bus is not present"),
+            Self::TrackNotRoutingBus => {
+                formatter.write_str("routing-bus duplication supports group and return tracks only")
+            }
+            Self::ParentTrackUnsupported => {
+                formatter.write_str("routing-bus duplication does not infer hierarchy copy semantics")
+            }
+            Self::TrackCapacity => formatter.write_str("the routing-bus capacity is exhausted"),
+            Self::ReturnBusUnavailable => {
+                formatter.write_str("no version-1 return-bus identity is available for the copy")
+            }
+            Self::InvalidTrackName => {
+                formatter.write_str("the duplicated routing-bus name is outside the version-1 domain")
+            }
+            Self::InvalidGeneratedIdentity => {
+                formatter.write_str("a generated duplication identity is invalid or collides")
+            }
+            Self::SourceTrackMismatch => {
+                formatter.write_str("source routing-bus bytes do not match the loaded project")
+            }
+            Self::SourceMixerMismatch => {
+                formatter.write_str("source mixer bytes do not match the loaded project")
+            }
+            Self::SourceAutomationCoverage => {
+                formatter.write_str("source automation documents have duplicate or misaddressed identities")
+            }
+            Self::SourceDeviceChainMismatch => {
+                formatter.write_str("source native device chain does not belong to the selected routing bus")
+            }
+            Self::InvalidDocumentShape => {
+                formatter.write_str("a source document shape changed after typed validation")
+            }
+            Self::UnknownExtensionSemantics => formatter.write_str(
+                "routing-bus duplication refuses a transformed document with unknown extension identity semantics",
+            ),
+            Self::Source(source) => source.fmt(formatter),
+            Self::Device(source) => source.fmt(formatter),
+            Self::Serialization(source) => source.fmt(formatter),
+            Self::ProjectCompilation(source) => source.fmt(formatter),
+            Self::MixerCompilation(source) => source.fmt(formatter),
+            Self::AutomationCompilation(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for RoutingBusDuplicationSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Device(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::ProjectCompilation(source) => Some(source),
+            Self::MixerCompilation(source) => Some(source),
+            Self::AutomationCompilation(source) => Some(source),
+            Self::TrackMissing
+            | Self::TrackNotRoutingBus
+            | Self::ParentTrackUnsupported
+            | Self::TrackCapacity
+            | Self::ReturnBusUnavailable
+            | Self::InvalidTrackName
+            | Self::InvalidGeneratedIdentity
+            | Self::SourceTrackMismatch
+            | Self::SourceMixerMismatch
+            | Self::SourceAutomationCoverage
+            | Self::SourceDeviceChainMismatch
+            | Self::InvalidDocumentShape
+            | Self::UnknownExtensionSemantics => None,
+        }
+    }
+}
+
+/// Builds one independent Group or Return copy without copying the incoming
+/// routing edges that belong to other channels.
+///
+/// # Errors
+///
+/// Returns a classified refusal for incomplete or stale authority, unsupported
+/// topology, exhausted routing capacity, unknown extension semantics, unsafe
+/// identities, or a candidate that fails playback or automation compilation.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "routing-bus duplication validates every owned mutable identity edge before returning one atomic document set"
+)]
+pub fn serialize_routing_bus_duplication(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source: RoutingBusDuplicationSource<'_>,
+    source_track_id: &str,
+    duplicated_track_name: &str,
+    limits: LoaderLimits,
+    mut next_identity: impl FnMut() -> String,
+) -> Result<TrackDuplicationDocuments, RoutingBusDuplicationSerializationError> {
+    if project.tracks.len() >= limits.max_track_documents {
+        return Err(RoutingBusDuplicationSerializationError::TrackCapacity);
+    }
+    let name_length = duplicated_track_name.chars().count();
+    if duplicated_track_name.trim() != duplicated_track_name
+        || !(1..=super::MAX_VERSION_1_NAME_CHARACTERS).contains(&name_length)
+    {
+        return Err(RoutingBusDuplicationSerializationError::InvalidTrackName);
+    }
+    let source_track_index = project
+        .track_index(source_track_id)
+        .ok_or(RoutingBusDuplicationSerializationError::TrackMissing)?;
+    let loaded_source_track = load_track(
+        source.track,
+        source_track_index,
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(RoutingBusDuplicationSerializationError::Source)?;
+    if !same_track(&loaded_source_track, &project.tracks[source_track_index]) {
+        return Err(RoutingBusDuplicationSerializationError::SourceTrackMismatch);
+    }
+    let kind = match loaded_source_track.kind {
+        super::TrackKind::Group => super::RoutingBusKind::Group,
+        super::TrackKind::Return => super::RoutingBusKind::Return,
+        _ => return Err(RoutingBusDuplicationSerializationError::TrackNotRoutingBus),
+    };
+    if loaded_source_track.parent_track_id.is_some() {
+        return Err(RoutingBusDuplicationSerializationError::ParentTrackUnsupported);
+    }
+    let next_order = (0..=7)
+        .find(|order| project.tracks.iter().all(|track| track.order != *order))
+        .ok_or(RoutingBusDuplicationSerializationError::TrackCapacity)?;
+    let (mut track_value, canonical_track) = routing_bus_canonical_value(source.track)?;
+    if canonical_track != source.track {
+        return Err(RoutingBusDuplicationSerializationError::SourceTrackMismatch);
+    }
+    routing_bus_require_empty_extensions(&track_value)?;
+
+    let (mixer_value, canonical_mixer) = routing_bus_canonical_value(source.mixer)?;
+    if canonical_mixer != source.mixer {
+        return Err(RoutingBusDuplicationSerializationError::SourceMixerMismatch);
+    }
+    routing_bus_require_empty_extensions(&mixer_value)?;
+    let loaded_mixer = project
+        .load_mixer(source.mixer, assets, limits)
+        .map_err(RoutingBusDuplicationSerializationError::Source)?;
+    let source_automation = routing_bus_source_automation(
+        project,
+        &loaded_mixer,
+        assets,
+        source.automation_take_ids,
+        source.automation_takes,
+        limits,
+    )?;
+    let mut known_identities = known_identities(project, assets, &loaded_mixer, &source_automation);
+    let parsed_chain = routing_bus_source_device_chain(
+        project,
+        source,
+        source_track_id,
+        &mut known_identities,
+    )?;
+    let duplicated_track_id = routing_bus_allocate_identity(&mut known_identities, &mut next_identity)?;
+    routing_bus_rewrite_string(&mut track_value, "id", &duplicated_track_id)?;
+    routing_bus_rewrite_string(&mut track_value, "name", duplicated_track_name)?;
+    routing_bus_replace_u8(&mut track_value, "order", next_order)?;
+    let track_bytes = routing_bus_canonical_bytes(&track_value)?;
+    let duplicated_track = load_track(
+        &track_bytes,
+        project.tracks.len(),
+        project.project_id(),
+        limits.max_document_bytes,
+        limits.max_track_clip_references,
+    )
+    .map_err(RoutingBusDuplicationSerializationError::Source)?;
+    let mut candidate = project.clone();
+    candidate
+        .tracks
+        .try_reserve(1)
+        .map_err(|_| RoutingBusDuplicationSerializationError::Source(capacity_error()))?;
+    candidate.tracks.push(duplicated_track);
+    validate_track_hierarchy(&candidate.tracks).map_err(RoutingBusDuplicationSerializationError::Source)?;
+    validate_loaded_identities(&candidate).map_err(RoutingBusDuplicationSerializationError::Source)?;
+
+    let (mixer, source_send_ids, candidate_mixer) = duplicate_routing_bus_mixer(
+        &candidate,
+        source.mixer,
+        &loaded_mixer,
+        source_track_id,
+        &duplicated_track_id,
+        kind,
+        assets,
+        limits,
+        &mut known_identities,
+        &mut next_identity,
+    )?;
+    let automation_takes = duplicate_routing_bus_automation_lanes(
+        &candidate,
+        assets,
+        source.automation_takes,
+        source_track_id,
+        &duplicated_track_id,
+        &source_send_ids,
+        &candidate_mixer,
+        limits,
+        &mut known_identities,
+        &mut next_identity,
+    )?;
+    candidate
+        .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
+        .map_err(RoutingBusDuplicationSerializationError::ProjectCompilation)?;
+    let device_chain = parsed_chain
+        .map(|chain| {
+            let chain_id = routing_bus_allocate_identity(&mut known_identities, &mut next_identity)?;
+            let mut device_ids = Vec::new();
+            device_ids
+                .try_reserve_exact(chain.devices().len())
+                .map_err(|_| RoutingBusDuplicationSerializationError::Source(capacity_error()))?;
+            for _ in chain.devices() {
+                device_ids.push(routing_bus_allocate_identity(&mut known_identities, &mut next_identity)?);
+            }
+            let cloned = chain
+                .try_clone_for_track(chain_id.clone(), duplicated_track_id.clone(), &device_ids)
+                .map_err(RoutingBusDuplicationSerializationError::Device)?;
+            let bytes = cloned
+                .to_canonical_vec()
+                .map_err(RoutingBusDuplicationSerializationError::Device)?;
+            Ok(TrackDuplicationDocument { id: chain_id, bytes })
+        })
+        .transpose()?;
+    Ok(TrackDuplicationDocuments {
+        track: TrackDuplicationDocument {
+            id: duplicated_track_id,
+            bytes: track_bytes,
+        },
+        clips: Vec::new(),
+        mixer,
+        arrangement: None,
+        scenes: Vec::new(),
+        automation_takes,
+        device_chain,
+    })
+}
+
+fn routing_bus_source_automation(
+    project: &LoadedPlaybackProject,
+    mixer: &super::LoadedMixer,
+    assets: &[MediaAssetFact<'_>],
+    expected_ids: &[&str],
+    source: &[(&str, &[u8])],
+    limits: LoaderLimits,
+) -> Result<super::LoadedAutomationSet, RoutingBusDuplicationSerializationError> {
+    if expected_ids.len() != source.len() {
+        return Err(RoutingBusDuplicationSerializationError::SourceAutomationCoverage);
+    }
+    let mut expected = BTreeSet::new();
+    for id in expected_ids {
+        if !is_valid_entity_id(id) || !expected.insert(*id) {
+            return Err(RoutingBusDuplicationSerializationError::SourceAutomationCoverage);
+        }
+    }
+    let mut documents = Vec::new();
+    documents
+        .try_reserve_exact(source.len())
+        .map_err(|_| RoutingBusDuplicationSerializationError::Source(capacity_error()))?;
+    let mut actual = BTreeSet::new();
+    for (id, bytes) in source {
+        if !actual.insert(*id) || !expected.contains(*id) {
+            return Err(RoutingBusDuplicationSerializationError::SourceAutomationCoverage);
+        }
+        let (_, canonical) = routing_bus_canonical_value(bytes)?;
+        if canonical != *bytes {
+            return Err(RoutingBusDuplicationSerializationError::SourceAutomationCoverage);
+        }
+        documents.push(*bytes);
+    }
+    let loaded = project
+        .load_automation_takes(mixer, assets, &documents, limits)
+        .map_err(RoutingBusDuplicationSerializationError::Source)?;
+    if loaded.takes().len() != source.len()
+        || loaded
+            .takes()
+            .iter()
+            .zip(source)
+            .any(|(take, (id, _))| take.id() != *id)
+    {
+        return Err(RoutingBusDuplicationSerializationError::SourceAutomationCoverage);
+    }
+    Ok(loaded)
+}
+
+fn routing_bus_source_device_chain(
+    project: &LoadedPlaybackProject,
+    source: RoutingBusDuplicationSource<'_>,
+    source_track_id: &str,
+    known_identities: &mut BTreeSet<String>,
+) -> Result<Option<DeviceChain>, RoutingBusDuplicationSerializationError> {
+    match (source.device_chain_id, source.device_chain) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            Err(RoutingBusDuplicationSerializationError::SourceDeviceChainMismatch)
+        }
+        (Some(expected_id), Some(bytes)) => {
+            let (_, canonical) = routing_bus_canonical_value(bytes)?;
+            if canonical != bytes {
+                return Err(RoutingBusDuplicationSerializationError::SourceDeviceChainMismatch);
+            }
+            let chain = DeviceChain::parse(bytes).map_err(RoutingBusDuplicationSerializationError::Device)?;
+            if chain.id() != expected_id
+                || chain.project_id() != project.project_id()
+                || chain.track_id() != source_track_id
+                || !known_identities.insert(chain.id().to_owned())
+                || chain
+                    .devices()
+                    .iter()
+                    .any(|device| !known_identities.insert(device.id().to_owned()))
+            {
+                return Err(RoutingBusDuplicationSerializationError::SourceDeviceChainMismatch);
+            }
+            Ok(Some(chain))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, reason = "the helper carries the owned channel, send, and return-bus identity transformations together")]
+fn duplicate_routing_bus_mixer(
+    candidate: &LoadedPlaybackProject,
+    source: &[u8],
+    loaded_source: &super::LoadedMixer,
+    source_track_id: &str,
+    duplicated_track_id: &str,
+    kind: super::RoutingBusKind,
+    assets: &[MediaAssetFact<'_>],
+    limits: LoaderLimits,
+    known_identities: &mut BTreeSet<String>,
+    next_identity: &mut impl FnMut() -> String,
+) -> Result<
+    (
+        TrackDuplicationDocument,
+        HashMap<String, String>,
+        super::LoadedMixer,
+    ),
+    RoutingBusDuplicationSerializationError,
+> {
+    let source_channel = loaded_source
+        .channels
+        .iter()
+        .find(|channel| channel.track_id == source_track_id)
+        .ok_or(RoutingBusDuplicationSerializationError::SourceMixerMismatch)?;
+    let (mut value, _) = routing_bus_canonical_value(source)?;
+    routing_bus_require_empty_extensions(&value)?;
+    let (duplicate, source_send_ids) = {
+        let channels = value
+            .get_mut("channels")
+            .and_then(Value::as_array_mut)
+            .ok_or(RoutingBusDuplicationSerializationError::InvalidDocumentShape)?;
+        let source_index = channels
+            .iter()
+            .position(|channel| channel.get("track_id").and_then(Value::as_str) == Some(source_track_id))
+            .ok_or(RoutingBusDuplicationSerializationError::SourceMixerMismatch)?;
+        let mut duplicate = channels[source_index].clone();
+        routing_bus_rewrite_string(&mut duplicate, "track_id", duplicated_track_id)?;
+        let sends = duplicate
+            .get_mut("sends")
+            .and_then(Value::as_array_mut)
+            .ok_or(RoutingBusDuplicationSerializationError::InvalidDocumentShape)?;
+        if sends.len() != source_channel.sends.len() {
+            return Err(RoutingBusDuplicationSerializationError::SourceMixerMismatch);
+        }
+        let mut source_send_ids = HashMap::new();
+        source_send_ids
+            .try_reserve(sends.len())
+            .map_err(|_| RoutingBusDuplicationSerializationError::Source(capacity_error()))?;
+        for (index, send) in sends.iter_mut().enumerate() {
+            let source_id = source_channel.sends[index].id.as_str();
+            if send.get("id").and_then(Value::as_str) != Some(source_id) {
+                return Err(RoutingBusDuplicationSerializationError::SourceMixerMismatch);
+            }
+            let duplicated_id = routing_bus_allocate_identity(known_identities, next_identity)?;
+            routing_bus_rewrite_string(send, "id", &duplicated_id)?;
+            source_send_ids.insert(source_id.to_owned(), duplicated_id);
+        }
+        (duplicate, source_send_ids)
+    };
+    if kind == super::RoutingBusKind::Return {
+        let return_buses = value
+            .get_mut("return_buses")
+            .and_then(Value::as_array_mut)
+            .ok_or(RoutingBusDuplicationSerializationError::InvalidDocumentShape)?;
+        let used = return_buses
+            .iter()
+            .map(|entry| entry.get("bus").and_then(Value::as_str))
+            .collect::<Option<BTreeSet<_>>>()
+            .ok_or(RoutingBusDuplicationSerializationError::InvalidDocumentShape)?;
+        let bus = ["a", "b"]
+            .into_iter()
+            .find(|bus| !used.contains(bus))
+            .ok_or(RoutingBusDuplicationSerializationError::ReturnBusUnavailable)?;
+        return_buses.push(serde_json::json!({"bus": bus, "track_id": duplicated_track_id}));
+        return_buses.sort_by_key(|entry| entry["bus"].as_str().unwrap_or_default().to_owned());
+    }
+    let channel_index = candidate
+        .structural_track_index(duplicated_track_id)
+        .ok_or(RoutingBusDuplicationSerializationError::SourceMixerMismatch)?;
+    let channels = value
+        .get_mut("channels")
+        .and_then(Value::as_array_mut)
+        .ok_or(RoutingBusDuplicationSerializationError::InvalidDocumentShape)?;
+    if channel_index > channels.len() {
+        return Err(RoutingBusDuplicationSerializationError::SourceMixerMismatch);
+    }
+    channels.insert(channel_index, duplicate);
+    let bytes = routing_bus_canonical_bytes(&value)?;
+    let loaded = candidate
+        .load_mixer(&bytes, assets, limits)
+        .map_err(RoutingBusDuplicationSerializationError::Source)?;
+    Ok((
+        TrackDuplicationDocument {
+            id: loaded_source.id.clone(),
+            bytes,
+        },
+        source_send_ids,
+        loaded,
+    ))
+}
+
+#[allow(clippy::too_many_arguments, reason = "the helper rewrites every owned routing-bus automation target in one candidate mixer domain")]
+fn duplicate_routing_bus_automation_lanes(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source: &[(&str, &[u8])],
+    source_track_id: &str,
+    duplicated_track_id: &str,
+    source_send_ids: &HashMap<String, String>,
+    mixer: &super::LoadedMixer,
+    limits: LoaderLimits,
+    known_identities: &mut BTreeSet<String>,
+    next_identity: &mut impl FnMut() -> String,
+) -> Result<Vec<TrackDuplicationDocument>, RoutingBusDuplicationSerializationError> {
+    let mut rewritten = Vec::new();
+    rewritten
+        .try_reserve_exact(source.len())
+        .map_err(|_| RoutingBusDuplicationSerializationError::Source(capacity_error()))?;
+    let mut output = Vec::new();
+    for (take_id, bytes) in source {
+        let (mut value, canonical) = routing_bus_canonical_value(bytes)?;
+        if canonical != *bytes {
+            return Err(RoutingBusDuplicationSerializationError::SourceAutomationCoverage);
+        }
+        let extensions_empty = routing_bus_extensions_empty(&value)?;
+        let lanes = value
+            .get_mut("lanes")
+            .and_then(Value::as_array_mut)
+            .ok_or(RoutingBusDuplicationSerializationError::InvalidDocumentShape)?;
+        let mut additions = Vec::new();
+        for lane in lanes.iter() {
+            let target = lane
+                .get("target")
+                .and_then(Value::as_object)
+                .ok_or(RoutingBusDuplicationSerializationError::InvalidDocumentShape)?;
+            let kind = target
+                .get("kind")
+                .and_then(Value::as_str)
+                .ok_or(RoutingBusDuplicationSerializationError::InvalidDocumentShape)?;
+            let rewrite = match kind {
+                "mixer-channel"
+                    if target.get("track_id").and_then(Value::as_str) == Some(source_track_id) =>
+                {
+                    Some(("track_id", duplicated_track_id.to_owned()))
+                }
+                "mixer-send" => target
+                    .get("send_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| source_send_ids.get(id))
+                    .map(|id| ("send_id", id.clone())),
+                "mixer-channel" | "mixer-main" | "mixer-cue" => None,
+                _ => return Err(RoutingBusDuplicationSerializationError::InvalidDocumentShape),
+            };
+            let Some((target_key, target_id)) = rewrite else {
+                continue;
+            };
+            let mut duplicate = lane.clone();
+            routing_bus_rewrite_string(
+                &mut duplicate,
+                "id",
+                &routing_bus_allocate_identity(known_identities, next_identity)?,
+            )?;
+            routing_bus_rewrite_string(
+                duplicate
+                    .get_mut("target")
+                    .ok_or(RoutingBusDuplicationSerializationError::InvalidDocumentShape)?,
+                target_key,
+                &target_id,
+            )?;
+            additions.push(duplicate);
+        }
+        if additions.is_empty() {
+            rewritten.push(None);
+        } else {
+            if !extensions_empty {
+                return Err(RoutingBusDuplicationSerializationError::UnknownExtensionSemantics);
+            }
+            lanes.extend(additions);
+            let bytes = routing_bus_canonical_bytes(&value)?;
+            output.push(TrackDuplicationDocument {
+                id: (*take_id).to_owned(),
+                bytes: bytes.clone(),
+            });
+            rewritten.push(Some(bytes));
+        }
+    }
+    let candidate_documents = rewritten
+        .iter()
+        .zip(source)
+        .map(|(replacement, (_, source_bytes))| replacement.as_deref().unwrap_or(source_bytes))
+        .collect::<Vec<_>>();
+    let automation = project
+        .load_automation_takes(mixer, assets, &candidate_documents, limits)
+        .map_err(RoutingBusDuplicationSerializationError::Source)?;
+    let graph = mixer
+        .compile_main_graph()
+        .map_err(RoutingBusDuplicationSerializationError::MixerCompilation)?;
+    project
+        .compile_main_automation(&graph, &automation)
+        .map_err(RoutingBusDuplicationSerializationError::AutomationCompilation)?;
+    Ok(output)
+}
+
+fn routing_bus_allocate_identity(
+    known: &mut BTreeSet<String>,
+    next_identity: &mut impl FnMut() -> String,
+) -> Result<String, RoutingBusDuplicationSerializationError> {
+    let identity = next_identity();
+    if !is_valid_entity_id(&identity) || !known.insert(identity.clone()) {
+        return Err(RoutingBusDuplicationSerializationError::InvalidGeneratedIdentity);
+    }
+    Ok(identity)
+}
+
+fn routing_bus_canonical_value(
+    bytes: &[u8],
+) -> Result<(Value, Vec<u8>), RoutingBusDuplicationSerializationError> {
+    let value = serde_json::from_slice(bytes).map_err(RoutingBusDuplicationSerializationError::Serialization)?;
+    let canonical = routing_bus_canonical_bytes(&value)?;
+    Ok((value, canonical))
+}
+
+fn routing_bus_canonical_bytes(
+    value: &Value,
+) -> Result<Vec<u8>, RoutingBusDuplicationSerializationError> {
+    serde_json_canonicalizer::to_vec(value).map_err(RoutingBusDuplicationSerializationError::Serialization)
+}
+
+fn routing_bus_extensions_empty(
+    value: &Value,
+) -> Result<bool, RoutingBusDuplicationSerializationError> {
+    value
+        .get("extensions")
+        .and_then(Value::as_object)
+        .map(serde_json::Map::is_empty)
+        .ok_or(RoutingBusDuplicationSerializationError::InvalidDocumentShape)
+}
+
+fn routing_bus_require_empty_extensions(
+    value: &Value,
+) -> Result<(), RoutingBusDuplicationSerializationError> {
+    if routing_bus_extensions_empty(value)? {
+        Ok(())
+    } else {
+        Err(RoutingBusDuplicationSerializationError::UnknownExtensionSemantics)
+    }
+}
+
+fn routing_bus_rewrite_string(
+    value: &mut Value,
+    key: &str,
+    replacement: &str,
+) -> Result<(), RoutingBusDuplicationSerializationError> {
+    let object = value
+        .as_object_mut()
+        .ok_or(RoutingBusDuplicationSerializationError::InvalidDocumentShape)?;
+    if !object.contains_key(key) {
+        return Err(RoutingBusDuplicationSerializationError::InvalidDocumentShape);
+    }
+    object.insert(key.to_owned(), replacement.into());
+    Ok(())
+}
+
+fn routing_bus_replace_u8(
+    value: &mut Value,
+    key: &str,
+    replacement: u8,
+) -> Result<(), RoutingBusDuplicationSerializationError> {
+    let object = value
+        .as_object_mut()
+        .ok_or(RoutingBusDuplicationSerializationError::InvalidDocumentShape)?;
+    if !object.contains_key(key) {
+        return Err(RoutingBusDuplicationSerializationError::InvalidDocumentShape);
+    }
+    object.insert(key.to_owned(), u64::from(replacement).into());
+    Ok(())
 }
 
 /// One canonical replacement or removed resource in a complete track-content
@@ -2245,6 +2890,173 @@ mod tests {
         .unwrap();
         let copied: Value = serde_json::from_slice(documents.track().bytes()).unwrap();
         assert_eq!(copied["order"], 1);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture proves a copied group retains only its owned identity graph and never creates a new inbound route"
+    )]
+    fn duplicates_group_owned_state_without_copying_incoming_routes() {
+        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) = fixture();
+        let mut group_track: Value = serde_json::from_slice(&return_track).unwrap();
+        group_track["kind"] = "group".into();
+        group_track["name"] = "Drums".into();
+        let group_track = canonical(group_track);
+        let return_two_id = "018f47a2-6b2d-7c11-8a44-001122335018";
+        let mut second_return: Value = serde_json::from_slice(&return_track).unwrap();
+        second_return["id"] = return_two_id.into();
+        second_return["name"] = "Verb".into();
+        second_return["order"] = 2.into();
+        let second_return = canonical(second_return);
+        let mut group_mixer: Value = serde_json::from_slice(&mixer).unwrap();
+        group_mixer["channels"][0]["destination"] = serde_json::json!({"kind":"track", "track_id": RETURN_ID});
+        group_mixer["channels"][0]["sends"] = serde_json::json!([]);
+        group_mixer["channels"][1]["track_id"] = RETURN_ID.into();
+        group_mixer["channels"][1]["sends"] = serde_json::json!([
+            {"id": SEND_ID, "bus":"a", "tap":"post-fader", "gain_millionths":500_000, "pan_millionths":100_000, "enabled":true}
+        ]);
+        group_mixer["channels"].as_array_mut().unwrap().push(serde_json::json!({
+            "track_id": return_two_id, "gain_millionths":1_000_000, "pan_millionths":0,
+            "mute":false, "solo":false, "destination":{"kind":"main"}, "sends":[]
+        }));
+        group_mixer["return_buses"] = serde_json::json!([{"bus":"a", "track_id":return_two_id}]);
+        let group_mixer = canonical(group_mixer);
+        let mut group_take: Value = serde_json::from_slice(&take).unwrap();
+        group_take["lanes"][0]["target"]["track_id"] = RETURN_ID.into();
+        group_take["lanes"][1]["target"]["send_id"] = SEND_ID.into();
+        let group_take = canonical(group_take);
+        let mut group_chain: Value = serde_json::from_slice(&device_chain).unwrap();
+        group_chain["track_id"] = RETURN_ID.into();
+        let group_chain = canonical(group_chain);
+        let tracks = [track.as_slice(), group_track.as_slice(), second_return.as_slice()];
+        let clips = [clip.as_slice()];
+        let scenes = [scene.as_slice()];
+        let project = crate::load(
+            crate::PlaybackJsonInput {
+                project_id: PROJECT_ID,
+                sample_rate_hz: 48_000,
+                timeline: &timeline,
+                tracks: &tracks,
+                clips: &clips,
+                scenes: &scenes,
+                arrangement: Some(&arrangement),
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let assets = [MediaAssetFact {
+            id: ASSET_ID,
+            sample_rate_hz: 48_000,
+            frame_count: 24_000,
+        }];
+        let identities = [
+            "018f47a2-6b2d-7c11-8a44-001122335101",
+            "018f47a2-6b2d-7c11-8a44-001122335102",
+            "018f47a2-6b2d-7c11-8a44-001122335103",
+            "018f47a2-6b2d-7c11-8a44-001122335104",
+            "018f47a2-6b2d-7c11-8a44-001122335105",
+            "018f47a2-6b2d-7c11-8a44-001122335106",
+        ];
+        let mut identities = identities.into_iter();
+        let documents = serialize_routing_bus_duplication(
+            &project,
+            &assets,
+            RoutingBusDuplicationSource {
+                track: &group_track,
+                mixer: &group_mixer,
+                automation_take_ids: &[TAKE_ID],
+                automation_takes: &[(TAKE_ID, group_take.as_slice())],
+                device_chain_id: Some("018f47a2-6b2d-7c11-8a44-001122335017"),
+                device_chain: Some(&group_chain),
+            },
+            RETURN_ID,
+            "Drums copy",
+            LoaderLimits::VERSION_1,
+            || identities.next().unwrap().to_owned(),
+        )
+        .unwrap();
+
+        let group_copy_id = documents.track().id();
+        let mixer_value: Value = serde_json::from_slice(documents.mixer().bytes()).unwrap();
+        assert_eq!(mixer_value["channels"][0]["destination"]["track_id"], RETURN_ID);
+        let group_copy = mixer_value["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|channel| channel["track_id"] == group_copy_id)
+            .unwrap();
+        assert_eq!(group_copy["sends"][0]["id"], "018f47a2-6b2d-7c11-8a44-001122335102");
+        assert_eq!(group_copy["sends"][0]["bus"], "a");
+        let automation_value: Value = serde_json::from_slice(documents.automation_takes()[0].bytes()).unwrap();
+        assert_eq!(automation_value["lanes"].as_array().unwrap().len(), 5);
+        assert_eq!(automation_value["lanes"][3]["target"]["track_id"], group_copy_id);
+        assert_eq!(automation_value["lanes"][4]["target"]["send_id"], "018f47a2-6b2d-7c11-8a44-001122335102");
+        let cloned_chain = DeviceChain::parse(documents.device_chain().unwrap().bytes()).unwrap();
+        assert_eq!(cloned_chain.track_id(), group_copy_id);
+        assert_eq!(cloned_chain.devices()[0].id(), "018f47a2-6b2d-7c11-8a44-001122335106");
+    }
+
+    #[test]
+    fn duplicates_return_with_a_fresh_bus_without_copying_its_incoming_sends() {
+        let (timeline, track, return_track, clip, scene, arrangement, mixer, take, device_chain) = fixture();
+        let mut return_chain: Value = serde_json::from_slice(&device_chain).unwrap();
+        return_chain["track_id"] = RETURN_ID.into();
+        let return_chain = canonical(return_chain);
+        let tracks = [track.as_slice(), return_track.as_slice()];
+        let clips = [clip.as_slice()];
+        let scenes = [scene.as_slice()];
+        let project = crate::load(
+            crate::PlaybackJsonInput {
+                project_id: PROJECT_ID,
+                sample_rate_hz: 48_000,
+                timeline: &timeline,
+                tracks: &tracks,
+                clips: &clips,
+                scenes: &scenes,
+                arrangement: Some(&arrangement),
+            },
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let assets = [MediaAssetFact {
+            id: ASSET_ID,
+            sample_rate_hz: 48_000,
+            frame_count: 24_000,
+        }];
+        let identities = [
+            "018f47a2-6b2d-7c11-8a44-001122335201",
+            "018f47a2-6b2d-7c11-8a44-001122335202",
+            "018f47a2-6b2d-7c11-8a44-001122335203",
+        ];
+        let mut identities = identities.into_iter();
+        let documents = serialize_routing_bus_duplication(
+            &project,
+            &assets,
+            RoutingBusDuplicationSource {
+                track: &return_track,
+                mixer: &mixer,
+                automation_take_ids: &[TAKE_ID],
+                automation_takes: &[(TAKE_ID, take.as_slice())],
+                device_chain_id: Some("018f47a2-6b2d-7c11-8a44-001122335017"),
+                device_chain: Some(&return_chain),
+            },
+            RETURN_ID,
+            "Verb copy",
+            LoaderLimits::VERSION_1,
+            || identities.next().unwrap().to_owned(),
+        )
+        .unwrap();
+
+        assert!(documents.automation_takes().is_empty());
+        let mixer_value: Value = serde_json::from_slice(documents.mixer().bytes()).unwrap();
+        assert_eq!(mixer_value["channels"][0]["sends"].as_array().unwrap().len(), 1);
+        assert_eq!(mixer_value["return_buses"], serde_json::json!([
+            {"bus":"a", "track_id":RETURN_ID},
+            {"bus":"b", "track_id":documents.track().id()}
+        ]));
+        let cloned_chain = DeviceChain::parse(documents.device_chain().unwrap().bytes()).unwrap();
+        assert_eq!(cloned_chain.track_id(), documents.track().id());
     }
 
     #[test]

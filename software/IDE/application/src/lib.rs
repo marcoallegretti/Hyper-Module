@@ -92,6 +92,7 @@ use hyper_playback_json::{
     AudioTrackDocumentSerializationError, AudioTrackRemovalBlockers,
     AudioTrackRemovalSerializationError, AudioTrackRenameSerializationError,
     AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
+    RoutingBusDuplicationSerializationError, RoutingBusDuplicationSource,
     MixerStripReorderSerializationError,
     AudioPrimaryRouteSerializationError, AudioPrimaryRouteTarget,
     ReturnSendSerializationError, RoutingBusCreationSerializationError,
@@ -120,6 +121,7 @@ use hyper_playback_json::{
     serialize_audio_track_content_removal,
     serialize_audio_track_removal, serialize_audio_track_rename,
     serialize_audio_track_duplication, serialize_mixer_strip_reorder,
+    serialize_routing_bus_duplication,
     serialize_audio_primary_route_change, serialize_return_send_addition,
     serialize_return_send_removal,
     serialize_routing_bus_creation, serialize_routing_bus_removal,
@@ -2576,9 +2578,10 @@ impl Error for IdeMixerStripReorderError {
     }
 }
 
-/// A complete independent audio-track duplication. The operation owns every
-/// mutable document edge that the duplicated track can reach, so publication
-/// is intentionally one manifest-last batch rather than a sequence of edits.
+/// A complete independent executable mixer-strip duplication. The operation
+/// owns every mutable document edge that the selected strip can reach, so
+/// publication is intentionally one manifest-last batch rather than a
+/// sequence of edits.
 #[derive(Debug)]
 pub enum IdeAudioTrackDuplicationError {
     MixerSave(Box<IdeProjectSaveError>),
@@ -2590,6 +2593,7 @@ pub enum IdeAudioTrackDuplicationError {
     CapacityUnavailable,
     InvalidName,
     Serialization(AudioTrackDuplicationSerializationError),
+    RoutingBusSerialization(RoutingBusDuplicationSerializationError),
     Publication(Box<ProjectResourcePublicationError>),
     NativeClose(IdeNativeCloseFailure),
     NativeCloseAndReopen {
@@ -2633,7 +2637,7 @@ impl fmt::Display for IdeAudioTrackDuplicationError {
                 formatter.write_str("the source audio track is unavailable")
             }
             Self::TrackResourceRoleMismatch => formatter.write_str(
-                "the selected track cannot be duplicated as independent audio-track state",
+                "the selected mixer strip cannot be duplicated as independent track state",
             ),
             Self::DeviceChainAmbiguous => formatter.write_str(
                 "the source track has more than one native device chain",
@@ -2641,30 +2645,31 @@ impl fmt::Display for IdeAudioTrackDuplicationError {
             Self::CapacityUnavailable => {
                 formatter.write_str("audio-track duplication capacity is unavailable")
             }
-            Self::InvalidName => formatter.write_str("the duplicated track name is invalid"),
+            Self::InvalidName => formatter.write_str("the duplicated mixer-strip name is invalid"),
             Self::Serialization(source) => source.fmt(formatter),
+            Self::RoutingBusSerialization(source) => source.fmt(formatter),
             Self::Publication(source) => source.fmt(formatter),
             Self::NativeClose(source) => write!(
                 formatter,
-                "native playback did not close cleanly before duplicating the audio track: {source:?}"
+                "native playback did not close cleanly before duplicating the mixer strip: {source:?}"
             ),
             Self::NativeCloseAndReopen { close, reopen } => write!(
                 formatter,
-                "native playback did not close cleanly before duplicating the audio track ({close:?}) and the unchanged project could not be reopened ({reopen})"
+                "native playback did not close cleanly before duplicating the mixer strip ({close:?}) and the unchanged project could not be reopened ({reopen})"
             ),
             Self::ReopenAfterPreparation { preparation, reopen } => write!(
                 formatter,
-                "audio-track duplication preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
+                "mixer-strip duplication preparation failed ({preparation}) and the unchanged project could not be reopened ({reopen})"
             ),
             Self::ReopenAfterPublication { outcome, source } => write!(
                 formatter,
-                "audio track {} was duplicated in project revision {} but the project could not be reopened: {source}",
+                "mixer strip {} was duplicated in project revision {} but the project could not be reopened: {source}",
                 outcome.track_id(),
                 outcome.project_revision()
             ),
             Self::PublicationAndReopen { publication, reopen } => write!(
                 formatter,
-                "audio-track duplication failed ({publication}) and the project could not be reopened ({reopen})"
+                "mixer-strip duplication failed ({publication}) and the project could not be reopened ({reopen})"
             ),
         }
     }
@@ -2677,6 +2682,7 @@ impl Error for IdeAudioTrackDuplicationError {
             Self::Storage(source) => Some(source),
             Self::Device(source) => Some(source),
             Self::Serialization(source) => Some(source),
+            Self::RoutingBusSerialization(source) => Some(source),
             Self::Publication(source) => Some(source.as_ref()),
             Self::NativeCloseAndReopen { reopen, .. } => Some(reopen.as_ref()),
             Self::ReopenAfterPreparation { preparation, .. } => Some(preparation.as_ref()),
@@ -9770,26 +9776,46 @@ impl RunningDesktopIdeApplication {
             .iter()
             .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
             .collect::<Vec<_>>();
-        let documents = serialize_audio_track_duplication(
-            project,
-            &assets,
-            AudioTrackDuplicationSource {
-                track: &source_track,
-                clips: &clip_sources,
-                scenes: &scene_sources,
-                arrangement: arrangement.as_deref(),
-                mixer: &mixer.resource_bytes,
-                automation_take_ids: &automation_take_ids,
-                automation_takes: &automation_sources,
-                device_chain_id: device_chain_id.as_deref(),
-                device_chain: device_chain.as_deref(),
-            },
-            track_id,
-            track_name,
-            application.config.project_limits.session.documents,
-            || uuid::Uuid::new_v4().to_string(),
-        )
-        .map_err(IdeAudioTrackDuplicationError::Serialization)?;
+        let documents = if project.is_audio_track(track_id) {
+            serialize_audio_track_duplication(
+                project,
+                &assets,
+                AudioTrackDuplicationSource {
+                    track: &source_track,
+                    clips: &clip_sources,
+                    scenes: &scene_sources,
+                    arrangement: arrangement.as_deref(),
+                    mixer: &mixer.resource_bytes,
+                    automation_take_ids: &automation_take_ids,
+                    automation_takes: &automation_sources,
+                    device_chain_id: device_chain_id.as_deref(),
+                    device_chain: device_chain.as_deref(),
+                },
+                track_id,
+                track_name,
+                application.config.project_limits.session.documents,
+                || uuid::Uuid::new_v4().to_string(),
+            )
+            .map_err(IdeAudioTrackDuplicationError::Serialization)?
+        } else {
+            serialize_routing_bus_duplication(
+                project,
+                &assets,
+                RoutingBusDuplicationSource {
+                    track: &source_track,
+                    mixer: &mixer.resource_bytes,
+                    automation_take_ids: &automation_take_ids,
+                    automation_takes: &automation_sources,
+                    device_chain_id: device_chain_id.as_deref(),
+                    device_chain: device_chain.as_deref(),
+                },
+                track_id,
+                track_name,
+                application.config.project_limits.session.documents,
+                || uuid::Uuid::new_v4().to_string(),
+            )
+            .map_err(IdeAudioTrackDuplicationError::RoutingBusSerialization)?
+        };
         Ok(IdeAudioTrackDuplicationPlan { mixer, documents })
     }
 

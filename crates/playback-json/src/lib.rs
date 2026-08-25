@@ -17,7 +17,10 @@ pub use duplication::{
     AudioTrackContentRemovalSerializationError, AudioTrackContentRemovalSource,
     AudioTrackDuplicationDocument, AudioTrackDuplicationDocuments,
     AudioTrackDuplicationSerializationError, AudioTrackDuplicationSource,
+    RoutingBusDuplicationSerializationError, RoutingBusDuplicationSource,
+    TrackDuplicationDocument, TrackDuplicationDocuments,
     serialize_audio_track_content_removal, serialize_audio_track_duplication,
+    serialize_routing_bus_duplication,
 };
 
 use core::error::Error;

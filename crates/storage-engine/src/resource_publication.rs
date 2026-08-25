@@ -28,7 +28,8 @@ pub use audio_clip_publication::{
 pub use audio_track_duplication::{
     AudioTrackDuplicationPublicationOutcome, AudioTrackDuplicationPublicationRecovery,
     AudioTrackDuplicationPublicationRecoveryDisposition, AudioTrackDuplicationPublicationRequest,
-    publish_audio_track_duplication, recover_audio_track_duplications,
+    RoutingBusDuplicationPublicationRequest, publish_audio_track_duplication,
+    publish_routing_bus_duplication, recover_audio_track_duplications,
 };
 pub use audio_track_content_removal::{
     AudioTrackContentRemovalPublicationOutcome, AudioTrackContentRemovalPublicationRecovery,
