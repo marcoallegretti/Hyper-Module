@@ -343,7 +343,7 @@ export global IdeActions {
     callback undo-edit();
     callback redo-edit();
     callback save-project();
-    callback save-project-as(string);
+    callback save-project-as(string, bool);
     callback rename-project(string);
     callback add-audio-track(string);
     callback begin-routing-bus-creation();
@@ -467,6 +467,7 @@ export component MainWindow inherits Window {
     in-out property <string> new-project-name: "Untitled Project";
     in-out property <bool> save-project-as-visible: false;
     in-out property <string> save-project-as-name: "";
+    in-out property <bool> save-project-as-switch-to: true;
     in-out property <bool> rename-project-visible: false;
     in-out property <string> rename-project-name: "";
     in property <string> project-id: "—";
@@ -892,6 +893,7 @@ export component MainWindow inherits Window {
             if event.modifiers.control && event.modifiers.shift && !event.modifiers.alt && !event.modifiers.meta && !event.repeat && (event.text == "s" || event.text == "S") {
                 if root.app-mode == AppMode.running && root.mixer-main-state-available && !root.local-edit-form-visible {
                     root.save-project-as-name = root.project-name + " copy";
+                    root.save-project-as-switch-to = true;
                     root.save-project-as-visible = true;
                 }
                 return accept;
@@ -1374,7 +1376,26 @@ export component MainWindow inherits Window {
                                 enabled: root.app-mode == AppMode.running;
                                 accessible-label: "Independent project name";
                             }
-                            Text { text: "Creates and verifies an independent project package, then opens it without altering this source package."; color: #728196; font-size: 9px; wrap: word-wrap; }
+                            Button {
+                                text: root.save-project-as-switch-to
+                                    ? "After saving: open copy"
+                                    : "After saving: keep source open";
+                                accessible-label: root.save-project-as-switch-to
+                                    ? "After saving, open the independent project copy"
+                                    : "After saving, keep the source project open";
+                                enabled: root.app-mode == AppMode.running;
+                                clicked => {
+                                    root.save-project-as-switch-to = !root.save-project-as-switch-to;
+                                }
+                            }
+                            Text {
+                                text: root.save-project-as-switch-to
+                                    ? "Preserves live mixer state in the source project, creates and verifies an independent package, then opens it."
+                                    : "Preserves live mixer state in the source project, creates and verifies an independent package, then reopens this source project.";
+                                color: #728196;
+                                font-size: 9px;
+                                wrap: word-wrap;
+                            }
                             HorizontalLayout {
                                 spacing: 8px;
                                 save-project-as-cancel := Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.save-project-as-visible = false; } }
@@ -1382,7 +1403,7 @@ export component MainWindow inherits Window {
                                     horizontal-stretch: 1;
                                     text: root.app-mode == AppMode.saving ? "Saving copy…" : "Choose location & save copy";
                                     enabled: root.app-mode == AppMode.running && root.save-project-as-name != "";
-                                    clicked => { IdeActions.save-project-as(root.save-project-as-name); }
+                                    clicked => { IdeActions.save-project-as(root.save-project-as-name, root.save-project-as-switch-to); }
                                 }
                             }
                         }
@@ -1428,6 +1449,7 @@ export component MainWindow inherits Window {
                                     accessible-label: "Save an independent verified project copy";
                                     clicked => {
                                         root.save-project-as-name = root.project-name + " copy";
+                                        root.save-project-as-switch-to = true;
                                         root.save-project-as-visible = true;
                                     }
                                 }

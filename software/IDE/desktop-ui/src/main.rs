@@ -1300,7 +1300,7 @@ fn bind_project_save_callback_with(
 }
 
 fn bind_project_copy_callback(ui: &MainWindow, worker: &WorkerCell) {
-    bind_project_copy_callback_with(ui, worker, |weak, worker, project_name| {
+    bind_project_copy_callback_with(ui, worker, |weak, worker, project_name, switch_to| {
         let weak_for_dialog = weak.clone();
         let spawn_result = slint::spawn_local(async move {
             let selection = rfd::AsyncFileDialog::new()
@@ -1317,6 +1317,7 @@ fn bind_project_copy_callback(ui: &MainWindow, worker: &WorkerCell) {
                 &ui,
                 &worker,
                 project_name,
+                switch_to,
                 selection.map_or(ProjectCopyChoice::Cancelled, |selection| {
                     ProjectCopyChoice::Selected(selection.path().to_path_buf())
                 }),
@@ -1341,9 +1342,10 @@ fn complete_project_copy_choice(
     ui: &MainWindow,
     worker: &WorkerCell,
     project_name: String,
+    switch_to: bool,
     choice: ProjectCopyChoice,
 ) {
-    complete_project_copy_choice_with(ui, project_name, choice, |command| {
+    complete_project_copy_choice_with(ui, project_name, switch_to, choice, |command| {
         submit_to_ui(ui, worker, command);
     });
 }
@@ -1351,6 +1353,7 @@ fn complete_project_copy_choice(
 fn complete_project_copy_choice_with(
     ui: &MainWindow,
     project_name: String,
+    switch_to: bool,
     choice: ProjectCopyChoice,
     submit: impl FnOnce(IdeWorkerCommand),
 ) {
@@ -1359,6 +1362,7 @@ fn complete_project_copy_choice_with(
             parent,
             directory_name: project_name.clone(),
             project_name,
+            switch_to,
         }),
         ProjectCopyChoice::Cancelled => {
             ui.set_app_mode(AppMode::Running);
@@ -1370,11 +1374,11 @@ fn complete_project_copy_choice_with(
 fn bind_project_copy_callback_with(
     ui: &MainWindow,
     worker: &WorkerCell,
-    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell, String) + 'static,
+    choose: impl Fn(slint::Weak<MainWindow>, WorkerCell, String, bool) + 'static,
 ) {
     let weak = ui.as_weak();
     let worker = Rc::clone(worker);
-    ui.global::<IdeActions>().on_save_project_as(move |project_name| {
+    ui.global::<IdeActions>().on_save_project_as(move |project_name, switch_to| {
         let Some(ui) = weak.upgrade() else {
             return;
         };
@@ -1389,7 +1393,7 @@ fn bind_project_copy_callback_with(
         ui.set_app_mode(AppMode::Saving);
         ui.set_error_text(SharedString::default());
         ui.set_status_text("Waiting for the independent project destination…".into());
-        choose(weak.clone(), Rc::clone(&worker), project_name);
+        choose(weak.clone(), Rc::clone(&worker), project_name, switch_to);
     });
 }
 
@@ -4839,18 +4843,32 @@ fn apply_event(
             ui.set_error_text(SharedString::default());
         }
         event @ IdeWorkerEvent::ProjectSaved { .. } => apply_project_saved_event(ui, &event),
-        IdeWorkerEvent::ProjectCopied { project_path } => {
+        IdeWorkerEvent::ProjectCopied {
+            project_path,
+            opened,
+        } => {
             ui.set_status_text(
-                format!("Independent project verified and opened at {}", project_path.display()).into(),
+                if opened {
+                    format!("Independent project verified and opened at {}", project_path.display())
+                } else {
+                    format!("Independent project verified at {}; source project remains open", project_path.display())
+                }
+                .into(),
             );
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::ProjectCopyCommittedWithWarning {
             project_path,
+            opened,
             warning,
         } => {
             ui.set_status_text(
-                format!("Independent project opened at {} with a durability warning", project_path.display()).into(),
+                if opened {
+                    format!("Independent project opened at {} with a durability warning", project_path.display())
+                } else {
+                    format!("Independent project verified at {}; source project remains open with a durability warning", project_path.display())
+                }
+                .into(),
             );
             ui.set_error_text(warning.to_string().into());
         }
@@ -11523,11 +11541,12 @@ mod tests {
 
     fn assert_project_copy_callback_contract(ui: &MainWindow) {
         let worker: WorkerCell = Rc::new(RefCell::new(None));
-        bind_project_copy_callback_with(ui, &worker, move |weak, _, project_name| {
+        bind_project_copy_callback_with(ui, &worker, move |weak, _, project_name, switch_to| {
             let ui = weak.upgrade().unwrap();
             complete_project_copy_choice_with(
                 &ui,
                 project_name,
+                switch_to,
                 ProjectCopyChoice::Cancelled,
                 |_| panic!("a cancelled Save As chooser must not submit a command"),
             );
@@ -11535,7 +11554,7 @@ mod tests {
         ui.set_app_mode(AppMode::Running);
         ui.set_save_project_as_visible(true);
         ui.global::<IdeActions>()
-            .invoke_save_project_as("Independent".into());
+            .invoke_save_project_as("Independent".into(), true);
         assert_eq!(ui.get_app_mode(), AppMode::Running);
         assert_eq!(ui.get_status_text(), "Save As cancelled");
 
@@ -11544,6 +11563,7 @@ mod tests {
         complete_project_copy_choice_with(
             ui,
             "Independent".to_owned(),
+            true,
             ProjectCopyChoice::Selected(PathBuf::from("parent")),
             move |command| submitted_by_choice.borrow_mut().push(command),
         );
@@ -11553,30 +11573,33 @@ mod tests {
                 parent,
                 directory_name,
                 project_name,
+                switch_to,
             }] if parent == &PathBuf::from("parent")
                 && directory_name == "Independent"
                 && project_name == "Independent"
+                && *switch_to
         ));
 
-        bind_project_copy_callback_with(ui, &worker, move |weak, worker, project_name| {
+        bind_project_copy_callback_with(ui, &worker, move |weak, worker, project_name, switch_to| {
             let ui = weak.upgrade().unwrap();
             complete_project_copy_choice(
                 &ui,
                 &worker,
                 project_name,
+                switch_to,
                 ProjectCopyChoice::Selected(PathBuf::from("parent")),
             );
         });
         ui.set_app_mode(AppMode::Running);
         ui.set_save_project_as_visible(true);
         ui.global::<IdeActions>()
-            .invoke_save_project_as("Independent".into());
+            .invoke_save_project_as("Independent".into(), true);
         assert_eq!(ui.get_app_mode(), AppMode::Unavailable);
         assert!(ui.get_error_text().contains("no longer available"));
         ui.set_app_mode(AppMode::Saving);
         ui.set_error_text(SharedString::default());
         ui.global::<IdeActions>()
-            .invoke_save_project_as("Ignored".into());
+            .invoke_save_project_as("Ignored".into(), true);
         assert!(ui.get_error_text().is_empty());
         ui.set_save_project_as_visible(false);
         ui.set_app_mode(AppMode::Running);
@@ -12793,11 +12816,12 @@ mod tests {
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let submitted_by_choice = Rc::clone(&submitted);
         let worker: WorkerCell = Rc::new(RefCell::new(None));
-        bind_project_copy_callback_with(&ui, &worker, move |weak, _, project_name| {
+        bind_project_copy_callback_with(&ui, &worker, move |weak, _, project_name, switch_to| {
             let ui = weak.upgrade().unwrap();
             complete_project_copy_choice_with(
                 &ui,
                 project_name,
+                switch_to,
                 ProjectCopyChoice::Selected(PathBuf::from("parent")),
                 |command| submitted_by_choice.borrow_mut().push(command),
             );
@@ -12818,6 +12842,7 @@ mod tests {
             .next()
             .expect("the generated Save As submission button must be present");
         assert!(submits.next().is_none(), "the Save As submission button id is unique");
+        ui.set_save_project_as_switch_to(false);
         submit.mock_single_click(PointerEventButton::Left);
         assert!(matches!(
             submitted.borrow().as_slice(),
@@ -12825,9 +12850,11 @@ mod tests {
                 parent,
                 directory_name,
                 project_name,
+                switch_to,
             }] if parent == &PathBuf::from("parent")
                 && directory_name == "Source copy"
                 && project_name == "Source copy"
+                && !switch_to
         ));
         submit.mock_single_click(PointerEventButton::Left);
         assert_eq!(

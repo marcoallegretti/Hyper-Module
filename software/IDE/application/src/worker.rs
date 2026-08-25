@@ -266,6 +266,7 @@ pub enum IdeWorkerCommand {
         parent: PathBuf,
         directory_name: String,
         project_name: String,
+        switch_to: bool,
     },
     RenameProject {
         project_name: String,
@@ -1749,6 +1750,10 @@ pub enum IdeProjectCopyError {
         project_path: PathBuf,
         source: IdeProjectOpenError,
     },
+    CopiedButSourceNotReopened {
+        project_path: PathBuf,
+        source: IdeProjectOpenError,
+    },
 }
 
 impl fmt::Display for IdeProjectCopyError {
@@ -1768,6 +1773,14 @@ impl fmt::Display for IdeProjectCopyError {
                 "project was safely copied to {} but could not be opened: {source}",
                 project_path.display()
             ),
+            Self::CopiedButSourceNotReopened {
+                project_path,
+                source,
+            } => write!(
+                formatter,
+                "project was safely copied to {} but the source project could not be reopened: {source}",
+                project_path.display()
+            ),
         }
     }
 }
@@ -1778,7 +1791,8 @@ impl Error for IdeProjectCopyError {
             Self::Save(source) => Some(source),
             Self::Copy(source) => Some(source),
             Self::SourceReopen { source, .. } => Some(source.as_ref()),
-            Self::CopiedButNotOpened { source, .. } => Some(source),
+            Self::CopiedButNotOpened { source, .. }
+            | Self::CopiedButSourceNotReopened { source, .. } => Some(source),
         }
     }
 }
@@ -2339,9 +2353,11 @@ pub enum IdeWorkerEvent {
     },
     ProjectCopied {
         project_path: PathBuf,
+        opened: bool,
     },
     ProjectCopyCommittedWithWarning {
         project_path: PathBuf,
+        opened: bool,
         warning: Box<IdeProjectCopyError>,
     },
     ProjectRenamed {
@@ -3167,6 +3183,7 @@ enum ProjectMutation {
         parent: PathBuf,
         directory_name: String,
         project_name: String,
+        switch_to: bool,
     },
     RenameProject {
         project_name: String,
@@ -4308,6 +4325,7 @@ fn process_project_mutation_command(
             parent,
             directory_name,
             project_name,
+            switch_to,
         } => begin_project_mutation_request(
             state,
             events,
@@ -4315,6 +4333,7 @@ fn process_project_mutation_command(
                 parent,
                 directory_name,
                 project_name,
+                switch_to,
             },
         ),
         IdeWorkerCommand::RenameProject { project_name } => {
@@ -8686,6 +8705,8 @@ struct RuntimePreparationAttempt {
 
 struct ProjectCopyAttempt {
     destination_path: PathBuf,
+    mixer: Option<hyper_storage_engine::ProjectResourcePublicationOutcome>,
+    switch_to: bool,
     result: Result<(), IdeProjectCopyError>,
 }
 
@@ -10320,6 +10341,10 @@ fn complete_project_copy(
 ) -> bool {
     let committed = attempt.publication_committed();
     let destination_path = attempt.destination_path;
+    let switch_to = attempt.switch_to;
+    if !switch_to {
+        observe_project_copy_source_history(history, attempt.mixer.as_ref(), events);
+    }
     let warning = attempt.result.err();
     if !committed {
         let reason = warning.expect("unpublished project copies must retain their failure");
@@ -10352,6 +10377,48 @@ fn complete_project_copy(
             }
         };
     }
+    if !switch_to {
+        return match application.open_project(source_path) {
+            Ok(running) => {
+                *state = WorkerState::Running(running);
+                let mut no_native_failure = None;
+                publish_state(state, events, &mut no_native_failure)
+                    && match warning {
+                        Some(warning) => send_event(
+                            events,
+                            IdeWorkerEvent::ProjectCopyCommittedWithWarning {
+                                project_path: destination_path,
+                                opened: false,
+                                warning: Box::new(warning),
+                            },
+                        ),
+                        None => send_event(
+                            events,
+                            IdeWorkerEvent::ProjectCopied {
+                                project_path: destination_path,
+                                opened: false,
+                            },
+                        ),
+                    }
+            }
+            Err(source) => {
+                let (application, source) = source.into_parts();
+                *state = WorkerState::Closed(application);
+                let mut no_native_failure = None;
+                publish_state(state, events, &mut no_native_failure)
+                    && publish_failure(
+                        events,
+                        IdeWorkerCommandKind::SaveProjectAs,
+                        IdeWorkerCommandFailure::ProjectCopy(Box::new(
+                            IdeProjectCopyError::CopiedButSourceNotReopened {
+                                project_path: destination_path,
+                                source,
+                            },
+                        )),
+                    )
+            }
+        };
+    }
     match application.open_project(&destination_path) {
         Ok(running) => {
             if !remember_running_project(project_history, &running, events) {
@@ -10368,6 +10435,7 @@ fn complete_project_copy(
                         events,
                         IdeWorkerEvent::ProjectCopyCommittedWithWarning {
                             project_path: destination_path,
+                            opened: true,
                             warning: Box::new(warning),
                         },
                     ),
@@ -10375,6 +10443,7 @@ fn complete_project_copy(
                         events,
                         IdeWorkerEvent::ProjectCopied {
                             project_path: destination_path,
+                            opened: true,
                         },
                     ),
                 }
@@ -10421,6 +10490,27 @@ fn complete_project_copy(
     }
 }
 
+fn observe_project_copy_source_history(
+    history: &mut UndoHistory,
+    mixer: Option<&hyper_storage_engine::ProjectResourcePublicationOutcome>,
+    events: &SyncSender<IdeWorkerEvent>,
+) {
+    let Some(outcome) = mixer else {
+        return;
+    };
+    let Some(previous) = outcome.previous_resource() else {
+        return;
+    };
+    history.record_edit(UndoEntry::from_operation(
+        IdeHistoryOperation::ResourceReplacement {
+            resource_id: outcome.resource_id().to_owned(),
+            bytes: previous.to_vec(),
+        },
+        undo_label(IdeWorkerCommandKind::SaveProject),
+    ));
+    let _ = send_event(events, history.state_event());
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the exhaustive dispatcher keeps every mutation paired with its typed preparation and publication outcome"
@@ -10448,37 +10538,45 @@ fn attempt_project_mutation(
             parent,
             directory_name,
             project_name,
+            switch_to,
         } => {
             let destination_path = parent.join(&directory_name);
+            let mut mixer = None;
             let result = if let Some(failure) = native_failure {
                 Err(IdeProjectCopyError::Save(IdeProjectSaveError::NativeClose(
                     failure,
                 )))
             } else {
-                RunningDesktopIdeApplication::prepare_mixer_save(application, recovery)
+                match RunningDesktopIdeApplication::prepare_mixer_save(application, recovery)
                     .and_then(|plan| {
                         plan.publish().map_err(|source| {
                             IdeProjectSaveError::Publication(Box::new(source))
                         })
-                    })
-                    .map_err(IdeProjectCopyError::Save)
-                    .and_then(|_| {
-                        let project = recovery
+                    }) {
+                    Ok(outcome) => {
+                        mixer = Some(outcome);
+                        recovery
                             .prepared_project()
                             .ok_or(IdeProjectSaveError::ProjectSnapshotUnavailable)
-                            .map_err(IdeProjectCopyError::Save)?;
-                        copy_project_package(ProjectCopyRequest {
-                            source: project.package().root(),
-                            destination_parent: &parent,
-                            directory_name: &directory_name,
-                            project_name: &project_name,
-                        })
-                        .map(|_| ())
-                        .map_err(IdeProjectCopyError::Copy)
-                    })
+                            .map_err(IdeProjectCopyError::Save)
+                            .and_then(|project| {
+                                copy_project_package(ProjectCopyRequest {
+                                    source: project.package().root(),
+                                    destination_parent: &parent,
+                                    directory_name: &directory_name,
+                                    project_name: &project_name,
+                                })
+                                .map(|_| ())
+                                .map_err(IdeProjectCopyError::Copy)
+                            })
+                    }
+                    Err(error) => Err(IdeProjectCopyError::Save(error)),
+                }
             };
             ProjectMutationAttempt::SaveProjectAs(ProjectCopyAttempt {
                 destination_path,
+                mixer,
+                switch_to,
                 result,
             })
         }
@@ -14966,6 +15064,7 @@ mod tests {
                 parent: projects.clone(),
                 directory_name: "Independent".to_owned(),
                 project_name: "Independent".to_owned(),
+                switch_to: true,
             })
             .unwrap();
         assert!(matches!(recv_native_mutation(&worker), IdeWorkerEvent::Saving));
@@ -14990,13 +15089,129 @@ mod tests {
         assert_ne!(copied.project_id(), source_id);
         assert!(matches!(
             recv_native_mutation(&worker),
-            IdeWorkerEvent::ProjectCopied { project_path } if project_path == destination
+            IdeWorkerEvent::ProjectCopied {
+                project_path,
+                opened: true,
+            } if project_path == destination
         ));
         assert_eq!(
             history.load().unwrap()[0].path(),
             std::fs::canonicalize(&destination).unwrap()
         );
         assert!(source.is_dir());
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn save_as_can_keep_the_verified_source_open_after_copying() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-save-as-stay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = fixture.join("config");
+        let projects = fixture.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let source = create_project_package(
+            &projects,
+            ProjectCreationRequest {
+                directory_name: "Source",
+                project_name: "Source",
+            },
+        )
+        .unwrap()
+        .project()
+        .root()
+        .to_path_buf();
+        let history = ProjectHistory::at(&config);
+        let worker = DesktopIdeWorker::start_state_with_history(
+            WorkerState::Closed(closed_application()),
+            Some(history.clone()),
+            2,
+            8,
+        )
+        .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RecentProjectsChanged { projects } if projects.is_empty()
+        ));
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(source.clone()))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RecentProjectsChanged { projects }
+                if projects.len() == 1 && projects[0].path() == source
+        ));
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the source project must open before saving its independent copy");
+        };
+        let source_id = opened.project_id().to_owned();
+        worker
+            .try_send(IdeWorkerCommand::Mixer(IdeMixerCommand::ChannelGain {
+                channel_index: 0,
+                gain_millionths: 750_000,
+            }))
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::MixerQueued(IdeMixerCommand::ChannelGain {
+                channel_index: 0,
+                gain_millionths: 750_000,
+            })
+        ));
+
+        worker
+            .try_send(IdeWorkerCommand::SaveProjectAs {
+                parent: projects.clone(),
+                directory_name: "Snapshot".to_owned(),
+                project_name: "Snapshot".to_owned(),
+                switch_to: false,
+            })
+            .unwrap();
+        assert!(matches!(recv_native_mutation(&worker), IdeWorkerEvent::Saving));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::UndoStateChanged {
+                undo_label: Some("mixer save"),
+                redo_label: None,
+            }
+        ));
+        let IdeWorkerEvent::Running(reopened) = recv_native_mutation(&worker) else {
+            panic!("the source project must reopen after copying");
+        };
+        assert_eq!(reopened.project_id(), source_id);
+        let destination = projects.join("Snapshot");
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::ProjectCopied {
+                project_path,
+                opened: false,
+            } if project_path == destination
+        ));
+        assert_eq!(
+            verify_project_package(&source)
+                .unwrap()
+                .manifest()
+                .project_id(),
+            source_id.as_str(),
+            "the source project identity must remain unchanged"
+        );
+        assert_ne!(
+            verify_project_package(&destination)
+                .unwrap()
+                .manifest()
+                .project_id(),
+            source_id.as_str(),
+            "the saved copy must have an independent project identity"
+        );
+        assert_eq!(
+            history.load().unwrap()[0].path(),
+            std::fs::canonicalize(&source).unwrap(),
+            "keeping the source open must not retarget recent-project authority"
+        );
+        undo_mixer_save(&worker);
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
@@ -16551,6 +16766,7 @@ mod tests {
                 parent: projects,
                 directory_name: "Occupied".to_owned(),
                 project_name: "Occupied".to_owned(),
+                switch_to: true,
             })
             .unwrap();
         assert!(matches!(recv_native_mutation(&worker), IdeWorkerEvent::Saving));
