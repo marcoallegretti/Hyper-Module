@@ -7,7 +7,7 @@ use std::path::Path;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::fs::{Dir, OpenOptions};
 use hyper_native_device::DeviceChain;
-use hyper_playback_json::AudioTrackReorderDocuments;
+use hyper_playback_json::MixerStripReorderDocuments;
 use hyper_project_model::{ProjectManifest, ResourceDescriptor, ResourceRole, is_valid_entity_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -375,7 +375,7 @@ pub struct TrackOrderPublicationRequest<'a> {
     pub mixer_id: &'a str,
     /// The opaque canonical output of the playback-document reorder boundary.
     /// It cannot be assembled from arbitrary bytes by a storage caller.
-    pub documents: &'a AudioTrackReorderDocuments,
+    pub documents: &'a MixerStripReorderDocuments,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7876,7 +7876,7 @@ mod tests {
 
     fn prepared_track_order_documents(
         fixture: &AudioTrackFixture,
-    ) -> ([u8; 32], hyper_playback_json::AudioTrackReorderDocuments) {
+    ) -> ([u8; 32], hyper_playback_json::MixerStripReorderDocuments) {
         let package = verify_project_package(&fixture.root).unwrap();
         let mixer = package.read_resource(&fixture.mixer_id).unwrap();
         prepared_track_order_documents_with_mixer(fixture, &mixer)
@@ -7885,10 +7885,10 @@ mod tests {
     fn prepared_track_order_documents_with_mixer(
         fixture: &AudioTrackFixture,
         mixer: &[u8],
-    ) -> ([u8; 32], hyper_playback_json::AudioTrackReorderDocuments) {
+    ) -> ([u8; 32], hyper_playback_json::MixerStripReorderDocuments) {
         use hyper_playback_json::{
             LoaderLimits, PlaybackJsonInput, load as load_playback,
-            serialize_audio_track_reorder,
+            serialize_mixer_strip_reorder,
         };
 
         let package = verify_project_package(&fixture.root).unwrap();
@@ -7933,7 +7933,7 @@ mod tests {
             .zip(&tracks)
             .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
             .collect();
-        let documents = serialize_audio_track_reorder(
+        let documents = serialize_mixer_strip_reorder(
             &project,
             &[],
             &source_tracks,
@@ -10435,7 +10435,7 @@ mod tests {
     fn reorders_every_track_and_the_matching_mixer_in_one_publication() {
         use hyper_playback_json::{
             LoaderLimits, PlaybackJsonInput, load as load_playback,
-            serialize_audio_track_reorder,
+            serialize_mixer_strip_reorder,
         };
 
         let fixture = AudioTrackFixture::new();
@@ -10482,7 +10482,7 @@ mod tests {
             .zip(&tracks)
             .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
             .collect();
-        let documents = serialize_audio_track_reorder(
+        let documents = serialize_mixer_strip_reorder(
             &project,
             &[],
             &source_tracks,
@@ -10523,7 +10523,7 @@ mod tests {
         let ordered_tracks: Vec<_> = documents
             .tracks()
             .iter()
-            .map(hyper_playback_json::AudioTrackReorderDocument::track_id)
+            .map(hyper_playback_json::MixerStripReorderDocument::track_id)
             .collect();
         assert_eq!(ordered_tracks, vec![NEW_TRACK_ID, track_ids[0].as_str()]);
     }

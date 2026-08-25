@@ -43,7 +43,7 @@ use super::{
     IdeAudioImportError, IdeAudioInputInventory, IdeAudioOutputInventory,
     IdeAudioPreviewControlCommand, IdeAudioPreviewError, IdeAudioTrackAdditionError,
     IdeAudioTrackContentRemovalError, IdeAudioTrackDuplicationError, IdeAudioTrackEditError,
-    IdeAudioPrimaryRouteError, IdeAudioTrackRemovalError, IdeAudioTrackReorderError,
+    IdeAudioPrimaryRouteError, IdeAudioTrackRemovalError, IdeMixerStripReorderError,
     IdeReturnSendEditError,
     IdeRoutingBusCreationError, IdeRoutingBusRemovalError, IdeRoutingBusRenameError,
     IdeRoutingBusKind,
@@ -800,7 +800,7 @@ pub struct IdeRunningObservation {
     preview: IdeAudioPreviewObservation,
     scenes: Vec<IdeScene>,
     track_count: usize,
-    flat_audio_track_reorder_available: bool,
+    flat_mixer_strip_reorder_available: bool,
     mixer_channels: Vec<IdeMixerChannel>,
     mixer_main: Option<IdeMixerMainState>,
     mixer_unsaved_changes: bool,
@@ -1491,7 +1491,7 @@ impl IdeRunningObservation {
             },
             scenes: Vec::new(),
             track_count: 0,
-            flat_audio_track_reorder_available: false,
+            flat_mixer_strip_reorder_available: false,
             mixer_channels: Vec::new(),
             mixer_main: None,
             mixer_unsaved_changes: false,
@@ -1628,11 +1628,11 @@ impl IdeRunningObservation {
         &self.mixer_channels
     }
 
-    /// The verified project shape supports the initial coupled audio-track
-    /// reorder operation.
+    /// The verified project shape supports the coupled mixer-strip reorder
+    /// operation.
     #[must_use]
-    pub const fn flat_audio_track_reorder_available(&self) -> bool {
-        self.flat_audio_track_reorder_available
+    pub const fn flat_mixer_strip_reorder_available(&self) -> bool {
+        self.flat_mixer_strip_reorder_available
     }
 
     #[must_use]
@@ -1960,7 +1960,7 @@ pub enum IdeWorkerCommandFailure {
     AudioPrimaryRoute(Box<super::IdeAudioPrimaryRouteError>),
     AudioTrackRemoval(Box<super::IdeAudioTrackRemovalError>),
     AudioTrackContentRemoval(Box<super::IdeAudioTrackContentRemovalError>),
-    AudioTrackReorder(Box<super::IdeAudioTrackReorderError>),
+    AudioTrackReorder(Box<super::IdeMixerStripReorderError>),
     AudioTrackDuplication(Box<super::IdeAudioTrackDuplicationError>),
     AudioTrackRename(Box<super::IdeAudioTrackEditError>),
     AudioTrackActivation(Box<super::IdeAudioTrackEditError>),
@@ -5977,7 +5977,7 @@ fn reorder_audio_tracks(
             events,
             IdeWorkerCommandKind::ReorderAudioTracks,
             IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
-                IdeAudioTrackReorderError::TrackResourceMissing,
+                IdeMixerStripReorderError::TrackResourceMissing,
             )),
         );
     }
@@ -5987,7 +5987,7 @@ fn reorder_audio_tracks(
             events,
             IdeWorkerCommandKind::ReorderAudioTracks,
             IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
-                IdeAudioTrackReorderError::CapacityUnavailable,
+                IdeMixerStripReorderError::CapacityUnavailable,
             )),
         );
     }
@@ -8185,7 +8185,7 @@ fn project_mutation_save_failure(
             ))
         }
         ProjectMutation::ReorderAudioTracks { .. } => IdeWorkerCommandFailure::AudioTrackReorder(
-            Box::new(IdeAudioTrackReorderError::MixerSave(Box::new(reason))),
+            Box::new(IdeMixerStripReorderError::MixerSave(Box::new(reason))),
         ),
         ProjectMutation::DuplicateAudioTrack { .. } => {
             IdeWorkerCommandFailure::AudioTrackDuplication(Box::new(
@@ -8490,7 +8490,7 @@ fn project_mutation_native_close_failure(
             ))
         }
         ProjectMutation::ReorderAudioTracks { .. } => IdeWorkerCommandFailure::AudioTrackReorder(
-            Box::new(IdeAudioTrackReorderError::NativeClose(failure)),
+            Box::new(IdeMixerStripReorderError::NativeClose(failure)),
         ),
         ProjectMutation::DuplicateAudioTrack { .. } => {
             IdeWorkerCommandFailure::AudioTrackDuplication(Box::new(
@@ -8732,7 +8732,7 @@ enum ProjectMutationAttempt {
         >,
     ),
     ReorderAudioTracks(
-        Result<hyper_storage_engine::TrackOrderPublicationOutcome, IdeAudioTrackReorderError>,
+        Result<hyper_storage_engine::TrackOrderPublicationOutcome, IdeMixerStripReorderError>,
     ),
     DuplicateAudioTrack(
         Result<hyper_storage_engine::AudioTrackDuplicationPublicationOutcome, IdeAudioTrackDuplicationError>,
@@ -10719,9 +10719,9 @@ fn attempt_project_mutation(
             track_id,
             destination_index,
         } => ProjectMutationAttempt::ReorderAudioTracks(if let Some(failure) = native_failure {
-            Err(IdeAudioTrackReorderError::NativeClose(failure))
+            Err(IdeMixerStripReorderError::NativeClose(failure))
         } else {
-            RunningDesktopIdeApplication::prepare_audio_track_reorder(
+            RunningDesktopIdeApplication::prepare_mixer_strip_reorder(
                 application,
                 recovery,
                 &track_id,
@@ -10729,7 +10729,7 @@ fn attempt_project_mutation(
             )
             .and_then(|plan| {
                 plan.publish()
-                    .map_err(|source| IdeAudioTrackReorderError::Publication(Box::new(source)))
+                    .map_err(|source| IdeMixerStripReorderError::Publication(Box::new(source)))
             })
         }),
         ProjectMutation::DuplicateAudioTrack { track_id, name } => {
@@ -12186,31 +12186,31 @@ fn project_mutation_reopen_failure(
         }
         ProjectMutationAttempt::ReorderAudioTracks(Ok(outcome)) => {
             IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
-                IdeAudioTrackReorderError::ReopenAfterPublication {
+                IdeMixerStripReorderError::ReopenAfterPublication {
                     outcome,
                     source: Box::new(reopen),
                 },
             ))
         }
         ProjectMutationAttempt::ReorderAudioTracks(Err(
-            IdeAudioTrackReorderError::Publication(publication),
+            IdeMixerStripReorderError::Publication(publication),
         )) => IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
-            IdeAudioTrackReorderError::PublicationAndReopen {
+            IdeMixerStripReorderError::PublicationAndReopen {
                 publication,
                 reopen: Box::new(reopen),
             },
         )),
         ProjectMutationAttempt::ReorderAudioTracks(Err(
-            IdeAudioTrackReorderError::NativeClose(close),
+            IdeMixerStripReorderError::NativeClose(close),
         )) => IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
-            IdeAudioTrackReorderError::NativeCloseAndReopen {
+            IdeMixerStripReorderError::NativeCloseAndReopen {
                 close,
                 reopen: Box::new(reopen),
             },
         )),
         ProjectMutationAttempt::ReorderAudioTracks(Err(preparation)) => {
             IdeWorkerCommandFailure::AudioTrackReorder(Box::new(
-                IdeAudioTrackReorderError::ReopenAfterPreparation {
+                IdeMixerStripReorderError::ReopenAfterPreparation {
                     preparation: Box::new(preparation),
                     reopen: Box::new(reopen),
                 },
@@ -13997,7 +13997,7 @@ fn running_observation(
         },
         scenes,
         track_count: snapshot.track_count,
-        flat_audio_track_reorder_available: snapshot.loaded.supports_flat_audio_track_reorder(),
+        flat_mixer_strip_reorder_available: snapshot.loaded.supports_flat_mixer_strip_reorder(),
         mixer_channels,
         mixer_main: snapshot.mixer_main_state,
         mixer_unsaved_changes: snapshot.mixer_unsaved_changes,
@@ -14997,6 +14997,149 @@ mod tests {
             std::fs::canonicalize(&destination).unwrap()
         );
         assert!(source.is_dir());
+        assert_eq!(shutdown_report(worker).native_failure(), None);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker scenario retains the complete mixed routing and structural reorder lifecycle"
+    )]
+    fn mixer_strip_reorder_preserves_flat_routing_through_the_real_worker() {
+        let fixture = std::env::temp_dir().join(format!(
+            "hyper-desktop-ide-mixer-strip-reorder-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let created = create_project_package(
+            &fixture,
+            ProjectCreationRequest {
+                directory_name: "Session",
+                project_name: "Session",
+            },
+        )
+        .unwrap();
+        let project = created.project().root().to_path_buf();
+        drop(created);
+
+        let worker = DesktopIdeWorker::start_state(WorkerState::Closed(closed_application()), 2, 8)
+            .unwrap();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::Closed { .. }));
+        worker
+            .try_send(IdeWorkerCommand::OpenProject(project))
+            .unwrap();
+        let IdeWorkerEvent::Running(opened) = recv(&worker) else {
+            panic!("the verified project must open before mixer-strip reorder");
+        };
+        let audio_track_id = opened
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Audio)
+            .expect("the created project has one audio source")
+            .id()
+            .to_owned();
+
+        worker
+            .try_send(IdeWorkerCommand::AddRoutingBus {
+                kind: IdeRoutingBusKind::Group,
+                name: "Drums".to_owned(),
+                source_track_ids: vec![audio_track_id.clone()],
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusAdding {
+                kind: IdeRoutingBusKind::Group
+            }
+        ));
+        let IdeWorkerEvent::Running(with_group) = recv(&worker) else {
+            panic!("the group must reopen before mixer-strip reorder");
+        };
+        let group_track_id = with_group
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Group)
+            .expect("the reopened project exposes the group")
+            .id()
+            .to_owned();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::RoutingBusAdded { revision: 2, .. }));
+
+        worker
+            .try_send(IdeWorkerCommand::AddRoutingBus {
+                kind: IdeRoutingBusKind::Return,
+                name: "Verb".to_owned(),
+                source_track_ids: vec![audio_track_id.clone()],
+            })
+            .unwrap();
+        assert!(matches!(
+            recv(&worker),
+            IdeWorkerEvent::RoutingBusAdding {
+                kind: IdeRoutingBusKind::Return
+            }
+        ));
+        let IdeWorkerEvent::Running(with_return) = recv(&worker) else {
+            panic!("the return must reopen before mixer-strip reorder");
+        };
+        let return_track_id = with_return
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.kind() == IdeMixerChannelKind::Return)
+            .expect("the reopened project exposes the return")
+            .id()
+            .to_owned();
+        assert!(matches!(recv(&worker), IdeWorkerEvent::RoutingBusAdded { revision: 3, .. }));
+        add_compressor_history(&worker, audio_track_id.clone());
+        while worker.events.as_ref().unwrap().try_recv().is_ok() {}
+
+        worker
+            .try_send(IdeWorkerCommand::ReorderAudioTracks {
+                track_id: return_track_id.clone(),
+                destination_index: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioTracksReordering
+        ));
+        loop {
+            match recv_native_mutation(&worker) {
+                IdeWorkerEvent::UndoStateChanged {
+                    undo_label: None,
+                    redo_label: None,
+                } => break,
+                IdeWorkerEvent::Running(_) => {}
+                event => panic!("mixer-strip reorder must invalidate history before final reopen: {event:?}"),
+            }
+        }
+        let IdeWorkerEvent::Running(reordered) = recv_native_mutation(&worker) else {
+            panic!("the mixed mixer-strip reorder must reopen the project");
+        };
+        assert_eq!(
+            reordered
+                .mixer_channels()
+                .iter()
+                .map(IdeMixerChannel::id)
+                .collect::<Vec<_>>(),
+            vec![
+                return_track_id.as_str(),
+                audio_track_id.as_str(),
+                group_track_id.as_str(),
+            ]
+        );
+        let audio = reordered
+            .mixer_channels()
+            .iter()
+            .find(|channel| channel.id() == audio_track_id)
+            .expect("the reordered project retains the audio source");
+        assert!(matches!(
+            audio.sends(),
+            [send] if send.target_name() == "Verb" && send.state().is_some()
+        ));
+        assert!(matches!(
+            recv_native_mutation(&worker),
+            IdeWorkerEvent::AudioTracksReordered { revision } if revision > 3
+        ));
         assert_eq!(shutdown_report(worker).native_failure(), None);
         std::fs::remove_dir_all(fixture).unwrap();
     }
@@ -19399,7 +19542,7 @@ mod tests {
             IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::ReorderAudioTracks,
                 reason: IdeWorkerCommandFailure::AudioTrackReorder(reason),
-            } if matches!(reason.as_ref(), IdeAudioTrackReorderError::TrackResourceMissing)
+            } if matches!(reason.as_ref(), IdeMixerStripReorderError::TrackResourceMissing)
         ));
 
         worker
@@ -19415,7 +19558,7 @@ mod tests {
             IdeWorkerEvent::CommandFailed {
                 command: IdeWorkerCommandKind::ReorderAudioTracks,
                 reason: IdeWorkerCommandFailure::AudioTrackReorder(reason),
-            } if matches!(reason.as_ref(), IdeAudioTrackReorderError::MixerSave(boxed)
+            } if matches!(reason.as_ref(), IdeMixerStripReorderError::MixerSave(boxed)
                 if matches!(boxed.as_ref(), IdeProjectSaveError::ProjectSnapshotUnavailable))
         ));
         assert_eq!(shutdown_report(worker).native_failure(), None);

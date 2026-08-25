@@ -2389,7 +2389,7 @@ fn bind_audio_track_reorder_callback(ui: &MainWindow, worker: &WorkerCell) {
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        match audio_track_reorder_command(
+        match mixer_strip_reorder_command(
             ui.get_app_mode(),
             index,
             earlier,
@@ -4611,7 +4611,7 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
             "Preserving mixer state, removing the audio track and its content, and reopening project…"
         }
         IdeWorkerCommandKind::ReorderAudioTracks => {
-            "Preserving mixer state, reordering audio tracks, and reopening project…"
+            "Preserving mixer state, reordering mixer strips, and reopening project…"
         }
         IdeWorkerCommandKind::RenameAudioTrack => {
             "Preserving mixer state, renaming the audio track, and reopening project…"
@@ -5437,11 +5437,11 @@ fn apply_audio_track_duplication_event(ui: &MainWindow, event: &IdeWorkerEvent) 
 fn apply_audio_track_reorder_event(ui: &MainWindow, event: &IdeWorkerEvent) {
     match event {
         IdeWorkerEvent::AudioTracksReordered { revision } => {
-            ui.set_status_text(format!("Audio tracks reordered in project revision {revision}").into());
+            ui.set_status_text(format!("Mixer strips reordered in project revision {revision}").into());
             ui.set_error_text(SharedString::default());
         }
         IdeWorkerEvent::AudioTracksReordering => {
-            ui.set_status_text("Waiting for native output before reordering audio tracks…".into());
+            ui.set_status_text("Waiting for native output before reordering mixer strips…".into());
         }
         _ => unreachable!("audio-track reorder event dispatcher received another event"),
     }
@@ -7621,7 +7621,7 @@ fn apply_mixer_observation(ui: &MainWindow, observation: &IdeRunningObservation)
     set_mixer(
         ui,
         observation.mixer_channels(),
-        observation.flat_audio_track_reorder_available(),
+        observation.flat_mixer_strip_reorder_available(),
     );
     let unsaved_changes = observation.mixer_unsaved_changes();
     ui.set_mixer_unsaved_changes(unsaved_changes);
@@ -8879,7 +8879,7 @@ fn validate_mixer_channel(
     Ok((channel_index, row))
 }
 
-fn audio_track_reorder_command(
+fn mixer_strip_reorder_command(
     mode: AppMode,
     index: i32,
     earlier: bool,
@@ -9097,7 +9097,7 @@ fn set_observed_scenes(
 
 fn mixer_rows(
     channels: &[IdeMixerChannel],
-    flat_audio_track_reorder_available: bool,
+    flat_mixer_strip_reorder_available: bool,
 ) -> Vec<MixerChannelRow> {
     channels
         .iter()
@@ -9121,8 +9121,8 @@ fn mixer_rows(
                     IdeMixerChannelKind::Audio | IdeMixerChannelKind::Group | IdeMixerChannelKind::Return
                 ),
                 removable: channel.kind() == IdeMixerChannelKind::Audio,
-                can_move_earlier: flat_audio_track_reorder_available && index > 0,
-                can_move_later: flat_audio_track_reorder_available && index + 1 < channels.len(),
+                can_move_earlier: flat_mixer_strip_reorder_available && index > 0,
+                can_move_later: flat_mixer_strip_reorder_available && index + 1 < channels.len(),
                 active: channel.active(),
                 activation_toggleable: channel.kind() == IdeMixerChannelKind::Audio,
             }
@@ -10952,7 +10952,7 @@ fn encode_sha256(digest: &[u8; 32]) -> String {
 fn set_mixer(
     ui: &MainWindow,
     channels: &[IdeMixerChannel],
-    flat_audio_track_reorder_available: bool,
+    flat_mixer_strip_reorder_available: bool,
 ) {
     let current = ui.get_mixer_channels();
     let unchanged = current.row_count() == channels.len()
@@ -10980,9 +10980,9 @@ fn set_mixer(
                         )
                     && actual.removable == (expected.kind() == IdeMixerChannelKind::Audio)
                     && actual.can_move_earlier
-                        == (flat_audio_track_reorder_available && index > 0)
+                        == (flat_mixer_strip_reorder_available && index > 0)
                     && actual.can_move_later
-                        == (flat_audio_track_reorder_available && index + 1 < channels.len())
+                        == (flat_mixer_strip_reorder_available && index + 1 < channels.len())
                     && actual.active == expected.active()
                     && actual.activation_toggleable
                         == (expected.kind() == IdeMixerChannelKind::Audio)
@@ -10991,7 +10991,7 @@ fn set_mixer(
     if !unchanged {
         ui.set_mixer_channels(ModelRc::from(Rc::new(VecModel::from(mixer_rows(
             channels,
-            flat_audio_track_reorder_available,
+            flat_mixer_strip_reorder_available,
         )))));
     }
     let current_sends = ui.get_mixer_sends();
@@ -14119,16 +14119,16 @@ mod tests {
             audio_track_mixer_row(1, track_a),
         ])));
         assert!(matches!(
-            audio_track_reorder_command(AppMode::Running, 1, true, &reordered),
+            mixer_strip_reorder_command(AppMode::Running, 1, true, &reordered),
             Ok(IdeWorkerCommand::ReorderAudioTracks { track_id, destination_index })
                 if track_id == track_a && destination_index == 0
         ));
         assert!(matches!(
-            audio_track_reorder_command(AppMode::Running, 0, true, &reordered),
+            mixer_strip_reorder_command(AppMode::Running, 0, true, &reordered),
             Err(MixerControlFailure::StateUnavailable)
         ));
         assert!(matches!(
-            audio_track_reorder_command(AppMode::Closed, 1, true, &reordered),
+            mixer_strip_reorder_command(AppMode::Closed, 1, true, &reordered),
             Err(MixerControlFailure::StateUnavailable)
         ));
         assert_eq!(
@@ -14142,6 +14142,33 @@ mod tests {
             mode_after_failure(AppMode::Saving, IdeWorkerCommandKind::ReorderAudioTracks),
             AppMode::Running
         );
+        let mut group = audio_track_mixer_row(1, "018f47a2-6b2d-7c11-8a44-001122334458");
+        group.name = "Drums".into();
+        group.kind = "GROUP".into();
+        group.solo_available = false;
+        group.removable = false;
+        group.activation_toggleable = false;
+        let mut returned = audio_track_mixer_row(2, "018f47a2-6b2d-7c11-8a44-001122334459");
+        returned.name = "Verb".into();
+        returned.kind = "RETURN".into();
+        returned.solo_available = false;
+        returned.removable = false;
+        returned.can_move_later = false;
+        returned.activation_toggleable = false;
+        let mixed = ModelRc::from(Rc::new(VecModel::from(vec![
+            audio_track_mixer_row(0, track_b),
+            group,
+            returned,
+        ])));
+        assert!(matches!(
+            mixer_strip_reorder_command(AppMode::Running, 1, true, &mixed),
+            Ok(IdeWorkerCommand::ReorderAudioTracks { track_id, destination_index })
+                if track_id == "018f47a2-6b2d-7c11-8a44-001122334458" && destination_index == 0
+        ));
+        assert!(matches!(
+            mixer_strip_reorder_command(AppMode::Running, 2, false, &mixed),
+            Err(MixerControlFailure::StateUnavailable)
+        ));
         assert!(matches!(
             audio_track_duplication_command(
                 AppMode::Running,

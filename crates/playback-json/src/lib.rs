@@ -610,9 +610,9 @@ pub struct RoutingBusRemovalDocuments {
     kind: RoutingBusKind,
 }
 
-/// One canonical track replacement produced by an audio-track reorder.
+/// One canonical track replacement produced by a mixer-strip reorder.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AudioTrackReorderDocument {
+pub struct MixerStripReorderDocument {
     track_id: String,
     bytes: Vec<u8>,
 }
@@ -624,8 +624,8 @@ pub struct AudioTrackReorderDocument {
 /// to equal the prior value, so callers can commit one explicit complete
 /// transaction rather than infer an unsafe partial update.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AudioTrackReorderDocuments {
-    tracks: Vec<AudioTrackReorderDocument>,
+pub struct MixerStripReorderDocuments {
+    tracks: Vec<MixerStripReorderDocument>,
     mixer: Vec<u8>,
 }
 
@@ -776,7 +776,7 @@ impl RoutingBusRemovalDocuments {
     }
 }
 
-impl AudioTrackReorderDocument {
+impl MixerStripReorderDocument {
     #[must_use]
     pub fn track_id(&self) -> &str {
         &self.track_id
@@ -788,9 +788,9 @@ impl AudioTrackReorderDocument {
     }
 }
 
-impl AudioTrackReorderDocuments {
+impl MixerStripReorderDocuments {
     #[must_use]
-    pub fn tracks(&self) -> &[AudioTrackReorderDocument] {
+    pub fn tracks(&self) -> &[MixerStripReorderDocument] {
         &self.tracks
     }
 
@@ -800,7 +800,7 @@ impl AudioTrackReorderDocuments {
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (Vec<AudioTrackReorderDocument>, Vec<u8>) {
+    pub fn into_parts(self) -> (Vec<MixerStripReorderDocument>, Vec<u8>) {
         (self.tracks, self.mixer)
     }
 }
@@ -1054,9 +1054,9 @@ pub enum AudioTrackDocumentSerializationError {
 /// Refuses unsupported topology, stale authority, and malformed canonical
 /// documents before a track-order transaction is made durable.
 #[derive(Debug)]
-pub enum AudioTrackReorderSerializationError {
+pub enum MixerStripReorderSerializationError {
     TrackMissing,
-    TrackNotAudio,
+    TrackNotMixable,
     ParentTrackUnsupported,
     DestinationOutOfRange,
     NoChange,
@@ -1340,14 +1340,14 @@ impl Error for AudioTrackDocumentSerializationError {
     }
 }
 
-impl fmt::Display for AudioTrackReorderSerializationError {
+impl fmt::Display for MixerStripReorderSerializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TrackMissing => formatter.write_str("the selected audio track is not present in the project"),
-            Self::TrackNotAudio => formatter.write_str("track reorder currently supports audio tracks only"),
-            Self::ParentTrackUnsupported => formatter.write_str("track reorder currently requires a flat audio-track project"),
-            Self::DestinationOutOfRange => formatter.write_str("the requested audio-track destination is outside the project order"),
-            Self::NoChange => formatter.write_str("the requested audio-track order is already active"),
+            Self::TrackMissing => formatter.write_str("the selected mixer strip is not present in the project"),
+            Self::TrackNotMixable => formatter.write_str("the selected track has no mixer strip"),
+            Self::ParentTrackUnsupported => formatter.write_str("mixer-strip reorder requires a flat project topology"),
+            Self::DestinationOutOfRange => formatter.write_str("the requested mixer-strip destination is outside the project order"),
+            Self::NoChange => formatter.write_str("the requested mixer-strip order is already active"),
             Self::SourceTrackCountMismatch => formatter.write_str("source track documents do not cover the loaded project"),
             Self::SourceTrackDuplicate => formatter.write_str("source track documents contain a duplicate identity"),
             Self::SourceTrackMissing => formatter.write_str("a loaded track has no matching source document"),
@@ -1362,14 +1362,14 @@ impl fmt::Display for AudioTrackReorderSerializationError {
     }
 }
 
-impl Error for AudioTrackReorderSerializationError {
+impl Error for MixerStripReorderSerializationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Source(source) => Some(source),
             Self::ProjectCompilation(source) => Some(source),
             Self::Serialization(source) => Some(source),
             Self::TrackMissing
-            | Self::TrackNotAudio
+            | Self::TrackNotMixable
             | Self::ParentTrackUnsupported
             | Self::DestinationOutOfRange
             | Self::NoChange
@@ -4300,16 +4300,15 @@ pub fn serialize_audio_track_activation(
     })
 }
 
-/// Reorders one audio track within a flat audio-only project and produces the
-/// complete coupled track and mixer replacement set.
+/// Reorders one mixable track within a flat project and produces the complete
+/// coupled track and mixer replacement set.
 ///
 /// The source set must contain exactly one canonical current document for
-/// every project track.  The first IDE surface deliberately refuses projects
-/// with non-audio or parented tracks: their hierarchy and routing semantics
-/// need an explicit product-level reorder policy instead of an inferred list
-/// operation.  A supported reorder preserves each track's existing numeric
-/// order slots, all namespaced extensions, and every mixer-channel field; it
-/// changes only the order permutation and the matching channel sequence.
+/// every project track. A supported reorder is limited to parentless mixable
+/// tracks: Audio, External Input, Group, and Return. It preserves each track's
+/// existing numeric order slots, all namespaced extensions, and every
+/// mixer-channel field; it changes only the order permutation and matching
+/// channel sequence.
 ///
 /// # Errors
 ///
@@ -4324,7 +4323,7 @@ pub fn serialize_audio_track_activation(
     clippy::too_many_lines,
     reason = "the coupled order and mixer serialization must validate one complete replacement set before returning any publishable bytes"
 )]
-pub fn serialize_audio_track_reorder(
+pub fn serialize_mixer_strip_reorder(
     project: &LoadedPlaybackProject,
     assets: &[MediaAssetFact<'_>],
     source_tracks: &[(&str, &[u8])],
@@ -4333,41 +4332,44 @@ pub fn serialize_audio_track_reorder(
     track_id: &str,
     destination_index: usize,
     limits: LoaderLimits,
-) -> Result<AudioTrackReorderDocuments, AudioTrackReorderSerializationError> {
+) -> Result<MixerStripReorderDocuments, MixerStripReorderSerializationError> {
     if source_tracks.len() != project.tracks.len() {
-        return Err(AudioTrackReorderSerializationError::SourceTrackCountMismatch);
+        return Err(MixerStripReorderSerializationError::SourceTrackCountMismatch);
     }
     let target_index = project
         .track_index(track_id)
-        .ok_or(AudioTrackReorderSerializationError::TrackMissing)?;
-    if !project.is_audio_track(track_id) {
-        return Err(AudioTrackReorderSerializationError::TrackNotAudio);
+        .ok_or(MixerStripReorderSerializationError::TrackMissing)?;
+    if !project.is_mixable_track(track_id) {
+        return Err(MixerStripReorderSerializationError::TrackNotMixable);
     }
     if destination_index >= project.tracks.len() {
-        return Err(AudioTrackReorderSerializationError::DestinationOutOfRange);
+        return Err(MixerStripReorderSerializationError::DestinationOutOfRange);
     }
 
     let mut source_by_id = HashMap::new();
     source_by_id
         .try_reserve(source_tracks.len())
-        .map_err(|_| AudioTrackReorderSerializationError::Source(capacity_error()))?;
+        .map_err(|_| MixerStripReorderSerializationError::Source(capacity_error()))?;
     for (id, bytes) in source_tracks {
         if source_by_id.insert(*id, *bytes).is_some() {
-            return Err(AudioTrackReorderSerializationError::SourceTrackDuplicate);
+            return Err(MixerStripReorderSerializationError::SourceTrackDuplicate);
         }
     }
 
     for (index, current) in project.tracks.iter().enumerate() {
-        if current.kind != TrackKind::Audio {
-            return Err(AudioTrackReorderSerializationError::TrackNotAudio);
+        if !matches!(
+            current.kind,
+            TrackKind::Audio | TrackKind::ExternalInput | TrackKind::Group | TrackKind::Return
+        ) {
+            return Err(MixerStripReorderSerializationError::TrackNotMixable);
         }
         if current.parent_track_id.is_some() {
-            return Err(AudioTrackReorderSerializationError::ParentTrackUnsupported);
+            return Err(MixerStripReorderSerializationError::ParentTrackUnsupported);
         }
         let source_bytes = source_by_id
             .get(current.id.as_str())
             .copied()
-            .ok_or(AudioTrackReorderSerializationError::SourceTrackMissing)?;
+            .ok_or(MixerStripReorderSerializationError::SourceTrackMissing)?;
         let source = load_track(
             source_bytes,
             index,
@@ -4375,7 +4377,7 @@ pub fn serialize_audio_track_reorder(
             limits.max_document_bytes,
             limits.max_track_clip_references,
         )
-        .map_err(AudioTrackReorderSerializationError::Source)?;
+        .map_err(MixerStripReorderSerializationError::Source)?;
         if source.id != current.id
             || source.name != current.name
             || source.kind != current.kind
@@ -4384,35 +4386,35 @@ pub fn serialize_audio_track_reorder(
             || source.parent_track_id != current.parent_track_id
             || source.clip_ids != current.clip_ids
         {
-            return Err(AudioTrackReorderSerializationError::SourceTrackMismatch);
+            return Err(MixerStripReorderSerializationError::SourceTrackMismatch);
         }
         let value: Value = serde_json::from_slice(source_bytes)
-            .map_err(AudioTrackReorderSerializationError::Serialization)?;
+            .map_err(MixerStripReorderSerializationError::Serialization)?;
         let canonical = serde_json_canonicalizer::to_vec(&value)
-            .map_err(AudioTrackReorderSerializationError::Serialization)?;
+            .map_err(MixerStripReorderSerializationError::Serialization)?;
         if canonical != source_bytes {
-            return Err(AudioTrackReorderSerializationError::SourceTrackMismatch);
+            return Err(MixerStripReorderSerializationError::SourceTrackMismatch);
         }
     }
 
     let mixer_value: Value = serde_json::from_slice(source_mixer)
-        .map_err(AudioTrackReorderSerializationError::Serialization)?;
+        .map_err(MixerStripReorderSerializationError::Serialization)?;
     let canonical_mixer = serde_json_canonicalizer::to_vec(&mixer_value)
-        .map_err(AudioTrackReorderSerializationError::Serialization)?;
+        .map_err(MixerStripReorderSerializationError::Serialization)?;
     if canonical_mixer != source_mixer {
-        return Err(AudioTrackReorderSerializationError::SourceMixerMismatch);
+        return Err(MixerStripReorderSerializationError::SourceMixerMismatch);
     }
     let loaded_mixer = project
         .load_mixer(source_mixer, assets, limits)
-        .map_err(AudioTrackReorderSerializationError::Source)?;
+        .map_err(MixerStripReorderSerializationError::Source)?;
     if loaded_mixer.id() != mixer_id {
-        return Err(AudioTrackReorderSerializationError::MixerIdentityMismatch);
+        return Err(MixerStripReorderSerializationError::MixerIdentityMismatch);
     }
 
     let mut ordered_indices: Vec<_> = (0..project.tracks.len()).collect();
     ordered_indices
         .try_reserve_exact(project.tracks.len())
-        .map_err(|_| AudioTrackReorderSerializationError::Source(capacity_error()))?;
+        .map_err(|_| MixerStripReorderSerializationError::Source(capacity_error()))?;
     ordered_indices.sort_unstable_by_key(|index| project.tracks[*index].order);
     let order_slots: Vec<_> = ordered_indices
         .iter()
@@ -4421,9 +4423,9 @@ pub fn serialize_audio_track_reorder(
     let source_position = ordered_indices
         .iter()
         .position(|index| *index == target_index)
-        .ok_or(AudioTrackReorderSerializationError::TrackMissing)?;
+        .ok_or(MixerStripReorderSerializationError::TrackMissing)?;
     if source_position == destination_index {
-        return Err(AudioTrackReorderSerializationError::NoChange);
+        return Err(MixerStripReorderSerializationError::NoChange);
     }
     let moved = ordered_indices.remove(source_position);
     ordered_indices.insert(destination_index, moved);
@@ -4431,23 +4433,23 @@ pub fn serialize_audio_track_reorder(
     let mut output_tracks = Vec::new();
     output_tracks
         .try_reserve_exact(ordered_indices.len())
-        .map_err(|_| AudioTrackReorderSerializationError::Source(capacity_error()))?;
+        .map_err(|_| MixerStripReorderSerializationError::Source(capacity_error()))?;
     let mut reordered_project = project.clone();
     for (destination, source_index) in ordered_indices.iter().copied().enumerate() {
         let current = &project.tracks[source_index];
         let source_bytes = source_by_id
             .get(current.id.as_str())
             .copied()
-            .ok_or(AudioTrackReorderSerializationError::SourceTrackMissing)?;
+            .ok_or(MixerStripReorderSerializationError::SourceTrackMissing)?;
         let mut value: Value = serde_json::from_slice(source_bytes)
-            .map_err(AudioTrackReorderSerializationError::Serialization)?;
+            .map_err(MixerStripReorderSerializationError::Serialization)?;
         let document = value
             .as_object_mut()
-            .ok_or(AudioTrackReorderSerializationError::InvalidDocumentShape)?;
+            .ok_or(MixerStripReorderSerializationError::InvalidDocumentShape)?;
         let next_order = order_slots[destination];
         document.insert("order".to_owned(), next_order.into());
         let bytes = serde_json_canonicalizer::to_vec(&value)
-            .map_err(AudioTrackReorderSerializationError::Serialization)?;
+            .map_err(MixerStripReorderSerializationError::Serialization)?;
         let edited = load_track(
             &bytes,
             source_index,
@@ -4455,58 +4457,58 @@ pub fn serialize_audio_track_reorder(
             limits.max_document_bytes,
             limits.max_track_clip_references,
         )
-        .map_err(AudioTrackReorderSerializationError::Source)?;
+        .map_err(MixerStripReorderSerializationError::Source)?;
         reordered_project.tracks[source_index] = edited;
-        output_tracks.push(AudioTrackReorderDocument {
+        output_tracks.push(MixerStripReorderDocument {
             track_id: current.id.clone(),
             bytes,
         });
     }
     validate_track_hierarchy(&reordered_project.tracks)
-        .map_err(AudioTrackReorderSerializationError::Source)?;
+        .map_err(MixerStripReorderSerializationError::Source)?;
     validate_loaded_identities(&reordered_project)
-        .map_err(AudioTrackReorderSerializationError::Source)?;
+        .map_err(MixerStripReorderSerializationError::Source)?;
 
     let mut mixer_value: Value = serde_json::from_slice(source_mixer)
-        .map_err(AudioTrackReorderSerializationError::Serialization)?;
+        .map_err(MixerStripReorderSerializationError::Serialization)?;
     let channels = mixer_value
         .get_mut("channels")
         .and_then(Value::as_array_mut)
-        .ok_or(AudioTrackReorderSerializationError::InvalidDocumentShape)?;
+        .ok_or(MixerStripReorderSerializationError::InvalidDocumentShape)?;
     let mut channels_by_track = HashMap::new();
     channels_by_track
         .try_reserve(channels.len())
-        .map_err(|_| AudioTrackReorderSerializationError::Source(capacity_error()))?;
+        .map_err(|_| MixerStripReorderSerializationError::Source(capacity_error()))?;
     for channel in channels.drain(..) {
         let track = channel
             .get("track_id")
             .and_then(Value::as_str)
-            .ok_or(AudioTrackReorderSerializationError::InvalidDocumentShape)?
+            .ok_or(MixerStripReorderSerializationError::InvalidDocumentShape)?
             .to_owned();
         if channels_by_track.insert(track, channel).is_some() {
-            return Err(AudioTrackReorderSerializationError::InvalidDocumentShape);
+            return Err(MixerStripReorderSerializationError::InvalidDocumentShape);
         }
     }
     for source_index in &ordered_indices {
         let track_id = project.tracks[*source_index].id.as_str();
         let channel = channels_by_track
             .remove(track_id)
-            .ok_or(AudioTrackReorderSerializationError::SourceMixerMismatch)?;
+            .ok_or(MixerStripReorderSerializationError::SourceMixerMismatch)?;
         channels.push(channel);
     }
     if !channels_by_track.is_empty() {
-        return Err(AudioTrackReorderSerializationError::SourceMixerMismatch);
+        return Err(MixerStripReorderSerializationError::SourceMixerMismatch);
     }
     let mixer = serde_json_canonicalizer::to_vec(&mixer_value)
-        .map_err(AudioTrackReorderSerializationError::Serialization)?;
+        .map_err(MixerStripReorderSerializationError::Serialization)?;
     reordered_project
         .load_mixer(&mixer, assets, limits)
-        .map_err(AudioTrackReorderSerializationError::Source)?;
+        .map_err(MixerStripReorderSerializationError::Source)?;
     reordered_project
         .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
-        .map_err(AudioTrackReorderSerializationError::ProjectCompilation)?;
+        .map_err(MixerStripReorderSerializationError::ProjectCompilation)?;
 
-    Ok(AudioTrackReorderDocuments {
+    Ok(MixerStripReorderDocuments {
         tracks: output_tracks,
         mixer,
     })
@@ -6810,15 +6812,23 @@ impl LoadedPlaybackProject {
         tracks.iter().position(|track| track.id == track_id)
     }
 
-    /// Whether this project can use the initial flat-audio track reorder
-    /// operation without inventing parent or non-audio ordering semantics.
+    /// Whether this project can reorder every persisted mixer strip without
+    /// inventing parent or non-mixable ordering semantics.
     #[must_use]
-    pub fn supports_flat_audio_track_reorder(&self) -> bool {
+    pub fn supports_flat_mixer_strip_reorder(&self) -> bool {
         !self.tracks.is_empty()
             && self
                 .tracks
                 .iter()
-                .all(|track| track.kind == TrackKind::Audio && track.parent_track_id.is_none())
+                .all(|track| {
+                    matches!(
+                        track.kind,
+                        TrackKind::Audio
+                            | TrackKind::ExternalInput
+                            | TrackKind::Group
+                            | TrackKind::Return
+                    ) && track.parent_track_id.is_none()
+                })
     }
 
     /// Returns a validated structural track name by stable identity.
@@ -6844,6 +6854,20 @@ impl LoadedPlaybackProject {
         self.tracks
             .iter()
             .any(|track| track.id == track_id && track.kind == TrackKind::Audio)
+    }
+
+    #[must_use]
+    pub fn is_mixable_track(&self, track_id: &str) -> bool {
+        self.tracks.iter().any(|track| {
+            track.id == track_id
+                && matches!(
+                    track.kind,
+                    TrackKind::Audio
+                        | TrackKind::ExternalInput
+                        | TrackKind::Group
+                        | TrackKind::Return
+                )
+        })
     }
 
     #[must_use]
@@ -11497,7 +11521,7 @@ mod tests {
         .unwrap();
         let tracks: [&[u8]; 3] = [&first, &second, &third];
         let project = load(input(TIMELINE, &tracks, &[], None), LoaderLimits::VERSION_1).unwrap();
-        let reordered = serialize_audio_track_reorder(
+        let reordered = serialize_mixer_strip_reorder(
             &project,
             &[],
             &[(first_id, &first), (second_id, &second), (third_id, &third)],
@@ -11513,7 +11537,7 @@ mod tests {
             reordered
                 .tracks()
                 .iter()
-                .map(AudioTrackReorderDocument::track_id)
+                .map(MixerStripReorderDocument::track_id)
                 .collect::<Vec<_>>(),
             vec![second_id, first_id, third_id]
         );
@@ -11548,7 +11572,7 @@ mod tests {
         let reopened_tracks: Vec<_> = reordered
             .tracks()
             .iter()
-            .map(AudioTrackReorderDocument::bytes)
+            .map(MixerStripReorderDocument::bytes)
             .collect();
         let reopened = load(
             input(TIMELINE, &reopened_tracks, &[], None),
@@ -11561,7 +11585,114 @@ mod tests {
     }
 
     #[test]
-    fn audio_track_reorder_refuses_noop_stale_and_unsupported_authority() {
+    fn reorders_flat_audio_group_and_return_strips_without_changing_routes() {
+        let audio_track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
+        let group_track_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let return_track_id = "018f47a2-6b2d-7c11-8a44-001122334470";
+        let mixer_id = "018f47a2-6b2d-7c11-8a44-001122334468";
+        let clips: [&[u8]; 1] = [CLIP];
+        let audio = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<Value>(TRACK).unwrap(),
+        )
+        .unwrap();
+        let source = load(
+            input(TIMELINE, &[&audio], &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let group = serialize_routing_bus_creation(
+            &source,
+            &asset_facts(),
+            MIXER,
+            mixer_id,
+            RoutingBusKind::Group,
+            group_track_id,
+            "Drum Bus",
+            &[audio_track_id],
+            &[],
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let with_group = load(
+            input(TIMELINE, &[&audio, group.track()], &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let returned = serialize_routing_bus_creation(
+            &with_group,
+            &asset_facts(),
+            group.mixer(),
+            mixer_id,
+            RoutingBusKind::Return,
+            return_track_id,
+            "Verb",
+            &[audio_track_id],
+            &["018f47a2-6b2d-7c11-8a44-001122334471"],
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let project = load(
+            input(
+                TIMELINE,
+                &[&audio, group.track(), returned.track()],
+                &clips,
+                Some(ARRANGEMENT),
+            ),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(project.supports_flat_mixer_strip_reorder());
+
+        let reordered = serialize_mixer_strip_reorder(
+            &project,
+            &asset_facts(),
+            &[
+                (audio_track_id, &audio),
+                (group_track_id, group.track()),
+                (return_track_id, returned.track()),
+            ],
+            returned.mixer(),
+            mixer_id,
+            return_track_id,
+            0,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let mixer: Value = serde_json::from_slice(reordered.mixer()).unwrap();
+        assert_eq!(
+            mixer["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|channel| channel["track_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![return_track_id, audio_track_id, group_track_id]
+        );
+        assert_eq!(
+            mixer["channels"][1]["destination"],
+            json!({"kind":"track", "track_id":group_track_id})
+        );
+        assert_eq!(mixer["return_buses"], json!([{ "bus":"a", "track_id":return_track_id }]));
+        assert_eq!(mixer["channels"][1]["sends"].as_array().unwrap().len(), 1);
+
+        let tracks = reordered
+            .tracks()
+            .iter()
+            .map(MixerStripReorderDocument::bytes)
+            .collect::<Vec<_>>();
+        let reopened = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        reopened
+            .load_mixer(reordered.mixer(), &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+    }
+
+    #[test]
+    fn mixer_strip_reorder_refuses_noop_stale_and_unsupported_authority() {
         let first_id = "018f47a2-6b2d-7c11-8a44-001122334456";
         let second_id = "018f47a2-6b2d-7c11-8a44-001122334469";
         let mixer_id = "018f47a2-6b2d-7c11-8a44-001122334468";
@@ -11590,11 +11721,11 @@ mod tests {
         .unwrap();
         let tracks: [&[u8]; 2] = [&first, &second];
         let project = load(input(TIMELINE, &tracks, &[], None), LoaderLimits::VERSION_1).unwrap();
-        assert!(project.supports_flat_audio_track_reorder());
+        assert!(project.supports_flat_mixer_strip_reorder());
         assert_eq!(project.structural_track_index(first_id), Some(0));
         assert_eq!(project.structural_track_index(second_id), Some(1));
         let reorder = |source_tracks: &[(&str, &[u8])], destination_index| {
-            serialize_audio_track_reorder(
+            serialize_mixer_strip_reorder(
                 &project,
                 &[],
                 source_tracks,
@@ -11608,18 +11739,18 @@ mod tests {
 
         assert!(matches!(
             reorder(&[(first_id, &first), (second_id, &second)], 0),
-            Err(AudioTrackReorderSerializationError::NoChange)
+            Err(MixerStripReorderSerializationError::NoChange)
         ));
         assert!(matches!(
             reorder(&[(first_id, &first), (second_id, &second)], 2),
-            Err(AudioTrackReorderSerializationError::DestinationOutOfRange)
+            Err(MixerStripReorderSerializationError::DestinationOutOfRange)
         ));
         let mut stale: Value = serde_json::from_slice(&second).unwrap();
         stale["active"] = false.into();
         let stale = serde_json_canonicalizer::to_vec(&stale).unwrap();
         assert!(matches!(
             reorder(&[(first_id, &first), (second_id, &stale)], 1),
-            Err(AudioTrackReorderSerializationError::SourceTrackMismatch)
+            Err(MixerStripReorderSerializationError::SourceTrackMismatch)
         ));
     }
 
