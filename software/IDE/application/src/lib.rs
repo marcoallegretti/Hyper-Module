@@ -88,7 +88,7 @@ pub use hyper_native_device::{
 };
 use hyper_playback_compiler::scene::LaunchQuantization;
 pub use hyper_playback_compiler::{
-    MeterEvent, MusicalPosition, TempoEvent, musical_position_at_frame,
+    MeterEvent, MusicalPosition, TempoEvent, musical_position, musical_position_at_frame,
 };
 pub use hyper_playback_json::is_native_audio_clip_gain_decibels as ide_audio_clip_gain_is_supported;
 use hyper_playback_json::{
@@ -136,11 +136,11 @@ use hyper_playback_json::{
     serialize_routing_bus_duplication, serialize_routing_bus_removal, serialize_routing_bus_rename,
     serialize_scene_activation, serialize_scene_addition, serialize_scene_duplication,
     serialize_scene_removal, serialize_scene_rename, serialize_scene_slot_edit,
-    serialize_timeline_meter, serialize_timeline_tempo,
+    serialize_timeline_map_edit, serialize_timeline_meter, serialize_timeline_tempo,
 };
 pub use hyper_playback_json::{
     AutomationChannelParameter, AutomationInterpolation, AutomationMainParameter, AutomationPoint,
-    AutomationSendParameter, AutomationTarget, AutomationValue,
+    AutomationSendParameter, AutomationTarget, AutomationValue, TimelineMapEdit,
 };
 pub use hyper_playback_json::{
     bpm_for_microseconds_per_quarter, meter_is_in_version_one_domain,
@@ -10865,6 +10865,26 @@ impl RunningDesktopIdeApplication {
             prepared,
             |project, facts, source, limits| {
                 serialize_timeline_meter(project, facts, source, numerator, denominator, limits)
+            },
+        )
+    }
+
+    fn prepare_timeline_map_edit(
+        application: &DesktopIdeApplication,
+        recovery: &DesktopPlaybackRecovery,
+        edit: TimelineMapEdit,
+    ) -> Result<IdeTimelineEditPlan, IdeTempoEditError> {
+        let mixer = Self::prepare_mixer_save(application, recovery)
+            .map_err(|source| IdeTempoEditError::MixerSave(Box::new(source)))?;
+        let prepared = recovery.prepared_project().ok_or_else(|| {
+            IdeTempoEditError::MixerSave(Box::new(IdeProjectSaveError::ProjectSnapshotUnavailable))
+        })?;
+        Self::prepare_timeline_edit_from_project(
+            application,
+            mixer,
+            prepared,
+            |project, facts, source, limits| {
+                serialize_timeline_map_edit(project, facts, source, limits, edit)
             },
         )
     }

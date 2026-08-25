@@ -58,6 +58,47 @@ const MAX_VERSION_1_TIMELINE_EVENTS: usize = 65_536;
 const MAX_VERSION_1_NAME_CHARACTERS: usize = 120;
 const MAX_VERSION_1_SENDS_PER_CHANNEL: usize = 2;
 
+/// One atomic edit to a version-1 step tempo or meter map.
+///
+/// Map positions are addressed by their project tick. Events have no separate
+/// identity: a tick is therefore both an event's location and its stable edit
+/// key. Moving an event preserves its value while changing that key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimelineMapEdit {
+    AddTempo {
+        tick: u64,
+        microseconds_per_quarter: u32,
+    },
+    UpdateTempo {
+        tick: u64,
+        microseconds_per_quarter: u32,
+    },
+    MoveTempo {
+        from_tick: u64,
+        to_tick: u64,
+    },
+    RemoveTempo {
+        tick: u64,
+    },
+    AddMeter {
+        tick: u64,
+        numerator: u16,
+        denominator: u16,
+    },
+    UpdateMeter {
+        tick: u64,
+        numerator: u16,
+        denominator: u16,
+    },
+    MoveMeter {
+        from_tick: u64,
+        to_tick: u64,
+    },
+    RemoveMeter {
+        tick: u64,
+    },
+}
+
 #[derive(Debug)]
 struct ExtensionsDocument(BTreeSet<String>);
 
@@ -4917,6 +4958,11 @@ const MAX_MICROSECONDS_PER_QUARTER: u32 = 16_777_215;
 pub enum TempoSerializationError {
     TempoOutOfRange,
     MeterOutOfRange,
+    TimelineEventAtOrigin,
+    TimelineEventAlreadyExists,
+    TimelineEventMissing,
+    TimelineEventDestinationOccupied,
+    TimelineEventLimitReached,
     TimelineMissing,
     SourceTimelineMismatch,
     NonCanonicalSource,
@@ -4934,6 +4980,21 @@ impl fmt::Display for TempoSerializationError {
             ),
             Self::MeterOutOfRange => {
                 formatter.write_str("time signature is outside the version 1 domain")
+            }
+            Self::TimelineEventAtOrigin => {
+                formatter.write_str("the timeline origin event cannot be moved or removed")
+            }
+            Self::TimelineEventAlreadyExists => {
+                formatter.write_str("a timeline event already exists at that tick")
+            }
+            Self::TimelineEventMissing => {
+                formatter.write_str("there is no timeline event at that tick")
+            }
+            Self::TimelineEventDestinationOccupied => {
+                formatter.write_str("another timeline event already occupies the destination tick")
+            }
+            Self::TimelineEventLimitReached => {
+                formatter.write_str("the timeline map has reached the version 1 event limit")
             }
             Self::TimelineMissing => formatter.write_str("the project has no timeline"),
             Self::SourceTimelineMismatch => {
@@ -4960,6 +5021,11 @@ impl Error for TempoSerializationError {
             Self::Serialization(source) => Some(source),
             Self::TempoOutOfRange
             | Self::MeterOutOfRange
+            | Self::TimelineEventAtOrigin
+            | Self::TimelineEventAlreadyExists
+            | Self::TimelineEventMissing
+            | Self::TimelineEventDestinationOccupied
+            | Self::TimelineEventLimitReached
             | Self::TimelineMissing
             | Self::SourceTimelineMismatch
             | Self::NonCanonicalSource
@@ -4988,17 +5054,15 @@ pub fn serialize_timeline_tempo(
     if microseconds_per_quarter == 0 || microseconds_per_quarter > MAX_MICROSECONDS_PER_QUARTER {
         return Err(TempoSerializationError::TempoOutOfRange);
     }
-    serialize_timeline_origin_edit(
+    ensure_timeline_origin_event(source_timeline, "tempo_events")?;
+    serialize_timeline_map_edit(
         project,
         assets,
         source_timeline,
         limits,
-        "tempo_events",
-        |origin| {
-            origin.insert(
-                "microseconds_per_quarter".to_owned(),
-                microseconds_per_quarter.into(),
-            );
+        TimelineMapEdit::UpdateTempo {
+            tick: 0,
+            microseconds_per_quarter,
         },
     )
 }
@@ -5025,15 +5089,16 @@ pub fn serialize_timeline_meter(
     if !meter_is_in_version_one_domain(numerator, denominator) {
         return Err(TempoSerializationError::MeterOutOfRange);
     }
-    serialize_timeline_origin_edit(
+    ensure_timeline_origin_event(source_timeline, "meter_events")?;
+    serialize_timeline_map_edit(
         project,
         assets,
         source_timeline,
         limits,
-        "meter_events",
-        |origin| {
-            origin.insert("numerator".to_owned(), numerator.into());
-            origin.insert("denominator".to_owned(), denominator.into());
+        TimelineMapEdit::UpdateMeter {
+            tick: 0,
+            numerator,
+            denominator,
         },
     )
 }
@@ -5044,17 +5109,43 @@ pub fn meter_is_in_version_one_domain(numerator: u16, denominator: u16) -> bool 
     (1..=255).contains(&numerator) && [1_u16, 2, 4, 8, 16, 32, 64, 128, 256].contains(&denominator)
 }
 
-/// The shared timeline write path: verify the source is the loaded, canonical
-/// timeline, rewrite the event at the origin of one map, then reload and
-/// recompile before returning. Tempo and meter differ only in which map they
-/// address and which fields they set.
-fn serialize_timeline_origin_edit(
+fn ensure_timeline_origin_event(
+    source_timeline: &[u8],
+    map: &str,
+) -> Result<(), TempoSerializationError> {
+    let value: Value =
+        serde_json::from_slice(source_timeline).map_err(TempoSerializationError::Serialization)?;
+    if value
+        .as_object()
+        .and_then(|document| document.get(map))
+        .and_then(Value::as_array)
+        .and_then(|events| events.first())
+        .and_then(Value::as_object)
+        .and_then(|event| event.get("tick"))
+        .and_then(Value::as_u64)
+        != Some(0)
+    {
+        return Err(TempoSerializationError::InvalidDocumentShape);
+    }
+    Ok(())
+}
+
+/// Applies one complete marker operation after verifying that the source is the
+/// loaded canonical timeline. The result is reloaded and recompiled before it
+/// is returned, so a map which would require unavailable time stretching can
+/// never be published.
+///
+/// # Errors
+///
+/// Returns [`TempoSerializationError`] when the operation is outside the
+/// version-1 map domain, its source is stale, or the resulting project is not
+/// executable by the current engine.
+pub fn serialize_timeline_map_edit(
     project: &LoadedPlaybackProject,
     assets: &[MediaAssetFact<'_>],
     source_timeline: &[u8],
     limits: LoaderLimits,
-    map: &str,
-    edit: impl FnOnce(&mut serde_json::Map<String, Value>),
+    edit: TimelineMapEdit,
 ) -> Result<Vec<u8>, TempoSerializationError> {
     let mut value: Value =
         serde_json::from_slice(source_timeline).map_err(TempoSerializationError::Serialization)?;
@@ -5069,17 +5160,7 @@ fn serialize_timeline_origin_edit(
     if document.get("id").and_then(Value::as_str) != Some(project.timeline_id.as_str()) {
         return Err(TempoSerializationError::SourceTimelineMismatch);
     }
-    let origin = document
-        .get_mut(map)
-        .and_then(Value::as_array_mut)
-        .ok_or(TempoSerializationError::InvalidDocumentShape)?
-        .first_mut()
-        .and_then(Value::as_object_mut)
-        .ok_or(TempoSerializationError::TimelineMissing)?;
-    if origin.get("tick").and_then(Value::as_u64) != Some(0) {
-        return Err(TempoSerializationError::InvalidDocumentShape);
-    }
-    edit(origin);
+    apply_timeline_map_edit(document, edit)?;
 
     let output =
         serde_json_canonicalizer::to_vec(&value).map_err(TempoSerializationError::Serialization)?;
@@ -5111,6 +5192,206 @@ fn serialize_timeline_origin_edit(
         .compile_playback(assets, GraphLimits::VERSION_1, SceneLimits::VERSION_1)
         .map_err(TempoSerializationError::ProjectCompilation)?;
     Ok(output)
+}
+
+fn apply_timeline_map_edit(
+    document: &mut serde_json::Map<String, Value>,
+    edit: TimelineMapEdit,
+) -> Result<(), TempoSerializationError> {
+    match edit {
+        TimelineMapEdit::AddTempo {
+            tick,
+            microseconds_per_quarter,
+        } => {
+            validate_tempo_value(microseconds_per_quarter)?;
+            add_timeline_event(
+                timeline_events(document, "tempo_events")?,
+                tick,
+                timeline_tempo_event(tick, microseconds_per_quarter),
+            )
+        }
+        TimelineMapEdit::UpdateTempo {
+            tick,
+            microseconds_per_quarter,
+        } => {
+            validate_tempo_value(microseconds_per_quarter)?;
+            update_timeline_event(timeline_events(document, "tempo_events")?, tick, |event| {
+                event.insert(
+                    "microseconds_per_quarter".to_owned(),
+                    microseconds_per_quarter.into(),
+                );
+            })
+        }
+        TimelineMapEdit::MoveTempo { from_tick, to_tick } => move_timeline_event(
+            timeline_events(document, "tempo_events")?,
+            from_tick,
+            to_tick,
+        ),
+        TimelineMapEdit::RemoveTempo { tick } => {
+            remove_timeline_event(timeline_events(document, "tempo_events")?, tick)
+        }
+        TimelineMapEdit::AddMeter {
+            tick,
+            numerator,
+            denominator,
+        } => {
+            validate_meter_value(numerator, denominator)?;
+            add_timeline_event(
+                timeline_events(document, "meter_events")?,
+                tick,
+                timeline_meter_event(tick, numerator, denominator),
+            )
+        }
+        TimelineMapEdit::UpdateMeter {
+            tick,
+            numerator,
+            denominator,
+        } => {
+            validate_meter_value(numerator, denominator)?;
+            update_timeline_event(timeline_events(document, "meter_events")?, tick, |event| {
+                event.insert("numerator".to_owned(), numerator.into());
+                event.insert("denominator".to_owned(), denominator.into());
+            })
+        }
+        TimelineMapEdit::MoveMeter { from_tick, to_tick } => move_timeline_event(
+            timeline_events(document, "meter_events")?,
+            from_tick,
+            to_tick,
+        ),
+        TimelineMapEdit::RemoveMeter { tick } => {
+            remove_timeline_event(timeline_events(document, "meter_events")?, tick)
+        }
+    }
+}
+
+fn validate_tempo_value(microseconds_per_quarter: u32) -> Result<(), TempoSerializationError> {
+    if microseconds_per_quarter == 0 || microseconds_per_quarter > MAX_MICROSECONDS_PER_QUARTER {
+        return Err(TempoSerializationError::TempoOutOfRange);
+    }
+    Ok(())
+}
+
+fn validate_meter_value(numerator: u16, denominator: u16) -> Result<(), TempoSerializationError> {
+    if !meter_is_in_version_one_domain(numerator, denominator) {
+        return Err(TempoSerializationError::MeterOutOfRange);
+    }
+    Ok(())
+}
+
+fn timeline_events<'a>(
+    document: &'a mut serde_json::Map<String, Value>,
+    map: &str,
+) -> Result<&'a mut Vec<Value>, TempoSerializationError> {
+    document
+        .get_mut(map)
+        .and_then(Value::as_array_mut)
+        .ok_or(TempoSerializationError::InvalidDocumentShape)
+}
+
+fn timeline_tempo_event(tick: u64, microseconds_per_quarter: u32) -> Value {
+    json!({"tick": tick, "microseconds_per_quarter": microseconds_per_quarter})
+}
+
+fn timeline_meter_event(tick: u64, numerator: u16, denominator: u16) -> Value {
+    json!({"tick": tick, "numerator": numerator, "denominator": denominator})
+}
+
+fn add_timeline_event(
+    events: &mut Vec<Value>,
+    tick: u64,
+    event: Value,
+) -> Result<(), TempoSerializationError> {
+    if events.len() >= MAX_VERSION_1_TIMELINE_EVENTS {
+        return Err(TempoSerializationError::TimelineEventLimitReached);
+    }
+    if timeline_event_index(events, tick)?.is_some() {
+        return Err(TempoSerializationError::TimelineEventAlreadyExists);
+    }
+    let insertion_index = events
+        .iter()
+        .position(|candidate| timeline_event_tick(candidate).is_ok_and(|current| current > tick))
+        .unwrap_or(events.len());
+    events.insert(insertion_index, event);
+    Ok(())
+}
+
+fn update_timeline_event(
+    events: &mut [Value],
+    tick: u64,
+    update: impl FnOnce(&mut serde_json::Map<String, Value>),
+) -> Result<(), TempoSerializationError> {
+    let index =
+        timeline_event_index(events, tick)?.ok_or(TempoSerializationError::TimelineEventMissing)?;
+    let event = events[index]
+        .as_object_mut()
+        .ok_or(TempoSerializationError::InvalidDocumentShape)?;
+    update(event);
+    Ok(())
+}
+
+fn move_timeline_event(
+    events: &mut Vec<Value>,
+    from_tick: u64,
+    to_tick: u64,
+) -> Result<(), TempoSerializationError> {
+    if from_tick == 0 || to_tick == 0 {
+        return Err(TempoSerializationError::TimelineEventAtOrigin);
+    }
+    let source_index = timeline_event_index(events, from_tick)?
+        .ok_or(TempoSerializationError::TimelineEventMissing)?;
+    if from_tick == to_tick {
+        return Ok(());
+    }
+    if timeline_event_index(events, to_tick)?.is_some() {
+        return Err(TempoSerializationError::TimelineEventDestinationOccupied);
+    }
+    let mut event = events.remove(source_index);
+    event
+        .as_object_mut()
+        .ok_or(TempoSerializationError::InvalidDocumentShape)?
+        .insert("tick".to_owned(), to_tick.into());
+    let insertion_index = events
+        .iter()
+        .position(|candidate| timeline_event_tick(candidate).is_ok_and(|current| current > to_tick))
+        .unwrap_or(events.len());
+    events.insert(insertion_index, event);
+    Ok(())
+}
+
+fn remove_timeline_event(
+    events: &mut Vec<Value>,
+    tick: u64,
+) -> Result<(), TempoSerializationError> {
+    if tick == 0 {
+        return Err(TempoSerializationError::TimelineEventAtOrigin);
+    }
+    let index =
+        timeline_event_index(events, tick)?.ok_or(TempoSerializationError::TimelineEventMissing)?;
+    events.remove(index);
+    Ok(())
+}
+
+fn timeline_event_index(
+    events: &[Value],
+    tick: u64,
+) -> Result<Option<usize>, TempoSerializationError> {
+    events
+        .iter()
+        .enumerate()
+        .find_map(|(index, event)| match timeline_event_tick(event) {
+            Ok(event_tick) if event_tick == tick => Some(Ok(index)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .transpose()
+}
+
+fn timeline_event_tick(event: &Value) -> Result<u64, TempoSerializationError> {
+    event
+        .as_object()
+        .and_then(|event| event.get("tick"))
+        .and_then(Value::as_u64)
+        .ok_or(TempoSerializationError::InvalidDocumentShape)
 }
 
 /// Writes the transport loop into the arrangement, or removes it when `range`
@@ -17452,6 +17733,199 @@ mod tests {
                     Err(TempoSerializationError::MeterOutOfRange)
                 ),
                 "{refused:?} is outside the version 1 domain"
+            );
+        }
+    }
+
+    #[test]
+    fn timeline_marker_edits_preserve_order_identity_and_the_origin_invariant() {
+        let tracks: [&[u8]; 0] = [];
+        let clips: [&[u8]; 0] = [];
+        let assets: [MediaAssetFact<'_>; 0] = [];
+        let source = serde_json_canonicalizer::to_vec(
+            &serde_json::from_slice::<serde_json::Value>(TIMELINE).unwrap(),
+        )
+        .unwrap();
+        let project = load(
+            input(&source, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+
+        let tempo_added = serialize_timeline_map_edit(
+            &project,
+            &assets,
+            &source,
+            LoaderLimits::VERSION_1,
+            TimelineMapEdit::AddTempo {
+                tick: 7_680,
+                microseconds_per_quarter: 400_000,
+            },
+        )
+        .unwrap();
+        let project = load(
+            input(&tempo_added, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(
+            project.tempo_events(),
+            [
+                TempoEvent {
+                    tick: 0,
+                    microseconds_per_quarter: 1_000_000,
+                },
+                TempoEvent {
+                    tick: 7_680,
+                    microseconds_per_quarter: 400_000,
+                },
+            ]
+        );
+
+        let tempo_updated = serialize_timeline_map_edit(
+            &project,
+            &assets,
+            &tempo_added,
+            LoaderLimits::VERSION_1,
+            TimelineMapEdit::UpdateTempo {
+                tick: 7_680,
+                microseconds_per_quarter: 300_000,
+            },
+        )
+        .unwrap();
+        let project = load(
+            input(&tempo_updated, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(project.tempo_events()[1].microseconds_per_quarter, 300_000);
+
+        let tempo_moved = serialize_timeline_map_edit(
+            &project,
+            &assets,
+            &tempo_updated,
+            LoaderLimits::VERSION_1,
+            TimelineMapEdit::MoveTempo {
+                from_tick: 7_680,
+                to_tick: 9_600,
+            },
+        )
+        .unwrap();
+        let project = load(
+            input(&tempo_moved, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(project.tempo_events()[1].tick, 9_600);
+
+        let tempo_removed = serialize_timeline_map_edit(
+            &project,
+            &assets,
+            &tempo_moved,
+            LoaderLimits::VERSION_1,
+            TimelineMapEdit::RemoveTempo { tick: 9_600 },
+        )
+        .unwrap();
+        let project = load(
+            input(&tempo_removed, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(project.tempo_events().len(), 1);
+
+        let meter_added = serialize_timeline_map_edit(
+            &project,
+            &assets,
+            &tempo_removed,
+            LoaderLimits::VERSION_1,
+            TimelineMapEdit::AddMeter {
+                tick: 7_680,
+                numerator: 3,
+                denominator: 4,
+            },
+        )
+        .unwrap();
+        let project = load(
+            input(&meter_added, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let meter_updated = serialize_timeline_map_edit(
+            &project,
+            &assets,
+            &meter_added,
+            LoaderLimits::VERSION_1,
+            TimelineMapEdit::UpdateMeter {
+                tick: 7_680,
+                numerator: 5,
+                denominator: 4,
+            },
+        )
+        .unwrap();
+        let project = load(
+            input(&meter_updated, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let meter_moved = serialize_timeline_map_edit(
+            &project,
+            &assets,
+            &meter_updated,
+            LoaderLimits::VERSION_1,
+            TimelineMapEdit::MoveMeter {
+                from_tick: 7_680,
+                to_tick: 9_600,
+            },
+        )
+        .unwrap();
+        let project = load(
+            input(&meter_moved, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(project.meter_events()[1].tick, 9_600);
+        assert_eq!(project.meter_events()[1].numerator, 5);
+
+        let meter_removed = serialize_timeline_map_edit(
+            &project,
+            &assets,
+            &meter_moved,
+            LoaderLimits::VERSION_1,
+            TimelineMapEdit::RemoveMeter { tick: 9_600 },
+        )
+        .unwrap();
+        let project = load(
+            input(&meter_removed, &tracks, &clips, None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(project.meter_events().len(), 1);
+
+        for rejected in [
+            TimelineMapEdit::AddTempo {
+                tick: 0,
+                microseconds_per_quarter: 500_000,
+            },
+            TimelineMapEdit::UpdateTempo {
+                tick: 7_680,
+                microseconds_per_quarter: 500_000,
+            },
+            TimelineMapEdit::RemoveMeter { tick: 0 },
+            TimelineMapEdit::MoveMeter {
+                from_tick: 0,
+                to_tick: 7_680,
+            },
+        ] {
+            assert!(
+                serialize_timeline_map_edit(
+                    &project,
+                    &assets,
+                    &meter_removed,
+                    LoaderLimits::VERSION_1,
+                    rejected,
+                )
+                .is_err(),
+                "the map contract rejects invalid marker lifecycle requests: {rejected:?}"
             );
         }
     }

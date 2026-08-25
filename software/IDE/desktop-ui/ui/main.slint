@@ -228,6 +228,20 @@ export struct ArrangementSceneLaunchRow {
     tick: string,
 }
 
+export struct TimelineTempoMarkerRow {
+    tick: string,
+    position: string,
+    bpm: string,
+    origin: bool,
+}
+
+export struct TimelineMeterMarkerRow {
+    tick: string,
+    position: string,
+    signature: string,
+    origin: bool,
+}
+
 export struct ClipRow {
     id: string,
     name: string,
@@ -273,6 +287,14 @@ export global IdeActions {
     callback metronome-toggle();
     callback set-tempo(string);
     callback set-meter(string);
+    callback add-timeline-tempo(string, string);
+    callback update-timeline-tempo(string, string);
+    callback move-timeline-tempo(string, string);
+    callback remove-timeline-tempo(string);
+    callback add-timeline-meter(string, string);
+    callback update-timeline-meter(string, string);
+    callback move-timeline-meter(string, string);
+    callback remove-timeline-meter(string);
     callback locate-placement(int);
     callback set-arrangement-placement-active(int, bool);
     callback move-arrangement-placement(string, string);
@@ -538,6 +560,16 @@ export component MainWindow inherits Window {
     in-out property <string> take-clip-track-name: "";
     in-out property <string> take-clip-name: "";
     in-out property <bool> arrangement-visible: false;
+    in-out property <bool> timeline-map-visible: false;
+    in-out property <bool> timeline-tempo-add-visible: false;
+    in-out property <bool> timeline-tempo-edit-visible: false;
+    in-out property <bool> timeline-tempo-move-visible: false;
+    in-out property <bool> timeline-meter-add-visible: false;
+    in-out property <bool> timeline-meter-edit-visible: false;
+    in-out property <bool> timeline-meter-move-visible: false;
+    in-out property <string> timeline-map-tick: "";
+    in-out property <string> timeline-map-value: "";
+    in-out property <string> timeline-map-source-tick: "";
     in-out property <bool> add-arrangement-scene-launch-visible: false;
     in-out property <string> add-arrangement-scene-launch-id: "";
     in-out property <string> add-arrangement-scene-launch-name: "";
@@ -784,6 +816,8 @@ export component MainWindow inherits Window {
     in property <[TakeRow]> recording-takes: [];
     in property <[ArrangementRow]> arrangement-placements: [];
     in property <[ArrangementSceneLaunchRow]> arrangement-scene-launches: [];
+    in property <[TimelineTempoMarkerRow]> timeline-tempo-markers: [];
+    in property <[TimelineMeterMarkerRow]> timeline-meter-markers: [];
     in property <[string]> scene-names: [];
     in property <[ClipRow]> audio-clips: [];
     in property <int> unused-sample-assets: 0;
@@ -1637,27 +1671,32 @@ export component MainWindow inherits Window {
                         Button {
                             text: "Arrangement (" + root.arrangement-placements.length + ")";
                             enabled: root.app-mode == AppMode.running;
-                            clicked => { root.clips-visible = false; root.loudness-visible = false; root.arrangement-visible = true; }
+                            clicked => { root.timeline-map-visible = false; root.clips-visible = false; root.loudness-visible = false; root.arrangement-visible = true; }
                         }
                         Button {
                             text: "Clips (" + root.audio-clips.length + ")";
                             enabled: root.app-mode == AppMode.running;
-                            clicked => { root.arrangement-visible = false; root.loudness-visible = false; root.clips-visible = true; }
+                            clicked => { root.timeline-map-visible = false; root.arrangement-visible = false; root.loudness-visible = false; root.clips-visible = true; }
                         }
                         Button {
                             text: "Loudness";
                             enabled: root.app-mode == AppMode.running;
-                            clicked => { root.arrangement-visible = false; root.clips-visible = false; root.loudness-visible = true; }
+                            clicked => { root.timeline-map-visible = false; root.arrangement-visible = false; root.clips-visible = false; root.loudness-visible = true; }
                         }
                         Button {
                             text: "Takes (" + root.recording-takes.length + ")";
                             enabled: root.app-mode == AppMode.running || root.app-mode == AppMode.previewing;
-                            clicked => { root.arrangement-visible = false; root.clips-visible = false; root.loudness-visible = false; root.takes-visible = true; }
+                            clicked => { root.timeline-map-visible = false; root.arrangement-visible = false; root.clips-visible = false; root.loudness-visible = false; root.takes-visible = true; }
                         }
                         Button {
                             text: "Mixer";
                             enabled: root.app-mode == AppMode.running;
-                            clicked => { root.arrangement-visible = false; root.clips-visible = false; root.loudness-visible = false; root.mixer-visible = true; }
+                            clicked => { root.timeline-map-visible = false; root.arrangement-visible = false; root.clips-visible = false; root.loudness-visible = false; root.mixer-visible = true; }
+                        }
+                        Button {
+                            text: "Timeline";
+                            enabled: root.app-mode == AppMode.running;
+                            clicked => { root.arrangement-visible = false; root.clips-visible = false; root.loudness-visible = false; root.takes-visible = false; root.mixer-visible = false; root.timeline-map-visible = true; }
                         }
                         Text { text: root.stream-state; color: #8fa0b4; font-size: 12px; vertical-alignment: center; }
                     }
@@ -3574,7 +3613,138 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if root.arrangement-visible && !root.clips-visible && !root.loudness-visible : Panel {
+                if root.timeline-map-visible : Panel {
+                    width: parent.width;
+                    height: parent.height;
+                    VerticalLayout {
+                        padding: 22px;
+                        spacing: 14px;
+                        HorizontalLayout {
+                            height: 48px;
+                            VerticalLayout {
+                                Text { text: "TIMELINE MAP"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                                Text { text: root.timeline-tempo-markers.length + " tempo markers · " + root.timeline-meter-markers.length + " time signatures"; color: #aebccc; font-size: 12px; }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Button {
+                                text: "Add tempo";
+                                enabled: root.app-mode == AppMode.running && root.tempo-available;
+                                clicked => { root.timeline-tempo-edit-visible = false; root.timeline-tempo-move-visible = false; root.timeline-meter-add-visible = false; root.timeline-meter-edit-visible = false; root.timeline-meter-move-visible = false; root.timeline-map-tick = ""; root.timeline-map-value = root.tempo-bpm; root.timeline-tempo-add-visible = true; }
+                            }
+                            Button {
+                                text: "Add signature";
+                                enabled: root.app-mode == AppMode.running;
+                                clicked => { root.timeline-tempo-add-visible = false; root.timeline-tempo-edit-visible = false; root.timeline-tempo-move-visible = false; root.timeline-meter-edit-visible = false; root.timeline-meter-move-visible = false; root.timeline-map-tick = ""; root.timeline-map-value = root.meter-signature; root.timeline-meter-add-visible = true; }
+                            }
+                        }
+                        Rectangle { height: 1px; background: #27313d; }
+
+                        if root.timeline-tempo-add-visible : VerticalLayout {
+                            spacing: 10px;
+                            Text { text: "ADD TEMPO MARKER"; color: #7fd6a2; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            Text { text: "A tempo marker is a step change at a project tick. The project is recompiled before the change is saved."; color: #aebccc; font-size: 12px; wrap: word-wrap; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                tempo-add-tick-input := IdeLineEdit { width: 130px; text: root.timeline-map-tick; placeholder-text: "Tick"; accessible-label: "Tempo marker project tick"; enabled: root.app-mode == AppMode.running && root.tempo-available; accepted => { IdeActions.add-timeline-tempo(self.text, tempo-add-value-input.text); } }
+                                tempo-add-value-input := IdeLineEdit { width: 130px; text: root.timeline-map-value; placeholder-text: "BPM"; accessible-label: "Tempo marker beats per minute"; enabled: root.app-mode == AppMode.running && root.tempo-available; accepted => { IdeActions.add-timeline-tempo(tempo-add-tick-input.text, self.text); } }
+                                Button { text: "Add"; enabled: root.app-mode == AppMode.running && root.tempo-available; clicked => { IdeActions.add-timeline-tempo(tempo-add-tick-input.text, tempo-add-value-input.text); } }
+                                Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-tempo-add-visible = false; } }
+                            }
+                        }
+                        if root.timeline-tempo-edit-visible : VerticalLayout {
+                            spacing: 10px;
+                            Text { text: "EDIT TEMPO MARKER · TICK " + root.timeline-map-source-tick; color: #7fd6a2; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            HorizontalLayout {
+                                tempo-edit-value-input := IdeLineEdit { width: 130px; text: root.timeline-map-value; placeholder-text: "BPM"; accessible-label: "Tempo marker beats per minute"; enabled: root.app-mode == AppMode.running && root.tempo-available; accepted => { IdeActions.update-timeline-tempo(root.timeline-map-source-tick, self.text); } }
+                                Button { text: "Save"; enabled: root.app-mode == AppMode.running && root.tempo-available; clicked => { IdeActions.update-timeline-tempo(root.timeline-map-source-tick, tempo-edit-value-input.text); } }
+                                Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-tempo-edit-visible = false; } }
+                            }
+                        }
+                        if root.timeline-tempo-move-visible : VerticalLayout {
+                            spacing: 10px;
+                            Text { text: "MOVE TEMPO MARKER · FROM TICK " + root.timeline-map-source-tick; color: #7fd6a2; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            HorizontalLayout {
+                                tempo-move-tick-input := IdeLineEdit { width: 130px; text: root.timeline-map-tick; placeholder-text: "Destination tick"; accessible-label: "New tempo marker project tick"; enabled: root.app-mode == AppMode.running && root.tempo-available; accepted => { IdeActions.move-timeline-tempo(root.timeline-map-source-tick, self.text); } }
+                                Button { text: "Move"; enabled: root.app-mode == AppMode.running && root.tempo-available; clicked => { IdeActions.move-timeline-tempo(root.timeline-map-source-tick, tempo-move-tick-input.text); } }
+                                Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-tempo-move-visible = false; } }
+                            }
+                        }
+                        if root.timeline-meter-add-visible : VerticalLayout {
+                            spacing: 10px;
+                            Text { text: "ADD TIME SIGNATURE"; color: #7fd6a2; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            Text { text: "A time-signature marker changes bar and beat grouping at a project tick without retiming audio."; color: #aebccc; font-size: 12px; wrap: word-wrap; }
+                            HorizontalLayout {
+                                meter-add-tick-input := IdeLineEdit { width: 130px; text: root.timeline-map-tick; placeholder-text: "Tick"; accessible-label: "Time signature marker project tick"; accepted => { IdeActions.add-timeline-meter(self.text, meter-add-value-input.text); } }
+                                meter-add-value-input := IdeLineEdit { width: 130px; text: root.timeline-map-value; placeholder-text: "4/4"; accessible-label: "Time signature marker"; accepted => { IdeActions.add-timeline-meter(meter-add-tick-input.text, self.text); } }
+                                Button { text: "Add"; enabled: root.app-mode == AppMode.running; clicked => { IdeActions.add-timeline-meter(meter-add-tick-input.text, meter-add-value-input.text); } }
+                                Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-meter-add-visible = false; } }
+                            }
+                        }
+                        if root.timeline-meter-edit-visible : VerticalLayout {
+                            spacing: 10px;
+                            Text { text: "EDIT TIME SIGNATURE · TICK " + root.timeline-map-source-tick; color: #7fd6a2; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            HorizontalLayout {
+                                meter-edit-value-input := IdeLineEdit { width: 130px; text: root.timeline-map-value; placeholder-text: "4/4"; accessible-label: "Time signature marker"; accepted => { IdeActions.update-timeline-meter(root.timeline-map-source-tick, self.text); } }
+                                Button { text: "Save"; enabled: root.app-mode == AppMode.running; clicked => { IdeActions.update-timeline-meter(root.timeline-map-source-tick, meter-edit-value-input.text); } }
+                                Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-meter-edit-visible = false; } }
+                            }
+                        }
+                        if root.timeline-meter-move-visible : VerticalLayout {
+                            spacing: 10px;
+                            Text { text: "MOVE TIME SIGNATURE · FROM TICK " + root.timeline-map-source-tick; color: #7fd6a2; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                            HorizontalLayout {
+                                meter-move-tick-input := IdeLineEdit { width: 130px; text: root.timeline-map-tick; placeholder-text: "Destination tick"; accessible-label: "New time signature marker project tick"; accepted => { IdeActions.move-timeline-meter(root.timeline-map-source-tick, self.text); } }
+                                Button { text: "Move"; enabled: root.app-mode == AppMode.running; clicked => { IdeActions.move-timeline-meter(root.timeline-map-source-tick, meter-move-tick-input.text); } }
+                                Button { text: "Cancel"; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-meter-move-visible = false; } }
+                            }
+                        }
+
+                        Text { text: "TEMPO MARKERS"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        ListView {
+                            height: Math.min(160px, root.timeline-tempo-markers.length * 40px);
+                            for marker in root.timeline-tempo-markers : Rectangle {
+                                height: 36px;
+                                width: parent.width;
+                                background: marker.origin ? #17242d : #101820;
+                                HorizontalLayout {
+                                    padding: 8px;
+                                    spacing: 10px;
+                                    Text { width: 100px; text: "Tick " + marker.tick; color: #aebccc; font-size: 11px; vertical-alignment: center; }
+                                    Text { width: 110px; text: marker.position; color: #7fd6a2; font-size: 11px; vertical-alignment: center; }
+                                    Text { width: 86px; text: marker.bpm + " BPM"; color: #edf2f8; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+                                    Text { width: 45px; text: marker.origin ? "Origin" : ""; color: #728196; font-size: 10px; vertical-alignment: center; }
+                                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    Button { text: "Edit"; enabled: root.app-mode == AppMode.running && root.tempo-available; clicked => { root.timeline-tempo-add-visible = false; root.timeline-tempo-move-visible = false; root.timeline-map-source-tick = marker.tick; root.timeline-map-value = marker.bpm; root.timeline-tempo-edit-visible = true; } }
+                                    Button { text: "Move"; enabled: root.app-mode == AppMode.running && root.tempo-available && !marker.origin; clicked => { root.timeline-tempo-add-visible = false; root.timeline-tempo-edit-visible = false; root.timeline-map-source-tick = marker.tick; root.timeline-map-tick = marker.tick; root.timeline-tempo-move-visible = true; } }
+                                    Button { text: "Remove"; enabled: root.app-mode == AppMode.running && root.tempo-available && !marker.origin; clicked => { IdeActions.remove-timeline-tempo(marker.tick); } }
+                                }
+                            }
+                        }
+                        Text { text: "TIME SIGNATURES"; color: #6f8197; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+                        ListView {
+                            vertical-stretch: 1;
+                            for marker in root.timeline-meter-markers : Rectangle {
+                                height: 36px;
+                                width: parent.width;
+                                background: marker.origin ? #17242d : #101820;
+                                HorizontalLayout {
+                                    padding: 8px;
+                                    spacing: 10px;
+                                    Text { width: 100px; text: "Tick " + marker.tick; color: #aebccc; font-size: 11px; vertical-alignment: center; }
+                                    Text { width: 110px; text: marker.position; color: #7fd6a2; font-size: 11px; vertical-alignment: center; }
+                                    Text { width: 86px; text: marker.signature; color: #edf2f8; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+                                    Text { width: 45px; text: marker.origin ? "Origin" : ""; color: #728196; font-size: 10px; vertical-alignment: center; }
+                                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    Button { text: "Edit"; enabled: root.app-mode == AppMode.running; clicked => { root.timeline-meter-add-visible = false; root.timeline-meter-move-visible = false; root.timeline-map-source-tick = marker.tick; root.timeline-map-value = marker.signature; root.timeline-meter-edit-visible = true; } }
+                                    Button { text: "Move"; enabled: root.app-mode == AppMode.running && !marker.origin; clicked => { root.timeline-meter-add-visible = false; root.timeline-meter-edit-visible = false; root.timeline-map-source-tick = marker.tick; root.timeline-map-tick = marker.tick; root.timeline-meter-move-visible = true; } }
+                                    Button { text: "Remove"; enabled: root.app-mode == AppMode.running && !marker.origin; clicked => { IdeActions.remove-timeline-meter(marker.tick); } }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.arrangement-visible && !root.clips-visible && !root.loudness-visible && !root.timeline-map-visible : Panel {
                     width: parent.width;
                     height: parent.height;
                     VerticalLayout {

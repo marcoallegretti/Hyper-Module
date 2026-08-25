@@ -36,10 +36,11 @@ use hyper_desktop_ide::{
     MIN_COMPRESSOR_THRESHOLD_MILLIDECIBELS, MIN_FILTER_CUTOFF_MILLIHERTZ,
     MIN_FILTER_RESONANCE_MILLIONTHS, MeterEvent, NativeFilterMode, OfflineExportReport,
     OfflineTrackStemExportFormat, PlaybackRecoveryTransportState, ProjectHistory, RecentProject,
-    SceneAction, TempoEvent, TransportAction, TransportCommand, TransportLoopRange,
-    TriggerBehavior, bpm_for_microseconds_per_quarter, desktop_ide_application_config,
-    ide_audio_clip_gain_is_supported, meter_is_in_version_one_domain,
-    microseconds_per_quarter_for_bpm, musical_position_at_frame,
+    SceneAction, TempoEvent, TimelineMapEdit, TransportAction, TransportCommand,
+    TransportLoopRange, TriggerBehavior, bpm_for_microseconds_per_quarter,
+    desktop_ide_application_config, ide_audio_clip_gain_is_supported,
+    meter_is_in_version_one_domain, microseconds_per_quarter_for_bpm, musical_position,
+    musical_position_at_frame,
 };
 #[cfg(test)]
 use hyper_desktop_ide::{
@@ -3042,6 +3043,7 @@ fn bind_arrangement_scene_launch_callback(
     bind_loop_callbacks(ui, worker, project_state);
     bind_tempo_callback(ui, worker);
     bind_meter_callback(ui, worker);
+    bind_timeline_map_callbacks(ui, worker);
     bind_arrangement_scene_launch_locate_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_scene_callback(ui, worker, project_state);
     bind_arrangement_scene_launch_removal_callback(ui, worker, project_state);
@@ -4614,7 +4616,8 @@ fn mode_after_successful_submission(current: AppMode, command: IdeWorkerCommandK
         | IdeWorkerCommandKind::SetSceneSlot
         | IdeWorkerCommandKind::SetArrangementLoopRange
         | IdeWorkerCommandKind::SetTempo
-        | IdeWorkerCommandKind::SetMeter => AppMode::Saving,
+        | IdeWorkerCommandKind::SetMeter
+        | IdeWorkerCommandKind::EditTimelineMap => AppMode::Saving,
         IdeWorkerCommandKind::AddAudioTrack => AppMode::AddingTrack,
         IdeWorkerCommandKind::AddRoutingBus => AppMode::AddingRoutingBus,
         IdeWorkerCommandKind::DuplicateAudioTrack => AppMode::DuplicatingTrack,
@@ -4732,6 +4735,9 @@ fn command_status(command: IdeWorkerCommandKind) -> &'static str {
         }
         IdeWorkerCommandKind::SetMeter => {
             "Preserving mixer state, saving the time signature, and reopening project..."
+        }
+        IdeWorkerCommandKind::EditTimelineMap => {
+            "Preserving mixer state, saving the timeline map, and reopening project..."
         }
         IdeWorkerCommandKind::SetArrangementSceneLaunchScene => {
             "Preserving mixer state, changing the marker scene, and reopening project..."
@@ -5346,6 +5352,28 @@ fn apply_event(
             ui.set_status_text(SharedString::default());
             ui.set_error_text(
                 format!("The tempo was saved but the project may need attention: {warning}").into(),
+            );
+        }
+        IdeWorkerEvent::TimelineMapChanging => {
+            ui.set_status_text("Saving the timeline map...".into());
+        }
+        IdeWorkerEvent::TimelineMapChanged { revision } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_timeline_tempo_add_visible(false);
+            ui.set_timeline_tempo_edit_visible(false);
+            ui.set_timeline_tempo_move_visible(false);
+            ui.set_timeline_meter_add_visible(false);
+            ui.set_timeline_meter_edit_visible(false);
+            ui.set_timeline_meter_move_visible(false);
+            ui.set_status_text(format!("Timeline map saved in project revision {revision}").into());
+            ui.set_error_text(SharedString::default());
+        }
+        IdeWorkerEvent::TimelineMapCommittedWithWarning { warning } => {
+            ui.set_app_mode(AppMode::Running);
+            ui.set_status_text(SharedString::default());
+            ui.set_error_text(
+                format!("The timeline map was saved but the project may need attention: {warning}")
+                    .into(),
             );
         }
         IdeWorkerEvent::ArrangementLoopRangeChanging => {
@@ -8439,6 +8467,18 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_tempo_locked_reason(SharedString::default());
     ui.set_meter_signature(SharedString::default());
     ui.set_meter_available(false);
+    ui.set_timeline_tempo_markers(ModelRc::default());
+    ui.set_timeline_meter_markers(ModelRc::default());
+    ui.set_timeline_map_visible(false);
+    ui.set_timeline_tempo_add_visible(false);
+    ui.set_timeline_tempo_edit_visible(false);
+    ui.set_timeline_tempo_move_visible(false);
+    ui.set_timeline_meter_add_visible(false);
+    ui.set_timeline_meter_edit_visible(false);
+    ui.set_timeline_meter_move_visible(false);
+    ui.set_timeline_map_tick(SharedString::default());
+    ui.set_timeline_map_value(SharedString::default());
+    ui.set_timeline_map_source_tick(SharedString::default());
     ui.set_loop_marking_available(false);
     ui.set_loop_toggle_available(false);
     ui.set_loop_engaged(false);
@@ -8485,6 +8525,7 @@ fn mode_after_failure(current: AppMode, command: IdeWorkerCommandKind) -> AppMod
         | IdeWorkerCommandKind::SetArrangementLoopRange
         | IdeWorkerCommandKind::SetTempo
         | IdeWorkerCommandKind::SetMeter
+        | IdeWorkerCommandKind::EditTimelineMap
             if current == AppMode::Saving =>
         {
             AppMode::Running
@@ -10884,6 +10925,187 @@ fn bind_meter_callback(ui: &MainWindow, worker: &WorkerCell) {
     });
 }
 
+fn timeline_tick(typed: &str) -> Result<u64, String> {
+    let trimmed = typed.trim();
+    let tick: u64 = trimmed
+        .parse()
+        .map_err(|_| format!("\"{trimmed}\" is not a project tick"))?;
+    if tick <= MAX_SAFE_TIMELINE_TICK {
+        Ok(tick)
+    } else {
+        Err(format!(
+            "{trimmed} is outside this project's timeline domain"
+        ))
+    }
+}
+
+fn timeline_meter(typed: &str) -> Result<(u16, u16), String> {
+    match meter_command(typed)? {
+        IdeWorkerCommand::SetMeter {
+            numerator,
+            denominator,
+        } => Ok((numerator, denominator)),
+        _ => unreachable!("meter_command constructs only a meter command"),
+    }
+}
+
+fn timeline_tempo(typed: &str) -> Result<u32, String> {
+    match tempo_command(typed)? {
+        IdeWorkerCommand::SetTempo {
+            microseconds_per_quarter,
+        } => Ok(microseconds_per_quarter),
+        _ => unreachable!("tempo_command constructs only a tempo command"),
+    }
+}
+
+fn submit_timeline_map_edit(
+    ui: &MainWindow,
+    worker: &WorkerCell,
+    edit: Result<TimelineMapEdit, String>,
+) {
+    match edit {
+        Ok(edit) => submit_to_ui(ui, worker, IdeWorkerCommand::EditTimelineMap { edit }),
+        Err(message) => ui.set_error_text(message.into()),
+    }
+}
+
+fn bind_timeline_map_callbacks(ui: &MainWindow, worker: &WorkerCell) {
+    let actions = ui.global::<IdeActions>();
+    let weak = ui.as_weak();
+    let worker = Rc::clone(worker);
+    let add_tempo_worker = Rc::clone(&worker);
+    let update_tempo_worker = Rc::clone(&worker);
+    let move_tempo_worker = Rc::clone(&worker);
+    let remove_tempo_worker = Rc::clone(&worker);
+    let add_meter_worker = Rc::clone(&worker);
+    let update_meter_worker = Rc::clone(&worker);
+    let move_meter_worker = Rc::clone(&worker);
+    let remove_meter_worker = Rc::clone(&worker);
+    actions.on_add_timeline_tempo(move |tick, bpm| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        submit_timeline_map_edit(
+            &ui,
+            &add_tempo_worker,
+            timeline_tick(tick.as_str()).and_then(|tick| {
+                timeline_tempo(bpm.as_str()).map(|microseconds_per_quarter| {
+                    TimelineMapEdit::AddTempo {
+                        tick,
+                        microseconds_per_quarter,
+                    }
+                })
+            }),
+        );
+    });
+    let weak = ui.as_weak();
+    actions.on_update_timeline_tempo(move |tick, bpm| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        submit_timeline_map_edit(
+            &ui,
+            &update_tempo_worker,
+            timeline_tick(tick.as_str()).and_then(|tick| {
+                timeline_tempo(bpm.as_str()).map(|microseconds_per_quarter| {
+                    TimelineMapEdit::UpdateTempo {
+                        tick,
+                        microseconds_per_quarter,
+                    }
+                })
+            }),
+        );
+    });
+    let weak = ui.as_weak();
+    actions.on_move_timeline_tempo(move |from_tick, to_tick| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        submit_timeline_map_edit(
+            &ui,
+            &move_tempo_worker,
+            timeline_tick(from_tick.as_str()).and_then(|from_tick| {
+                timeline_tick(to_tick.as_str())
+                    .map(|to_tick| TimelineMapEdit::MoveTempo { from_tick, to_tick })
+            }),
+        );
+    });
+    let weak = ui.as_weak();
+    actions.on_remove_timeline_tempo(move |tick| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        submit_timeline_map_edit(
+            &ui,
+            &remove_tempo_worker,
+            timeline_tick(tick.as_str()).map(|tick| TimelineMapEdit::RemoveTempo { tick }),
+        );
+    });
+    let weak = ui.as_weak();
+    actions.on_add_timeline_meter(move |tick, signature| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        submit_timeline_map_edit(
+            &ui,
+            &add_meter_worker,
+            timeline_tick(tick.as_str()).and_then(|tick| {
+                timeline_meter(signature.as_str()).map(|(numerator, denominator)| {
+                    TimelineMapEdit::AddMeter {
+                        tick,
+                        numerator,
+                        denominator,
+                    }
+                })
+            }),
+        );
+    });
+    let weak = ui.as_weak();
+    actions.on_update_timeline_meter(move |tick, signature| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        submit_timeline_map_edit(
+            &ui,
+            &update_meter_worker,
+            timeline_tick(tick.as_str()).and_then(|tick| {
+                timeline_meter(signature.as_str()).map(|(numerator, denominator)| {
+                    TimelineMapEdit::UpdateMeter {
+                        tick,
+                        numerator,
+                        denominator,
+                    }
+                })
+            }),
+        );
+    });
+    let weak = ui.as_weak();
+    actions.on_move_timeline_meter(move |from_tick, to_tick| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        submit_timeline_map_edit(
+            &ui,
+            &move_meter_worker,
+            timeline_tick(from_tick.as_str()).and_then(|from_tick| {
+                timeline_tick(to_tick.as_str())
+                    .map(|to_tick| TimelineMapEdit::MoveMeter { from_tick, to_tick })
+            }),
+        );
+    });
+    let weak = ui.as_weak();
+    actions.on_remove_timeline_meter(move |tick| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        submit_timeline_map_edit(
+            &ui,
+            &remove_meter_worker,
+            timeline_tick(tick.as_str()).map(|tick| TimelineMapEdit::RemoveMeter { tick }),
+        );
+    });
+}
+
 /// Saving the project writes the loop range alongside the mixer, because the
 /// loop plan publishes both in one transaction. Marking a loop point is session
 /// state and must never close the audio device on its own.
@@ -10932,6 +11154,14 @@ fn set_tempo_and_loop(
         tempo_events: observation.tempo_events().to_vec(),
         meter_events: observation.meter_events().to_vec(),
     };
+    let timeline = project_state.timeline.borrow();
+    ui.set_timeline_tempo_markers(ModelRc::from(Rc::new(VecModel::from(
+        timeline_tempo_marker_rows(&timeline),
+    ))));
+    ui.set_timeline_meter_markers(ModelRc::from(Rc::new(VecModel::from(
+        timeline_meter_marker_rows(&timeline),
+    ))));
+    drop(timeline);
     let editable = tempo_editable(
         observation.arrangement().placements().len(),
         scene_clip_count(observation.scenes()),
@@ -10955,6 +11185,47 @@ fn set_tempo_and_loop(
     });
     seed_loop_marks(project_state, observation);
     refresh_loop_controls(ui, project_state, observation.sample_rate_hz());
+}
+
+fn timeline_marker_position(meter_events: &[MeterEvent], tick: u64) -> SharedString {
+    musical_position(meter_events, tick).map_or_else(
+        |_| SharedString::default(),
+        |position| {
+            format!(
+                "{}|{}|{:03}",
+                position.bar(),
+                position.beat(),
+                position.tick()
+            )
+            .into()
+        },
+    )
+}
+
+fn timeline_tempo_marker_rows(timeline: &ProjectTimeline) -> Vec<TimelineTempoMarkerRow> {
+    timeline
+        .tempo_events
+        .iter()
+        .map(|event| TimelineTempoMarkerRow {
+            tick: event.tick.to_string().into(),
+            position: timeline_marker_position(&timeline.meter_events, event.tick),
+            bpm: format_tempo_bpm(event.microseconds_per_quarter).into(),
+            origin: event.tick == 0,
+        })
+        .collect()
+}
+
+fn timeline_meter_marker_rows(timeline: &ProjectTimeline) -> Vec<TimelineMeterMarkerRow> {
+    timeline
+        .meter_events
+        .iter()
+        .map(|event| TimelineMeterMarkerRow {
+            tick: event.tick.to_string().into(),
+            position: timeline_marker_position(&timeline.meter_events, event.tick),
+            signature: format_meter(event.numerator, event.denominator).into(),
+            origin: event.tick == 0,
+        })
+        .collect()
 }
 
 fn format_tempo_bpm(microseconds_per_quarter: u32) -> String {
@@ -14190,6 +14461,58 @@ mod tests {
             "4/3 is not a time signature this project can hold",
             "a well-formed but unsupported denominator says so specifically"
         );
+    }
+
+    #[test]
+    fn timeline_marker_inputs_preserve_the_project_domain_and_marker_kind() {
+        assert_eq!(timeline_tick(" 7680 "), Ok(7_680));
+        assert!(timeline_tick("-1").is_err());
+        assert!(timeline_tick("9007199254740992").is_err());
+        assert!(timeline_tick("bar five").is_err());
+
+        assert!(matches!(timeline_tempo("120"), Ok(500_000)));
+        assert!(matches!(timeline_meter("6/8"), Ok((6, 8))));
+    }
+
+    #[test]
+    fn timeline_marker_rows_show_the_stored_maps_in_musical_order() {
+        let timeline = ProjectTimeline {
+            sample_rate_hz: 48_000,
+            tempo_events: vec![
+                TempoEvent {
+                    tick: 0,
+                    microseconds_per_quarter: 500_000,
+                },
+                TempoEvent {
+                    tick: 7_680,
+                    microseconds_per_quarter: 400_000,
+                },
+            ],
+            meter_events: vec![
+                MeterEvent {
+                    tick: 0,
+                    numerator: 4,
+                    denominator: 4,
+                },
+                MeterEvent {
+                    tick: 7_680,
+                    numerator: 3,
+                    denominator: 4,
+                },
+            ],
+        };
+        let tempos = timeline_tempo_marker_rows(&timeline);
+        assert_eq!(tempos.len(), 2);
+        assert!(tempos[0].origin);
+        assert_eq!(tempos[1].tick, "7680");
+        assert_eq!(tempos[1].position, "2|1|000");
+        assert_eq!(tempos[1].bpm, "150");
+
+        let meters = timeline_meter_marker_rows(&timeline);
+        assert_eq!(meters.len(), 2);
+        assert!(meters[0].origin);
+        assert_eq!(meters[1].signature, "3/4");
+        assert_eq!(meters[1].position, "2|1|000");
     }
 
     /// The seam the review found untested: saving must write the marks the
