@@ -601,6 +601,15 @@ pub struct RoutingBusCreationDocuments {
     kind: RoutingBusKind,
 }
 
+/// Canonical mixer replacement and kind produced by removing one unused
+/// routing bus. The removed track resource remains owned by the durable
+/// structural-removal publication boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutingBusRemovalDocuments {
+    mixer: Vec<u8>,
+    kind: RoutingBusKind,
+}
+
 /// One canonical track replacement produced by an audio-track reorder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioTrackReorderDocument {
@@ -750,6 +759,23 @@ impl RoutingBusCreationDocuments {
     }
 }
 
+impl RoutingBusRemovalDocuments {
+    #[must_use]
+    pub fn mixer(&self) -> &[u8] {
+        &self.mixer
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> RoutingBusKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, RoutingBusKind) {
+        (self.mixer, self.kind)
+    }
+}
+
 impl AudioTrackReorderDocument {
     #[must_use]
     pub fn track_id(&self) -> &str {
@@ -805,6 +831,20 @@ pub enum RoutingBusCreationSerializationError {
     ReturnBusUnavailable,
     SendIdentityCountMismatch,
     InvalidSendIdentity,
+    InvalidDocumentShape,
+    Serialization(serde_json::Error),
+}
+
+/// Failure to remove one structurally unreferenced version-1 routing bus.
+#[derive(Debug)]
+pub enum RoutingBusRemovalSerializationError {
+    Source(LoadError),
+    TrackMissing,
+    TrackNotRoutingBus,
+    Blocked(AudioTrackRemovalBlockers),
+    PrimaryRouteInUse,
+    ReturnSendInUse,
+    MixerIdentityMismatch,
     InvalidDocumentShape,
     Serialization(serde_json::Error),
 }
@@ -1778,6 +1818,55 @@ impl Error for RoutingBusCreationSerializationError {
             | Self::ReturnBusUnavailable
             | Self::SendIdentityCountMismatch
             | Self::InvalidSendIdentity
+            | Self::InvalidDocumentShape => None,
+        }
+    }
+}
+
+impl fmt::Display for RoutingBusRemovalSerializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => source.fmt(formatter),
+            Self::TrackMissing => formatter.write_str("the routing bus does not exist"),
+            Self::TrackNotRoutingBus => {
+                formatter.write_str("the selected track is not a routing bus")
+            }
+            Self::Blocked(blockers) => write!(
+                formatter,
+                "the routing bus is still referenced by {} clips, {} child tracks, {} scene slots, and {} arrangement placements",
+                blockers.clip_references,
+                blockers.child_tracks,
+                blockers.scene_slots,
+                blockers.arrangement_placements
+            ),
+            Self::PrimaryRouteInUse => {
+                formatter.write_str("an audio channel still targets the group routing bus")
+            }
+            Self::ReturnSendInUse => {
+                formatter.write_str("a mixer send still targets the return routing bus")
+            }
+            Self::MixerIdentityMismatch => {
+                formatter.write_str("source mixer identity does not match the removal request")
+            }
+            Self::InvalidDocumentShape => {
+                formatter.write_str("source mixer shape changed after typed validation")
+            }
+            Self::Serialization(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for RoutingBusRemovalSerializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Serialization(source) => Some(source),
+            Self::TrackMissing
+            | Self::TrackNotRoutingBus
+            | Self::Blocked(_)
+            | Self::PrimaryRouteInUse
+            | Self::ReturnSendInUse
+            | Self::MixerIdentityMismatch
             | Self::InvalidDocumentShape => None,
         }
     }
@@ -3019,6 +3108,113 @@ pub fn serialize_audio_primary_route_change(
         .load_mixer(&candidate, assets, limits)
         .map_err(AudioPrimaryRouteSerializationError::Source)?;
     Ok(candidate)
+}
+
+/// Removes one Group or Return routing bus only after every persisted routing
+/// and structural reference is absent. The canonical candidate is reloaded
+/// before it is returned.
+///
+/// # Errors
+///
+/// Returns a classified rejection when the selected track is not an unused
+/// routing bus, its source mixer is stale or malformed, or the reduced
+/// candidate cannot be loaded.
+pub fn serialize_routing_bus_removal(
+    project: &LoadedPlaybackProject,
+    assets: &[MediaAssetFact<'_>],
+    source_mixer: &[u8],
+    mixer_id: &str,
+    track_id: &str,
+    limits: LoaderLimits,
+) -> Result<RoutingBusRemovalDocuments, RoutingBusRemovalSerializationError> {
+    let track_index = project
+        .track_index(track_id)
+        .ok_or(RoutingBusRemovalSerializationError::TrackMissing)?;
+    let kind = match project.tracks[track_index].kind {
+        TrackKind::Group => RoutingBusKind::Group,
+        TrackKind::Return => RoutingBusKind::Return,
+        _ => return Err(RoutingBusRemovalSerializationError::TrackNotRoutingBus),
+    };
+    let blockers = project.audio_track_removal_blockers(track_id);
+    if !blockers.is_empty() {
+        return Err(RoutingBusRemovalSerializationError::Blocked(blockers));
+    }
+    let loaded_mixer = project
+        .load_mixer(source_mixer, assets, limits)
+        .map_err(RoutingBusRemovalSerializationError::Source)?;
+    if loaded_mixer.id() != mixer_id {
+        return Err(RoutingBusRemovalSerializationError::MixerIdentityMismatch);
+    }
+    let channel_index = loaded_mixer
+        .channels
+        .iter()
+        .position(|channel| channel.track_id == track_id)
+        .ok_or(RoutingBusRemovalSerializationError::InvalidDocumentShape)?;
+    if kind == RoutingBusKind::Group
+        && loaded_mixer.channels.iter().any(|channel| {
+            matches!(&channel.destination, MixerDestination::Track(id) if id == track_id)
+        })
+    {
+        return Err(RoutingBusRemovalSerializationError::PrimaryRouteInUse);
+    }
+    let return_bus = if kind == RoutingBusKind::Return {
+        let bus = loaded_mixer
+            .return_buses
+            .iter()
+            .find_map(|(bus, mapped_track_id)| (mapped_track_id == track_id).then_some(*bus))
+            .ok_or(RoutingBusRemovalSerializationError::InvalidDocumentShape)?;
+        if loaded_mixer
+            .channels
+            .iter()
+            .flat_map(|channel| &channel.sends)
+            .any(|send| send.bus == bus)
+        {
+            return Err(RoutingBusRemovalSerializationError::ReturnSendInUse);
+        }
+        Some(bus)
+    } else {
+        None
+    };
+
+    let mut reduced = project.clone();
+    reduced.tracks.remove(track_index);
+    validate_track_hierarchy(&reduced.tracks).map_err(RoutingBusRemovalSerializationError::Source)?;
+    validate_loaded_identities(&reduced).map_err(RoutingBusRemovalSerializationError::Source)?;
+
+    let mut mixer_value: Value = serde_json::from_slice(source_mixer)
+        .map_err(RoutingBusRemovalSerializationError::Serialization)?;
+    let channels = mixer_value
+        .get_mut("channels")
+        .and_then(Value::as_array_mut)
+        .ok_or(RoutingBusRemovalSerializationError::InvalidDocumentShape)?;
+    if channels
+        .get(channel_index)
+        .and_then(|channel| channel["track_id"].as_str())
+        != Some(track_id)
+    {
+        return Err(RoutingBusRemovalSerializationError::InvalidDocumentShape);
+    }
+    channels.remove(channel_index);
+    if let Some(return_bus) = return_bus {
+        let return_buses = mixer_value
+            .get_mut("return_buses")
+            .and_then(Value::as_array_mut)
+            .ok_or(RoutingBusRemovalSerializationError::InvalidDocumentShape)?;
+        let return_index = return_buses.iter().position(|mapping| {
+            mapping.get("bus").and_then(Value::as_str) == Some(match return_bus {
+                MixerBus::A => "a",
+                MixerBus::B => "b",
+            }) && mapping.get("track_id").and_then(Value::as_str) == Some(track_id)
+        });
+        let return_index = return_index.ok_or(RoutingBusRemovalSerializationError::InvalidDocumentShape)?;
+        return_buses.remove(return_index);
+    }
+    let mixer = serde_json_canonicalizer::to_vec(&mixer_value)
+        .map_err(RoutingBusRemovalSerializationError::Serialization)?;
+    reduced
+        .load_mixer(&mixer, assets, limits)
+        .map_err(RoutingBusRemovalSerializationError::Source)?;
+    Ok(RoutingBusRemovalDocuments { mixer, kind })
 }
 
 /// Creates one complete reusable audio-clip view from a verified recorded asset
@@ -10402,6 +10598,144 @@ mod tests {
                 LoaderLimits::VERSION_1,
             ),
             Err(AudioPrimaryRouteSerializationError::TargetGroupMissing)
+        ));
+    }
+
+    #[test]
+    fn routing_bus_removal_requires_explicit_dependency_cleanup() {
+        let tracks: [&[u8]; 1] = [TRACK];
+        let clips: [&[u8]; 1] = [CLIP];
+        let project = load(
+            input(TIMELINE, &tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let mixer_id = "018f47a2-6b2d-7c11-8a44-001122334468";
+        let source_track_id = "018f47a2-6b2d-7c11-8a44-001122334456";
+        let canonical_mixer =
+            serde_json_canonicalizer::to_vec(&serde_json::from_slice::<Value>(MIXER).unwrap())
+                .unwrap();
+        let group_track_id = "018f47a2-6b2d-7c11-8a44-001122334469";
+        let group = serialize_routing_bus_creation(
+            &project,
+            &asset_facts(),
+            MIXER,
+            mixer_id,
+            RoutingBusKind::Group,
+            group_track_id,
+            "Drum Bus",
+            &[source_track_id],
+            &[],
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let group_tracks: [&[u8]; 2] = [TRACK, group.track()];
+        let group_project = load(
+            input(TIMELINE, &group_tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_routing_bus_removal(
+                &group_project,
+                &asset_facts(),
+                group.mixer(),
+                mixer_id,
+                group_track_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(RoutingBusRemovalSerializationError::PrimaryRouteInUse)
+        ));
+        let group_cleared = serialize_audio_primary_route_change(
+            &group_project,
+            &asset_facts(),
+            group.mixer(),
+            mixer_id,
+            source_track_id,
+            AudioPrimaryRouteTarget::Main,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let removed_group = serialize_routing_bus_removal(
+            &group_project,
+            &asset_facts(),
+            &group_cleared,
+            mixer_id,
+            group_track_id,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(removed_group.kind(), RoutingBusKind::Group);
+        assert_eq!(removed_group.mixer(), canonical_mixer);
+        project
+            .load_mixer(removed_group.mixer(), &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+
+        let return_track_id = "018f47a2-6b2d-7c11-8a44-00112233446a";
+        let return_send_id = "018f47a2-6b2d-7c11-8a44-00112233446b";
+        let return_bus = serialize_routing_bus_creation(
+            &project,
+            &asset_facts(),
+            MIXER,
+            mixer_id,
+            RoutingBusKind::Return,
+            return_track_id,
+            "Reverb",
+            &[source_track_id],
+            &[return_send_id],
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let return_tracks: [&[u8]; 2] = [TRACK, return_bus.track()];
+        let return_project = load(
+            input(TIMELINE, &return_tracks, &clips, Some(ARRANGEMENT)),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(matches!(
+            serialize_routing_bus_removal(
+                &return_project,
+                &asset_facts(),
+                return_bus.mixer(),
+                mixer_id,
+                return_track_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(RoutingBusRemovalSerializationError::ReturnSendInUse)
+        ));
+        let return_cleared = serialize_return_send_removal(
+            &return_project,
+            &asset_facts(),
+            return_bus.mixer(),
+            mixer_id,
+            return_send_id,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        let removed_return = serialize_routing_bus_removal(
+            &return_project,
+            &asset_facts(),
+            &return_cleared,
+            mixer_id,
+            return_track_id,
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(removed_return.kind(), RoutingBusKind::Return);
+        assert_eq!(removed_return.mixer(), canonical_mixer);
+        project
+            .load_mixer(removed_return.mixer(), &asset_facts(), LoaderLimits::VERSION_1)
+            .unwrap();
+        assert!(matches!(
+            serialize_routing_bus_removal(
+                &project,
+                &asset_facts(),
+                MIXER,
+                mixer_id,
+                source_track_id,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(RoutingBusRemovalSerializationError::TrackNotRoutingBus)
         ));
     }
 
