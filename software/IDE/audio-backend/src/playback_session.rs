@@ -33,10 +33,12 @@ use hyper_media_cache::{DecodedMediaCache, PreparePlaybackError};
 use hyper_mixer_runtime::{
     LoudnessCommandSender, MixerChannelHandle, MixerParameterCommand, MixerParameterCommandSender,
     MixerParameterResolveError, MixerParameterStateRestoreError, MixerSendHandle,
-    OutputMeterReceiver, RoutedMainRuntime, RoutedTransportRuntime, RuntimeCreationError,
+    MetronomePlan, MetronomePlanError, OutputMeterReceiver, RoutedMainRuntime,
+    RoutedTransportRuntime, RuntimeCreationError,
     TransportCommand, TransportCommandSendError, TransportCommandSender, TransportLoopRange,
     TransportLoopRangeError, TransportOutputCreationError, TransportOutputProcessor,
-    loudness_command_channel, output_meter_channel, playback_recovery_channel_with_initial_loop,
+    loudness_command_channel, output_meter_channel,
+    playback_recovery_channel_with_initial_loop_and_metronome,
 };
 use hyper_native_device::DeviceChain;
 use hyper_playback_compiler::graph::GraphLimits;
@@ -255,6 +257,7 @@ pub enum DesktopPlaybackSessionBuildError {
     Playback(AdapterCompileError),
     Media(PreparePlaybackError),
     Runtime(RuntimeCreationError),
+    Metronome(MetronomePlanError),
     PersistedLoopRange(TransportLoopRangeError),
     PersistedLoopCommand(TransportCommandSendError),
     MixerRecovery(MixerParameterStateRestoreError),
@@ -315,6 +318,7 @@ impl fmt::Display for DesktopPlaybackSessionBuildError {
             Self::Playback(source) => write!(formatter, "playback compilation failed: {source}"),
             Self::Media(source) => write!(formatter, "media preparation failed: {source}"),
             Self::Runtime(source) => write!(formatter, "runtime construction failed: {source}"),
+            Self::Metronome(source) => write!(formatter, "metronome preparation failed: {source}"),
             Self::PersistedLoopRange(source) => {
                 write!(formatter, "persisted loop range is invalid: {source}")
             }
@@ -355,6 +359,7 @@ impl Error for DesktopPlaybackSessionBuildError {
             Self::Playback(source) => Some(source),
             Self::Media(source) => Some(source),
             Self::Runtime(source) => Some(source),
+            Self::Metronome(source) => Some(source),
             Self::PersistedLoopRange(source) => Some(source),
             Self::PersistedLoopCommand(source) => Some(source),
             Self::MixerRecovery(source) => Some(source),
@@ -2088,6 +2093,13 @@ fn initialize_session(
     let persisted_loop = input.arrangement().loop_range();
     validate_session_sample_rate(project, sample_rate_hz)
         .or_else(|source| fail_build(publication, source))?;
+    let metronome = MetronomePlan::try_new(
+        sample_rate_hz,
+        project.tempo_events(),
+        project.meter_events(),
+    )
+    .map_err(DesktopPlaybackSessionBuildError::Metronome)
+    .or_else(|source| fail_build(publication, source))?;
 
     let facts =
         collect_media_asset_facts(media).or_else(|source| fail_build(publication, source))?;
@@ -2137,7 +2149,7 @@ fn initialize_session(
     );
 
     let (commands, mixer_parameter_commands, mut transport) =
-        RoutedTransportRuntime::with_command_queues(runtime);
+        RoutedTransportRuntime::with_command_queues_and_metronome(runtime, metronome);
     prepare_initial_transport_authority(
         &commands,
         &mut transport,
@@ -2148,6 +2160,8 @@ fn initialize_session(
     let initial_mixer_parameter_state = transport.mixer_parameter_state();
     let initial_loop_range = transport.loop_range();
     let initial_loop_enabled = transport.loop_enabled();
+    let initial_metronome_available = transport.metronome_available();
+    let initial_metronome_enabled = transport.metronome_enabled();
     let (mut meter_sender, meters) = output_meter_channel();
     let (loudness_commands, loudness_command_receiver) = loudness_command_channel();
     let processor = TransportOutputProcessor::try_new(
@@ -2165,11 +2179,13 @@ fn initialize_session(
         .or_else(|source| fail_build(publication, source))?;
     let (preview_control, preview) =
         prepare_audio_preview(media, recordings, sample_rate_hz, publication)?;
-    let (publisher, recovery) = playback_recovery_channel_with_initial_loop(
+    let (publisher, recovery) = playback_recovery_channel_with_initial_loop_and_metronome(
         initial_checkpoint,
         Some(&initial_mixer_parameter_state),
         initial_loop_range,
         initial_loop_enabled,
+        initial_metronome_available,
+        initial_metronome_enabled,
     );
     let controls = build_session_controls(
         commands,
@@ -2846,7 +2862,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let (mut publisher, recovery) = playback_recovery_channel_with_initial_loop(
+        let (mut publisher, recovery) = hyper_mixer_runtime::playback_recovery_channel_with_initial_loop(
             None,
             None,
             transport.loop_range(),

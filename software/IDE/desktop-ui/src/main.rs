@@ -1153,6 +1153,24 @@ fn bind_playback_callbacks(
     });
 
     let weak = ui.as_weak();
+    let worker_for_metronome = Rc::clone(worker);
+    actions.on_metronome_toggle(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_app_mode() != AppMode::Running || !ui.get_metronome_available() {
+            return;
+        }
+        submit_to_ui(
+            &ui,
+            &worker_for_metronome,
+            IdeWorkerCommand::Transport(TransportCommand::SetMetronomeEnabled(
+                !ui.get_metronome_enabled(),
+            )),
+        );
+    });
+
+    let weak = ui.as_weak();
     let worker_for_return = Rc::clone(worker);
     actions.on_transport_return_start(move || {
         submit(
@@ -4848,6 +4866,12 @@ fn apply_event(
                     TransportCommand::SetLoopEnabled(false) => {
                         "Loop release queued for the audio runtime"
                     }
+                    TransportCommand::SetMetronomeEnabled(true) => {
+                        "Metronome enable queued for the audio runtime"
+                    }
+                    TransportCommand::SetMetronomeEnabled(false) => {
+                        "Metronome disable queued for the audio runtime"
+                    }
                 }
                 .into(),
             );
@@ -7037,6 +7061,7 @@ fn apply_running_event(
     set_playhead(ui, project_state, position_frame);
     let transport_state = observation.recovery().state();
     apply_transport_recovery_availability(ui, transport_state);
+    apply_metronome_observation(ui, observation.recovery());
     ui.set_transport_clock(
         format_transport_clock(
             u64::try_from(position_frame).unwrap_or(u64::MAX),
@@ -8156,6 +8181,14 @@ fn apply_transport_recovery_availability(
     ui.set_transport_stop_available(state == PlaybackRecoveryTransportState::Rolling);
 }
 
+fn apply_metronome_observation(
+    ui: &MainWindow,
+    observation: hyper_mixer_runtime::PlaybackCycleObservation,
+) {
+    ui.set_metronome_available(observation.metronome_available());
+    ui.set_metronome_enabled(observation.metronome_enabled());
+}
+
 fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_arrangement_visible(false);
     reset_arrangement_placement_removal_confirmation(ui);
@@ -8195,6 +8228,8 @@ fn reset_arrangement_ui(ui: &MainWindow) {
     ui.set_loop_marking_available(false);
     ui.set_loop_toggle_available(false);
     ui.set_loop_engaged(false);
+    ui.set_metronome_available(false);
+    ui.set_metronome_enabled(false);
     reset_arrangement_scene_launch_addition_form(ui);
     reset_arrangement_scene_launch_move_form(ui);
     reset_arrangement_scene_launch_scene_form(ui);

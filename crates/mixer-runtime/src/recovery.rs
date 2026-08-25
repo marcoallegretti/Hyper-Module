@@ -100,6 +100,8 @@ pub struct PlaybackCycleObservation {
     committed_cycle_count: u64,
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
+    metronome_available: bool,
+    metronome_enabled: bool,
     queued_scene_index: Option<usize>,
     queued_scene_launch_frame: Option<usize>,
     last_launched_scene_index: Option<usize>,
@@ -129,6 +131,18 @@ impl PlaybackCycleObservation {
     #[must_use]
     pub const fn loop_enabled(self) -> bool {
         self.loop_enabled
+    }
+
+    /// Whether this playback session owns a prepared metronome plan.
+    #[must_use]
+    pub const fn metronome_available(self) -> bool {
+        self.metronome_available
+    }
+
+    /// Whether the audio thread committed metronome playback for this cycle.
+    #[must_use]
+    pub const fn metronome_enabled(self) -> bool {
+        self.metronome_enabled
     }
 
     #[must_use]
@@ -395,11 +409,39 @@ impl AtomicLoopObservation {
 }
 
 #[derive(Debug, Default)]
+struct AtomicMetronomeObservation {
+    available: AtomicBool,
+    enabled: AtomicBool,
+}
+
+impl AtomicMetronomeObservation {
+    const fn new(available: bool, enabled: bool) -> Self {
+        Self {
+            available: AtomicBool::new(available),
+            enabled: AtomicBool::new(enabled),
+        }
+    }
+
+    fn store(&self, available: bool, enabled: bool) {
+        self.available.store(available, Ordering::Relaxed);
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn load(&self) -> (bool, bool) {
+        (
+            self.available.load(Ordering::Relaxed),
+            self.enabled.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
 struct PlaybackRecoveryState {
     sequence: AtomicU64,
     position_frame: AtomicUsize,
     transport_state: AtomicU8,
     loop_observation: AtomicLoopObservation,
+    metronome_observation: AtomicMetronomeObservation,
     scene_launch: AtomicSceneLaunchObservation,
     mixer_parameters: AtomicMixerParameterState,
 }
@@ -466,6 +508,7 @@ impl PlaybackRecoveryCheckpoint {
             let position_frame = self.inner.position_frame.load(Ordering::Relaxed);
             let state = decode_state(self.inner.transport_state.load(Ordering::Relaxed));
             let (loop_range, loop_enabled) = self.inner.loop_observation.load();
+            let (metronome_available, metronome_enabled) = self.inner.metronome_observation.load();
             let (queued_scene_index, queued_scene_launch_frame, last_launched_scene_index) =
                 self.inner.scene_launch.load();
             fence(Ordering::Acquire);
@@ -477,6 +520,8 @@ impl PlaybackRecoveryCheckpoint {
                     committed_cycle_count: after / 2,
                     loop_range,
                     loop_enabled,
+                    metronome_available,
+                    metronome_enabled,
                     queued_scene_index,
                     queued_scene_launch_frame,
                     last_launched_scene_index,
@@ -510,6 +555,8 @@ struct PlaybackCyclePublication {
     position_frame: usize,
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
+    metronome_available: bool,
+    metronome_enabled: bool,
     queued_scene_index: Option<usize>,
     queued_scene_launch_frame: Option<usize>,
     last_launched_scene_index: Option<usize>,
@@ -532,6 +579,8 @@ impl PlaybackRecoveryPublisher {
                 position_frame: cycle.position_frame(),
                 loop_range: cycle.loop_range(),
                 loop_enabled: cycle.loop_enabled(),
+                metronome_available: cycle.metronome_available(),
+                metronome_enabled: cycle.metronome_enabled(),
                 queued_scene_index: scene.queued_scene_index(),
                 queued_scene_launch_frame: scene.queued_launch_frame(),
                 last_launched_scene_index: scene.last_launched_scene_index(),
@@ -553,6 +602,8 @@ impl PlaybackRecoveryPublisher {
                 position_frame,
                 loop_range: None,
                 loop_enabled: false,
+                metronome_available: false,
+                metronome_enabled: false,
                 queued_scene_index: None,
                 queued_scene_launch_frame: None,
                 last_launched_scene_index: None,
@@ -577,6 +628,9 @@ impl PlaybackRecoveryPublisher {
         self.inner
             .loop_observation
             .store(publication.loop_range, publication.loop_enabled);
+        self.inner
+            .metronome_observation
+            .store(publication.metronome_available, publication.metronome_enabled);
         self.inner.scene_launch.store(
             publication.queued_scene_index,
             publication.queued_scene_launch_frame,
@@ -619,6 +673,27 @@ pub fn playback_recovery_channel_with_initial_loop(
     initial_loop_range: Option<TransportLoopRange>,
     initial_loop_enabled: bool,
 ) -> (PlaybackRecoveryPublisher, PlaybackRecoveryCheckpoint) {
+    playback_recovery_channel_with_initial_loop_and_metronome(
+        snapshot,
+        initial_mixer_parameter_state,
+        initial_loop_range,
+        initial_loop_enabled,
+        false,
+        false,
+    )
+}
+
+/// Creates a recovery channel whose zero-cycle observation also carries the
+/// session-only metronome capability and state.
+#[must_use]
+pub fn playback_recovery_channel_with_initial_loop_and_metronome(
+    snapshot: Option<&PlaybackRecoverySnapshot>,
+    initial_mixer_parameter_state: Option<&MixerParameterStateSnapshot>,
+    initial_loop_range: Option<TransportLoopRange>,
+    initial_loop_enabled: bool,
+    initial_metronome_available: bool,
+    initial_metronome_enabled: bool,
+) -> (PlaybackRecoveryPublisher, PlaybackRecoveryCheckpoint) {
     let mixer_parameters = AtomicMixerParameterState::default();
     if let Some(state) = snapshot
         .and_then(|snapshot| snapshot.mixer_parameter_state.as_ref())
@@ -643,6 +718,10 @@ pub fn playback_recovery_channel_with_initial_loop(
             observation.store(range, enabled);
             observation
         },
+        metronome_observation: AtomicMetronomeObservation::new(
+            initial_metronome_available,
+            initial_metronome_enabled,
+        ),
         scene_launch: AtomicSceneLaunchObservation::default(),
         mixer_parameters,
     });
@@ -769,11 +848,31 @@ mod tests {
                 committed_cycle_count: 0,
                 loop_range: None,
                 loop_enabled: false,
+                metronome_available: false,
+                metronome_enabled: false,
                 queued_scene_index: None,
                 queued_scene_launch_frame: None,
                 last_launched_scene_index: None,
             }
         );
+    }
+
+    #[test]
+    fn zero_cycle_observation_exposes_session_only_metronome_capability() {
+        let (_publisher, checkpoint) = playback_recovery_channel_with_initial_loop_and_metronome(
+            None,
+            None,
+            None,
+            false,
+            true,
+            false,
+        );
+
+        let observation = checkpoint.observe_cycle();
+        assert_eq!(observation.committed_cycle_count(), 0);
+        assert!(observation.metronome_available());
+        assert!(!observation.metronome_enabled());
+        assert!(!checkpoint.snapshot().loop_enabled());
     }
 
     #[test]
@@ -865,6 +964,8 @@ mod tests {
                         position_frame: generation,
                         loop_range,
                         loop_enabled,
+                        metronome_available: !generation.is_multiple_of(3),
+                        metronome_enabled: generation.is_multiple_of(5),
                         queued_scene_index: scene.map(|value| value.0),
                         queued_scene_launch_frame: scene.map(|value| value.1),
                         last_launched_scene_index: scene.map(|value| value.2),
@@ -890,6 +991,11 @@ mod tests {
                     .then(|| TransportLoopRange::new(generation, generation + 10).unwrap());
                 assert_eq!(observation.loop_range(), expected_loop);
                 assert_eq!(observation.loop_enabled(), generation % 4 == 1);
+                assert_eq!(
+                    observation.metronome_available(),
+                    !generation.is_multiple_of(3)
+                );
+                assert_eq!(observation.metronome_enabled(), generation.is_multiple_of(5));
                 let expected_scene = (!generation.is_multiple_of(2)).then_some((
                     generation % 8,
                     generation * 2,

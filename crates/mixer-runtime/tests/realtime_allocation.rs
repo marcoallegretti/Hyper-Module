@@ -8,12 +8,13 @@ use hyper_arrangement_renderer::RenderScratchSlot;
 use hyper_audio_engine::{InterleavedStereoCallback, LoudnessMeasurementCommand, StereoOutput};
 use hyper_mixer_runtime::{
     EbuLoudnessPresentationConfig, FlatMainRuntime, GraphMainRuntime, GraphTransportRuntime,
-    MixerParameterCommand, PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime,
+    MetronomePlan, MixerParameterCommand, PreparedPlaybackMainRuntime, PreparedPlaybackTransportRuntime,
     TransportCommand, TransportOutputProcessor, loudness_command_channel, output_meter_channel,
 };
 use hyper_native_device::{
     DeviceChain, NativeDeviceInstance, NativeFilterMode, NativeFilterState,
 };
+use hyper_playback_compiler::{MeterEvent, TempoEvent};
 
 use common::{fixture, graph_fixture, playback_fixture};
 use realtime_allocator::HeapMeasurement;
@@ -85,7 +86,21 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
     let automated =
         GraphMainRuntime::try_new_automated(&prepared, &fixture.mixer, fixture.automation, 64)
             .unwrap();
-    let (mut sender, mut transport) = GraphTransportRuntime::with_command_queue(automated);
+    let metronome = MetronomePlan::try_new(
+        48_000,
+        &[TempoEvent {
+            tick: 0,
+            microseconds_per_quarter: 1_000_000,
+        }],
+        &[MeterEvent {
+            tick: 0,
+            numerator: 4,
+            denominator: 4,
+        }],
+    )
+    .unwrap();
+    let (mut sender, mut transport) =
+        GraphTransportRuntime::with_command_queue_and_metronome(automated, metronome);
     let mut left_0 = [0.0_f32; 64];
     let mut right_0 = [0.0_f32; 64];
     let mut left_1 = [0.0_f32; 64];
@@ -119,6 +134,7 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
         },
     );
     let start_result = sender.try_send(TransportCommand::Start);
+    let metronome_result = sender.try_send(TransportCommand::SetMetronomeEnabled(true));
     let automated_result = transport.process_interleaved_cycle(
         &mut callback,
         &mut scratch,
@@ -136,6 +152,7 @@ fn prepared_routing_graph_performs_zero_heap_allocations() {
 
     assert!(result.is_ok());
     assert!(start_result.is_ok());
+    assert!(metronome_result.is_ok());
     assert!(automated_result.is_ok());
     assert!(stop_result.is_ok());
     assert!(stopped_result.is_ok());

@@ -319,6 +319,9 @@ enum OperatorCommand {
     SetLoopRange {
         range: Option<TransportLoopRange>,
     },
+    SetMetronomeEnabled {
+        enabled: bool,
+    },
     SetLoudnessState {
         state: LoudnessMeasurementState,
     },
@@ -374,6 +377,12 @@ struct OperatorLoopAuthority {
     enabled: bool,
     position_frame: usize,
     extent: PlaybackExtent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OperatorMetronomeAuthority {
+    available: bool,
+    enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -664,6 +673,10 @@ fn finish_runtime_output<O: RuntimeOutputObservation>(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the bounded operator command dispatcher keeps every queue outcome explicit"
+)]
 fn drain_operator_commands<H: RuntimeOperatorControl>(
     host: &mut H,
     commands: &Receiver<OperatorCommand>,
@@ -725,6 +738,16 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
             }
             OperatorCommand::SetLoopRange { range } => {
                 queue_operator_loop_range(host, range, diagnostic);
+            }
+            OperatorCommand::SetMetronomeEnabled { enabled } => {
+                match host.queue_transport(TransportCommand::SetMetronomeEnabled(enabled)) {
+                    Ok(()) => diagnostic(if enabled {
+                        "metronome enable queued".to_owned()
+                    } else {
+                        "metronome disable queued".to_owned()
+                    }),
+                    Err(error) => diagnostic(format!("metronome toggle refused: {error}")),
+                }
             }
             OperatorCommand::SetLoudnessState { state } => {
                 match host.queue_loudness(LoudnessMeasurementCommand::SetState(state)) {
@@ -1187,6 +1210,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let mixer_send_model = Rc::new(VecModel::from(operator_mixer_send_rows(&mixer_sends)));
     let transport_authority = Rc::new(Cell::new(None));
     let loop_authority = Rc::new(Cell::new(None));
+    let metronome_authority = Rc::new(Cell::new(None));
     let seek_authority = Rc::new(Cell::new(None));
     let scene_launch_authority = Rc::new(Cell::new(false));
     let scene_selection = Rc::new(Cell::new(None));
@@ -1216,6 +1240,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_scene_stop(&ui, &commands_tx, &diagnostic, &scene_stop_authority);
     wire_operator_loop_toggle(&ui, &commands_tx, &diagnostic, &loop_authority);
     wire_operator_loop_range(&ui, &commands_tx, &diagnostic, &loop_authority);
+    wire_operator_metronome_toggle(&ui, &commands_tx, &diagnostic, &metronome_authority);
 
     apply_operator_cycle_observation(
         &ui,
@@ -1223,6 +1248,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
         &diagnostic,
         &transport_authority,
         &loop_authority,
+        &metronome_authority,
         &seek_authority,
         &scene_model,
         &scene_launch_authority,
@@ -1256,6 +1282,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     let timer_scene_stop_authority = Rc::clone(&scene_stop_authority);
     let timer_transport_authority = Rc::clone(&transport_authority);
     let timer_loop_authority = Rc::clone(&loop_authority);
+    let timer_metronome_authority = Rc::clone(&metronome_authority);
     let timer_seek_authority = Rc::clone(&seek_authority);
     let timer_loudness_authority = Rc::clone(&loudness_authority);
     let timer_mixer_model = Rc::clone(&mixer_model);
@@ -1275,6 +1302,7 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
                 &timer_diagnostic,
                 &timer_transport_authority,
                 &timer_loop_authority,
+                &timer_metronome_authority,
                 &timer_seek_authority,
                 &timer_scene_model,
                 &timer_scene_launch_authority,
@@ -2222,6 +2250,40 @@ fn wire_operator_loop_toggle(
     });
 }
 
+fn wire_operator_metronome_toggle(
+    ui: &OperatorWindow,
+    sender: &SyncSender<OperatorCommand>,
+    diagnostic: &Arc<Mutex<String>>,
+    authority: &Rc<Cell<Option<OperatorMetronomeAuthority>>>,
+) {
+    let sender = sender.clone();
+    let diagnostic = Arc::clone(diagnostic);
+    let authority = Rc::clone(authority);
+    ui.on_toggle_metronome_requested(move || {
+        let Some(current) = authority.get() else {
+            set_diagnostic(
+                &diagnostic,
+                "metronome toggle refused: accepted state is unavailable".to_owned(),
+            );
+            return;
+        };
+        if !current.available {
+            set_diagnostic(
+                &diagnostic,
+                "metronome toggle refused: this session has no metronome plan".to_owned(),
+            );
+            return;
+        }
+        send_operator_command(
+            &sender,
+            OperatorCommand::SetMetronomeEnabled {
+                enabled: !current.enabled,
+            },
+            &diagnostic,
+        );
+    });
+}
+
 #[derive(Clone, Copy)]
 enum OperatorLoopMark {
     In,
@@ -2676,6 +2738,35 @@ fn apply_operator_loop_observation(
     }
 }
 
+fn apply_operator_metronome_observation(
+    ui: &OperatorWindow,
+    authority: &Cell<Option<OperatorMetronomeAuthority>>,
+    observation: PlaybackCycleObservation,
+) {
+    let current = OperatorMetronomeAuthority {
+        available: observation.metronome_available(),
+        enabled: observation.metronome_enabled(),
+    };
+    authority.set(Some(current));
+    if current.available {
+        ui.set_metronome_state(if current.enabled {
+            "Committed on".into()
+        } else {
+            "Committed off".into()
+        });
+        ui.set_metronome_toggle_label(if current.enabled {
+            "Disable metronome".into()
+        } else {
+            "Enable metronome".into()
+        });
+        ui.set_metronome_toggle_enabled(true);
+    } else {
+        ui.set_metronome_state("Session unavailable".into());
+        ui.set_metronome_toggle_label("Metronome unavailable".into());
+        ui.set_metronome_toggle_enabled(false);
+    }
+}
+
 fn apply_operator_seek_observation(
     ui: &OperatorWindow,
     authority: &Cell<Option<usize>>,
@@ -2743,6 +2834,7 @@ fn apply_operator_cycle_observation(
     diagnostic: &Mutex<String>,
     transport_authority: &Cell<Option<PlaybackRecoveryTransportState>>,
     loop_authority: &Cell<Option<OperatorLoopAuthority>>,
+    metronome_authority: &Cell<Option<OperatorMetronomeAuthority>>,
     seek_authority: &Cell<Option<usize>>,
     scene_model: &VecModel<OperatorSceneRow>,
     scene_launch_authority: &Cell<bool>,
@@ -2752,6 +2844,7 @@ fn apply_operator_cycle_observation(
 ) {
     if terminal_latched {
         revoke_operator_transport_authority(ui, transport_authority);
+        revoke_operator_metronome_authority(ui, metronome_authority);
         revoke_operator_scene_launch_authority(ui, scene_model, scene_launch_authority);
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
         return;
@@ -2760,6 +2853,7 @@ fn apply_operator_cycle_observation(
     if observers.output_status.state() == OutputStreamState::Failed {
         revoke_operator_transport_authority(ui, transport_authority);
         revoke_operator_loop_authority(ui, loop_authority);
+        revoke_operator_metronome_authority(ui, metronome_authority);
         revoke_operator_seek_authority(ui, seek_authority);
         revoke_operator_scene_launch_authority(ui, scene_model, scene_launch_authority);
         revoke_operator_scene_stop_authority(ui, scene_stop_authority);
@@ -2778,6 +2872,7 @@ fn apply_operator_cycle_observation(
         observation,
         observers.facts.playback_extent,
     );
+    apply_operator_metronome_observation(ui, metronome_authority, observation);
     apply_operator_scene_observation(ui, scene_model, observation);
     set_operator_scene_launch_authority(ui, scene_model, scene_launch_authority, scene_selection);
     let available = scene_model.row_count() > 0;
@@ -2865,6 +2960,16 @@ fn revoke_operator_loop_authority(
     ui.set_loop_in_enabled(false);
     ui.set_loop_out_enabled(false);
     ui.set_loop_clear_enabled(false);
+}
+
+fn revoke_operator_metronome_authority(
+    ui: &OperatorWindow,
+    authority: &Cell<Option<OperatorMetronomeAuthority>>,
+) {
+    authority.set(None);
+    ui.set_metronome_state("Runtime stopped".into());
+    ui.set_metronome_toggle_label("Runtime stopped".into());
+    ui.set_metronome_toggle_enabled(false);
 }
 
 fn revoke_operator_loudness_authority(
@@ -6485,9 +6590,11 @@ mod tests {
         wire_operator_transport_controls(&ui, &sender, &diagnostic, &transport_authority);
         wire_operator_quit(&ui, &sender, &stop, &diagnostic);
         let loop_authority = Rc::new(Cell::new(None));
+        let metronome_authority = Rc::new(Cell::new(None));
         let seek_authority = Rc::new(Cell::new(None));
         wire_operator_loop_toggle(&ui, &sender, &diagnostic, &loop_authority);
         wire_operator_loop_range(&ui, &sender, &diagnostic, &loop_authority);
+        wire_operator_metronome_toggle(&ui, &sender, &diagnostic, &metronome_authority);
         wire_operator_seek(&ui, &sender, &diagnostic, &seek_authority);
 
         let facts = RuntimeFacts {
@@ -6727,11 +6834,13 @@ mod tests {
 
         let terminal_range = TransportLoopRange::new(120, 360).unwrap();
         let (_publisher, terminal_recovery) =
-            hyper_mixer_runtime::playback_recovery_channel_with_initial_loop(
+            hyper_mixer_runtime::playback_recovery_channel_with_initial_loop_and_metronome(
                 None,
                 None,
                 Some(terminal_range),
                 true,
+                true,
+                false,
             );
         let terminal_observers = RuntimeObservers {
             facts: facts.clone(),
@@ -6768,6 +6877,7 @@ mod tests {
             &diagnostic,
             &transport_authority,
             &loop_authority,
+            &metronome_authority,
             &seek_authority,
             &terminal_scenes,
             &terminal_scene_launch_authority,
@@ -6783,6 +6893,20 @@ mod tests {
                 position_frame: 0,
                 extent: facts.playback_extent,
             })
+        );
+        assert_eq!(
+            metronome_authority.get(),
+            Some(OperatorMetronomeAuthority {
+                available: true,
+                enabled: false,
+            })
+        );
+        assert_eq!(ui.get_metronome_state().as_str(), "Committed off");
+        assert!(ui.get_metronome_toggle_enabled());
+        ui.invoke_toggle_metronome_requested();
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(OperatorCommand::SetMetronomeEnabled { enabled: true })
         );
         assert!(terminal_scene_launch_authority.get());
         assert!(terminal_scenes.row_data(0).unwrap().controls_enabled);
@@ -6805,6 +6929,7 @@ mod tests {
             &diagnostic,
             &transport_authority,
             &loop_authority,
+            &metronome_authority,
             &seek_authority,
             &terminal_scenes,
             &terminal_scene_launch_authority,
@@ -6813,10 +6938,12 @@ mod tests {
             true,
         );
         assert_eq!(loop_authority.get(), None);
+        assert_eq!(metronome_authority.get(), None);
         assert_eq!(transport_authority.get(), None);
         assert!(!ui.get_transport_start_enabled());
         assert!(!ui.get_transport_stop_enabled());
         assert!(!ui.get_transport_return_to_start_enabled());
+        assert!(!ui.get_metronome_toggle_enabled());
         assert!(!terminal_scene_launch_authority.get());
         assert!(!terminal_scenes.row_data(0).unwrap().controls_enabled);
         assert!(!terminal_scene_stop_authority.get());

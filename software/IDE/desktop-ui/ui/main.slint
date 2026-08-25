@@ -270,6 +270,7 @@ export global IdeActions {
     callback loop-mark-out();
     callback loop-toggle();
     callback loop-clear();
+    callback metronome-toggle();
     callback set-tempo(string);
     callback set-meter(string);
     callback locate-placement(int);
@@ -809,6 +810,8 @@ export component MainWindow inherits Window {
     in property <bool> loop-marking-available: false;
     in property <bool> loop-toggle-available: false;
     in property <bool> loop-engaged: false;
+    in property <bool> metronome-available: false;
+    in property <bool> metronome-enabled: false;
     in property <string> tempo-bpm: "";
     in property <bool> tempo-available: false;
     in property <string> tempo-locked-reason: "";
@@ -1776,10 +1779,22 @@ export component MainWindow inherits Window {
                                         accessible-label: "Discard the marked loop range";
                                         clicked => { IdeActions.loop-clear(); }
                                     }
+                                    Button {
+                                        text: root.metronome-enabled ? "Click On" : "Click";
+                                        enabled: root.metronome-available && root.app-mode == AppMode.running;
+                                        accessible-label: root.metronome-enabled ? "Disable the committed transport metronome" : "Enable the transport metronome at the next audio cycle";
+                                        clicked => { IdeActions.metronome-toggle(); }
+                                    }
                                 }
                                 Text {
                                     text: root.loop-summary;
                                     color: root.loop-engaged ? #7fd6a2 : #8fa0b4;
+                                    font-size: 9px;
+                                    horizontal-alignment: center;
+                                }
+                                Text {
+                                    text: root.metronome-available ? (root.metronome-enabled ? "METRONOME · COMMITTED ON" : "METRONOME · COMMITTED OFF") : "METRONOME · SESSION UNAVAILABLE";
+                                    color: root.metronome-enabled ? #7fd6a2 : #8fa0b4;
                                     font-size: 9px;
                                     horizontal-alignment: center;
                                 }

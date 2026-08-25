@@ -6,11 +6,13 @@ use hyper_audio_engine::{
     MAX_PROCESS_FRAMES, Pan, StereoCallbackError, StereoOutput,
 };
 use hyper_media_cache::PreparedSceneAvailability;
+use hyper_playback_compiler::{MeterEvent, TempoEvent};
 use hyper_mixer_runtime::{
     EbuLoudnessPresentationConfig, EbuLoudnessScale, FlatMainRuntime, GraphMainRuntime,
     GraphTransportRuntime, LocateState, LoudnessCommandSendError, LoudnessCommandSender,
     LoudnessDisplayUnit, MAX_QUEUED_LOUDNESS_COMMANDS, MAX_QUEUED_MIXER_PARAMETER_COMMANDS,
-    MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, MixerChannelHandle,
+    MAX_QUEUED_OUTPUT_METER_SNAPSHOTS, MAX_QUEUED_TRANSPORT_COMMANDS, MetronomePlan,
+    MixerChannelHandle,
     MixerParameterCommand, MixerParameterCommandSendError, MixerParameterCommandSender,
     MixerParameterResolveError, MixerParameterStateRestoreError, MixerParameterTargetError,
     OutputMeterPublication, OutputMeterReceiver, OutputMeterSender, OutputMeterSnapshot,
@@ -817,6 +819,22 @@ fn process_transport<const FRAMES: usize>(
             right: output_right,
         },
     )
+}
+
+fn metronome_plan() -> MetronomePlan {
+    MetronomePlan::try_new(
+        48_000,
+        &[TempoEvent {
+            tick: 0,
+            microseconds_per_quarter: 1_000_000,
+        }],
+        &[MeterEvent {
+            tick: 0,
+            numerator: 4,
+            denominator: 4,
+        }],
+    )
+    .unwrap()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2324,6 +2342,71 @@ fn transport_owns_stopped_rolling_and_located_callback_windows() {
     assert_eq!(transport.position_frame(), usize::MAX - 1);
     assert_constant(&overflow_left, 9.0);
     assert_constant(&overflow_right, 9.0);
+}
+
+#[test]
+fn metronome_commands_commit_at_the_transport_boundary_and_mix_into_output() {
+    let fixture = graph_fixture();
+    let prepared = fixture.cache.prepare_schedule(&fixture.schedule).unwrap();
+    let runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let baseline_runtime = GraphMainRuntime::try_new(&prepared, &fixture.mixer, 8).unwrap();
+    let (mut sender, mut transport) =
+        GraphTransportRuntime::with_command_queue_and_metronome(runtime, metronome_plan());
+    let mut baseline = GraphTransportRuntime::new(baseline_runtime);
+    assert!(sender.metronome_available());
+    assert!(transport.metronome_available());
+    assert!(!transport.metronome_enabled());
+
+    sender
+        .try_send(TransportCommand::SetMetronomeEnabled(true))
+        .unwrap();
+    sender.try_send(TransportCommand::Start).unwrap();
+    let mut left = [0.0_f32; 8];
+    let mut right = [0.0_f32; 8];
+    baseline.apply_command(TransportCommand::Start).unwrap();
+    let mut baseline_left = [0.0_f32; 8];
+    let mut baseline_right = [0.0_f32; 8];
+    process_transport(&mut baseline, &mut baseline_left, &mut baseline_right).unwrap();
+    let enabled = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert!(enabled.metronome_available());
+    assert!(enabled.metronome_enabled());
+    for ((left, right), (baseline_left, baseline_right)) in left
+        .iter()
+        .zip(&right)
+        .zip(baseline_left.iter().zip(&baseline_right))
+    {
+        assert!(
+            ((*left - *baseline_left) - (*right - *baseline_right)).abs() <= f32::EPSILON,
+            "the transport click is a centered output voice"
+        );
+    }
+    assert!(left.iter().zip(&baseline_left).any(|(actual, baseline)| {
+        (*actual - *baseline).abs() > f32::EPSILON
+    }));
+
+    sender
+        .try_send(TransportCommand::Locate {
+            frame: 47_996,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    let next_beat = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert_eq!(next_beat.start_frame(), 47_996);
+    assert!(left[4..].iter().any(|sample| sample.abs() > f32::EPSILON));
+
+    sender
+        .try_send(TransportCommand::SetMetronomeEnabled(false))
+        .unwrap();
+    sender
+        .try_send(TransportCommand::Locate {
+            frame: 300_000,
+            state: LocateState::Rolling,
+        })
+        .unwrap();
+    let disabled = process_transport(&mut transport, &mut left, &mut right).unwrap();
+    assert!(!disabled.metronome_enabled());
+    assert_constant(&left, 0.0);
+    assert_constant(&right, 0.0);
 }
 
 #[test]

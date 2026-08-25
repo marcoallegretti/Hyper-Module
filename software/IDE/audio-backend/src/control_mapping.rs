@@ -482,6 +482,7 @@ impl RuntimeControlSink for DesktopControlSink {
             Err(
                 TransportCommandSendError::MissingScene { .. }
                 | TransportCommandSendError::LoopRangeShorterThanBlock { .. }
+                | TransportCommandSendError::MetronomeUnavailable { .. }
                 | TransportCommandSendError::Full(_)
                 | TransportCommandSendError::Disconnected(_),
             ) => ControlBindingAvailability::Unavailable(
@@ -597,7 +598,8 @@ impl RuntimeControlSink for DesktopControlSink {
                     | TransportCommand::LaunchScene { .. }
                     | TransportCommand::StopInteractiveScenes
                     | TransportCommand::SetLoopRange(_)
-                    | TransportCommand::SetLoopEnabled(_) => DirectControlStateUpdate::Unchanged,
+                    | TransportCommand::SetLoopEnabled(_)
+                    | TransportCommand::SetMetronomeEnabled(_) => DirectControlStateUpdate::Unchanged,
                 })
             }
         }

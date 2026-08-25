@@ -425,6 +425,9 @@ export component OperatorWindow inherits Window {
     in property <bool> loop-in-enabled;
     in property <bool> loop-out-enabled;
     in property <bool> loop-clear-enabled;
+    in property <string> metronome-state: "Metronome unavailable";
+    in property <string> metronome-toggle-label: "Metronome unavailable";
+    in property <bool> metronome-toggle-enabled: false;
     in property <string> stream-state;
     in property <string> callback-count;
     in property <string> stream-failures;
@@ -472,6 +475,7 @@ export component OperatorWindow inherits Window {
     callback set-loop-in-requested();
     callback set-loop-out-requested();
     callback clear-loop-range-requested();
+    callback toggle-metronome-requested();
     callback reset-output-peak-requested();
     callback loudness-run-requested();
     callback loudness-standby-requested();
@@ -573,6 +577,7 @@ export component OperatorWindow inherits Window {
                 detail: "BBT " + root.transport-musical-position + "  ·  frame " + root.transport-frame;
             }
             FactCard { label: "SESSION LOOP"; value: root.loop-state; detail: root.loop-range; }
+            FactCard { label: "METRONOME"; value: root.metronome-state; }
             FactCard { label: "AUDIO OWNER"; value: root.stream-state; }
             FactCard { label: "PANEL LINK"; value: root.panel-state; }
         }
@@ -622,6 +627,12 @@ export component OperatorWindow inherits Window {
             Button { text: "Loop In"; enabled: root.loop-in-enabled; clicked => { root.set-loop-in-requested(); } }
             Button { text: "Loop Out"; enabled: root.loop-out-enabled; clicked => { root.set-loop-out-requested(); } }
             Button { text: "Clear loop"; enabled: root.loop-clear-enabled; clicked => { root.clear-loop-range-requested(); } }
+            Button {
+                text: root.metronome-toggle-label;
+                enabled: root.metronome-toggle-enabled;
+                accessible-label: root.metronome-toggle-label;
+                clicked => { root.toggle-metronome-requested(); }
+            }
             Rectangle { horizontal-stretch: 1; }
             Button { text: "Shut down Runtime"; clicked => { root.quit-requested(); } }
         }

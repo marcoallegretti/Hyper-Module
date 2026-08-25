@@ -31,7 +31,10 @@ use hyper_playback_json::{
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use sha2::{Digest, Sha256};
 
+use crate::metronome::Metronome;
+
 mod loudness_presentation;
+mod metronome;
 mod meter_ballistics;
 mod recovery;
 pub use hyper_playback_compiler::scene::SceneLaunchState;
@@ -43,10 +46,12 @@ pub use meter_ballistics::{
     ChannelSamplePeakBallistics, SamplePeakBallisticsConfig, SamplePeakBallisticsConfigError,
     StereoSamplePeakBallistics, StereoSamplePeakBallisticsSnapshot,
 };
+pub use metronome::{MetronomePlan, MetronomePlanError, MetronomeProcessError};
 pub use recovery::{
     PlaybackCycleObservation, PlaybackRecoveryCheckpoint, PlaybackRecoveryPublisher,
     PlaybackRecoverySnapshot, PlaybackRecoveryTransportState, playback_recovery_channel,
     playback_recovery_channel_with_initial_loop,
+    playback_recovery_channel_with_initial_loop_and_metronome,
 };
 
 pub const MAX_MAIN_MIXER_SLOTS: usize = 8;
@@ -162,6 +167,7 @@ pub enum RuntimeProcessError {
     BlockLimit { actual: usize, maximum: usize },
     FrameRangeOverflow,
     Scene(SceneRuntimeError),
+    Metronome(MetronomeProcessError),
     Automation(FrameTimelineError),
     AutomationValueMismatch,
     Parameter(ParameterError),
@@ -204,6 +210,7 @@ impl fmt::Display for RuntimeProcessError {
             ),
             Self::FrameRangeOverflow => formatter.write_str("runtime frame range overflowed"),
             Self::Scene(source) => write!(formatter, "interactive scene launch failed: {source}"),
+            Self::Metronome(source) => write!(formatter, "metronome rendering failed: {source}"),
             Self::Automation(source) => write!(formatter, "automation evaluation failed: {source}"),
             Self::AutomationValueMismatch => {
                 formatter.write_str("compiled automation value differs from its target domain")
@@ -229,6 +236,7 @@ impl Error for RuntimeProcessError {
             Self::Automation(source) => Some(source),
             Self::Parameter(source) => Some(source),
             Self::Scene(source) => Some(source),
+            Self::Metronome(source) => Some(source),
             Self::OutputLengthMismatch { .. }
             | Self::ChannelTapOutputLengthMismatch { .. }
             | Self::ChannelTapUnavailable { .. }
@@ -262,6 +270,7 @@ pub enum TransportCommand {
     StopInteractiveScenes,
     SetLoopRange(Option<TransportLoopRange>),
     SetLoopEnabled(bool),
+    SetMetronomeEnabled(bool),
 }
 
 /// A half-open `[start, end)` span the transport repeats while looping.
@@ -352,6 +361,9 @@ pub enum TransportCommandSendError {
         command: TransportCommand,
         reason: PreparedSceneAvailability,
     },
+    MetronomeUnavailable {
+        command: TransportCommand,
+    },
 }
 
 impl TransportCommandSendError {
@@ -362,7 +374,8 @@ impl TransportCommandSendError {
             | Self::Disconnected(command)
             | Self::MissingScene { command, .. }
             | Self::LoopRangeShorterThanBlock { command, .. }
-            | Self::SceneUnavailable { command, .. } => command,
+            | Self::SceneUnavailable { command, .. }
+            | Self::MetronomeUnavailable { command } => command,
         }
     }
 }
@@ -394,6 +407,9 @@ impl fmt::Display for TransportCommandSendError {
                     formatter.write_str("scene launch is unexpectedly unavailable")
                 }
             },
+            Self::MetronomeUnavailable { .. } => {
+                formatter.write_str("metronome is unavailable for this transport")
+            }
         }
     }
 }
@@ -1240,6 +1256,7 @@ pub struct TransportCommandSender {
     scene_ready_mask: u8,
     scene_disabled_mask: u8,
     scene_consolidation_mask: u8,
+    metronome_available: bool,
 }
 
 impl TransportCommandSender {
@@ -1261,6 +1278,12 @@ impl TransportCommandSender {
     #[must_use]
     pub const fn scene_count(&self) -> usize {
         self.scene_count
+    }
+
+    /// Whether this transport was prepared with a callback-safe metronome plan.
+    #[must_use]
+    pub const fn metronome_available(&self) -> bool {
+        self.metronome_available
     }
 
     /// Returns the prepared launch status for a scene, or `None` outside the validated domain.
@@ -1312,6 +1335,11 @@ impl TransportCommandSender {
                 return Err(TransportCommandSendError::SceneUnavailable { command, reason });
             }
         }
+        if matches!(command, TransportCommand::SetMetronomeEnabled(_))
+            && !self.metronome_available
+        {
+            return Err(TransportCommandSendError::MetronomeUnavailable { command });
+        }
         Ok(())
     }
 
@@ -1335,6 +1363,10 @@ impl TransportCommandSender {
 /// Result of one device-independent transport processing cycle.
 ///
 /// Queue diagnostics describe commands applied at the beginning of this cycle.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the cycle is a flat, copyable publication of independent committed transport facts"
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransportCycle {
     state: TransportState,
@@ -1344,6 +1376,8 @@ pub struct TransportCycle {
     loop_wrap_count: usize,
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
+    metronome_available: bool,
+    metronome_enabled: bool,
     active_slot_count: usize,
     scene_launch_state: SceneLaunchState,
     applied_command_count: usize,
@@ -1370,6 +1404,18 @@ impl TransportCycle {
     #[must_use]
     pub const fn loop_enabled(self) -> bool {
         self.loop_enabled
+    }
+
+    /// Whether this cycle's transport has a prepared metronome plan.
+    #[must_use]
+    pub const fn metronome_available(self) -> bool {
+        self.metronome_available
+    }
+
+    /// Whether the metronome was enabled after this cycle's FIFO commands.
+    #[must_use]
+    pub const fn metronome_enabled(self) -> bool {
+        self.metronome_enabled
     }
 
     #[must_use]
@@ -3339,6 +3385,7 @@ pub struct RoutedTransportRuntime<R> {
     position_frame: usize,
     loop_range: Option<TransportLoopRange>,
     loop_enabled: bool,
+    metronome: Option<Metronome>,
     command_consumer: Option<Consumer<TransportCommand>>,
     mixer_parameter_command_consumer: Option<Consumer<MixerParameterCommand>>,
     mixer_parameter_fence: Option<Arc<AtomicU64>>,
@@ -3371,6 +3418,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             position_frame: 0,
             loop_range: None,
             loop_enabled: false,
+            metronome: None,
             command_consumer: None,
             mixer_parameter_command_consumer: None,
             mixer_parameter_fence: None,
@@ -3394,6 +3442,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 scene_ready_mask,
                 scene_disabled_mask,
                 scene_consolidation_mask,
+                metronome_available: false,
             },
             Self {
                 runtime,
@@ -3401,11 +3450,26 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 position_frame: 0,
                 loop_range: None,
                 loop_enabled: false,
+                metronome: None,
                 command_consumer: Some(consumer),
                 mixer_parameter_command_consumer: None,
                 mixer_parameter_fence: None,
             },
         )
+    }
+
+    /// Creates one transport with a bounded command queue and one prepared
+    /// session metronome. The click remains disabled until its explicit
+    /// transport command is committed by a process cycle.
+    #[must_use]
+    pub fn with_command_queue_and_metronome(
+        runtime: RoutedMainRuntime<R>,
+        plan: MetronomePlan,
+    ) -> (TransportCommandSender, Self) {
+        let (mut commands, mut transport) = Self::with_command_queue(runtime);
+        commands.metronome_available = true;
+        transport.metronome = Some(Metronome::new(plan));
+        (commands, transport)
     }
 
     /// Creates one transport with bounded application-thread transport and
@@ -3435,6 +3499,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 scene_ready_mask,
                 scene_disabled_mask,
                 scene_consolidation_mask,
+                metronome_available: false,
             },
             MixerParameterCommandSender {
                 producer: parameter_producer,
@@ -3448,11 +3513,26 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 position_frame: 0,
                 loop_range: None,
                 loop_enabled: false,
+                metronome: None,
                 command_consumer: Some(transport_consumer),
                 mixer_parameter_command_consumer: Some(parameter_consumer),
                 mixer_parameter_fence: Some(committed_fence),
             },
         )
+    }
+
+    /// Creates one transport with bounded transport/mixer queues and a
+    /// prepared session metronome. Construction allocates only the command
+    /// queues; the metronome plan was already fully prepared by its caller.
+    #[must_use]
+    pub fn with_command_queues_and_metronome(
+        runtime: RoutedMainRuntime<R>,
+        plan: MetronomePlan,
+    ) -> (TransportCommandSender, MixerParameterCommandSender, Self) {
+        let (mut commands, mixer_commands, mut transport) = Self::with_command_queues(runtime);
+        commands.metronome_available = true;
+        transport.metronome = Some(Metronome::new(plan));
+        (commands, mixer_commands, transport)
     }
 
     #[must_use]
@@ -3468,6 +3548,19 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     #[must_use]
     pub const fn loop_enabled(&self) -> bool {
         self.loop_enabled
+    }
+
+    /// Whether this transport owns a prepared, callback-safe metronome plan.
+    #[must_use]
+    pub const fn metronome_available(&self) -> bool {
+        self.metronome.is_some()
+    }
+
+    /// Whether the prepared metronome is enabled after the latest committed
+    /// transport command.
+    #[must_use]
+    pub fn metronome_enabled(&self) -> bool {
+        self.metronome.as_ref().is_some_and(Metronome::enabled)
     }
 
     #[must_use]
@@ -3518,10 +3611,18 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     pub fn apply_command(&mut self, command: TransportCommand) -> Result<(), SceneRuntimeError> {
         match command {
             TransportCommand::Start => self.state = TransportState::Rolling,
-            TransportCommand::Stop => self.state = TransportState::Stopped,
+            TransportCommand::Stop => {
+                self.state = TransportState::Stopped;
+                if let Some(metronome) = &mut self.metronome {
+                    metronome.clear_voice();
+                }
+            }
             TransportCommand::Locate { frame, state } => {
                 self.position_frame = frame;
                 self.runtime.seek(frame);
+                if let Some(metronome) = &mut self.metronome {
+                    metronome.clear_voice();
+                }
                 match state {
                     LocateState::Preserve => {}
                     LocateState::Stopped => self.state = TransportState::Stopped,
@@ -3534,6 +3635,11 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             TransportCommand::StopInteractiveScenes => self.runtime.stop_interactive_scenes(),
             TransportCommand::SetLoopRange(range) => self.loop_range = range,
             TransportCommand::SetLoopEnabled(enabled) => self.loop_enabled = enabled,
+            TransportCommand::SetMetronomeEnabled(enabled) => {
+                if let Some(metronome) = &mut self.metronome {
+                    metronome.set_enabled(enabled);
+                }
+            }
         }
         Ok(())
     }
@@ -3583,6 +3689,17 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                     right: &mut right[written..written + span],
                 },
             )?;
+            if let Some(metronome) = &mut self.metronome {
+                metronome
+                    .mix_window(
+                        position,
+                        StereoOutput {
+                            left: &mut left[written..written + span],
+                            right: &mut right[written..written + span],
+                        },
+                    )
+                    .map_err(RuntimeProcessError::Metronome)?;
+            }
             active_slot_count = active_slot_count.max(rendered.active_slot_count);
             written += span;
             position = position
@@ -3593,6 +3710,9 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             {
                 position = range.start_frame();
                 self.runtime.seek(position);
+                if let Some(metronome) = &mut self.metronome {
+                    metronome.reset_position();
+                }
                 wraps += 1;
             }
         }
@@ -3629,6 +3749,10 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     /// range, rendering, automation, or mixer failures. A failed cycle never
     /// commits queued transport or mixer base state and never advances the
     /// transport position.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the transactional transport rollback remains auditable when its state fences are co-located"
+    )]
     pub fn process_cycle(
         &mut self,
         scratch: &mut [RenderScratchSlot<'_>],
@@ -3651,6 +3775,7 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
         let committed_position = self.position_frame;
         let committed_loop_range = self.loop_range;
         let committed_loop_enabled = self.loop_enabled;
+        let committed_metronome = self.metronome.as_ref().map(Metronome::checkpoint);
         let committed_parameters = self.runtime.capture_parameter_state();
         let committed_renderer = self.runtime.renderer_checkpoint();
         let applied_command_count = match self.drain_commands() {
@@ -3660,6 +3785,11 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 self.position_frame = committed_position;
                 self.loop_range = committed_loop_range;
                 self.loop_enabled = committed_loop_enabled;
+                if let (Some(metronome), Some(checkpoint)) =
+                    (&mut self.metronome, committed_metronome)
+                {
+                    metronome.restore(checkpoint);
+                }
                 self.runtime.restore_renderer(committed_renderer);
                 self.runtime
                     .restore_parameter_state_unchecked(&committed_parameters);
@@ -3684,6 +3814,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 loop_wrap_count: 0,
                 loop_range: self.loop_range,
                 loop_enabled: self.loop_enabled,
+                metronome_available: self.metronome_available(),
+                metronome_enabled: self.metronome_enabled(),
                 active_slot_count: 0,
                 scene_launch_state: self.runtime.scene_launch_state(),
                 applied_command_count,
@@ -3700,6 +3832,11 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
                 self.position_frame = committed_position;
                 self.loop_range = committed_loop_range;
                 self.loop_enabled = committed_loop_enabled;
+                if let (Some(metronome), Some(checkpoint)) =
+                    (&mut self.metronome, committed_metronome)
+                {
+                    metronome.restore(checkpoint);
+                }
                 self.runtime.restore_renderer(committed_renderer);
                 self.runtime
                     .restore_parameter_state_unchecked(&committed_parameters);
@@ -3716,6 +3853,8 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             loop_wrap_count,
             loop_range: self.loop_range,
             loop_enabled: self.loop_enabled,
+            metronome_available: self.metronome_available(),
+            metronome_enabled: self.metronome_enabled(),
             active_slot_count: rendered.active_slot_count,
             scene_launch_state: self.runtime.scene_launch_state(),
             applied_command_count,

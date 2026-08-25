@@ -371,6 +371,8 @@ mod tests {
                 loop_wrap_count: 0,
                 loop_range: None,
                 loop_enabled: false,
+                metronome_available: false,
+                metronome_enabled: false,
                 active_slot_count: 1,
                 scene_launch_state: SceneLaunchState::default(),
                 applied_command_count: 0,
