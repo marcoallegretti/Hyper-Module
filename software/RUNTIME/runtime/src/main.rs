@@ -833,7 +833,7 @@ fn drain_operator_commands<H: RuntimeOperatorControl>(
                 match host.queue_native_device(NativeDeviceCommand::SetState { device, state }) {
                     Ok(()) => diagnostic("native device parameter update queued".to_owned()),
                     Err(error) => {
-                        diagnostic(format!("native device parameter update refused: {error}"))
+                        diagnostic(format!("native device parameter update refused: {error}"));
                     }
                 }
             }
@@ -1317,7 +1317,13 @@ fn run_operator_ui(arguments: RuntimeArguments) -> Result<(), String> {
     wire_operator_peak_reset(&ui, &meter_observer, &loudness_authority);
     wire_operator_loudness_controls(&ui, &commands_tx, &diagnostic, &loudness_authority);
     wire_operator_mixer_controls(&ui, &commands_tx, &diagnostic, &mixer_authority);
-    wire_operator_native_device_controls(&ui, &commands_tx, &diagnostic, &native_device_authority);
+    wire_operator_native_device_controls(
+        &ui,
+        &commands_tx,
+        &diagnostic,
+        &native_device_model,
+        &native_device_authority,
+    );
     wire_operator_scene_launch(
         &ui,
         &commands_tx,
@@ -1647,7 +1653,9 @@ fn queue_operator_transport_action(
     action: OperatorTransportAction,
 ) {
     match operator_transport_command(state, action) {
-        Ok(command) => send_operator_command(sender, command, diagnostic),
+        Ok(command) => {
+            send_operator_command(sender, command, diagnostic);
+        }
         Err(message) => set_diagnostic(diagnostic, message.to_owned()),
     }
 }
@@ -2013,10 +2021,12 @@ fn wire_operator_native_device_controls(
     ui: &OperatorWindow,
     sender: &SyncSender<OperatorCommand>,
     diagnostic: &Arc<Mutex<String>>,
+    model: &Rc<VecModel<OperatorNativeDeviceRow>>,
     authority: &Rc<RefCell<Option<Vec<OperatorNativeDeviceAuthority>>>>,
 ) {
     let bypass_sender = sender.clone();
     let bypass_diagnostic = Arc::clone(diagnostic);
+    let bypass_model = Rc::clone(model);
     let bypass_authority = Rc::clone(authority);
     ui.on_toggle_native_device_requested(move |row| {
         let Ok(row) = usize::try_from(row) else {
@@ -2038,18 +2048,27 @@ fn wire_operator_native_device_controls(
             );
             return;
         };
-        send_operator_command(
+        if send_operator_command(
             &bypass_sender,
             OperatorCommand::SetNativeDeviceEnabled {
                 device: current.handle,
                 enabled: !current.enabled,
             },
             &bypass_diagnostic,
-        );
+        ) {
+            commit_operator_native_device_enabled(
+                &bypass_authority,
+                &bypass_model,
+                row,
+                current.handle,
+                !current.enabled,
+            );
+        }
     });
 
     let mode_sender = sender.clone();
     let mode_diagnostic = Arc::clone(diagnostic);
+    let mode_model = Rc::clone(model);
     let mode_authority = Rc::clone(authority);
     ui.on_toggle_native_filter_mode_requested(move |row| {
         let Some(current) = operator_native_device_authority(&mode_authority, row) else {
@@ -2075,18 +2094,75 @@ fn wire_operator_native_device_controls(
             state.resonance_millionths(),
         )
         .expect("an accepted filter state remains in the declared domain");
-        send_operator_command(
+        if send_operator_command(
             &mode_sender,
             OperatorCommand::SetNativeDeviceState {
                 device: current.handle,
                 state: NativeDeviceState::Filter(state),
             },
             &mode_diagnostic,
-        );
+        ) {
+            commit_operator_native_device_state(
+                &mode_authority,
+                &mode_model,
+                row,
+                current.handle,
+                NativeDeviceState::Filter(state),
+            );
+        }
     });
 
-    wire_operator_native_filter_value_controls(ui, sender, diagnostic, authority);
-    wire_operator_native_compressor_value_controls(ui, sender, diagnostic, authority);
+    wire_operator_native_filter_value_controls(ui, sender, diagnostic, model, authority);
+    wire_operator_native_compressor_value_controls(ui, sender, diagnostic, model, authority);
+}
+
+fn commit_operator_native_device_enabled(
+    authority: &Rc<RefCell<Option<Vec<OperatorNativeDeviceAuthority>>>>,
+    model: &VecModel<OperatorNativeDeviceRow>,
+    row: usize,
+    handle: NativeDeviceHandle,
+    enabled: bool,
+) {
+    let mut authority = authority.borrow_mut();
+    let Some(device) = authority
+        .as_mut()
+        .and_then(|devices| devices.get_mut(row))
+        .filter(|device| device.handle == handle)
+    else {
+        return;
+    };
+    device.enabled = enabled;
+    let Some(mut model_row) = model.row_data(row) else {
+        return;
+    };
+    model_row.enabled = enabled;
+    model.set_row_data(row, model_row);
+}
+
+fn commit_operator_native_device_state(
+    authority: &Rc<RefCell<Option<Vec<OperatorNativeDeviceAuthority>>>>,
+    model: &VecModel<OperatorNativeDeviceRow>,
+    row: i32,
+    handle: NativeDeviceHandle,
+    state: NativeDeviceState,
+) {
+    let Ok(row) = usize::try_from(row) else {
+        return;
+    };
+    let mut authority = authority.borrow_mut();
+    let Some(device) = authority
+        .as_mut()
+        .and_then(|devices| devices.get_mut(row))
+        .filter(|device| device.handle == handle)
+    else {
+        return;
+    };
+    device.state = state;
+    let Some(mut model_row) = model.row_data(row) else {
+        return;
+    };
+    apply_operator_native_device_row_state(&mut model_row, state);
+    model.set_row_data(row, model_row);
 }
 
 fn operator_native_device_authority(
@@ -2106,10 +2182,12 @@ fn wire_operator_native_filter_value_controls(
     ui: &OperatorWindow,
     sender: &SyncSender<OperatorCommand>,
     diagnostic: &Arc<Mutex<String>>,
+    model: &Rc<VecModel<OperatorNativeDeviceRow>>,
     authority: &Rc<RefCell<Option<Vec<OperatorNativeDeviceAuthority>>>>,
 ) {
     let cutoff_sender = sender.clone();
     let cutoff_diagnostic = Arc::clone(diagnostic);
+    let cutoff_model = Rc::clone(model);
     let cutoff_authority = Rc::clone(authority);
     ui.on_set_native_filter_cutoff_requested(move |row, hertz| {
         let Some((device, state)) =
@@ -2128,15 +2206,24 @@ fn wire_operator_native_filter_value_controls(
             );
             return;
         };
-        send_operator_command(
+        if send_operator_command(
             &cutoff_sender,
             OperatorCommand::SetNativeDeviceState { device, state },
             &cutoff_diagnostic,
-        );
+        ) {
+            commit_operator_native_device_state(
+                &cutoff_authority,
+                &cutoff_model,
+                row,
+                device,
+                state,
+            );
+        }
     });
 
     let resonance_sender = sender.clone();
     let resonance_diagnostic = Arc::clone(diagnostic);
+    let resonance_model = Rc::clone(model);
     let resonance_authority = Rc::clone(authority);
     ui.on_set_native_filter_resonance_requested(move |row, resonance| {
         let Some((device, state)) =
@@ -2156,11 +2243,19 @@ fn wire_operator_native_filter_value_controls(
             );
             return;
         };
-        send_operator_command(
+        if send_operator_command(
             &resonance_sender,
             OperatorCommand::SetNativeDeviceState { device, state },
             &resonance_diagnostic,
-        );
+        ) {
+            commit_operator_native_device_state(
+                &resonance_authority,
+                &resonance_model,
+                row,
+                device,
+                state,
+            );
+        }
     });
 }
 
@@ -2192,12 +2287,14 @@ fn wire_operator_native_compressor_value_controls(
     ui: &OperatorWindow,
     sender: &SyncSender<OperatorCommand>,
     diagnostic: &Arc<Mutex<String>>,
+    model: &Rc<VecModel<OperatorNativeDeviceRow>>,
     authority: &Rc<RefCell<Option<Vec<OperatorNativeDeviceAuthority>>>>,
 ) {
     wire_operator_native_compressor_value_control(
         ui,
         sender,
         diagnostic,
+        model,
         authority,
         |ui, callback| {
             ui.on_set_native_compressor_threshold_requested(callback);
@@ -2217,6 +2314,7 @@ fn wire_operator_native_compressor_value_controls(
         ui,
         sender,
         diagnostic,
+        model,
         authority,
         |ui, callback| {
             ui.on_set_native_compressor_ratio_requested(callback);
@@ -2236,6 +2334,7 @@ fn wire_operator_native_compressor_value_controls(
         ui,
         sender,
         diagnostic,
+        model,
         authority,
         |ui, callback| {
             ui.on_set_native_compressor_attack_requested(callback);
@@ -2255,6 +2354,7 @@ fn wire_operator_native_compressor_value_controls(
         ui,
         sender,
         diagnostic,
+        model,
         authority,
         |ui, callback| {
             ui.on_set_native_compressor_release_requested(callback);
@@ -2274,6 +2374,7 @@ fn wire_operator_native_compressor_value_controls(
         ui,
         sender,
         diagnostic,
+        model,
         authority,
         |ui, callback| {
             ui.on_set_native_compressor_makeup_requested(callback);
@@ -2295,12 +2396,14 @@ fn wire_operator_native_compressor_value_control(
     ui: &OperatorWindow,
     sender: &SyncSender<OperatorCommand>,
     diagnostic: &Arc<Mutex<String>>,
+    model: &Rc<VecModel<OperatorNativeDeviceRow>>,
     authority: &Rc<RefCell<Option<Vec<OperatorNativeDeviceAuthority>>>>,
     bind: impl FnOnce(&OperatorWindow, Box<dyn FnMut(i32, f32)>),
     update: impl Fn(NativeCompressorState, f32) -> Option<NativeCompressorState> + 'static,
 ) {
     let sender = sender.clone();
     let diagnostic = Arc::clone(diagnostic);
+    let model = Rc::clone(model);
     let authority = Rc::clone(authority);
     bind(
         ui,
@@ -2315,11 +2418,13 @@ fn wire_operator_native_compressor_value_control(
                 );
                 return;
             };
-            send_operator_command(
+            if send_operator_command(
                 &sender,
                 OperatorCommand::SetNativeDeviceState { device, state },
                 &diagnostic,
-            );
+            ) {
+                commit_operator_native_device_state(&authority, &model, row, device, state);
+            }
         }),
     );
 }
@@ -2858,9 +2963,13 @@ fn send_operator_command(
     sender: &SyncSender<OperatorCommand>,
     command: OperatorCommand,
     diagnostic: &Mutex<String>,
-) {
-    if let Err(error) = sender.try_send(command) {
-        set_diagnostic(diagnostic, format!("operator command refused: {error}"));
+) -> bool {
+    match sender.try_send(command) {
+        Ok(()) => true,
+        Err(error) => {
+            set_diagnostic(diagnostic, format!("operator command refused: {error}"));
+            false
+        }
     }
 }
 
@@ -7788,8 +7897,14 @@ mod tests {
             compressor_release_milliseconds: 0.0,
             compressor_makeup_decibels: 0.0,
         }]));
-        ui.set_native_devices(ModelRc::from(rows));
-        wire_operator_native_device_controls(&ui, &sender, &diagnostic, &native_device_authority);
+        ui.set_native_devices(ModelRc::from(Rc::clone(&rows)));
+        wire_operator_native_device_controls(
+            &ui,
+            &sender,
+            &diagnostic,
+            &rows,
+            &native_device_authority,
+        );
 
         ui.invoke_toggle_native_device_requested(0);
 

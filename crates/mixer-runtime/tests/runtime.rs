@@ -527,6 +527,38 @@ fn native_device_commands_are_bound_to_the_prepared_graph_and_commit_at_the_cycl
     assert!(left.iter().all(|sample| sample.is_finite()));
     assert!(right.iter().all(|sample| sample.is_finite()));
 
+    let intermediate = NativeDeviceState::Filter(
+        NativeFilterState::try_new(NativeFilterMode::LowPass, 1_000_000, 500_000).unwrap(),
+    );
+    let latest = NativeDeviceState::Filter(
+        NativeFilterState::try_new(NativeFilterMode::HighPass, 8_000_000, 2_000_000).unwrap(),
+    );
+    sender
+        .try_send(NativeDeviceCommand::SetState {
+            device,
+            state: intermediate,
+        })
+        .unwrap();
+    sender
+        .try_send(NativeDeviceCommand::SetState {
+            device,
+            state: latest,
+        })
+        .unwrap();
+    let coalesced_cycle = transport
+        .process_cycle(
+            &mut scratch,
+            StereoOutput {
+                left: &mut left,
+                right: &mut right,
+            },
+        )
+        .unwrap();
+    assert_eq!(coalesced_cycle.applied_native_device_command_count(), 2);
+    assert_eq!(transport.native_device_state().state(0, 0), Some(latest));
+    assert!(left.iter().all(|sample| sample.is_finite()));
+    assert!(right.iter().all(|sample| sample.is_finite()));
+
     let foreign_fixture = playback_fixture();
     let foreign_graph = foreign_fixture.compile_playback();
     let foreign_prepared = foreign_fixture

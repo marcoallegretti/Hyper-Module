@@ -1864,7 +1864,11 @@ impl TransportCycle {
         self.mixer_parameter_command_sender_disconnected
     }
 
-    /// Session-only native-device commands applied at this cycle boundary.
+    /// Session-only native-device commands accepted at this cycle boundary.
+    ///
+    /// Multiple state updates for one device can be coalesced before DSP
+    /// processing, so this count includes superseded updates accepted from the
+    /// bounded command queue.
     #[must_use]
     pub const fn applied_native_device_command_count(self) -> usize {
         self.applied_native_device_command_count
@@ -2247,9 +2251,10 @@ impl InterleavedTransportCycle {
         self.mixer_parameter_state.as_ref()
     }
 
-    /// Returns newly committed bypass state when this callback applied native
-    /// device commands. Callbacks without device changes omit the duplicate
-    /// snapshot.
+    /// Returns newly committed native-device state when this callback accepts
+    /// native-device commands. The snapshot reflects the final state after
+    /// same-device updates are coalesced. Callbacks without device changes
+    /// omit the duplicate snapshot.
     #[must_use]
     pub const fn native_device_state(&self) -> Option<&NativeDeviceStateSnapshot> {
         self.native_device_state.as_ref()
@@ -4730,7 +4735,9 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
     }
 
     fn drain_native_device_commands(&mut self) -> usize {
-        let mut applied = 0;
+        let mut accepted = 0;
+        let mut pending_states = [None; MAX_QUEUED_NATIVE_DEVICE_COMMANDS];
+        let mut pending_state_count = 0;
         for _ in 0..MAX_QUEUED_NATIVE_DEVICE_COMMANDS {
             let command = self
                 .native_device_command_consumer
@@ -4739,10 +4746,50 @@ impl<R: TrackWindowRenderer> RoutedTransportRuntime<R> {
             let Some(command) = command else {
                 break;
             };
-            self.runtime.apply_native_device_command(command);
-            applied += 1;
+            accepted += 1;
+            match command {
+                NativeDeviceCommand::SetState { device, state } => {
+                    if let Some(index) =
+                        pending_states[..pending_state_count]
+                            .iter()
+                            .position(|pending| {
+                                pending.is_some_and(|(pending_device, _)| pending_device == device)
+                            })
+                    {
+                        pending_states[index] = Some((device, state));
+                    } else {
+                        pending_states[pending_state_count] = Some((device, state));
+                        pending_state_count += 1;
+                    }
+                }
+                NativeDeviceCommand::SetEnabled { device, enabled } => {
+                    if let Some(index) =
+                        pending_states[..pending_state_count]
+                            .iter()
+                            .position(|pending| {
+                                pending.is_some_and(|(pending_device, _)| pending_device == device)
+                            })
+                        && let Some((device, state)) = pending_states[index].take()
+                    {
+                        self.runtime
+                            .apply_native_device_command(NativeDeviceCommand::SetState {
+                                device,
+                                state,
+                            });
+                    }
+                    self.runtime
+                        .apply_native_device_command(NativeDeviceCommand::SetEnabled {
+                            device,
+                            enabled,
+                        });
+                }
+            }
         }
-        applied
+        for (device, state) in pending_states.into_iter().flatten() {
+            self.runtime
+                .apply_native_device_command(NativeDeviceCommand::SetState { device, state });
+        }
+        accepted
     }
 
     fn native_device_command_sender_disconnected(&self) -> bool {
