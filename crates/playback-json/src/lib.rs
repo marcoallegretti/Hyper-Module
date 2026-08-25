@@ -1056,7 +1056,7 @@ pub enum AudioTrackDocumentSerializationError {
 #[derive(Debug)]
 pub enum MixerStripReorderSerializationError {
     TrackMissing,
-    TrackNotMixable,
+    TrackNotReorderable,
     ParentTrackUnsupported,
     DestinationOutOfRange,
     NoChange,
@@ -1344,7 +1344,9 @@ impl fmt::Display for MixerStripReorderSerializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TrackMissing => formatter.write_str("the selected mixer strip is not present in the project"),
-            Self::TrackNotMixable => formatter.write_str("the selected track has no mixer strip"),
+            Self::TrackNotReorderable => {
+                formatter.write_str("the selected track is not supported for mixer-strip reorder")
+            }
             Self::ParentTrackUnsupported => formatter.write_str("mixer-strip reorder requires a flat project topology"),
             Self::DestinationOutOfRange => formatter.write_str("the requested mixer-strip destination is outside the project order"),
             Self::NoChange => formatter.write_str("the requested mixer-strip order is already active"),
@@ -1369,7 +1371,7 @@ impl Error for MixerStripReorderSerializationError {
             Self::ProjectCompilation(source) => Some(source),
             Self::Serialization(source) => Some(source),
             Self::TrackMissing
-            | Self::TrackNotMixable
+            | Self::TrackNotReorderable
             | Self::ParentTrackUnsupported
             | Self::DestinationOutOfRange
             | Self::NoChange
@@ -4305,8 +4307,8 @@ pub fn serialize_audio_track_activation(
 ///
 /// The source set must contain exactly one canonical current document for
 /// every project track. A supported reorder is limited to parentless mixable
-/// tracks: Audio, External Input, Group, and Return. It preserves each track's
-/// existing numeric order slots, all namespaced extensions, and every
+/// tracks: Audio, Group, and Return. It preserves each track's existing numeric
+/// order slots, all namespaced extensions, and every
 /// mixer-channel field; it changes only the order permutation and matching
 /// channel sequence.
 ///
@@ -4339,8 +4341,8 @@ pub fn serialize_mixer_strip_reorder(
     let target_index = project
         .track_index(track_id)
         .ok_or(MixerStripReorderSerializationError::TrackMissing)?;
-    if !project.is_mixable_track(track_id) {
-        return Err(MixerStripReorderSerializationError::TrackNotMixable);
+    if !project.is_reorderable_mixer_strip(track_id) {
+        return Err(MixerStripReorderSerializationError::TrackNotReorderable);
     }
     if destination_index >= project.tracks.len() {
         return Err(MixerStripReorderSerializationError::DestinationOutOfRange);
@@ -4359,9 +4361,9 @@ pub fn serialize_mixer_strip_reorder(
     for (index, current) in project.tracks.iter().enumerate() {
         if !matches!(
             current.kind,
-            TrackKind::Audio | TrackKind::ExternalInput | TrackKind::Group | TrackKind::Return
+            TrackKind::Audio | TrackKind::Group | TrackKind::Return
         ) {
-            return Err(MixerStripReorderSerializationError::TrackNotMixable);
+            return Err(MixerStripReorderSerializationError::TrackNotReorderable);
         }
         if current.parent_track_id.is_some() {
             return Err(MixerStripReorderSerializationError::ParentTrackUnsupported);
@@ -6812,8 +6814,8 @@ impl LoadedPlaybackProject {
         tracks.iter().position(|track| track.id == track_id)
     }
 
-    /// Whether this project can reorder every persisted mixer strip without
-    /// inventing parent or non-mixable ordering semantics.
+    /// Whether this project can reorder every persisted executable mixer strip
+    /// without inventing parent or hierarchy ordering semantics.
     #[must_use]
     pub fn supports_flat_mixer_strip_reorder(&self) -> bool {
         !self.tracks.is_empty()
@@ -6823,10 +6825,7 @@ impl LoadedPlaybackProject {
                 .all(|track| {
                     matches!(
                         track.kind,
-                        TrackKind::Audio
-                            | TrackKind::ExternalInput
-                            | TrackKind::Group
-                            | TrackKind::Return
+                        TrackKind::Audio | TrackKind::Group | TrackKind::Return
                     ) && track.parent_track_id.is_none()
                 })
     }
@@ -6857,15 +6856,12 @@ impl LoadedPlaybackProject {
     }
 
     #[must_use]
-    pub fn is_mixable_track(&self, track_id: &str) -> bool {
+    pub fn is_reorderable_mixer_strip(&self, track_id: &str) -> bool {
         self.tracks.iter().any(|track| {
             track.id == track_id
                 && matches!(
                     track.kind,
-                    TrackKind::Audio
-                        | TrackKind::ExternalInput
-                        | TrackKind::Group
-                        | TrackKind::Return
+                    TrackKind::Audio | TrackKind::Group | TrackKind::Return
                 )
         })
     }
@@ -11751,6 +11747,60 @@ mod tests {
         assert!(matches!(
             reorder(&[(first_id, &first), (second_id, &stale)], 1),
             Err(MixerStripReorderSerializationError::SourceTrackMismatch)
+        ));
+
+        let mut external_input: Value = serde_json::from_slice(&second).unwrap();
+        external_input["kind"] = "external-input".into();
+        let external_input = serde_json_canonicalizer::to_vec(&external_input).unwrap();
+        let external_input_project = load(
+            input(TIMELINE, &[&first, &external_input], &[], None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(!external_input_project.supports_flat_mixer_strip_reorder());
+        assert!(matches!(
+            serialize_mixer_strip_reorder(
+                &external_input_project,
+                &[],
+                &[(first_id, &first), (second_id, &external_input)],
+                &mixer,
+                mixer_id,
+                first_id,
+                1,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(MixerStripReorderSerializationError::TrackNotReorderable)
+        ));
+
+        let mut group: Value = serde_json::from_slice(&second).unwrap();
+        group["kind"] = "group".into();
+        group["order"] = 0.into();
+        let group = serde_json_canonicalizer::to_vec(&group).unwrap();
+        let mut child: Value = serde_json::from_slice(&first).unwrap();
+        child["order"] = 1.into();
+        child["parent_track_id"] = second_id.into();
+        let child = serde_json_canonicalizer::to_vec(&child).unwrap();
+        let mut parented_mixer: Value = serde_json::from_slice(&mixer).unwrap();
+        parented_mixer["channels"].as_array_mut().unwrap().swap(0, 1);
+        let parented_mixer = serde_json_canonicalizer::to_vec(&parented_mixer).unwrap();
+        let parented_project = load(
+            input(TIMELINE, &[&group, &child], &[], None),
+            LoaderLimits::VERSION_1,
+        )
+        .unwrap();
+        assert!(!parented_project.supports_flat_mixer_strip_reorder());
+        assert!(matches!(
+            serialize_mixer_strip_reorder(
+                &parented_project,
+                &[],
+                &[(second_id, &group), (first_id, &child)],
+                &parented_mixer,
+                mixer_id,
+                first_id,
+                0,
+                LoaderLimits::VERSION_1,
+            ),
+            Err(MixerStripReorderSerializationError::ParentTrackUnsupported)
         ));
     }
 
